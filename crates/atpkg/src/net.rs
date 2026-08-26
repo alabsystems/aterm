@@ -701,13 +701,8 @@ impl crate::flow::Fetcher for GithubFetcher {
         // complete file refuses it, which costs exactly what a failed download costs
         // today.
         if let Some(url) = direct_asset_url(&slug, asset)
-            && aterm_update_core::download_to_resumable(
-                &url,
-                self.credential(),
-                dest,
-                ARTIFACT_CAP,
-            )
-            .is_ok()
+            && aterm_update_core::download_to_resumable(&url, self.credential(), dest, ARTIFACT_CAP)
+                .is_ok()
         {
             return Ok(());
         }
@@ -1095,13 +1090,13 @@ mod tests {
     #[test]
     fn direct_urls_refuse_unsafe_slugs_and_names() {
         for bad in [
-            "alabsystems",                      // no repo half
-            "alabsystems/ty/extra",             // an extra path segment
-            "alabsystems/",                     // empty repo
-            "/ty",                              // empty owner
-            "alabsystems/..",                   // parent traversal
-            "evil.com/x/../../alabsystems/ty",  // traversal via a long slug
-            "https://evil.com/a",               // a scheme smuggled in as a slug
+            "alabsystems",                     // no repo half
+            "alabsystems/ty/extra",            // an extra path segment
+            "alabsystems/",                    // empty repo
+            "/ty",                             // empty owner
+            "alabsystems/..",                  // parent traversal
+            "evil.com/x/../../alabsystems/ty", // traversal via a long slug
+            "https://evil.com/a",              // a scheme smuggled in as a slug
         ] {
             assert!(
                 super::direct_manifest_urls(bad, "ty", 1).is_none(),
@@ -1309,7 +1304,10 @@ mod tests {
         assert!(index_pair_urls(std::slice::from_ref(&doc_only)).is_empty());
 
         // NON-VACUITY: restore the pair and the very same release is a candidate again.
-        assert_eq!(index_pair_urls(std::slice::from_ref(&quad("idx-1"))).len(), 1);
+        assert_eq!(
+            index_pair_urls(std::slice::from_ref(&quad("idx-1"))).len(),
+            1
+        );
     }
 
     #[test]
@@ -1464,7 +1462,12 @@ mod tests {
         // assertion: both operands are compile-time constants, so this is a ceiling on
         // the SOURCE, and it should fail the build that raises the cap rather than wait
         // for someone to run this test.
-        const { assert!(INDEX_CANDIDATE_CAP <= 24, "INDEX_CANDIDATE_CAP exceeds the §14 cache's candidate ceiling: a full candidate set could no longer be persisted for the offline fallback") };
+        const {
+            assert!(
+                INDEX_CANDIDATE_CAP <= 24,
+                "INDEX_CANDIDATE_CAP exceeds the §14 cache's candidate ceiling: a full candidate set could no longer be persisted for the offline fallback"
+            )
+        };
     }
 
     #[test]

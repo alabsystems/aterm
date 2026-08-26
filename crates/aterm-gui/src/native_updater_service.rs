@@ -113,9 +113,9 @@ impl StagedUpdate {
     /// not a `ready.toml` marker (see [`installed_activation_digest`]).
     #[must_use]
     pub(crate) fn is_installed_activation(&self) -> bool {
-        self.commit
-            .as_deref()
-            .is_some_and(|commit| installed_activation_digest(self.build, commit) == self.dmg_sha256)
+        self.commit.as_deref().is_some_and(|commit| {
+            installed_activation_digest(self.build, commit) == self.dmg_sha256
+        })
     }
 }
 
@@ -232,7 +232,11 @@ impl InstalledUpdate {
     /// the running build: the sealed identity as a [`StagedUpdate`] whose digest is the
     /// [`installed_activation_digest`]. `None` when the bundle is not newer.
     #[must_use]
-    pub(crate) fn activation_stage(&self, running_build: u64, generation: u64) -> Option<StagedUpdate> {
+    pub(crate) fn activation_stage(
+        &self,
+        running_build: u64,
+        generation: u64,
+    ) -> Option<StagedUpdate> {
         // The same identity rule the import applies (`staged_from_status`), so a
         // bundle whose sealed commit is unusable is not an activation at all —
         // it must not retire a download it can never replace.
@@ -1205,7 +1209,9 @@ impl NativeUpdaterService {
             self.snapshot.acknowledged_attention_revision = None;
             self.snapshot.error = None;
             self.snapshot.outcome = bounded(
-                format!("Returned activation attempt was retired because the installed bundle changed: {message}"),
+                format!(
+                    "Returned activation attempt was retired because the installed bundle changed: {message}"
+                ),
                 MAX_MESSAGE_BYTES,
             );
             self.close_preflight_ready = false;
@@ -1810,7 +1816,11 @@ mod tests {
             CheckCompletion::Reduced
         );
         assert!(
-            service.snapshot().staged.as_ref().is_some_and(StagedUpdate::is_installed_activation),
+            service
+                .snapshot()
+                .staged
+                .as_ref()
+                .is_some_and(StagedUpdate::is_installed_activation),
             "the imported stage carries the activation identity"
         );
         ticket
@@ -1827,7 +1837,10 @@ mod tests {
         assert!(usable_commit_identity("248091d23ab0"));
         assert!(usable_commit_identity(" 248091D23AB0 "));
         assert!(usable_commit_identity(&"a".repeat(40)));
-        assert!(!usable_commit_identity("248091"), "six hex is not an identity");
+        assert!(
+            !usable_commit_identity("248091"),
+            "six hex is not an identity"
+        );
         assert!(!usable_commit_identity(&"a".repeat(41)));
         assert!(!usable_commit_identity("unknown"));
         assert!(!usable_commit_identity("248091d23ab0-dirty"));
@@ -1910,11 +1923,22 @@ mod tests {
         let snap = service.snapshot();
         assert!(snap.failing_persistent && snap.failing_kind == "apply");
         assert!(snap.staged.is_some(), "the stage is untouched");
-        assert_eq!(snap.attention_revision, Some(snap.revision), "badged on the edge");
+        assert_eq!(
+            snap.attention_revision,
+            Some(snap.revision),
+            "badged on the edge"
+        );
         assert!(snap.revision > rev0);
         let rev1 = snap.revision;
-        assert!(!service.absorb_failure_state(&failing), "a repeat changes nothing");
-        assert_eq!(service.snapshot().revision, rev1, "no revision churn per cycle");
+        assert!(
+            !service.absorb_failure_state(&failing),
+            "a repeat changes nothing"
+        );
+        assert_eq!(
+            service.snapshot().revision,
+            rev1,
+            "no revision churn per cycle"
+        );
         let healed = status(Some(11));
         assert!(service.absorb_failure_state(&healed));
         assert!(!service.snapshot().failing_persistent);
@@ -1924,7 +1948,10 @@ mod tests {
     fn the_activation_identity_is_well_formed_pure_and_distinct() {
         let a = installed_activation_digest(11, TEST_COMMIT);
         assert_eq!(a.len(), 64);
-        assert!(a.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(
+            a.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
         assert_eq!(a, installed_activation_digest(11, TEST_COMMIT), "pure");
         assert_eq!(
             a,
@@ -1935,7 +1962,9 @@ mod tests {
         assert_ne!(a, TEST_DIGEST, "not a download digest");
         let ticket = ApplyAttemptTicket::for_test(11, TEST_COMMIT, &a);
         assert!(ticket.is_installed_activation());
-        assert!(!ApplyAttemptTicket::for_test(11, TEST_COMMIT, TEST_DIGEST).is_installed_activation());
+        assert!(
+            !ApplyAttemptTicket::for_test(11, TEST_COMMIT, TEST_DIGEST).is_installed_activation()
+        );
     }
 
     /// An activation stage is BACKED BY THE INSTALLED BUNDLE, not by `ready.toml`:
@@ -2023,7 +2052,13 @@ mod tests {
             "the bundle still backs the activation: re-armed for the budget to decide"
         );
         assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
-        assert!(service.snapshot().staged.as_ref().is_some_and(StagedUpdate::is_installed_activation));
+        assert!(
+            service
+                .snapshot()
+                .staged
+                .as_ref()
+                .is_some_and(StagedUpdate::is_installed_activation)
+        );
 
         // Second attempt, but by the time it returns the bundle moved on: retire.
         let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
@@ -2055,13 +2090,22 @@ mod tests {
     #[test]
     fn a_download_stage_retires_for_activation_but_nothing_else_does() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
-        assert!(!service.retire_stage_for_activation(), "nothing staged: no-op");
+        assert!(
+            !service.retire_stage_for_activation(),
+            "nothing staged: no-op"
+        );
         stage(&mut service, 11);
-        assert!(service.retire_stage_for_activation(), "a download stage retires");
+        assert!(
+            service.retire_stage_for_activation(),
+            "a download stage retires"
+        );
         assert!(service.snapshot().staged.is_none());
         assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
         stage_activation(&mut service, 12);
-        assert!(!service.retire_stage_for_activation(), "an activation stays");
+        assert!(
+            !service.retire_stage_for_activation(),
+            "an activation stays"
+        );
         assert!(service.snapshot().staged.is_some());
         let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
             ApplyPreflightStart::Inspect(ticket) => ticket,
@@ -2071,7 +2115,10 @@ mod tests {
             ApplyDecision::Execute(command) => command,
             other => panic!("expected execute decision, got {other:?}"),
         };
-        assert!(!service.retire_stage_for_activation(), "an in-flight apply is untouchable");
+        assert!(
+            !service.retire_stage_for_activation(),
+            "an in-flight apply is untouchable"
+        );
         assert_eq!(service.snapshot().phase, UpdaterPhase::Applying);
     }
 

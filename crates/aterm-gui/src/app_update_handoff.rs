@@ -2998,12 +2998,14 @@ impl App {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    capture_failed = Some("a terminal engine was busy during handoff capture".to_string());
+                    capture_failed =
+                        Some("a terminal engine was busy during handoff capture".to_string());
                     break;
                 }
             };
             if !terminal.parser_is_ground() {
-                capture_failed = Some("a terminal parser was mid-sequence during handoff capture".to_string());
+                capture_failed =
+                    Some("a terminal parser was mid-sequence during handoff capture".to_string());
                 break;
             }
             // SCROLLBACK IS BEST-EFFORT AND MUST NEVER COST THE HANDOFF.
@@ -3115,8 +3117,9 @@ impl App {
             // refusal as the byte cap sent this exact investigation looking for a
             // 256 MiB allocation that was never involved.
             if per_grid.is_none() {
-                capture_failed =
-                    Some("visible-screen capture exceeded the aggregate grid-cell budget".to_string());
+                capture_failed = Some(
+                    "visible-screen capture exceeded the aggregate grid-cell budget".to_string(),
+                );
                 break;
             }
             capture_budget = per_grid
@@ -3169,7 +3172,8 @@ impl App {
             // only ever makes a LATER session degrade sooner, and refunding a
             // transactional admission would be the kind of partial-authority
             // bookkeeping `admit_checkpoint_dimensions` exists to avoid.
-            if let Some(refusal) = crate::seamless::checkpoint_shape_refusal(session.id, &checkpoint)
+            if let Some(refusal) =
+                crate::seamless::checkpoint_shape_refusal(session.id, &checkpoint)
             {
                 if history == 0 {
                     // Nothing left to lower. A visible-only capture that still will

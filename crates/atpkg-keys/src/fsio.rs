@@ -323,7 +323,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(leftovers, vec!["pins.rs".to_string()], "no temporary survives");
+        assert_eq!(
+            leftovers,
+            vec!["pins.rs".to_string()],
+            "no temporary survives"
+        );
 
         // It creates as well as replaces.
         let fresh = dir.join("new.rs").to_str().unwrap().to_string();
@@ -420,7 +424,11 @@ mod tests {
     #[test]
     fn ensure_parent_dir_creates_a_missing_chain_and_is_idempotent() {
         let dir = scratch("parents");
-        let key = dir.join("home/.aterm/machine.key").to_str().unwrap().to_string();
+        let key = dir
+            .join("home/.aterm/machine.key")
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(!dir.join("home/.aterm").exists());
         ensure_parent_dir(&key).expect("creates the chain");
         assert!(dir.join("home/.aterm").is_dir());

@@ -1675,7 +1675,10 @@ mod tests {
             vec![
                 (
                     "ay".to_string(),
-                    vec!["ay-17.tar.zst".to_string(), "ay-17.tar.zst.part".to_string()]
+                    vec![
+                        "ay-17.tar.zst".to_string(),
+                        "ay-17.tar.zst.part".to_string()
+                    ]
                 ),
                 ("ny".to_string(), vec!["ny-7.tar.zst.part".to_string()]),
             ],

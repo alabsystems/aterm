@@ -457,7 +457,11 @@ mod tests {
         ] {
             let spec = menu_command(action);
             assert_eq!(spec.id.as_str(), id);
-            assert_eq!(spec.authority, ActionAuthority::Owner, "{id} mints authority");
+            assert_eq!(
+                spec.authority,
+                ActionAuthority::Owner,
+                "{id} mints authority"
+            );
             assert_eq!(spec.content, ContentRequirement::Terminal);
         }
         // The picker/map ids (§2.3 [v5]): stable fieldless identities, Owner

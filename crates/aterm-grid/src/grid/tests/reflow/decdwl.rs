@@ -270,7 +270,10 @@ fn decdwl_continuation_row_survives_shrink_merge() {
         .find(|&r| grid.row(r).unwrap().line_size() == LineSize::DoubleWidth)
         .expect("the DECDWL continuation row must survive the shrink merge");
     let row = grid.row(dwl).unwrap();
-    assert!(row.is_wrapped(), "the DECDWL row keeps its continuation flag");
+    assert!(
+        row.is_wrapped(),
+        "the DECDWL row keeps its continuation flag"
+    );
     assert_eq!(row.get(0).unwrap().char_data(), 'K' as u16);
     assert_eq!(row.get(1).unwrap().char_data(), 'L' as u16);
 }

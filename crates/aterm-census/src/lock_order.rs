@@ -3140,9 +3140,8 @@ mod tests {
     #[test]
     fn every_registry_entry_is_mirrored_in_the_synthetic_fixture() {
         let files = synth_helper_files();
-        let find = |rel: &str| -> Option<&String> {
-            files.iter().find(|(p, _)| p == rel).map(|(_, c)| c)
-        };
+        let find =
+            |rel: &str| -> Option<&String> { files.iter().find(|(p, _)| p == rel).map(|(_, c)| c) };
         // The crates the synthetic workspace derives: the base fixture's two
         // plus whatever SYNTH_HELPER_CRATES splices in.
         let scanned_crate = |def_file: &str| -> bool {
@@ -3212,8 +3211,7 @@ mod tests {
                 )
             });
             assert!(
-                contents.contains(&format!("fn {}(", v.symbol))
-                    && acquires(contents, "self"),
+                contents.contains(&format!("fn {}(", v.symbol)) && acquires(contents, "self"),
                 "the fixture at {} must define `fn {}` WITH its bare-`self` acquisition — \
                  both halves of the interior registry are fail-closed",
                 v.def_file,

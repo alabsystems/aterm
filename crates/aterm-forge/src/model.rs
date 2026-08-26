@@ -31,7 +31,10 @@ pub struct PkgId {
 
 impl PkgId {
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
-        Self { name: name.into(), version: version.into() }
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
     }
 
     /// The unambiguous cargo `-p` spelling. Never emit a bare name.
@@ -82,7 +85,9 @@ impl Graph {
         seen.insert(self.root.clone());
         let mut stack = vec![self.root.clone()];
         while let Some(u) = stack.pop() {
-            let Some(children) = self.edges.get(&u) else { continue };
+            let Some(children) = self.edges.get(&u) else {
+                continue;
+            };
             for v in children {
                 if Some(v) == blocked || seen.contains(v) {
                     continue;
@@ -136,15 +141,22 @@ impl CellSurvey {
     }
 
     pub fn third_party_loc(&self) -> u64 {
-        self.third_party().filter_map(|p| self.facts.get(p)).map(|f| f.loc).sum()
+        self.third_party()
+            .filter_map(|p| self.facts.get(p))
+            .map(|f| f.loc)
+            .sum()
     }
 
     pub fn build_scripts(&self) -> usize {
-        self.third_party().filter(|p| self.facts.get(*p).is_some_and(|f| f.has_build_rs)).count()
+        self.third_party()
+            .filter(|p| self.facts.get(*p).is_some_and(|f| f.has_build_rs))
+            .count()
     }
 
     pub fn proc_macros(&self) -> usize {
-        self.third_party().filter(|p| self.facts.get(*p).is_some_and(|f| f.is_proc_macro)).count()
+        self.third_party()
+            .filter(|p| self.facts.get(*p).is_some_and(|f| f.is_proc_macro))
+            .count()
     }
 
     /// Names appearing at two or more versions in this cell — the dedup
@@ -153,7 +165,10 @@ impl CellSurvey {
     pub fn duplicate_names(&self) -> BTreeMap<String, Vec<String>> {
         let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in self.third_party() {
-            by_name.entry(p.name.clone()).or_default().push(p.version.clone());
+            by_name
+                .entry(p.name.clone())
+                .or_default()
+                .push(p.version.clone());
         }
         by_name.retain(|_, v| v.len() > 1);
         by_name

@@ -1606,12 +1606,7 @@ fn toolchain_lane(lane: &str) -> &'static str {
 /// Render `samples` as ledger rows (one metric per line, TSV). The trailing
 /// toolchain column is absent from pre-2026-07-22 rows and the SHAPE column
 /// from every row before W-1; the parser still accepts both.
-pub(crate) fn trend_rows(
-    date: &str,
-    sha: &str,
-    me: &MachineId,
-    samples: &[TrendSample],
-) -> String {
+pub(crate) fn trend_rows(date: &str, sha: &str, me: &MachineId, samples: &[TrendSample]) -> String {
     let mut s = String::new();
     for sample in samples {
         s.push_str(&format!(
@@ -2097,7 +2092,6 @@ mod tests {
         trend_rows(date, sha, &box_id(key), samples)
     }
 
-
     fn sample(lane: &'static str, metric: &str, value: f64) -> TrendSample {
         TrendSample {
             lane,
@@ -2320,7 +2314,6 @@ mod tests {
         );
     }
 
-
     // --- machine identity (W-1) --------------------------------------------
 
     const ALIASES: &str = "# box\tidentity\tnote\n\
@@ -2359,7 +2352,10 @@ mod tests {
             1,
             "the pre-rename rows must judge the post-rename run"
         );
-        assert!(j.skipped.is_empty(), "history was found, so nothing skipped");
+        assert!(
+            j.skipped.is_empty(),
+            "history was found, so nothing skipped"
+        );
     }
 
     /// THE OTHER HALF, and the one that matters more: an identity nobody
@@ -2408,7 +2404,8 @@ mod tests {
     /// never quietly average across them.
     #[test]
     fn a_chip_conflict_drops_the_rows_instead_of_comparing_across_machines() {
-        let ledger = "2026-07-22\tabc\tm21\tthroughput/median_mbps\t9000.000\ttrust\tIntel-Core-i9-8c\n";
+        let ledger =
+            "2026-07-22\tabc\tm21\tthroughput/median_mbps\t9000.000\ttrust\tIntel-Core-i9-8c\n";
         let me = MachineId {
             key: "m21".to_string(),
             shape: "Apple-M5-Max-18c".to_string(),
@@ -2430,7 +2427,8 @@ mod tests {
         assert_eq!(j.skipped, vec!["throughput/median_mbps"]);
         // A row on the SAME chip with a different core count is fine: the core
         // count is recorded, not enforced (cgroup/affinity views move it).
-        let same = "2026-07-22\tabc\tm21\tthroughput/median_mbps\t1000.000\ttrust\tApple-M5-Max-10c\n";
+        let same =
+            "2026-07-22\tabc\tm21\tthroughput/median_mbps\t1000.000\ttrust\tApple-M5-Max-10c\n";
         let ok = judge_trend(
             same,
             ALIASES,

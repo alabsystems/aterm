@@ -14,9 +14,6 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -47,6 +44,9 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;

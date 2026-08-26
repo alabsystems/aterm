@@ -108,7 +108,11 @@ fn wasm_selection_drag(c: &mut Criterion) {
             g.bench_function(BenchmarkId::new("one_cell_move", &label), |b| {
                 b.iter(|| {
                     tick = tick.wrapping_add(1);
-                    let col = if tick.is_multiple_of(2) { head } else { head + 1 };
+                    let col = if tick.is_multiple_of(2) {
+                        head
+                    } else {
+                        head + 1
+                    };
                     t.selection_extend(black_box(row), black_box(col));
                     t.render();
                     black_box(t.width());

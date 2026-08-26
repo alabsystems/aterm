@@ -23,8 +23,7 @@ fn crate_dir() -> PathBuf {
 
 fn manifest_text() -> String {
     let path = crate_dir().join("assets/aterm.manifest");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 /// The manifest with every `<!-- … -->` removed.
@@ -62,7 +61,10 @@ fn manifest_binds_common_controls_v6() {
         m.contains("Microsoft.Windows.Common-Controls"),
         "manifest must declare a dependency on Common-Controls"
     );
-    assert!(m.contains(r#"version="6.0.0.0""#), "Common-Controls must be pinned at v6");
+    assert!(
+        m.contains(r#"version="6.0.0.0""#),
+        "Common-Controls must be pinned at v6"
+    );
     assert!(
         m.contains(r#"publicKeyToken="6595b64144ccf1df""#),
         "Common-Controls v6 identity requires Microsoft's fixed public key token"
@@ -75,12 +77,18 @@ fn manifest_binds_common_controls_v6() {
 #[test]
 fn manifest_declares_windows_settings() {
     let m = manifest_markup();
-    assert!(m.contains("<longPathAware"), "manifest must declare longPathAware");
+    assert!(
+        m.contains("<longPathAware"),
+        "manifest must declare longPathAware"
+    );
     assert!(
         m.contains(">true</longPathAware>"),
         "longPathAware must be true, not merely present"
     );
-    assert!(m.contains("<activeCodePage"), "manifest must declare activeCodePage");
+    assert!(
+        m.contains("<activeCodePage"),
+        "manifest must declare activeCodePage"
+    );
     assert!(
         m.contains(">UTF-8</activeCodePage>"),
         "activeCodePage must be UTF-8, the encoding aterm uses end to end"
@@ -97,7 +105,10 @@ fn manifest_declares_supported_os() {
         "manifest must declare the Windows 10/11 supportedOS GUID"
     );
     let count = m.matches("<supportedOS").count();
-    assert!(count >= 2, "expected the conventional supportedOS ladder, found {count} entries");
+    assert!(
+        count >= 2,
+        "expected the conventional supportedOS ladder, found {count} entries"
+    );
 }
 
 /// A terminal must never ask to elevate, and the loader's installer-detection
@@ -170,11 +181,19 @@ fn resource_script_uses_numeric_ids_not_sdk_macros() {
 #[test]
 fn icon_the_build_script_embeds_exists_and_is_an_ico() {
     let icon = crate_dir().join("../aterm-gui/assets/aterm.ico");
-    let bytes = std::fs::read(&icon)
-        .unwrap_or_else(|e| panic!("build.rs embeds {}, which cannot be read: {e}", icon.display()));
+    let bytes = std::fs::read(&icon).unwrap_or_else(|e| {
+        panic!(
+            "build.rs embeds {}, which cannot be read: {e}",
+            icon.display()
+        )
+    });
     // ICONDIR: reserved=0, type=1 (icon), count>=1 — all little-endian u16.
     assert!(bytes.len() > 6, "icon file is truncated");
-    assert_eq!(&bytes[0..4], &[0, 0, 1, 0], "not an .ico (bad ICONDIR header)");
+    assert_eq!(
+        &bytes[0..4],
+        &[0, 0, 1, 0],
+        "not an .ico (bad ICONDIR header)"
+    );
     let frames = u16::from_le_bytes([bytes[4], bytes[5]]);
     assert!(frames > 0, "icon carries no frames");
 }

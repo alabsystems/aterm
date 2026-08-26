@@ -63,6 +63,12 @@ pub(crate) const EDIT_LIGATURES: &str = "ligatures";
 pub(crate) const EDIT_THEME: &str = "theme";
 pub(crate) const EDIT_CURSOR_STYLE: &str = "cursor_style";
 pub(crate) const EDIT_CURSOR_BLINK: &str = "cursor_blink";
+/// The cursor-trail master (`Config::cursor_trail`). Default
+/// [`crate::app_config::DEFAULT_DECORATIVE_EFFECTS`]: an opt-OUT everywhere except
+/// Windows, where the resident walking cat the default style rides makes it an
+/// opt-IN. Settings seeds this row from the RESOLVED config, so the row and every
+/// "Inactive · Cursor trail Off" disclosure below it are platform-correct for free —
+/// never re-derive the default from a typed `true`.
 pub(crate) const EDIT_CURSOR_TRAIL: &str = "cursor_trail";
 pub(crate) const EDIT_CURSOR_TRAIL_STYLE: &str = "cursor_trail_style";
 pub(crate) const EDIT_TRAIL_SOUNDS: &str = "trail_sounds";
@@ -2554,9 +2560,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => ("Wallpaper", 4),
         // The celebration sparkles ride beside the process-wide effect switch:
         // both answer "how much fun is this terminal allowed to have".
-        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE | EDIT_PKG_PROGRESS_EFFECTS => {
-            ("Effect policy", 0)
-        }
+        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE | EDIT_PKG_PROGRESS_EFFECTS => ("Effect policy", 0),
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
@@ -5197,7 +5201,13 @@ mod trail_style_tests {
                 "documented alias {alias:?} must select the dog pet"
             );
         }
-        for other in ["rainbow", "dog", "puppy", "rainbowdogpet", "rainbow kitty pet"] {
+        for other in [
+            "rainbow",
+            "dog",
+            "puppy",
+            "rainbowdogpet",
+            "rainbow kitty pet",
+        ] {
             assert!(
                 !GlowStyle::style_names_dog_pet(other),
                 "{other:?} must NOT select the dog pet"
@@ -5297,7 +5307,10 @@ mod trail_style_tests {
         assert_eq!(super::DEFAULT_TRAIL_SOUND_STYLE, "auto");
         assert_eq!(super::TRAIL_SOUND_STYLES.len(), 14);
         for &o in super::TRAIL_SOUND_STYLES {
-            assert!(o.chars().all(|c| c.is_ascii_lowercase() || c == ' '), "{o:?}");
+            assert!(
+                o.chars().all(|c| c.is_ascii_lowercase() || c == ' '),
+                "{o:?}"
+            );
         }
         assert!(super::TRAIL_SOUND_STYLES.contains(&"glass bell"));
         assert!(super::TRAIL_SOUND_STYLES.contains(&"typewriter"));
@@ -5331,7 +5344,11 @@ mod trail_style_tests {
             );
         }
         for &(alias, voice) in SoundVoice::ALIASES {
-            assert_eq!(super::trail_sound_style_canonical(alias), Some(voice.name()), "{alias}");
+            assert_eq!(
+                super::trail_sound_style_canonical(alias),
+                Some(voice.name()),
+                "{alias}"
+            );
             // Aliases are accepted at LOAD…
             let cfg = Config {
                 trail_sound_style: Some(alias.to_string()),
@@ -5368,7 +5385,10 @@ mod trail_style_tests {
         // The writer takes every canonical spelling verbatim (case-folded).
         for &o in super::TRAIL_SOUND_STYLES {
             let out = apply_prefs_edits("", &[(super::EDIT_TRAIL_SOUND_STYLE, set(o))]).unwrap();
-            assert!(out.contains(&format!("trail_sound_style = \"{o}\"")), "{out}");
+            assert!(
+                out.contains(&format!("trail_sound_style = \"{o}\"")),
+                "{out}"
+            );
             let up = apply_prefs_edits(
                 "",
                 &[(super::EDIT_TRAIL_SOUND_STYLE, set(&o.to_ascii_uppercase()))],
@@ -6355,14 +6375,26 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(field(EDIT_LINES).placeholder, "50");
     }
 
-    /// The cursor-trail rows are present: the master toggle seeds its RESOLVED state (ON
-    /// by default — the owner's batteries-on delight call) and the style enum seeds blank
-    /// on an unset config but advertises its effective default in the placeholder.
+    /// The cursor-trail rows are present: the master toggle seeds its RESOLVED state and
+    /// the style enum seeds blank on an unset config but advertises its effective default
+    /// in the placeholder.
+    ///
+    /// THE MASTER'S SEED IS PLATFORM-CORRECT, because Settings projects the RESOLVED
+    /// config: the absent key resolves to
+    /// [`crate::app_config::DEFAULT_DECORATIVE_EFFECTS`] — the owner's batteries-on
+    /// delight call everywhere except Windows, where the minimal-fast directive makes
+    /// the resident pet an opt-in. The STYLE row is untouched by that split: it still
+    /// advertises `rainbow kitty pet` as the style you get once the master is on.
     #[test]
     fn editable_fields_includes_cursor_trail() {
         let fields = editable_fields(&Config::default());
         let f = |k: &str| fields.iter().find(|f| f.key == k).expect("row present");
-        assert_eq!(f(EDIT_CURSOR_TRAIL).seed.as_deref(), Some("true"));
+        let want = crate::app_config::DEFAULT_DECORATIVE_EFFECTS.to_string();
+        assert_eq!(
+            f(EDIT_CURSOR_TRAIL).seed.as_deref(),
+            Some(want.as_str()),
+            "the master row seeds the RESOLVED platform default, never a hardcoded on"
+        );
         assert_eq!(f(EDIT_CURSOR_TRAIL_STYLE).seed, None);
         assert_eq!(
             f(EDIT_CURSOR_TRAIL_STYLE).placeholder,

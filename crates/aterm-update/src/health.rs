@@ -674,14 +674,20 @@ mod tests {
         Health::record_failure(&p, "stage", "bundle would not verify");
         Health::record_apply_failure(&p, 9, "ActivityRevoked");
         let h = Health::read(&p);
-        assert_eq!((h.network_failures, h.stage_failures, h.apply_failures), (1, 1, 1));
+        assert_eq!(
+            (h.network_failures, h.stage_failures, h.apply_failures),
+            (1, 1, 1)
+        );
 
         let h = Health::record_acquisition_success(&p);
         assert_eq!(h.network_failures, 0, "acquisition streak clears");
         assert!(h.network_since.is_empty(), "and so does its clock");
         assert_eq!(h.stage_failures, 1, "the skipped lane keeps its streak");
         assert!(!h.stage_since.is_empty(), "and its clock");
-        assert_eq!(h.apply_failures, 1, "a check never vouches for the apply lane");
+        assert_eq!(
+            h.apply_failures, 1,
+            "a check never vouches for the apply lane"
+        );
         assert_eq!(h.kind, "stage", "the standing streak owns the headline");
     }
 
@@ -796,7 +802,10 @@ mod tests {
             failing_since: "2026-08-11T07:16:17Z".to_string(),
             ..Health::default()
         };
-        assert!(h.manifest_since.is_empty(), "the field is new; old files lack it");
+        assert!(
+            h.manifest_since.is_empty(),
+            "the field is new; old files lack it"
+        );
         assert_eq!(h.class_since("manifest"), "2026-08-11T07:16:17Z");
         assert_eq!(
             h.class_since("not-a-class"),
@@ -914,10 +923,16 @@ mod tests {
         let h = Health::read(&p);
         assert!(h.is_persistent());
         assert_eq!(h.last_apply_failure_build, 77);
-        assert!(!h.last_apply_failure_at.is_empty(), "the lane owns its clock");
+        assert!(
+            !h.last_apply_failure_at.is_empty(),
+            "the lane owns its clock"
+        );
         // Same build still running: the streak is fresh evidence — stands.
         Health::expire_stale_apply_streak(&p, 77);
-        assert!(Health::read(&p).is_persistent(), "same build ⇒ still standing");
+        assert!(
+            Health::read(&p).is_persistent(),
+            "same build ⇒ still standing"
+        );
         // A different build is running: the machine moved, the claim is stale.
         Health::expire_stale_apply_streak(&p, 78);
         let h = Health::read(&p);
@@ -926,7 +941,10 @@ mod tests {
         assert!(h.last_apply_error.is_empty());
         assert!(h.last_apply_failure_at.is_empty());
         assert_eq!(h.last_apply_failure_build, 0);
-        assert!(h.kind.is_empty(), "an expired lane stops owning the headline");
+        assert!(
+            h.kind.is_empty(),
+            "an expired lane stops owning the headline"
+        );
         // An interleaved acquisition failure keeps ITS OWN streak through the
         // apply expiry — the lanes never launder each other.
         Health::record_failure(&p, "network", "dns");

@@ -200,7 +200,10 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
         // the only caller that must STOP, so it is the only one that has to say what to
         // do about it right here.
         x86_target_probe().map_err(|e| {
-            Error::new(format!("{e}\nfix:  {}", X86_SLICE_REMEDIES.replace('\n', "\n      ")))
+            Error::new(format!(
+                "{e}\nfix:  {}",
+                X86_SLICE_REMEDIES.replace('\n', "\n      ")
+            ))
         })?;
         true
     };

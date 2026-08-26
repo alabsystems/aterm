@@ -117,14 +117,14 @@ mod github;
 mod health;
 #[cfg(target_os = "macos")]
 mod install;
-// Not macOS-only: every platform relaunches aterm (see the module's own doc).
-mod relaunch;
 #[cfg(target_os = "macos")]
 mod manifest;
 #[cfg(target_os = "macos")]
 mod no_token;
 #[cfg(target_os = "macos")]
 mod paths;
+// Not macOS-only: every platform relaunches aterm (see the module's own doc).
+mod relaunch;
 #[cfg(target_os = "macos")]
 mod sig;
 #[cfg(target_os = "macos")]
@@ -704,8 +704,8 @@ pub fn preverify_installed_for_handoff(
     expected_build: u64,
     expected_commit: &str,
 ) -> Result<(), String> {
-    let installed =
-        bundle::resolve_layout().ok_or_else(|| "no installed bundle at this executable's path".to_string())?;
+    let installed = bundle::resolve_layout()
+        .ok_or_else(|| "no installed bundle at this executable's path".to_string())?;
     let (build, commit) = install::verified_bundle_identity_at(&installed.app_root)?;
     // The operator apply floor (a yank) gates an ACTIVATION exactly as it gates a
     // staged swap (`install.rs`): a yanked build found under our own path is still a
@@ -1773,10 +1773,7 @@ const DEFERRED_WINDOW_INTERVALS: u32 = 2;
 /// outcome and the window returns to the base — so the retreat self-heals
 /// exactly as the per-process backoff does.
 #[cfg(target_os = "macos")]
-fn checker_skip(
-    staging: &paths::Staging,
-    base: std::time::Duration,
-) -> Option<&'static str> {
+fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<&'static str> {
     let text = read_ledger_text(&staging.status)?;
     let v = text.parse::<toml::Value>().ok()?;
     let updated = v.get("updated_at").and_then(toml::Value::as_str)?;
@@ -2050,7 +2047,10 @@ mod checker_gate_tests {
         assert_eq!(dedup_window_base(false, Lane::Anonymous, ANON), ANON);
         // An operator interval owns its own consequence, fast or slow.
         let configured = Duration::from_secs(10);
-        assert_eq!(dedup_window_base(true, Lane::Unknown, configured), configured);
+        assert_eq!(
+            dedup_window_base(true, Lane::Unknown, configured),
+            configured
+        );
     }
 
     /// The window may only ever GROW relative to the schedule's own base, so this
@@ -2058,7 +2058,12 @@ mod checker_gate_tests {
     #[test]
     fn the_dedup_window_never_undercuts_the_schedules_own_base() {
         for lane in [Lane::Unknown, Lane::Authenticated, Lane::Anonymous] {
-            for base in [Duration::from_secs(1), AUTH, ANON, Duration::from_secs(7200)] {
+            for base in [
+                Duration::from_secs(1),
+                AUTH,
+                ANON,
+                Duration::from_secs(7200),
+            ] {
                 for configured in [false, true] {
                     assert!(
                         dedup_window_base(configured, lane, base) >= base,
@@ -2102,10 +2107,12 @@ mod checker_skip_tests {
         let stamp = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(age_secs));
         std::fs::write(
             &s.status,
-            format!("schema = 1
+            format!(
+                "schema = 1
 updated_at = \"{stamp}\"
 outcome = \"{outcome}\"
-"),
+"
+            ),
         )
         .expect("write ledger");
     }
@@ -2162,9 +2169,13 @@ outcome = \"{outcome}\"
     fn a_missing_or_empty_ledger_never_defers_a_check() {
         let s = staging("missing");
         assert!(checker_skip(&s, BASE).is_none(), "no ledger: check");
-        std::fs::write(&s.status, "schema = 1
+        std::fs::write(
+            &s.status,
+            "schema = 1
 updated_at = \"\"
-").expect("write");
+",
+        )
+        .expect("write");
         assert!(checker_skip(&s, BASE).is_none(), "empty stamp: check");
         std::fs::write(&s.status, "not toml at all {{{").expect("write");
         assert!(checker_skip(&s, BASE).is_none(), "unparseable: check");
@@ -2604,7 +2615,10 @@ mod commit_match_tests {
         assert!(persistent_notice_is_owed(None, Some("pipeline")));
         // The SAME class on the next tick is the "once per streak" promise: the loud
         // notice must not become a nag.
-        assert!(!persistent_notice_is_owed(Some("pipeline"), Some("pipeline")));
+        assert!(!persistent_notice_is_owed(
+            Some("pipeline"),
+            Some("pipeline")
+        ));
         // A DIFFERENT class is news. THIS is the regression.
         assert!(persistent_notice_is_owed(Some("pipeline"), Some("apply")));
         // …and having spoken about it, it goes quiet too.

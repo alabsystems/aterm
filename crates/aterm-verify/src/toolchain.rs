@@ -133,7 +133,9 @@ fn sysroot_bin(path_env: &OsStr) -> Option<PathBuf> {
     if sysroot.as_os_str().is_empty() {
         return None;
     }
-    let dir = std::fs::canonicalize(&sysroot).unwrap_or(sysroot).join("bin");
+    let dir = std::fs::canonicalize(&sysroot)
+        .unwrap_or(sysroot)
+        .join("bin");
     dir.is_dir().then_some(dir)
 }
 
@@ -449,7 +451,12 @@ mod tests {
         let tmp = crate::mktemp_dir("atv-pin").expect("mktemp");
         exec_stub(&tmp.join("targo"));
 
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), Some("trust"));
+        let t = Toolchain::discover(
+            Some(&tmp),
+            Path::new("/unused"),
+            OsStr::new(""),
+            Some("trust"),
+        );
         assert!(!t.have_targo(), "fail-closed: not the pinned toolchain");
         assert!(t.refused.is_some());
         let label = t.missing_targo_label();
@@ -459,15 +466,24 @@ mod tests {
 
         // The branded rustc beside it is what makes the directory the pin.
         exec_stub(&tmp.join("trustc"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), Some("trust"));
+        let t = Toolchain::discover(
+            Some(&tmp),
+            Path::new("/unused"),
+            OsStr::new(""),
+            Some("trust"),
+        );
         assert!(t.have_targo());
         assert!(t.refused.is_none());
 
         // An UPSTREAM channel ships no branded driver, so it passes through —
         // the check must not invent a `stablec` nobody has.
         fs::remove_file(tmp.join("trustc")).expect("rm");
-        let t =
-            Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), Some("stable"));
+        let t = Toolchain::discover(
+            Some(&tmp),
+            Path::new("/unused"),
+            OsStr::new(""),
+            Some("stable"),
+        );
         assert!(t.have_targo(), "upstream channels are a passthrough");
         fs::remove_dir_all(&tmp).ok();
     }

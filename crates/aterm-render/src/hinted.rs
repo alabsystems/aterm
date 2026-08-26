@@ -728,7 +728,10 @@ mod tests {
         #[allow(unused_mut)]
         let mut faces: Vec<(&str, &[u8])> = vec![("DejaVuSansMono (embedded)", dejavu())];
         #[cfg(feature = "embedded-symbols")]
-        faces.push(("SymbolsNerdFontMono (embedded)", crate::embedded_symbols_font()));
+        faces.push((
+            "SymbolsNerdFontMono (embedded)",
+            crate::embedded_symbols_font(),
+        ));
         let chars = sweep_chars();
         let modes = [HintMode::Full, HintMode::Light, HintMode::Native];
         let mut checked = 0usize;
@@ -736,7 +739,9 @@ mod tests {
             let font = FontRef::new(bytes).expect("bundled face parses");
             for mode in modes {
                 for px in 12..=40 {
-                    let opts = mode.options().expect("the three hinting modes carry options");
+                    let opts = mode
+                        .options()
+                        .expect("the three hinting modes carry options");
                     let px = px as f32;
                     let hint = HintingInstance::new(
                         &font.outline_glyphs(),

@@ -144,7 +144,15 @@ mod pct_tests {
     /// malformed escapes pass through; invalid UTF-8 decodes lossily.
     #[test]
     fn pct_decode_is_total_and_round_trips() {
-        for s in ["", "plain", "with space", "构建 agent ✨", "100%", "a-b_c", "-"] {
+        for s in [
+            "",
+            "plain",
+            "with space",
+            "构建 agent ✨",
+            "100%",
+            "a-b_c",
+            "-",
+        ] {
             assert_eq!(pct_decode(&pct_encode(s)), s, "round-trip: {s:?}");
         }
         assert_eq!(pct_decode("%G1"), "%G1", "malformed hex passes through");

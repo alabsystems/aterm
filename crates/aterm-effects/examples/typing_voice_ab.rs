@@ -975,7 +975,11 @@ fn render_all_voices(out: &std::path::Path) {
             file
         );
     }
-    println!("\nwrote {} voice wavs to {}", SoundVoice::ALL.len(), out.display());
+    println!(
+        "\nwrote {} voice wavs to {}",
+        SoundVoice::ALL.len(),
+        out.display()
+    );
 }
 
 fn main() {

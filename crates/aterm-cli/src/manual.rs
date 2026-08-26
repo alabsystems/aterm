@@ -993,9 +993,27 @@ mod tests {
         let (page, code) = render(Some("pkg"), None);
         assert_eq!(code, 0);
         for verb in [
-            "doctor", "status", "which", "list", "uninstall", "tree-root", "verify-index",
-            "verify-pkg", "install", "seed", "update", "rollback", "pin", "unpin", "gc",
-            "verify", "link", "unlink", "refresh", "run", "relocate",
+            "doctor",
+            "status",
+            "which",
+            "list",
+            "uninstall",
+            "tree-root",
+            "verify-index",
+            "verify-pkg",
+            "install",
+            "seed",
+            "update",
+            "rollback",
+            "pin",
+            "unpin",
+            "gc",
+            "verify",
+            "link",
+            "unlink",
+            "refresh",
+            "run",
+            "relocate",
         ] {
             assert!(
                 page.contains(verb),

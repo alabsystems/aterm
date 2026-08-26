@@ -228,7 +228,8 @@ const STREAM_LINE: &[u8] = b"fuck cat dog kitty aaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n
 
 /// A full-width line with NO lexicon surface on it, for the tick_one_on grid:
 /// the sparkle engine must scan it and conclude there is nothing to decorate.
-const NOISE_LINE: &[u8] = b"qwrt yuio psdf ghjk lzxc vbnm qwrt yuio psdf ghjk lzxc vbnm qwrt yuio psdf\r\n";
+const NOISE_LINE: &[u8] =
+    b"qwrt yuio psdf ghjk lzxc vbnm qwrt yuio psdf ghjk lzxc vbnm qwrt yuio psdf\r\n";
 
 /// The tick_one_on CONTROL's grid line: the same shape, saturated with
 /// lexicon matches — what proves the engine in tick_one_on was alive.
@@ -401,8 +402,7 @@ fn warm_stream(f: &mut Fixture) {
     for _ in 0..30 {
         step(f, arm_typing);
     }
-    f.p
-        .note_matrix_rain_signal(aterm_effects::matrix_rain::RainSignal::TurnStart as u32, 1);
+    f.p.note_matrix_rain_signal(aterm_effects::matrix_rain::RainSignal::TurnStart as u32, 1);
     for _ in 0..1_600 {
         step(f, arm_stream);
     }
@@ -838,19 +838,19 @@ fn workloads() -> Vec<Workload> {
                 assert!(!f.p.sparkle_enabled() && !f.p.matrix_rain_enabled());
             },
             bounds: [
-                (69, 89),         // trail
-                (3_970, 5_060),   // glow_add
-                (1, 3),           // glow_halo
-                (0, 0),           // fire_patch
-                (0, 0),           // glow_under
-                (0, 0),           // char_fg
-                (0, 0),           // fire_halo
-                (0, 0),           // decos
-                (0, 0),           // ink
-                (0, 0),           // free_sprites
-                (0, 0),           // nova_add
-                (0, 0),           // rain_quads
-                (0, 0),           // rain_add
+                (69, 89),       // trail
+                (3_970, 5_060), // glow_add
+                (1, 3),         // glow_halo
+                (0, 0),         // fire_patch
+                (0, 0),         // glow_under
+                (0, 0),         // char_fg
+                (0, 0),         // fire_halo
+                (0, 0),         // decos
+                (0, 0),         // ink
+                (0, 0),         // free_sprites
+                (0, 0),         // nova_add
+                (0, 0),         // rain_quads
+                (0, 0),         // rain_add
             ],
             lit_pct: (100, 100),
             // Saturated cadence: intensity exactly 1.0 at every apply instant,
@@ -869,19 +869,19 @@ fn workloads() -> Vec<Workload> {
                 assert!(!f.p.sparkle_enabled() && !f.p.matrix_rain_enabled());
             },
             bounds: [
-                (69, 89),         // trail
-                (2_330, 2_970),   // glow_add
-                (1, 3),           // glow_halo
-                (0, 0),           // fire_patch
-                (0, 0),           // glow_under
-                (0, 0),           // char_fg
-                (0, 0),           // fire_halo
-                (0, 0),           // decos
-                (0, 0),           // ink
-                (0, 0),           // free_sprites
-                (0, 0),           // nova_add
-                (0, 0),           // rain_quads
-                (0, 0),           // rain_add
+                (69, 89),       // trail
+                (2_330, 2_970), // glow_add
+                (1, 3),         // glow_halo
+                (0, 0),         // fire_patch
+                (0, 0),         // glow_under
+                (0, 0),         // char_fg
+                (0, 0),         // fire_halo
+                (0, 0),         // decos
+                (0, 0),         // ink
+                (0, 0),         // free_sprites
+                (0, 0),         // nova_add
+                (0, 0),         // rain_quads
+                (0, 0),         // rain_add
             ],
             lit_pct: (100, 100),
             trail_pin: Some(TRAIL_HOT),
@@ -900,25 +900,25 @@ fn workloads() -> Vec<Workload> {
                 );
             },
             bounds: [
-                (42, 54),         // trail
-                (2_080, 2_650),   // glow_add
-                (1, 3),           // glow_halo
-                (0, 0),           // fire_patch
-                (0, 0),           // glow_under
-                (0, 0),           // char_fg
-                (0, 0),           // fire_halo
+                (42, 54),       // trail
+                (2_080, 2_650), // glow_add
+                (1, 3),         // glow_halo
+                (0, 0),         // fire_patch
+                (0, 0),         // glow_under
+                (0, 0),         // char_fg
+                (0, 0),         // fire_halo
                 // The legacy decoration stream stays EMPTY in the rainbow-ink
                 // era: sparkle output rides `ink` (per-cell fg overrides) —
                 // a non-empty `decos` here would mean a routing change.
-                (0, 0),           // decos
-                (84, 108),        // ink
+                (0, 0),    // decos
+                (84, 108), // ink
                 // Peeking cats did not fire in this streaming window (the
                 // occurrences are young and scroll away before an idle
                 // one-shot rolls); a sprite appearing is a cadence change.
-                (0, 0),           // free_sprites
-                (0, 0),           // nova_add
-                (155, 199),       // rain_quads
-                (7, 15),          // rain_add
+                (0, 0),     // free_sprites
+                (0, 0),     // nova_add
+                (155, 199), // rain_quads
+                (7, 15),    // rain_add
             ],
             lit_pct: (100, 100),
             // The cadence is COLD here (last keystroke was the prompt, > 26 s

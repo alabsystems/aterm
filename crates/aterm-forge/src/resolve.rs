@@ -63,7 +63,13 @@ pub fn select(cells: &[Cell], names: &[String]) -> Result<Vec<Cell>, String> {
     if names.is_empty() {
         return Ok(cells.to_vec());
     }
-    let known = || cells.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+    let known = || {
+        cells
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let mut out: Vec<Cell> = Vec::new();
     for want in names {
         let Some(cell) = cells.iter().find(|c| c.name == *want) else {
@@ -116,9 +122,9 @@ pub fn parse_line(line: &str) -> Result<Option<TreeLine>, String> {
              itself, so seeing this means cargo's output format changed)."
         ));
     }
-    let depth: usize = text[..digits].parse().map_err(|_| {
-        format!("cargo tree line `{text}` has a depth prefix that is not a usize")
-    })?;
+    let depth: usize = text[..digits]
+        .parse()
+        .map_err(|_| format!("cargo tree line `{text}` has a depth prefix that is not a usize"))?;
 
     let rest = text[digits..].trim_start();
     let mut parts = rest.splitn(3, ' ');
@@ -135,7 +141,9 @@ pub fn parse_line(line: &str) -> Result<Option<TreeLine>, String> {
         ));
     };
     if name.is_empty() || version.is_empty() {
-        return Err(format!("cargo tree line `{text}` names an empty package or version"));
+        return Err(format!(
+            "cargo tree line `{text}` names an empty package or version"
+        ));
     }
 
     let mut tail = parts.next().unwrap_or("").trim();
@@ -175,7 +183,9 @@ fn parenthesised<'a>(tail: &'a str, whole: &str) -> Result<(&'a str, &'a str), S
             return Ok((&tail[1..i], &tail[i + 1..]));
         }
     }
-    Err(format!("cargo tree line `{whole}` has an unclosed `(` in `{tail}`"))
+    Err(format!(
+        "cargo tree line `{whole}` has an unclosed `(` in `{tail}`"
+    ))
 }
 
 /// Rebuild the graph from depth-prefixed output. A node at depth `d` attaches
@@ -192,7 +202,9 @@ pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), Strin
     let mut have_root = false;
 
     for raw in text.lines() {
-        let Some(line) = parse_line(raw)? else { continue };
+        let Some(line) = parse_line(raw)? else {
+            continue;
+        };
         if line.depth > stack.len() {
             return Err(format!(
                 "cargo tree depth jumped to {} with only {} ancestors open, at `{}` — \
@@ -218,7 +230,11 @@ pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), Strin
             have_root = true;
         } else {
             let parent = stack[line.depth - 1].clone();
-            graph.edges.entry(parent).or_default().insert(line.id.clone());
+            graph
+                .edges
+                .entry(parent)
+                .or_default()
+                .insert(line.id.clone());
         }
         stack.truncate(line.depth);
         stack.push(line.id);
@@ -342,8 +358,12 @@ fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    String::from_utf8(out.stdout)
-        .map_err(|e| format!("`cargo tree` emitted non-UTF-8 output for `{}`: {e}", cell.name))
+    String::from_utf8(out.stdout).map_err(|e| {
+        format!(
+            "`cargo tree` emitted non-UTF-8 output for `{}`: {e}",
+            cell.name
+        )
+    })
 }
 
 fn first_line(s: &str) -> &str {
@@ -371,7 +391,10 @@ mod tests {
     fn the_matrix_is_four_cells_in_report_order() {
         let cells = default_cells();
         assert_eq!(names(&cells), ["mac-arm", "linux", "win", "wasm"]);
-        assert!(cells.iter().all(|c| c.package == "aterm"), "every cell measures the binary");
+        assert!(
+            cells.iter().all(|c| c.package == "aterm"),
+            "every cell measures the binary"
+        );
         assert_eq!(cells[0].triple, "aarch64-apple-darwin");
         assert_eq!(cells[3].triple, "wasm32-unknown-unknown");
     }
@@ -409,11 +432,15 @@ mod tests {
 
     #[test]
     fn a_workspace_line_carries_its_path() {
-        let line =
-            parse_line("0aterm v0.47.0 (/Users//example/aterm/crates/aterm)").unwrap().unwrap();
+        let line = parse_line("0aterm v0.47.0 (/Users//example/aterm/crates/aterm)")
+            .unwrap()
+            .unwrap();
         assert_eq!(line.depth, 0);
         assert_eq!(line.id, PkgId::new("aterm", "0.47.0"));
-        assert_eq!(line.path.as_deref(), Some(Path::new("/Users//example/aterm/crates/aterm")));
+        assert_eq!(
+            line.path.as_deref(),
+            Some(Path::new("/Users//example/aterm/crates/aterm"))
+        );
     }
 
     #[test]
@@ -421,7 +448,10 @@ mod tests {
         let raw = "6aterm-error-derive v0.47.0 (proc-macro) (/w/crates/aterm-error-derive)";
         let line = parse_line(raw).unwrap().unwrap();
         assert!(line.is_proc_macro);
-        assert_eq!(line.path.as_deref(), Some(Path::new("/w/crates/aterm-error-derive")));
+        assert_eq!(
+            line.path.as_deref(),
+            Some(Path::new("/w/crates/aterm-error-derive"))
+        );
         assert_eq!(line.id, PkgId::new("aterm-error-derive", "0.47.0"));
     }
 
@@ -433,13 +463,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(pathed.deduped);
-        assert_eq!(pathed.path.as_deref(), Some(Path::new("/Users//example/aterm/vendor/winnow")));
+        assert_eq!(
+            pathed.path.as_deref(),
+            Some(Path::new("/Users//example/aterm/vendor/winnow"))
+        );
     }
 
     #[test]
     fn a_directory_containing_a_paren_still_parses() {
-        let line = parse_line("2foo v1.0.0 (/Users//a b (1)/vendor/foo) (*)").unwrap().unwrap();
-        assert_eq!(line.path.as_deref(), Some(Path::new("/Users//a b (1)/vendor/foo")));
+        let line = parse_line("2foo v1.0.0 (/Users//a b (1)/vendor/foo) (*)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            line.path.as_deref(),
+            Some(Path::new("/Users//a b (1)/vendor/foo"))
+        );
         assert!(line.deduped);
     }
 
@@ -494,7 +532,10 @@ mod tests {
         // The `(*)` child under beta is still a real edge: dedupe is a display
         // trick, and dropping it would make `shared` look uniquely alpha's.
         assert_eq!(kids("beta", "2.0.0"), ["gamma 3.0.0", "shared 9.9.9"]);
-        assert_eq!(paths[&PkgId::new("gamma", "3.0.0")], PathBuf::from("/w/vendor/gamma"));
+        assert_eq!(
+            paths[&PkgId::new("gamma", "3.0.0")],
+            PathBuf::from("/w/vendor/gamma")
+        );
         assert!(!paths.contains_key(&PkgId::new("alpha", "1.0.0")));
     }
 
@@ -516,8 +557,16 @@ mod tests {
         let want = measured::MAC_ARM;
         let g = graph(&root, &cells[0]).expect("mac-arm must resolve offline");
         assert_eq!(g.root.name, "aterm", "the cell roots at the shipped binary");
-        assert_eq!(g.nodes.len(), want.resolved, "packages for aterm on mac-arm");
-        assert_eq!(g.reach(None).len(), want.resolved, "every node is reachable from the root");
+        assert_eq!(
+            g.nodes.len(),
+            want.resolved,
+            "packages for aterm on mac-arm"
+        );
+        assert_eq!(
+            g.reach(None).len(),
+            want.resolved,
+            "every node is reachable from the root"
+        );
     }
 
     #[test]

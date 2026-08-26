@@ -23,7 +23,9 @@ use aterm_session::SessionId;
 
 use crate::App;
 use crate::WindowId;
-use crate::connection_map::{ConnectionMapState, MapActivation, MapAnnotation, MapChip, MapFlow, MapGroup};
+use crate::connection_map::{
+    ConnectionMapState, MapActivation, MapAnnotation, MapChip, MapFlow, MapGroup,
+};
 
 impl App {
     /// Snapshot the map's GRAPH: chips grouped by window (tab order, pane
@@ -138,10 +140,8 @@ impl App {
                 title: title_of(h),
             })
             .collect();
-        let known: std::collections::HashSet<&str> = handles
-            .iter()
-            .map(|h| h.sid.as_str())
-            .collect();
+        let known: std::collections::HashSet<&str> =
+            handles.iter().map(|h| h.sid.as_str()).collect();
         let mut foreign: Vec<&SessionId> = Vec::new();
         for flow in &flows {
             for sid in [&flow.src, &flow.dst] {
@@ -263,7 +263,11 @@ impl App {
         let (groups, flows) = self.connection_map_parts();
         let annotations = self.connection_map_annotations();
         for wid in open {
-            if let Some(m) = self.windows.get_mut(&wid).and_then(|ws| ws.connection_map_mut()) {
+            if let Some(m) = self
+                .windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.connection_map_mut())
+            {
                 m.retarget(groups.clone(), flows.clone());
                 let _ = m.set_annotations(annotations.clone());
             }
@@ -285,7 +289,11 @@ impl App {
             return;
         }
         let annotations = self.connection_map_annotations();
-        if let Some(m) = self.windows.get_mut(&wid).and_then(|ws| ws.connection_map_mut()) {
+        if let Some(m) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.connection_map_mut())
+        {
             let _ = m.set_annotations(annotations);
         }
     }
@@ -300,7 +308,11 @@ impl App {
 
     /// Move the map cursor by `delta` over the chip/arrow items.
     pub(crate) fn connection_map_move(&mut self, wid: WindowId, delta: isize) {
-        if let Some(m) = self.windows.get_mut(&wid).and_then(|ws| ws.connection_map_mut()) {
+        if let Some(m) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.connection_map_mut())
+        {
             m.move_selection(delta);
         }
         self.connection_map_repaint(wid);
@@ -672,15 +684,23 @@ mod tests {
             Some(OverlayKind::ConnectionMap)
         );
         // The overlay keyword pipes back through `controls <kind>` (§5.3).
-        assert_eq!(AuxTarget::parse("connections"), Some(AuxTarget::Connections));
+        assert_eq!(
+            AuxTarget::parse("connections"),
+            Some(AuxTarget::Connections)
+        );
         assert_eq!(
             app.windows[&wid].overlay().unwrap().kind().keyword(),
             "connections"
         );
         let lines = app.read_aux_controls(AuxTarget::Connections);
-        assert!(lines[0].contains("sessions=3") && lines[0].contains("flows=1"), "{lines:?}");
         assert!(
-            lines.iter().any(|l| l.starts_with("connections group label=\"Window 1")),
+            lines[0].contains("sessions=3") && lines[0].contains("flows=1"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("connections group label=\"Window 1")),
             "window header present: {lines:?}"
         );
         assert!(
@@ -763,7 +783,10 @@ mod tests {
             assert!(records.get(&(sids[1].clone(), sids[0].clone())).is_some());
         }
         let lines = app.windows[&wid].connection_map().unwrap().controls_lines();
-        assert!(lines[0].contains("flows=1"), "map recomposed live: {lines:?}");
+        assert!(
+            lines[0].contains("flows=1"),
+            "map recomposed live: {lines:?}"
+        );
         // A bare Esc now closes.
         app.connection_map_input_event(wid, &key(aterm_types::keyboard::NamedKey::Escape));
         assert!(app.windows[&wid].connection_map().is_none());
@@ -779,7 +802,10 @@ mod tests {
         connect(&app, &sids[0], &sids[2]);
         assert!(app.open_connection_map().is_ok());
         let lines = app.read_aux_controls(AuxTarget::Connections);
-        assert!(lines[0].contains("sessions=3") && lines[0].contains("flows=1"), "{lines:?}");
+        assert!(
+            lines[0].contains("sessions=3") && lines[0].contains("flows=1"),
+            "{lines:?}"
+        );
 
         let local = {
             let g = app.store.read().unwrap();
@@ -814,16 +840,17 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains(&format!("sid={}", sids[1].as_str())) && l.contains("driving=42")),
+                .any(|l| l.contains(&format!("sid={}", sids[1].as_str()))
+                    && l.contains("driving=42")),
             "{lines:?}"
         );
         *ctx.turn_lease.lock().unwrap() = None;
         app.connection_map_prepaint(wid);
         let lines = app.windows[&wid].connection_map().unwrap().controls_lines();
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains(&format!("sid={}", sids[1].as_str())) && l.contains("driving=-")),
+            lines.iter().any(
+                |l| l.contains(&format!("sid={}", sids[1].as_str())) && l.contains("driving=-")
+            ),
             "{lines:?}"
         );
     }

@@ -280,11 +280,7 @@ struct TtyRun {
 /// `TCSAFLUSH`, which DISCARDS pending input, so a phrase typed before the prompt is thrown
 /// away by the tool's own (correct) hardening. Waiting for the prompt is what a human does
 /// too.
-fn run_on_a_terminal(
-    dir: &Path,
-    args: &[&str],
-    reply: Option<(&str, &str)>,
-) -> TtyRun {
+fn run_on_a_terminal(dir: &Path, args: &[&str], reply: Option<(&str, &str)>) -> TtyRun {
     let mut pty = Pty::open();
     let mut child = pty.spawn(dir, args);
     let mut terminal = String::new();
@@ -313,7 +309,9 @@ fn run_on_a_terminal(
     }
     // One last drain: the child may have written and exited between two polls.
     pty.drain(&mut terminal);
-    let out = child.wait_with_output().expect("collect the child's output");
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
     TtyRun {
         status: out.status,
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -363,7 +361,9 @@ fn run_on_a_terminal_retyping_phrase(dir: &Path, args: &[&str]) -> TtyRun {
         }
     }
     pty.drain(&mut terminal);
-    let out = child.wait_with_output().expect("collect the child's output");
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
     TtyRun {
         status: out.status,
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -448,7 +448,10 @@ fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
         "a refused join must mint no key"
     );
     assert_eq!(std::fs::read(p(&dir, "pins.rs")).unwrap(), before_pins);
-    assert_eq!(std::fs::read(p(&dir, "roster.toml")).unwrap(), before_roster);
+    assert_eq!(
+        std::fs::read(p(&dir, "roster.toml")).unwrap(),
+        before_roster
+    );
 
     // ...and with stdin at /dev/null, which is the shape the retired `machine-mint`
     // property is stated in, the refusal is the same one.
@@ -508,7 +511,10 @@ fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
             "the refusal must say what the operator has to do about it: {err}"
         );
         assert!(err.contains("/dev/tty"), "{err}");
-        assert!(!err.contains(PAPER), "the refusal must not echo the value: {err}");
+        assert!(
+            !err.contains(PAPER),
+            "the refusal must not echo the value: {err}"
+        );
     }
     assert_eq!(
         std::fs::read(p(&dir, "pins.rs")).unwrap(),
@@ -531,7 +537,11 @@ fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
             &p(&dir, "roster.toml"),
         ],
     );
-    assert!(!stderr_of(&out).contains("COMPROMISED"), "{}", stderr_of(&out));
+    assert!(
+        !stderr_of(&out).contains("COMPROMISED"),
+        "{}",
+        stderr_of(&out)
+    );
     assert!(stderr_of(&out).contains("/dev/tty"), "{}", stderr_of(&out));
 }
 
@@ -565,7 +575,10 @@ fn setup_without_a_terminal_refuses_and_writes_nothing() {
         ],
     );
 
-    assert!(!out.status.success(), "setup must refuse without a terminal");
+    assert!(
+        !out.status.success(),
+        "setup must refuse without a terminal"
+    );
     let err = stderr_of(&out);
     assert!(err.contains("/dev/tty"), "{err}");
     assert!(
@@ -637,9 +650,21 @@ fn an_unread_flag_spelling_is_refused_rather_than_silently_replaced_by_a_default
     let out = run(
         &dir,
         None,
-        &["setup", "--id", "oops", "--pins", &named, "--roster", &p(&dir, "r.toml")],
+        &[
+            "setup",
+            "--id",
+            "oops",
+            "--pins",
+            &named,
+            "--roster",
+            &p(&dir, "r.toml"),
+        ],
     );
-    assert!(!stderr_of(&out).contains("--name=value"), "{}", stderr_of(&out));
+    assert!(
+        !stderr_of(&out).contains("--name=value"),
+        "{}",
+        stderr_of(&out)
+    );
     assert!(stderr_of(&out).contains("/dev/tty"), "{}", stderr_of(&out));
 }
 
@@ -650,13 +675,24 @@ fn unknown_and_malformed_arguments_are_refused_by_name() {
     let dir = scratch("bad-args");
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).unwrap();
 
-    let out = run(&dir, None, &["setup", "--id", "m3", "--pinz", &p(&dir, "pins.rs")]);
+    let out = run(
+        &dir,
+        None,
+        &["setup", "--id", "m3", "--pinz", &p(&dir, "pins.rs")],
+    );
     assert!(!out.status.success());
     let err = stderr_of(&out);
     assert!(err.contains("unknown flag '--pinz'"), "{err}");
-    assert!(err.contains("--pins"), "the message lists what IS accepted: {err}");
+    assert!(
+        err.contains("--pins"),
+        "the message lists what IS accepted: {err}"
+    );
 
-    let out = run(&dir, None, &["setup", "--id", "--pins", &p(&dir, "pins.rs")]);
+    let out = run(
+        &dir,
+        None,
+        &["setup", "--id", "--pins", &p(&dir, "pins.rs")],
+    );
     assert!(!out.status.success());
     assert!(
         stderr_of(&out).contains("as its value, which is another flag"),
@@ -673,7 +709,11 @@ fn unknown_and_malformed_arguments_are_refused_by_name() {
     );
 
     // NEGATIVE CONTROL: the well-formed invocation is not refused for its arguments.
-    let out = run(&dir, None, &["setup", "--id", "m3", "--pins", &p(&dir, "pins.rs")]);
+    let out = run(
+        &dir,
+        None,
+        &["setup", "--id", "m3", "--pins", &p(&dir, "pins.rs")],
+    );
     let err = stderr_of(&out);
     assert!(!err.contains("unknown flag"), "{err}");
     assert!(!err.contains("unexpected argument"), "{err}");
@@ -717,7 +757,10 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
     assert!(!out.status.success());
     let err = stderr_of(&out);
     assert!(err.contains("no roster at"), "{err}");
-    assert!(err.contains("COPY"), "the refusal must say how to fix it: {err}");
+    assert!(
+        err.contains("COPY"),
+        "the refusal must say how to fix it: {err}"
+    );
     assert!(
         err.contains("will not start a second roster"),
         "and why it will not do it for you: {err}"
@@ -725,7 +768,10 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
     // The refusal comes BEFORE the prompt: the operator is not asked to type 64 characters
     // only to be told the file is missing.
     assert!(!err.contains("/dev/tty"), "{err}");
-    assert!(!Path::new(&p(&dir, "roster.toml")).exists(), "no roster was created");
+    assert!(
+        !Path::new(&p(&dir, "roster.toml")).exists(),
+        "no roster was created"
+    );
     assert!(!Path::new(&p(&dir, "m11.key")).exists());
 
     // NEGATIVE CONTROL: put the roster back and the same command reaches the prompt.
@@ -751,7 +797,10 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
     );
     let err = stderr_of(&out);
     assert!(!err.contains("no roster at"), "{err}");
-    assert!(err.contains("/dev/tty"), "it got as far as the prompt: {err}");
+    assert!(
+        err.contains("/dev/tty"),
+        "it got as far as the prompt: {err}"
+    );
     let _ = master_pub;
 }
 
@@ -837,7 +886,11 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
     // this tool cannot reach anyway.
     let channel = read_anchor(&src, CHANNEL_ANCHOR).unwrap();
     assert_eq!(channel.members, vec![HEAD_KEY.to_string()]);
-    assert_eq!(channel.head(), Some(HEAD_KEY), "the incumbent head survives");
+    assert_eq!(
+        channel.head(),
+        Some(HEAD_KEY),
+        "the incumbent head survives"
+    );
     // THE ROSTER NAMES THE INCUMBENT FIRST, THEN THIS MACHINE. Without the first entry,
     // committing this anchor would leave the machine holding the head key — the one key
     // clients that predate the roster can verify — unable to cut.
@@ -846,7 +899,10 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
     let roster = Roster::parse(&verify_roster(&[&master_pub], bytes, &sig).expect("verifies"))
         .expect("parses");
     assert_eq!(roster.machines.len(), 2);
-    assert_eq!(roster.machines[0].id, "m21", "--head-id named the incumbent");
+    assert_eq!(
+        roster.machines[0].id, "m21",
+        "--head-id named the incumbent"
+    );
     assert_eq!(roster.machines[0].pubkey, HEAD_KEY);
     assert_eq!(roster.machines[1].id, "m3");
     // THE MINTED KEY IS ON THE ROSTER AND IN NO ANCHOR — read from the roster, because
@@ -859,13 +915,20 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
 
     // THE MACHINE'S OWN FILES.
     use std::os::unix::fs::PermissionsExt as _;
-    let mode = std::fs::metadata(p(&dir, "m3.key")).unwrap().permissions().mode();
+    let mode = std::fs::metadata(p(&dir, "m3.key"))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600);
     let record = std::fs::read_to_string(dir.join(".aterm/machine.toml")).unwrap();
     assert!(record.contains("id = \"m3\""), "{record}");
 
     // THE CLOSING OUTPUT — on stdout, where it belongs — says what is not yet true.
-    assert!(run.stdout.contains("a commit makes it durable"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("a commit makes it durable"),
+        "{}",
+        run.stdout
+    );
     assert!(
         run.stdout.contains("no pre-roster client is left"),
         "{}",
@@ -876,12 +939,23 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         "{}",
         run.stdout
     );
-    assert!(run.stdout.contains("the ONLY roster this master signs"), "{}", run.stdout);
-    assert!(run.stdout.contains("incumbent keyset head"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("the ONLY roster this master signs"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("incumbent keyset head"),
+        "{}",
+        run.stdout
+    );
 
     // THE PHRASE REACHED NO FILE.
     let checked = assert_nothing_on_disk_holds(&dir, &phrase);
-    assert!(checked >= 5, "the run must have written five files; saw {checked}");
+    assert!(
+        checked >= 5,
+        "the run must have written five files; saw {checked}"
+    );
 
     // AND A SECOND `setup` IS REFUSED, because the anchor it just wrote is committed.
     let again = run_on_a_terminal(
@@ -900,7 +974,11 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         None,
     );
     assert!(!again.status.success());
-    assert!(again.stderr.contains("ALREADY committed"), "{}", again.stderr);
+    assert!(
+        again.stderr.contains("ALREADY committed"),
+        "{}",
+        again.stderr
+    );
     assert_eq!(
         std::fs::read_to_string(p(&dir, "pins.rs")).unwrap(),
         src,
@@ -961,9 +1039,14 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
         }
     }
     pty.drain(&mut terminal);
-    let out = child.wait_with_output().expect("collect the child's output");
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
 
-    assert!(out.status.success(), "a corrected retype must arm: {terminal}");
+    assert!(
+        out.status.success(),
+        "a corrected retype must arm: {terminal}"
+    );
     assert!(terminal.contains("NO MATCH"), "{terminal}");
     let phrase = phrase_on(&terminal).expect("phrase shown");
     assert!(
@@ -973,8 +1056,15 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
     // The wrong retype armed nothing until the right one landed: the anchor holds exactly
     // the master the shown phrase derives.
     let src = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
-    let master_pub = parse_master(&phrase).expect("parses").seed().pubkey_b64().unwrap();
-    assert_eq!(read_anchor(&src, MASTER_ANCHOR).unwrap().members, vec![master_pub]);
+    let master_pub = parse_master(&phrase)
+        .expect("parses")
+        .seed()
+        .pubkey_b64()
+        .unwrap();
+    assert_eq!(
+        read_anchor(&src, MASTER_ANCHOR).unwrap().members,
+        vec![master_pub]
+    );
 }
 
 /// `join` END TO END, WITH THE PHRASE TYPED AT THE TERMINAL.
@@ -1021,7 +1111,11 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
     );
     assert!(!Path::new(&p(&dir, "m11.key")).exists());
     // ECHO WAS OFF: what the operator typed is not on the terminal.
-    assert!(!bad.terminal.contains(&wrong), "the phrase was echoed: {}", bad.terminal);
+    assert!(
+        !bad.terminal.contains(&wrong),
+        "the phrase was echoed: {}",
+        bad.terminal
+    );
 
     // Now the right one.
     let good = run_on_a_terminal(
@@ -1045,12 +1139,18 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
         good.stderr,
         good.terminal
     );
-    assert!(!good.terminal.contains(PAPER), "echo stays off on the happy path too");
+    assert!(
+        !good.terminal.contains(PAPER),
+        "echo stays off on the happy path too"
+    );
     assert!(!good.stdout.contains(PAPER), "{}", good.stdout);
 
     // `join` edited NO trust anchor: neither the master nor the keyset moved.
     let src = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
-    assert_eq!(read_anchor(&src, MASTER_ANCHOR).unwrap().members, vec![master_pub.clone()]);
+    assert_eq!(
+        read_anchor(&src, MASTER_ANCHOR).unwrap().members,
+        vec![master_pub.clone()]
+    );
     let keyset = read_anchor(&src, CHANNEL_ANCHOR).unwrap();
     assert_eq!(keyset.head(), Some(HEAD_KEY));
     assert_eq!(
@@ -1066,7 +1166,10 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
         .expect("parses");
     let ids: Vec<&str> = roster.machines.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["m3", "m11"], "the existing machine survives");
-    assert_eq!(roster.roster_seq, 2, "the sequence advanced rather than restarting");
+    assert_eq!(
+        roster.roster_seq, 2,
+        "the sequence advanced rather than restarting"
+    );
     assert!(
         !good.stdout.contains("the ONLY roster this master signs"),
         "join extended a roster; it must not claim to have created one: {}",
@@ -1194,7 +1297,10 @@ fn setup_refuses_on_an_armed_tree() {
     let err = stderr_of(&out);
     assert!(err.contains("ALREADY committed"), "{err}");
     assert!(err.contains("join"), "{err}");
-    assert!(!err.contains(PAPER), "the refusal must not echo a phrase: {err}");
+    assert!(
+        !err.contains(PAPER),
+        "the refusal must not echo a phrase: {err}"
+    );
     assert_eq!(
         std::fs::read(p(&dir, "pins.rs")).unwrap(),
         before_pins,

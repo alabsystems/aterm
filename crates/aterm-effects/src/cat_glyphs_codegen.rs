@@ -632,9 +632,7 @@ fn emit_robi(glyphs: &[Glyph]) -> String {
 
     // Stable enum-value roster (same reason as the cat's GLYPH_IDS: pose selection
     // resolves through `ROBI_GLYPHS[i].id` strings, never a Rust discriminant).
-    s.push_str(
-        "/// Every pose id in [`ROBI_GLYPHS`] order. Pair with `ROBI_GLYPHS[i].id` for\n",
-    );
+    s.push_str("/// Every pose id in [`ROBI_GLYPHS`] order. Pair with `ROBI_GLYPHS[i].id` for\n");
     s.push_str("/// stable string lookup.\n");
     s.push_str("pub const ROBI_GLYPH_IDS: &[RobiGlyphId] = &[\n");
     for g in glyphs {

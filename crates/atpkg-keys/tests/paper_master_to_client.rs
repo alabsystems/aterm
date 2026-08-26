@@ -59,13 +59,7 @@ fn publish(roster: &Roster, paper: &str) -> (Vec<u8>, Vec<u8>, String) {
 fn a_master_phrase_mints_a_machine_whose_release_the_client_accepts() {
     // Owner side: mint m3's key on m3, and put it on a roster signed by the paper master.
     let (m3_key, m3_pub) = atpkg_keys::generate().expect("machine keypair");
-    let roster = add(
-        empty(NOW),
-        "m3",
-        &m3_pub,
-        NOW,
-    )
-    .expect("m3 joins");
+    let roster = add(empty(NOW), "m3", &m3_pub, NOW).expect("m3 joins");
     let (roster_bytes, roster_sig, master_pub) = publish(&roster, PAPER);
 
     // The machine signs a release with its OWN key. The master is not present for this —
@@ -277,7 +271,9 @@ fn an_unpinned_master_accepts_nothing_at_all() {
 #[test]
 fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     use atpkg_keys::pins_edit::{CHANNEL_ANCHOR, MASTER_ANCHOR, read_anchor};
-    use atpkg_keys::provision::{Paths, Verb, plan, preflight, verify_master, write_pins, write_rest};
+    use atpkg_keys::provision::{
+        Paths, Verb, plan, preflight, verify_master, write_pins, write_rest,
+    };
 
     // The incumbent head — the key whose private half is on another machine and which
     // signed the live release. Its survival is the property that keeps the fleet alive.
@@ -317,14 +313,16 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     // downstream of it is exactly what the verb does.
     let seed = parse_master(PAPER).expect("synthetic phrase").seed();
     let m3_paths = paths("m3.key", "m3.toml");
-    let pre = preflight(Verb::Setup, "m3", "incumbent-head", &m3_paths).expect("a fresh tree accepts setup");
+    let pre = preflight(Verb::Setup, "m3", "incumbent-head", &m3_paths)
+        .expect("a fresh tree accepts setup");
     let planned = plan(pre, &seed, NOW).expect("setup plans");
     write_pins(&planned).expect("the anchor is written and verified");
     let m3 = write_rest(planned).expect("setup completes");
 
     // --- join, on a second machine, against the anchor setup committed ---------------
     let m11_paths = paths("m11.key", "m11.toml");
-    let pre = preflight(Verb::Join, "m11", "incumbent-head", &m11_paths).expect("an armed tree accepts join");
+    let pre = preflight(Verb::Join, "m11", "incumbent-head", &m11_paths)
+        .expect("an armed tree accepts join");
     verify_master(&pre, &seed).expect("the phrase proves against the committed anchor");
     let planned = plan(pre, &seed, NOW).expect("join plans");
     write_pins(&planned).expect("the keyset entry is written and verified");
@@ -365,7 +363,9 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
     let verified = verify_roster(&[master_anchor[0].as_str()], roster_bytes, &roster_sig)
         .expect("the roster verifies under the anchor the tool wrote");
     let parsed = Roster::parse(&verified).expect("it parses");
-    parsed.admit(0, NOW as i64).expect("fresh, above a first-contact floor");
+    parsed
+        .admit(0, NOW as i64)
+        .expect("fresh, above a first-contact floor");
 
     let who = parsed
         .authorize_appcast(&bytes, &sig, NOW as i64)

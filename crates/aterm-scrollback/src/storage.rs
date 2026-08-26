@@ -88,10 +88,7 @@ impl Iterator for ScrollbackStorageIter<'_> {
                     // non-terminating solve. The macro-expanded `fmt::Arguments`
                     // here leaves ONE documented full-verify gap on this
                     // function (a toolchain limitation, not a refutation).
-                    aterm_log::warn!(
-                        "storage iter: skipping {skip} line(s) at {}: {e}",
-                        self.idx
-                    );
+                    aterm_log::warn!("storage iter: skipping {skip} line(s) at {}: {e}", self.idx);
                     // Clamp so a corrupt tail segment cannot push the cursor
                     // past `total`; `max(1)` guarantees forward progress.
                     let skip = skip.min(total.saturating_sub(self.idx)).max(1);

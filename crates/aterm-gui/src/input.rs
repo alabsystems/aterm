@@ -1225,7 +1225,12 @@ mod tests {
             let (mut read, mut write): (isize, isize) = (0, 0);
             // SAFETY: two out-params, default security attributes, explicit size.
             let ok = unsafe {
-                winapi::CreatePipe(&mut read, &mut write, std::ptr::null_mut(), Self::PIPE_BYTES)
+                winapi::CreatePipe(
+                    &mut read,
+                    &mut write,
+                    std::ptr::null_mut(),
+                    Self::PIPE_BYTES,
+                )
             };
             assert_ne!(ok, 0, "CreatePipe for the egress capture");
             // ONE event object under TWO handles, via the name: the session takes
@@ -1670,7 +1675,10 @@ mod tests {
     #[test]
     fn alt_screen_alternate_scroll_converts_wheel_to_arrows() {
         let term = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
-        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 2)), b"\x1b[A\x1b[A");
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, 2)),
+            b"\x1b[A\x1b[A"
+        );
         assert_eq!(egress_bytes(&term, &wheel(WheelDir::Down, 1)), b"\x1b[B");
         // DECCKM (?1h): arrows switch to the SS3 form, proving the bytes come from
         // the live keyboard mode, not a hardcoded CSI.
@@ -1693,7 +1701,10 @@ mod tests {
             b"\x1b[?1000h",
             b"\x1b[?1006h",
         ]);
-        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 1)), b"\x1b[<64;1;1M");
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, 1)),
+            b"\x1b[<64;1;1M"
+        );
     }
 
     /// I12 at the byte level: the SAME tracking + alt-scroll terminal as above,
@@ -1725,7 +1736,10 @@ mod tests {
         ));
         assert!(egress_bytes(&term, &shifted).is_empty());
         // Control: the unshifted twin still reports (the bypass is the ONLY change).
-        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 1)), b"\x1b[<64;1;1M");
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, 1)),
+            b"\x1b[<64;1;1M"
+        );
     }
 
     /// Alternate scroll applies only on the ALT screen: on the main screen the wheel
@@ -1843,7 +1857,10 @@ mod tests {
     #[test]
     fn alternate_scroll_emits_one_arrow_per_line() {
         let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
-        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 3)), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, 3)),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
     }
 
     /// The report burst is bounded at BOTH ends, for every source. A tracking app
@@ -2724,8 +2741,14 @@ mod tests {
         // DEC-1007 alt-scroll, then the local viewport.
         assert_eq!(wheel_route(false, false, true, false), WheelRoute::Report);
         assert_eq!(wheel_route(false, false, true, true), WheelRoute::Report);
-        assert_eq!(wheel_route(false, false, false, true), WheelRoute::AltScroll);
-        assert_eq!(wheel_route(false, false, false, false), WheelRoute::Viewport);
+        assert_eq!(
+            wheel_route(false, false, false, true),
+            WheelRoute::AltScroll
+        );
+        assert_eq!(
+            wheel_route(false, false, false, false),
+            WheelRoute::Viewport
+        );
         // SELECTION CUSTODY Phase 2: Alt on the main screen reaches local
         // history over a tracking app — and over nothing else, because the
         // caller only sets `alt_local` off the alt screen, where `alt_scroll`

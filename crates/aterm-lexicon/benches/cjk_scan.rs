@@ -171,7 +171,11 @@ fn corpora() -> Vec<(&'static str, Vec<String>, Reach)> {
             Reach::new(24, 1920),
         ),
         // The control: not one character of it reaches scan_cjk_run.
-        ("ascii_control", screen(ASCII, NARROW_COLS), Reach::new(0, 0)),
+        (
+            "ascii_control",
+            screen(ASCII, NARROW_COLS),
+            Reach::new(0, 0),
+        ),
     ]
 }
 

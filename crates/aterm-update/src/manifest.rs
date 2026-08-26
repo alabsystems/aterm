@@ -832,7 +832,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".tmp"))
             .collect();
-        assert!(strays.is_empty(), "durable write leaves no scratch: {strays:?}");
+        assert!(
+            strays.is_empty(),
+            "durable write leaves no scratch: {strays:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1372,8 +1375,7 @@ changelog = '''
     /// the commit error, and one of the two assertions below fails.
     #[test]
     fn a_floor_that_cannot_be_committed_is_reported_and_leaves_no_temp_file() {
-        let root =
-            std::env::temp_dir().join(format!("aterm-floor-commit-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aterm-floor-commit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // A DIRECTORY where the floor file belongs: the temp write succeeds and the

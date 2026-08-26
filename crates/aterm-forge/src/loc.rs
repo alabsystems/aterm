@@ -82,7 +82,9 @@ pub fn package_dir_hinted(root: &Path, id: &PkgId, printed: Option<&Path>) -> Op
 fn registry_srcs() -> &'static [PathBuf] {
     static SRCS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     SRCS.get_or_init(|| {
-        let Some(home) = cargo_home() else { return Vec::new() };
+        let Some(home) = cargo_home() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         if let Ok(entries) = std::fs::read_dir(home.join("registry").join("src")) {
             for entry in entries.flatten() {
@@ -122,7 +124,10 @@ pub fn facts_with_paths(
 ) -> BTreeMap<PkgId, PkgFacts> {
     let mut out = BTreeMap::new();
     for id in &graph.nodes {
-        out.insert(id.clone(), cached_facts(root, id, printed.get(id).map(PathBuf::as_path)));
+        out.insert(
+            id.clone(),
+            cached_facts(root, id, printed.get(id).map(PathBuf::as_path)),
+        );
     }
     out
 }
@@ -135,14 +140,19 @@ pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
         // only be a registry package whose source was never unpacked. It is
         // third-party by definition; its LOC is honestly unknown, so it is 0
         // and the survey's own totals will not silently absorb it.
-        return PkgFacts { is_third_party: true, ..PkgFacts::default() };
+        return PkgFacts {
+            is_third_party: true,
+            ..PkgFacts::default()
+        };
     };
     let mut files = Vec::new();
     collect_rs(&dir, &mut files);
     let mut loc = 0u64;
     let mut unsafe_tokens = 0u64;
     for file in &files {
-        let Ok(bytes) = std::fs::read(file) else { continue };
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
         loc += physical_lines(&bytes);
         unsafe_tokens += count_unsafe(&bytes);
     }
@@ -201,7 +211,11 @@ pub fn survey_cell_logged(
 ) -> Result<CellSurvey, String> {
     let (graph, paths) = resolve::graph_and_paths(root, cell, log)?;
     let facts = facts_with_paths(root, &graph, &paths);
-    Ok(CellSurvey { cell: cell.clone(), graph, facts })
+    Ok(CellSurvey {
+        cell: cell.clone(),
+        graph,
+        facts,
+    })
 }
 
 /// Every `*.rs` under `dir`. `target/` is skipped (build output is not source)
@@ -210,10 +224,14 @@ pub fn survey_cell_logged(
 /// See the module docs for why this diverges from
 /// [`aterm_census::collect_rs_files`].
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         if kind.is_dir() {
             let name = path.file_name().unwrap_or_default();
             if name == "target" || name == ".git" {
@@ -233,7 +251,11 @@ fn physical_lines(bytes: &[u8]) -> u64 {
         return 0;
     }
     let newlines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
-    if bytes.last() == Some(&b'\n') { newlines } else { newlines + 1 }
+    if bytes.last() == Some(&b'\n') {
+        newlines
+    } else {
+        newlines + 1
+    }
 }
 
 /// `\bunsafe\b` occurrences. Word-bounded on both sides, so
@@ -244,7 +266,9 @@ fn count_unsafe(bytes: &[u8]) -> u64 {
     let mut count = 0u64;
     let mut at = 0usize;
     while at + WORD.len() <= bytes.len() {
-        let Some(offset) = bytes[at..].windows(WORD.len()).position(|w| w == WORD) else { break };
+        let Some(offset) = bytes[at..].windows(WORD.len()).position(|w| w == WORD) else {
+            break;
+        };
         let start = at + offset;
         let end = start + WORD.len();
         let left_free = start == 0 || !is_ident_byte(bytes[start - 1]);
@@ -266,7 +290,9 @@ fn is_ident_byte(b: u8) -> bool {
 /// `license.workspace = true` yields an empty string rather than a lie —
 /// workspace members are not the licence-obligation surface, forks are.
 fn manifest_facts(text: &str) -> (String, bool) {
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return (String::new(), false) };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return (String::new(), false);
+    };
     let license = doc
         .get("package")
         .and_then(|p| p.get("license"))
@@ -345,7 +371,10 @@ mod tests {
         let registry = package_dir(&root, &PkgId::new("libc", "0.2.186"))
             .expect("libc 0.2.186 is unpacked in this checkout's registry");
         assert!(registry.ends_with("libc-0.2.186"), "{}", registry.display());
-        assert!(!registry.starts_with(&root), "registry sources live outside the repo");
+        assert!(
+            !registry.starts_with(&root),
+            "registry sources live outside the repo"
+        );
 
         // No registry copy of this version exists, so the fork answers.
         let vendored = package_dir(&root, &PkgId::new("winit", "0.0.0-not-published"))
@@ -356,7 +385,10 @@ mod tests {
             .expect("workspace members resolve under crates/");
         assert_eq!(member, root.join("crates").join("aterm-core"));
 
-        assert_eq!(package_dir(&root, &PkgId::new("no-such-crate-anywhere", "1.0.0")), None);
+        assert_eq!(
+            package_dir(&root, &PkgId::new("no-such-crate-anywhere", "1.0.0")),
+            None
+        );
     }
 
     #[test]
@@ -388,7 +420,11 @@ mod tests {
             proc_macros: s.proc_macros(),
             duplicate_names: s.duplicate_names().len(),
         };
-        assert_eq!(got, want, "cell `{}` has moved off the measured baseline", want.cell);
+        assert_eq!(
+            got, want,
+            "cell `{}` has moved off the measured baseline",
+            want.cell
+        );
     }
 
     #[test]
@@ -398,7 +434,10 @@ mod tests {
 
     #[test]
     fn mac_arm_third_party_loc_matches_the_baseline() {
-        assert_eq!(survey(0).third_party_loc(), measured::MAC_ARM.third_party_loc);
+        assert_eq!(
+            survey(0).third_party_loc(),
+            measured::MAC_ARM.third_party_loc
+        );
     }
 
     #[test]
@@ -429,7 +468,10 @@ mod tests {
         let s = survey(0);
         for id in s.third_party() {
             let f = &s.facts[id];
-            assert!(f.root_dir.is_some(), "{id} has no directory — LOC would silently be 0");
+            assert!(
+                f.root_dir.is_some(),
+                "{id} has no directory — LOC would silently be 0"
+            );
             assert!(f.loc > 0, "{id} measured 0 lines of Rust");
         }
     }
@@ -442,14 +484,20 @@ mod tests {
             .iter()
             .find(|(id, _)| id.name == "winnow")
             .expect("the winnow fork is in the mac-arm graph");
-        assert!(winnow.1.is_third_party, "a [patch.crates-io] fork is still upstream code");
+        assert!(
+            winnow.1.is_third_party,
+            "a [patch.crates-io] fork is still upstream code"
+        );
         let core = s
             .facts
             .iter()
             .find(|(id, _)| id.name == "aterm-core")
             .expect("aterm-core is in the graph");
         assert!(!core.1.is_third_party);
-        assert!(core.1.loc > 0, "workspace crates are measured too, just not billed");
+        assert!(
+            core.1.loc > 0,
+            "workspace crates are measured too, just not billed"
+        );
     }
 
     #[test]
@@ -460,7 +508,10 @@ mod tests {
             .filter(|id| s.facts[*id].license.is_empty())
             .map(ToString::to_string)
             .collect();
-        assert!(blank.is_empty(), "third-party packages with no `license` field: {blank:?}");
+        assert!(
+            blank.is_empty(),
+            "third-party packages with no `license` field: {blank:?}"
+        );
     }
 
     #[test]

@@ -239,7 +239,11 @@ fn verify_reaches_target(w: &Workload) {
     // is named for. This is what stops a corpus change from silently turning
     // the retained-Rle lane into another discarded-Rle lane (or vice versa).
     let mut checked = 0usize;
-    for idx in [0usize, sb.line_count() / 2, sb.line_count().saturating_sub(1)] {
+    for idx in [
+        0usize,
+        sb.line_count() / 2,
+        sb.line_count().saturating_sub(1),
+    ] {
         let Ok(Some(line)) = sb.get_line(idx) else {
             continue;
         };

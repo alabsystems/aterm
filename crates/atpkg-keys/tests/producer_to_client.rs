@@ -214,7 +214,15 @@ fn run_setup(home: &Path, id: &str, pins: &Path, roster: &Path) -> String {
     let mut pty = Pty::open();
     let mut child = pty.spawn(
         home,
-        &["setup", "--id", id, "--pins", &s(pins), "--roster", &s(roster)],
+        &[
+            "setup",
+            "--id",
+            id,
+            "--pins",
+            &s(pins),
+            "--roster",
+            &s(roster),
+        ],
     );
     let mut terminal = String::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -249,7 +257,9 @@ fn run_setup(home: &Path, id: &str, pins: &Path, roster: &Path) -> String {
             }
         }
     }
-    let out = child.wait_with_output().expect("collect the child's output");
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
     assert!(
         out.status.success(),
         "setup must succeed on a terminal.\nstderr: {}\nterminal: {terminal}",
@@ -297,8 +307,11 @@ impl Prefix {
         assert!(home.join(".aterm/machine.toml").is_file());
 
         let spec = home.join("programs.spec");
-        std::fs::write(&spec, "ay ay prebuilt-only 6255\nny ny prebuilt-or-build 12 rustc\n")
-            .expect("program spec");
+        std::fs::write(
+            &spec,
+            "ay ay prebuilt-only 6255\nny ny prebuilt-or-build 12 rustc\n",
+        )
+        .expect("program spec");
 
         Self {
             out: home.join("out"),
@@ -434,7 +447,10 @@ impl Prefix {
         let out = self.home.join(format!("roster-revoked-{id}.toml"));
         std::fs::write(
             &out,
-            format!("{}{kept}", head.replace("revoked = []", &format!("revoked = [\"{id}\"]"))),
+            format!(
+                "{}{kept}",
+                head.replace("revoked = []", &format!("revoked = [\"{id}\"]"))
+            ),
         )
         .expect("write the revoked roster");
         std::fs::copy(
@@ -543,8 +559,10 @@ fn the_real_producer_emits_a_quad_the_real_client_accepts() {
         assert!(
             prefix.out.join(asset).is_file(),
             "the publish set must carry {asset}; it has {:?}",
-            std::fs::read_dir(&prefix.out)
-                .map(|d| d.filter_map(Result::ok).map(|e| e.file_name()).collect::<Vec<_>>())
+            std::fs::read_dir(&prefix.out).map(|d| d
+                .filter_map(Result::ok)
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>())
         );
     }
     // The staged roster is the roster, byte for byte — a re-serialization would be a
@@ -571,7 +589,10 @@ fn the_real_producer_emits_a_quad_the_real_client_accepts() {
         .lines()
         .find_map(|l| l.trim().strip_prefix("roster_seq = "))
         .expect("the roster states its sequence");
-    assert!(index.contains(&format!("\nroster_seq = {seq}\n")), "{index}");
+    assert!(
+        index.contains(&format!("\nroster_seq = {seq}\n")),
+        "{index}"
+    );
 
     // AND THE CLIENT AGREES — run independently of the script, so the two cannot pass by
     // agreeing with each other.
@@ -637,7 +658,10 @@ fn the_retired_index_shape_is_refused_by_the_self_check() {
     // The bytes written really are the retired shape, so the refusal is about the document
     // and not about a script that died before emitting one.
     let index = std::fs::read_to_string(prefix.out.join("index.toml")).unwrap();
-    assert!(index.contains("\nschema = 1\n") && index.contains("[keys]"), "{index}");
+    assert!(
+        index.contains("\nschema = 1\n") && index.contains("[keys]"),
+        "{index}"
+    );
     assert!(!index.contains("machine_id"), "{index}");
     // And the client refuses those same bytes for itself.
     assert!(!prefix.client_verify().status.success());
@@ -664,7 +688,10 @@ fn a_producer_that_drops_machine_id_fails_its_own_self_check() {
     assert!(text(&out).contains("SELF-CHECK FAILED"), "{}", text(&out));
     let index = std::fs::read_to_string(prefix.out.join("index.toml")).unwrap();
     assert!(!index.contains("machine_id"), "{index}");
-    assert!(index.contains("\nschema = 2\n"), "the ONLY change is the missing id: {index}");
+    assert!(
+        index.contains("\nschema = 2\n"),
+        "the ONLY change is the missing id: {index}"
+    );
     assert!(!prefix.client_verify().status.success());
 }
 
@@ -707,7 +734,10 @@ fn an_index_signed_by_an_unrostered_key_fails_the_self_check() {
     // is wrong, which is exactly the case a byte-level check of the emitted file misses
     // and only the real verifier catches.
     let index = std::fs::read_to_string(prefix.out.join("index.toml")).unwrap();
-    assert!(index.contains("\nschema = 2\n") && index.contains("machine_id = \"m3\""), "{index}");
+    assert!(
+        index.contains("\nschema = 2\n") && index.contains("machine_id = \"m3\""),
+        "{index}"
+    );
     assert!(!prefix.client_verify().status.success());
 }
 
@@ -729,7 +759,9 @@ fn a_machine_the_roster_does_not_name_is_refused_before_anything_is_signed() {
     let stranger_rec = prefix.home.join("stranger.toml");
     std::fs::write(
         &stranger_rec,
-        format!("id = \"m99\"\npubkey = \"{stranger_pub}\"\nminted_at = \"2026-08-04T00:00:00Z\"\n"),
+        format!(
+            "id = \"m99\"\npubkey = \"{stranger_pub}\"\nminted_at = \"2026-08-04T00:00:00Z\"\n"
+        ),
     )
     .expect("stranger record");
 
@@ -758,7 +790,11 @@ fn a_machine_the_roster_does_not_name_is_refused_before_anything_is_signed() {
         &[("MACHINE_KEY", &s(&prefix.home.join("nope.key")))],
     );
     assert!(!out.status.success());
-    assert!(text(&out).contains("atpkg-keys setup --id"), "{}", text(&out));
+    assert!(
+        text(&out).contains("atpkg-keys setup --id"),
+        "{}",
+        text(&out)
+    );
     assert!(text(&out).contains("atpkg-keys join"), "{}", text(&out));
 
     let out = prefix.run_indexer(
@@ -1099,9 +1135,15 @@ fn a_roster_older_than_the_published_generation_is_refused() {
     let ahead = baseline("ahead", seq + 7);
     let out = prefix.run_indexer(&tracked_indexer(), &[("BASELINE", &s(&ahead))]);
     let log = text(&out);
-    assert!(!out.status.success(), "a stale roster must be refused:\n{log}");
     assert!(
-        log.contains(&format!("REFUSING roster_seq {seq} < baseline's {}", seq + 7)),
+        !out.status.success(),
+        "a stale roster must be refused:\n{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "REFUSING roster_seq {seq} < baseline's {}",
+            seq + 7
+        )),
         "the refusal must name both generations:\n{log}"
     );
     assert!(
@@ -1216,7 +1258,11 @@ fn a_successful_publish_prints_no_absolute_home_path() {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let counter = prefix.home.join(".config/atpkg/index_build");
     std::fs::create_dir_all(counter.parent().unwrap()).expect("counter dir");
     std::fs::write(&counter, "20\n").expect("counter");

@@ -109,10 +109,7 @@ fn space_cell() -> RenderCell {
 }
 
 fn text_cell(ch: char) -> RenderCell {
-    RenderCell {
-        ch,
-        ..space_cell()
-    }
+    RenderCell { ch, ..space_cell() }
 }
 
 /// Deterministic LCG — the corpora must be identical on every machine and every
@@ -230,9 +227,7 @@ fn framed_grid() -> Vec<Vec<RenderCell>> {
 /// count and nothing else.
 fn prose_grid(pct: usize) -> Vec<Vec<RenderCell>> {
     let len = COLS * pct / 100;
-    (0..ROWS)
-        .map(|r| text_row(r as u64 + 7_000, len))
-        .collect()
+    (0..ROWS).map(|r| text_row(r as u64 + 7_000, len)).collect()
 }
 
 /// `STREAM_LINES + ROWS` lines of scrollback: a quarter blank, the rest output
@@ -676,7 +671,10 @@ fn bench_off_floor(group: &mut BenchmarkGroup<'_, WallTime>) {
             "{name}: `is_active()` is still true, so the host keeps the shared \
              ticker armed and the real idle cost is this number times 30 Hz"
         );
-        off.report(name, "the floor a user pays for an effect they never turned on");
+        off.report(
+            name,
+            "the floor a user pays for an effect they never turned on",
+        );
 
         group.bench_function(name, |b| {
             b.iter(|| black_box(rig.tick().fp));
@@ -765,7 +763,8 @@ fn bench_field_classic(group: &mut BenchmarkGroup<'_, WallTime>) {
         v.quads_max
     );
     assert_eq!(
-        v.lit_frames, v.frames,
+        v.lit_frames,
+        v.frames,
         "{name}: {} of {} frames emitted nothing",
         v.frames - v.lit_frames,
         v.frames
@@ -801,12 +800,16 @@ fn bench_field_literal(group: &mut BenchmarkGroup<'_, WallTime>) {
         v.quads_max
     );
     assert_eq!(
-        v.lit_frames, v.frames,
+        v.lit_frames,
+        v.frames,
         "{name}: {} of {} frames emitted nothing",
         v.frames - v.lit_frames,
         v.frames
     );
-    v.report(name, "shipping default: literal material + Execute choreography");
+    v.report(
+        name,
+        "shipping default: literal material + Execute choreography",
+    );
 
     group.bench_function(name, |b| {
         b.iter(|| black_box(rig.tick_semantic().fp));

@@ -510,7 +510,10 @@ mod tests {
         assert!(!without.iter().any(|n| n.contains("x86_64")), "{without:?}");
 
         let with = required_asset_names("0.47.0", true, false, true, false);
-        assert!(with.contains(&"aterm-0.47.0-x86_64.dmg".to_string()), "{with:?}");
+        assert!(
+            with.contains(&"aterm-0.47.0-x86_64.dmg".to_string()),
+            "{with:?}"
+        );
         assert!(
             with.contains(&"aterm-0.47.0-x86_64.dmg.sha256".to_string()),
             "{with:?}"
@@ -549,7 +552,9 @@ mod tests {
 
         let without = required_asset_names("0.50.0", true, false, false, false);
         assert!(
-            !without.iter().any(|n| n.contains("lite") || n.contains("offline")),
+            !without
+                .iter()
+                .any(|n| n.contains("lite") || n.contains("offline")),
             "{without:?}"
         );
 

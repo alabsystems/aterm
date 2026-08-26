@@ -46,11 +46,17 @@ fn every_byte_mutation_precedes_relocate_gates_tar_and_sign() {
     let disk = at(&s, "DISK_INSTALLED=");
 
     // Mutations first, in their landed order…
-    assert!(prune < hygiene && hygiene < strip, "prune -> hygiene -> strip");
+    assert!(
+        prune < hygiene && hygiene < strip,
+        "prune -> hygiene -> strip"
+    );
     // …then relocation (the last writer: vendoring + optional Dev-ID signing)…
     assert!(strip < relocate, "the strip must precede relocate/signing");
     // …then the gates that prove the FINAL bytes…
-    assert!(relocate < smoke && smoke < hello, "gates run on relocated bytes");
+    assert!(
+        relocate < smoke && smoke < hello,
+        "gates run on relocated bytes"
+    );
     // …and only then the tarball and the size that feed the signed manifest.
     assert!(hello < tar && tar < disk, "tar + DISK_INSTALLED come last");
 }
@@ -61,23 +67,26 @@ fn the_lane_keeps_its_fail_closed_guards_and_its_escape_hatches() {
     // The still-runs probes: a stripped binary that will not start must fail
     // the pack, which is the entire safety argument for stripping at all.
     for guard in [
-        "smoke_one",                            // per-bin smoke-exec probe
-        "hello, atpkg sysroot",                 // hello-world compile+run proof
-        "strip -x -S",                          // one flag discipline, all classes
-        "codesign -f -s -",                     // the explicit re-sign: strip only
-                                                // regenerates LINKER-SIGNED adhoc
-                                                // signatures; an explicitly signed
-                                                // Mach-O (the trust-wp drivers) is
-                                                // invalidated and native arm64
-                                                // SIGKILLs it at exec
-        "REFUSING fat Mach-O",                  // thin guard fails closed
+        "smoke_one",            // per-bin smoke-exec probe
+        "hello, atpkg sysroot", // hello-world compile+run proof
+        "strip -x -S",          // one flag discipline, all classes
+        "codesign -f -s -",     // the explicit re-sign: strip only
+        // regenerates LINKER-SIGNED adhoc
+        // signatures; an explicitly signed
+        // Mach-O (the trust-wp drivers) is
+        // invalidated and native arm64
+        // SIGKILLs it at exec
+        "REFUSING fat Mach-O", // thin guard fails closed
         "has NO members — refusing to sign an empty tarball", // member-listing refusal
-        "AppleDouble",                          // xattr leak refusal
+        "AppleDouble",         // xattr leak refusal
     ] {
         assert!(s.contains(guard), "the lane lost its {guard:?} guard");
     }
     // The escapes are documented knobs, never silent defaults.
-    assert!(s.contains("--no-strip"), "the strip must keep its debugging escape");
+    assert!(
+        s.contains("--no-strip"),
+        "the strip must keep its debugging escape"
+    );
     assert!(
         s.contains("BUNDLE_KEEP_TARGETS"),
         "the prune must keep its cross-capable local escape"

@@ -55,8 +55,8 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
         };
-        let index = (0..ws.tab_set.len())
-            .find(|&i| self.tab_terminal_session(wid, i) == Some(local));
+        let index =
+            (0..ws.tab_set.len()).find(|&i| self.tab_terminal_session(wid, i) == Some(local));
         let Some(index) = index else {
             return 0;
         };
@@ -304,7 +304,12 @@ impl App {
         ev: &winit::event::KeyEvent,
     ) -> bool {
         use winit::keyboard::{Key, NamedKey};
-        if self.windows.get(&wid).and_then(|ws| ws.conn_card()).is_none() {
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.conn_card())
+            .is_none()
+        {
             return false;
         }
         match &ev.logical_key {
@@ -325,7 +330,12 @@ impl App {
     /// PTY (the `App::input` overlay gate).
     pub(crate) fn conn_card_input_event(&mut self, wid: WindowId, ev: &crate::input::InputEvent) {
         use aterm_types::keyboard::{Key as TKey, KeyEventType, NamedKey as TNamed};
-        if self.windows.get(&wid).and_then(|ws| ws.conn_card()).is_none() {
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.conn_card())
+            .is_none()
+        {
             return;
         }
         if let crate::input::InputEvent::Key {
@@ -499,7 +509,12 @@ mod tests {
     }
 
     /// Two registered stub sessions in one window; returns their sids.
-    fn app_with_pair() -> (App, WindowId, aterm_session::SessionId, aterm_session::SessionId) {
+    fn app_with_pair() -> (
+        App,
+        WindowId,
+        aterm_session::SessionId,
+        aterm_session::SessionId,
+    ) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.tab_strip_rows = 1;
@@ -603,7 +618,10 @@ mod tests {
         }
         app.input(wid, key(NamedKey::Enter), crate::Source::Human);
         let records = app.connections.records();
-        assert!(records.get(&(a.clone(), b.clone())).is_none(), "S→T not minted");
+        assert!(
+            records.get(&(a.clone(), b.clone())).is_none(),
+            "S→T not minted"
+        );
         let rec = records.get(&(b.clone(), a.clone())).expect("T→S minted");
         assert_eq!(rec.kind(), Some(ConnectionKind::Push));
         let g = app.store.read().unwrap();
@@ -637,7 +655,11 @@ mod tests {
         {
             let card = app.windows[&wid].conn_card().unwrap();
             assert_eq!(card.direction, crate::conn_card::CardDirection::SrcToDst);
-            assert_eq!(card.kind, ConnectionKind::Pull, "prefilled from the live pair");
+            assert_eq!(
+                card.kind,
+                ConnectionKind::Pull,
+                "prefilled from the live pair"
+            );
         }
         // Re-kind to push and confirm.
         app.input(wid, key(NamedKey::Tab), crate::Source::Human);
@@ -660,8 +682,14 @@ mod tests {
         app.input(wid, key(NamedKey::Enter), crate::Source::Human);
         {
             let records = app.connections.records();
-            assert!(records.get(&(a.clone(), b.clone())).is_none(), "old half gone");
-            assert!(records.get(&(b.clone(), a.clone())).is_some(), "new half live");
+            assert!(
+                records.get(&(a.clone(), b.clone())).is_none(),
+                "old half gone"
+            );
+            assert!(
+                records.get(&(b.clone(), a.clone())).is_some(),
+                "new half live"
+            );
         }
         let g = app.store.read().unwrap();
         assert!(
@@ -689,7 +717,10 @@ mod tests {
             "{lines:?}"
         );
         let front = app.read_aux_controls(AuxTarget::Front);
-        assert!(front[0].starts_with("overlay kind=conn-card open=true"), "{front:?}");
+        assert!(
+            front[0].starts_with("overlay kind=conn-card open=true"),
+            "{front:?}"
+        );
         assert_eq!(AuxTarget::parse("conn-card"), Some(AuxTarget::ConnCard));
         app.conn_card_exit(wid);
         assert_eq!(

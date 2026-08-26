@@ -933,13 +933,11 @@ impl AppRt for AppRtMacOS {
         // SAFETY: plain AppKit lookup + activation request; a dead pid yields
         // None and reads as a failed activation, never a crash.
         unsafe {
-            NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(
-                |app| {
-                    app.activateWithOptions(
-                        NSApplicationActivationOptions::NSApplicationActivateAllWindows,
-                    )
-                },
-            )
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(|app| {
+                app.activateWithOptions(
+                    NSApplicationActivationOptions::NSApplicationActivateAllWindows,
+                )
+            })
         }
     }
 
@@ -1258,10 +1256,14 @@ mod hid_idle {
             }
             let mut idle_ns: i64 = 0;
             let ok = CFGetTypeID(value) == CFNumberGetTypeID()
-                && CFNumberGetValue(value, CF_NUMBER_SINT64_TYPE, (&raw mut idle_ns).cast::<c_void>())
-                    != 0;
+                && CFNumberGetValue(
+                    value,
+                    CF_NUMBER_SINT64_TYPE,
+                    (&raw mut idle_ns).cast::<c_void>(),
+                ) != 0;
             CFRelease(value);
-            #[allow(clippy::cast_precision_loss)] // nanoseconds → seconds; sub-ns precision is irrelevant
+            #[allow(clippy::cast_precision_loss)]
+            // nanoseconds → seconds; sub-ns precision is irrelevant
             ok.then(|| idle_ns as f64 / 1e9)
         }
     }
@@ -1311,7 +1313,11 @@ mod user_input_probe_tests {
         let first = super::hid_idle::seconds_since_last_input();
         let _ = super::recent_user_input_event(std::time::Duration::from_millis(500));
         let second = super::hid_idle::seconds_since_last_input();
-        assert_eq!(first.is_some(), second.is_some(), "the cached handles answer consistently");
+        assert_eq!(
+            first.is_some(),
+            second.is_some(),
+            "the cached handles answer consistently"
+        );
         if let (Some(a), Some(b)) = (first, second) {
             assert!(a >= 0.0 && b >= 0.0, "idle ages are non-negative: {a} {b}");
         }
@@ -1322,7 +1328,9 @@ mod user_input_probe_tests {
     /// binary off the platform input-activity path (2026-08-17).
     #[test]
     fn no_recent_user_input_event_is_never_recent() {
-        assert!(!super::no_recent_user_input_event(std::time::Duration::from_secs(3600)));
+        assert!(!super::no_recent_user_input_event(
+            std::time::Duration::from_secs(3600)
+        ));
     }
 }
 

@@ -1943,10 +1943,8 @@ impl App {
                             }
                             _ => crate::conn_card::CardRow::Kind,
                         };
-                        if let Some(c) = self
-                            .windows
-                            .get_mut(&wid)
-                            .and_then(|ws| ws.conn_card_mut())
+                        if let Some(c) =
+                            self.windows.get_mut(&wid).and_then(|ws| ws.conn_card_mut())
                         {
                             c.cycle_row(row, 1);
                         }

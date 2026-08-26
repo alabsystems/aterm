@@ -18,8 +18,8 @@ use std::time::Instant;
 use crate::app_mouse::note_selection_custody;
 use crate::{App, term_lock};
 use aterm_core::search::{SearchDirection as EngineSearchDirection, SearchMatch};
-use aterm_core::terminal::Terminal;
 use aterm_core::selection::{SelectionSide, SelectionType};
+use aterm_core::terminal::Terminal;
 
 /// Direction of an incremental terminal search. Forward is the legacy Cmd-F
 /// default; backward is selected by Cmd-R/Ctrl-R and makes every query recompute
@@ -40,7 +40,6 @@ impl SearchDirection {
             Self::Backward
         }
     }
-
 
     #[cfg(test)]
     fn initial_index(self, match_count: usize) -> usize {
@@ -2798,5 +2797,4 @@ mod tests {
              the `custody` verb answers a stale transition beside a changed selection"
         );
     }
-
 }

@@ -5846,8 +5846,14 @@ mod tests {
                     )
                 })
             };
-            assert!(bar(&selected), "{label}: the selected row has no rail indicator");
-            assert!(!bar(&resting), "{label}: a resting row grew a rail indicator");
+            assert!(
+                bar(&selected),
+                "{label}: the selected row has no rail indicator"
+            );
+            assert!(
+                !bar(&resting),
+                "{label}: a resting row grew a rail indicator"
+            );
 
             // 2. The rim: an accent stroke around the row itself.
             let rim = |prims: &[DrawPrim]| {
@@ -5859,8 +5865,14 @@ mod tests {
                     )
                 })
             };
-            assert!(rim(&selected), "{label}: the selected row has no accent rim");
-            assert!(!rim(&resting), "{label}: a resting rail row grew an accent rim");
+            assert!(
+                rim(&selected),
+                "{label}: the selected row has no accent rim"
+            );
+            assert!(
+                !rim(&resting),
+                "{label}: a resting rail row grew an accent rim"
+            );
 
             // 3. The label: semibold, and painted in the accent.
             let bold_accent = selected.iter().any(|p| {

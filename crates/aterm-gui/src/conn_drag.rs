@@ -142,7 +142,11 @@ impl ConnDragState {
     /// `Wake::ConnDragBegin` entry): born dragging, screen-space coordinates.
     /// The release-in-place menu path never reaches the App for a native
     /// press — the strip opens its own `NSMenu` in-process.
-    pub(crate) fn native_drag(src_window: WindowId, src_tab: usize, src_session: SessionId) -> Self {
+    pub(crate) fn native_drag(
+        src_window: WindowId,
+        src_tab: usize,
+        src_session: SessionId,
+    ) -> Self {
         Self {
             src_window,
             src_tab,

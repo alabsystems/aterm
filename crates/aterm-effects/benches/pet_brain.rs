@@ -136,17 +136,15 @@ use std::time::Instant as WallInstant;
 
 use aterm_core::render::FreeSprite;
 use aterm_effects::cat_baker::CatColorKey;
-use aterm_effects::kitty_pet::{
-    PetAction, PetBrain, PetFrame, PetMoteKind, PetSense, PetSpecies,
-};
+use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetMoteKind, PetSense, PetSpecies};
 use aterm_effects::robi::{CYCLE_MS, MAX_HANDHOLDS, RobiFrame, RobiSense, RobiShow, WANDER_END};
 use aterm_effects::robi_glyphs_gen::RobiGlyphId;
 use aterm_effects::word_decorations::{EffectGeom, PetCursorFrame, WordDecorations};
+use aterm_time::Instant;
 use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, black_box, criterion_group, criterion_main,
 };
-use aterm_time::Instant;
 
 // ---------------------------------------------------------------- geometry --
 
@@ -322,7 +320,11 @@ fn arm_chase(r: &mut BrainRig) {
     r.feed();
     let leg = CHASE_HI - CHASE_LO;
     let k = (r.n / CHASE_STRIDE) % (2 * leg);
-    let col = if k < leg { CHASE_LO + k } else { CHASE_HI - (k - leg) };
+    let col = if k < leg {
+        CHASE_LO + k
+    } else {
+        CHASE_HI - (k - leg)
+    };
     r.caret = Some((25, col as u16));
 }
 
@@ -608,7 +610,10 @@ fn verify_chase(r: &mut BrainRig) -> BrainSampled {
 fn verify_bound(r: &mut BrainRig) -> BrainSampled {
     let s = run_brain(r, arm_bound, SAMPLE_FRAMES);
     report_brain("screen_bound_flights", "100-col teleport / 2 s", &s);
-    assert_eq!(s.lit, SAMPLE_FRAMES, "screen_bound_flights: pet not visible");
+    assert_eq!(
+        s.lit, SAMPLE_FRAMES,
+        "screen_bound_flights: pet not visible"
+    );
     // Measured: 180 airborne and 70 dust frames per 600 (5 teleports) —
     // 36 flight + 14 dust frames per bound, every bound.
     assert!(
@@ -1261,7 +1266,11 @@ fn pet_brain(c: &mut Criterion) {
              zero proves nothing"
         );
         let s = run_robi(&mut robi_tip, SAMPLE_FRAMES);
-        report_robi("robi_jacks_tip_window", "jacks stage, tip up: pick_tip/frame", &s);
+        report_robi(
+            "robi_jacks_tip_window",
+            "jacks stage, tip up: pick_tip/frame",
+            &s,
+        );
         assert_eq!(s.some, s.frames, "robi_jacks_tip_window: dropped frames");
         assert_eq!(
             s.tips, s.frames,
@@ -1303,8 +1312,15 @@ fn pet_brain(c: &mut Criterion) {
     // constant of the cycle — asserted exactly.
     let cycle_frames = (CYCLE_MS / ROBI_DT_MS) as usize;
     let cycle_s = run_robi(&mut robi_cycle, cycle_frames);
-    report_robi("robi_full_cycle", "one whole 76 s cycle, every phase once", &cycle_s);
-    assert_eq!(cycle_s.some, cycle_s.frames, "robi_full_cycle: dropped frames");
+    report_robi(
+        "robi_full_cycle",
+        "one whole 76 s cycle, every phase once",
+        &cycle_s,
+    );
+    assert_eq!(
+        cycle_s.some, cycle_s.frames,
+        "robi_full_cycle: dropped frames"
+    );
     // Measured: exactly 650 tip frames — the two 5.2 s windows on the 16 ms
     // phase grid. The ±10 margin is ±160 ms of window drift; a real change
     // to the tip schedule moves this by whole seconds' worth of frames.
@@ -1438,14 +1454,26 @@ fn pet_brain(c: &mut Criterion) {
         bench_count(&mut group, "zee_lane/sprites", zee_s.sprites);
         bench_count(&mut group, "dust_burst/mote_sprites", dust_s.motes);
         bench_count(&mut group, "body_only/sprites", body_s.sprites);
-        bench_count(&mut group, "bound_flights/airborne_frames", bound_s.airborne);
+        bench_count(
+            &mut group,
+            "bound_flights/airborne_frames",
+            bound_s.airborne,
+        );
         bench_count(&mut group, "bound_flights/dust_frames", bound_s.dust_frames);
-        bench_count(&mut group, "typing_chase/gait_frames", chase_s.moving + chase_s.airborne);
+        bench_count(
+            &mut group,
+            "typing_chase/gait_frames",
+            chase_s.moving + chase_s.airborne,
+        );
         bench_count(&mut group, "ink_eviction/divergent_frames", ink_divergent);
         bench_count(&mut group, "robi_full_cycle/tip_frames", cycle_s.tips);
         // The retired workload's count IS zero by assertion; record its
         // control's lit count instead so the pair stays visible in baselines.
-        bench_count(&mut group, "retired_control/lit_frames", retired_control_lit);
+        bench_count(
+            &mut group,
+            "retired_control/lit_frames",
+            retired_control_lit,
+        );
         group.finish();
     }
 }

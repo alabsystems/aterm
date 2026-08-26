@@ -253,7 +253,10 @@ mod tests {
             assert_eq!(s.observe_launch(1235).unwrap(), 1);
             assert_eq!(s.forgive_launch(1235).unwrap(), 0);
         }
-        assert!(!s.should_revert(1235, 3), "forgiven launches are not a loop");
+        assert!(
+            !s.should_revert(1235, 3),
+            "forgiven launches are not a loop"
+        );
         // ...but a candidate that DIED keeps its count, and forgiveness never
         // undercounts below zero or reaches into another build's sentinel.
         assert_eq!(s.observe_launch(1235).unwrap(), 1);

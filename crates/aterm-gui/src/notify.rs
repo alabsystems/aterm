@@ -45,7 +45,10 @@
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
 // channel-draining stub (`spawn_delivery`), so the real-notification
 // helpers/fields are intentionally unused there.
-#![cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code, unused_imports))]
+#![cfg_attr(
+    not(any(target_os = "macos", windows)),
+    allow(dead_code, unused_imports)
+)]
 
 use std::collections::HashSet;
 use std::sync::Arc;

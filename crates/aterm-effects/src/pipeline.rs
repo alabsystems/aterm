@@ -31,8 +31,8 @@
 //! effects (the native default is ON per the 2026-06-30 flips, but an embedder
 //! opts in explicitly — its config surface owns the default).
 
-use std::time::Duration;
 use aterm_time::Instant;
+use std::time::Duration;
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ContentScrollState, Terminal};
@@ -1358,7 +1358,8 @@ impl EffectsPipeline {
                     .get(col)
                     .map_or(' ', |cell| if cell.wide { '\0' } else { cell.ch })
             }));
-            self.glow.observe_row(row, col, &self.row_probe_scratch, now);
+            self.glow
+                .observe_row(row, col, &self.row_probe_scratch, now);
         }
 
         // Why: native suppresses unfocused animation with a motion-policy
@@ -1836,7 +1837,10 @@ mod tests {
         term.process(&b"history\r\n".repeat(12));
         term.scroll_display(1);
         term.cell_frame_into(&mut input, 5, 16);
-        assert!(input.display_offset > 0, "fixture extracted retained history");
+        assert!(
+            input.display_offset > 0,
+            "fixture extracted retained history"
+        );
         assert!(
             !input.cursor_visible,
             "the exact frame snapshot centrally suppresses the DEC cursor"
@@ -1976,7 +1980,10 @@ mod tests {
 
             term.cell_frame_into(&mut input, 5, 16);
             pipeline.apply(&mut term, &mut input, 10, 19);
-            assert!(!before_trail.is_empty(), "cap={cap}: fixture must be charged");
+            assert!(
+                !before_trail.is_empty(),
+                "cap={cap}: fixture must be charged"
+            );
             assert!(
                 pipeline.trail.is_active(),
                 "cap={cap}: an unowned parser generation must not destroy earned light"
@@ -2722,28 +2729,15 @@ mod tests {
         let now = Instant::now();
         p.glow
             .tick(Some((2, 2)), now, &p.glow_cfg, g, &mut p.glow_scratch);
-        p.trail.tick(
-            Some((2, 2)),
-            now,
-            &p.trail_cfg,
-            &mut p.trail_scratch,
-        );
+        p.trail
+            .tick(Some((2, 2)), now, &p.trail_cfg, &mut p.trail_scratch);
         let moved = now + Duration::from_millis(1);
         p.glow.note_synthetic_move(moved);
         p.trail.note_synthetic_move(moved);
-        p.glow.tick(
-            Some((2, 3)),
-            moved,
-            &p.glow_cfg,
-            g,
-            &mut p.glow_scratch,
-        );
-        p.trail.tick(
-            Some((2, 3)),
-            moved,
-            &p.trail_cfg,
-            &mut p.trail_scratch,
-        );
+        p.glow
+            .tick(Some((2, 3)), moved, &p.glow_cfg, g, &mut p.glow_scratch);
+        p.trail
+            .tick(Some((2, 3)), moved, &p.trail_cfg, &mut p.trail_scratch);
         assert!(p.glow.is_active() && p.trail.is_active());
 
         let pending = moved + Duration::from_millis(1);
@@ -2767,22 +2761,13 @@ mod tests {
         p.set_effects_visibility("focused");
         let refocused = pending + Duration::from_millis(1);
         assert_eq!(
-            p.glow.tick(
-                Some((2, 3)),
-                refocused,
-                &p.glow_cfg,
-                g,
-                &mut p.glow_scratch,
-            ),
+            p.glow
+                .tick(Some((2, 3)), refocused, &p.glow_cfg, g, &mut p.glow_scratch,),
             0
         );
         assert_eq!(
-            p.trail.tick(
-                Some((2, 3)),
-                refocused,
-                &p.trail_cfg,
-                &mut p.trail_scratch,
-            ),
+            p.trail
+                .tick(Some((2, 3)), refocused, &p.trail_cfg, &mut p.trail_scratch,),
             0
         );
         assert!(p.glow_scratch.is_empty() && p.trail_scratch.is_empty());
@@ -2868,9 +2853,6 @@ mod tests {
         );
         assert!(!cold.trail.is_active());
     }
-
-
-
 
     /// The trail's gated branch is a hard clear (native does the identical
     /// `enabled &=`), but the trail COLOUR is a config value, not animation —

@@ -477,39 +477,39 @@ pub(crate) fn grid_tree(
         // split into consecutive runs, each its own text run with its own
         // word starts, which is exactly what runs are for.
         for (chunk_index, chunk) in row_chunks(line).into_iter().enumerate() {
-        let line = &chunk;
-        let id = NodeId(ROW_BASE + row as u64 * RUNS_PER_ROW + chunk_index as u64);
-        row_ids.push(id);
-        let mut run = Node::new(Role::TextRun);
-        run.set_value((*line).to_string());
-        run.set_character_lengths(
-            line.chars()
-                .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
-                .collect::<Vec<u8>>(),
-        );
-        run.set_word_starts(word_starts_of(line.strip_suffix('\n').unwrap_or(line)));
-        if let Some(g) = geom {
-            // One character per cell (`push_visible_row` emits exactly one char per
-            // rendered cell, wide-glyph continuations included), so the character index
-            // IS the column. The hard line break is zero-width at the end of the row.
-            let mut positions: Vec<f32> = Vec::with_capacity(line.len());
-            let mut widths: Vec<f32> = Vec::with_capacity(line.len());
-            let col0 = chunk_index * RUN_CHARS;
-            for (i, ch) in line.chars().enumerate() {
-                positions.push(((col0 + i) as f64 * g.cell_w) as f32);
-                widths.push(if ch == '\n' { 0.0 } else { g.cell_w as f32 });
+            let line = &chunk;
+            let id = NodeId(ROW_BASE + row as u64 * RUNS_PER_ROW + chunk_index as u64);
+            row_ids.push(id);
+            let mut run = Node::new(Role::TextRun);
+            run.set_value((*line).to_string());
+            run.set_character_lengths(
+                line.chars()
+                    .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
+                    .collect::<Vec<u8>>(),
+            );
+            run.set_word_starts(word_starts_of(line.strip_suffix('\n').unwrap_or(line)));
+            if let Some(g) = geom {
+                // One character per cell (`push_visible_row` emits exactly one char per
+                // rendered cell, wide-glyph continuations included), so the character index
+                // IS the column. The hard line break is zero-width at the end of the row.
+                let mut positions: Vec<f32> = Vec::with_capacity(line.len());
+                let mut widths: Vec<f32> = Vec::with_capacity(line.len());
+                let col0 = chunk_index * RUN_CHARS;
+                for (i, ch) in line.chars().enumerate() {
+                    positions.push(((col0 + i) as f64 * g.cell_w) as f32);
+                    widths.push(if ch == '\n' { 0.0 } else { g.cell_w as f32 });
+                }
+                run.set_character_positions(positions);
+                run.set_character_widths(widths);
+                let y0 = g.origin_y + row as f64 * g.cell_h;
+                run.set_bounds(Rect {
+                    x0: g.origin_x,
+                    y0,
+                    x1: g.origin_x + snap.cols as f64 * g.cell_w,
+                    y1: y0 + g.cell_h,
+                });
             }
-            run.set_character_positions(positions);
-            run.set_character_widths(widths);
-            let y0 = g.origin_y + row as f64 * g.cell_h;
-            run.set_bounds(Rect {
-                x0: g.origin_x,
-                y0,
-                x1: g.origin_x + snap.cols as f64 * g.cell_w,
-                y1: y0 + g.cell_h,
-            });
-        }
-        nodes.push((id, run));
+            nodes.push((id, run));
         }
     }
 
@@ -687,7 +687,9 @@ mod tests {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
         let update = grid_tree(&snap, Some(GEOM), &[]);
         let grid = node(&update, GRID);
-        let rows: Vec<NodeId> = (0..3).map(|r| NodeId(ROW_BASE + r * RUNS_PER_ROW)).collect();
+        let rows: Vec<NodeId> = (0..3)
+            .map(|r| NodeId(ROW_BASE + r * RUNS_PER_ROW))
+            .collect();
         assert_eq!(grid.children(), rows, "one text run per visible row");
 
         let mut rebuilt = String::new();
@@ -817,7 +819,11 @@ mod tests {
         // The caret at column 281 names the run it actually sits in, with an
         // index inside that run rather than an offset off the end of run 0.
         let sel = grid.text_selection().copied().expect("a caret");
-        assert_eq!(sel.focus.node, NodeId(ROW_BASE + 1), "the SECOND run of row 0");
+        assert_eq!(
+            sel.focus.node,
+            NodeId(ROW_BASE + 1),
+            "the SECOND run of row 0"
+        );
         assert_eq!(sel.focus.character_index, 281 - RUN_CHARS);
     }
 

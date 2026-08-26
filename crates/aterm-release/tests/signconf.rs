@@ -228,7 +228,11 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
     let machine = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
         .expect("a provisioned machine resolves")
         .expect("machine state yields credentials");
-    assert_eq!(machine.pubkey(), expected, "identity derives from machine.key");
+    assert_eq!(
+        machine.pubkey(),
+        expected,
+        "identity derives from machine.key"
+    );
     assert!(
         machine.machine_roster().is_none(),
         "no staged roster in the repo means none is claimed"

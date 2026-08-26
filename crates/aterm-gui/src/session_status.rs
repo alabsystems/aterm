@@ -531,13 +531,15 @@ impl StatusFsm {
                 // to plain `Idle` with no new bytes at all (see `owed_wake`).
                 // `Prompt` never carries the marker — its movement is the
                 // `tail -f &` case, not a keystroke.
-                ShellEvidence::Entering if self.typed_recently(&evidence.activity, now) => Candidate {
-                    phase: Phase::Idle,
-                    confidence: Confidence::Strong,
-                    reasons: vec![Reason::ShellBlock, Reason::ContentActivity],
-                    conflict: false,
-                    outcome: None,
-                },
+                ShellEvidence::Entering if self.typed_recently(&evidence.activity, now) => {
+                    Candidate {
+                        phase: Phase::Idle,
+                        confidence: Confidence::Strong,
+                        reasons: vec![Reason::ShellBlock, Reason::ContentActivity],
+                        conflict: false,
+                        outcome: None,
+                    }
+                }
                 ShellEvidence::Prompt | ShellEvidence::Entering => Candidate {
                     phase: Phase::Idle,
                     confidence: Confidence::Strong,
@@ -2372,7 +2374,10 @@ mod tests {
         ev.activity.content_seq = 2;
         let t1 = t0 + DWELL + Duration::from_millis(10);
         ev.activity.last_input = Some(t1);
-        assert!(fsm.observe(&ev, t1), "the live marker publishes immediately");
+        assert!(
+            fsm.observe(&ev, t1),
+            "the live marker publishes immediately"
+        );
         assert_eq!(
             fsm.status().phase,
             Phase::Idle,
@@ -2459,7 +2464,9 @@ mod tests {
 
         // No more keystrokes will ever land. The event loop must still be
         // told to come back, or the typing subject never decays.
-        let owed = observer.next_wake().expect("a live typing pane owes a wake");
+        let owed = observer
+            .next_wake()
+            .expect("a live typing pane owes a wake");
         assert_eq!(
             owed,
             t2 + QUIET,
@@ -2535,7 +2542,12 @@ mod tests {
             app.session_status.observe(0, &ev, t0 + DWELL),
             "the live typing record publishes"
         );
-        assert!(!app.session_status.status(0).expect("published").settled_idle());
+        assert!(
+            !app.session_status
+                .status(0)
+                .expect("published")
+                .settled_idle()
+        );
 
         // The coordinator observes the Entering block; the reconcile pushes
         // the LIVE verdict, so the typing subject stays up.
@@ -2560,7 +2572,12 @@ mod tests {
             app.session_status.observe(0, &ev, t0 + DWELL + QUIET),
             "the settle publishes"
         );
-        assert!(app.session_status.status(0).expect("published").settled_idle());
+        assert!(
+            app.session_status
+                .status(0)
+                .expect("published")
+                .settled_idle()
+        );
         app.refresh_session_status_chrome(0);
         assert_eq!(
             app.title_summaries.activity(0, &app.config),
@@ -2643,7 +2660,9 @@ mod tests {
             t0 + DWELL < gate,
             "the raw owed wake precedes the gate — the shape under test"
         );
-        let owed = observer.next_wake().expect("a pending candidate owes a wake");
+        let owed = observer
+            .next_wake()
+            .expect("a pending candidate owes a wake");
         assert_eq!(owed, gate, "the armed wake is clamped to the gate");
         assert!(
             observer.due(1, owed),
@@ -2749,12 +2768,18 @@ mod tests {
             !observer.any_due(now),
             "the O(1) gate agrees, so the sweep itself stops running per turn"
         );
-        assert!(observer.due(1, wake), "the armed wake is admissible when it fires");
+        assert!(
+            observer.due(1, wake),
+            "the armed wake is admissible when it fires"
+        );
 
         // An unknown session is NOT charged: it holds no slot, so it owes no
         // deadline and cannot spin the loop, and inserting one here would bank
         // the pool epoch over a session that was never classified.
         observer.note_skipped(404, now);
-        assert!(!observer.knows(404), "a refusal never invents a classification");
+        assert!(
+            !observer.knows(404),
+            "a refusal never invents a classification"
+        );
     }
 }

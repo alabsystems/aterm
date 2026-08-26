@@ -52,13 +52,17 @@ impl ConnectionRecord {
     #[must_use]
     pub fn kind(&self) -> Option<ConnectionKind> {
         let ops: Vec<Op> = self.tokens.iter().map(|(op, _)| *op).collect();
-        [ConnectionKind::Pull, ConnectionKind::Push, ConnectionKind::Both]
-            .into_iter()
-            .find(|kind| {
-                ops.len() == kind.ops().len()
-                    && kind.ops().iter().all(|op| ops.contains(op))
-                    && ops.iter().all(|op| kind.ops().contains(op))
-            })
+        [
+            ConnectionKind::Pull,
+            ConnectionKind::Push,
+            ConnectionKind::Both,
+        ]
+        .into_iter()
+        .find(|kind| {
+            ops.len() == kind.ops().len()
+                && kind.ops().iter().all(|op| ops.contains(op))
+                && ops.iter().all(|op| kind.ops().contains(op))
+        })
     }
 }
 
@@ -509,8 +513,11 @@ pub(crate) fn all_edges(sessions: &Store) -> Vec<aterm_session::Edge> {
         out.extend(rows);
     }
     out.sort_by(|a, b| {
-        (a.src.as_str(), a.dst.as_str(), a.op.as_str())
-            .cmp(&(b.src.as_str(), b.dst.as_str(), b.op.as_str()))
+        (a.src.as_str(), a.dst.as_str(), a.op.as_str()).cmp(&(
+            b.src.as_str(),
+            b.dst.as_str(),
+            b.op.as_str(),
+        ))
     });
     out
 }
@@ -583,7 +590,9 @@ fn fold_roles(out: &mut HashMap<SessionId, SessionRoles>, rows: Vec<aterm_sessio
 /// rows folded. Takes the ALREADY-RELEASED snapshot so no store lock is held
 /// while the per-session table locks are taken briefly (the registry's
 /// clone-then-release discipline, `session_store.rs`).
-fn fold_registry(handles: &[crate::session_store::SessionHandle]) -> HashMap<SessionId, SessionRoles> {
+fn fold_registry(
+    handles: &[crate::session_store::SessionHandle],
+) -> HashMap<SessionId, SessionRoles> {
     let mut out: HashMap<SessionId, SessionRoles> = HashMap::new();
     for h in handles {
         let rows = {
@@ -756,7 +765,10 @@ mod tests {
         // Ops a connection cannot spell (§1.4#2) and unknown strings drop.
         assert_eq!(
             carried_kind(&s(&["config-write", "read-screen", "not-an-op"])),
-            (Some(ConnectionKind::Pull), s(&["config-write", "not-an-op"]))
+            (
+                Some(ConnectionKind::Pull),
+                s(&["config-write", "not-an-op"])
+            )
         );
         assert_eq!(carried_kind(&[]), (None, vec![]));
     }
@@ -809,14 +821,21 @@ mod tests {
         let conn = new_connection_store();
         let (a, _b, nonce) = ids();
         let dst_edges = Mutex::new(EdgeTable::new());
-        for kind in [ConnectionKind::Pull, ConnectionKind::Push, ConnectionKind::Both] {
+        for kind in [
+            ConnectionKind::Pull,
+            ConnectionKind::Push,
+            ConnectionKind::Both,
+        ] {
             assert!(
                 !connect_in(&conn, &a, &a, &dst_edges, &nonce, kind, "test"),
                 "{kind:?} self-loop must be refused"
             );
         }
         assert!(conn.records().is_empty(), "no record behind a refusal");
-        assert!(dst_edges.lock().unwrap().is_empty(), "no row behind a refusal");
+        assert!(
+            dst_edges.lock().unwrap().is_empty(),
+            "no row behind a refusal"
+        );
     }
 
     #[test]
@@ -896,7 +915,14 @@ mod tests {
 
         // kind=pull revokes ONLY the read row; the record survives as Push.
         assert_eq!(
-            disconnect_kind_in(&conn, &a, &b, &dst_edges, Some(ConnectionKind::Pull), "test"),
+            disconnect_kind_in(
+                &conn,
+                &a,
+                &b,
+                &dst_edges,
+                Some(ConnectionKind::Pull),
+                "test"
+            ),
             Some(1)
         );
         let ops: Vec<Op> = dst_edges
@@ -917,7 +943,14 @@ mod tests {
 
         // Filtering the already-gone half is a known-pair no-op (Some(0)).
         assert_eq!(
-            disconnect_kind_in(&conn, &a, &b, &dst_edges, Some(ConnectionKind::Pull), "test"),
+            disconnect_kind_in(
+                &conn,
+                &a,
+                &b,
+                &dst_edges,
+                Some(ConnectionKind::Pull),
+                "test"
+            ),
             Some(0)
         );
 
@@ -929,7 +962,10 @@ mod tests {
         assert!(conn.records().is_empty());
         assert!(dst_edges.lock().unwrap().is_empty());
         // An unknown pair now fails closed.
-        assert_eq!(disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"), None);
+        assert_eq!(
+            disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"),
+            None
+        );
     }
 
     #[test]
@@ -947,7 +983,14 @@ mod tests {
 
         // The push half sweeps by (src, op); pull survives.
         assert_eq!(
-            disconnect_kind_in(&conn, &a, &b, &dst_edges, Some(ConnectionKind::Push), "test"),
+            disconnect_kind_in(
+                &conn,
+                &a,
+                &b,
+                &dst_edges,
+                Some(ConnectionKind::Push),
+                "test"
+            ),
             Some(2)
         );
         let ops: Vec<Op> = dst_edges
@@ -964,7 +1007,10 @@ mod tests {
             disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"),
             Some(1)
         );
-        assert_eq!(disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"), None);
+        assert_eq!(
+            disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"),
+            None
+        );
     }
 
     #[test]
@@ -1075,8 +1121,14 @@ mod tests {
         }
         // The two presets INVERT who drives; the notice must not blur that.
         assert_ne!(controlled, controller);
-        assert!(controlled.contains("this session can now type into"), "{controlled}");
-        assert!(controller.contains("the new session can now type into"), "{controller}");
+        assert!(
+            controlled.contains("this session can now type into"),
+            "{controlled}"
+        );
+        assert!(
+            controller.contains("the new session can now type into"),
+            "{controller}"
+        );
     }
 
     #[test]

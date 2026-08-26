@@ -104,10 +104,7 @@ impl ShellType {
         // whole, and every match below misses. The shell path is data (a config
         // value, a remote handoff, a test fixture), not a fact about this host,
         // so the split is spelled for both.
-        let tail = shell_path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(shell_path);
+        let tail = shell_path.rsplit(['/', '\\']).next().unwrap_or(shell_path);
         let name = tail.to_ascii_lowercase();
         let name = name.strip_suffix(".exe").unwrap_or(&name);
         match name {
@@ -253,7 +250,8 @@ pub fn generate_nonce() -> ShellNonce {
 /// nonce would silently un-gate shell integration, so this fails loud.
 #[cfg(any(unix, windows))]
 fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
-    aterm_uds::rand::fill(buf).expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
+    aterm_uds::rand::fill(buf)
+        .expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
 }
 
 /// `wasm32-unknown-unknown` arm of [`fill_nonce_entropy`].
@@ -271,7 +269,8 @@ fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
 /// the nonce.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
-    getrandom::getrandom(buf).expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
+    getrandom::getrandom(buf)
+        .expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
 }
 
 // Any target that is neither unix, nor windows, nor wasm32-unknown-unknown has

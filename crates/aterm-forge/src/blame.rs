@@ -117,7 +117,13 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
     }
 
     if found.is_empty() {
-        not_found(&mut log, root, &want_name, want_version.as_deref(), &surveys);
+        not_found(
+            &mut log,
+            root,
+            &want_name,
+            want_version.as_deref(),
+            &surveys,
+        );
         return Ok(Outcome { ok: false, log });
     }
 
@@ -151,7 +157,10 @@ fn versions_block(
 ) {
     let _ = writeln!(log, "\n  VERSIONS RESOLVED");
     for (id, cells_with) in found {
-        let where_ = cells_with.iter().map(|i| surveys[*i].cell.name.as_str()).collect::<Vec<_>>();
+        let where_ = cells_with
+            .iter()
+            .map(|i| surveys[*i].cell.name.as_str())
+            .collect::<Vec<_>>();
         let state = patch_state(forks, id);
         let tag = match &state {
             PatchState::Fork { path } => format!("FORKED   {path}"),
@@ -173,7 +182,10 @@ fn versions_block(
         let mut locs: Vec<u64> = found
             .keys()
             .map(|id| {
-                surveys.iter().find_map(|s| s.facts.get(id)).map_or(0, |f| f.loc)
+                surveys
+                    .iter()
+                    .find_map(|s| s.facts.get(id))
+                    .map_or(0, |f| f.loc)
             })
             .collect();
         locs.sort_unstable();
@@ -216,11 +228,16 @@ fn liveness_block(
     let Some(fork) = forks.get(name) else { return };
 
     let _ = writeln!(log, "\n{}", "!".repeat(W_LINE));
-    let _ = writeln!(log, "PATCH LIVENESS DEFECT — the fork does not cover every resolved version");
+    let _ = writeln!(
+        log,
+        "PATCH LIVENESS DEFECT — the fork does not cover every resolved version"
+    );
     let _ = writeln!(log, "{}", "!".repeat(W_LINE));
     for (id, fork_version, cells_with) in &stale {
-        let where_: Vec<&str> =
-            cells_with.iter().map(|i| surveys[*i].cell.name.as_str()).collect();
+        let where_: Vec<&str> = cells_with
+            .iter()
+            .map(|i| surveys[*i].cell.name.as_str())
+            .collect();
         wrap(
             log,
             "  ",
@@ -246,8 +263,11 @@ fn liveness_block(
                 .collect();
             via.sort();
             if !via.is_empty() {
-                let shown: Vec<String> =
-                    via.iter().take(3).map(|p| format!("{} {}", p.name, p.version)).collect();
+                let shown: Vec<String> = via
+                    .iter()
+                    .take(3)
+                    .map(|p| format!("{} {}", p.name, p.version))
+                    .collect();
                 let more = if via.len() > 3 {
                     format!(" (+{} more)", via.len() - 3)
                 } else {
@@ -269,7 +289,11 @@ fn liveness_block(
             }
             let (paths, _) = shortest_paths(&s.graph, id, 1);
             if let Some(path) = paths.first() {
-                let _ = writeln!(log, "  Shortest path to the unpatched copy in {}:", s.cell.name);
+                let _ = writeln!(
+                    log,
+                    "  Shortest path to the unpatched copy in {}:",
+                    s.cell.name
+                );
                 write_path(log, "      ", path);
             }
         }
@@ -313,7 +337,10 @@ fn package_block(
                 log,
                 "  source        crates.io registry — UNPATCHED, while {path} carries the fork at"
             );
-            let _ = writeln!(log, "                {fork_version}. See the DEFECT block above.");
+            let _ = writeln!(
+                log,
+                "                {fork_version}. See the DEFECT block above."
+            );
         }
         PatchState::ForkVersionUnreadable { path } => {
             let _ = writeln!(
@@ -326,11 +353,18 @@ fn package_block(
             );
         }
         PatchState::Registry => {
-            let _ = writeln!(log, "  source        crates.io registry (not forked, not owned)");
+            let _ = writeln!(
+                log,
+                "  source        crates.io registry (not forked, not owned)"
+            );
         }
     }
     if let Some(f) = facts {
-        let lic = if f.license.is_empty() { "license unknown" } else { f.license.as_str() };
+        let lic = if f.license.is_empty() {
+            "license unknown"
+        } else {
+            f.license.as_str()
+        };
         let _ = writeln!(
             log,
             "  facts         {} LOC   {} unsafe tokens   build.rs {}   proc-macro {}   {}",
@@ -343,7 +377,11 @@ fn package_block(
         let _ = writeln!(
             log,
             "                {}",
-            if f.is_third_party { "THIRD-PARTY (not under crates/)" } else { "first-party" }
+            if f.is_third_party {
+                "THIRD-PARTY (not under crates/)"
+            } else {
+                "first-party"
+            }
         );
         if let Some(dir) = &f.root_dir {
             let _ = writeln!(log, "                {}", dir.display());
@@ -353,8 +391,10 @@ fn package_block(
         // contradiction: "PATCHED path package" above a registry path here.
         if let PatchState::Fork { path } = &state {
             let vendored = root.join(path);
-            let measured_here =
-                f.root_dir.as_ref().is_some_and(|d| d.starts_with(&vendored));
+            let measured_here = f
+                .root_dir
+                .as_ref()
+                .is_some_and(|d| d.starts_with(&vendored));
             if !measured_here {
                 let mine = rs_lines(&vendored);
                 let delta = mine as i64 - f.loc as i64;
@@ -378,7 +418,10 @@ fn package_block(
             }
         }
     } else {
-        let _ = writeln!(log, "  facts         not measured — the fact table has no row for it.");
+        let _ = writeln!(
+            log,
+            "  facts         not measured — the fact table has no row for it."
+        );
     }
 
     for i in cells_with {
@@ -392,7 +435,11 @@ fn package_block(
             s.cell.name,
             commas(cost.pkgs as u64),
             commas(cost.loc),
-            if total.1 { format!(">{}", commas(total.0)) } else { commas(total.0) },
+            if total.1 {
+                format!(">{}", commas(total.0))
+            } else {
+                commas(total.0)
+            },
             s.graph.root.name
         );
         if cost.pkgs > 1 {
@@ -403,7 +450,11 @@ fn package_block(
                 .map(|p| format!("{} {}", p.name, p.version))
                 .collect();
             also.sort();
-            let _ = writeln!(log, "      removing it also removes: {}", fit(&also.join(", "), 68));
+            let _ = writeln!(
+                log,
+                "      removing it also removes: {}",
+                fit(&also.join(", "), 68)
+            );
         }
 
         let entries = entry_points(s, id);
@@ -411,15 +462,28 @@ fn package_block(
             let _ = writeln!(
                 log,
                 "      first-party edges responsible: {}",
-                fit(&entries.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "), 62)
+                fit(
+                    &entries
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    62
+                )
             );
         }
         let direct = direct_dependants(&s.graph, id);
         if !direct.is_empty() {
-            let mut d: Vec<String> =
-                direct.iter().map(|p| format!("{} {}", p.name, p.version)).collect();
+            let mut d: Vec<String> = direct
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.version))
+                .collect();
             d.sort();
-            let _ = writeln!(log, "      required directly by: {}", fit(&d.join(", "), 68));
+            let _ = writeln!(
+                log,
+                "      required directly by: {}",
+                fit(&d.join(", "), 68)
+            );
         }
         for (n, p) in paths.iter().enumerate() {
             write_path(log, &format!("      [{:>2}] ", n + 1), p);
@@ -429,7 +493,11 @@ fn package_block(
                 log,
                 "      … {} further path(s) not shown{}",
                 commas(total.0 - paths.len() as u64),
-                if budget_hit { " (the path search hit its bound)" } else { "" }
+                if budget_hit {
+                    " (the path search hit its bound)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -446,7 +514,10 @@ fn not_found(
         Some(v) => format!("{name}@{v}"),
         None => name.to_string(),
     };
-    let _ = writeln!(log, "\n  NOT RESOLVED — `{spec}` is in no surveyed cell's shipped graph.");
+    let _ = writeln!(
+        log,
+        "\n  NOT RESOLVED — `{spec}` is in no surveyed cell's shipped graph."
+    );
     for s in surveys {
         let _ = writeln!(
             log,
@@ -522,7 +593,9 @@ fn depths(g: &Graph) -> BTreeMap<PkgId, usize> {
     let mut queue = std::collections::VecDeque::from([g.root.clone()]);
     while let Some(u) = queue.pop_front() {
         let du = d[&u];
-        let Some(children) = g.edges.get(&u) else { continue };
+        let Some(children) = g.edges.get(&u) else {
+            continue;
+        };
         for v in children {
             if !d.contains_key(v) {
                 d.insert(v.clone(), du + 1);
@@ -541,7 +614,14 @@ fn count_paths(g: &Graph, target: &PkgId) -> (u64, bool) {
     let mut memo: BTreeMap<PkgId, u64> = BTreeMap::new();
     let mut active: BTreeSet<PkgId> = BTreeSet::new();
     let mut saturated = false;
-    let n = walk(target, &g.root, &rev, &mut memo, &mut active, &mut saturated);
+    let n = walk(
+        target,
+        &g.root,
+        &rev,
+        &mut memo,
+        &mut active,
+        &mut saturated,
+    );
     (n, saturated)
 }
 
@@ -592,7 +672,9 @@ fn shortest_paths(g: &Graph, target: &PkgId, want: usize) -> (Vec<Vec<PkgId>>, b
         return (out, false);
     }
     let d = depths(g);
-    let Some(dt) = d.get(target) else { return (out, false) };
+    let Some(dt) = d.get(target) else {
+        return (out, false);
+    };
     let rev = parents_of(g);
 
     let mut heap: BinaryHeap<Reverse<(usize, Vec<PkgId>)>> = BinaryHeap::new();
@@ -654,8 +736,14 @@ fn direct_dependants(g: &Graph, target: &PkgId) -> BTreeSet<PkgId> {
 /// the first-party manifest lines that own this package's presence.
 fn entry_points(s: &CellSurvey, target: &PkgId) -> Vec<PkgId> {
     let anc = ancestors(&s.graph, target);
-    let Some(children) = s.graph.edges.get(&s.graph.root) else { return Vec::new() };
-    children.iter().filter(|c| *c == target || anc.contains(*c)).cloned().collect()
+    let Some(children) = s.graph.edges.get(&s.graph.root) else {
+        return Vec::new();
+    };
+    children
+        .iter()
+        .filter(|c| *c == target || anc.contains(*c))
+        .cloned()
+        .collect()
 }
 
 // ------------------------------------------------------------------ vendor/fork
@@ -671,16 +759,23 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
         )
     })?;
     let doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        format!("{} is not valid TOML: {e} — Fix: repair the manifest first.", manifest.display())
+        format!(
+            "{} is not valid TOML: {e} — Fix: repair the manifest first.",
+            manifest.display()
+        )
     })?;
     let mut out = BTreeMap::new();
-    let Some(table) =
-        doc.get("patch").and_then(|p| p.get("crates-io")).and_then(|c| c.as_table_like())
+    let Some(table) = doc
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.as_table_like())
     else {
         return Ok(out);
     };
     for (name, item) in table.iter() {
-        let Some(rel) = item.get("path").and_then(|p| p.as_str()) else { continue };
+        let Some(rel) = item.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
         let version = std::fs::read_to_string(root.join(rel).join("Cargo.toml"))
             .ok()
             .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
@@ -690,35 +785,54 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             });
-        out.insert(name.to_string(), VendorFork { path: rel.to_string(), version });
+        out.insert(
+            name.to_string(),
+            VendorFork {
+                path: rel.to_string(),
+                version,
+            },
+        );
     }
     Ok(out)
 }
 
 fn patch_state(forks: &BTreeMap<String, VendorFork>, id: &PkgId) -> PatchState {
-    let Some(f) = forks.get(&id.name) else { return PatchState::Registry };
+    let Some(f) = forks.get(&id.name) else {
+        return PatchState::Registry;
+    };
     match &f.version {
-        Some(v) if *v == id.version => PatchState::Fork { path: f.path.clone() },
+        Some(v) if *v == id.version => PatchState::Fork {
+            path: f.path.clone(),
+        },
         Some(v) => PatchState::UnpatchedBesideFork {
             path: f.path.clone(),
             fork_version: v.clone(),
         },
-        None => PatchState::ForkVersionUnreadable { path: f.path.clone() },
+        None => PatchState::ForkVersionUnreadable {
+            path: f.path.clone(),
+        },
     }
 }
 
 /// Versions of `name` in `Cargo.lock`. Used only to explain an absence: a
 /// package in the lock but not in the shipped graph is a dev/build edge.
 fn lock_versions(root: &Path, name: &str) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(root.join("Cargo.lock")) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.lock")) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     let mut hit = false;
     for line in text.lines() {
         let line = line.trim();
-        if let Some(v) = line.strip_prefix("name = \"").and_then(|r| r.strip_suffix('"')) {
+        if let Some(v) = line
+            .strip_prefix("name = \"")
+            .and_then(|r| r.strip_suffix('"'))
+        {
             hit = v == name;
         } else if hit
-            && let Some(v) = line.strip_prefix("version = \"").and_then(|r| r.strip_suffix('"'))
+            && let Some(v) = line
+                .strip_prefix("version = \"")
+                .and_then(|r| r.strip_suffix('"'))
         {
             out.push(v.to_string());
             hit = false;
@@ -754,13 +868,20 @@ fn nearby(name: &str, surveys: &[CellSurvey]) -> Vec<String> {
 /// hanging under the first segment. `indent` may carry a label (`[ 3] `); the
 /// continuation replaces it with blanks so the label reads once, not per line.
 fn write_path(out: &mut String, indent: &str, path: &[PkgId]) {
-    let segs: Vec<String> = path.iter().map(|p| format!("{} {}", p.name, p.version)).collect();
+    let segs: Vec<String> = path
+        .iter()
+        .map(|p| format!("{} {}", p.name, p.version))
+        .collect();
     let hang = " ".repeat(indent.chars().count() + 2);
     let mut line = String::from(indent);
     let mut first = true;
     for (i, seg) in segs.iter().enumerate() {
         let arrow = if i + 1 == segs.len() { "" } else { " ->" };
-        let piece = if first { format!("{seg}{arrow}") } else { format!(" {seg}{arrow}") };
+        let piece = if first {
+            format!("{seg}{arrow}")
+        } else {
+            format!(" {seg}{arrow}")
+        };
         if !first && line.chars().count() + piece.chars().count() > W_LINE {
             let _ = writeln!(out, "{line}");
             line = format!("{hang}{seg}{arrow}");
@@ -812,11 +933,17 @@ mod tests {
             PkgId::new("c", "1"),
             PkgId::new("d", "1"),
         );
-        let mut g = Graph { root: r.clone(), ..Graph::default() };
+        let mut g = Graph {
+            root: r.clone(),
+            ..Graph::default()
+        };
         for n in [&r, &a, &b, &c, &d] {
             g.nodes.insert(n.clone());
         }
-        g.edges.entry(r.clone()).or_default().extend([a.clone(), b.clone()]);
+        g.edges
+            .entry(r.clone())
+            .or_default()
+            .extend([a.clone(), b.clone()]);
         g.edges.entry(a.clone()).or_default().insert(c.clone());
         g.edges.entry(b.clone()).or_default().insert(c.clone());
         g.edges.entry(c.clone()).or_default().insert(d.clone());
@@ -859,13 +986,21 @@ mod tests {
     #[test]
     fn the_workspace_patch_table_is_read_with_its_vendored_versions() {
         let forks = read_forks(&repo_root()).expect("the workspace manifest parses");
-        assert!(forks.contains_key("winnow"), "vendor/winnow is patched in: {forks:?}");
+        assert!(
+            forks.contains_key("winnow"),
+            "vendor/winnow is patched in: {forks:?}"
+        );
         let w = &forks["winnow"];
         assert_eq!(w.path, "vendor/winnow");
-        let v = w.version.clone().expect("vendor/winnow/Cargo.toml carries a literal version");
+        let v = w
+            .version
+            .clone()
+            .expect("vendor/winnow/Cargo.toml carries a literal version");
         assert_eq!(
             patch_state(&forks, &PkgId::new("winnow", v.clone())),
-            PatchState::Fork { path: "vendor/winnow".into() }
+            PatchState::Fork {
+                path: "vendor/winnow".into()
+            }
         );
         // Any OTHER version of a forked name is the defect this verb exists
         // for. Asserted on a SYNTHETIC id on purpose: the shipped graph carries
@@ -874,7 +1009,10 @@ mod tests {
             patch_state(&forks, &PkgId::new("winnow", "1.0.3")),
             PatchState::UnpatchedBesideFork { .. }
         ));
-        assert_eq!(patch_state(&forks, &PkgId::new("serde", "1.0.0")), PatchState::Registry);
+        assert_eq!(
+            patch_state(&forks, &PkgId::new("serde", "1.0.0")),
+            PatchState::Registry
+        );
     }
 
     #[test]
@@ -885,7 +1023,11 @@ mod tests {
             .collect();
         write_path(&mut out, "      ", &long);
         for line in out.lines() {
-            assert!(line.chars().count() <= 100, "{} cols: {line:?}", line.chars().count());
+            assert!(
+                line.chars().count() <= 100,
+                "{} cols: {line:?}",
+                line.chars().count()
+            );
         }
         assert!(out.contains("a-rather-long-package-name-11 0.47.0"));
     }
@@ -916,11 +1058,27 @@ mod tests {
         let cells = ["mac-arm".to_string(), "linux".to_string()];
         let out = run(&root, "winnow", &cells).expect("blame runs");
         assert!(out.ok, "{}", out.log);
-        assert!(out.log.contains("winnow 0.7.15"), "the version is named:\n{}", out.log);
-        assert!(out.log.contains("FORKED"), "the fork is flagged as one:\n{}", out.log);
-        assert!(out.log.contains("vendor/winnow"), "the fork's path is named:\n{}", out.log);
+        assert!(
+            out.log.contains("winnow 0.7.15"),
+            "the version is named:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("FORKED"),
+            "the fork is flagged as one:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("vendor/winnow"),
+            "the fork's path is named:\n{}",
+            out.log
+        );
         for c in &cells {
-            assert!(out.log.contains(c.as_str()), "cell `{c}` is reported:\n{}", out.log);
+            assert!(
+                out.log.contains(c.as_str()),
+                "cell `{c}` is reported:\n{}",
+                out.log
+            );
             assert!(
                 out.log.contains(&format!("cell {c}   dom ")),
                 "cell `{c}` gets a dominator cost:\n{}",
@@ -945,7 +1103,11 @@ mod tests {
             out.log
         );
         for line in out.log.lines() {
-            assert!(line.chars().count() <= 100, "{} cols: {line:?}", line.chars().count());
+            assert!(
+                line.chars().count() <= 100,
+                "{} cols: {line:?}",
+                line.chars().count()
+            );
         }
     }
 
@@ -956,7 +1118,11 @@ mod tests {
         assert!(out.ok, "{}", out.log);
         assert!(out.log.contains("libc 0.2.186"));
         assert!(out.log.contains("path(s) from `aterm`"), "{}", out.log);
-        assert!(out.log.contains("first-party edges responsible:"), "{}", out.log);
+        assert!(
+            out.log.contains("first-party edges responsible:"),
+            "{}",
+            out.log
+        );
     }
 
     #[test]
@@ -965,8 +1131,16 @@ mod tests {
         let out = run(&root, "definitely-not-a-crate", &["mac-arm".into()]).expect("blame runs");
         assert!(!out.ok, "an absent package is a refusal, not a pass");
         assert!(out.log.contains("NOT RESOLVED"));
-        assert!(out.log.contains("mac-arm"), "the refusal names the cells searched:\n{}", out.log);
-        assert!(out.log.contains("Fix:"), "the refusal names the fix:\n{}", out.log);
+        assert!(
+            out.log.contains("mac-arm"),
+            "the refusal names the cells searched:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("Fix:"),
+            "the refusal names the fix:\n{}",
+            out.log
+        );
     }
 
     #[test]
@@ -974,7 +1148,11 @@ mod tests {
         let root = repo_root();
         let out = run(&root, "libc@0.0.1", &["mac-arm".into()]).expect("blame runs");
         assert!(!out.ok);
-        assert!(out.log.contains("IS resolved, but not at 0.0.1"), "{}", out.log);
+        assert!(
+            out.log.contains("IS resolved, but not at 0.0.1"),
+            "{}",
+            out.log
+        );
     }
 
     #[test]

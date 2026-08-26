@@ -247,7 +247,10 @@ mod tests {
     #[test]
     fn prompt_and_shells_claim_nothing_and_executing_names_the_program() {
         let mut slot = AppKittySlot::default();
-        assert!(slot.resolve(Some(&block(BlockState::PromptOnly, None))).is_none());
+        assert!(
+            slot.resolve(Some(&block(BlockState::PromptOnly, None)))
+                .is_none()
+        );
         for state in [BlockState::EnteringCommand, BlockState::Complete] {
             assert!(
                 slot.resolve(Some(&block(state, Some("claude --resume"))))
@@ -285,10 +288,15 @@ mod tests {
         let mut slot = AppKittySlot::default();
         let executing = block(BlockState::Executing, None);
         assert!(slot.resolve(Some(&executing)).is_none());
-        assert!(slot.resolve(Some(&executing)).is_none(), "stable across frames");
+        assert!(
+            slot.resolve(Some(&executing)).is_none(),
+            "stable across frames"
+        );
         let late_e = block(BlockState::Executing, Some("codex exec"));
         assert_eq!(
-            slot.resolve(Some(&late_e)).expect("late 633;E re-resolves").id,
+            slot.resolve(Some(&late_e))
+                .expect("late 633;E re-resolves")
+                .id,
             "codex"
         );
         let done = block(BlockState::Complete, Some("codex exec"));
@@ -309,23 +317,35 @@ mod tests {
         let ls = ident("ls");
         assert!(gate.observe(Some(&ls), t0).is_none());
         assert!(
-            gate.observe(Some(&ls), t0 + Duration::from_millis(300)).is_none(),
+            gate.observe(Some(&ls), t0 + Duration::from_millis(300))
+                .is_none(),
             "300 ms of `ls` earns nothing"
         );
-        assert!(gate.observe(None, t0 + Duration::from_millis(400)).is_none());
+        assert!(
+            gate.observe(None, t0 + Duration::from_millis(400))
+                .is_none()
+        );
         assert!(gate.deadline().is_none(), "home again: nothing pending");
 
         // claude: seen, then held.
         let t1 = t0 + Duration::from_secs(1);
-        assert!(gate.observe(Some(&claude), t1).is_none(), "seen, not yet earned");
-        assert_eq!(gate.deadline(), Some(t1 + TENURE), "the wake is armed at tenure");
+        assert!(
+            gate.observe(Some(&claude), t1).is_none(),
+            "seen, not yet earned"
+        );
+        assert_eq!(
+            gate.deadline(),
+            Some(t1 + TENURE),
+            "the wake is armed at tenure"
+        );
         assert!(
             gate.observe(Some(&claude), t1 + TENURE - Duration::from_millis(1))
                 .is_none(),
             "one ms short: still the base cat"
         );
         assert_eq!(
-            gate.observe(Some(&claude), t1 + TENURE).map(|i| i.id.as_str()),
+            gate.observe(Some(&claude), t1 + TENURE)
+                .map(|i| i.id.as_str()),
             Some("claude"),
             "tenure served: the claude cat"
         );
@@ -358,7 +378,10 @@ mod tests {
                 .map(|i| i.id.as_str()),
             Some("claude")
         );
-        assert!(gate.deadline().is_none(), "the round trip came home: disarmed");
+        assert!(
+            gate.deadline().is_none(),
+            "the round trip came home: disarmed"
+        );
 
         // A settled return to the prompt releases the cat.
         let t_exit2 = t_exit + Duration::from_secs(120);
@@ -385,12 +408,21 @@ mod tests {
         let mut gate = KittyTenure::default();
         let claude = ident("claude");
         gate.observe(Some(&claude), t0);
-        assert!(!gate.poll(t0 + TENURE - Duration::from_millis(1)), "not due: untouched");
+        assert!(
+            !gate.poll(t0 + TENURE - Duration::from_millis(1)),
+            "not due: untouched"
+        );
         assert_eq!(gate.deadline(), Some(t0 + TENURE), "…and still armed");
         assert!(gate.poll(t0 + TENURE), "due: lands (the look moved)");
         assert_eq!(gate.worn().map(|i| i.id.as_str()), Some("claude"));
-        assert!(gate.deadline().is_none(), "…and disarms: nothing left to spin on");
-        assert!(!gate.poll(t0 + TENURE + Duration::from_secs(1)), "idempotent once landed");
+        assert!(
+            gate.deadline().is_none(),
+            "…and disarms: nothing left to spin on"
+        );
+        assert!(
+            !gate.poll(t0 + TENURE + Duration::from_secs(1)),
+            "idempotent once landed"
+        );
 
         // The linger's release, likewise, lands at the wake without a present…
         let t1 = t0 + Duration::from_secs(60);
@@ -404,7 +436,11 @@ mod tests {
         let t2 = t1 + Duration::from_secs(120);
         gate.observe(Some(&vim), t2);
         assert!(gate.poll(t2 + TENURE));
-        assert_eq!(gate.worn().map(|i| i.id.as_str()), Some("vim"), "landed blind");
+        assert_eq!(
+            gate.worn().map(|i| i.id.as_str()),
+            Some("vim"),
+            "landed blind"
+        );
         assert_eq!(
             gate.observe(None, t2 + TENURE + Duration::from_millis(16))
                 .map(|i| i.id.as_str()),
@@ -431,11 +467,18 @@ mod tests {
         gate.observe(Some(&claude), t0 + TENURE);
 
         let t1 = t0 + Duration::from_secs(30);
-        assert_eq!(gate.observe(Some(&vim), t1).map(|i| i.id.as_str()), Some("claude"));
+        assert_eq!(
+            gate.observe(Some(&vim), t1).map(|i| i.id.as_str()),
+            Some("claude")
+        );
         // A stray `git` claim 2 s in restarts the candidate clock…
         let t2 = t1 + Duration::from_secs(2);
         gate.observe(Some(&git), t2);
-        assert_eq!(gate.deadline(), Some(t2 + TENURE), "the clock restarted on git");
+        assert_eq!(
+            gate.deadline(),
+            Some(t2 + TENURE),
+            "the clock restarted on git"
+        );
         // …and vim again 1 s later restarts it once more.
         let t3 = t2 + Duration::from_secs(1);
         gate.observe(Some(&vim), t3);

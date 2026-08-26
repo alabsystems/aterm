@@ -200,8 +200,9 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
 /// `exec "<target>" "$@"` sets argv[0] to the target, which targo's brand detection
 /// reads: the stub is invisible to the tool it launches.
 pub(crate) fn sh_shim_content(target: &Path) -> String {
-    let mut s =
-        String::from("#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec ");
+    let mut s = String::from(
+        "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec ",
+    );
     s.push_str(&sh_shim_quote(target));
     s.push_str(" \"$@\"\n");
     s

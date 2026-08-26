@@ -206,7 +206,11 @@ fn under_a_live_wallpaper_no_background_run_is_elided() {
 /// The band base as a cell's `[r, g, b]` — the composed-row fixture below hands
 /// panes their live default background by colour, and `RenderCell::bg` is bytes.
 fn rgb_bytes(c: u32) -> [u8; 3] {
-    [((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8]
+    [
+        ((c >> 16) & 0xff) as u8,
+        ((c >> 8) & 0xff) as u8,
+        (c & 0xff) as u8,
+    ]
 }
 
 /// SITE COVERAGE — the MID-RUN flush of the uniform run-coalescing path.
@@ -374,8 +378,7 @@ fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
     // that resolved `COLS` runs is proof the per-column arm, and not the
     // coalescing one, did the walking.
     assert_eq!(
-        total,
-        COLS as u32,
+        total, COLS as u32,
         "the composed row resolved {total} run(s), not one per column — the \
          frame is no longer taking the MIXED arm, so this fixture has stopped \
          covering it"

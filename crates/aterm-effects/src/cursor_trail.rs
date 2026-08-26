@@ -19,8 +19,8 @@
 //! fade is unit-testable without sleeping. The renderer is a pure consumer of the
 //! resulting [`TrailCell`]s and never sees this state.
 
-use std::time::Duration;
 use aterm_time::Instant;
+use std::time::Duration;
 
 use aterm_render::TrailCell;
 
@@ -294,9 +294,6 @@ impl CursorTrail {
             .or_else(|| self.last_visible.map(|(cell, _)| cell))
     }
 
-
-
-
     /// HOST KEY-HINT: one PLAIN typed-glyph or Backspace echo keypress (never
     /// Enter/Tab/nav/modified chords). Arms only the [`Self::type_hint`]
     /// re-anchor classifier; see the field doc. It cannot admit a comet.
@@ -305,13 +302,6 @@ impl CursorTrail {
         self.nav_hint = None;
         self.type_hint = Some(now);
     }
-
-
-
-
-
-
-
 
     /// HOST COALESCED TYPING: an embedder may batch several key events between
     /// two render callbacks. One or two cells still fit the typed echo/re-anchor
@@ -362,10 +352,6 @@ impl CursorTrail {
         self.move_hint = None;
     }
 
-
-
-
-
     /// Arm the navigation veto — see `CursorGlow::note_navigation`. It licenses
     /// the following move (a key was pressed) and classifies it as scrubbing,
     /// which the comet deliberately does not paint.
@@ -387,8 +373,6 @@ impl CursorTrail {
     pub fn note_user_gesture(&mut self, now: Instant) {
         self.note_move(now);
     }
-
-
 
     /// Classify a plain Return.
     pub fn note_return(&mut self, now: Instant) {
@@ -412,10 +396,6 @@ impl CursorTrail {
     pub fn note_synthetic_typed(&mut self, now: Instant) {
         self.note_typed(now);
     }
-
-
-
-
 
     /// Cancel only the license written by one not-yet-egressed dispatch. See
     /// `CursorGlow::revoke_input_hints_at` for the host contract.
@@ -1083,9 +1063,6 @@ mod tests {
         assert!(!t.is_active());
     }
 
-
-
-
     /// PTY scrolls carry the classic terminal-cell trail just like the glow
     /// engine's pixel/cell pools. A survivor moves by the exact row delta,
     /// while visible light and classifier anchors that cross the top retire;
@@ -1610,7 +1587,6 @@ mod tests {
         assert!(!ok, "a spent licence must not survive its own echo");
     }
 
-
     #[test]
     fn same_row_jump_spawns_a_bounded_comet_nearest_the_cursor() {
         let mut t = CursorTrail::default();
@@ -1798,8 +1774,6 @@ mod tests {
         assert_ne!(fp, 0, "candidate-backed typing still trails");
         assert!(!out.is_empty());
     }
-
-
 
     /// THE KITTY→BLINK SWAP (trail twin of the glow law): on the ALT screen a
     /// typed classifier alone no longer re-anchors — for a candidate-backed

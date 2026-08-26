@@ -289,7 +289,9 @@ fn read_peer_meta(
     deadline: Instant,
 ) -> Option<Option<PeerMeta>> {
     arm(stream, deadline)?;
-    { stream }.write_all(format!("@{sid} meta\n").as_bytes()).ok()?;
+    { stream }
+        .write_all(format!("@{sid} meta\n").as_bytes())
+        .ok()?;
     { stream }.flush().ok()?;
     let line = read_bounded_line(stream, reader, deadline)?;
     let line = line.trim_end();

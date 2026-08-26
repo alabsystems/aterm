@@ -81,9 +81,7 @@ impl Scrollback {
                 (e, skip)
             })
         } else {
-            let hot_idx = idx
-                .saturating_sub(cold_count)
-                .saturating_sub(warm_count);
+            let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
             match self.hot.get(hot_idx) {
                 Some(line) => Ok(vec![line.clone()]),
                 // In-range index with no hot line: stale aggregate count —

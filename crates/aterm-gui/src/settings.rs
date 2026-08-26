@@ -3044,11 +3044,7 @@ pub(crate) fn paint_rainbow_banner(
     rim: [u8; 3],
 ) {
     let dark_sky = crate::native_appearance::surface_is_dark(sky);
-    let (arch_alpha, glint_alpha) = if dark_sky {
-        (0x86, 0xC4)
-    } else {
-        (0x46, 0x6E)
-    };
+    let (arch_alpha, glint_alpha) = if dark_sky { (0x86, 0xC4) } else { (0x46, 0x6E) };
     prims.push(DrawPrim::Panel {
         x,
         y,
@@ -7287,10 +7283,14 @@ mod tests {
             .iter()
             .find(|f| f.key == crate::prefs::EDIT_CURSOR_TRAIL)
             .expect("cursor_trail row");
-        // Default resolved state is ON (owner batteries-on default), so the first toggle writes "false".
+        // A Bool row toggles AWAY FROM ITS RESOLVED SEED, whatever that seed is. The
+        // trail's absent-key default is platform-split
+        // (`app_config::DEFAULT_DECORATIVE_EFFECTS`), so the mechanic — not a literal —
+        // is what this pins, and it is pinned on every platform.
+        let flipped = (!crate::app_config::DEFAULT_DECORATIVE_EFFECTS).to_string();
         assert_eq!(
             cycle_edit(trail),
-            Some((crate::prefs::EDIT_CURSOR_TRAIL, Some("false".to_string())))
+            Some((crate::prefs::EDIT_CURSOR_TRAIL, Some(flipped)))
         );
     }
 
@@ -7706,10 +7706,15 @@ mod tests {
         let s = SettingsState::from_config(&cfg());
         let by_key = |k: &str| s.fields.iter().find(|f| f.key == k).unwrap();
 
-        // Bool: either direction toggles (default cursor_trail resolves ON → "false").
+        // Bool: either direction toggles AWAY FROM THE RESOLVED SEED — which for the
+        // trail is platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`), so the
+        // expectation is derived rather than typed, and holds on every platform.
         assert_eq!(
             step_edit(by_key(crate::prefs::EDIT_CURSOR_TRAIL), -1, false),
-            Some((crate::prefs::EDIT_CURSOR_TRAIL, Some("false".to_string())))
+            Some((
+                crate::prefs::EDIT_CURSOR_TRAIL,
+                Some((!crate::app_config::DEFAULT_DECORATIVE_EFFECTS).to_string())
+            ))
         );
 
         // Bounded numeric: one step, Shift = ×10, clamped; the rail returns None.

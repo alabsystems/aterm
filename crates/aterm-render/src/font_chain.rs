@@ -238,8 +238,6 @@ pub const fn io_free_mask(policy: ChainPolicy) -> u8 {
     reachable_mask(policy) & !Tier::RuntimeDecisions.bit()
 }
 
-/// Walk the chain. Pure: every fact comes from `probe`, every policy bit from
-
 /// Whether `ch` sits in a Private Use Area — the BMP block plus both
 /// supplementary planes. Used by [`ChainPolicy::prefers_symbol`]; see that
 /// field for why PUA reorders the chain.

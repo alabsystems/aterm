@@ -611,7 +611,10 @@ fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Stri
     s.push_str("complete -c aterm -n '__fish_seen_subcommand_from ctl' -a '");
     s.push_str(ctl_verbs);
     s.push_str("'\n");
-    push_fish_ctl_flags(&mut s, "complete -c aterm -n '__fish_seen_subcommand_from ctl' ");
+    push_fish_ctl_flags(
+        &mut s,
+        "complete -c aterm -n '__fish_seen_subcommand_from ctl' ",
+    );
     // The ONE binary also fronts `aterm conn` (the session-connections CLI,
     // SESSION_CONNECTIONS.md §6.1), implemented in this crate — so its subverbs
     // complete here, gated behind a seen `conn`, exactly as `ctl`'s do.
@@ -668,7 +671,8 @@ fn front_door_completions_result(
             "--completions requires a shell name (bash, zsh, or fish)",
         ));
     };
-    let script = front_door_completion_script(shell, verbs, flags).ok_or_else(unknown_shell_error)?;
+    let script =
+        front_door_completion_script(shell, verbs, flags).ok_or_else(unknown_shell_error)?;
     let stdout = stdout_handle();
     let mut out = stdout.lock();
     out.write_all(script.as_bytes())?;
@@ -3380,7 +3384,10 @@ mod tests {
     #[test]
     fn front_door_completions_complete_aterm_and_carry_the_ctl_surface() {
         let verbs = ["help", "ctl", "pkg", "fleet", "drive"];
-        let flags = [("--window", "open the GPU window"), ("--version", "print the version")];
+        let flags = [
+            ("--window", "open the GPU window"),
+            ("--version", "print the version"),
+        ];
         for (shell, wiring) in [
             ("bash", "complete -F _aterm aterm\n"),
             ("zsh", "#compdef aterm\n"),
@@ -3410,7 +3417,10 @@ mod tests {
                     spec.name
                 );
             }
-            assert!(script.contains("ls instances"), "{shell} has the client verbs");
+            assert!(
+                script.contains("ls instances"),
+                "{shell} has the client verbs"
+            );
             let sock = if shell == "fish" { "-l sock" } else { "--sock" };
             assert!(script.contains(sock), "{shell} has the ctl flags");
         }

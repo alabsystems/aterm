@@ -1045,4 +1045,3 @@ mod tests {
         assert_eq!(got, legacy_results(&t, "needle"));
     }
 }
-

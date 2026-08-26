@@ -1019,8 +1019,14 @@ mod tests {
         let mut st = staged_status();
         st.installable = false;
         let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
-        assert!(p.staged.is_none(), "a stage it cannot apply is not this copy's");
-        assert!(p.changelog.is_empty(), "…nor are that build's release notes");
+        assert!(
+            p.staged.is_none(),
+            "a stage it cannot apply is not this copy's"
+        );
+        assert!(
+            p.changelog.is_empty(),
+            "…nor are that build's release notes"
+        );
         assert!(p.outcome.is_empty(), "…nor the check verdict it never ran");
         assert_eq!(p.headline, "This copy of aterm can\u{2019}t update itself.");
 
@@ -1083,7 +1089,10 @@ mod tests {
         let p = s.projection();
         assert_eq!(p.headline, "This copy of aterm can\u{2019}t update itself.");
         let detail = p.detail.expect("detail");
-        assert!(detail.contains("Applications"), "…and how to fix it: {detail}");
+        assert!(
+            detail.contains("Applications"),
+            "…and how to fix it: {detail}"
+        );
         // The same state WITH a replaceable bundle is the ordinary healthy line.
         st.installable = true;
         let ok = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
@@ -1099,11 +1108,20 @@ mod tests {
         st.outcome = "staged 0.5.15 (build 830) — verified and ready to apply".to_string();
         let s = UpdateState::from_status(828, "0.5.14", Some(&st), false);
         let p = s.projection();
-        assert!(p.failing_persistent, "the projection no longer masks a failure while staged");
+        assert!(
+            p.failing_persistent,
+            "the projection no longer masks a failure while staged"
+        );
         assert_eq!(p.headline, "Update ready, but it keeps failing to apply.");
         let detail = p.detail.expect("detail");
-        assert!(detail.contains("build 830") && detail.contains("failed"), "{detail}");
-        assert!(!detail.contains("ready to apply"), "not the ledger's healthy sentence: {detail}");
+        assert!(
+            detail.contains("build 830") && detail.contains("failed"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("ready to apply"),
+            "not the ledger's healthy sentence: {detail}"
+        );
 
         // AN ACQUISITION-CLASS streak is a different statement: the stage in hand is
         // fine and will install; what is failing is fetching the NEXT build.
@@ -1116,7 +1134,10 @@ mod tests {
         assert!(p.failing_persistent && !p.apply_is_failing);
         assert_eq!(p.headline, "Update ready");
         let detail = p.detail.expect("detail");
-        assert!(detail.contains("CHECKS are failing") && detail.contains("manifest"), "{detail}");
+        assert!(
+            detail.contains("CHECKS are failing") && detail.contains("manifest"),
+            "{detail}"
+        );
     }
 
     #[test]

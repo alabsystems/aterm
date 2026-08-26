@@ -347,24 +347,23 @@ impl Terminal {
         let mut rows_emitted = 0usize;
         let mut truncated = false;
 
-            // Rectangular selection: extract adjusted columns from each row
-            for row in first_row..=last_row {
-                if rows_emitted >= max_rows || result.len() >= max_bytes {
+        // Rectangular selection: extract adjusted columns from each row
+        for row in first_row..=last_row {
+            if rows_emitted >= max_rows || result.len() >= max_bytes {
+                truncated = true;
+                break;
+            }
+            rows_emitted += 1;
+            if row > first_row {
+                result.push('\n');
+            }
+            if let Some(line) = self.get_line_text(row, Some((adj_start_col, adj_end_col))) {
+                if push_row_capped(result, &line, max_bytes) {
                     truncated = true;
                     break;
                 }
-                rows_emitted += 1;
-                if row > first_row {
-                    result.push('\n');
-                }
-                if let Some(line) = self.get_line_text(row, Some((adj_start_col, adj_end_col)))
-                {
-                    if push_row_capped(result, &line, max_bytes) {
-                        truncated = true;
-                        break;
-                    }
-                }
             }
+        }
 
         (rows_emitted, truncated)
     }
@@ -396,92 +395,92 @@ impl Terminal {
         let mut rows_emitted = 0usize;
         let mut truncated = false;
 
-            for row in first_row..=last_row {
-                if rows_emitted >= max_rows || result.len() >= max_bytes {
+        for row in first_row..=last_row {
+            if rows_emitted >= max_rows || result.len() >= max_bytes {
+                truncated = true;
+                break;
+            }
+            rows_emitted += 1;
+            // ONE tier fetch per HISTORY row (SCR-4). This loop used to
+            // resolve every scrollback row TWICE — once below for the
+            // soft-wrap bit and once inside `get_line_text` for the text
+            // — i.e. 2N-1 tier reads for an N-row selection, where each
+            // read is a full `Line` construction on the ring path
+            // (Row -> String + RLE attrs + hyperlink clone) or a `Line`
+            // CLONE out of the decompressed block on warm/cold. The two
+            // uses are hoisted onto one `Cow<Line>` here; both leaves
+            // below read it instead of re-entering the tiers.
+            //
+            // Behaviour is identical by construction: the wrap flag is
+            // the same `Line::is_wrapped()` off the same line, and the
+            // text branch inlines exactly what `get_line_text`'s
+            // negative-row arm does with the same column range and the
+            // same `MAX_SCROLLBACK_LINE_SCAN_BYTES` ceiling. Live rows
+            // (`row >= 0`) keep going through `get_line_text` unchanged
+            // — they never touched the tiers to begin with.
+            let history_line = if row < 0 {
+                usize::try_from(-(i64::from(row)) - 1)
+                    .ok()
+                    .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
+            } else {
+                None
+            };
+            if row > first_row {
+                // Only insert newline if this row is NOT a soft-wrap continuation.
+                // Row::is_wrapped() / Line::is_wrapped() means "this row continues
+                // the previous row's content" (soft wrap, not a hard line break).
+                #[allow(
+                    clippy::redundant_closure_for_method_calls,
+                    reason = "private row/line types prevent method-reference shorthand"
+                )]
+                let is_continuation = if row >= 0 && row < visible_rows {
+                    // LIVE-frame read: selection rows are terminal-relative
+                    // (see get_line_text), so the display-mapped Grid::row
+                    // would test the wrong row's wrap flag while scrolled.
+                    u16::try_from(row)
+                        .ok()
+                        .and_then(|idx| self.grid.row_at_screen(idx))
+                        .is_some_and(|r| r.is_wrapped())
+                } else if row < 0 {
+                    history_line.as_ref().is_some_and(|l| l.is_wrapped())
+                } else {
+                    false
+                };
+                if !is_continuation {
+                    result.push('\n');
+                }
+            }
+
+            let start_col = if row == adj_start_row {
+                adj_start_col
+            } else {
+                0
+            };
+            let end_col = if row == adj_end_row {
+                adj_end_col
+            } else {
+                cols - 1
+            };
+
+            let line = if row < 0 {
+                history_line.as_ref().map(|stored| {
+                    scrollback_line_range_text(
+                        stored.as_bytes(),
+                        start_col,
+                        end_col,
+                        MAX_SCROLLBACK_LINE_SCAN_BYTES,
+                    )
+                })
+            } else {
+                self.get_line_text(row, Some((start_col, end_col)))
+            };
+            if let Some(line) = line {
+                if push_row_capped(result, &line, max_bytes) {
                     truncated = true;
                     break;
                 }
-                rows_emitted += 1;
-                // ONE tier fetch per HISTORY row (SCR-4). This loop used to
-                // resolve every scrollback row TWICE — once below for the
-                // soft-wrap bit and once inside `get_line_text` for the text
-                // — i.e. 2N-1 tier reads for an N-row selection, where each
-                // read is a full `Line` construction on the ring path
-                // (Row -> String + RLE attrs + hyperlink clone) or a `Line`
-                // CLONE out of the decompressed block on warm/cold. The two
-                // uses are hoisted onto one `Cow<Line>` here; both leaves
-                // below read it instead of re-entering the tiers.
-                //
-                // Behaviour is identical by construction: the wrap flag is
-                // the same `Line::is_wrapped()` off the same line, and the
-                // text branch inlines exactly what `get_line_text`'s
-                // negative-row arm does with the same column range and the
-                // same `MAX_SCROLLBACK_LINE_SCAN_BYTES` ceiling. Live rows
-                // (`row >= 0`) keep going through `get_line_text` unchanged
-                // — they never touched the tiers to begin with.
-                let history_line = if row < 0 {
-                    usize::try_from(-(i64::from(row)) - 1)
-                        .ok()
-                        .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
-                } else {
-                    None
-                };
-                if row > first_row {
-                    // Only insert newline if this row is NOT a soft-wrap continuation.
-                    // Row::is_wrapped() / Line::is_wrapped() means "this row continues
-                    // the previous row's content" (soft wrap, not a hard line break).
-                    #[allow(
-                        clippy::redundant_closure_for_method_calls,
-                        reason = "private row/line types prevent method-reference shorthand"
-                    )]
-                    let is_continuation = if row >= 0 && row < visible_rows {
-                        // LIVE-frame read: selection rows are terminal-relative
-                        // (see get_line_text), so the display-mapped Grid::row
-                        // would test the wrong row's wrap flag while scrolled.
-                        u16::try_from(row)
-                            .ok()
-                            .and_then(|idx| self.grid.row_at_screen(idx))
-                            .is_some_and(|r| r.is_wrapped())
-                    } else if row < 0 {
-                        history_line.as_ref().is_some_and(|l| l.is_wrapped())
-                    } else {
-                        false
-                    };
-                    if !is_continuation {
-                        result.push('\n');
-                    }
-                }
-
-                let start_col = if row == adj_start_row {
-                    adj_start_col
-                } else {
-                    0
-                };
-                let end_col = if row == adj_end_row {
-                    adj_end_col
-                } else {
-                    cols - 1
-                };
-
-                let line = if row < 0 {
-                    history_line.as_ref().map(|stored| {
-                        scrollback_line_range_text(
-                            stored.as_bytes(),
-                            start_col,
-                            end_col,
-                            MAX_SCROLLBACK_LINE_SCAN_BYTES,
-                        )
-                    })
-                } else {
-                    self.get_line_text(row, Some((start_col, end_col)))
-                };
-                if let Some(line) = line {
-                    if push_row_capped(result, &line, max_bytes) {
-                        truncated = true;
-                        break;
-                    }
-                }
             }
+        }
 
         (rows_emitted, truncated)
     }

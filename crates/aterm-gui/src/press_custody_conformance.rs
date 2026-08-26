@@ -314,7 +314,11 @@ fn arm(term: &Arc<Mutex<Terminal>>) {
 
 /// Read back what the step recorded, requiring that it recorded SOMETHING and that it
 /// recorded the RIGHT thing.
-fn recorded(term: &Arc<Mutex<Terminal>>, expect: CustodyTransition, what: &str) -> CustodyTransition {
+fn recorded(
+    term: &Arc<Mutex<Terminal>>,
+    expect: CustodyTransition,
+    what: &str,
+) -> CustodyTransition {
     let got = term_lock(term).take_custody_transition();
     assert_eq!(
         got,
@@ -457,7 +461,11 @@ fn damaged_rows_case(validated: &mut usize) {
     {
         let mut t = term_lock(&term);
         arm_selection(&mut t, 0, 1);
-        assert_eq!(t.grid().display_offset(), 0, "the tail-follower owns the view");
+        assert_eq!(
+            t.grid().display_offset(),
+            0,
+            "the tail-follower owns the view"
+        );
     }
     let mut c = Press::new();
     let next = step(
@@ -997,7 +1005,11 @@ fn output_batches(validated: &mut usize) {
             },
             validated,
         );
-        assert_eq!([next[0], next[1], next[2]], [0, 0, 0], "same law, other route");
+        assert_eq!(
+            [next[0], next[1], next[2]],
+            [0, 0, 0],
+            "same law, other route"
+        );
     }
 }
 
@@ -1168,4 +1180,3 @@ pub(crate) fn run_conformance() {
         rejected.len()
     );
 }
-

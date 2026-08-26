@@ -1596,10 +1596,8 @@ mod win32 {
         } else {
             owner_hwnd
         };
-        let style = MB_OK
-            | MB_ICONWARNING
-            | MB_SETFOREGROUND
-            | if owner == 0 { MB_TASKMODAL } else { 0 };
+        let style =
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | if owner == 0 { MB_TASKMODAL } else { 0 };
         // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the
         // (modal, synchronous) call; the owner HWND is either 0 or live.
         unsafe {
@@ -13787,19 +13785,13 @@ impl App {
     /// its own tree. With no AT attached this is a single bool test — see
     /// [`WindowState::a11y_active`], which is what actually makes that true; before the latch
     /// existed the whole tree was materialised first and only then discarded.
-    #[cfg(all(
-        a11y_tree,
-        not(all(target_os = "macos", feature = "a11y-appkit"))
-    ))]
+    #[cfg(all(a11y_tree, not(all(target_os = "macos", feature = "a11y-appkit"))))]
     fn update_accessibility(&mut self, id: WindowId, _window: &Window) {
         self.push_a11y_tree(id);
     }
 
     /// No-op accessibility publish (neither a11y feature enabled).
-    #[cfg(not(any(
-        all(target_os = "macos", feature = "a11y-appkit"),
-        a11y_tree
-    )))]
+    #[cfg(not(any(all(target_os = "macos", feature = "a11y-appkit"), a11y_tree)))]
     #[inline]
     fn update_accessibility(&mut self, _id: WindowId, _window: &Window) {}
 
@@ -20261,8 +20253,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
              adopted master and exiting before any window so the outgoing process keeps every \
              session. This binary is build {} commit {}.",
             seamless_adopt.len(),
-            if ready_admitted { "admitted" } else { "REFUSED" },
-            if commit_admitted { "admitted" } else { "REFUSED" },
+            if ready_admitted {
+                "admitted"
+            } else {
+                "REFUSED"
+            },
+            if commit_admitted {
+                "admitted"
+            } else {
+                "REFUSED"
+            },
             build_info::BUILD_NUMBER,
             build_info::GIT_COMMIT
         );
@@ -24759,7 +24759,11 @@ mod multi_window_tests {
         );
 
         // NOTHING WAS CREATED. This is the anti-leak assertion.
-        assert_eq!(app.pool.iter().count(), sessions_before, "no session pooled");
+        assert_eq!(
+            app.pool.iter().count(),
+            sessions_before,
+            "no session pooled"
+        );
         assert_eq!(
             app.next_session_id, next_id_before,
             "not even a session id was burned"
@@ -24854,7 +24858,11 @@ mod multi_window_tests {
             "Split refused: this pane is 19x24 cells; a left/right split needs at least 33x3",
             "the refusal names the UNZOOMED pane"
         );
-        assert_eq!(app.pool.iter().count(), sessions_before, "no session pooled");
+        assert_eq!(
+            app.pool.iter().count(),
+            sessions_before,
+            "no session pooled"
+        );
         assert_eq!(
             app.next_session_id, next_id_before,
             "not even a session id was burned"
@@ -35223,7 +35231,9 @@ mod ime_cursor_area_tests {
         let wid = WindowId(0);
         let cell = (4, 9);
         app.report_ime_cursor_area(wid, cell, (0, 0), true);
-        let parked = app.windows[&wid].last_ime_rect.expect("caret rect reported");
+        let parked = app.windows[&wid]
+            .last_ime_rect
+            .expect("caret rect reported");
 
         // Control: the memo is what makes a steady caret free — re-reporting the
         // SAME cell must not disturb it.

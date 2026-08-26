@@ -196,7 +196,9 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
         return Err(format!("no executable at {}", exe.display()));
     }
     let out = output_bounded(
-        Command::new(&exe).arg("--version").env("ATERM_NO_AUTO_UPDATE", "1"),
+        Command::new(&exe)
+            .arg("--version")
+            .env("ATERM_NO_AUTO_UPDATE", "1"),
         "candidate --version probe",
     )?;
     if !out.status.success() {
@@ -209,7 +211,9 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
     // …and it must be the build we are installing. A probe that starts SOME binary
     // proves nothing about this one.
     let text = String::from_utf8_lossy(&out.stdout);
-    if !text.contains(&expected_build.to_string()) && bundle_build_number(app).ok() != Some(expected_build) {
+    if !text.contains(&expected_build.to_string())
+        && bundle_build_number(app).ok() != Some(expected_build)
+    {
         return Err(format!(
             "the staged bundle started but does not report build {expected_build}: {}",
             text.trim()

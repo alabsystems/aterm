@@ -373,8 +373,8 @@ fn build_semantic_candidate(
 #[cfg(test)]
 use std::ops::{Deref, DerefMut};
 
-use aterm_render::chrome_metrics::{baseline_in_row_q, px_to_q, q_round_to_px, q_to_px};
 use aterm_render::Renderer;
+use aterm_render::chrome_metrics::{baseline_in_row_q, px_to_q, q_round_to_px, q_to_px};
 
 use crate::widget::{DrawPrim, SpecimenTextBlending, TerminalSpecimenSpec, TextFace, TextWeight};
 

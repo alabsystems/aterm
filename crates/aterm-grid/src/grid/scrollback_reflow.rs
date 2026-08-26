@@ -174,8 +174,7 @@ impl Grid {
             // is newer than the rewrapped `lines`). Absorb it here as the
             // newest tail of the restored history (fixwave5). The detached
             // window keeps its staged flight output for re-attach instead.
-            if !self.storage.scrollback_detached_for_reflow
-                && !self.storage.lazy_buffer.is_empty()
+            if !self.storage.scrollback_detached_for_reflow && !self.storage.lazy_buffer.is_empty()
             {
                 lines.extend(self.storage.lazy_buffer.drain_all());
             }
@@ -388,7 +387,9 @@ pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -
 /// affects geometry, hence the one flag check).
 fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
     if line.hyperlinks().is_some_and(|spans| !spans.is_empty())
-        || line.underline_colors().is_some_and(|spans| !spans.is_empty())
+        || line
+            .underline_colors()
+            .is_some_and(|spans| !spans.is_empty())
     {
         return false;
     }

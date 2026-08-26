@@ -1408,7 +1408,8 @@ pub(crate) fn cmd_meta(
         Some("set") => {
             let Some(field) = toks.next() else {
                 return (
-                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n".to_string(),
+                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n"
+                        .to_string(),
                     false,
                 );
             };
@@ -1432,7 +1433,8 @@ pub(crate) fn cmd_meta(
                 // On the wire `meta set title ""` is a USAGE ERROR, never a
                 // clear: clearing has its own explicit `meta unset` form.
                 Err(MetaWriteError::Empty) => (
-                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n".to_string(),
+                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n"
+                        .to_string(),
                     false,
                 ),
                 Err(MetaWriteError::ForbiddenFormatting) => (
@@ -1761,7 +1763,13 @@ pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     let Some(edge) = removed else {
         return "ERR no such edge\n".to_string();
     };
-    session_edge_audit::emit(EdgeAction::Revoke, "wire", &edge.src, &edge.dst, edge.op.as_str());
+    session_edge_audit::emit(
+        EdgeAction::Revoke,
+        "wire",
+        &edge.src,
+        &edge.dst,
+        edge.op.as_str(),
+    );
     "OK\n".to_string()
 }
 
@@ -1771,9 +1779,7 @@ pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
 /// `disconnect` ⇒ the whole connection). Any unknown token, empty value, or
 /// missing endpoint is `Err` (the caller's usage string) — an authority-minting
 /// argument gets no guessed default.
-fn parse_connection_args(
-    rest: &str,
-) -> Result<(SessionId, SessionId, Option<ConnectionKind>), ()> {
+fn parse_connection_args(rest: &str) -> Result<(SessionId, SessionId, Option<ConnectionKind>), ()> {
     let (mut dst, mut src, mut kind) = (None, None, None);
     for tok in rest.split_whitespace() {
         if let Some(v) = tok.strip_prefix("dst=") {

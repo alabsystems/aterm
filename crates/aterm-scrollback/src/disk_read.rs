@@ -144,7 +144,9 @@ impl DiskColdTier {
         // dropped-prefix base is added to the query instead. Live indices
         // are exactly the live page indices.
         let live = self.live_cumulative();
-        let target = line_idx.saturating_add(self.cumulative_base).saturating_add(1);
+        let target = line_idx
+            .saturating_add(self.cumulative_base)
+            .saturating_add(1);
         match live.binary_search(&target) {
             Ok(idx) => Some(idx),
             Err(idx) => {

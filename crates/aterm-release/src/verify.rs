@@ -1271,7 +1271,8 @@ fn prove_successor_on_channel(repo: &Path, successor: &Published) -> Result<()> 
     };
     let head = scan_published_channel(&mirror_slug, true)?;
     let head = head.first();
-    let mirrored = head.is_some_and(|h| h.build == successor.build && h.min_build >= successor.min_build);
+    let mirrored =
+        head.is_some_and(|h| h.build == successor.build && h.min_build >= successor.min_build);
     if mirrored {
         return Ok(());
     }
@@ -1904,7 +1905,9 @@ pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
                  {fleet} — the mirror can never proceed, so this cut retires unmirrored"
             ),
         ),
-        (Some(carried), Some((fleet, bytes))) if *fleet == carried && shipped_roster()? != *bytes => {
+        (Some(carried), Some((fleet, bytes)))
+            if *fleet == carried && shipped_roster()? != *bytes =>
+        {
             step(
                 "retire",
                 &format!(
@@ -1957,7 +1960,10 @@ pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
                                 out.stderr_utf8().trim()
                             )));
                         }
-                        step("retire", &format!("orphaned public draft {tag} (ID {id}) deleted"));
+                        step(
+                            "retire",
+                            &format!("orphaned public draft {tag} (ID {id}) deleted"),
+                        );
                     }
                     Some(other) => {
                         return Err(Error::new(format!(

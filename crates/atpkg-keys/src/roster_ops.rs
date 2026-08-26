@@ -60,12 +60,7 @@ pub fn empty(_now_unix: u64) -> Roster {
 /// A REVOKED id is refused for the same reason with more force: an id never returns from
 /// the dead, because a client that still holds the revoking roster would keep denying it
 /// while a client on the new roster allowed it.
-pub fn add(
-    mut r: Roster,
-    id: &str,
-    pubkey_b64: &str,
-    now_unix: u64,
-) -> Result<Roster, String> {
+pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<Roster, String> {
     if id.is_empty() {
         return Err(
             "a machine id is required (it is how a release is attributed, and \

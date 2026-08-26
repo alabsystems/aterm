@@ -145,12 +145,7 @@ impl Grid {
     /// columns beyond the requested prefix. It does not synthesize the sparse
     /// row's implicit blank tail; callers that require a fixed-width prefix may
     /// resize the returned buffer to `prefix_len`.
-    pub fn row_cols_prefix_into(
-        &self,
-        row: u16,
-        prefix_len: usize,
-        out: &mut Vec<char>,
-    ) -> u16 {
+    pub fn row_cols_prefix_into(&self, row: u16, prefix_len: usize, out: &mut Vec<char>) -> u16 {
         out.clear();
         if row >= self.rows() {
             return 0;

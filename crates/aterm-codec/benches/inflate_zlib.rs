@@ -201,7 +201,10 @@ fn lengths_from_tiers(total: usize, tiers: &[(usize, u16)], priority: &[usize]) 
             lengths[sym] = len;
         }
     }
-    assert!(it.next().is_none(), "priority list longer than the tier spec");
+    assert!(
+        it.next().is_none(),
+        "priority list longer than the tier spec"
+    );
     lengths
 }
 

@@ -130,7 +130,11 @@ impl SessionPickerState {
         if title.is_empty() {
             title = "(untitled)".to_string();
         }
-        let connected = if row.connected { " \u{00b7} connected" } else { "" };
+        let connected = if row.connected {
+            " \u{00b7} connected"
+        } else {
+            ""
+        };
         format!("\"{title}\"  @{}{connected}", row.sid.as_str())
     }
 
@@ -184,7 +188,12 @@ impl SessionPickerState {
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
         let n = self.filtered().len();
         let body = self.body();
-        let before = (self.selected, self.scroll, self.pointer_over, self.pointer_armed);
+        let before = (
+            self.selected,
+            self.scroll,
+            self.pointer_over,
+            self.pointer_armed,
+        );
         self.pointer_over = None;
         self.pointer_armed = None;
         if n == 0 || body == 0 {
@@ -197,7 +206,13 @@ impl SessionPickerState {
             self.selected = (self.scroll + relative).min(n - 1);
             self.clamp_scroll();
         }
-        before != (self.selected, self.scroll, self.pointer_over, self.pointer_armed)
+        before
+            != (
+                self.selected,
+                self.scroll,
+                self.pointer_over,
+                self.pointer_armed,
+            )
     }
 
     /// Move the cursor to FILTERED index `idx` (a11y Focus/Click land here).
@@ -352,7 +367,11 @@ impl SessionPickerState {
             self.rows[i].sid.as_str().hash(&mut h);
         }
         let epoch = h.finish() as u32;
-        if epoch == u32::MAX { u32::MAX - 1 } else { epoch }
+        if epoch == u32::MAX {
+            u32::MAX - 1
+        } else {
+            epoch
+        }
     }
 
     /// Decode a node minted by the CURRENT epoch to its filtered index.
@@ -809,9 +828,9 @@ mod tests {
             "the connected annotation is painted"
         );
         assert!(
-            tray.prims
-                .iter()
-                .any(|pr| matches!(pr, DrawPrim::Text { s, .. } if s.contains("Connect to Session"))),
+            tray.prims.iter().any(
+                |pr| matches!(pr, DrawPrim::Text { s, .. } if s.contains("Connect to Session"))
+            ),
             "the intent titles the card"
         );
     }

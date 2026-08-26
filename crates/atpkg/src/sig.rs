@@ -294,8 +294,7 @@ pub fn admit_roster(
         return Err(Reject::Disabled);
     }
     // STEPS 2–3 — signature length, then the master crypto.
-    let verified: VerifiedRoster =
-        verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
+    let verified: VerifiedRoster = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
     let master_index = verified.master_index();
     // STEPS 4–5 — parse ONLY from the verified wrapper (no public constructor), which
     // also applies the reject-newer schema gate.
@@ -547,7 +546,10 @@ pub(crate) mod testkit {
 
     /// The roster's published bytes + the paper master's detached signature.
     pub(crate) fn published_roster() -> (Vec<u8>, Vec<u8>) {
-        let bytes = roster().to_toml().expect("a valid roster emits").into_bytes();
+        let bytes = roster()
+            .to_toml()
+            .expect("a valid roster emits")
+            .into_bytes();
         let sig = sign(&MASTER_SEED, &bytes);
         (bytes, sig)
     }
@@ -956,7 +958,10 @@ mod tests {
             roster_seq: 4,
         };
         // The master's rescue: a NEW index that declares generation 5.
-        assert!(floor.admits(5, 1), "a genuinely newer generation re-bases the floor");
+        assert!(
+            floor.admits(5, 1),
+            "a genuinely newer generation re-bases the floor"
+        );
         // The replay: an OLD index (declaring 4) served beside a generation-5 roster.
         assert!(
             !floor.admits(4, 99),
@@ -1091,7 +1096,11 @@ mod tests {
             Some(Reject::Verify)
         );
         // NON-VACUITY: the same bytes signed by a listed machine are accepted.
-        assert!(roster.authorize_index(raw, &sign(&M3_SEED, &index_body("m3", 3, 41))).is_ok());
+        assert!(
+            roster
+                .authorize_index(raw, &sign(&M3_SEED, &index_body("m3", 3, 41)))
+                .is_ok()
+        );
     }
 
     /// REVOCATION, and the ORDERING that makes it worth having: m11's key is genuine, was
@@ -1152,7 +1161,9 @@ mod tests {
         let roster = admit(&anchor, &r).unwrap();
         let raw = index_body("m3", 3, 41);
         assert_eq!(
-            roster.authorize_index(raw, &sign(&M3_SEED, &index_body("m3", 3, 41))).err(),
+            roster
+                .authorize_index(raw, &sign(&M3_SEED, &index_body("m3", 3, 41)))
+                .err(),
             Some(Reject::Verify)
         );
     }
@@ -1290,7 +1301,9 @@ mod tests {
         // m11 signs bytes that CLAIM m3. The key decides who signed; the claim disagrees.
         let raw = index_body("m3", 3, 41);
         assert_eq!(
-            roster.authorize_index(raw, &sign(&M11_SEED, &index_body("m3", 3, 41))).err(),
+            roster
+                .authorize_index(raw, &sign(&M11_SEED, &index_body("m3", 3, 41)))
+                .err(),
             Some(Reject::NotAuthorized),
             "a genuine signature must not be wearable under another machine's name"
         );
@@ -1300,7 +1313,9 @@ mod tests {
         s.push_str("valid_until = \"2027-02-01T00:00:00Z\"\n[programs.ay]\nrepo = \"ay\"\n");
         let bare = s.into_bytes();
         assert_eq!(
-            roster.authorize_index(bare.clone(), &sign(&M3_SEED, &bare)).err(),
+            roster
+                .authorize_index(bare.clone(), &sign(&M3_SEED, &bare))
+                .err(),
             Some(Reject::Unattributed)
         );
 
@@ -1309,12 +1324,16 @@ mod tests {
         // that stays refused.
         let older = index_body("m3", 2, 41);
         assert!(
-            roster.authorize_index(older.clone(), &sign(&M3_SEED, &older)).is_ok(),
+            roster
+                .authorize_index(older.clone(), &sign(&M3_SEED, &older))
+                .is_ok(),
             "an index attributed under an older generation verifies under a newer roster"
         );
         let ahead = index_body("m3", 4, 41);
         assert_eq!(
-            roster.authorize_index(ahead.clone(), &sign(&M3_SEED, &ahead)).err(),
+            roster
+                .authorize_index(ahead.clone(), &sign(&M3_SEED, &ahead))
+                .err(),
             Some(Reject::SeqMismatch)
         );
     }
@@ -1326,17 +1345,24 @@ mod tests {
     fn cheap_local_gates_and_post_verify_parse_failures_both_fail_closed() {
         let roster = admit(&armed(0), &roster()).unwrap();
         assert_eq!(
-            roster.authorize_index(index_body("m3", 3, 41), &[0u8; 10]).err(),
+            roster
+                .authorize_index(index_body("m3", 3, 41), &[0u8; 10])
+                .err(),
             Some(Reject::BadSig)
         );
         let garbage = b"this is not toml {{{".to_vec();
         assert_eq!(
-            roster.authorize_index(garbage.clone(), &sign(&M3_SEED, &garbage)).err(),
+            roster
+                .authorize_index(garbage.clone(), &sign(&M3_SEED, &garbage))
+                .err(),
             Some(Reject::Malformed)
         );
-        let newer = b"schema = 99\nindex_build = 1\nvalid_until = \"2027-01-01T00:00:00Z\"\n".to_vec();
+        let newer =
+            b"schema = 99\nindex_build = 1\nvalid_until = \"2027-01-01T00:00:00Z\"\n".to_vec();
         assert_eq!(
-            roster.authorize_index(newer.clone(), &sign(&M3_SEED, &newer)).err(),
+            roster
+                .authorize_index(newer.clone(), &sign(&M3_SEED, &newer))
+                .err(),
             Some(Reject::Schema)
         );
     }
@@ -1457,7 +1483,10 @@ mod tests {
         // Same generation: exactly the old high-water, inclusive at the boundary.
         assert!(floor.admits(7, 50), "equal to the floor passes");
         assert!(floor.admits(7, 51));
-        assert!(!floor.admits(7, 49), "below the floor, same generation ⇒ refused");
+        assert!(
+            !floor.admits(7, 49),
+            "below the floor, same generation ⇒ refused"
+        );
         // A STRICTLY newer generation re-bases it — the master's rescue lever.
         assert!(
             floor.admits(8, 1),
@@ -1465,7 +1494,10 @@ mod tests {
         );
         // ...and nothing else waives it. An older generation is still floored (it can only
         // arrive at all if the roster ratchet let it, and it must not open a second door).
-        assert!(!floor.admits(6, 49), "an OLDER generation must not waive the floor");
+        assert!(
+            !floor.admits(6, 49),
+            "an OLDER generation must not waive the floor"
+        );
         assert!(!floor.admits(0, 49), "nor an absent/unknown one");
         // First contact admits everything, which is the genuine residual §8 freshness bounds.
         assert!(BuildFloor::none().admits(0, 0));
@@ -1514,11 +1546,21 @@ mod tests {
         assert_eq!(floor.read_floor_classified(), (7, false));
         // Garbage text, non-UTF-8 bytes, over the size bound: all corrupt, all read 0.
         let oversized = vec![b'9'; MAX_FLOOR_BYTES + 1];
-        for garbage in [b"garbage-not-a-number".as_slice(), &[0xFF, 0xFE, 0x00], &oversized] {
+        for garbage in [
+            b"garbage-not-a-number".as_slice(),
+            &[0xFF, 0xFE, 0x00],
+            &oversized,
+        ] {
             std::fs::write(&path, garbage).unwrap();
             let (value, corrupt) = floor.read_floor_classified();
-            assert_eq!(value, 0, "corrupt must read 0 — a refusal would be a local DoS");
-            assert!(corrupt, "corruption must be DETECTED, never silent first contact");
+            assert_eq!(
+                value, 0,
+                "corrupt must read 0 — a refusal would be a local DoS"
+            );
+            assert!(
+                corrupt,
+                "corruption must be DETECTED, never silent first contact"
+            );
         }
         // The documented residual, pinned: after corruption the ratchet re-arms from 0...
         assert_eq!(floor.check_and_record(1), Ok(()));
@@ -1547,7 +1589,11 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let (decision, persist_failure) = floor.check_and_record_classified(8);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(decision, Ok(()), "a persist failure never rejects a passed check");
+        assert_eq!(
+            decision,
+            Ok(()),
+            "a persist failure never rejects a passed check"
+        );
         assert!(
             persist_failure.is_some(),
             "the lost advance must be reported, not discarded"
@@ -1582,7 +1628,9 @@ mod tests {
         assert_eq!(trusted.still_fresh(1_900_000_000), Err(Reject::Stale));
         let raw = index_body("m3", 3, 41);
         assert!(
-            trusted.authorize_index(raw.clone(), &sign(&M3_SEED, &raw)).is_ok(),
+            trusted
+                .authorize_index(raw.clone(), &sign(&M3_SEED, &raw))
+                .is_ok(),
             "precondition: the frozen clock alone would never notice the lapse"
         );
     }

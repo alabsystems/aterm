@@ -1325,8 +1325,7 @@ impl App {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.robi_dismissal = None;
                     self.surface_native_config_lane_error(
-                        "Robi was not dismissed: the settings lane dropped the request"
-                            .to_string(),
+                        "Robi was not dismissed: the settings lane dropped the request".to_string(),
                     );
                 }
             }
@@ -1372,8 +1371,7 @@ impl App {
             // hovering it must not drop the chip's hover state — that cell
             // hovered as Select before design §3.1 [v5] made it a hit.
             Some(
-                crate::tab_bar::TabHit::Select(index)
-                | crate::tab_bar::TabHit::Connector(index),
+                crate::tab_bar::TabHit::Select(index) | crate::tab_bar::TabHit::Connector(index),
             ) => Some(index),
             // The `+` and the `↻` are not tabs; the pointer is in the strip but
             // on no tab, so nothing reveals a `✕`.
@@ -1465,7 +1463,11 @@ impl App {
         // `palette_claims_pointer` (the motion seam's gate) owns the hover/press
         // side effects, and the release still lands in `on_mouse_input`'s
         // hoisted disarm, so the gesture simply ends when the button lifts.
-        if self.windows.get(&wid).is_some_and(|ws| ws.palette().is_some()) {
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.palette().is_some())
+        {
             return;
         }
         let Some(col) = self.strip_col_at_with(wid, geom, x, y) else {
@@ -2201,7 +2203,11 @@ impl App {
         // when the pointer leaves the card, which is what a real menu does.
         // Placed after the palette for the same reason `on_mouse_input`'s gate
         // is: the palette is the more modal of the two.
-        if self.windows.get(&wid).is_some_and(|ws| ws.tab_menu.is_some()) {
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu.is_some())
+        {
             // …but the cell caches still refresh, exactly as the About modal
             // does: the first click after a KEYBOARD dismiss (Esc/↵, no
             // intervening motion) must not act on the pre-open cell.
@@ -3091,9 +3097,7 @@ impl App {
         // PRESS while one is somehow still armed means the release was lost
         // (focus steal mid-gesture): dissolve defensively, then let the press
         // proceed normally. Native-origin drags settle via their own wakes.
-        if button == WinitMouseButton::Left
-            && self.conn_drag.as_ref().is_some_and(|d| !d.native)
-        {
+        if button == WinitMouseButton::Left && self.conn_drag.as_ref().is_some_and(|d| !d.native) {
             if pressed {
                 self.conn_drag_abort();
             } else {
@@ -3133,7 +3137,11 @@ impl App {
         // same gate having never set a `reported_buttons` bit, so a tracking app
         // sees neither half and its press/release stream stays balanced (the
         // config-banner pattern, restated in `RightPressPlan::Chrome`).
-        if self.windows.get(&wid).is_some_and(|ws| ws.tab_menu.is_some()) {
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu.is_some())
+        {
             if pressed {
                 let (px, py) = self
                     .windows
@@ -3700,7 +3708,8 @@ impl App {
                             // with no button down opened the menu instantly). The
                             // matching release completes it below, after winit has
                             // released capture — the bdf7cf40 custody rule.
-                            _ => {
+                            _ =>
+                            {
                                 #[cfg(windows)]
                                 if let Some(ws) = self.windows.get_mut(&wid) {
                                     ws.band_menu_release_pending = true;
@@ -3719,8 +3728,7 @@ impl App {
                         // and leaving a stale highlight would read as a no-op.
                         let _ = control::pbcopy(&text);
                         term_lock(t).text_selection_mut().clear();
-                        if let Some(w) =
-                            self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
                         {
                             w.request_redraw();
                         }
@@ -4122,7 +4130,11 @@ impl App {
             return;
         }
         if let Some(up) = vertical_up {
-            let signed = if up { -(lines as isize) } else { lines as isize };
+            let signed = if up {
+                -(lines as isize)
+            } else {
+                lines as isize
+            };
             if palette {
                 self.palette_pointer_wheel(wid, signed);
                 return;
@@ -6132,10 +6144,7 @@ mod tests {
         // Linux (the whole remainder lands under the frame, keeping the chrome
         // band glued to the titlebar), centred elsewhere. Both come from the
         // same `band_offset`/`band_offset_y` pair the presenters place with.
-        let (ox, oy) = (
-            rw / 2,
-            if cfg!(target_os = "linux") { 0 } else { rh / 2 },
-        );
+        let (ox, oy) = (rw / 2, if cfg!(target_os = "linux") { 0 } else { rh / 2 });
         assert_eq!(
             app.frame_origin(wid),
             (ox as i64, oy as i64),
@@ -6552,8 +6561,10 @@ mod tests {
         // Failure completion (the OCC-conflict shape): banner + release.
         let (tx, rx) = std::sync::mpsc::channel();
         app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
-        tx.send(Err("save conflict for robi at config revision 7".to_string()))
-            .unwrap();
+        tx.send(Err(
+            "save conflict for robi at config revision 7".to_string()
+        ))
+        .unwrap();
         app.poll_robi_dismissal();
         assert!(
             app.robi_dismissal.is_none(),
@@ -6583,7 +6594,10 @@ mod tests {
         // …and it releases the moment the dismissal IS the live config.
         app.config.robi = Some(false);
         app.poll_robi_dismissal();
-        assert!(app.robi_dismissal.is_none(), "the landed config owns the gate");
+        assert!(
+            app.robi_dismissal.is_none(),
+            "the landed config owns the gate"
+        );
     }
 
     /// DISMISSING ROBI vs HIS OWN BUBBLE: the tip bubble is the app-global
@@ -6641,8 +6655,14 @@ mod tests {
             motion,
             app.notice_clear_rows(),
         );
-        assert!(rw > 0.0 && rh > 0.0, "the card must be drawable to be clickable");
-        let (click_x, click_y) = (f64::from(pad + rx + rw * 0.5), f64::from(top + ry + rh * 0.5));
+        assert!(
+            rw > 0.0 && rh > 0.0,
+            "the card must be drawable to be clickable"
+        );
+        let (click_x, click_y) = (
+            f64::from(pad + rx + rw * 0.5),
+            f64::from(top + ry + rh * 0.5),
+        );
         // Robi's stashed body DIRECTLY under that same point: if the bubble
         // did not win by order, this press would dismiss him.
         let body = (
@@ -6798,8 +6818,7 @@ mod tests {
             "fixture point must be ON the strip"
         );
         assert!(
-            crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, bare)
-                .is_none(),
+            crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, bare).is_none(),
             "fixture point must be the BARE band, not a chip or control"
         );
 
@@ -6894,9 +6913,8 @@ mod tests {
         let button_col = plus.start_col + 1;
         // Reads the LIVE painted row, so it takes `app` as an argument rather
         // than capturing it — the pointer events below need `&mut app`.
-        let bg_of = |app: &crate::App, col: u16| {
-            app.windows[&wid].cached_strip_rows[0][col as usize].bg
-        };
+        let bg_of =
+            |app: &crate::App, col: u16| app.windows[&wid].cached_strip_rows[0][col as usize].bg;
         let resting = bg_of(&app, button_col);
 
         // (1) the motion hook records the button…
@@ -7009,7 +7027,11 @@ mod tests {
         let _ = resting_chip;
         let q = point(chip.start_col + 1);
         app.on_cursor_moved(wid, q.0, q.1);
-        assert_eq!(app.windows[&wid].strip_hover, Some(0), "the chip is hovered");
+        assert_eq!(
+            app.windows[&wid].strip_hover,
+            Some(0),
+            "the chip is hovered"
+        );
         app.on_cursor_left(wid);
         assert_eq!(
             app.windows[&wid].strip_hover, None,

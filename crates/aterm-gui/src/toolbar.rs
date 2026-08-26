@@ -392,9 +392,9 @@ mod shared_tests {
         assert!(line.contains(r#"icons=[Some("settings")]"#));
         // A both-ways connection reports BOTH directional tokens, keeping the
         // states list total per direction.
-        assert!(line.contains(
-            r#"["selected", "dirty", "busy", "attention", "conn-out", "conn-in"]"#
-        ));
+        assert!(
+            line.contains(r#"["selected", "dirty", "busy", "attention", "conn-out", "conn-in"]"#)
+        );
         assert!(line.contains("Settings · Cursor & Motion"));
 
         let help = tab_help(
@@ -434,11 +434,21 @@ mod shared_tests {
         .expect("two tabs report chrome");
         assert!(line.contains(r#"["selected", "conn-out"], ["conn-in"]"#));
         assert_eq!(
-            tab_help("push-src", None, conn_only(Some(crate::tab_bar::TabConnRole::Outbound)), 0),
+            tab_help(
+                "push-src",
+                None,
+                conn_only(Some(crate::tab_bar::TabConnRole::Outbound)),
+                0
+            ),
             "push-src · Connects into a peer session · ⌘1"
         );
         assert_eq!(
-            tab_help("push-dst", None, conn_only(Some(crate::tab_bar::TabConnRole::Inbound)), 1),
+            tab_help(
+                "push-dst",
+                None,
+                conn_only(Some(crate::tab_bar::TabConnRole::Inbound)),
+                1
+            ),
             "push-dst · A peer session connects in · ⌘2"
         );
         assert_eq!(
@@ -516,7 +526,12 @@ mod shared_tests {
         assert!(!busy_spinner_phase_only_change("prefix ⠋", "prefix ⠙"));
 
         // Claude Code's circle-fill "moon" spinner coalesces the same way.
-        let moons = ["◐ Claude Code", "◓ Claude Code", "◑ Claude Code", "◒ Claude Code"];
+        let moons = [
+            "◐ Claude Code",
+            "◓ Claude Code",
+            "◑ Claude Code",
+            "◒ Claude Code",
+        ];
         for pair in moons.windows(2) {
             assert!(busy_spinner_phase_only_change(pair[0], pair[1]));
         }
@@ -525,7 +540,10 @@ mod shared_tests {
         assert!(busy_spinner_phase_only_change("⠋ aterm", "◐ aterm"));
         // The busy→idle handoff (✳ is not a spinner frame) is always recorded,
         // as are suffix changes and missing separators.
-        assert!(!busy_spinner_phase_only_change("◑ Claude Code", "✳ Claude Code"));
+        assert!(!busy_spinner_phase_only_change(
+            "◑ Claude Code",
+            "✳ Claude Code"
+        ));
         assert!(!busy_spinner_phase_only_change("◐ aterm", "◑ project"));
         assert!(!busy_spinner_phase_only_change("◐aterm", "◑aterm"));
     }
@@ -3016,12 +3034,9 @@ mod macos {
             // This custom NSView consumes right/ctrl-click without a winit
             // pointer event. Fence at OPEN, before the synchronous nested menu
             // loop: dismissing the menu produces no TabMenuAction wake at all.
-            let _ = self
-                .ivars()
-                .proxy
-                .send_event(Wake::TabContextMenuOpening {
-                    window: self.ivars().window,
-                });
+            let _ = self.ivars().proxy.send_event(Wake::TabContextMenuOpening {
+                window: self.ivars().window,
+            });
             let mtm = MainThreadMarker::from(self);
             // CLONE the model out of the RefCell (dropping the borrow) BEFORE the
             // tracking session: menu tracking runs a nested run loop that can

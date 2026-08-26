@@ -162,7 +162,9 @@ fn restored_origin_visible(origin: (f64, f64), monitors: &[MonitorRectPx]) -> bo
         return false;
     }
     monitors.iter().any(|m| {
-        let finite = [m.x, m.y, m.w, m.h, m.scale].into_iter().all(f64::is_finite);
+        let finite = [m.x, m.y, m.w, m.h, m.scale]
+            .into_iter()
+            .all(f64::is_finite);
         if !finite || m.w <= 0.0 || m.h <= 0.0 || m.scale <= 0.0 {
             return false;
         }
@@ -1416,7 +1418,10 @@ impl App {
         let mut early_reveal_bg: Option<u32> = None;
         #[cfg(windows)]
         if pending_join && !defer_reveal && self.seamless_position.is_none() {
-            let bootstrap_restore = self.pending_restore.as_ref().and_then(|m| m.windows.first());
+            let bootstrap_restore = self
+                .pending_restore
+                .as_ref()
+                .and_then(|m| m.windows.first());
             let restore_maximized = bootstrap_restore.and_then(|wl| wl.maximized) == Some(true);
             // The same scale resolution the post-join sizing uses (force-scale
             // override included), so the two frame derivations cannot diverge.
@@ -1451,8 +1456,9 @@ impl App {
                 // and put one visible resize on glass. The cached `(cell_w, cell_h)`
                 // this branch is already gated on is exactly the input the law wants,
                 // so the prediction is the same arithmetic, not a second heuristic.
-                let head = (self.apprt.titlebar_band_pts(&window) * scale).round().max(0.0)
-                    as usize
+                let head = (self.apprt.titlebar_band_pts(&window) * scale)
+                    .round()
+                    .max(0.0) as usize
                     + self.synthetic_strip_head_px(scale, cell_h);
                 let total_rows = rows.saturating_add(self.tab_strip_rows) as usize;
                 // THE SHARED LAW, not a second copy of it. `frame_size_px` is what
@@ -2078,7 +2084,11 @@ impl App {
     /// (maximized/fullscreen/tiled), so a tiling compositor is never fought.
     #[cfg(target_os = "linux")]
     pub(crate) fn settle_initial_frame(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
-        let Some(settle) = self.windows.get(&wid).and_then(|ws| ws.initial_frame_settle) else {
+        let Some(settle) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.initial_frame_settle)
+        else {
             return;
         };
         if Instant::now() > settle.deadline || settle.corrections == 0 {
@@ -2133,7 +2143,9 @@ impl App {
                         + (size.height as i64 - intended.height as i64).abs()
                 );
             }
-            if settle.corrected && let Some(ws) = self.windows.get_mut(&wid) {
+            if settle.corrected
+                && let Some(ws) = self.windows.get_mut(&wid)
+            {
                 ws.initial_frame_settle = None;
             }
             return;
@@ -3069,10 +3081,8 @@ impl App {
                     // settle must not re-assert the attach grid over it.
                     ws.initial_frame_settle = None;
                 }
-                let _ = w.request_inner_size(PhysicalSize::new(
-                    u32::from(width),
-                    u32::from(height),
-                ));
+                let _ =
+                    w.request_inner_size(PhysicalSize::new(u32::from(width), u32::from(height)));
             }
             W::RestoreMaximized => w.set_maximized(false),
             W::MaximizeWindow => w.set_maximized(true),
@@ -4284,7 +4294,10 @@ mod tests {
         assert!(!restored_origin_visible((100.0, 1080.0 - 10.0), &desk()));
         // The 2× monitor's grab minimum is 320 PHYSICAL px: a point 200 px from
         // its right edge fails there even though 200 > 160.
-        assert!(!restored_origin_visible((1920.0 + 2560.0 - 200.0, 100.0), &desk()));
+        assert!(!restored_origin_visible(
+            (1920.0 + 2560.0 - 200.0, 100.0),
+            &desk()
+        ));
         // Nonsense geometry answers false rather than guessing.
         assert!(!restored_origin_visible((f64::NAN, 10.0), &desk()));
         assert!(!restored_origin_visible((10.0, 10.0), &[]));
@@ -4345,7 +4358,10 @@ mod tests {
         app.settle_initial_frame(wid, stolen);
         let s = settle_state(&app).expect("a spent correction stays armed for its own echo");
         assert!(s.corrected);
-        assert_eq!(s.corrections, 2, "the mismatch spends exactly one correction");
+        assert_eq!(
+            s.corrections, 2,
+            "the mismatch spends exactly one correction"
+        );
 
         app.settle_initial_frame(wid, intended);
         assert!(
@@ -4416,7 +4432,12 @@ mod tests {
         let insisted = PhysicalSize::new(1920, 1080);
 
         app.settle_initial_frame(wid, insisted);
-        assert_eq!(settle_state(&app).expect("one correction spent").corrections, 0);
+        assert_eq!(
+            settle_state(&app)
+                .expect("one correction spent")
+                .corrections,
+            0
+        );
 
         app.settle_initial_frame(wid, insisted);
         assert!(

@@ -62,7 +62,10 @@ impl Fixture {
         std::fs::create_dir_all(&root).expect("fixture root");
         let fx = Self { root };
 
-        copy_tree(&repo_root().join("vendor/winnow"), &fx.path("vendor/winnow"));
+        copy_tree(
+            &repo_root().join("vendor/winnow"),
+            &fx.path("vendor/winnow"),
+        );
         std::fs::copy(repo_root().join("deny.toml"), fx.path("deny.toml"))
             .expect("the real deny.toml is the license policy under test");
 
@@ -87,13 +90,19 @@ impl Fixture {
              [dependencies]\n\
              winnow = { path = \"../../vendor/winnow\" }\n",
         );
-        fx.write("crates/aterm/src/lib.rs", "// SPDX-License-Identifier: Apache-2.0\n");
+        fx.write(
+            "crates/aterm/src/lib.rs",
+            "// SPDX-License-Identifier: Apache-2.0\n",
+        );
         fx.write_notice(&[("winnow", "0.7.15", "MIT")]);
 
         // See the module docs: without its own repository, this fixture lives
         // inside the aterm checkout's ignored `target/` and attest's [OB-10]
         // reports every vendored path as swallowed.
-        let _ = Command::new("git").args(["init", "-q"]).current_dir(&fx.root).status();
+        let _ = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&fx.root)
+            .status();
 
         fx.regen_lock();
         fx
@@ -134,7 +143,9 @@ impl Fixture {
              \n",
         );
         for (name, version, license) in forks {
-            text.push_str(&format!("- {name} {version}, {license} (`vendor/{name}/`)\n"));
+            text.push_str(&format!(
+                "- {name} {version}, {license} (`vendor/{name}/`)\n"
+            ));
         }
         self.write("NOTICE", &text);
     }
@@ -174,13 +185,19 @@ impl Fixture {
                  [workspace]\n"
             ),
         );
-        self.write(&format!("{dir}/Cargo.toml.orig"), "[package]\nname = \"pristine\"\n");
+        self.write(
+            &format!("{dir}/Cargo.toml.orig"),
+            "[package]\nname = \"pristine\"\n",
+        );
         self.write(
             &format!("{dir}/.cargo_vcs_info.json"),
             "{\n  \"git\": {\n    \"sha1\": \
              \"0000000000000000000000000000000000000000\"\n  },\n  \"path_in_vcs\": \"\"\n}\n",
         );
-        self.write(&format!("{dir}/LICENSE-MIT"), "MIT License\n\nCopyright (c) upstream\n");
+        self.write(
+            &format!("{dir}/LICENSE-MIT"),
+            "MIT License\n\nCopyright (c) upstream\n",
+        );
         self.write(
             &format!("{dir}/src/lib.rs"),
             "// aterm-trust: fixture fork — one discharged obligation, so [OB-8] holds\n",
@@ -233,15 +250,27 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
     );
 
     let (ok, log) = check_report(fx.root());
-    assert!(ok, "the baseline fixture must be GREEN or this test proves nothing:\n{log}");
-    assert!(log.contains("✓ vendor/winnow/src/_topic still absent"), "{log}");
+    assert!(
+        ok,
+        "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
+    );
+    assert!(
+        log.contains("✓ vendor/winnow/src/_topic still absent"),
+        "{log}"
+    );
 
     // Plant the violation: the carved module is back.
     fx.write("vendor/winnow/src/_topic/mod.rs", "// reinstated by hand\n");
 
     let (ok, log) = check_report(fx.root());
-    assert!(!ok, "a reinstated carved path must turn the forge verb RED:\n{log}");
-    assert!(log.contains("[OB-13]"), "the RED must be the carve-ledger obligation:\n{log}");
+    assert!(
+        !ok,
+        "a reinstated carved path must turn the forge verb RED:\n{log}"
+    );
+    assert!(
+        log.contains("[OB-13]"),
+        "the RED must be the carve-ledger obligation:\n{log}"
+    );
     assert!(
         log.contains("vendor/winnow/src/_topic") && log.contains("EXISTS again"),
         "the refusal must name the reinstated path:\n{log}"
@@ -250,12 +279,18 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
         log.contains("documentation-only module"),
         "the refusal must quote the ledger's reason:\n{log}"
     );
-    assert!(log.contains("PRECISION"), "a RED report carries the precision note:\n{log}");
+    assert!(
+        log.contains("PRECISION"),
+        "a RED report carries the precision note:\n{log}"
+    );
 
     // And it goes green again the moment the tree agrees with the ledger.
     fx.remove("vendor/winnow/src/_topic");
     let (ok, log) = check_report(fx.root());
-    assert!(ok, "removing the reinstated path must restore GREEN:\n{log}");
+    assert!(
+        ok,
+        "removing the reinstated path must restore GREEN:\n{log}"
+    );
 }
 
 /// `[OB-11]` — the census cross-check. A `[patch.crates-io]` entry with no
@@ -270,12 +305,18 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     let fx = Fixture::baseline("unreviewed-fork");
 
     let (ok, log) = check_report(fx.root());
-    assert!(ok, "the baseline fixture must be GREEN or this test proves nothing:\n{log}");
+    assert!(
+        ok,
+        "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
+    );
 
     // Plant the violation: a second fork, complete in every respect except
     // that no reviewed row names it.
     fx.add_wellformed_fork("forge_fixture_fork", "0.1.0");
-    fx.write_notice(&[("winnow", "0.7.15", "MIT"), ("forge_fixture_fork", "0.1.0", "MIT")]);
+    fx.write_notice(&[
+        ("winnow", "0.7.15", "MIT"),
+        ("forge_fixture_fork", "0.1.0", "MIT"),
+    ]);
     fx.write(
         "Cargo.toml",
         "[workspace]\n\
@@ -302,8 +343,14 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     fx.regen_lock();
 
     let (ok, log) = check_report(fx.root());
-    assert!(!ok, "an unreviewed path fork must turn the forge verb RED:\n{log}");
-    assert!(log.contains("[OB-11]"), "the RED must be the review-registration obligation:\n{log}");
+    assert!(
+        !ok,
+        "an unreviewed path fork must turn the forge verb RED:\n{log}"
+    );
+    assert!(
+        log.contains("[OB-11]"),
+        "the RED must be the review-registration obligation:\n{log}"
+    );
     assert!(
         log.contains("forge_fixture_fork") && log.contains("REVIEWED_VENDORED_CRATES"),
         "the refusal must name the fork and the registry it is missing from:\n{log}"
@@ -322,14 +369,20 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     let fx = Fixture::baseline("notice-omission");
 
     let (ok, log) = check_report(fx.root());
-    assert!(ok, "the baseline fixture must be GREEN or this test proves nothing:\n{log}");
+    assert!(
+        ok,
+        "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
+    );
 
     // Plant the violation: the fork is still vendored, patched and live — it
     // has simply been dropped from NOTICE.
     fx.write_notice(&[]);
 
     let (ok, log) = check_report(fx.root());
-    assert!(!ok, "a NOTICE that omits a shipped fork must turn the forge verb RED:\n{log}");
+    assert!(
+        !ok,
+        "a NOTICE that omits a shipped fork must turn the forge verb RED:\n{log}"
+    );
     assert!(
         log.contains("[OB-6]") && log.contains("NOTICE does not list fork `winnow`"),
         "the RED must be the NOTICE-agreement obligation, naming the fork:\n{log}"
@@ -358,7 +411,10 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
     let fx = Fixture::baseline("unpatched-sibling");
 
     let (ok, log) = check_report(fx.root());
-    assert!(ok, "the baseline fixture must be GREEN or this test proves nothing:\n{log}");
+    assert!(
+        ok,
+        "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
+    );
     assert!(log.contains("✓ winnow live in all 4 cell(s)"), "{log}");
 
     // Plant the violation: an intermediate dependency drags in a second
@@ -373,7 +429,10 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          \n\
          [workspace]\n",
     );
-    fx.write("other/winnow/src/lib.rs", "// the unpatched upstream copy\n");
+    fx.write(
+        "other/winnow/src/lib.rs",
+        "// the unpatched upstream copy\n",
+    );
     fx.write(
         "crates/dep_b/Cargo.toml",
         "[package]\n\
@@ -385,7 +444,10 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          [dependencies]\n\
          winnow = { path = \"../../other/winnow\" }\n",
     );
-    fx.write("crates/dep_b/src/lib.rs", "// SPDX-License-Identifier: Apache-2.0\n");
+    fx.write(
+        "crates/dep_b/src/lib.rs",
+        "// SPDX-License-Identifier: Apache-2.0\n",
+    );
     fx.write(
         "crates/aterm/Cargo.toml",
         "[package]\n\
@@ -411,8 +473,14 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
     fx.regen_lock();
 
     let (ok, log) = check_report(fx.root());
-    assert!(!ok, "an unpatched sibling of a patched crate must turn the forge verb RED:\n{log}");
-    assert!(log.contains("[OB-12]"), "the RED must be the patch-liveness obligation:\n{log}");
+    assert!(
+        !ok,
+        "an unpatched sibling of a patched crate must turn the forge verb RED:\n{log}"
+    );
+    assert!(
+        log.contains("[OB-12]"),
+        "the RED must be the patch-liveness obligation:\n{log}"
+    );
     assert!(
         log.contains("UNPATCHED `winnow`") && log.contains("winnow@1.0.3"),
         "the refusal must name the crate and the sibling version:\n{log}"
@@ -423,6 +491,9 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
     );
     // Every cell, not just one: the fork is patched for all four.
     for cell in ["mac-arm", "linux", "win", "wasm"] {
-        assert!(log.contains(&format!("cell `{cell}`")), "cell `{cell}` must be scored:\n{log}");
+        assert!(
+            log.contains(&format!("cell `{cell}`")),
+            "cell `{cell}` must be scored:\n{log}"
+        );
     }
 }

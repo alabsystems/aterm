@@ -502,11 +502,7 @@ pub(crate) const RASTER_PAD: usize = 1;
 /// rasterizer whose outline was translated by `+PAD` in both axes). The padding
 /// ring is discarded: by construction it can only hold antialiasing spill from
 /// an edge that is already inside the box.
-pub(crate) fn crop_padded_coverage(
-    ras: &crate::raster::Rasterizer,
-    w: usize,
-    h: usize,
-) -> Vec<u8> {
+pub(crate) fn crop_padded_coverage(ras: &crate::raster::Rasterizer, w: usize, h: usize) -> Vec<u8> {
     let pad = RASTER_PAD;
     let gw = w + 2 * pad;
     let mut cov = vec![0u8; w * h];
@@ -736,7 +732,9 @@ mod tests {
             let mut chars: Vec<char> = (' '..='~').collect();
             chars.extend("─│┌┐└┘├┤┬┴┼━┃█▀▄▌▐░▒▓".chars());
             for ch in chars {
-                let Some(g) = face.glyph_index(ch) else { continue };
+                let Some(g) = face.glyph_index(ch) else {
+                    continue;
+                };
                 let Some((w, h, _, _, _, cov)) = varied_glyph_raster_with_face(&face, g.0, px)
                 else {
                     continue;
@@ -747,7 +745,9 @@ mod tests {
                 checked += 1;
                 // The same outline, same mapping, into a grid with four times
                 // the production slack.
-                let bbox = face.glyph_bounding_box(g).expect("an inked glyph has a bbox");
+                let bbox = face
+                    .glyph_bounding_box(g)
+                    .expect("an inked glyph has a bbox");
                 let x_min = (f32::from(bbox.x_min) * scale).floor();
                 let y_max = (f32::from(bbox.y_max) * scale).ceil();
                 let mut ras = crate::raster::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
@@ -766,8 +766,7 @@ mod tests {
                 let mut reference = vec![0u8; w * h];
                 ras.for_each_pixel(|i, a| {
                     let (gx, gy) = (i % gw, i / gw);
-                    let (Some(x), Some(y)) = (gx.checked_sub(SLACK), gy.checked_sub(SLACK))
-                    else {
+                    let (Some(x), Some(y)) = (gx.checked_sub(SLACK), gy.checked_sub(SLACK)) else {
                         return;
                     };
                     if x < w && y < h {

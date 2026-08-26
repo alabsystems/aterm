@@ -62,7 +62,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aterm_core::terminal::{ClipboardAccess, ClipboardOperation, Terminal};
 use aterm_policy::engine::PolicyEngine;
-use aterm_policy::{Defaults, OriginTag, Policy, Profile, Response, Rule, SCHEMA_VERSION, profiles};
+use aterm_policy::{
+    Defaults, OriginTag, Policy, Profile, Response, Rule, SCHEMA_VERSION, profiles,
+};
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 const ROWS: u16 = 24;
@@ -196,9 +198,11 @@ impl Arm {
                 OriginTag::Pty,
                 Response::Execute,
             )),
-            Self::DenyOsc52Set => {
-                Some(one_rule_policy("OSC 52 set", OriginTag::Pty, Response::Drop))
-            }
+            Self::DenyOsc52Set => Some(one_rule_policy(
+                "OSC 52 set",
+                OriginTag::Pty,
+                Response::Drop,
+            )),
             Self::AllowCsiT => Some(one_rule_policy("CSI t", OriginTag::Pty, Response::Execute)),
         }
     }

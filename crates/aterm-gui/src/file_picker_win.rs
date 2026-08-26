@@ -487,7 +487,10 @@ unsafe fn show_dialog(
 
     // Options FIRST, folded over the shell's defaults (see `dialog_options`).
     let mut defaults = 0u32;
-    check(unsafe { (vt.get_options)(ptr, &mut defaults) }, "GetOptions")?;
+    check(
+        unsafe { (vt.get_options)(ptr, &mut defaults) },
+        "GetOptions",
+    )?;
     check(
         unsafe { (vt.set_options)(ptr, dialog_options(defaults)) },
         "SetOptions",
@@ -551,8 +554,9 @@ unsafe fn show_dialog(
 mod tests {
     use super::{
         ALL_FILES, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
-        FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FilterSpecs, dialog_options,
-        IFileOpenDialogVtbl, IShellItemVtbl, is_cancelled, path_from_nul_terminated,
+        FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FilterSpecs,
+        IFileOpenDialogVtbl, IShellItemVtbl, dialog_options, is_cancelled,
+        path_from_nul_terminated,
     };
     use std::path::PathBuf;
 
@@ -587,23 +591,51 @@ mod tests {
 
         // Every slot this module actually CALLS, pinned at its documented index.
         let slot = |bytes: usize| bytes / size_of::<usize>();
-        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, release)), 2, "IUnknown::Release");
-        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, show)), 3, "IModalWindow::Show");
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, release)),
+            2,
+            "IUnknown::Release"
+        );
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, show)),
+            3,
+            "IModalWindow::Show"
+        );
         assert_eq!(
             slot(offset_of!(IFileOpenDialogVtbl, set_file_types)),
             4,
             "IFileDialog::SetFileTypes"
         );
-        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, set_options)), 9, "SetOptions");
-        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, get_options)), 10, "GetOptions");
-        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, set_title)), 17, "SetTitle");
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, set_options)),
+            9,
+            "SetOptions"
+        );
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, get_options)),
+            10,
+            "GetOptions"
+        );
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, set_title)),
+            17,
+            "SetTitle"
+        );
         assert_eq!(
             slot(offset_of!(IFileOpenDialogVtbl, set_ok_button_label)),
             18,
             "SetOkButtonLabel"
         );
-        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, get_result)), 20, "GetResult is LAST");
-        assert_eq!(slot(offset_of!(IShellItemVtbl, release)), 2, "IUnknown::Release");
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, get_result)),
+            20,
+            "GetResult is LAST"
+        );
+        assert_eq!(
+            slot(offset_of!(IShellItemVtbl, release)),
+            2,
+            "IUnknown::Release"
+        );
         assert_eq!(
             slot(offset_of!(IShellItemVtbl, get_display_name)),
             5,
@@ -671,14 +703,22 @@ mod tests {
     #[test]
     fn the_options_mirror_the_macos_panel() {
         let opts = dialog_options(0);
-        assert_eq!(opts & FOS_FORCEFILESYSTEM, FOS_FORCEFILESYSTEM, "a real path");
+        assert_eq!(
+            opts & FOS_FORCEFILESYSTEM,
+            FOS_FORCEFILESYSTEM,
+            "a real path"
+        );
         assert_eq!(opts & FOS_FILEMUSTEXIST, FOS_FILEMUSTEXIST, "an open panel");
         assert_eq!(opts & FOS_PATHMUSTEXIST, FOS_PATHMUSTEXIST, "a real folder");
 
         let hostile = FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT | FOS_NODEREFERENCELINKS;
         let opts = dialog_options(hostile);
         assert_eq!(opts & FOS_PICKFOLDERS, 0, "canChooseDirectories(false)");
-        assert_eq!(opts & FOS_ALLOWMULTISELECT, 0, "allowsMultipleSelection(false)");
+        assert_eq!(
+            opts & FOS_ALLOWMULTISELECT,
+            0,
+            "allowsMultipleSelection(false)"
+        );
         assert_eq!(opts & FOS_NODEREFERENCELINKS, 0, "resolvesAliases(true)");
     }
 
@@ -722,10 +762,7 @@ mod tests {
             r"C:\Users\m6-an\My Pictures\naïve — copy (1).jpeg",
             r"\\?\C:\very\long\path\image.png",
         ] {
-            let units: Vec<u16> = original
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            let units: Vec<u16> = original.encode_utf16().chain(std::iter::once(0)).collect();
             assert_eq!(
                 path_from_nul_terminated(&units),
                 PathBuf::from(original),
@@ -757,7 +794,8 @@ mod tests {
         units.extend(".png".encode_utf16());
         units.push(0);
         let path = path_from_nul_terminated(&units);
-        let back: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str()).collect();
+        let back: Vec<u16> =
+            std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str()).collect();
         assert_eq!(back, units[..units.len() - 1], "byte-exact, not lossy");
         assert!(
             !path.to_string_lossy().is_empty(),

@@ -714,10 +714,7 @@ impl CursorCat {
     /// starting an ordinary flying episode. The resident pet owns idle glass,
     /// but the held-key song still owes the same real cursor-travel floor as
     /// classic mode; starving this feed makes that authored handoff unreachable.
-    pub fn on_pet_mode_motion_pulse(
-        &mut self,
-        pulse: crate::cursor_glow::CursorCatMotionPulse,
-    ) {
+    pub fn on_pet_mode_motion_pulse(&mut self, pulse: crate::cursor_glow::CursorCatMotionPulse) {
         self.on_motion_pulse_with_owner(pulse, false);
     }
 
@@ -2393,7 +2390,10 @@ mod tests {
         let mut promised = CursorCat::default();
         promised.on_collect(now, KittyLook::default());
         promised.retire_unowned_cursor_motion();
-        assert!(promised.is_active(), "a collection hello is independently owned");
+        assert!(
+            promised.is_active(),
+            "a collection hello is independently owned"
+        );
         assert!(
             promised
                 .frame(now + Duration::from_secs_f32(FADE_IN * 0.5))

@@ -74,7 +74,8 @@ pub(crate) const SHADOW_MARGIN: f32 = 12.0;
 /// beside the loop has always claimed these stay inside [`SHADOW_MARGIN`]; until this
 /// was a table, nothing checked it, and a fourth layer or a bigger spread would have
 /// been cropped by the compositor's paint region with no test to say so.
-pub(crate) const SHADOW_LAYERS: [(f32, f32, u8); 3] = [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
+pub(crate) const SHADOW_LAYERS: [(f32, f32, u8); 3] =
+    [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
 
 /// The alpha below which the card stops being a click target. The exit tail runs the
 /// card down to nothing, and an all-but-invisible thing that swallows clicks — or worse,
@@ -278,7 +279,11 @@ impl TransientNotice {
     /// through the hold, then an eased ramp 1→0 across the exit tail.
     pub(crate) fn alpha(&self, now: Instant) -> f32 {
         let elapsed = now.duration_since(self.spawned).as_secs_f32();
-        let (ttl, enter, fade) = (self.ttl.as_secs_f32(), ENTER.as_secs_f32(), FADE.as_secs_f32());
+        let (ttl, enter, fade) = (
+            self.ttl.as_secs_f32(),
+            ENTER.as_secs_f32(),
+            FADE.as_secs_f32(),
+        );
         let fade_start = ttl - fade;
         if elapsed <= 0.0 {
             0.0
@@ -297,7 +302,11 @@ impl TransientNotice {
     /// thing that blinks on and dissolves. `0` throughout the hold.
     pub(crate) fn rise(&self, now: Instant) -> f32 {
         let elapsed = now.duration_since(self.spawned).as_secs_f32();
-        let (ttl, enter, fade) = (self.ttl.as_secs_f32(), ENTER.as_secs_f32(), FADE.as_secs_f32());
+        let (ttl, enter, fade) = (
+            self.ttl.as_secs_f32(),
+            ENTER.as_secs_f32(),
+            FADE.as_secs_f32(),
+        );
         let fade_start = ttl - fade;
         if elapsed <= 0.0 {
             -1.0
@@ -808,7 +817,6 @@ pub(crate) fn notice_rect(
     (p.x, p.y, p.w, p.h)
 }
 
-
 /// A fully-saturated rainbow colour at hue `h` turns (0..1 wraps).
 ///
 /// Full saturation and value on purpose: this is party trim, not a UI role, and it is
@@ -829,11 +837,7 @@ pub(crate) fn rainbow(h: f32) -> [u8; 3] {
         4 => (t, 0.0, 1.0),
         _ => (1.0, 0.0, q),
     };
-    [
-        (r * 255.0) as u8,
-        (g * 255.0) as u8,
-        (b * 255.0) as u8,
-    ]
+    [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
 }
 
 /// How many sparkles ring the celebration card.
@@ -1160,11 +1164,8 @@ mod tests {
             ("auto-light", terminal_light),
         ] {
             let r = Roles::from_theme(theme);
-            let ink = crate::chrome_band::ensure_contrast(
-                r.text_tertiary,
-                r.elevated,
-                CHEVRON_INK_FLOOR,
-            );
+            let ink =
+                crate::chrome_band::ensure_contrast(r.text_tertiary, r.elevated, CHEVRON_INK_FLOOR);
             let got = crate::chrome_band::contrast(ink, r.elevated);
             assert!(
                 got >= CHEVRON_INK_FLOOR,
@@ -1202,8 +1203,8 @@ mod tests {
         let p = layout(&n, &g, now, 1.0, 0.0);
         let s = p.size.get();
         let (detail, detail_x) = p.detail.clone().expect("the ready pill carries a version");
-        let detail_end =
-            detail_x + crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, &detail, s);
+        let detail_end = detail_x
+            + crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, &detail, s);
         let chevron_cx = p.chevron_cx.expect("the ready pill is the clickable one");
         // Half the drawn chevron's horizontal reach — the arms span `arm` total.
         let chevron_left = chevron_cx - s * 0.28 * 0.5;
@@ -1236,8 +1237,7 @@ mod tests {
         let now = Instant::now();
         let short = super::TransientNotice::gesture_failure("✕ New tab failed: EMFILE", now);
         assert_eq!(short.text(), "✕ New tab failed: EMFILE");
-        let multiline =
-            super::TransientNotice::gesture_failure("first line\nsecond line", now);
+        let multiline = super::TransientNotice::gesture_failure("first line\nsecond line", now);
         assert_eq!(multiline.text(), "first line");
         let long = super::TransientNotice::gesture_failure("x".repeat(300), now);
         let text = long.text();
@@ -1449,7 +1449,11 @@ mod tests {
             "the hold sleeps to the exit boundary"
         );
         let leaving = now + TTL - FADE / 2;
-        assert_eq!(n.deadline(leaving, true), leaving + FRAME, "the exit animates");
+        assert_eq!(
+            n.deadline(leaving, true),
+            leaving + FRAME,
+            "the exit animates"
+        );
     }
 
     #[test]
@@ -1794,7 +1798,10 @@ mod tests {
         );
         // The celebration animates during its hold; nothing else does, so nothing
         // else starts churning repaints.
-        assert!(party.animates(true), "the celebration's pixels move while it holds");
+        assert!(
+            party.animates(true),
+            "the celebration's pixels move while it holds"
+        );
         assert!(
             !party.animates(false),
             "…and stand still when sparkles are off or motion is reduced — no wake, no re-raster"
@@ -1831,5 +1838,4 @@ mod tests {
             assert!(c.iter().any(|&v| v > 0), "hue {i} produced black");
         }
     }
-
 }

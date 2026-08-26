@@ -233,7 +233,6 @@ fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> st
 // relaunches aterm, so it cannot live inside this macOS-only module.
 use crate::relaunch::reexec_forwarded_args;
 
-
 /// The post-swap re-exec command: the NEW binary at the canonical path, the
 /// forwarded argv, the single-use re-exec nonce — and the caller's handoff
 /// authority variables restored onto the exec image ONLY. The GUI's prearm
@@ -310,7 +309,11 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn prepare_trial(staging: &Staging, ready: &Ready, install_root: &Path) -> Result<Sentinel, String> {
+fn prepare_trial(
+    staging: &Staging,
+    ready: &Ready,
+    install_root: &Path,
+) -> Result<Sentinel, String> {
     let sentinel = boot_sentinel(staging);
     // The trial is bound to the install it swaps: see `trial_owned_by`.
     if let Err(error) = crate::manifest::FailedMark::record_required(
@@ -546,9 +549,9 @@ fn recover_abandoned_preswap_trial_if_exact(
         // the rename back (EXDEV whenever the install volume differs from HOME,
         // i.e. every external-volume install) destroyed the one copy the
         // published authority still pointed at.
-        if verified_bundle_identity(&staging.staged_app).is_ok_and(|(build, commit)| {
-            build == candidate_build && commit == candidate_commit
-        }) {
+        if verified_bundle_identity(&staging.staged_app)
+            .is_ok_and(|(build, commit)| build == candidate_build && commit == candidate_commit)
+        {
             let _ = remove_path_no_follow(&fixed);
         } else {
             let _ = remove_path_no_follow(&staging.staged_app);
@@ -663,7 +666,8 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
                 std::fs::symlink_metadata(root),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound
             );
-            present && bundle::resolve_layout().is_none_or(|b| !same_install_root(root, &b.app_root))
+            present
+                && bundle::resolve_layout().is_none_or(|b| !same_install_root(root, &b.app_root))
         });
     if owned_elsewhere {
         let idle_long_enough = mtime(&staging.root.join("boot.sentinel"))
@@ -3541,13 +3545,14 @@ mod tests {
         // A `--window` past the first other token is payload-adjacent and
         // survives verbatim — including inside an -e command.
         assert_eq!(
-            super::reexec_forwarded_args(
-                args(&["-e", "sh", "-c", "--window"]).into_iter()
-            ),
+            super::reexec_forwarded_args(args(&["-e", "sh", "-c", "--window"]).into_iter()),
             args(&["-e", "sh", "-c", "--window"]),
         );
         // Empty argv (Finder/launchd launch) stays empty.
-        assert_eq!(super::reexec_forwarded_args(args(&[]).into_iter()), args(&[]));
+        assert_eq!(
+            super::reexec_forwarded_args(args(&[]).into_iter()),
+            args(&[])
+        );
     }
 
     /// `rfc3339_delta_secs` inverts `format_rfc3339` across day/month/year and
@@ -3617,8 +3622,6 @@ mod tests {
         std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
     }
 
-
-
     /// A `ready.toml` whose staged bundle is GONE must clear itself. This recovery runs
     /// before the `is_publishable` retirement, so returning Err made that retirement
     /// unreachable and turned every launch into a permanent `Deferred` naming a rollback
@@ -3630,7 +3633,10 @@ mod tests {
         let installed = root.join("Applications").join("aterm.app");
         std::fs::create_dir_all(&installed).unwrap();
         let ready = Ready::read(&s.ready).unwrap();
-        assert!(!s.staged_app.exists(), "the staged bundle is the missing half");
+        assert!(
+            !s.staged_app.exists(),
+            "the staged bundle is the missing half"
+        );
         assert!(
             !rollback_path(&installed).exists(),
             "and nothing at the fixed path could ever satisfy the marker"
@@ -3706,12 +3712,14 @@ staged_at = "2026-08-17T00:00:00Z"
             "clamped marker is {} bytes",
             marker.len()
         );
-        assert!(crate::read_ledger_text(&{
-            let (s, _root) = temp_staging();
-            std::fs::write(&s.ready, &marker).unwrap();
-            s.ready
-        })
-        .is_some());
+        assert!(
+            crate::read_ledger_text(&{
+                let (s, _root) = temp_staging();
+                std::fs::write(&s.ready, &marker).unwrap();
+                s.ready
+            })
+            .is_some()
+        );
     }
 
     /// A marker that would read as ABSENT must never be committed — and refusing it
@@ -4567,15 +4575,24 @@ staged_at = "2026-08-17T00:00:00Z"
         make_app(&owner, "OWNER");
         let sentinel = boot_sentinel(&s);
         sentinel.arm(1000).unwrap();
-        crate::manifest::FailedMark::record_required(&s.trial(), 1000, &"ab".repeat(32), Some(&owner))
-            .unwrap();
+        crate::manifest::FailedMark::record_required(
+            &s.trial(),
+            1000,
+            &"ab".repeat(32),
+            Some(&owner),
+        )
+        .unwrap();
         for _ in 0..MAX_BOOT_ATTEMPTS + 2 {
             assert!(
                 !escape_wedged_foreign_trial(&s, 1001, 1000),
                 "a present, recently-touched owner keeps its trial past the budget"
             );
         }
-        assert_eq!(sentinel.read_state(), Some((1000, 0)), "still armed, still untouched");
+        assert_eq!(
+            sentinel.read_state(),
+            Some((1000, 0)),
+            "still armed, still untouched"
+        );
         // The owner install GONE: the next exhausted budget disarms (ghost cedes).
         std::fs::remove_dir_all(&owner).unwrap();
         let mut disarmed = false;
@@ -4859,7 +4876,8 @@ staged_at = "2026-08-17T00:00:00Z"
         let failed_installed = failed_root.join("Applications/aterm.app");
         make_app(&failed_installed, "OLD");
         let failed_ready = Ready::read(&failed_staging.ready).unwrap();
-        let failed_sentinel = prepare_trial(&failed_staging, &failed_ready, &failed_installed).unwrap();
+        let failed_sentinel =
+            prepare_trial(&failed_staging, &failed_ready, &failed_installed).unwrap();
         let mut failed_state = disk_model_ready(&model);
         disk_model_step(&model, &mut failed_state, "RemovePreviousReceipt");
         disk_model_step(&model, &mut failed_state, "PrepareFixedNew");
@@ -4957,7 +4975,8 @@ staged_at = "2026-08-17T00:00:00Z"
         make_app(&rollback_installed, "OLD");
         make_app(&rollback_fixed, "NEW");
         let rollback_ready = Ready::read(&rollback_staging.ready).unwrap();
-        let rollback_sentinel = prepare_trial(&rollback_staging, &rollback_ready, &rollback_installed).unwrap();
+        let rollback_sentinel =
+            prepare_trial(&rollback_staging, &rollback_ready, &rollback_installed).unwrap();
         let mut rollback_state = disk_model_ready(&model);
         disk_model_step(&model, &mut rollback_state, "RemovePreviousReceipt");
         for action in ["PrepareFixedNew", "ArmExactTrial"] {

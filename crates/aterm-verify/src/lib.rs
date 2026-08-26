@@ -447,7 +447,9 @@ pub fn is_executable_file(path: &Path) -> bool {
 #[cfg(not(unix))]
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| !m.is_dir()).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| !m.is_dir())
+        .unwrap_or(false)
 }
 
 /// `command -v <name>` against the PATH the gate hands its children.

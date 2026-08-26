@@ -136,8 +136,8 @@ pub const GRIP_FRAC: f32 = 10.0 / 176.0;
 /// click box IS the sprite, not a model of it.
 #[must_use]
 pub fn body_size_px(geom: &EffectGeom) -> (u16, u16) {
-    let h = ((art_rows(geom) * f32::from(geom.cell_h)).round() as i32)
-        .clamp(1, i32::from(u16::MAX)) as u16;
+    let h = ((art_rows(geom) * f32::from(geom.cell_h)).round() as i32).clamp(1, i32::from(u16::MAX))
+        as u16;
     let slot = (i32::from(geom.cell_h) * 4).max(1);
     let w = ((f32::from(h) * ART_ASPECT).round() as i32)
         .clamp(1, slot)
@@ -1156,7 +1156,11 @@ mod tests {
                     l.top_y - lh / 4,
                     l.top_y
                 );
-                assert!(l.bot_y <= se.win_bot, "t={t}: ladder foot {} clips", l.bot_y);
+                assert!(
+                    l.bot_y <= se.win_bot,
+                    "t={t}: ladder foot {} clips",
+                    l.bot_y
+                );
             }
         }
     }

@@ -220,7 +220,7 @@ impl GridStorage {
             lazy_buffer: LazyBuffer::new(),
             scrollback_detached_for_reflow: false,
             pending_scrollback_settings: None,
-                pending_fill_target: None,
+            pending_fill_target: None,
             compress_offload_active: false,
             flood_truncated_lines: 0,
             ring_byte_watermark: None,

@@ -1864,7 +1864,11 @@ pub const fn draft_cleanup_decision(
     exact_draft_visible: bool,
     claim_bound_draft: bool,
 ) -> DraftCleanupDecision {
-    match (durable_create_intent, exact_draft_visible, claim_bound_draft) {
+    match (
+        durable_create_intent,
+        exact_draft_visible,
+        claim_bound_draft,
+    ) {
         (Some(false), false, _) => DraftCleanupDecision::AbandonProvenNoPost,
         (Some(true), true, _) => DraftCleanupDecision::DeleteIssuedVisible,
         (Some(true), false, _) => DraftCleanupDecision::RetainIssuedAwaitVisibility,
@@ -3256,10 +3260,7 @@ impl PreRosterStanding<'_> {
 /// Locate `material` in the committed keyset, by canonical identity rather than by
 /// spelling — the same normalisation the client's verifier applies, so two base64
 /// aliases of one key cannot be judged differently here than there.
-fn pre_roster_standing<'a>(
-    keyset: &'a [&'a str],
-    material: &str,
-) -> Result<PreRosterStanding<'a>> {
+fn pre_roster_standing<'a>(keyset: &'a [&'a str], material: &str) -> Result<PreRosterStanding<'a>> {
     let Some(head_raw) = keyset.first() else {
         return Ok(PreRosterStanding::NobodyToStrand);
     };
@@ -4088,7 +4089,10 @@ fn gate_seed_matches_published_index(stat: &crate::seedpack::SeedStat) -> Result
         Ok(Some(newest)) => {
             step(
                 "seed-index",
-                &format!("seed is index build {} — current with {slug} (newest: {newest})", stat.index_build),
+                &format!(
+                    "seed is index build {} — current with {slug} (newest: {newest})",
+                    stat.index_build
+                ),
             );
             Ok(())
         }
@@ -6154,7 +6158,9 @@ impl CutCtx {
     fn retract_mirror_upload_intent(&mut self, name: &str) -> Result<()> {
         self.mirror_upload_intents.retain(|issued| issued != name);
         if let Some(journal) = &mut self.journal {
-            journal.mirror_upload_intents.retain(|issued| issued != name);
+            journal
+                .mirror_upload_intents
+                .retain(|issued| issued != name);
             journal.save(&self.journal_path)?;
         }
         Ok(())
@@ -7144,10 +7150,13 @@ fn fresh_published_recovery_signature_policy(
     // it validates and finishes bytes that already shipped — so the attribution it
     // must record is the one INSIDE those bytes, read from the downloaded manifest by
     // `recover_published_cut`, never a fresh local claim about who this machine is.
-    Ok(
-        preflight_signature_policy(repo, credentials, RosterDuty::Finish, PreRosterClients::Answered)?
-            .policy,
-    )
+    Ok(preflight_signature_policy(
+        repo,
+        credentials,
+        RosterDuty::Finish,
+        PreRosterClients::Answered,
+    )?
+    .policy)
 }
 
 /// Which assets a published release must be carrying for its own manifest to make
@@ -7287,11 +7296,9 @@ fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
     // Only a MASTER-SIGNED local roster can outrank the release's. An unverifiable
     // file is not an authorizing document, and letting one block a recovery would
     // hand any stray bytes in `dist/` a veto over un-wedging the release pipeline.
-    let Ok(verified) = roster::verify_roster(
-        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-        bytes,
-        &sig,
-    ) else {
+    let Ok(verified) =
+        roster::verify_roster(aterm_update_core::pins::PAPER_MASTER_PUBKEYS, bytes, &sig)
+    else {
         return Ok(());
     };
     let Ok(existing) = roster::Roster::parse(&verified) else {
@@ -8128,7 +8135,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     if let Some(document) = signature_verdict.roster.as_ref() {
         machines::roster_lineage_agrees(
             &document.bytes,
-            signature_verdict.attribution.as_ref().map(|who| who.roster_seq),
+            signature_verdict
+                .attribution
+                .as_ref()
+                .map(|who| who.roster_seq),
             observed_roster.as_ref(),
         )
         .map_err(Error::new)?;
@@ -10120,9 +10130,8 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             let seeded = String::from_utf8_lossy(&provenance)
                 .lines()
                 .any(|line| line == "seed=yes");
-            let out =
-                dmg::create_lite(&app, &ctx.dist, &ctx.version, notarized, seeded)
-                    .map_err(Error::new)?;
+            let out = dmg::create_lite(&app, &ctx.dist, &ctx.version, notarized, seeded)
+                .map_err(Error::new)?;
             let hooked = sign::sign_and_notarize_dmg(&out.path, &ctx.apple, &sign::RealAppleTools)
                 .map_err(Error::new)?;
             let (sha, size) = if hooked {
@@ -10154,7 +10163,10 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
                 mirror::sha256_sidecar_contents(&sha, &lite_name),
             )
             .map_err(|e| {
-                Error::new(format!("self-check: write {}: {e}", ctx.dmg_lite_sha256_path().display()))
+                Error::new(format!(
+                    "self-check: write {}: {e}",
+                    ctx.dmg_lite_sha256_path().display()
+                ))
             })?;
             fs::copy(&out.path, ctx.stable_dmg_path()).map_err(|e| {
                 Error::new(format!(
@@ -10263,7 +10275,11 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             manifest.sha256.as_str(),
             manifest.dmg.as_str(),
         ),
-        (ctx.zip_sha256_path(), zip_sha256.as_str(), zip_name.as_str()),
+        (
+            ctx.zip_sha256_path(),
+            zip_sha256.as_str(),
+            zip_name.as_str(),
+        ),
         (
             ctx.dmg_lite_sha256_path(),
             lite_sha.as_str(),
@@ -10425,14 +10441,13 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     // burns a build number and strands the fleet.
     let manifest_roster_seq = published_roster_seq(best)?;
     let observed_roster = match (&ctx.mirror_slug, ctx.kind) {
-        (Some(slug), CutKind::Real) if *slug != ctx.slug => {
-            machines::channel_roster_document(slug).map_err(|e| {
+        (Some(slug), CutKind::Real) if *slug != ctx.slug => machines::channel_roster_document(slug)
+            .map_err(|e| {
                 Error::new(format!(
                     "cannot read the machine roster on the public channel {slug}'s latest \
                      release ({e}); refusing to reason about the fleet's roster floor"
                 ))
-            })?
-        }
+            })?,
         _ => None,
     };
     let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
@@ -12095,8 +12110,14 @@ mod transport_body_tests {
     fn the_retraction_is_decided_before_any_remote_probe() {
         let src = include_str!("publish.rs");
         for (func, retract) in [
-            ("fn upload_release_asset_by_id", "ctx.retract_upload_intent(name)?"),
-            ("fn upload_mirror_asset", "ctx.retract_mirror_upload_intent(name)?"),
+            (
+                "fn upload_release_asset_by_id",
+                "ctx.retract_upload_intent(name)?",
+            ),
+            (
+                "fn upload_mirror_asset",
+                "ctx.retract_mirror_upload_intent(name)?",
+            ),
         ] {
             let body = &src[src.find(func).expect("function present")..];
             let issue = body.find("post.issue(permit)?").expect("the POST");
@@ -12224,7 +12245,6 @@ mod roster_wiring_tests {
              machine's own key, or they would reject their own recovery"
         );
     }
-
 
     /// A context shaped like a real cut, differing only in whether it is attributed.
     /// Every remote-facing field is inert; nothing here touches the network or a repo.
@@ -12358,7 +12378,8 @@ mod roster_wiring_tests {
         ] {
             let set = names(&set);
             assert!(
-                !set.iter().any(|n| n.contains("lite") || n.contains("offline")),
+                !set.iter()
+                    .any(|n| n.contains("lite") || n.contains("offline")),
                 "the {label} set must never carry the mirror-only lean assets: {set:?}"
             );
         }
@@ -12367,7 +12388,8 @@ mod roster_wiring_tests {
         assert!(!pre_lite.carries_lite_dmg());
         let set = names(&pre_lite.mirror_asset_paths());
         assert!(
-            !set.iter().any(|n| n.contains("lite") || n.contains("offline")),
+            !set.iter()
+                .any(|n| n.contains("lite") || n.contains("offline")),
             "a pre-lite cut's mirror set must not grow one name: {set:?}"
         );
     }
@@ -12439,10 +12461,7 @@ mod roster_wiring_tests {
         // only needs to differ from the head; borrowing a real committed constant
         // here would couple this test to anchors it has no business reading.
         let other = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
-        assert_ne!(
-            other, head,
-            "precondition: a second, different key"
-        );
+        assert_ne!(other, head, "precondition: a second, different key");
 
         let mut signing_elsewhere = ctx(None);
         signing_elsewhere.signature_pubkey = Some(other.to_string());
@@ -12639,10 +12658,8 @@ mod roster_wiring_tests {
     /// is exercised against bytes that genuinely verify under the pinned paper master.
     #[test]
     fn recovery_refuses_to_overwrite_a_newer_local_roster() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-roster-downgrade-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aterm-roster-downgrade-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -12703,5 +12720,4 @@ sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
     ];
     const ROSTER_SEQ2_SIG: &str =
         "vNOvNYPssbUN3F/SmnoPDk6za2BAaewu9Vopl5YU7EDd+KUM0Y84eUryvFE9OWUywT/yggXE92SYQ2Qz7k56DA==";
-
 }

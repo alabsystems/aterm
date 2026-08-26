@@ -229,9 +229,7 @@ impl FleetGlance {
     pub fn header_line(&self) -> String {
         match &self.operator {
             OperatorState::NotRunning => "Operator: not running".to_string(),
-            OperatorState::Running(detail) if detail.is_empty() => {
-                "Operator: running".to_string()
-            }
+            OperatorState::Running(detail) if detail.is_empty() => "Operator: running".to_string(),
             OperatorState::Running(detail) => format!("Operator{detail}"),
         }
     }
@@ -426,7 +424,9 @@ pub fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
                 enabled: glance.start_available,
             });
             if !glance.start_available {
-                rows.push(StatusRow::Info("(claude CLI not found on PATH)".to_string()));
+                rows.push(StatusRow::Info(
+                    "(claude CLI not found on PATH)".to_string(),
+                ));
             }
         }
         OperatorState::Running(_) => {
@@ -628,10 +628,7 @@ mod macos {
     /// Called once when the first OS window attaches (never headless). Returns
     /// the retained handle for `App` to keep alive; best-effort `None` off the
     /// main thread — never a panic (the `menu::install` contract).
-    pub fn install(
-        proxy: &EventLoopProxy<Wake>,
-        glance: &FleetGlance,
-    ) -> Option<StatusItemHandle> {
+    pub fn install(proxy: &EventLoopProxy<Wake>, glance: &FleetGlance) -> Option<StatusItemHandle> {
         let mtm = MainThreadMarker::new()?;
         let target = StatusTarget::new(mtm, proxy.clone());
         // SAFETY: systemStatusBar/statusItemWithLength are main-thread AppKit
@@ -783,7 +780,11 @@ mod tests {
 
     #[test]
     fn operator_found_by_title_prefix_case_insensitive() {
-        let g = classify(&rows(&[(3, "zsh"), (7, "Operator: fleet idle"), (9, "vim")]));
+        let g = classify(&rows(&[
+            (3, "zsh"),
+            (7, "Operator: fleet idle"),
+            (9, "vim"),
+        ]));
         assert_eq!(g.operator_session, Some(7));
         assert_eq!(g.operator, OperatorState::Running(": fleet idle".into()));
         assert_eq!(g.header_line(), "Operator: fleet idle");
@@ -795,12 +796,18 @@ mod tests {
         // Tab titles carry spinner/state glyphs (e.g. "✳ operator: busy").
         let g = classify(&rows(&[(2, "✳ operator: driving 2 workers")]));
         assert_eq!(g.operator_session, Some(2));
-        assert_eq!(g.operator, OperatorState::Running(": driving 2 workers".into()));
+        assert_eq!(
+            g.operator,
+            OperatorState::Running(": driving 2 workers".into())
+        );
     }
 
     #[test]
     fn warning_titles_badge_the_button() {
-        let g = classify(&rows(&[(1, "operator: fleet idle"), (4, "⚠ needs human: approval")]));
+        let g = classify(&rows(&[
+            (1, "operator: fleet idle"),
+            (4, "⚠ needs human: approval"),
+        ]));
         assert_eq!(g.warnings, vec![(4, "⚠ needs human: approval".to_string())]);
         assert_eq!(g.button_title(), "❯⚠");
     }
@@ -817,7 +824,11 @@ mod tests {
     fn non_operator_titles_do_not_match() {
         // "operators guide" begins with the word but not the identity prefix
         // boundary we accept ("operator" + non-alnum); it still must not match.
-        let g = classify(&rows(&[(1, "cooperator"), (2, "operators guide"), (3, "vim operators.txt")]));
+        let g = classify(&rows(&[
+            (1, "cooperator"),
+            (2, "operators guide"),
+            (3, "vim operators.txt"),
+        ]));
         assert_eq!(g.operator_session, None);
         assert_eq!(g.operator, OperatorState::NotRunning);
     }
@@ -851,7 +862,10 @@ mod tests {
         assert_eq!(g.operator, OperatorState::Running(": fleet brain".into()));
         // …and with NO typed role anywhere, the title scan still wins (the
         // fallback that keeps older briefs working).
-        let g = classify(&[row(1, "zsh", None, None), row(2, "operator: legacy", None, None)]);
+        let g = classify(&[
+            row(1, "zsh", None, None),
+            row(2, "operator: legacy", None, None),
+        ]);
         assert_eq!(g.operator_session, Some(2));
         // Typed role is case-insensitive and trimmed; other roles never match.
         let g = classify(&[row(3, "worker", Some(" Operator "), None)]);
@@ -862,8 +876,16 @@ mod tests {
 
     #[test]
     fn typed_operator_with_operator_title_keeps_the_legacy_detail() {
-        let g = classify(&[row(7, "✳ operator: driving 2 workers", Some("operator"), None)]);
-        assert_eq!(g.operator, OperatorState::Running(": driving 2 workers".into()));
+        let g = classify(&[row(
+            7,
+            "✳ operator: driving 2 workers",
+            Some("operator"),
+            None,
+        )]);
+        assert_eq!(
+            g.operator,
+            OperatorState::Running(": driving 2 workers".into())
+        );
         // An empty title renders as the bare running header.
         let g = classify(&[row(7, "", Some("operator"), None)]);
         assert_eq!(g.operator, OperatorState::Running(String::new()));
@@ -887,7 +909,12 @@ mod tests {
         let g = classify(&[row(4, "zsh", None, Some("   "))]);
         assert!(g.warnings.is_empty());
         // An escalated operator still counts as running.
-        let g = classify(&[row(1, "operator: stuck", Some("operator"), Some("wedged on CI"))]);
+        let g = classify(&[row(
+            1,
+            "operator: stuck",
+            Some("operator"),
+            Some("wedged on CI"),
+        )]);
         assert_eq!(g.operator_session, Some(1));
         assert_eq!(g.warnings, vec![(1, "⚠ wedged on CI".to_string())]);
     }
@@ -983,7 +1010,10 @@ mod tests {
         assert!(
             !heuristic.iter().any(|r| matches!(
                 r,
-                StatusRow::Action { action: OperatorAction::Stop, .. }
+                StatusRow::Action {
+                    action: OperatorAction::Stop,
+                    ..
+                }
             )),
             "title-elected operator must not be offered Stop: {heuristic:?}"
         );
@@ -991,7 +1021,10 @@ mod tests {
         assert!(
             typed.iter().any(|r| matches!(
                 r,
-                StatusRow::Action { action: OperatorAction::Stop, .. }
+                StatusRow::Action {
+                    action: OperatorAction::Stop,
+                    ..
+                }
             )),
             "typed operator must keep Stop: {typed:?}"
         );

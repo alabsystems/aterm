@@ -182,7 +182,14 @@ fn subverb_flags_never_become_program_names() {
     let record = || std::fs::read_to_string(&status_toml).unwrap_or_default();
 
     // A flag right after a name-taking verb is someone asking how the verb works.
-    for verb in ["install", "update", "uninstall", "link", "rollback", "which"] {
+    for verb in [
+        "install",
+        "update",
+        "uninstall",
+        "link",
+        "rollback",
+        "which",
+    ] {
         let status = run_with_deadline(&home, &config_home, &registry, &[verb, "--help"]);
         assert!(
             status.success(),

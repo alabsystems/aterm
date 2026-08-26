@@ -1373,8 +1373,7 @@ pub(crate) fn store_cell_metrics(
         return;
     };
     std::thread::spawn(move || {
-        if let Err(error) =
-            store_cell_metrics_to(&path, &font_key, scale, font_px, cell_w, cell_h)
+        if let Err(error) = store_cell_metrics_to(&path, &font_key, scale, font_px, cell_w, cell_h)
         {
             eprintln!("aterm-gui: cell-metrics cache not written: {error}");
         }
@@ -1436,8 +1435,7 @@ fn store_cell_metrics_to(
                 cache.entries.push(entry);
             }
         }
-        let toml =
-            toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
+        let toml = toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
         write_restore_locked(path, toml.as_bytes())
     })
 }

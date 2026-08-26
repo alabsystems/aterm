@@ -44,8 +44,10 @@ pub fn dom(s: &CellSurvey, target: &PkgId) -> DomCost {
 /// program exists to defend.
 pub fn ranked(s: &CellSurvey) -> Vec<(PkgId, DomCost)> {
     let base = s.graph.reach(None);
-    let mut out: Vec<(PkgId, DomCost)> =
-        s.third_party().map(|id| (id.clone(), dom_against(s, &base, id))).collect();
+    let mut out: Vec<(PkgId, DomCost)> = s
+        .third_party()
+        .map(|id| (id.clone(), dom_against(s, &base, id)))
+        .collect();
     // LOC descending, then name/version ascending, so the table is stable
     // across runs and two versions of one crate sort adjacently.
     out.sort_by(|a, b| b.1.loc.cmp(&a.1.loc).then_with(|| a.0.cmp(&b.0)));
@@ -93,7 +95,11 @@ mod tests {
 
     fn find(s: &CellSurvey, name: &str) -> PkgId {
         let mut hits: Vec<&PkgId> = s.graph.nodes.iter().filter(|p| p.name == name).collect();
-        assert_eq!(hits.len(), 1, "`{name}` must be unambiguous in this cell, got {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "`{name}` must be unambiguous in this cell, got {hits:?}"
+        );
         hits.pop().expect("checked above").clone()
     }
 
@@ -103,9 +109,16 @@ mod tests {
         let id = find(s, want.name);
         let cost = dom(s, &id);
         assert_eq!((cost.pkgs, cost.loc), (want.pkgs, want.loc), "dom({id})");
-        assert_eq!(cost.also.len(), want.pkgs - 1, "`also` excludes the target itself");
+        assert_eq!(
+            cost.also.len(),
+            want.pkgs - 1,
+            "`also` excludes the target itself"
+        );
         assert!(!cost.also.contains(&id));
-        assert!(cost.also.windows(2).all(|w| w[0] < w[1]), "`also` must be sorted");
+        assert!(
+            cost.also.windows(2).all(|w| w[0] < w[1]),
+            "`also` must be sorted"
+        );
     }
 
     // ---- synthetic: the property that makes a dominator not a subtree -----
@@ -116,12 +129,19 @@ mod tests {
             .into_iter()
             .map(|n| (n, PkgId::new(n, "1.0.0")))
             .collect();
-        let mut graph = Graph { root: ids["root"].clone(), ..Graph::default() };
+        let mut graph = Graph {
+            root: ids["root"].clone(),
+            ..Graph::default()
+        };
         for id in ids.values() {
             graph.nodes.insert(id.clone());
         }
         let mut edge = |from: &str, to: &str| {
-            graph.edges.entry(ids[from].clone()).or_default().insert(ids[to].clone());
+            graph
+                .edges
+                .entry(ids[from].clone())
+                .or_default()
+                .insert(ids[to].clone());
         };
         edge("root", "a");
         edge("root", "b");
@@ -132,7 +152,14 @@ mod tests {
             .values()
             .map(|id| {
                 let third = id.name != "root";
-                (id.clone(), PkgFacts { loc: 100, is_third_party: third, ..PkgFacts::default() })
+                (
+                    id.clone(),
+                    PkgFacts {
+                        loc: 100,
+                        is_third_party: third,
+                        ..PkgFacts::default()
+                    },
+                )
             })
             .collect();
         CellSurvey {
@@ -170,14 +197,21 @@ mod tests {
 
     #[test]
     fn a_package_outside_the_graph_costs_nothing() {
-        assert_eq!(dom(&synthetic(), &PkgId::new("absent", "0.1.0")), DomCost::default());
+        assert_eq!(
+            dom(&synthetic(), &PkgId::new("absent", "0.1.0")),
+            DomCost::default()
+        );
     }
 
     #[test]
     fn ranked_is_third_party_only_and_sorted_by_loc_then_name() {
         let s = synthetic();
         let r = ranked(&s);
-        assert_eq!(r.len(), 4, "the root is not third-party and is never ranked");
+        assert_eq!(
+            r.len(),
+            4,
+            "the root is not third-party and is never ranked"
+        );
         assert!(r.iter().all(|(id, _)| id.name != "root"));
         assert!(r.windows(2).all(|w| w[0].1.loc >= w[1].1.loc));
         assert_eq!(r[0].0, PkgId::new("b", "1.0.0"), "b at 200 LOC leads");
@@ -200,7 +234,10 @@ mod tests {
     fn naga_falls_with_wgpu_and_libc_falls_alone() {
         let s = survey(0);
         let wgpu = dom(&s, &find(&s, "wgpu"));
-        assert!(wgpu.also.contains(&find(&s, "naga")), "naga is wgpu's alone");
+        assert!(
+            wgpu.also.contains(&find(&s, "naga")),
+            "naga is wgpu's alone"
+        );
         assert!(dom(&s, &find(&s, "libc")).also.is_empty(), "libc is a leaf");
     }
 
@@ -223,7 +260,11 @@ mod tests {
             .filter(|(_, kids)| kids.contains(&pe))
             .map(|(parent, _)| parent)
             .collect();
-        assert_eq!(parents, vec![&ureq], "percent-encoding hangs off ureq alone");
+        assert_eq!(
+            parents,
+            vec![&ureq],
+            "percent-encoding hangs off ureq alone"
+        );
 
         assert_dom(&s, measured::MAC_ARM_UREQ);
         let cost = dom(&s, &ureq);
@@ -264,8 +305,10 @@ mod tests {
             .take(measured::MAC_ARM_DOMINATORS.len())
             .map(|(id, c)| (id.name.as_str(), c.pkgs, c.loc))
             .collect();
-        let want: Vec<(&str, usize, u64)> =
-            measured::MAC_ARM_DOMINATORS.iter().map(|d| (d.name, d.pkgs, d.loc)).collect();
+        let want: Vec<(&str, usize, u64)> = measured::MAC_ARM_DOMINATORS
+            .iter()
+            .map(|d| (d.name, d.pkgs, d.loc))
+            .collect();
         assert_eq!(head, want);
         assert_eq!(
             r.len(),
@@ -280,7 +323,11 @@ mod tests {
         let total = s.third_party_loc();
         for (id, cost) in ranked(&s) {
             assert!(cost.pkgs >= 1, "{id} must at least cost itself");
-            assert!(cost.loc <= total, "dom({id}) = {} exceeds the surface {total}", cost.loc);
+            assert!(
+                cost.loc <= total,
+                "dom({id}) = {} exceeds the surface {total}",
+                cost.loc
+            );
         }
     }
 }

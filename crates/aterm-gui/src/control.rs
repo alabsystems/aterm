@@ -568,9 +568,7 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         // — all disclose the whole fabric to a scoped edge otherwise. Classified by
         // the TARGET TOKEN only (the `open prefs close` rule above), so the
         // `close`-variant dismiss escalates identically.
-        "open" | "controls" | "window"
-            if rest.split_whitespace().next() == Some("connections") =>
-        {
+        "open" | "controls" | "window" if rest.split_whitespace().next() == Some("connections") => {
             Some(Escalation::OwnerOnly)
         }
         "open" => match crate::app_introspect::AuxTarget::parse(
@@ -4352,17 +4350,16 @@ where
     // state.  Framing behavior below remains unchanged.
     let attempt_selector = binary_frame_attempt_selector(line, verb);
     let header_active_target = resolve_active(route.active);
-    let header_target = attempt_selector.as_ref().and_then(|selector| match selector {
-        None | Some(Selector::SelfTok) => header_active_target.clone(),
-        Some(sel) => resolve_explicit(route.store, sel),
-    });
+    let header_target = attempt_selector
+        .as_ref()
+        .and_then(|selector| match selector {
+            None | Some(Selector::SelfTok) => header_active_target.clone(),
+            Some(sel) => resolve_explicit(route.store, sel),
+        });
     let header_authorized = header_target.as_ref().is_some_and(|(_, _, _, ctx)| {
-        matches!(route.scope, Scope::Owner)
-            || cross_session_authorized(route.scope, "feed", ctx)
+        matches!(route.scope, Scope::Owner) || cross_session_authorized(route.scope, "feed", ctx)
     });
-    if header_authorized
-        && let Some((_, _, session, _)) = header_target.as_ref()
-    {
+    if header_authorized && let Some((_, _, session, _)) = header_target.as_ref() {
         let response = clear_license(*session);
         if !response.starts_with("OK") {
             // Do not wait for a slow payload while the header target's old
@@ -4417,8 +4414,7 @@ where
         Some(sel) => resolve_explicit(route.store, sel),
     };
     let authorized = target.as_ref().is_some_and(|(_, _, _, ctx)| {
-        matches!(route.scope, Scope::Owner)
-            || cross_session_authorized(route.scope, "feed", ctx)
+        matches!(route.scope, Scope::Owner) || cross_session_authorized(route.scope, "feed", ctx)
     });
 
     // The binary paste twin has the same hybrid target contract as inline
@@ -5473,10 +5469,7 @@ fn front_routed_input(
 /// synchronously trigger output that borrows the older licence.
 fn front_routed_license_clear(proxy: &EventLoopProxy<Wake>, session: u64) -> String {
     license_clear_reply(control_media::call_main(proxy, |reply| {
-        Wake::CursorMoveLicenseClear {
-            session,
-            reply,
-        }
+        Wake::CursorMoveLicenseClear { session, reply }
     }))
 }
 
@@ -5507,11 +5500,7 @@ fn control_attempt_closes_cursor_license(verb: &str) -> bool {
     )
 }
 
-fn front_routed_resize(
-    proxy: &EventLoopProxy<Wake>,
-    session: u64,
-    rest: &str,
-) -> String {
+fn front_routed_resize(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
     if let Some(px) = rest.trim().strip_prefix("px") {
         let mut it = px.split_whitespace();
         let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
@@ -6472,9 +6461,7 @@ fn handle(
         // DIRECTLY to the TARGET term's viewport and reports `OK <offset> <max>` — the
         // SAME wire shape as the self path's `cmd_scroll`. `select` is already
         // cross-correct (mutates the target term + fires a repaint keyed by target id).
-        "scroll" if is_cross && targets_front => {
-            front_routed_scroll(term, proxy, session, rest)
-        }
+        "scroll" if is_cross && targets_front => front_routed_scroll(term, proxy, session, rest),
         "scroll" if is_cross => cross_scroll(term, rest),
         "scroll" => control_input::cmd_scroll(term, proxy, rest),
         "dims" => control_query::cmd_dims(term, session, proxy),
@@ -6689,8 +6676,8 @@ mod tests {
     #[test]
     fn an_explicit_selector_for_the_front_tab_is_routed_through_the_input_seam() {
         use super::{
-            TurnInputRoute, license_clear_reply, control_attempt_closes_cursor_license,
-            front_routed, turn_input_route,
+            TurnInputRoute, control_attempt_closes_cursor_license, front_routed,
+            license_clear_reply, turn_input_route,
         };
         // Named the tab on screen -> the seam.
         assert!(front_routed(true, Some(7), 7));
@@ -6725,8 +6712,8 @@ mod tests {
         // front and cross forms cancel exactly like valid ones. Read-only and
         // unauthorized requests never reach this post-authorization predicate.
         for verb in [
-            "send", "key", "ctrl", "feed", "signal", "mouse", "paste", "focus", "turn",
-            "resize", "scroll",
+            "send", "key", "ctrl", "feed", "signal", "mouse", "paste", "focus", "turn", "resize",
+            "scroll",
         ] {
             assert!(
                 control_attempt_closes_cursor_license(verb),
@@ -7166,9 +7153,9 @@ mod tests {
     #[cfg(unix)]
     use super::control_selection::{cmd_select, cmd_selection};
     use super::control_session::{
-        TurnIo, cmd_cast, cmd_connect_in, cmd_disconnect_in, cmd_edges, cmd_edges_json,
-        cmd_family, cmd_flows, cmd_grant, cmd_lease, cmd_meta, cmd_ready, cmd_revoke,
-        cmd_sessions, cmd_timeline, cmd_turn, cmd_who, cmd_whoami, raise_target,
+        TurnIo, cmd_cast, cmd_connect_in, cmd_disconnect_in, cmd_edges, cmd_edges_json, cmd_family,
+        cmd_flows, cmd_grant, cmd_lease, cmd_meta, cmd_ready, cmd_revoke, cmd_sessions,
+        cmd_timeline, cmd_turn, cmd_who, cmd_whoami, raise_target,
     };
     use super::*;
     use crate::TabAction;
@@ -10745,9 +10732,15 @@ mod tests {
         // The connected-spawn presets MINT standing session-connection authority
         // (design §5.3/§6) — their `invoke` twins carry the same OwnerOnly fence
         // as the `spawn connected=` arm below.
-        assert_eq!(escalated_op("invoke", "NewControlledWindow"), Some(OwnerOnly));
+        assert_eq!(
+            escalated_op("invoke", "NewControlledWindow"),
+            Some(OwnerOnly)
+        );
         assert_eq!(escalated_op("invoke", "NewControlledTab"), Some(OwnerOnly));
-        assert_eq!(escalated_op("invoke", "NewControllerWindow"), Some(OwnerOnly));
+        assert_eq!(
+            escalated_op("invoke", "NewControllerWindow"),
+            Some(OwnerOnly)
+        );
         assert_eq!(escalated_op("invoke", "NewControllerTab"), Some(OwnerOnly));
         // The context-menu picker/map rows (§2.3): the `invoke` twins of the
         // `open connections` OwnerOnly arm below.
@@ -10850,7 +10843,10 @@ mod tests {
         );
         // Unparseable input is fenced too: the fence is never weaker than the
         // parser, and an unterminated quote reaches the parser as an error.
-        assert_eq!(escalated_op("spawn", "\"connected=controller"), Some(OwnerOnly));
+        assert_eq!(
+            escalated_op("spawn", "\"connected=controller"),
+            Some(OwnerOnly)
+        );
         // Every AGGREGATED-graph surface carries the `flows` Owner gate: the map
         // (`open connections`), its text readout (`controls connections`), and its
         // capture (`window connections`) — including the `close`-variant dismiss
@@ -11039,7 +11035,10 @@ mod tests {
                 !dispatch_allows(edge_read, verb, rest, &ctx),
                 "read edge DENIED {verb} {rest} (owner-only surface)"
             );
-            assert!(dispatch_allows(owner, verb, rest, &ctx), "Owner: {verb} {rest}");
+            assert!(
+                dispatch_allows(owner, verb, rest, &ctx),
+                "Owner: {verb} {rest}"
+            );
         }
         assert!(
             dispatch_allows(edge_read, "controls", "front", &ctx),
@@ -11449,7 +11448,10 @@ mod tests {
         }
 
         // Unknown source / empty source / non-Owner scope all refuse.
-        assert_eq!(cmd_revoke(&ctx, owner, "src=s-nobody99"), "ERR no such edge\n");
+        assert_eq!(
+            cmd_revoke(&ctx, owner, "src=s-nobody99"),
+            "ERR no such edge\n"
+        );
         assert_eq!(
             cmd_revoke(&ctx, owner, "src="),
             "ERR usage: revoke <edge-hex> | revoke src=<sid>\n"
@@ -13855,7 +13857,11 @@ mod tests {
         let edges = cmd_edges(&b.ctx);
         assert!(edges.starts_with("OK 3\n"), "{edges}");
         assert!(
-            edges.contains(&format!("{} {} read-screen", a.sid.as_str(), b.sid.as_str())),
+            edges.contains(&format!(
+                "{} {} read-screen",
+                a.sid.as_str(),
+                b.sid.as_str()
+            )),
             "{edges}"
         );
         assert!(!edges.contains(&tok.to_hex()), "no token leak: {edges}");
@@ -13873,11 +13879,15 @@ mod tests {
     #[test]
     fn connect_verb_is_declarative_across_kind_transitions() {
         let (store, conn, a, b) = connection_fixture();
-        let line = |kind: &str| format!("dst={} src={} kind={kind}", b.sid.as_str(), a.sid.as_str());
+        let line =
+            |kind: &str| format!("dst={} src={} kind={kind}", b.sid.as_str(), a.sid.as_str());
 
         let first = cmd_connect_in(&conn, &store, Scope::Owner, &line("pull"));
         assert!(first.starts_with("OK read-screen="), "{first}");
-        assert!(!first.contains("write-input="), "pull mints no push: {first}");
+        assert!(
+            !first.contains("write-input="),
+            "pull mints no push: {first}"
+        );
         // Idempotent re-connect: byte-identical reply — the original token stays.
         let again = cmd_connect_in(&conn, &store, Scope::Owner, &line("pull"));
         assert_eq!(first, again, "same-kind re-connect must not rotate tokens");
@@ -13891,7 +13901,10 @@ mod tests {
             "{pushed}"
         );
         let edges = cmd_edges(&b.ctx);
-        assert!(edges.starts_with("OK 2\n"), "exactly the push rows: {edges}");
+        assert!(
+            edges.starts_with("OK 2\n"),
+            "exactly the push rows: {edges}"
+        );
         assert!(
             !edges.contains("read-screen"),
             "pull must not survive the transition: {edges}"
@@ -14002,7 +14015,12 @@ mod tests {
         }
         let wire_pair = format!("dst={} src={}", b.sid.as_str(), c.as_str());
         assert_eq!(
-            cmd_disconnect_in(&conn, &store, Scope::Owner, &format!("{wire_pair} kind=push")),
+            cmd_disconnect_in(
+                &conn,
+                &store,
+                Scope::Owner,
+                &format!("{wire_pair} kind=push")
+            ),
             "OK 1\n",
             "push sweep takes only write-input"
         );
@@ -14031,7 +14049,11 @@ mod tests {
     #[test]
     fn flows_verb_lists_the_aggregated_graph() {
         let (store, conn, a, b) = connection_fixture();
-        assert_eq!(cmd_flows(&store, Scope::Owner, ""), "OK 0\n", "empty fabric");
+        assert_eq!(
+            cmd_flows(&store, Scope::Owner, ""),
+            "OK 0\n",
+            "empty fabric"
+        );
         let out = cmd_connect_in(
             &conn,
             &store,
@@ -14341,7 +14363,11 @@ mod tests {
             &mut cancel,
             &mut missing,
         ));
-        assert_eq!(cancel_count.get(), 2, "unknown target cannot fence a window");
+        assert_eq!(
+            cancel_count.get(),
+            2,
+            "unknown target cannot fence a window"
+        );
     }
 
     /// The header fence is an early liveness boundary, not an authority cache.
@@ -14387,13 +14413,12 @@ mod tests {
         let mut reader = OnFirstRead {
             inner: std::io::Cursor::new(b"X".to_vec()),
             action: Some(move || {
-                *switched_active.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(ActiveSession {
-                        term: switched_to.term.clone(),
-                        master: switched_to.master,
-                        id: switched_to.local_id,
-                        ctx: switched_to.ctx.clone(),
-                    });
+                *switched_active.lock().unwrap_or_else(|p| p.into_inner()) = Some(ActiveSession {
+                    term: switched_to.term.clone(),
+                    master: switched_to.master,
+                    id: switched_to.local_id,
+                    ctx: switched_to.ctx.clone(),
+                });
             }),
         };
         let canceled = std::cell::RefCell::new(Vec::new());
@@ -14471,7 +14496,10 @@ mod tests {
             &mut cancel,
             &mut denied,
         ));
-        assert_eq!(cancel_count, 1, "only the header fence ran before revocation");
+        assert_eq!(
+            cancel_count, 1,
+            "only the header fence ran before revocation"
+        );
         assert_eq!(String::from_utf8_lossy(&denied), "ERR denied\n");
         assert!(drain_pipe(&guarded_rx).is_empty());
 
@@ -14489,17 +14517,19 @@ mod tests {
             action: Some(move || {
                 let dst = grant_ctx.self_id.clone();
                 let nonce = grant_ctx.nonce;
-                assert!(grant_ctx
-                    .edges
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(
-                        token,
-                        SessionId::new("s-late-controller"),
-                        dst,
-                        Op::WriteInput,
-                        nonce,
-                    ));
+                assert!(
+                    grant_ctx
+                        .edges
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(
+                            token,
+                            SessionId::new("s-late-controller"),
+                            dst,
+                            Op::WriteInput,
+                            nonce,
+                        )
+                );
             }),
         };
         let canceled_late = std::cell::RefCell::new(Vec::new());
@@ -15228,7 +15258,11 @@ mod tests {
             "auto-default block-verifies once the command starts: {}",
             out.lines().next().unwrap_or("")
         );
-        assert_eq!(presses.get(), 1, "one press started the command — no re-press");
+        assert_eq!(
+            presses.get(),
+            1,
+            "one press started the command — no re-press"
+        );
     }
 
     /// AUTO's honest DEGRADE (the stock-Ubuntu-bash regression): the target LOOKS

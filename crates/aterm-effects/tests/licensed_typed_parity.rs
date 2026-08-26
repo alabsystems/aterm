@@ -24,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_effects::cursor_glow::{CursorGlow, GlowConfig, GlowStyle, Geom};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::cursor_trail::{CursorTrail, TrailConfig};
 use aterm_render::GlowQuad;
 
@@ -96,12 +96,12 @@ fn typed_script(style: GlowStyle) -> u64 {
     let mut acc: u64 = 0;
 
     let step = |glow: &mut CursorGlow,
-                    trail: &mut CursorTrail,
-                    out: &mut Vec<GlowQuad>,
-                    trail_out: &mut Vec<_>,
-                    acc: &mut u64,
-                    at: Instant,
-                    cell: (u16, u16)| {
+                trail: &mut CursorTrail,
+                out: &mut Vec<GlowQuad>,
+                trail_out: &mut Vec<_>,
+                acc: &mut u64,
+                at: Instant,
+                cell: (u16, u16)| {
         let fp = glow.tick(Some(cell), at, &c, g, out);
         trail.tick(Some(cell), at, &tc, trail_out);
         fold(acc, &fp.to_le_bytes());
@@ -256,7 +256,8 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // its typed-streak bloom were restored (owner, 2026-08-24: "I want it to
     // look more like a rainbow!", "there used to be what looked like the jump
     // streak drawing behind the cursor that was painted as typing"). That is a
-    // repaint of `emit_rainbow_underline_dark`, not a license effect, and no
+    // repaint of the default dark mark's emitter (`emit_rainbow_mark_dark`),
+    // not a license effect, and no
     // byte-exact golden can survive an intentional repaint.
     //
     // THE CLAUSE THIS FILE PROVES IS UNDAMAGED, and the diff is the proof: the
@@ -270,15 +271,22 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     const GOLDEN: [u64; 9] = [
         6_526_463_453_780_881_225,
         6_256_934_022_851_981_454,
-        // RE-BASELINED 2026-08-26, entry 2 (rainbow) ONLY, for the deliberate
-        // owner-driven palette restoration: *"it's more of just arbitrary
-        // colors?"* The wake's hue spread is now derived from the plume's own
-        // reach (RAINBOW_WAKE_SWEEP_TRAVEL) so a hot plume travels the same
-        // amount of spectrum a resting one does instead of repeating it 6.9
-        // times. Every other style folded BYTE-IDENTICAL across the change,
-        // which is the evidence that only the rainbow emitter moved — the
-        // license seam itself still lays the pixel it always laid.
-        3_323_371_464_999_701_743,
+        // RE-BASELINED AGAIN 2026-08-26, entry 2 (rainbow) ONLY, for the
+        // deliberate owner-driven restoration of the ADVANCING rainbow and the
+        // HIGHLIGHTER: *"it still doesn't look like an advancing rainbow like
+        // before it did, and you also removed the 'highlighter' cursor trail
+        // behind the text"*. Three things moved, all inside the rainbow
+        // emitter and its hue bookkeeping: the dark mark now colours each cell
+        // from that cell's OWN LAID hue (`rainbow_laid_sweep`) instead of from
+        // its head-to-tail ordinal, a coalesced rainbow sweep lays each swept
+        // cell its own successive hue instead of one hue for the whole batch,
+        // and the default look composes the v0.43 highlighter behind the
+        // glyphs with the strip in the leading. Every other style folded
+        // BYTE-IDENTICAL across the change (`3_323_371_464_999_701_743` was
+        // the previous rainbow value), which is the evidence that only the
+        // rainbow path moved — the license seam itself still lays the pixel it
+        // always laid.
+        3_947_126_183_161_842_362,
         10_295_259_453_273_105_322,
         3_062_372_403_814_732_219,
         11_710_665_231_074_982_027,

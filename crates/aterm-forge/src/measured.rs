@@ -171,11 +171,31 @@ pub struct Dom {
 /// that shrinks the surface can enlarge a dominator; that is the definition
 /// working, not a regression.
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
-    Dom { name: "wgpu", pkgs: 31, loc: 424_106 },
-    Dom { name: "naga", pkgs: 8, loc: 212_320 },
-    Dom { name: "regex", pkgs: 4, loc: 158_471 },
-    Dom { name: "libc", pkgs: 1, loc: 127_772 },
-    Dom { name: "tracing", pkgs: 3, loc: 84_483 },
+    Dom {
+        name: "wgpu",
+        pkgs: 31,
+        loc: 424_106,
+    },
+    Dom {
+        name: "naga",
+        pkgs: 8,
+        loc: 212_320,
+    },
+    Dom {
+        name: "regex",
+        pkgs: 4,
+        loc: 158_471,
+    },
+    Dom {
+        name: "libc",
+        pkgs: 1,
+        loc: 127_772,
+    },
+    Dom {
+        name: "tracing",
+        pkgs: 3,
+        loc: 84_483,
+    },
 ];
 
 /// The linux anchor.
@@ -195,7 +215,11 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
 /// dominator says so. This is the second time in two rounds that a successful
 /// extraction enlarged a dominator (see [`MAC_ARM_DOMINATORS`] on `wgpu`); it is
 /// the measure working, not drift.
-pub const LINUX_DOMINATORS: [Dom; 1] = [Dom { name: "sctk-adwaita", pkgs: 8, loc: 32_341 }];
+pub const LINUX_DOMINATORS: [Dom; 1] = [Dom {
+    name: "sctk-adwaita",
+    pkgs: 8,
+    loc: 32_341,
+}];
 
 /// `ureq` on mac-arm, and the figure the design note recorded for it.
 ///
@@ -204,9 +228,17 @@ pub const LINUX_DOMINATORS: [Dom; 1] = [Dom { name: "sctk-adwaita", pkgs: 8, loc
 /// whose only parent in the mac-arm graph is `ureq` itself — so it must fall
 /// with ureq. Both halves are pinned so the next person to re-measure sees the
 /// REASON, not just a number that moved.
-pub const MAC_ARM_UREQ: Dom = Dom { name: "ureq", pkgs: 9, loc: 72_528 };
+pub const MAC_ARM_UREQ: Dom = Dom {
+    name: "ureq",
+    pkgs: 9,
+    loc: 72_528,
+};
 /// The design-note figure `MAC_ARM_UREQ` exceeds by `percent-encoding` alone.
-pub const UREQ_DESIGN_NOTE: Dom = Dom { name: "ureq", pkgs: 8, loc: 71_834 };
+pub const UREQ_DESIGN_NOTE: Dom = Dom {
+    name: "ureq",
+    pkgs: 8,
+    loc: 71_834,
+};
 
 #[cfg(test)]
 mod tests {

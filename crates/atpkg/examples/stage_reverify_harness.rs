@@ -148,8 +148,7 @@ fn build_archive(dir: &Path, payload_bytes: u64) -> (PathBuf, u64, usize) {
         let big_total = payload_bytes / 100 * 80;
         let big_each = big_total / BIG_MEMBERS as u64;
         let tail_count = ENTRIES - BIG_MEMBERS;
-        let tail_each =
-            (payload_bytes - big_each * BIG_MEMBERS as u64) / tail_count as u64;
+        let tail_each = (payload_bytes - big_each * BIG_MEMBERS as u64) / tail_count as u64;
         for i in 0..BIG_MEMBERS {
             emit(
                 &mut builder,
@@ -204,9 +203,8 @@ fn main() {
     let fused_dir = scratch.join("fused");
     std::fs::create_dir_all(&fused_dir).expect("fused dir");
     let t2 = Instant::now();
-    let fused_root =
-        atpkg::extract::extract_tar_zst_rooted(&archive, &fused_dir, cap, 4_000_000)
-            .expect("extract rooted");
+    let fused_root = atpkg::extract::extract_tar_zst_rooted(&archive, &fused_dir, cap, 4_000_000)
+        .expect("extract rooted");
     let fused_total_ms = ms(t2);
 
     // --- Two-sided reach guards -------------------------------------------------

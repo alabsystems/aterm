@@ -143,10 +143,11 @@ fn ensure_command_links(home: &Path) {
     // into it is dangling by the next login — pointing at a path that will never
     // exist again, on a machine whose real install is elsewhere
     // (2026-08-20 round-9 audit).
-    if exe
-        .components()
-        .any(|c| c.as_os_str().to_string_lossy().starts_with("AppTranslocation"))
-    {
+    if exe.components().any(|c| {
+        c.as_os_str()
+            .to_string_lossy()
+            .starts_with("AppTranslocation")
+    }) {
         return;
     }
     let Some(macos) = exe.parent() else {
@@ -166,9 +167,9 @@ fn ensure_command_links(home: &Path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 // Ours to repoint only if it already points into an app bundle;
                 // anything else belongs to whoever put it there.
-                let ours = fs::read_link(&link)
-                    .ok()
-                    .is_some_and(|old| old.to_string_lossy().contains("/aterm.app/Contents/MacOS/"));
+                let ours = fs::read_link(&link).ok().is_some_and(|old| {
+                    old.to_string_lossy().contains("/aterm.app/Contents/MacOS/")
+                });
                 if !ours || fs::read_link(&link).is_ok_and(|old| old == target) {
                     continue;
                 }

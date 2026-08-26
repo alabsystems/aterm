@@ -73,8 +73,10 @@ fn cache() -> &'static Mutex<Cache> {
                 .join(format!("global.v{REPLAY_VERSION}")),
         );
         #[cfg(not(test))]
-        let file = aterm_types::dirs::cache_dir()
-            .map(|d| d.join("aterm").join(format!("font-admission.v{REPLAY_VERSION}")));
+        let file = aterm_types::dirs::cache_dir().map(|d| {
+            d.join("aterm")
+                .join(format!("font-admission.v{REPLAY_VERSION}"))
+        });
         let verdicts = file.as_deref().map(load).unwrap_or_default();
         Mutex::new(Cache {
             file,
@@ -165,11 +167,7 @@ fn identity(path: &Path) -> Option<(u128, u64)> {
 /// caller — a file swapped in that window records the old bytes' verdict
 /// under the new identity. That is the module-doc identity corner in one
 /// more costume, with the same two backstops.
-pub(crate) fn admissible_cached(
-    path: &str,
-    index: u32,
-    walk: impl FnOnce() -> bool,
-) -> bool {
+pub(crate) fn admissible_cached(path: &str, index: u32, walk: impl FnOnce() -> bool) -> bool {
     let Some((mtime, size)) = identity(Path::new(path)) else {
         return walk();
     };
@@ -214,7 +212,8 @@ mod tests {
     use super::*;
 
     fn scratch_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aterm-admission-cache-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aterm-admission-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir.join(name)
     }
@@ -227,10 +226,8 @@ mod tests {
             verdicts: Verdicts::default(),
             dirty: 0,
         };
-        c.verdicts
-            .insert(("/a/b.ttf".into(), 0), (123, 456, true));
-        c.verdicts
-            .insert(("/c/d.ttc".into(), 2), (789, 12, false));
+        c.verdicts.insert(("/a/b.ttf".into(), 0), (123, 456, true));
+        c.verdicts.insert(("/c/d.ttc".into(), 2), (789, 12, false));
         c.dirty = 2;
         flush(&mut c);
         assert_eq!(c.dirty, 0, "flush clears the dirty count");
@@ -256,9 +253,7 @@ mod tests {
         // lookup must miss and the walk's verdict must win and re-key.
         {
             let mut guard = cache().lock().expect("lock");
-            guard
-                .verdicts
-                .insert((path.clone(), 7), (1, 1, true));
+            guard.verdicts.insert((path.clone(), 7), (1, 1, true));
         }
         let walked = std::cell::Cell::new(false);
         let verdict = admissible_cached(&path, 7, || {
@@ -284,7 +279,8 @@ mod tests {
             return;
         };
         let t0 = std::time::Instant::now();
-        let cold = super::admissible_cached(path, 0, || super::super::fontdue_admissible(&bytes, 0));
+        let cold =
+            super::admissible_cached(path, 0, || super::super::fontdue_admissible(&bytes, 0));
         let cold_ms = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = std::time::Instant::now();
         let warm = super::admissible_cached(path, 0, || unreachable!("second call must hit"));

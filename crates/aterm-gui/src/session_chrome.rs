@@ -808,8 +808,7 @@ mod tests {
         assert!(compose_tab_menu(&input).iter().all(|entry| match entry {
             TabMenuEntry::Header(label) =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
-            TabMenuEntry::Action { label, .. }
-            | TabMenuEntry::ConnectionAction { label, .. } =>
+            TabMenuEntry::Action { label, .. } | TabMenuEntry::ConnectionAction { label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Separator => true,
         }));
@@ -1104,10 +1103,9 @@ mod tests {
             false,
         )];
         let menu = compose_tab_menu(&one_way);
-        assert!(
-            menu.iter()
-                .any(|e| matches!(e, TabMenuEntry::Header(h) if h == "\u{21e4} pulled by \"operator\"")),
-        );
+        assert!(menu.iter().any(
+            |e| matches!(e, TabMenuEntry::Header(h) if h == "\u{21e4} pulled by \"operator\"")
+        ),);
         assert_eq!(
             conn_rows(&one_way),
             vec![
@@ -1130,8 +1128,20 @@ mod tests {
         // PEER + LIVE: the ⇆ line, and the live qualifier on a live push.
         let mut peers = full_input();
         peers.connections = vec![
-            fact("s-b", "claude (b)", ConnDirection::Peer, ConnFlow::Push, false),
-            fact("s-c", "build", ConnDirection::Outbound, ConnFlow::Push, true),
+            fact(
+                "s-b",
+                "claude (b)",
+                ConnDirection::Peer,
+                ConnFlow::Push,
+                false,
+            ),
+            fact(
+                "s-c",
+                "build",
+                ConnDirection::Outbound,
+                ConnFlow::Push,
+                true,
+            ),
         ];
         let headers: Vec<String> = compose_tab_menu(&peers)
             .iter()
@@ -1163,7 +1173,8 @@ mod tests {
         )];
         let tip = compose_tooltip(&hostile).unwrap();
         assert!(
-            tip.lines().any(|l| l == "\u{21e5} pulls from \"abCONNECTIONS\""),
+            tip.lines()
+                .any(|l| l == "\u{21e5} pulls from \"abCONNECTIONS\""),
             "controls/bidi stripped, no forged extra line: {tip:?}"
         );
     }

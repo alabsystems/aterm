@@ -145,7 +145,9 @@ fn patch_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
 /// empty list, not an error: `[OB-1]` decides whether that is a defect.
 fn vendor_dirs(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root.join("vendor")) else { return out };
+    let Ok(entries) = std::fs::read_dir(root.join("vendor")) else {
+        return out;
+    };
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
             continue;
@@ -164,7 +166,11 @@ fn vendor_dirs(root: &Path) -> Vec<String> {
 fn survey_forks(root: &Path, patch: &[(String, String)]) -> Vec<VendoredFork> {
     let mut forks = Vec::new();
     for (name, rel) in patch {
-        let rel = if rel.is_empty() { format!("vendor/{name}") } else { rel.clone() };
+        let rel = if rel.is_empty() {
+            format!("vendor/{name}")
+        } else {
+            rel.clone()
+        };
         let dir = root.join(&rel);
         let mut fork = VendoredFork {
             name: name.clone(),
@@ -227,7 +233,9 @@ fn count_markers(root: &Path, fork: &mut VendoredFork) {
     }
     files.sort();
     for file in &files {
-        let Ok(text) = std::fs::read_to_string(file) else { continue };
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
         let trust = text.matches(TRUST_MARKER).count() as u64;
         let patch = text.matches(LOCAL_PATCH_MARKER).count() as u64;
         if trust + patch == 0 {
@@ -240,7 +248,10 @@ fn count_markers(root: &Path, fork: &mut VendoredFork) {
 }
 
 fn rel_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +282,10 @@ fn license_arms(expr: &str) -> Vec<String> {
 /// §4(b) obligation; a bare `Apache-2.0` fork cannot.
 fn apache_is_mandatory(expr: &str) -> bool {
     let arms: Vec<&str> = expr.split(" OR ").collect();
-    !arms.is_empty() && arms.iter().all(|arm| license_arms(arm).iter().any(|l| l == "Apache-2.0"))
+    !arms.is_empty()
+        && arms
+            .iter()
+            .all(|arm| license_arms(arm).iter().any(|l| l == "Apache-2.0"))
 }
 
 /// The `[licenses] allow` list from `deny.toml`.
@@ -279,15 +293,20 @@ fn deny_allow(root: &Path) -> Result<Vec<String>, String> {
     let path = root.join("deny.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let doc: DocumentMut =
-        text.parse().map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+    let doc: DocumentMut = text
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
     let array = doc
         .get("licenses")
         .and_then(Item::as_table_like)
         .and_then(|t| t.get("allow"))
         .and_then(Item::as_array)
         .ok_or_else(|| format!("{} has no `[licenses] allow` array", path.display()))?;
-    Ok(array.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+    Ok(array
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -388,8 +407,12 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
     }
     let mut out = Vec::new();
     for manifest in manifests {
-        let Ok(text) = std::fs::read_to_string(&manifest) else { continue };
-        let Ok(doc) = text.parse::<DocumentMut>() else { continue };
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<DocumentMut>() else {
+            continue;
+        };
         let mut tables: Vec<&dyn TableLike> = Vec::new();
         if let Some(ws) = doc
             .get("workspace")
@@ -405,12 +428,16 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
             }
         }
         for table in tables {
-            let Some(entry) = table.get(name) else { continue };
+            let Some(entry) = table.get(name) else {
+                continue;
+            };
             if let Some(req) = entry.as_str() {
                 out.push((rel_display(root, &manifest), req.to_string()));
                 continue;
             }
-            let Some(entry) = entry.as_table_like() else { continue };
+            let Some(entry) = entry.as_table_like() else {
+                continue;
+            };
             // A path/git replacement states no registry requirement, and an
             // inherited entry restates the root's — neither is a new fact.
             if entry.get("path").is_some() || entry.get("git").is_some() {
@@ -436,8 +463,9 @@ fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)>, String> 
     let path = root.join("Cargo.lock");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let doc: DocumentMut =
-        text.parse().map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+    let doc: DocumentMut = text
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
     let Some(packages) = doc.get("package").and_then(Item::as_array_of_tables) else {
         return Ok(Vec::new());
     };
@@ -446,8 +474,11 @@ fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)>, String> 
         if package.get("name").and_then(Item::as_str) != Some(name) {
             continue;
         }
-        let version =
-            package.get("version").and_then(Item::as_str).unwrap_or_default().to_string();
+        let version = package
+            .get("version")
+            .and_then(Item::as_str)
+            .unwrap_or_default()
+            .to_string();
         out.push((version, package.get("source").is_some()));
     }
     out.sort();
@@ -472,11 +503,21 @@ fn parse_notice(text: &str) -> Vec<NoticeEntry> {
     let mut out = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        let Some(rest) = line.strip_prefix("- ") else { continue };
-        let Some((head, tail)) = rest.split_once("(`vendor/") else { continue };
-        let Some(dir) = tail.trim().strip_suffix("/`)") else { continue };
-        let Some((name_version, license)) = head.trim().split_once(", ") else { continue };
-        let Some((name, version)) = name_version.trim().rsplit_once(' ') else { continue };
+        let Some(rest) = line.strip_prefix("- ") else {
+            continue;
+        };
+        let Some((head, tail)) = rest.split_once("(`vendor/") else {
+            continue;
+        };
+        let Some(dir) = tail.trim().strip_suffix("/`)") else {
+            continue;
+        };
+        let Some((name_version, license)) = head.trim().split_once(", ") else {
+            continue;
+        };
+        let Some((name, version)) = name_version.trim().rsplit_once(' ') else {
+            continue;
+        };
         out.push(NoticeEntry {
             name: name.trim().to_string(),
             version: version.trim().to_string(),
@@ -526,7 +567,9 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut out = Vec::new();
     for line in text.lines() {
-        let Some((location, path)) = line.rsplit_once('\t') else { continue };
+        let Some((location, path)) = line.rsplit_once('\t') else {
+            continue;
+        };
         let pattern = location.splitn(3, ':').nth(2).unwrap_or_default();
         out.push(IgnoreVerdict {
             rule: location.to_string(),
@@ -539,7 +582,9 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
 
 /// Every path under `vendor/`, repo-relative, files and directories alike.
 fn vendor_paths(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
@@ -559,7 +604,10 @@ fn vendor_paths(root: &Path, dir: &Path, out: &mut Vec<String>) {
 pub fn report(root: &Path) -> (bool, String) {
     let mut log = String::new();
     let mut fails = 0usize;
-    let _ = writeln!(log, "=== cargo forge attest (vendor/ provenance + license notary) ===");
+    let _ = writeln!(
+        log,
+        "=== cargo forge attest (vendor/ provenance + license notary) ==="
+    );
     let _ = writeln!(log, "    root: {}", root.display());
 
     let patch = match patch_paths(root) {
@@ -570,7 +618,10 @@ pub fn report(root: &Path) -> (bool, String) {
                 "  ✗ FAIL [OB-1] the root manifest's [patch.crates-io] table is unreadable, so \
                  attest refuses to notarize a guessed fork set (fail-closed).\n        {e}"
             );
-            let _ = writeln!(log, "cargo forge attest: FAILED — 1 obligation violation(s).");
+            let _ = writeln!(
+                log,
+                "cargo forge attest: FAILED — 1 obligation violation(s)."
+            );
             log.push_str(PRECISION_NOTE);
             log.push('\n');
             return (false, log);
@@ -604,7 +655,10 @@ pub fn report(root: &Path) -> (bool, String) {
         );
         return (true, log);
     }
-    let _ = writeln!(log, "cargo forge attest: FAILED — {fails} obligation violation(s).");
+    let _ = writeln!(
+        log,
+        "cargo forge attest: FAILED — {fails} obligation violation(s)."
+    );
     log.push_str(PRECISION_NOTE);
     log.push('\n');
     (false, log)
@@ -790,8 +844,10 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                 fails += 1;
             }
             Ok(entries) => {
-                let patched: Vec<&(String, bool)> =
-                    entries.iter().filter(|(_, has_source)| !has_source).collect();
+                let patched: Vec<&(String, bool)> = entries
+                    .iter()
+                    .filter(|(_, has_source)| !has_source)
+                    .collect();
                 if patched.is_empty() {
                     let _ = writeln!(
                         log,
@@ -809,7 +865,11 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                          `{}/Cargo.toml` says {} — refresh the lockfile with \
                          `cargo metadata --offline`.",
                         fork.name,
-                        patched.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>().join(", "),
+                        patched
+                            .iter()
+                            .map(|(v, _)| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         fork.rel,
                         fork.version
                     );
@@ -991,7 +1051,11 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
                  per fork so there is one authoritative version.",
                 fork.name,
                 matches.len(),
-                matches.iter().map(|e| e.line.to_string()).collect::<Vec<_>>().join(", ")
+                matches
+                    .iter()
+                    .map(|e| e.line.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             fails += 1;
         }
@@ -1048,11 +1112,7 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
 
 /// `[OB-7]` Apache-2.0 §4(b): every modified file must carry a prominent
 /// notice stating that it changed.
-fn ob7_apache_modification_notices(
-    root: &Path,
-    forks: &[VendoredFork],
-    log: &mut String,
-) -> usize {
+fn ob7_apache_modification_notices(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
     let mut fails = 0;
     let mut scoped = Vec::new();
     for fork in forks {
@@ -1101,7 +1161,9 @@ fn ob7_apache_modification_notices(
             .chain(added.iter().map(|r| (r, "added")))
         {
             let path = fork.dir.join(rel);
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             if has_modification_notice(&text) {
                 continue;
             }
@@ -1125,7 +1187,11 @@ fn ob7_apache_modification_notices(
          a BYTE DIFF against the pristine registry copy — not by aterm's own markers — so a file \
          edited without leaving a marker is still caught. A fork with no pristine copy available \
          is reported UNVERIFIED, never passed.",
-        if scoped.is_empty() { "none".to_string() } else { scoped.join(", ") }
+        if scoped.is_empty() {
+            "none".to_string()
+        } else {
+            scoped.join(", ")
+        }
     );
     if fails == 0 {
         let _ = writeln!(
@@ -1157,7 +1223,11 @@ fn pristine_dir(root: &Path, name: &str, version: &str) -> Option<PathBuf> {
     // license-checked as aterm source. It is also the seam the tests use, which
     // is deliberate — a check that cannot be exercised without the network is a
     // check that rots.
-    let local = root.join("vendor").join(".forge").join(name).join("pristine");
+    let local = root
+        .join("vendor")
+        .join(".forge")
+        .join(name)
+        .join("pristine");
     if local.is_dir() {
         return Some(local);
     }
@@ -1272,7 +1342,10 @@ fn ob8_marker_census(forks: &[VendoredFork], log: &mut String) -> usize {
         );
     }
     if fails == 0 {
-        let _ = writeln!(log, "  ✓ [OB-8] every fork records at least one marked local change.");
+        let _ = writeln!(
+            log,
+            "  ✓ [OB-8] every fork records at least one marked local change."
+        );
     }
     fails
 }
@@ -1417,7 +1490,12 @@ mod tests {
     use super::*;
 
     fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 
     // --- the real tree -----------------------------------------------------
@@ -1434,16 +1512,27 @@ mod tests {
         // one being left in the tree.
         let (ok, log) = report(&repo_root());
         assert!(ok, "attest must be GREEN on this tree:\n{log}");
-        for ob in ["OB-1", "OB-2", "OB-3", "OB-4", "OB-5", "OB-6", "OB-7", "OB-8", "OB-9", "OB-10"]
-        {
-            assert!(log.contains(ob), "every obligation must report; {ob} is absent:\n{log}");
+        for ob in [
+            "OB-1", "OB-2", "OB-3", "OB-4", "OB-5", "OB-6", "OB-7", "OB-8", "OB-9", "OB-10",
+        ] {
+            assert!(
+                log.contains(ob),
+                "every obligation must report; {ob} is absent:\n{log}"
+            );
         }
     }
 
     #[test]
     fn the_real_tree_holds_every_other_obligation() {
         let (_, log) = report(&repo_root());
-        for held in ["✓ [OB-1]", "✓ [OB-2]", "✓ [OB-5]", "✓ [OB-6]", "✓ [OB-8]", "✓ [OB-9]"] {
+        for held in [
+            "✓ [OB-1]",
+            "✓ [OB-2]",
+            "✓ [OB-5]",
+            "✓ [OB-6]",
+            "✓ [OB-8]",
+            "✓ [OB-9]",
+        ] {
             assert!(log.contains(held), "expected {held} to hold:\n{log}");
         }
     }
@@ -1456,8 +1545,10 @@ mod tests {
         let patch: u64 = forks.iter().map(|f| f.patch_markers).sum();
         assert_eq!(trust, 16, "`{TRUST_MARKER}` marker count");
         assert_eq!(patch, 2, "`{LOCAL_PATCH_MARKER}` marker count");
-        let by_name: BTreeMap<&str, (u64, u64)> =
-            forks.iter().map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers))).collect();
+        let by_name: BTreeMap<&str, (u64, u64)> = forks
+            .iter()
+            .map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers)))
+            .collect();
         assert_eq!(by_name["indexmap"], (8, 0));
         assert_eq!(by_name["smol_str"], (4, 0));
         assert_eq!(by_name["winnow"], (2, 0));
@@ -1469,10 +1560,23 @@ mod tests {
     #[test]
     fn the_real_tree_has_exactly_the_six_known_forks() {
         let root = repo_root();
-        let mut names: Vec<String> =
-            patch_paths(&root).unwrap().into_iter().map(|(n, _)| n).collect();
+        let mut names: Vec<String> = patch_paths(&root)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         names.sort();
-        assert_eq!(names, ["indexmap", "libm", "pkg-config", "smol_str", "winit", "winnow"]);
+        assert_eq!(
+            names,
+            [
+                "indexmap",
+                "libm",
+                "pkg-config",
+                "smol_str",
+                "winit",
+                "winnow"
+            ]
+        );
     }
 
     #[test]
@@ -1485,7 +1589,11 @@ mod tests {
         let forks = survey_forks(&root, &patch_paths(&root).unwrap());
         assert_eq!(forks.len(), 6);
         for fork in &forks {
-            assert!(fork.workspace_stub, "{} is missing its [workspace] stub", fork.name);
+            assert!(
+                fork.workspace_stub,
+                "{} is missing its [workspace] stub",
+                fork.name
+            );
             assert!(
                 fork.dir.join(".cargo_vcs_info.json").exists(),
                 "{} is missing .cargo_vcs_info.json",
@@ -1511,12 +1619,14 @@ mod tests {
     #[test]
     fn license_arms_unfold_or_and_and_with() {
         assert_eq!(license_arms("MIT OR Apache-2.0"), ["MIT", "Apache-2.0"]);
-        assert_eq!(license_arms("(MIT OR Apache-2.0) AND Unicode-3.0"), [
-            "MIT",
-            "Apache-2.0",
-            "Unicode-3.0"
-        ]);
-        assert_eq!(license_arms("Apache-2.0 WITH LLVM-exception OR MIT"), ["Apache-2.0", "MIT"]);
+        assert_eq!(
+            license_arms("(MIT OR Apache-2.0) AND Unicode-3.0"),
+            ["MIT", "Apache-2.0", "Unicode-3.0"]
+        );
+        assert_eq!(
+            license_arms("Apache-2.0 WITH LLVM-exception OR MIT"),
+            ["Apache-2.0", "MIT"]
+        );
     }
 
     #[test]
@@ -1536,7 +1646,10 @@ mod tests {
     fn the_workspace_states_the_winit_requirement_the_fork_satisfies() {
         let root = repo_root();
         let reqs = workspace_requirements(&root, "winit");
-        assert!(!reqs.is_empty(), "the workspace must state a winit requirement");
+        assert!(
+            !reqs.is_empty(),
+            "the workspace must state a winit requirement"
+        );
         for (manifest, req) in &reqs {
             assert_eq!(
                 req_satisfied(req, "0.30.13"),
@@ -1572,10 +1685,18 @@ mod tests {
 
     #[test]
     fn a_header_notice_is_recognized_and_a_buried_one_is_not() {
-        assert!(has_modification_notice("// Modified by aterm: pump WM_TIMER.\nfn main() {}"));
+        assert!(has_modification_notice(
+            "// Modified by aterm: pump WM_TIMER.\nfn main() {}"
+        ));
         assert!(!has_modification_notice("use std::ptr;\nfn main() {}"));
-        let buried = format!("{}// LOCAL PATCH (aterm): late\n", "\n".repeat(HEADER_LINES + 1));
-        assert!(!has_modification_notice(&buried), "§4(b) wants a PROMINENT notice");
+        let buried = format!(
+            "{}// LOCAL PATCH (aterm): late\n",
+            "\n".repeat(HEADER_LINES + 1)
+        );
+        assert!(
+            !has_modification_notice(&buried),
+            "§4(b) wants a PROMINENT notice"
+        );
     }
 
     // --- fixtures ----------------------------------------------------------
@@ -1613,10 +1734,19 @@ mod tests {
             "vendor/goodfork/Cargo.toml",
             "[package]\nname = \"goodfork\"\nversion = \"1.2.3\"\nlicense = \"MIT\"\n\n[workspace]\n",
         );
-        w("vendor/goodfork/Cargo.toml.orig", "[package]\nname = \"goodfork\"\n");
-        w("vendor/goodfork/.cargo_vcs_info.json", "{\"git\":{\"sha1\":\"deadbeef\"}}\n");
+        w(
+            "vendor/goodfork/Cargo.toml.orig",
+            "[package]\nname = \"goodfork\"\n",
+        );
+        w(
+            "vendor/goodfork/.cargo_vcs_info.json",
+            "{\"git\":{\"sha1\":\"deadbeef\"}}\n",
+        );
         w("vendor/goodfork/LICENSE-MIT", "MIT\n");
-        w("vendor/goodfork/src/lib.rs", "// aterm-trust: bounds proof discharged here.\n");
+        w(
+            "vendor/goodfork/src/lib.rs",
+            "// aterm-trust: bounds proof discharged here.\n",
+        );
         Fixture(dir)
     }
 
@@ -1631,7 +1761,11 @@ mod tests {
     #[test]
     fn a_notice_that_omits_a_fork_is_red() {
         let fixture = good_fixture("notice");
-        std::fs::write(fixture.0.join("NOTICE"), "prose only, no vendored crate list\n").unwrap();
+        std::fs::write(
+            fixture.0.join("NOTICE"),
+            "prose only, no vendored crate list\n",
+        )
+        .unwrap();
         let (ok, log) = report(&fixture.0);
         assert!(!ok, "an omitted fork must be RED:\n{log}");
         assert!(
@@ -1663,7 +1797,10 @@ mod tests {
         .unwrap();
         let (ok, log) = report(&fixture.0);
         assert!(!ok, "{log}");
-        assert!(log.contains("[OB-3]") && log.contains("no empty `[workspace]` table"), "{log}");
+        assert!(
+            log.contains("[OB-3]") && log.contains("no empty `[workspace]` table"),
+            "{log}"
+        );
     }
 
     #[test]
@@ -1687,7 +1824,11 @@ mod tests {
     #[test]
     fn an_unmarked_fork_is_red() {
         let fixture = good_fixture("markers");
-        std::fs::write(fixture.0.join("vendor/goodfork/src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            fixture.0.join("vendor/goodfork/src/lib.rs"),
+            "pub fn f() {}\n",
+        )
+        .unwrap();
         let (ok, log) = report(&fixture.0);
         assert!(!ok, "{log}");
         assert!(log.contains("[OB-8]") && log.contains("ZERO"), "{log}");
@@ -1716,10 +1857,16 @@ mod tests {
             "[package]\nname = \"goodfork\"\nversion = \"1.2.3\"\nlicense = \"Apache-2.0\"\n\n[workspace]\n",
         )
         .unwrap();
-        std::fs::write(root.join("NOTICE"), "- goodfork 1.2.3, Apache-2.0 (`vendor/goodfork/`)\n")
-            .unwrap();
-        std::fs::write(root.join("deny.toml"), "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n")
-            .unwrap();
+        std::fs::write(
+            root.join("NOTICE"),
+            "- goodfork 1.2.3, Apache-2.0 (`vendor/goodfork/`)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("deny.toml"),
+            "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n",
+        )
+        .unwrap();
 
         // The pristine tree the fork is diffed against. Placing it in the
         // ledger's own `vendor/.forge/<name>/pristine/` slot exercises the same
@@ -1730,7 +1877,12 @@ mod tests {
         let pristine = root.join("vendor/.forge/goodfork/pristine/src");
         std::fs::create_dir_all(&pristine).unwrap();
         std::fs::write(pristine.join("lib.rs"), "// upstream\n").unwrap();
-        for rel in ["Cargo.toml", "Cargo.toml.orig", ".cargo_vcs_info.json", "LICENSE-MIT"] {
+        for rel in [
+            "Cargo.toml",
+            "Cargo.toml.orig",
+            ".cargo_vcs_info.json",
+            "LICENSE-MIT",
+        ] {
             std::fs::copy(
                 root.join("vendor/goodfork").join(rel),
                 root.join("vendor/.forge/goodfork/pristine").join(rel),
@@ -1739,9 +1891,15 @@ mod tests {
         }
 
         let (ok, log) = report(root);
-        assert!(!ok, "a modified file with no header notice must be RED:\n{log}");
+        assert!(
+            !ok,
+            "a modified file with no header notice must be RED:\n{log}"
+        );
         assert!(log.contains("[OB-7]") && log.contains("§4(b)"), "{log}");
-        assert!(log.contains("1 modified file(s)"), "the diff must find exactly one:\n{log}");
+        assert!(
+            log.contains("1 modified file(s)"),
+            "the diff must find exactly one:\n{log}"
+        );
 
         // Adding the header notice discharges it.
         std::fs::write(
@@ -1769,7 +1927,11 @@ mod tests {
             "- goodfork 9.9.9-absent, Apache-2.0 (`vendor/goodfork/`)\n",
         )
         .unwrap();
-        std::fs::write(root.join("deny.toml"), "[licenses]\nallow = [\"Apache-2.0\"]\n").unwrap();
+        std::fs::write(
+            root.join("deny.toml"),
+            "[licenses]\nallow = [\"Apache-2.0\"]\n",
+        )
+        .unwrap();
         let (_, log) = report(root);
         assert!(
             log.contains("UNVERIFIED for it, not") || log.contains("cannot be diffed"),
@@ -1791,7 +1953,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.modified, ["src/lib.rs"], "lib.rs differs from upstream");
-        assert!(d.added.contains(&"src/extra.rs".to_string()), "added: {:?}", d.added);
+        assert!(
+            d.added.contains(&"src/extra.rs".to_string()),
+            "added: {:?}",
+            d.added
+        );
         assert!(!d.added.contains(&"src/lib.rs".to_string()));
     }
 }

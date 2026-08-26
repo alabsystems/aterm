@@ -92,9 +92,6 @@ pub mod net;
 pub mod ops;
 pub mod pin;
 pub mod platform;
-/// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
-/// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
-pub mod tarread;
 pub mod progress;
 pub mod provisional;
 pub mod relocate;
@@ -104,6 +101,9 @@ pub mod status;
 pub mod store;
 pub mod stub;
 pub mod sysroot;
+/// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
+/// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
+pub mod tarread;
 pub mod tree;
 pub mod verify;
 
@@ -126,8 +126,10 @@ pub use flow::{
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};
 pub use install::{StageError, verify_and_stage};
-pub use linkmode::{LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
-    linked_programs, linked_programs_checked, linked_tool_names, refresh, unlink};
+pub use linkmode::{
+    LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
+    linked_programs, linked_programs_checked, linked_tool_names, refresh, unlink,
+};
 pub use lock::{StoreLock, StoreLockError, try_lock_store};
 // `parse_index` is deliberately NOT re-exported (and is `pub(crate)`): outside this
 // crate, the only way to a parsed `Index` is `TrustedRoster::authorize_index`, which runs

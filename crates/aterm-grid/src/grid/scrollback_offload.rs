@@ -389,9 +389,7 @@ impl PendingScrollbackReflow {
                     // holds [full input | full output] at once and the job
                     // never holds the input materialized.
                     if let Err(error) = self.store.truncate_oldest(from_store) {
-                        aterm_log::warn!(
-                            "offload reflow: input front-truncation failed: {error}"
-                        );
+                        aterm_log::warn!("offload reflow: input front-truncation failed: {error}");
                     }
                     *store_input_left -= from_store;
                 }
@@ -1936,8 +1934,8 @@ mod tests {
     #[test]
     fn streaming_matches_materialize_all_reference() {
         for (limit, budget_bytes) in [
-            (None, 8_000_000usize),  // unconstrained
-            (Some(120), 8_000_000),  // tight total-line cap
+            (None, 8_000_000usize), // unconstrained
+            (Some(120), 8_000_000), // tight total-line cap
         ] {
             for seed in [5u64, 21] {
                 let (rows, new_cols) = (10u16, 23u16);
@@ -2032,10 +2030,7 @@ mod tests {
                 "seed {seed}: the streamed store must end under the byte budget"
             );
 
-            for (name, store) in [
-                ("one-shot", &one_shot.store),
-                ("chunked", &chunked.store),
-            ] {
+            for (name, store) in [("one-shot", &one_shot.store), ("chunked", &chunked.store)] {
                 let streamed = store_fingerprint(store);
                 assert!(
                     streamed.len() >= reference.len(),

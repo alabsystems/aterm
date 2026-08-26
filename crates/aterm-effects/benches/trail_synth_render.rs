@@ -1269,11 +1269,23 @@ fn tone_workloads() -> Vec<ToneWorkload> {
     let sweep: [(&'static str, &'static str, usize, Tone, usize); 7] = [
         ("ascii_006", TONE_ASCII, 6, Tone::Excited, 15),
         ("ascii_040", TONE_ASCII, 40, Tone::Frustrated, 92),
-        ("ascii_160", TONE_ASCII, TONE_WINDOW_CAP, Tone::Frustrated, 242),
+        (
+            "ascii_160",
+            TONE_ASCII,
+            TONE_WINDOW_CAP,
+            Tone::Frustrated,
+            242,
+        ),
         ("cjk_006", TONE_CJK, 6, Tone::Frustrated, 14),
         ("cjk_040", TONE_CJK, 40, Tone::Frustrated, 99),
         ("cjk_160", TONE_CJK, TONE_WINDOW_CAP, Tone::Frustrated, 342),
-        ("mixed_160", TONE_MIXED, TONE_WINDOW_CAP, Tone::Technical, 301),
+        (
+            "mixed_160",
+            TONE_MIXED,
+            TONE_WINDOW_CAP,
+            Tone::Technical,
+            301,
+        ),
     ];
     for (param, base, n, want, distinct) in sweep {
         out.push(ToneWorkload {
@@ -1331,7 +1343,10 @@ fn observe_tone(w: &ToneWorkload, m: &ToneModel) -> ToneEvidence {
     let b = m.scores(&w.text, &mut s2);
     let deterministic = match (&a, &b) {
         (None, None) => true,
-        (Some(x), Some(y)) => x.iter().zip(y.iter()).all(|(p, q)| p.to_bits() == q.to_bits()),
+        (Some(x), Some(y)) => x
+            .iter()
+            .zip(y.iter())
+            .all(|(p, q)| p.to_bits() == q.to_bits()),
         _ => false,
     };
     let verdict = m.classify_opt(&w.text, &mut s1);
@@ -1390,7 +1405,9 @@ fn verify_tone_reaches_target(w: &ToneWorkload, e: &ToneEvidence) {
                 "tone {}/{}: {} n-grams reaches the evidence floor ({MIN_NGRAMS}) \
                  — this arm exists to time the abstention path and would be \
                  timing a full inference under an idle arm's name",
-                w.kind, w.param, e.ngrams
+                w.kind,
+                w.param,
+                e.ngrams
             );
             assert_eq!(
                 e.verdict, None,
@@ -1404,7 +1421,9 @@ fn verify_tone_reaches_target(w: &ToneWorkload, e: &ToneEvidence) {
                 "tone {}/{}: only {} n-grams — below the evidence floor, so \
                  `scores` would return None before the matmul this workload \
                  exists to reach",
-                w.kind, w.param, e.ngrams
+                w.kind,
+                w.param,
+                e.ngrams
             );
             assert_eq!(
                 e.verdict,
@@ -1423,18 +1442,23 @@ fn verify_tone_reaches_target(w: &ToneWorkload, e: &ToneEvidence) {
             assert!(
                 e.sum > 0.999 && e.sum < 1.001,
                 "tone {}/{}: softmax sum {} is not a distribution",
-                w.kind, w.param, e.sum
+                w.kind,
+                w.param,
+                e.sum
             );
             assert!(
                 e.top > 0.2 && e.top < 1.0,
                 "tone {}/{}: top score {} outside (0.2, 1.0) — uniform or \
                  degenerate output",
-                w.kind, w.param, e.top
+                w.kind,
+                w.param,
+                e.top
             );
             assert!(
                 e.min > 0.0,
                 "tone {}/{}: a class underflowed to exactly zero",
-                w.kind, w.param
+                w.kind,
+                w.param
             );
         }
     }
@@ -1476,10 +1500,8 @@ fn tone_model(c: &mut Criterion) {
     // PROVE FIRST, TIME SECOND — but gather ALL evidence before asserting any
     // of it, so a broken pin prints the full table it should be corrected
     // from instead of dying on the first row.
-    let rows: Vec<(&ToneWorkload, ToneEvidence)> = workloads
-        .iter()
-        .map(|w| (w, observe_tone(w, m)))
-        .collect();
+    let rows: Vec<(&ToneWorkload, ToneEvidence)> =
+        workloads.iter().map(|w| (w, observe_tone(w, m))).collect();
 
     println!(
         "\nTONE — typing-mood classifier evidence (window chars -> hashed \
@@ -1542,8 +1564,7 @@ fn tone_model(c: &mut Criterion) {
                         // one register op per n-gram, noise against the FNV
                         // folds being timed.
                         let mut acc = 0usize;
-                        let n =
-                            for_each_ngram_bucket(black_box(w.text.as_str()), |bkt| acc ^= bkt);
+                        let n = for_each_ngram_bucket(black_box(w.text.as_str()), |bkt| acc ^= bkt);
                         black_box((acc, n))
                     });
                 });

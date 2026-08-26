@@ -405,16 +405,15 @@ impl TerminalHandler<'_> {
         // resolves to `RateLimitSlot::UNDECLARED`, which allows.
         let bytes = response.len() as u64;
         let clock = aterm_policy::limits::SystemClock;
-        let permitted = if let Some(permitted) =
-            self.policy.response_rate_limit_try_consume(bytes, &clock)
-        {
-            permitted
-        } else {
-            let legacy_clock = super::response_rate_limiter::SystemTime;
-            self.transient
-                .response_rate_limiter
-                .try_consume(response.len(), &legacy_clock)
-        };
+        let permitted =
+            if let Some(permitted) = self.policy.response_rate_limit_try_consume(bytes, &clock) {
+                permitted
+            } else {
+                let legacy_clock = super::response_rate_limiter::SystemTime;
+                self.transient
+                    .response_rate_limiter
+                    .try_consume(response.len(), &legacy_clock)
+            };
         if !permitted {
             return;
         }

@@ -96,8 +96,7 @@ impl ConfigNotice {
 /// the config warnings use. A `Mutex<Vec<String>>` behind an `AtomicBool` so the
 /// drain — which runs on EVERY park — is one relaxed load in the overwhelmingly
 /// common empty case and never touches the lock.
-static DEFERRED_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static DEFERRED_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DEFERRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Cap the deferred lane: a pathological loop that queued forever must not grow

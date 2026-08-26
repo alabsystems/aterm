@@ -2715,7 +2715,10 @@ mod spawn_parse_tests {
             parse_spawn_args("connected=controlled place=pane of=s-abc"),
             Err(())
         );
-        assert_eq!(parse_spawn_args("connected=controlled place=tab of="), Err(()));
+        assert_eq!(
+            parse_spawn_args("connected=controlled place=tab of="),
+            Err(())
+        );
     }
 
     /// The usage string the wire replies for every malformed form names the

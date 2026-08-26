@@ -38,11 +38,11 @@ pub use renderer::{
 pub use renderer::{
     EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
 };
-/// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
-pub mod video_tap;
 /// COLD-BUILD sub-phase probe: the ns split of the one startup phase the
 /// frontend ledger could only see as a `join()` (see `startup_probe`).
 pub mod startup_probe;
+/// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
+pub mod video_tap;
 // TRUST_NATIVE_TLA Phase 2: the GPU-free slice-precondition decision (the real
 // `GpuEncode.tla` `NeverSliceEmpty` gate `InstanceBuf::upload` uses), re-exported so
 // the Tier-1 conformance test can drive the genuine decision headlessly.
@@ -397,7 +397,10 @@ impl GpuContext {
         let instance = startup_probe::timed(startup_probe::Leg::GpuInstance, || {
             wgpu::Instance::new(desc)
         });
-        #[allow(unused_mut, reason = "mutated only on the Windows visual-swapchain arm")]
+        #[allow(
+            unused_mut,
+            reason = "mutated only on the Windows visual-swapchain arm"
+        )]
         let mut ctx = crate::block_on::block_on(Self::from_instance(instance))?;
         // The visual path is ACTIVE only if the DX12 backend actually won adapter
         // selection (the descriptor option is inert elsewhere). Recorded on the

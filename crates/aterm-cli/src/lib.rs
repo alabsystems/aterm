@@ -1121,9 +1121,8 @@ pub fn session_main(quiet: bool) -> ! {
 mod tests {
     use super::{
         CliAction, DIAG_COMMANDS, VERB_BLURB_COLUMN, Verb, decide_args, diag_report, doctor_checks,
-        help_text, verb_help_block,
-        explain_config_report, is_tool_candidate, list_fonts_report, list_themes_report,
-        prepend_path, show_face_report, validate_containment_value,
+        explain_config_report, help_text, is_tool_candidate, list_fonts_report, list_themes_report,
+        prepend_path, show_face_report, validate_containment_value, verb_help_block,
     };
 
     fn decide(args: &[&str]) -> CliAction {
@@ -1146,8 +1145,8 @@ mod tests {
     #[test]
     fn the_windowing_verbs_are_exactly_the_ones_the_grammar_parses() {
         for verb in Verb::ALL {
-            let parses = super::parse_window_request(verb.name(), &[], |raw| Ok(raw.to_string()))
-                .is_ok();
+            let parses =
+                super::parse_window_request(verb.name(), &[], |raw| Ok(raw.to_string())).is_ok();
             assert_eq!(
                 verb.is_windowing(),
                 parses,
@@ -1195,7 +1194,9 @@ mod tests {
             // loose substring — so a future name that is a substring of another
             // can't pass vacuously.
             assert!(
-                help_text().lines().any(|l| l.trim_start().starts_with(name)),
+                help_text()
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(name)),
                 "subcommand {name:?} is not advertised as a --help line"
             );
             assert!(
@@ -1271,8 +1272,9 @@ mod tests {
             // loose substring, so a name that happens to be a substring of
             // another cannot pass vacuously.
             assert!(
-                help.lines()
-                    .any(|l| l.trim_start().starts_with(&format!("aterm {}", verb.name()))),
+                help.lines().any(|l| l
+                    .trim_start()
+                    .starts_with(&format!("aterm {}", verb.name()))),
                 "verb `aterm {}` is not advertised in --help",
                 verb.name()
             );
@@ -1287,7 +1289,11 @@ mod tests {
             // shielding cannot disagree about what a verb is called.
             assert_eq!(Verb::from_operand(verb.name()), Some(*verb));
             // WELL-FORMED — a verb with no blurb would render a bare synopsis.
-            assert!(!verb.blurb().is_empty(), "verb {:?} has no help", verb.name());
+            assert!(
+                !verb.blurb().is_empty(),
+                "verb {:?} has no help",
+                verb.name()
+            );
         }
         // Names are distinct: `from_operand` must be unambiguous.
         for (i, verb) in Verb::ALL.iter().enumerate() {

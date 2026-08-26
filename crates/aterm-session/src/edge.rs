@@ -694,7 +694,11 @@ mod tests {
             [Op::ReadScreen, Op::WriteInput, Op::Signal]
         );
         // The greater authorities are unreachable through ANY kind.
-        for kind in [ConnectionKind::Pull, ConnectionKind::Push, ConnectionKind::Both] {
+        for kind in [
+            ConnectionKind::Pull,
+            ConnectionKind::Push,
+            ConnectionKind::Both,
+        ] {
             for op in [Op::ConfigWrite, Op::ClipboardWrite, Op::DeriveLoop] {
                 assert!(
                     !kind.ops().contains(&op),
@@ -727,7 +731,11 @@ mod tests {
     fn grant_connection_refuses_a_self_loop() {
         let (a, _b, nonce) = ids();
         let mut tbl = EdgeTable::new();
-        for kind in [ConnectionKind::Pull, ConnectionKind::Push, ConnectionKind::Both] {
+        for kind in [
+            ConnectionKind::Pull,
+            ConnectionKind::Push,
+            ConnectionKind::Both,
+        ] {
             assert!(
                 tbl.grant_connection(&a, &a, kind, &nonce).is_empty(),
                 "{kind:?} self-loop must mint nothing"
@@ -751,10 +759,7 @@ mod tests {
         // Source death sweeps the whole connection; every token now denies.
         assert_eq!(tbl.revoke_src(&a), 2);
         for (op, tok) in &minted {
-            assert_eq!(
-                decide_edge(&tbl, tok, &b, *op, &nonce),
-                EdgeDecision::Deny
-            );
+            assert_eq!(decide_edge(&tbl, tok, &b, *op, &nonce), EdgeDecision::Deny);
         }
     }
 }

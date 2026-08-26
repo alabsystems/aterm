@@ -12882,8 +12882,8 @@ mod press_path_lock_elision_tests {
     fn an_inert_press_to_a_hidden_session_does_not_outlast_the_lock_holder() {
         use crate::stub_session;
         use aterm_types::keyboard::{Key as EngineKey, KeyEventType, Modifiers};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -13991,11 +13991,6 @@ mod typed_kitty_summon_tests {
         bytes[..read as usize].to_vec()
     }
 
-
-
-
-
-
     /// The reply-bearing control `signal` fence is deliberately not an empty
     /// synthetic key. It clears only the two exact movement candidates: no PTY
     /// bytes, typing heat, rain scheduling, or latency-hot stamp. A tab-switch
@@ -14189,9 +14184,7 @@ mod typed_kitty_summon_tests {
             .expect("menu dispatcher")
             .1;
         assert!(
-            dispatch
-                .find("clear_front_move_license()")
-                .unwrap()
+            dispatch.find("clear_front_move_license()").unwrap()
                 < dispatch.find("divert_menu_action_around_rename").unwrap(),
             "menu candidate fence must precede every local/no-op early return"
         );
@@ -14202,9 +14195,7 @@ mod typed_kitty_summon_tests {
         // both status-item ingress points must cross the helper above.
         let lib_source = include_str!("lib.rs");
         assert_eq!(
-            lib_source
-                .matches("clear_tab_surface_move_license")
-                .count(),
+            lib_source.matches("clear_tab_surface_move_license").count(),
             8,
             "all custom tab-strip wake boundaries remain fenced",
         );

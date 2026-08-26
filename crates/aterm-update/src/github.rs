@@ -811,8 +811,8 @@ fn authorize_by_roster(
     observed_roster_seq: &mut Option<u64>,
     observed_revocations: &mut Vec<String>,
 ) -> Result<aterm_update_core::roster::Attribution, RosterFailure> {
-    use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET, Roster, verify_roster};
     use RosterFailure::{Refused, Transport};
+    use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET, Roster, verify_roster};
 
     // WHERE THE APPCAST SIGNATURE IS, resolved here rather than taken from the caller.
     //
@@ -862,11 +862,12 @@ fn authorize_by_roster(
         .map_err(|e| Transport(format!("fetch appcast signature: {e}")))?;
 
     // (3)(4) Verify under the paper master, then parse — in that order, by construction.
-    let verified = verify_roster(policy.master_pubkeys, roster_bytes, &roster_sig).map_err(|e| {
-        Refused(format!(
-            "machine roster did not verify under the pinned master ({e:?})"
-        ))
-    })?;
+    let verified =
+        verify_roster(policy.master_pubkeys, roster_bytes, &roster_sig).map_err(|e| {
+            Refused(format!(
+                "machine roster did not verify under the pinned master ({e:?})"
+            ))
+        })?;
     if verified.master_index() != 0 {
         // Never a rejection: a hit on a non-head master is a rotation in flight. Saying so
         // makes a STALLED rotation visible instead of silent until updates stop. At INFO,
@@ -905,7 +906,11 @@ fn authorize_by_roster(
     // (6) Deny-list before crypto, then the artifact signature.
     roster
         .authorize_appcast(appcast, &appcast_sig, policy.now_unix)
-        .map_err(|e| Refused(format!("no machine on the roster signed this release ({e:?})")))
+        .map_err(|e| {
+            Refused(format!(
+                "no machine on the roster signed this release ({e:?})"
+            ))
+        })
 }
 
 /// Fetch and validate exactly one candidate after the complete metadata pass.
@@ -1449,7 +1454,8 @@ impl MemoSelection {
         // The tag grammar and the canonical SPELLING, re-derived — so a memo naming
         // `v01.2.3` (or a tag that is not a candidate at all) cannot be admitted beside
         // `v1.2.3`.
-        let Ok(TagKind::Candidate(tag)) = aterm_update_core::tag::parse_release_tag(&self.release.tag_name)
+        let Ok(TagKind::Candidate(tag)) =
+            aterm_update_core::tag::parse_release_tag(&self.release.tag_name)
         else {
             return false;
         };
@@ -1788,7 +1794,10 @@ impl ListContext<'_> {
 /// body, or the credential lane flipped mid-revalidation); the caller must re-walk the
 /// WHOLE listing unconditionally from page 1, never stitch. `Ok(None)`/`Err` are the
 /// ordinary non-failure/failure ends, already reported by [`ListContext::page`].
-fn revalidate_catalog(ctx: &mut ListContext<'_>, memo: &CatalogMemo) -> Result<Option<bool>, String> {
+fn revalidate_catalog(
+    ctx: &mut ListContext<'_>,
+    memo: &CatalogMemo,
+) -> Result<Option<bool>, String> {
     let lane = ctx.tok.is_some();
     for (index, validator) in memo.etags.iter().enumerate() {
         // `index` is 0-based, pages are 1-based; saturating so the arithmetic carries no
@@ -1840,9 +1849,8 @@ fn walk_catalog(ctx: &mut ListContext<'_>) -> Result<Option<Catalog>, String> {
             // honour an unsolicited 304. Fail closed rather than treat "no body" as "no
             // releases", which would read as an empty channel.
             aterm_update_core::ApiResponse::NotModified => {
-                let msg = String::from(
-                    "GitHub answered 304 to an unconditional release listing request",
-                );
+                let msg =
+                    String::from("GitHub answered 304 to an unconditional release listing request");
                 crate::health::Health::record_failure(&ctx.staging.health(), "network", &msg);
                 return Err(msg);
             }
@@ -1945,7 +1953,9 @@ fn fetch_release_catalog(
         match revalidate_catalog(&mut ctx, memo)? {
             Some(true) => {
                 return Ok(Some(Catalog::Unchanged(
-                    memo.selection.clone().map(MemoSelection::into_authoritative),
+                    memo.selection
+                        .clone()
+                        .map(MemoSelection::into_authoritative),
                 )));
             }
             // Something moved. Fall through to the unconditional walk from page 1 — and
@@ -2074,47 +2084,45 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             validators,
         ),
     };
-    let authoritative =
-        match selection {
-            Ok(candidate) => {
-                if let Some(validators) = validators {
-                    CatalogMemo::write(
-                        &staging.catalog_memo(),
-                        source,
-                        tok.is_some(),
-                        current_build,
-                        validators,
-                        candidate.as_ref(),
-                    );
-                }
-                candidate
+    let authoritative = match selection {
+        Ok(candidate) => {
+            if let Some(validators) = validators {
+                CatalogMemo::write(
+                    &staging.catalog_memo(),
+                    source,
+                    tok.is_some(),
+                    current_build,
+                    validators,
+                    candidate.as_ref(),
+                );
             }
-            Err(error) => {
-                crate::warn(&error);
-                let h =
-                    crate::health::Health::record_failure(&staging.health(), "manifest", &error);
-                // Two-tier wording, exactly like the pipeline branch below. "deferred"
-                // means postponed-and-will-retry, which is a lie for this class: an
-                // untrustworthy authoritative release stays untrustworthy until the
-                // PUBLISHER republishes, so retrying changes nothing. A machine sat at
-                // failure 597 still being told its check was "deferred".
-                let msg = if h.manifest_failures >= crate::PERSISTENT_AFTER {
-                    format!(
-                        "FAILING ({} consecutive checks since {}): {error} — this machine \
+            candidate
+        }
+        Err(error) => {
+            crate::warn(&error);
+            let h = crate::health::Health::record_failure(&staging.health(), "manifest", &error);
+            // Two-tier wording, exactly like the pipeline branch below. "deferred"
+            // means postponed-and-will-retry, which is a lie for this class: an
+            // untrustworthy authoritative release stays untrustworthy until the
+            // PUBLISHER republishes, so retrying changes nothing. A machine sat at
+            // failure 597 still being told its check was "deferred".
+            let msg = if h.manifest_failures >= crate::PERSISTENT_AFTER {
+                format!(
+                    "FAILING ({} consecutive checks since {}): {error} — this machine \
                      cannot install any release until that is fixed at the publisher",
-                        h.manifest_failures,
-                        h.class_since("manifest")
-                    )
-                } else {
-                    format!(
-                        "update check deferred: {error} (attempt {})",
-                        h.manifest_failures
-                    )
-                };
-                crate::status::record(&staging, current_build, &msg);
-                return Ok(None);
-            }
-        };
+                    h.manifest_failures,
+                    h.class_since("manifest")
+                )
+            } else {
+                format!(
+                    "update check deferred: {error} (attempt {})",
+                    h.manifest_failures
+                )
+            };
+            crate::status::record(&staging, current_build, &msg);
+            return Ok(None);
+        }
+    };
     // The asset fetches ride the SAME lane the list request settled on: if the token
     // was rejected above, `tok` is already `None` and these go anonymous too.
     let mut download = |url: &str, max_bytes: u64| {
@@ -2591,12 +2599,12 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         Ok(got) => got,
         Err(e) => {
             let _ = std::fs::remove_file(&container_path);
-                crate::manifest::FailedMark::record_stage_failure(
-                    &staging.failed(),
-                    manifest.build_number,
-                    &manifest.sha256,
-                    crate::install::unix_now_secs(),
-                );
+            crate::manifest::FailedMark::record_stage_failure(
+                &staging.failed(),
+                manifest.build_number,
+                &manifest.sha256,
+                crate::install::unix_now_secs(),
+            );
             crate::health::Health::record_failure(&staging.health(), "stage", &e);
             return Err(e);
         }
@@ -2691,9 +2699,15 @@ mod tests {
         for _ in 0..super::ASSET_RATE_LIMIT_DEFERRALS {
             assert!(super::rate_limit_still_deferrable(&streak));
         }
-        assert!(!super::rate_limit_still_deferrable(&streak), "the fourth is booked");
+        assert!(
+            !super::rate_limit_still_deferrable(&streak),
+            "the fourth is booked"
+        );
         streak.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert!(super::rate_limit_still_deferrable(&streak), "a success starts over");
+        assert!(
+            super::rate_limit_still_deferrable(&streak),
+            "a success starts over"
+        );
     }
 
     use super::*;
@@ -5074,9 +5088,10 @@ mod tests {
         // refusal — the roster does NOT authorize the signer — still surfaces at WARN.
         let lines = crate::log_capture::take();
         assert!(
-            lines.iter().any(|(level, msg)| *level
-                == aterm_log::Level::Warn
-                && msg.contains("refusing authoritative")),
+            lines
+                .iter()
+                .any(|(level, msg)| *level == aterm_log::Level::Warn
+                    && msg.contains("refusing authoritative")),
             "a roster refusal is verification degradation and must WARN: {lines:?}"
         );
     }
@@ -6019,7 +6034,10 @@ mod tests {
         // (2) THE KEY IS A NON-HEAD MEMBER (a rotation in flight): still accepted.
         let rotating = [m11_pub.as_str(), m3_pub.as_str()];
         let (fetched, urls) = run_chain(&good, &rotating, &[], 0, ROSTER_NOW);
-        assert!(fetched.selected.is_some(), "any keyset member is authoritative");
+        assert!(
+            fetched.selected.is_some(),
+            "any keyset member is authoritative"
+        );
         assert_eq!(urls, ["m-url", "sig-url"]);
 
         // (3) THE KEY IS IN NO KEYSET: refused, as a manifest rejection.
@@ -6174,8 +6192,13 @@ mod tests {
             {
                 return Ok(aterm_update_core::ApiResponse::NotModified);
             }
-            let body = self.pages.get(page - 1).cloned().unwrap_or_else(|| b"[]".to_vec());
-            self.body_bytes.set(self.body_bytes.get() + body.len() as u64);
+            let body = self
+                .pages
+                .get(page - 1)
+                .cloned()
+                .unwrap_or_else(|| b"[]".to_vec());
+            self.body_bytes
+                .set(self.body_bytes.get() + body.len() as u64);
             Ok(aterm_update_core::ApiResponse::Body {
                 bytes: body,
                 etag: self.etags.get(page - 1).cloned().flatten(),
@@ -6264,11 +6287,18 @@ mod tests {
         // COLD: no memo. The historical walk — one request, the whole page.
         let cold = run_check_and_memoize(&staging, &channel);
         channel.report("cold");
-        assert_eq!(cold.as_deref(), Some("0.21.0"), "max arbitration, not row order");
+        assert_eq!(
+            cold.as_deref(),
+            Some("0.21.0"),
+            "max arbitration, not row order"
+        );
         assert_eq!(channel.requests.get(), 1);
         assert_eq!(channel.conditional.get(), 0, "nothing to revalidate yet");
         assert_eq!(channel.body_bytes.get(), page.len() as u64);
-        assert!(staging.catalog_memo().exists(), "a memoizable walk must memoize");
+        assert!(
+            staging.catalog_memo().exists(),
+            "a memoizable walk must memoize"
+        );
 
         // WARM: the memo revalidates. One CONDITIONAL request, zero body bytes.
         let before = channel.body_bytes.get();
@@ -6388,19 +6418,27 @@ mod tests {
         let path = staging.catalog_memo();
         let source = test_source();
         let good = CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS);
-        assert!(good.is_some(), "PRECONDITION: the memo we just wrote is usable");
+        assert!(
+            good.is_some(),
+            "PRECONDITION: the memo we just wrote is usable"
+        );
 
         // The credential lane: a token and an anonymous client can see different sets.
-        assert!(CatalogMemo::read(&path, &source, true, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        assert!(
+            CatalogMemo::read(&path, &source, true, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+        );
         // The running build: the pinned keyset and the selection rules are compiled in.
-        assert!(CatalogMemo::read(&path, &source, false, 101, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        assert!(
+            CatalogMemo::read(&path, &source, false, 101, crate::PINNED_UPDATE_PUBKEYS).is_none()
+        );
         // The channel.
         let elsewhere = Source {
             owner: "someone-else".into(),
             repo: "aterm".into(),
         };
         assert!(
-            CatalogMemo::read(&path, &elsewhere, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+            CatalogMemo::read(&path, &elsewhere, false, 100, crate::PINNED_UPDATE_PUBKEYS)
+                .is_none()
         );
 
         // A mangled file, a wrong schema, an unsafe validator, an out-of-range index and
@@ -6411,7 +6449,9 @@ mod tests {
         };
         memo.schema = CATALOG_MEMO_SCHEMA + 1;
         write(&memo);
-        assert!(CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        assert!(
+            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+        );
         memo.schema = CATALOG_MEMO_SCHEMA;
 
         memo.etags = vec!["\"a\"\r\nX-Evil: 1".to_string()];
@@ -6425,7 +6465,9 @@ mod tests {
         let mut broken = memo.clone();
         broken.selection.as_mut().unwrap().manifest_index = 99;
         write(&broken);
-        assert!(CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        assert!(
+            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+        );
 
         let mut renamed = memo.clone();
         renamed.selection.as_mut().unwrap().release.assets[0].name = "not-the-appcast".into();
@@ -6444,7 +6486,9 @@ mod tests {
         );
 
         std::fs::write(&path, b"{not json").unwrap();
-        assert!(CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        assert!(
+            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+        );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

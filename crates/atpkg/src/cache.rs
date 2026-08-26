@@ -673,7 +673,9 @@ mod tests {
         let at = "L".repeat(MAX_CACHED_LABEL_BYTES);
         write_doc(&p, &at);
         let c = IndexCache::new(p.clone());
-        let got = c.load("github:o/r").expect("a label at the ceiling is admissible");
+        let got = c
+            .load("github:o/r")
+            .expect("a label at the ceiling is admissible");
         assert_eq!(got[0].label, at, "and reaches the caller unmodified");
         assert!(
             c.load_if_identical("github:o/r", &["id1".to_string()])
@@ -737,7 +739,10 @@ mod tests {
         for bad in ["0", "2", "4294967295"] {
             fs::write(
                 &p,
-                good.replace(&format!("schema = {CACHE_SCHEMA}"), &format!("schema = {bad}")),
+                good.replace(
+                    &format!("schema = {CACHE_SCHEMA}"),
+                    &format!("schema = {bad}"),
+                ),
             )
             .unwrap();
             let c = IndexCache::new(p.clone());
@@ -752,5 +757,4 @@ mod tests {
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
-
 }

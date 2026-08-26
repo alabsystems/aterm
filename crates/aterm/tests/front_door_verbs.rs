@@ -44,12 +44,7 @@ fn on_a_terminal(args: &[&str]) -> String {
             std::ptr::null_mut(),
         )
     };
-    assert_eq!(
-        rc,
-        0,
-        "openpty failed: {}",
-        std::io::Error::last_os_error()
-    );
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
     // SAFETY: both fds come from the successful `openpty` above and are owned
     // here — nothing else holds or closes them.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
@@ -91,7 +86,10 @@ fn on_a_terminal(args: &[&str]) -> String {
             None if start.elapsed() >= DEADLINE => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("`aterm {}` did not exit within {DEADLINE:?}", args.join(" "));
+                panic!(
+                    "`aterm {}` did not exit within {DEADLINE:?}",
+                    args.join(" ")
+                );
             }
             None => std::thread::sleep(Duration::from_millis(10)),
         }

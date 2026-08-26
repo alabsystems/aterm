@@ -381,8 +381,7 @@ impl Terminal {
             // lead remains narrow. This also handles selector replay exactly:
             // `⌚︎️` is wide again (VS16 took effect) and therefore not text,
             // while an ineffective later VS16 at the row edge leaves VS15 active.
-            let text_presentation =
-                !wide && !cell.is_wide() && marks.contains(&'\u{FE0E}');
+            let text_presentation = !wide && !cell.is_wide() && marks.contains(&'\u{FE0E}');
 
             // Line decorations (SGR 4 family / 9 / 53).
             let cflags = eff_cell.flags();
@@ -2131,17 +2130,22 @@ mod tests {
         assert_eq!(base.cursor_row, 0, "cursor sits on the top row at offset 0");
         tall.scroll_display(2);
         let scrolled = tall.cell_frame(6, 8);
-        assert!(scrolled.display_offset >= 2, "scrolled a little into history");
+        assert!(
+            scrolled.display_offset >= 2,
+            "scrolled a little into history"
+        );
         assert!(
             scrolled.cursor_visible,
             "the cursor's row is still on screen after a small scroll — it must show"
         );
         assert_eq!(
-            scrolled.cursor_row,
-            scrolled.display_offset as usize,
+            scrolled.cursor_row, scrolled.display_offset as usize,
             "and it is PROJECTED down by the offset from its active-grid row 0"
         );
-        assert_eq!(live_row, 1, "sanity: the 2-row fixture's live cursor is on row 1");
+        assert_eq!(
+            live_row, 1,
+            "sanity: the 2-row fixture's live cursor is on row 1"
+        );
     }
 
     /// The per-frame snapshot folds emoji-cluster + combining-mark extraction

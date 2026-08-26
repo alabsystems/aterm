@@ -520,7 +520,10 @@ fn evict_destroys_a_selection_whose_whole_interval_fell_off() {
         after[0], 0,
         "a selection BOTH of whose endpoints were evicted is gone, not clamped: {after:?}"
     );
-    assert_eq!(after[4], 0, "…and a destroyed selection reports no truncation");
+    assert_eq!(
+        after[4], 0,
+        "…and a destroyed selection reports no truncation"
+    );
 }
 
 #[test]
@@ -590,7 +593,10 @@ pub(crate) fn run_conformance() {
         term.process(b"\x1bc");
         c.fired(prev, EV_WHOLESALE, None);
         let next = c.state(&term);
-        assert_eq!(next[0], 0, "RIS destroys the coordinate space the anchors name");
+        assert_eq!(
+            next[0], 0,
+            "RIS destroys the coordinate space the anchors name"
+        );
         let (ok, out) = validate_transition("WholesaleInvalidate", prev, next);
         assert!(
             ok,

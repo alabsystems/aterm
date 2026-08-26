@@ -53,8 +53,8 @@
 use aterm_render::{
     CJK_SCALE_MAX, CJK_SCALE_MIN, CONDENSE_MAX_RATIO, XHEIGHT_SCALE_MAX, XHEIGHT_SCALE_MIN,
     clamp_to_col_band, clamp_to_row_band, condense_coverage, condense_ink_w, fallback_cell_count,
-    fallback_cjk_scale, fallback_fit_scale, fallback_weight_rank,
-    fallback_xheight_scale, materialized_cell_span, wide_center_offset,
+    fallback_cjk_scale, fallback_fit_scale, fallback_weight_rank, fallback_xheight_scale,
+    materialized_cell_span, wide_center_offset,
 };
 
 // ---- (1) normalization clamps ----
@@ -758,9 +758,11 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
         // machine: 中 resolves to the primary, 一 to Arial Unicode), and a
         // guard that skips on the developer's own machine guards nothing.
         let candidates = ['\u{4E2D}', '\u{4E00}', '\u{4E01}', '\u{53E3}']; // 中 一 丁 口
-        let Some(key) = candidates.iter().map(|&c| r.glyph_key(c)).find(|k| {
-            k.source == FaceId::Fallback && k.glyph_class == GlyphClass::Mono
-        }) else {
+        let Some(key) = candidates
+            .iter()
+            .map(|&c| r.glyph_key(c))
+            .find(|k| k.source == FaceId::Fallback && k.glyph_class == GlyphClass::Mono)
+        else {
             eprintln!("SKIP: no wide ideograph served by the fallback chain on this host");
             return;
         };

@@ -435,9 +435,9 @@ impl TreeAccumulator {
 /// join), so the `strip_prefix` cannot fail; it is mapped to the same fail-closed
 /// `RootEscape` rejection anyway rather than unwrapped.
 fn rel_bytes_under(root: &Path, path: &Path) -> Result<Vec<u8>, ExtractError> {
-    let rel = path.strip_prefix(root).map_err(|_| {
-        ExtractError::Rejected(ExtractReject::RootEscape, path.to_path_buf())
-    })?;
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| ExtractError::Rejected(ExtractReject::RootEscape, path.to_path_buf()))?;
     // `platform::os_str_bytes` goes via `call1` — see `tree.rs`'s walk for why (std's
     // inlined `unsafe` in the `OsStr` byte-slice cast is otherwise attributed here).
     Ok(crate::call1(crate::platform::os_str_bytes, rel.as_os_str()).to_vec())
@@ -531,12 +531,15 @@ fn extract_inner(
         && let Ok(mut existing) = std::fs::read_dir(dest_root)
         && let Some(entry) = existing.next()
     {
-        let mut msg =
-            String::from("extraction destination is not empty; refusing to fold a tree_root \
-that would not describe everything under it: ");
+        let mut msg = String::from(
+            "extraction destination is not empty; refusing to fold a tree_root \
+that would not describe everything under it: ",
+        );
         msg.push_str(&crate::call1(
             std::path::Path::to_string_lossy,
-            &entry.map(|e| e.path()).unwrap_or_else(|_| dest_root.to_path_buf()),
+            &entry
+                .map(|e| e.path())
+                .unwrap_or_else(|_| dest_root.to_path_buf()),
         ));
         return Err(ExtractError::Io(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1319,7 +1322,10 @@ mod tests {
             std::fs::read(root.join("share/doc/readme")).unwrap(),
             b"hello, again"
         );
-        assert_eq!(std::fs::read(root.join("lib/big.so")).unwrap().len(), 200_000);
+        assert_eq!(
+            std::fs::read(root.join("lib/big.so")).unwrap().len(),
+            200_000
+        );
         assert!(std::fs::read(root.join("share/empty")).unwrap().is_empty());
         #[cfg(unix)]
         {
@@ -1330,10 +1336,18 @@ mod tests {
                 "the hardlink shape must be present for the parity to mean anything"
             );
             let mode_of = |p: &str| {
-                std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o7777
+                std::fs::metadata(root.join(p))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777
             };
             assert_eq!(mode_of("bin/targo"), 0o755, "the exec mode class");
-            assert_eq!(mode_of("share/doc/readme"), 0o644, "the non-exec mode class");
+            assert_eq!(
+                mode_of("share/doc/readme"),
+                0o644,
+                "the non-exec mode class"
+            );
         }
         let _ = std::fs::remove_dir_all(&d);
     }

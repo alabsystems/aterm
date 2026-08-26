@@ -13,8 +13,8 @@
 // instant on wasm32, where Instant::now() panics. Every Instant in the engine's clock
 // seam (transient.process_now, last_bell_time, ClockReading) must be this same type so
 // they interoperate. Duration is unaffected by wasm and stays std::time.
-use std::time::Duration;
 use aterm_time::Instant;
+use std::time::Duration;
 
 /// How long a visual bell keeps the frame flashed (inverted/dimmed).
 pub const FLASH_DURATION: Duration = Duration::from_millis(100);

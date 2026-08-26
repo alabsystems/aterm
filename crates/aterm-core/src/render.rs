@@ -2624,9 +2624,16 @@ mod ime_preedit_tests {
         assert_eq!(f.cells[1][3].ch, 'a');
         assert_eq!(f.cells[1][4].ch, 'b');
         assert_eq!(f.cells[1][3].underline, UnderlineStyle::Single);
-        assert_eq!(f.cells[1][3].fg, [200, 200, 200], "cursor cell's colors seed the style");
+        assert_eq!(
+            f.cells[1][3].fg,
+            [200, 200, 200],
+            "cursor cell's colors seed the style"
+        );
         assert_eq!(f.cursor_col, 5, "caret parks after the composition");
-        assert_eq!(f.cells[1][2].ch, ' ', "nothing left of the cursor is touched");
+        assert_eq!(
+            f.cells[1][2].ch, ' ',
+            "nothing left of the cursor is touched"
+        );
     }
 
     #[test]
@@ -2634,10 +2641,17 @@ mod ime_preedit_tests {
         let mut f = frame(4, 10, (0, 2));
         f.overlay_ime_preedit("日本", None, false);
         assert_eq!(f.cells[0][2].ch, '日');
-        assert!(f.cells[0][3].wide, "continuation column carries the wide flag");
+        assert!(
+            f.cells[0][3].wide,
+            "continuation column carries the wide flag"
+        );
         assert_eq!(f.cells[0][4].ch, '本');
         assert!(f.cells[0][5].wide);
-        assert_eq!(f.cells[0][3].underline, UnderlineStyle::Single, "the underline spans the continuation");
+        assert_eq!(
+            f.cells[0][3].underline,
+            UnderlineStyle::Single,
+            "the underline spans the continuation"
+        );
         assert_eq!(f.cursor_col, 6);
     }
 
@@ -2648,7 +2662,10 @@ mod ime_preedit_tests {
         // straddle the edge and must not be half-drawn.
         f.overlay_ime_preedit("日本", None, false);
         assert_eq!(f.cells[0][2].ch, '日');
-        assert_eq!(f.cells[0][4].ch, ' ', "the straddling char is truncated whole");
+        assert_eq!(
+            f.cells[0][4].ch, ' ',
+            "the straddling char is truncated whole"
+        );
         assert_eq!(f.cursor_col, 4, "caret clamps inside the row");
     }
 
@@ -2960,7 +2977,11 @@ mod ime_preedit_neighbour_tests {
         let mut f = painted_frame(2, 8, b"$ ");
         // に ほ ん take columns 2..8; ご would need 8..10.
         f.overlay_ime_preedit("にほんご", None, false);
-        assert_eq!(f.cells[0].len(), 8, "grown to the frame width, never past it");
+        assert_eq!(
+            f.cells[0].len(),
+            8,
+            "grown to the frame width, never past it"
+        );
         let row: String = f.cells[0].iter().map(|c| c.ch).collect();
         assert_eq!(row, "$ に ほ ん ");
         assert_eq!(f.cursor_col, 7, "the caret clamps to the last column");
@@ -2991,7 +3012,6 @@ mod ime_preedit_neighbour_tests {
         assert_eq!(f.cells[0][6].ch, 'ん');
     }
 
-
     /// The `cjk` argument — DECSET 8840 / `ambiguous_width_double`, read off the
     /// same `Terminal` under the same lock as the extraction — must reach the
     /// width call, or the composition would occupy different columns than the
@@ -3000,12 +3020,20 @@ mod ime_preedit_neighbour_tests {
     fn the_ambiguous_width_flag_widens_the_composition_it_is_given() {
         let mut narrow = painted_frame(2, 20, b"$ ");
         narrow.overlay_ime_preedit("±", None, false);
-        assert_eq!(narrow.cells[0].len(), 3, "EA-Ambiguous is narrow by default");
+        assert_eq!(
+            narrow.cells[0].len(),
+            3,
+            "EA-Ambiguous is narrow by default"
+        );
         assert!(!narrow.cells[0][2].wide);
 
         let mut wide = painted_frame(2, 20, b"$ ");
         wide.overlay_ime_preedit("±", None, true);
-        assert_eq!(wide.cells[0].len(), 4, "and double under the CJK width mode");
+        assert_eq!(
+            wide.cells[0].len(),
+            4,
+            "and double under the CJK width mode"
+        );
         assert!(wide.cells[0][3].wide);
         assert_eq!(wide.cursor_col, 4);
     }
@@ -3064,7 +3092,10 @@ mod ime_preedit_neighbour_tests {
         let mut f = RenderInput::empty();
         term.cell_frame_into(&mut f, 2, 10);
         assert_eq!(f.cluster_at(0, 0), Some("\u{1F1EF}\u{1F1F5}"));
-        assert_eq!(f.cursor_col, 1, "fixture: caret on the flag's second column");
+        assert_eq!(
+            f.cursor_col, 1,
+            "fixture: caret on the flag's second column"
+        );
 
         f.overlay_ime_preedit("a", None, false);
         assert_eq!(f.cells[0][1].ch, 'a');
@@ -3102,17 +3133,17 @@ mod ime_preedit_caret_query_tests {
     fn the_caret_query_returns_exactly_the_column_the_paint_lands_on() {
         // (preedit, caret byte, cjk, start column, frame cols)
         let cases: &[(&str, Option<usize>, bool, usize, u16)] = &[
-            ("にほん", None, false, 2, 20),        // caret trails
-            ("にほん", Some(0), false, 2, 20),     // caret at the start
-            ("にほん", Some(3), false, 2, 20),     // caret between に and ほ
-            ("ab", Some(1), false, 3, 20),         // narrow, mid-composition
-            ("にほんご", None, false, 2, 8),       // truncated at the edge
-            ("日", None, false, 7, 8),             // not one column fits
-            ("e\u{0301}", None, false, 0, 20),     // a zero-width combining mark
-            ("±", None, true, 2, 20),              // EA-Ambiguous, CJK mode
-            ("±", None, false, 2, 20),             // …and narrow mode
-            ("", None, false, 2, 20),              // no composition at all
-            ("にほん", Some(999), false, 2, 20),   // caret past the end
+            ("にほん", None, false, 2, 20),      // caret trails
+            ("にほん", Some(0), false, 2, 20),   // caret at the start
+            ("にほん", Some(3), false, 2, 20),   // caret between に and ほ
+            ("ab", Some(1), false, 3, 20),       // narrow, mid-composition
+            ("にほんご", None, false, 2, 8),     // truncated at the edge
+            ("日", None, false, 7, 8),           // not one column fits
+            ("e\u{0301}", None, false, 0, 20),   // a zero-width combining mark
+            ("±", None, true, 2, 20),            // EA-Ambiguous, CJK mode
+            ("±", None, false, 2, 20),           // …and narrow mode
+            ("", None, false, 2, 20),            // no composition at all
+            ("にほん", Some(999), false, 2, 20), // caret past the end
         ];
         for &(preedit, caret, cjk, start, cols) in cases {
             let mut f = prompt(cols, start);

@@ -535,7 +535,6 @@ mod cursor_fx_generation_fence_tests {
             panic!("headless test backend is CPU")
         };
         assert_eq!(renderer.cursor_style_override(), None);
-
     }
 
     /// TORN-FRAME PIN (v0.49.0): a PTY chunk landing between LOCK A and
@@ -656,7 +655,6 @@ mod cursor_fx_generation_fence_tests {
         );
     }
 
-
     struct StraddledEchoFixture {
         app: App,
         await_at: Instant,
@@ -739,12 +737,8 @@ mod cursor_fx_generation_fence_tests {
             geom,
             &mut ws.glow_scratch,
         );
-        ws.cursor_trail.tick(
-            Some(origin),
-            origin_at,
-            &trail_cfg,
-            &mut ws.trail_scratch,
-        );
+        ws.cursor_trail
+            .tick(Some(origin), origin_at, &trail_cfg, &mut ws.trail_scratch);
         assert_eq!(ws.cursor_glow.live_sparks() > 0, resident);
         assert_eq!(ws.cursor_trail.is_active(), resident);
 
@@ -771,12 +765,8 @@ mod cursor_fx_generation_fence_tests {
             geom,
             &mut ws.glow_scratch,
         );
-        ws.cursor_trail.tick(
-            Some(origin),
-            await_at,
-            &trail_cfg,
-            &mut ws.trail_scratch,
-        );
+        ws.cursor_trail
+            .tick(Some(origin), await_at, &trail_cfg, &mut ws.trail_scratch);
 
         // The key that will explain this straddle is still fresh on both
         // engines — but the commit below is not allowed to care, and is handed
@@ -902,7 +892,6 @@ mod cursor_fx_generation_fence_tests {
             "invalid ownership provenance fails closed"
         );
     }
-
 }
 
 /// Pure per-consumer projection of two cumulative snapshots. Kept separate
@@ -1685,7 +1674,6 @@ mod canonical_layout_scheduler_tests {
         );
         assert!(!app.windows[&wid].cursor_glow.is_active());
     }
-
 
     /// Tier-1 conformance for `layout_coordinate_reset_model`: drive the real
     /// shipping divider/key/reset seam and project each decision onto the
@@ -9025,10 +9013,7 @@ mod composed_cursor_effect_advance_tests {
             model.successors("SelectComposedExtractedRoute", &classified_state)[0].clone();
         let mut observed = model.successors("RenderComposedExtractedRoute", &selected)[0].clone();
         observed.insert("pending", i64::from(pending_after_render));
-        observed.insert(
-            "consumes",
-            i64::from(classified && !pending_after_render),
-        );
+        observed.insert("consumes", i64::from(classified && !pending_after_render));
         observed.insert("deliveries", i64::from(delivered));
         let transition_label = format!("{label} composed pulse consume/delivery");
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
@@ -9107,10 +9092,7 @@ mod composed_cursor_effect_advance_tests {
         );
         let mut observed = model.successors("RenderOrdinaryRoute", &selected)[0].clone();
         observed.insert("pending", i64::from(pending_after_render));
-        observed.insert(
-            "consumes",
-            i64::from(classified && !pending_after_render),
-        );
+        observed.insert("consumes", i64::from(classified && !pending_after_render));
         observed.insert("deliveries", i64::from(delivered));
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
@@ -10926,7 +10908,10 @@ mod ime_candidate_anchor_tests {
             "six columns of kana: the candidate list follows the caret, not the \
              column the composition started at"
         );
-        assert_eq!(composing.1, engine.1, "same row — a composition does not wrap");
+        assert_eq!(
+            composing.1, engine.1,
+            "same row — a composition does not wrap"
+        );
 
         // Committing puts it back: the engine cursor is the caret again.
         app.on_ime_preedit(wid, String::new(), None);
@@ -18935,11 +18920,8 @@ impl App {
             // must still repaint the cells the grid run covered.
             let preedit_drawn = preedit_on_grid && !ws.preedit.is_empty() && display_offset == 0;
             if preedit_drawn {
-                ws.input_scratch.overlay_ime_preedit(
-                    &ws.preedit,
-                    ws.preedit_caret,
-                    ambiguous_cjk,
-                );
+                ws.input_scratch
+                    .overlay_ime_preedit(&ws.preedit, ws.preedit_caret, ambiguous_cjk);
                 // IME-2 ANCHOR: the composition's OWN caret, not the engine
                 // cursor it starts at. Nothing has reached the PTY yet, so the
                 // caret captured under LOCK A is the column the composition
@@ -29490,6 +29472,10 @@ mod split_sparkle_tests {
         let t0 = Instant::now();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // Ownership + pane translation are what this measures, and both must hold on
+        // every platform — so the companion's master is asked for rather than inherited
+        // from a default that is now OFF on Windows.
+        app.config.cursor_trail = Some(true);
         let sid = app.split_active_stub_tab(wid);
         app.recompute_sparkle();
         assert!(
@@ -30427,6 +30413,12 @@ mod tone_melody_seam_tests {
     /// silently short-circuit the very wiring under test.
     fn app_with_capturing_audio() -> (App, WindowId) {
         let mut app = App::headless_for_test();
+        // The trail is ASKED FOR, not inherited: its absent-key default is
+        // platform-split (`DEFAULT_DECORATIVE_EFFECTS`), and everything below is about
+        // what the trail's audio seam does ONCE IT IS ON — a law that must hold
+        // identically on Windows, so silencing these on that host would delete the very
+        // coverage the platform needs.
+        app.config.cursor_trail = Some(true);
         app.trail_audio = TrailAudio::capturing_for_test();
         assert!(app.trail_audio.is_live(), "the capturing host reports live");
         (app, WindowId(0))
@@ -30707,6 +30699,12 @@ mod key_time_click_tests {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
         let mut app = crate::App::headless_for_test();
+        // The trail is ASKED FOR, not inherited. Its absent-key default is
+        // platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`), and the tick
+        // below has to actually DRAW to arm the key seam — so on Windows an
+        // inherited default would make this latency pin pass for the wrong reason,
+        // or fail, on the one platform whose input latency it was written for.
+        app.config.cursor_trail = Some(true);
         app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
         let wid = crate::WindowId(0);
         // ONE drawing tick, because the engine's silence law arms the key seam
@@ -31959,13 +31957,7 @@ mod cell_pixel_size_tests {
     #[test]
     fn a_newborn_live_engine_carries_the_owning_windows_cell_box() {
         let build = |cell_px| {
-            crate::spawn::new_live_terminal(
-                24,
-                80,
-                None,
-                aterm_types::Appearance::Dark,
-                cell_px,
-            )
+            crate::spawn::new_live_terminal(24, 80, None, aterm_types::Appearance::Dark, cell_px)
         };
         assert_eq!(build(Some((11, 23))).cell_pixel_size(), (11, 23));
         // `None` (the BOOT session, whose backend is still building) keeps the
@@ -32010,7 +32002,9 @@ mod cell_pixel_size_tests {
 
         app.finalize_backend();
 
-        let real = app.spawn_cell_px(wid).expect("a joined backend has metrics");
+        let real = app
+            .spawn_cell_px(wid)
+            .expect("a joined backend has metrics");
         assert_ne!(
             real, PLACEHOLDER,
             "the 24px fixture face must differ from the placeholder"
@@ -32104,11 +32098,7 @@ mod cell_pixel_size_tests {
         );
 
         // Zoom back down: a different resolved box must be pushed again.
-        app.windows
-            .get_mut(&wid)
-            .expect("window 0")
-            .metrics
-            .font_px = 10.0;
+        app.windows.get_mut(&wid).expect("window 0").metrics.font_px = 10.0;
         let second = {
             let (cw, ch) = app.win_cell_size(wid);
             (cw as u16, ch as u16)

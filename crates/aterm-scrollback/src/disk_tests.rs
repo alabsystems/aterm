@@ -568,7 +568,10 @@ fn disk_cold_clear_remap() {
         "Page1-Line0"
     );
     let file_len = cold.file.as_ref().unwrap().metadata().unwrap().len();
-    assert!(file_len > HEADER_SIZE as u64, "push after clear reaches disk");
+    assert!(
+        file_len > HEADER_SIZE as u64,
+        "push after clear reaches disk"
+    );
     // No view is re-established by the append (ST-1) — the read above went
     // through the positional path against the post-clear file.
     assert!(cold.mmap.is_none());
@@ -1007,7 +1010,10 @@ fn disk_cold_rotation_interleave_matches_oracle() {
     drop(cold);
     let cold = DiskColdTier::with_config(DiskColdConfig::new(&path)).unwrap();
     let total = cold.line_count();
-    assert!(total >= oracle.len(), "reload keeps at least the live lines");
+    assert!(
+        total >= oracle.len(),
+        "reload keeps at least the live lines"
+    );
     for (j, want) in oracle.iter().enumerate() {
         let idx = total - oracle.len() + j;
         let got = cold.get_line(idx).unwrap().unwrap().to_string();

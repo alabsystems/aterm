@@ -1606,8 +1606,8 @@ fn route_osc52_query(
     primary_supported: bool,
 ) -> QuerySource {
     use aterm_core::terminal::ClipboardSelection as Sel;
-    let only_primary = !selections.is_empty()
-        && selections.iter().all(|s| matches!(s, Sel::Primary));
+    let only_primary =
+        !selections.is_empty() && selections.iter().all(|s| matches!(s, Sel::Primary));
     if only_primary && primary_supported {
         QuerySource::Primary
     } else {
@@ -3205,7 +3205,10 @@ mod clipboard_coalesce_tests {
         // 'p' on X11: Set writes ONLY primary; the query reads Primary.
         let w = route_osc52_write(&[Sel::Primary], "yank", true);
         assert_eq!((w.clipboard, w.primary.as_deref()), (None, Some("yank")));
-        assert_eq!(route_osc52_query(&[Sel::Primary], true), QuerySource::Primary);
+        assert_eq!(
+            route_osc52_query(&[Sel::Primary], true),
+            QuerySource::Primary
+        );
         // 'c' and the empty default: Set writes the clipboard; so reads the query.
         assert_eq!(
             route_osc52_query(&[Sel::Clipboard], true),
@@ -3272,7 +3275,10 @@ mod clipboard_coalesce_tests {
     fn drain_with_empty_backlog_returns_first() {
         let (_tx, rx) = std::sync::mpsc::channel::<ClipWrite>();
         let folded = drain_latest_write(set(Some("only"), None), &rx);
-        assert_eq!((folded.clipboard.as_deref(), folded.primary), (Some("only"), None));
+        assert_eq!(
+            (folded.clipboard.as_deref(), folded.primary),
+            (Some("only"), None)
+        );
     }
 }
 

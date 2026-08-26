@@ -16,9 +16,6 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -49,6 +46,9 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -1092,9 +1092,17 @@ fn archive_executor_refines_identity_preserving_single_head_transitions() {
 #[test]
 fn a_rate_limited_anonymous_probe_is_classified_as_such() {
     use publish::anon_probe_stderr_is_rate_limit as is_rate_limit;
-    assert!(is_rate_limit("curl: (22) The requested URL returned error: 403"));
-    assert!(is_rate_limit("curl: (22) The requested URL returned error: 429"));
-    assert!(!is_rate_limit("curl: (22) The requested URL returned error: 404"));
-    assert!(!is_rate_limit("curl: (56) Recv failure: Connection reset by peer"));
+    assert!(is_rate_limit(
+        "curl: (22) The requested URL returned error: 403"
+    ));
+    assert!(is_rate_limit(
+        "curl: (22) The requested URL returned error: 429"
+    ));
+    assert!(!is_rate_limit(
+        "curl: (22) The requested URL returned error: 404"
+    ));
+    assert!(!is_rate_limit(
+        "curl: (56) Recv failure: Connection reset by peer"
+    ));
     assert!(!is_rate_limit(""));
 }

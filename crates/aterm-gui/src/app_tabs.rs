@@ -1518,7 +1518,11 @@ impl App {
         let (state, has_session, sid) = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             match g.by_local(session) {
-                Some(h) => (Some(h.state.as_str().to_string()), true, Some(h.sid.clone())),
+                Some(h) => (
+                    Some(h.state.as_str().to_string()),
+                    true,
+                    Some(h.sid.clone()),
+                ),
                 None => (None, false, None),
             }
         };
@@ -2497,7 +2501,10 @@ impl App {
                 // either way, and the fingerprint must not rebuild the native
                 // menu at animation/typing rate.
                 let title = crate::toolbar::busy_spinner_title_parts(&ws.current_title)
-                    .map_or_else(|| ws.current_title.clone(), |(_, s)| s.trim_start().to_string());
+                    .map_or_else(
+                        || ws.current_title.clone(),
+                        |(_, s)| s.trim_start().to_string(),
+                    );
                 let title = title
                     .split(" [‹")
                     .next()
@@ -4444,7 +4451,11 @@ impl App {
         self.clear_strip_press(wid);
         self.settle_rename_edit(wid);
         if select
-            && self.windows.get(&wid).and_then(|ws| ws.tab_set.active_index()) != Some(index)
+            && self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.tab_set.active_index())
+                != Some(index)
         {
             self.switch_tab_in(wid, index);
         }
@@ -6734,7 +6745,10 @@ mod session_chrome_app_tests {
             let g = app.store.read().unwrap();
             let a = g.by_local(0).expect("session 0 registered");
             let b = g.by_local(1).expect("session 1 registered");
-            ((a.sid.clone(), a.ctx.clone()), (b.sid.clone(), b.ctx.clone()))
+            (
+                (a.sid.clone(), a.ctx.clone()),
+                (b.sid.clone(), b.ctx.clone()),
+            )
         };
         (app, a, b)
     }
@@ -6879,12 +6893,7 @@ mod session_chrome_app_tests {
         // Show, clicked on A's tab (tab 0), targets the PEER: the window
         // switches to B's tab.
         let tab_a = app.windows[&wid].tab_set.tabs()[0].id;
-        app.dispatch_tab_menu_connection(
-            wid,
-            tab_a,
-            &b_sid,
-            crate::session_chrome::ConnVerb::Show,
-        );
+        app.dispatch_tab_menu_connection(wid, tab_a, &b_sid, crate::session_chrome::ConnVerb::Show);
         assert_eq!(
             app.windows[&wid].tab_set.active_index(),
             Some(1),
@@ -7290,7 +7299,11 @@ mod operator_glance_tests {
         assert_eq!(a.windows[0].title, "cargo build");
         app.windows.get_mut(&WindowId(0)).unwrap().current_title = "\u{2819} cargo build".into();
         let b = app.operator_fleet_glance();
-        assert_eq!(a.fingerprint(), b.fingerprint(), "phase-only change is not a rendered fact");
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "phase-only change is not a rendered fact"
+        );
         app.windows.get_mut(&WindowId(0)).unwrap().current_title = "cargo build done".into();
         assert_ne!(a.fingerprint(), app.operator_fleet_glance().fingerprint());
     }
@@ -7434,7 +7447,8 @@ mod tab_context_menu_tests {
 /// or uninstall mid-run is noticed on the next refresh.
 fn operator_cli_on_path() -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
+        std::env::split_paths(&path)
+            .any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
     })
 }
 

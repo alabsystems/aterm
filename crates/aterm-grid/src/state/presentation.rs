@@ -662,7 +662,9 @@ mod tests {
             (35, 39),
         ];
         let fold = |order: &mut dyn Iterator<Item = &(u64, u64)>| {
-            order.fold(SelectionDamage::None, |acc, &(lo, hi)| acc.union(band(lo, hi)))
+            order.fold(SelectionDamage::None, |acc, &(lo, hi)| {
+                acc.union(band(lo, hi))
+            })
         };
         let forward = fold(&mut seq.iter());
         let backward = fold(&mut seq.iter().rev());
@@ -707,15 +709,18 @@ mod tests {
             (80, 81),
             (90, 91),
         ];
-        let merged = ten
-            .iter()
-            .fold(SelectionDamage::None, |acc, &(lo, hi)| acc.union(band(lo, hi)));
+        let merged = ten.iter().fold(SelectionDamage::None, |acc, &(lo, hi)| {
+            acc.union(band(lo, hi))
+        });
         let got = bands_of(merged);
         assert!(
             got.len() <= MAX_SELECTION_DAMAGE_BANDS,
             "stays within the arity bound: {got:?}"
         );
-        assert!(got.len() > 1, "degrades by absorbing, NOT to a single hull: {got:?}");
+        assert!(
+            got.len() > 1,
+            "degrades by absorbing, NOT to a single hull: {got:?}"
+        );
         for pair in got.windows(2) {
             assert!(pair[0].1 < pair[1].0, "sorted and disjoint: {got:?}");
         }

@@ -119,9 +119,16 @@ pub(crate) enum MapActivation {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MapLine {
     Group(usize),
-    Chip { item: usize, group: usize, chip: usize },
+    Chip {
+        item: usize,
+        group: usize,
+        chip: usize,
+    },
     FlowsHeader,
-    Flow { item: usize, flow: usize },
+    Flow {
+        item: usize,
+        flow: usize,
+    },
     Empty,
 }
 
@@ -683,7 +690,11 @@ impl ConnectionMapState {
             }
         }
         let epoch = h.finish() as u32;
-        if epoch == u32::MAX { u32::MAX - 1 } else { epoch }
+        if epoch == u32::MAX {
+            u32::MAX - 1
+        } else {
+            epoch
+        }
     }
 
     /// Decode a node minted by the CURRENT epoch to its item index.
@@ -725,7 +736,11 @@ fn map_layout(state: &ConnectionMapState, g: &SettingsGeom) -> MapLayout {
 }
 
 /// Exact painted selection/hit rectangle for one VISIBLE body slot.
-fn map_row_rect_in(layout: &MapLayout, g: &SettingsGeom, slot: usize) -> Option<(f32, f32, f32, f32)> {
+fn map_row_rect_in(
+    layout: &MapLayout,
+    g: &SettingsGeom,
+    slot: usize,
+) -> Option<(f32, f32, f32, f32)> {
     if slot >= layout.body_rows {
         return None;
     }
@@ -829,7 +844,11 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
             if sessions == 1 { "" } else { "s" },
             state.flows.len(),
             if state.flows.len() == 1 { "" } else { "s" },
-            if state.layered { "" } else { " \u{00b7} cyclic" },
+            if state.layered {
+                ""
+            } else {
+                " \u{00b7} cyclic"
+            },
         );
         text_at(
             &mut prims,
@@ -858,8 +877,8 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
         if let MapLine::Chip { item, .. } | MapLine::Flow { item, .. } = line
             && item == state.selected
         {
-            let (x, y, w, h) = map_row_rect_in(&layout, g, slot)
-                .expect("painted map slot has a row rectangle");
+            let (x, y, w, h) =
+                map_row_rect_in(&layout, g, slot).expect("painted map slot has a row rectangle");
             let armed = state.confirm == Some(item);
             let ring = if armed { r.danger } else { r.accent };
             prims.push(DrawPrim::Panel {
@@ -1095,7 +1114,10 @@ mod tests {
             vec![push("a", "b"), pull("b", "a")],
         );
         let lines = state.controls_lines();
-        assert!(lines[0].contains("sessions=2") && lines[0].contains("flows=2"), "{lines:?}");
+        assert!(
+            lines[0].contains("sessions=2") && lines[0].contains("flows=2"),
+            "{lines:?}"
+        );
         assert!(
             lines
                 .iter()
@@ -1134,10 +1156,7 @@ mod tests {
         assert_eq!(state.delete_pressed(), None);
         assert!(state.controls_lines()[0].contains("confirm=-"));
         // Enter on a chip resolves to Raise with its local id.
-        assert_eq!(
-            state.activate(),
-            MapActivation::Raise(Some(1), sid("a"))
-        );
+        assert_eq!(state.activate(), MapActivation::Raise(Some(1), sid("a")));
         // Walk to the flow (2 chips → item 2) and run the two-step Delete.
         state.move_selection(2);
         assert_eq!(state.delete_pressed(), None, "first press only arms");
@@ -1190,9 +1209,9 @@ mod tests {
         state.retarget(groups(), vec![push("b", "a")]);
         let lines = state.controls_lines();
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("flow src=b dst=a") && l.contains("selected=true") && l.contains("confirm=true")),
+            lines.iter().any(|l| l.contains("flow src=b dst=a")
+                && l.contains("selected=true")
+                && l.contains("confirm=true")),
             "{lines:?}"
         );
         // Refresh with the armed flow itself gone: selection resets, confirm dies.
@@ -1254,9 +1273,9 @@ mod tests {
         assert_ne!(state.fingerprint(), before, "annotations fold into the fp");
         let lines = state.controls_lines();
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("sid=a") && l.contains("driving=turn-7") && l.contains("watchers=2")),
+            lines.iter().any(|l| l.contains("sid=a")
+                && l.contains("driving=turn-7")
+                && l.contains("watchers=2")),
             "{lines:?}"
         );
     }

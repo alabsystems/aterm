@@ -38,9 +38,6 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -71,6 +68,9 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -803,7 +803,9 @@ fn a_rostered_key_outside_the_keyset_needs_the_operator_to_accept_stranding_old_
     // where a 189-word paragraph buried it.
     assert!(err.contains("No ledger claim was made"), "{err}");
     assert!(
-        err.lines().next().is_some_and(|l| l.contains("No ledger claim was made")),
+        err.lines()
+            .next()
+            .is_some_and(|l| l.contains("No ledger claim was made")),
         "the reassuring fact belongs in the headline: {err}"
     );
 
@@ -832,7 +834,10 @@ fn a_rostered_key_outside_the_keyset_needs_the_operator_to_accept_stranding_old_
     );
     let err = publish::channel_signature_policy(Some(&pk(&M3)), Some(&stranger), &acknowledged)
         .expect_err("the roster is the authority; the flag only accepts a cost");
-    assert!(err.to_string().contains("not on the machine roster"), "{err}");
+    assert!(
+        err.to_string().contains("not on the machine roster"),
+        "{err}"
+    );
 
     // (4) A REVOKED machine is likewise refused with the flag set — revocation is what
     //     the tier exists for, and no acknowledgement can spend it.
@@ -933,7 +938,9 @@ fn a_non_head_keyset_member_strands_pre_roster_clients_just_as_a_stranger_does()
     // where a 189-word paragraph buried it.
     assert!(err.contains("No ledger claim was made"), "{err}");
     assert!(
-        err.lines().next().is_some_and(|l| l.contains("No ledger claim was made")),
+        err.lines()
+            .next()
+            .is_some_and(|l| l.contains("No ledger claim was made")),
         "the reassuring fact belongs in the headline: {err}"
     );
 
@@ -953,7 +960,10 @@ fn a_non_head_keyset_member_strands_pre_roster_clients_just_as_a_stranger_does()
     //     this is the comparison that proves the two paths now agree.
     let err = publish::committed_channel_signature_policy(Some(&pk(&M3)), Some(&pk(&M11)))
         .expect_err("the single-key cutter has never allowed a non-head key to sign");
-    assert!(err.to_string().contains("UPDATE_CHANNEL_PUBKEYS[0]"), "{err}");
+    assert!(
+        err.to_string().contains("UPDATE_CHANNEL_PUBKEYS[0]"),
+        "{err}"
+    );
 }
 
 /// An IDENTITY MISMATCH refuses. The declared id is never authority — the roster's

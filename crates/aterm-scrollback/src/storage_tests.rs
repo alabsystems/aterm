@@ -670,8 +670,14 @@ fn streaming_iter_matches_get_line_walk_memory() {
     }
     // Front-truncate to a non-block-aligned boundary: cold front_offset > 0.
     sb.truncate(53).unwrap();
-    assert!(sb.cold_line_count() > 0, "oracle needs a populated cold tier");
-    assert!(sb.warm_line_count() > 0, "oracle needs a populated warm tier");
+    assert!(
+        sb.cold_line_count() > 0,
+        "oracle needs a populated cold tier"
+    );
+    assert!(
+        sb.warm_line_count() > 0,
+        "oracle needs a populated warm tier"
+    );
     assert!(sb.hot_line_count() > 0, "oracle needs a populated hot tier");
 
     let via_get: Vec<String> = (0..sb.line_count())
@@ -731,10 +737,13 @@ fn streaming_iter_matches_get_line_walk_disk() {
         .with_hot_limit(4)
         .with_warm_limit(12)
         .with_block_size(4);
-    let mut storage: ScrollbackStorage =
-        DiskBackedScrollback::with_config(config).expect("store").into();
+    let mut storage: ScrollbackStorage = DiskBackedScrollback::with_config(config)
+        .expect("store")
+        .into();
     for i in 0..60 {
-        storage.push_line(Line::from(&*format!("dline-{i:03}"))).unwrap();
+        storage
+            .push_line(Line::from(&*format!("dline-{i:03}")))
+            .unwrap();
     }
     // ScrollbackStorage exposes truncation through the line limit.
     storage.set_line_limit(Some(53));

@@ -8,10 +8,7 @@
 use super::*;
 
 fn rle_from_raw_runs(runs: Vec<Run<u8>>, total_length: u32) -> Rle<u8> {
-    Rle {
-        runs,
-        total_length,
-    }
+    Rle { runs, total_length }
 }
 
 /// extend_with clamps to remaining capacity instead of desynchronizing runs.

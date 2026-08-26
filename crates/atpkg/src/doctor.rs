@@ -159,7 +159,8 @@ pub fn run_with(
     // own store is the most expensive kind of wrong, because the natural next step is to
     // reinstall something that was never broken. Naming the speaker makes that verifiable
     // in one line instead of an afternoon.
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "{p}: this atpkg is {} at {}",
         env!("CARGO_PKG_VERSION"),
         std::env::current_exe()
@@ -169,7 +170,8 @@ pub fn run_with(
     report_aterm_posture(layout, p, out);
 
     // (1) TRUST ROOT + INDEX SOURCE + TOKEN SOURCE.
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "{p}: index source github.com/{}",
         crate::resolve_account(cfg_account).slug()
     );
@@ -177,13 +179,15 @@ pub fn run_with(
         // The root is the PAPER MASTER — the same anchor the app updater uses, not a
         // package-specific key. Naming it here is what lets an operator answer "which
         // trust root is this build on?" without reading source.
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: ok — paper master pinned (fingerprint {}, {} key(s))",
             crate::root_key_fingerprint(),
             crate::PKG_TRUST_ANCHORS.len()
         );
     } else {
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: warn — disabled/inert (no paper master compiled in \
              (pins::PAPER_MASTER_PUBKEYS is empty), or ATPKG_DISABLE set) — this build \
              installs nothing"
@@ -193,21 +197,28 @@ pub fn run_with(
     // `$ATPKG_TOKEN` → aterm-update-core chain (env → keychain → 0600 file →
     // `$GITHUB_TOKEN`/`$GH_TOKEN` → `gh auth token`) supplied a credential.
     match token_source {
-        Some(src) => { let _ = writeln!(out, 
-            "{p}: ok — GitHub token from {src} (used for index/pkg fetches; never printed)"
-        ); },
-        None => { let _ = writeln!(out, 
-            "{p}: ok — no GitHub token provisioned (anonymous API: fine for public \
+        Some(src) => {
+            let _ = writeln!(
+                out,
+                "{p}: ok — GitHub token from {src} (used for index/pkg fetches; never printed)"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "{p}: ok — no GitHub token provisioned (anonymous API: fine for public \
              repos, rate-limited; `gh auth login` provisions one; private fetch overrides \
              need one)"
-        ); },
+            );
+        }
     }
 
     // (2) PREFIX / STORE.
     if layout.prefix.is_dir() {
         let _ = writeln!(out, "{p}: ok — prefix {}", layout.prefix.display());
     } else {
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: warn — prefix {} does not exist yet (nothing installed)",
             layout.prefix.display()
         );
@@ -258,7 +269,10 @@ pub fn run_with(
         let bd = layout.build_dir(program, *build);
         if !bd.is_dir() || !crate::store::build_is_complete(&bd) {
             fails += 1;
-            let _ = writeln!(err, "{p}: FAIL — active {program} build {build} store missing/incomplete");
+            let _ = writeln!(
+                err,
+                "{p}: FAIL — active {program} build {build} store missing/incomplete"
+            );
             if next_install_program.is_none() {
                 next_install_program = Some(program.clone());
             }
@@ -288,7 +302,11 @@ pub fn run_with(
     //
     // So: reported, never failed. A pin by design is not a problem; a pin
     // nobody can see is.
-    if let Some(trust_build) = active.iter().find(|(p, _)| p.as_str() == "trust").map(|(_, b)| *b) {
+    if let Some(trust_build) = active
+        .iter()
+        .find(|(p, _)| p.as_str() == "trust")
+        .map(|(_, b)| *b)
+    {
         let bundle_bin = layout.build_dir("trust", trust_build).join("bin");
         for (program, managed_build) in &active {
             if program.as_str() == "trust" {
@@ -299,8 +317,12 @@ pub fn run_with(
                 continue;
             }
             let pinned_version = probe_version(&pinned);
-            let managed_version =
-                probe_version(&layout.build_dir(program, *managed_build).join("bin").join(program));
+            let managed_version = probe_version(
+                &layout
+                    .build_dir(program, *managed_build)
+                    .join("bin")
+                    .join(program),
+            );
             // Equal versions are the healthy case. An unanswered probe on
             // either side is NOT evidence of divergence, so it stays silent
             // rather than reporting "pinned unknown vs managed 0.13.0" — a
@@ -311,8 +333,13 @@ pub fn run_with(
             {
                 continue;
             }
-            let override_hint = if program.as_str() == "ay" { " (override: AY_PATH)" } else { "" };
-            let _ = writeln!(out,
+            let override_hint = if program.as_str() == "ay" {
+                " (override: AY_PATH)"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
                 "{p}: note — Trust builds use the {program} pinned inside the trust bundle \
                  ({pinned_version}), not the managed {program} {managed_version} \
                  (build {managed_build}){override_hint}"
@@ -339,7 +366,8 @@ pub fn run_with(
             } => {
                 fails += 1;
                 next_update_divergence = true;
-                let _ = writeln!(err,
+                let _ = writeln!(
+                    err,
                     "{p}: FAIL — {}: the channel selects build {channel_says} but its bin/ \
                      shims run build {shims_say} (re-run `aterm pkg update {}`)",
                     d.program, d.program
@@ -348,7 +376,8 @@ pub fn run_with(
             crate::gc::Diverged::ShimsDisagree { builds } => {
                 fails += 1;
                 next_update_divergence = true;
-                let _ = writeln!(err,
+                let _ = writeln!(
+                    err,
                     "{p}: FAIL — {}: its bin/ shims are split across builds {} — one \
                      program's tools must all point into one build (re-run `aterm pkg update {}`)",
                     d.program,
@@ -359,7 +388,8 @@ pub fn run_with(
             crate::gc::Diverged::ChannelsDisagree { builds } => {
                 fails += 1;
                 next_update_divergence = true;
-                let _ = writeln!(err,
+                let _ = writeln!(
+                    err,
                     "{p}: FAIL — {}: two channel `current` links select different builds \
                      {} and it has no `store/{}/current` of its own to break the tie — run \
                      `aterm pkg update {}` to write one",
@@ -370,7 +400,8 @@ pub fn run_with(
                 );
             }
             crate::gc::Diverged::NoLiveWitness { shims_say } => {
-                let _ = writeln!(out,
+                let _ = writeln!(
+                    out,
                     "{p}: warn — {}: build {shims_say} is on PATH but no `current` link \
                      selects it, so gc keeps every superseded {} build. Run \
                      `aterm pkg update {}` to re-activate it and clear this.",
@@ -379,7 +410,8 @@ pub fn run_with(
             }
         }
     }
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "{p}: ok — {} program(s) with a proven live build",
         live.len()
     );
@@ -395,13 +427,17 @@ pub fn run_with(
         if shell_d.join(&native_hook).is_file() {
             let _ = writeln!(out, "{p}: ok — shell.d hooks present");
         } else {
-            let _ = writeln!(out, "{p}: warn — shell.d hooks not generated yet (an install writes them)");
+            let _ = writeln!(
+                out,
+                "{p}: warn — shell.d hooks not generated yet (an install writes them)"
+            );
         }
         if let Ok(entries) = std::fs::read_dir(&shell_d) {
             for e in entries.flatten() {
                 if e.file_name().to_string_lossy().ends_with(".sh") {
                     fails += 1;
-                    let _ = writeln!(err,
+                    let _ = writeln!(
+                        err,
                         "{p}: FAIL — shell.d/{}: a POSIX .sh breaks fish — remove it",
                         e.file_name().to_string_lossy()
                     );
@@ -415,7 +451,8 @@ pub fn run_with(
                 && !crate::platform::dir_meta_is_private(&m)
             {
                 fails += 1;
-                let _ = writeln!(err,
+                let _ = writeln!(
+                    err,
                     "{p}: FAIL — {} is group/other-writable (login shells source it)",
                     dir.display()
                 );
@@ -425,24 +462,41 @@ pub fn run_with(
 
     // (7) DISK HEADROOM.
     match crate::freespace::available_bytes(&layout.prefix) {
-        Some(free) if free < 5 * GIB => { let _ = writeln!(out, 
-            "{p}: warn — only {} free (a toolchain update needs ~2.5x its artifact size)",
-            crate::cost::human_bytes(free)
-        ); },
-        Some(free) => { let _ = writeln!(out, "{p}: ok — {} free", crate::cost::human_bytes(free)); },
-        None => { let _ = writeln!(out, "{p}: warn — could not query free space"); },
+        Some(free) if free < 5 * GIB => {
+            let _ = writeln!(
+                out,
+                "{p}: warn — only {} free (a toolchain update needs ~2.5x its artifact size)",
+                crate::cost::human_bytes(free)
+            );
+        }
+        Some(free) => {
+            let _ = writeln!(out, "{p}: ok — {} free", crate::cost::human_bytes(free));
+        }
+        None => {
+            let _ = writeln!(out, "{p}: warn — could not query free space");
+        }
     }
 
     // (8) INDEX FREEZE / AGE (no unverified parse — atpkg's OWN diagnostics only).
     if let Some(status) = crate::status::read(layout) {
         match index_age_days(&status.updated_at, now) {
-            Some(days) if days > 30 => { let _ = writeln!(out, 
-                "{p}: warn — {days} day(s) since the last successful update ({}) — publishing \
+            Some(days) if days > 30 => {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — {days} day(s) since the last successful update ({}) — publishing \
                  looks frozen or this machine has been offline",
-                status.updated_at
-            ); },
-            Some(days) => { let _ = writeln!(out, "{p}: ok — {days} day(s) since the last successful update"); },
-            None => { let _ = writeln!(out, "{p}: warn — could not parse the last-update time"); },
+                    status.updated_at
+                );
+            }
+            Some(days) => {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — {days} day(s) since the last successful update"
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{p}: warn — could not parse the last-update time");
+            }
         }
     } else {
         let _ = writeln!(out, "{p}: warn — no status.toml yet (no update has run)");
@@ -455,7 +509,8 @@ pub fn run_with(
         index_build: crate::sig::Floor::new(layout.floor()).current(),
         roster_seq: crate::sig::Floor::new(layout.floor_generation()).current(),
     };
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "{p}: last-trusted index_build {} (recorded under roster_seq {})",
         build_floor.index_build, build_floor.roster_seq
     );
@@ -464,14 +519,18 @@ pub fn run_with(
     // advanced, `roster_seq` is which generation of the machine roster this store has
     // accepted. A roster floor that is stuck while machines have been minted or revoked
     // means this store has not seen a publish since, which is worth being able to see.
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "{p}: last-trusted roster_seq {}",
         crate::sig::Floor::new(layout.roster_floor()).current()
     );
 
     // (9) RUSTUP + RELOCATABILITY.
     if !rustup_present() {
-        let _ = writeln!(out, "{p}: warn — rustup not found (self-contained bundles are portable)");
+        let _ = writeln!(
+            out,
+            "{p}: warn — rustup not found (self-contained bundles are portable)"
+        );
     }
 
     // (10) THE QUESTION A USER ACTUALLY CAME HERE WITH: do I have the toolchain?
@@ -496,7 +555,8 @@ pub fn run_with(
         .map(|s| s.programs.keys().filter(|k| k.starts_with('-')).collect())
         .unwrap_or_default();
     for stray in &strays {
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: warn — the record holds a stray row for {stray:?}, which cannot be a \
              program name (it is a command-line flag, left by a mistyped `atpkg install`). \
              No program is missing because of it; the next successful `aterm pkg update` \
@@ -512,27 +572,40 @@ pub fn run_with(
     let mut toolset_problem = false;
     if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: the ALab toolset was removed on this machine (`aterm pkg install \
              --default-set` reinstalls it)"
         );
     } else if installed.is_empty() {
         toolset_problem = true;
         match recorded_problems.first() {
-            Some(why) => { let _ = writeln!(out, "{p}: PROBLEM — no ALab programs are installed ({why})"); },
+            Some(why) => {
+                let _ = writeln!(out, "{p}: PROBLEM — no ALab programs are installed ({why})");
+            }
             // No per-program row survives an ENVIRONMENTAL failure any more — an
             // unreachable index says nothing about any particular program — so the
             // aggregate sentence is now the only place the reason lives. Preferring it to
             // the generic hint is what keeps "why did nothing arrive?" answerable offline.
-            None => match status.as_ref().map(|s| s.outcome.as_str()).filter(|o| !o.is_empty()) {
-                Some(outcome) => { let _ = writeln!(out, 
-                    "{p}: PROBLEM — no ALab programs are installed (last attempt: {outcome})"
-                ); },
-                None => { let _ = writeln!(out,
-                    "{p}: PROBLEM — no ALab programs are installed. Fix: aterm pkg install \
+            None => match status
+                .as_ref()
+                .map(|s| s.outcome.as_str())
+                .filter(|o| !o.is_empty())
+            {
+                Some(outcome) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: PROBLEM — no ALab programs are installed (last attempt: {outcome})"
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: PROBLEM — no ALab programs are installed. Fix: aterm pkg install \
                      --default-set (installs the whole ALab toolset; if no build is \
                      published for this machine it names the reason and exits 2)"
-                ); },
+                    );
+                }
             },
         }
     } else if !recorded_problems.is_empty() {
@@ -545,14 +618,16 @@ pub fn run_with(
         // a different N would contradict it in the same report — the tail is the line a
         // human reads last and a script would grep. The problems are listed immediately
         // below, so the number is there to be read.
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: PROBLEM — the toolset is incomplete; {} program(s) active",
             installed.len()
         );
     } else {
         let _ = writeln!(out, "{p}: {} ALab program(s) active", installed.len());
     }
-    if let Some(start) = problem_listing_start(declined, installed.is_empty(), recorded_problems.len())
+    if let Some(start) =
+        problem_listing_start(declined, installed.is_empty(), recorded_problems.len())
     {
         for why in recorded_problems.iter().skip(start) {
             let _ = writeln!(out, "{p}:   {why}");
@@ -688,22 +763,33 @@ fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn st
     let field = |file: &str, key: &str| -> Option<String> {
         let text = std::fs::read_to_string(updates.join(file)).ok()?;
         text.lines()
-            .find_map(|l| l.split_once('='). filter(|(k, _)| k.trim() == key))
+            .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == key))
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
     };
     let Some(installed) = field("installed.toml", "build_number") else {
         return;
     };
-    match (field("status.toml", "current_build"), field("status.toml", "staged_build")) {
-        (Some(current), Some(staged)) if current != staged => { let _ = writeln!(out, 
-            "{p}: note — aterm is RUNNING build {current}, installed {installed}, with \
+    match (
+        field("status.toml", "current_build"),
+        field("status.toml", "staged_build"),
+    ) {
+        (Some(current), Some(staged)) if current != staged => {
+            let _ = writeln!(
+                out,
+                "{p}: note — aterm is RUNNING build {current}, installed {installed}, with \
              build {staged} staged and waiting for a restart"
-        ); },
-        (Some(current), _) if current != installed => { let _ = writeln!(out, 
-            "{p}: note — aterm is RUNNING build {current} but build {installed} is \
+            );
+        }
+        (Some(current), _) if current != installed => {
+            let _ = writeln!(
+                out,
+                "{p}: note — aterm is RUNNING build {current} but build {installed} is \
              installed; the running process predates it"
-        ); },
-        _ => { let _ = writeln!(out, "{p}: ok — aterm build {installed} installed"); },
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "{p}: ok — aterm build {installed} installed");
+        }
     }
 }
 
@@ -781,7 +867,17 @@ mod tests {
         // PATH contains the managed bin/ so even the advisory check is clean.
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a clean install is healthy"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -799,7 +895,17 @@ mod tests {
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         // Structurally spotless — and still not healthy, because there is no toolchain.
         assert!(
-            !run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a store with no ALab programs must report a problem, not health"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -840,7 +946,14 @@ mod tests {
                     tree_root: String::new(),
                 },
             );
-            crate::status::write(&l, &crate::Status { programs, ..existing }).unwrap();
+            crate::status::write(
+                &l,
+                &crate::Status {
+                    programs,
+                    ..existing
+                },
+            )
+            .unwrap();
             l
         };
 
@@ -848,7 +961,17 @@ mod tests {
         let home = synthetic_home("stray-help");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a mistyped flag left in the record is a stray row, not a missing program"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -860,7 +983,17 @@ mod tests {
         let home = synthetic_home("stray-real");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            !run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a real program name in an error state is still a problem doctor must report"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -962,12 +1095,29 @@ mod tests {
                 },
             );
         }
-        crate::status::write(&l, &crate::Status { programs, ..existing }).unwrap();
+        crate::status::write(
+            &l,
+            &crate::Status {
+                programs,
+                ..existing
+            },
+        )
+        .unwrap();
 
         let home = synthetic_home("multi-problem");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            !run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "three recorded faults must fail the health verdict"
         );
 
@@ -987,7 +1137,9 @@ mod tests {
         );
         // The healthy member is not swept up in the reporting.
         assert!(
-            !recorded_problems(Some(&status)).iter().any(|p| p.starts_with("ay:")),
+            !recorded_problems(Some(&status))
+                .iter()
+                .any(|p| p.starts_with("ay:")),
             "an active program is not a problem"
         );
 
@@ -1005,7 +1157,17 @@ mod tests {
         std::fs::create_dir_all(&l.prefix).unwrap();
         std::fs::write(l.declined(), b"# removed on purpose\n").unwrap();
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a deliberate removal is a healthy state, not a fault"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1023,7 +1185,17 @@ mod tests {
             .unwrap();
         let home = synthetic_home("broken");
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a dangling bin symlink is structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1048,7 +1220,17 @@ mod tests {
         assert!(!crate::store::build_is_complete(&l.build_dir("ay", 18)));
         let home = synthetic_home("missing-store");
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "an incomplete active build is structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1064,7 +1246,17 @@ mod tests {
         std::fs::create_dir_all(&shell_d).unwrap();
         std::fs::write(shell_d.join("00-atpkg.sh"), b"echo stray\n").unwrap();
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a fish-breaking stray .sh is structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1085,7 +1277,17 @@ mod tests {
         crate::platform::install_shim(&older.join("bin"), &ay, &l.shim(&ay)).unwrap();
         let home = synthetic_home("witness-mismatch");
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            !run_with(
+                &l,
+                Some(&home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "channel says 19, shims say 18 — structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1104,7 +1306,17 @@ mod tests {
         crate::store::mark_build_ready(&dir).unwrap();
         let home = synthetic_home("witness-absent");
         assert!(
-            run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            run_with(
+                &l,
+                Some(&home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "an un-witnessed program is advisory, not structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1119,7 +1331,17 @@ mod tests {
         // PATH without the managed bin/ → a warning, not a structural fail.
         let path = std::ffi::OsString::from("/usr/bin:/bin");
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
+            run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut std::io::sink(),
+                &mut std::io::sink()
+            ),
             "a PATH warning stays exit-0"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1156,7 +1378,8 @@ mod tests {
                     "invoked as {invoked}, no line may speak as {other}:\n{text}"
                 );
                 assert!(
-                    text.lines().all(|line| line.is_empty() || line.starts_with(invoked)),
+                    text.lines()
+                        .all(|line| line.is_empty() || line.starts_with(invoked)),
                     "every line is signed by the verb the user typed ({invoked}):\n{text}"
                 );
             }
@@ -1175,13 +1398,26 @@ mod tests {
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        assert!(!run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut out, &mut err));
+        assert!(!run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            None,
+            "doctor",
+            &mut out,
+            &mut err
+        ));
         let text = String::from_utf8_lossy(&out);
         assert!(
             text.contains("doctor: found 1 problem(s)"),
             "the verdict line keeps its bytes:\n{text}"
         );
-        let next: Vec<&str> = text.lines().filter(|l| l.starts_with("doctor: next — ")).collect();
+        let next: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("doctor: next — "))
+            .collect();
         assert_eq!(
             next,
             vec!["doctor: next — aterm pkg install --default-set"],

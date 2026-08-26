@@ -162,10 +162,7 @@ impl MenuRect {
     /// swallowed, not fall through to the terminal underneath.
     #[must_use]
     pub(crate) fn contains(&self, row: usize, col: usize) -> bool {
-        row >= self.row
-            && row < self.row + self.h
-            && col >= self.col
-            && col < self.col + self.w
+        row >= self.row && row < self.row + self.h && col >= self.col && col < self.col + self.w
     }
 }
 
@@ -346,10 +343,7 @@ pub(crate) fn action_at(
 /// The first selectable entry, for a keyboard open.
 #[must_use]
 pub(crate) fn first_selectable(entries: &[TabMenuEntry], limit: usize) -> Option<usize> {
-    entries
-        .iter()
-        .take(limit)
-        .position(is_selectable)
+    entries.iter().take(limit).position(is_selectable)
 }
 
 /// Step the highlight one selectable row in `down`'s direction, WRAPPING at the
@@ -488,7 +482,11 @@ fn menu_colors(theme: Theme) -> MenuColors {
         // unavailable, and AA-strength ink does not. 3:1 is the WCAG
         // non-text/large floor, so it stays perceivable rather than vanishing.
         disabled: chrome_band::ensure_contrast(label, card_bg, 3.0),
-        band: BandColors { label, value, ..band },
+        band: BandColors {
+            label,
+            value,
+            ..band
+        },
     }
 }
 
@@ -513,7 +511,9 @@ fn put_text(
         if let Some(slot) = row.get_mut(col) {
             *slot = chrome_band::cell(c, fg, bg, bold, false);
         }
-        if w == 2 && let Some(slot) = row.get_mut(col + 1) {
+        if w == 2
+            && let Some(slot) = row.get_mut(col + 1)
+        {
             let mut tail = chrome_band::cell(' ', fg, bg, bold, false);
             tail.wide = true;
             *slot = tail;
@@ -668,7 +668,14 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
                 peer_sid,
                 verb,
                 enabled,
-            } => (3u8, label.as_str(), peer_sid.as_str(), *verb as u8, *enabled).hash(&mut h),
+            } => (
+                3u8,
+                label.as_str(),
+                peer_sid.as_str(),
+                *verb as u8,
+                *enabled,
+            )
+                .hash(&mut h),
         }
     }
     rect.hash(&mut h);
@@ -714,7 +721,10 @@ mod tests {
     fn card_hangs_under_the_strip_at_the_clicked_column() {
         let m = model();
         let rect = place(&m, 7, 100, 30, 1).expect("a 100x30 frame hosts a menu");
-        assert_eq!(rect.row, 1, "the card starts on the first row BELOW the band");
+        assert_eq!(
+            rect.row, 1,
+            "the card starts on the first row BELOW the band"
+        );
         assert_eq!(rect.col, 7, "and its left edge is the clicked column");
         assert_eq!(rect.h, m.len() + 2, "every entry plus two border rows");
         assert!(rect.w >= "Rename Session\u{2026}".chars().count() + 4);
@@ -740,7 +750,11 @@ mod tests {
         assert_eq!(rect.h, 5, "clamped to the rows below the band");
         assert_eq!(visible_entries(rect), 3);
         assert_eq!(entry_at_row(rect, 4), Some(2), "the last shown entry");
-        assert_eq!(entry_at_row(rect, 5), None, "the bottom edge shows no entry");
+        assert_eq!(
+            entry_at_row(rect, 5),
+            None,
+            "the bottom edge shows no entry"
+        );
     }
 
     #[test]
@@ -799,7 +813,10 @@ mod tests {
         ] {
             assert!(rect.contains(r, cc), "({r},{cc}) is on the card");
         }
-        assert!(!rect.contains(rect.row + rect.h, rect.col), "one past is off");
+        assert!(
+            !rect.contains(rect.row + rect.h, rect.col),
+            "one past is off"
+        );
     }
 
     #[test]

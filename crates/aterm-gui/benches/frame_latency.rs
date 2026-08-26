@@ -816,7 +816,9 @@ fn verify_strip() -> BenchApp {
     );
     report(
         "strip_frame",
-        &format!("full arm Full on {WARM_FRAMES}/{WARM_FRAMES}, scoped arm Scoped on {scoped}/{WARM_FRAMES}"),
+        &format!(
+            "full arm Full on {WARM_FRAMES}/{WARM_FRAMES}, scoped arm Scoped on {scoped}/{WARM_FRAMES}"
+        ),
     );
     b
 }

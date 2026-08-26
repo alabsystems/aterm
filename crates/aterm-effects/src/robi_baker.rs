@@ -312,7 +312,11 @@ mod tests {
     fn every_pose_draws_a_robot() {
         for &id in ROBI_GLYPH_IDS {
             let is_ladder = ROBI_GLYPHS[id as usize].id == "robi_ladder";
-            let (w, h) = if is_ladder { (36u32, 24u32) } else { (52u32, 72u32) };
+            let (w, h) = if is_ladder {
+                (36u32, 24u32)
+            } else {
+                (52u32, 72u32)
+            };
             let tile = bake_pose(id, w, h);
             let px = tile.pixels();
             let mut opaque = 0usize;

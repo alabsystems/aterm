@@ -64,7 +64,11 @@ fn wasm_frame_gate(c: &mut Criterion) {
             g.bench_function(BenchmarkId::new("keystroke", &label), |b| {
                 b.iter(|| {
                     tick = tick.wrapping_add(1);
-                    t.process(if tick.is_multiple_of(2) { b"\rx" } else { b"\ry" });
+                    t.process(if tick.is_multiple_of(2) {
+                        b"\rx"
+                    } else {
+                        b"\ry"
+                    });
                     t.advance_effects(black_box(16.0));
                     t.render();
                     black_box(t.width());
@@ -79,7 +83,11 @@ fn wasm_frame_gate(c: &mut Criterion) {
                 b.iter(|| {
                     tick = tick.wrapping_add(1);
                     if tick.is_multiple_of(8) {
-                        t.process(if tick.is_multiple_of(16) { b"\rx" } else { b"\ry" });
+                        t.process(if tick.is_multiple_of(16) {
+                            b"\rx"
+                        } else {
+                            b"\ry"
+                        });
                     }
                     t.advance_effects(black_box(16.0));
                     t.render();

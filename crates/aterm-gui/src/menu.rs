@@ -2514,7 +2514,10 @@ mod tests {
                 super::InvokeAuthority::OwnerOnly,
                 "{a:?} mints standing authority — only the god token may invoke it"
             );
-            assert!(super::requires_terminal_tab(a), "{a:?} needs a focused session");
+            assert!(
+                super::requires_terminal_tab(a),
+                "{a:?} needs a focused session"
+            );
         }
     }
 

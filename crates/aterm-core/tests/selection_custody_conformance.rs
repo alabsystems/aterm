@@ -920,7 +920,10 @@ fn the_output_dedup_guard_does_not_leak_into_the_next_batch() {
 
     // Batch 2 lands on the SAME row. A leaked guard would suppress this mark.
     select_row_5(&mut term);
-    assert!(term.text_selection().has_selection(), "precondition: re-selected");
+    assert!(
+        term.text_selection().has_selection(),
+        "precondition: re-selected"
+    );
     term.process(b"\x1b[6;1Hsecond overwrite");
     assert!(
         !term.text_selection().has_selection(),

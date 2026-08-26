@@ -307,10 +307,7 @@ impl ColdTier {
     /// Returns an empty vec for an out-of-bounds `idx`.
     // Skip: the page lookup + decode path — same class as `get_line`.
     #[cfg_attr(trust_verify, trust::skip)]
-    pub(crate) fn take_lines_from(
-        &self,
-        idx: usize,
-    ) -> Result<Vec<Line>, super::ScrollbackError> {
+    pub(crate) fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, super::ScrollbackError> {
         if idx >= self.line_count {
             return Ok(Vec::new());
         }

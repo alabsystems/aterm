@@ -298,7 +298,11 @@ fn chrome_band_lift_paints_the_lip_above_the_grid() {
     let (img_w, img_h) = (2 * cw, ch + lift);
     let mut bytes = Vec::with_capacity(img_w * img_h * 4);
     for y in 0..img_h {
-        let rgba: [u8; 4] = if y < lift { [220, 30, 30, 255] } else { [30, 200, 30, 255] };
+        let rgba: [u8; 4] = if y < lift {
+            [220, 30, 30, 255]
+        } else {
+            [30, 200, 30, 255]
+        };
         for _ in 0..img_w {
             bytes.extend_from_slice(&rgba);
         }

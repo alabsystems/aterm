@@ -220,8 +220,11 @@ struct IUnknownRepr {
 #[repr(C)]
 #[allow(dead_code)] // layout-only slots: their offsets are load-bearing, not their use
 struct ICustomDestinationListVtbl {
-    query_interface:
-        unsafe extern "system" fn(*mut ICustomDestinationList, *const Guid, *mut *mut c_void) -> i32,
+    query_interface: unsafe extern "system" fn(
+        *mut ICustomDestinationList,
+        *const Guid,
+        *mut *mut c_void,
+    ) -> i32,
     add_ref: unsafe extern "system" fn(*mut ICustomDestinationList) -> u32,
     release: unsafe extern "system" fn(*mut ICustomDestinationList) -> u32,
     set_app_id: unsafe extern "system" fn(*mut ICustomDestinationList, *const u16) -> i32,
@@ -236,8 +239,11 @@ struct ICustomDestinationListVtbl {
     append_known_category: unsafe extern "system" fn(*mut ICustomDestinationList, i32) -> i32,
     add_user_tasks: unsafe extern "system" fn(*mut ICustomDestinationList, *mut c_void) -> i32,
     commit_list: unsafe extern "system" fn(*mut ICustomDestinationList) -> i32,
-    get_removed_destinations:
-        unsafe extern "system" fn(*mut ICustomDestinationList, *const Guid, *mut *mut c_void) -> i32,
+    get_removed_destinations: unsafe extern "system" fn(
+        *mut ICustomDestinationList,
+        *const Guid,
+        *mut *mut c_void,
+    ) -> i32,
     delete_list: unsafe extern "system" fn(*mut ICustomDestinationList, *const u16) -> i32,
     abort_list: unsafe extern "system" fn(*mut ICustomDestinationList) -> i32,
 }
@@ -256,8 +262,12 @@ struct IObjectCollectionVtbl {
     add_ref: unsafe extern "system" fn(*mut IObjectCollection) -> u32,
     release: unsafe extern "system" fn(*mut IObjectCollection) -> u32,
     get_count: unsafe extern "system" fn(*mut IObjectCollection, *mut u32) -> i32,
-    get_at:
-        unsafe extern "system" fn(*mut IObjectCollection, u32, *const Guid, *mut *mut c_void) -> i32,
+    get_at: unsafe extern "system" fn(
+        *mut IObjectCollection,
+        u32,
+        *const Guid,
+        *mut *mut c_void,
+    ) -> i32,
     add_object: unsafe extern "system" fn(*mut IObjectCollection, *mut c_void) -> i32,
     add_from_array: unsafe extern "system" fn(*mut IObjectCollection, *mut c_void) -> i32,
     remove_object_at: unsafe extern "system" fn(*mut IObjectCollection, u32) -> i32,
@@ -279,8 +289,7 @@ struct IShellLinkWVtbl {
         unsafe extern "system" fn(*mut IShellLinkW, *const Guid, *mut *mut c_void) -> i32,
     add_ref: unsafe extern "system" fn(*mut IShellLinkW) -> u32,
     release: unsafe extern "system" fn(*mut IShellLinkW) -> u32,
-    get_path:
-        unsafe extern "system" fn(*mut IShellLinkW, *mut u16, i32, *mut c_void, u32) -> i32,
+    get_path: unsafe extern "system" fn(*mut IShellLinkW, *mut u16, i32, *mut c_void, u32) -> i32,
     get_id_list: unsafe extern "system" fn(*mut IShellLinkW, *mut *mut c_void) -> i32,
     set_id_list: unsafe extern "system" fn(*mut IShellLinkW, *const c_void) -> i32,
     get_description: unsafe extern "system" fn(*mut IShellLinkW, *mut u16, i32) -> i32,
@@ -293,8 +302,7 @@ struct IShellLinkWVtbl {
     set_hotkey: unsafe extern "system" fn(*mut IShellLinkW, u16) -> i32,
     get_show_cmd: unsafe extern "system" fn(*mut IShellLinkW, *mut i32) -> i32,
     set_show_cmd: unsafe extern "system" fn(*mut IShellLinkW, i32) -> i32,
-    get_icon_location:
-        unsafe extern "system" fn(*mut IShellLinkW, *mut u16, i32, *mut i32) -> i32,
+    get_icon_location: unsafe extern "system" fn(*mut IShellLinkW, *mut u16, i32, *mut i32) -> i32,
     set_icon_location: unsafe extern "system" fn(*mut IShellLinkW, *const u16, i32) -> i32,
     set_relative_path: unsafe extern "system" fn(*mut IShellLinkW, *const u16, u32) -> i32,
     resolve: unsafe extern "system" fn(*mut IShellLinkW, isize, u32) -> i32,
@@ -316,11 +324,8 @@ struct IPropertyStoreVtbl {
     release: unsafe extern "system" fn(*mut IPropertyStore) -> u32,
     get_count: unsafe extern "system" fn(*mut IPropertyStore, *mut u32) -> i32,
     get_at: unsafe extern "system" fn(*mut IPropertyStore, u32, *mut PropertyKey) -> i32,
-    get_value: unsafe extern "system" fn(
-        *mut IPropertyStore,
-        *const PropertyKey,
-        *mut PropVariant,
-    ) -> i32,
+    get_value:
+        unsafe extern "system" fn(*mut IPropertyStore, *const PropertyKey, *mut PropVariant) -> i32,
     set_value: unsafe extern "system" fn(
         *mut IPropertyStore,
         *const PropertyKey,
@@ -401,7 +406,13 @@ unsafe fn co_create(clsid: &Guid, iid: &Guid, step: &'static str) -> Result<Com,
     // SAFETY: standard object creation; `ppv` receives the interface pointer
     // only on success, and a success with a null pointer is rejected.
     let hr = unsafe {
-        CoCreateInstance(clsid, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid, &mut ppv)
+        CoCreateInstance(
+            clsid,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            iid,
+            &mut ppv,
+        )
     };
     if hr < 0 || ppv.is_null() {
         return Err((step, hr));
@@ -551,7 +562,10 @@ unsafe fn build(exe: &[u16], attach: bool) -> Result<(), StepError> {
     // it silently attaches to the exe-path identity — visibly fine on the live
     // button, invisibly absent on the AUMID-stamped pinned tile.
     let aumid = wide(crate::win32::AUMID);
-    check(unsafe { (list_vt.set_app_id)(list_ptr, aumid.as_ptr()) }, "SetAppID")?;
+    check(
+        unsafe { (list_vt.set_app_id)(list_ptr, aumid.as_ptr()) },
+        "SetAppID",
+    )?;
 
     // BeginList opens the transaction and MUST hand back the removed-items
     // array. Tasks cannot be removed by the user (only destinations can), so
@@ -596,14 +610,7 @@ unsafe fn build(exe: &[u16], attach: bool) -> Result<(), StepError> {
             "AddObject",
         )?;
     }
-    let new_window = unsafe {
-        task(
-            exe,
-            "new-window",
-            "New Window",
-            "Open a new aterm window",
-        )?
-    };
+    let new_window = unsafe { task(exe, "new-window", "New Window", "Open a new aterm window")? };
     check(
         unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_window.0) },
         "AddObject",
@@ -611,7 +618,10 @@ unsafe fn build(exe: &[u16], attach: bool) -> Result<(), StepError> {
 
     // IObjectCollection inherits IObjectArray, so the collection pointer IS the
     // IObjectArray AddUserTasks wants — no QueryInterface detour needed.
-    check(unsafe { (list_vt.add_user_tasks)(list_ptr, tasks.0) }, "AddUserTasks")?;
+    check(
+        unsafe { (list_vt.add_user_tasks)(list_ptr, tasks.0) },
+        "AddUserTasks",
+    )?;
     // Commit publishes atomically; an error-path return before this point
     // abandons the transaction on release and the previously committed list
     // (if any) stays in force — the shell's documented AbortList-on-release.
@@ -637,7 +647,10 @@ unsafe fn task(exe: &[u16], args: &str, title: &str, tooltip: &str) -> Result<Co
     let link_ptr = link.0.cast::<IShellLinkW>();
     let link_vt = unsafe { &*(*link_ptr).vtbl };
 
-    check(unsafe { (link_vt.set_path)(link_ptr, exe.as_ptr()) }, "SetPath")?;
+    check(
+        unsafe { (link_vt.set_path)(link_ptr, exe.as_ptr()) },
+        "SetPath",
+    )?;
     let args_w = wide(args);
     check(
         unsafe { (link_vt.set_arguments)(link_ptr, args_w.as_ptr()) },
@@ -655,9 +668,8 @@ unsafe fn task(exe: &[u16], args: &str, title: &str, tooltip: &str) -> Result<Co
 
     let mut store_raw: *mut c_void = std::ptr::null_mut();
     let unk = link.0.cast::<IUnknownRepr>();
-    let hr = unsafe {
-        ((*(*unk).vtbl).query_interface)(link.0, &IID_IPROPERTY_STORE, &mut store_raw)
-    };
+    let hr =
+        unsafe { ((*(*unk).vtbl).query_interface)(link.0, &IID_IPROPERTY_STORE, &mut store_raw) };
     if hr < 0 || store_raw.is_null() {
         return Err(("QueryInterface IPropertyStore", hr));
     }
@@ -678,7 +690,10 @@ unsafe fn task(exe: &[u16], args: &str, title: &str, tooltip: &str) -> Result<Co
         unsafe { (store_vt.set_value)(store_ptr, &PKEY_TITLE, &variant) },
         "SetValue PKEY_Title",
     )?;
-    check(unsafe { (store_vt.commit)(store_ptr) }, "IPropertyStore::Commit")?;
+    check(
+        unsafe { (store_vt.commit)(store_ptr) },
+        "IPropertyStore::Commit",
+    )?;
     Ok(link)
 }
 

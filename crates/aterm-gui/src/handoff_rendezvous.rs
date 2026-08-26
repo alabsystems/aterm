@@ -543,11 +543,12 @@ fn prove_bound_socket_is_ours(dir: &Path, path: &Path) -> Result<(), String> {
     let dmeta = dir_handle
         .metadata()
         .map_err(|e| format!("rendezvous directory fstat: {e}"))?;
-    if !dmeta.file_type().is_dir() || dmeta.uid() != uid || dmeta.permissions().mode() & 0o022 != 0 {
+    if !dmeta.file_type().is_dir() || dmeta.uid() != uid || dmeta.permissions().mode() & 0o022 != 0
+    {
         return Err("rendezvous directory is not owned by this uid or is shared".to_string());
     }
-    let smeta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("rendezvous socket lstat: {e}"))?;
+    let smeta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("rendezvous socket lstat: {e}"))?;
     if !smeta.file_type().is_socket() || smeta.uid() != uid {
         return Err("rendezvous node is not a socket owned by this uid".to_string());
     }
@@ -582,7 +583,8 @@ fn sweep_dead_rendezvous(dir: &Path) {
             continue;
         }
         // SAFETY: kill(pid, 0) probes existence only; ESRCH means gone.
-        let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         if !alive {
             let _ = std::fs::remove_file(entry.path());
         }

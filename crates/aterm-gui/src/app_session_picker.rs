@@ -39,9 +39,7 @@ impl App {
             .into_iter()
             .filter(|h| h.sid != *subject)
             .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-            .filter(|h| {
-                matches!(intent, PickerIntent::Connect) || peers.contains(h.sid.as_str())
-            })
+            .filter(|h| matches!(intent, PickerIntent::Connect) || peers.contains(h.sid.as_str()))
             .map(|h| {
                 let title = h
                     .ctx
@@ -571,13 +569,16 @@ mod tests {
             Some(OverlayKind::SessionPicker)
         );
         let lines = app.windows[&wid].session_picker().unwrap().controls_lines();
-        assert!(!lines.iter().any(|l| l.contains(&format!("sid={}", sids[0].as_str()))
-            && l.contains("row")),
-            "the subject never lists itself: {lines:?}");
         assert!(
-            lines
+            !lines
                 .iter()
-                .any(|l| l.contains(&format!("sid={}", sids[2].as_str())) && l.contains("connected")),
+                .any(|l| l.contains(&format!("sid={}", sids[0].as_str())) && l.contains("row")),
+            "the subject never lists itself: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains(&format!("sid={}", sids[2].as_str())) && l.contains("connected")
+            ),
             "connected peers are annotated: {lines:?}"
         );
 
@@ -585,7 +586,9 @@ mod tests {
         let target = picker_row_ordinal(&app, wid, &sids[2]);
         app.session_picker_move(wid, target as isize);
         app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter));
-        let card = app.windows[&wid].conn_card().expect("selection opens the card");
+        let card = app.windows[&wid]
+            .conn_card()
+            .expect("selection opens the card");
         assert_eq!(card.src, sids[0]);
         assert_eq!(card.dst, sids[2]);
         // Prefilled from the live pair (Both exists already).
@@ -621,15 +624,17 @@ mod tests {
             app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Backspace));
         }
         assert!(
-            app.windows[&wid]
-                .session_picker()
-                .unwrap()
-                .controls_lines()[0]
-                .contains("shown=2")
+            app.windows[&wid].session_picker().unwrap().controls_lines()[0].contains("shown=2")
         );
         app.session_picker_input_event(wid, &key(aterm_types::keyboard::NamedKey::Escape));
-        assert!(app.windows[&wid].session_picker().is_none(), "Esc closed it");
-        assert!(app.connections.records().is_empty(), "closing minted nothing");
+        assert!(
+            app.windows[&wid].session_picker().is_none(),
+            "Esc closed it"
+        );
+        assert!(
+            app.connections.records().is_empty(),
+            "closing minted nothing"
+        );
     }
 
     /// `session.configure_connection` (id-invoked): one peer opens the sheet
@@ -659,7 +664,9 @@ mod tests {
         // SEVERAL peers: configure routes through the picker (never guesses).
         connect(&app, &sids[0], &sids[2]);
         app.open_connection_ui(wid, sids[0].clone(), MenuAction::ConfigureConnection);
-        let picker = app.windows[&wid].session_picker().expect("several ⇒ picker");
+        let picker = app.windows[&wid]
+            .session_picker()
+            .expect("several ⇒ picker");
         assert_eq!(picker.intent, PickerIntent::Configure);
         let lines = picker.controls_lines();
         assert!(lines[0].contains("rows=2"), "peers only: {lines:?}");
@@ -699,6 +706,9 @@ mod tests {
         assert!(app.open_session_picker(wid, sids[0].clone(), PickerIntent::Configure));
         let lines = app.windows[&wid].session_picker().unwrap().controls_lines();
         assert!(lines[0].contains("rows=2"));
-        assert!(lines.iter().skip(1).all(|l| l.contains("connected")), "{lines:?}");
+        assert!(
+            lines.iter().skip(1).all(|l| l.contains("connected")),
+            "{lines:?}"
+        );
     }
 }

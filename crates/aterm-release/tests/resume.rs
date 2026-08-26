@@ -21,9 +21,6 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -54,6 +51,9 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -474,9 +474,9 @@ fn the_lite_digest_round_trips_the_journal_and_rejects_corrupt_records() {
     assert_eq!(Journal::load(&path).unwrap().unwrap(), with_lite);
 
     for corrupt in [
-        "C6".repeat(32),                   // uppercase — not what this cutter writes
-        "c6".repeat(31),                   // short
-        format!("{}zz", "c6".repeat(31)),  // non-hex
+        "C6".repeat(32),                  // uppercase — not what this cutter writes
+        "c6".repeat(31),                  // short
+        format!("{}zz", "c6".repeat(31)), // non-hex
     ] {
         let mut bad = journal();
         bad.lite_dmg_sha256 = Some(corrupt.clone());
@@ -2823,8 +2823,14 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
         (vec!["cut", "--frobnicate"], "unknown cut flag"),
         (vec!["provision"], "--id"),
         (vec!["provision", "--id"], "needs a machine id"),
-        (vec!["provision", "--frobnicate", "m2"], "unknown provision flag"),
-        (vec!["provision", "--id", "m2", "--id", "m3"], "--id given twice"),
+        (
+            vec!["provision", "--frobnicate", "m2"],
+            "unknown provision flag",
+        ),
+        (
+            vec!["provision", "--id", "m2", "--id", "m3"],
+            "--id given twice",
+        ),
         // --set-version now REQUIRES the canonical three-component form;
         // the retired two-component spelling is just another malformed one.
         (vec!["cut", "--set-version", "0.26"], "MAJOR.MINOR.PATCH"),
@@ -2921,8 +2927,7 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
 /// take an acknowledgement and do nothing with it.
 #[test]
 fn the_pre_roster_stranding_flag_is_explicit_per_cut_and_never_silently_ignored() {
-    let cli::Cmd::Cut { opts, .. } =
-        parse(&["cut", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap()
+    let cli::Cmd::Cut { opts, .. } = parse(&["cut", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap()
     else {
         panic!("expected Cut");
     };
@@ -2937,7 +2942,10 @@ fn the_pre_roster_stranding_flag_is_explicit_per_cut_and_never_silently_ignored(
     // A RESUME may not carry it: the journal already fixed the key, and the flag would
     // be accepted and ignored. Refusing is the honest answer.
     let err = parse(&["cut", "--resume", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap_err();
-    assert!(err.contains("--resume combines with no other cut flag"), "{err}");
+    assert!(
+        err.contains("--resume combines with no other cut flag"),
+        "{err}"
+    );
     let err = parse(&[
         "cut",
         "--abandon",

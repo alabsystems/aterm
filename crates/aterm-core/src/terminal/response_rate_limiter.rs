@@ -38,8 +38,8 @@
 
 // aterm_time::Instant: std::time on native (byte-identical), JS clock on wasm32 where
 // Instant::now() panics. Must match the engine's other Instant seams (bell, transient).
-use std::time::Duration;
 use aterm_time::Instant;
+use std::time::Duration;
 
 /// Default refill rate in bytes/sec. 100 KiB/s is far above the peak
 /// legitimate response traffic (shell-startup probes are <1 KiB total)

@@ -285,9 +285,7 @@ fn reverified_root(
     }
     let walked = tree_root(incoming)?;
     if !walked.eq_ignore_ascii_case(&extracted_root) {
-        let mut msg = String::from(
-            "staged tree_root disagreement: the extraction folded ",
-        );
+        let mut msg = String::from("staged tree_root disagreement: the extraction folded ");
         msg.push_str(&extracted_root);
         msg.push_str(" but the on-disk walk read ");
         msg.push_str(&walked);
@@ -1151,7 +1149,10 @@ mod tests {
         let walked = tree_root(&probe).unwrap();
         // Reach guard: the corpus must be non-empty, or "they agree" is vacuous.
         assert_eq!(fused.len(), 64);
-        assert_eq!(fused, walked, "the two producers must agree over this bundle");
+        assert_eq!(
+            fused, walked,
+            "the two producers must agree over this bundle"
+        );
 
         // Disarmed: the fused root is returned verbatim, no walk.
         assert_eq!(
@@ -1164,8 +1165,14 @@ mod tests {
         let bogus = "0".repeat(64);
         let err = reverified_root(&probe, bogus.clone(), true).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains(&bogus), "the folded root must be named: {text}");
-        assert!(text.contains(&walked), "the walked root must be named: {text}");
+        assert!(
+            text.contains(&bogus),
+            "the folded root must be named: {text}"
+        );
+        assert!(
+            text.contains(&walked),
+            "the walked root must be named: {text}"
+        );
         let _ = std::fs::remove_dir_all(&b.dir);
     }
 

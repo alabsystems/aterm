@@ -1904,7 +1904,11 @@ mod tests {
             &[0, 0, 0, 0, 255, 255, 255, 255],
         ];
         let sdr_raw = padded_fixture(&sdr_rows, stride);
-        let sdr_enc = encoding(wgpu::TextureFormat::Rgba8Unorm, CaptureColorSpace::Srgb, 1.0);
+        let sdr_enc = encoding(
+            wgpu::TextureFormat::Rgba8Unorm,
+            CaptureColorSpace::Srgb,
+            1.0,
+        );
         // EDR: 2x2 RGBA16F scRGB with an above-1.0 highlight, half res (the
         // downsampling path exercises the decode table + premultiplied filter).
         let edr_pixels: Vec<u8> = [
@@ -1922,7 +1926,13 @@ mod tests {
             1.0,
         );
         for (label, raw, format, enc, half_res) in [
-            ("sdr", sdr_raw, wgpu::TextureFormat::Rgba8Unorm, sdr_enc, false),
+            (
+                "sdr",
+                sdr_raw,
+                wgpu::TextureFormat::Rgba8Unorm,
+                sdr_enc,
+                false,
+            ),
             (
                 "edr",
                 edr_raw,

@@ -238,8 +238,14 @@ mod bounded_lock_tests {
         let waited = started.elapsed();
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
-        assert!(waited >= Duration::from_millis(150), "gave up too early: {waited:?}");
-        assert!(waited < Duration::from_secs(5), "waited {waited:?}: it blocked");
+        assert!(
+            waited >= Duration::from_millis(150),
+            "gave up too early: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?}: it blocked"
+        );
 
         // And once the holder goes, the same call succeeds immediately.
         drop(held);
@@ -253,7 +259,8 @@ mod bounded_lock_tests {
     /// not introduce a poll-interval floor on the common case.
     #[test]
     fn acquire_within_is_immediate_when_the_lock_is_free() {
-        let dir = std::env::temp_dir().join(format!("aterm-bounded-lock-free-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aterm-bounded-lock-free-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("apply.lock");
         let started = Instant::now();

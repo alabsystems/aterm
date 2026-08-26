@@ -284,9 +284,9 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             Ok(Cmd::Verify { version })
         }
         "yank" => {
-            let build = it
-                .next()
-                .ok_or("yank needs the bad release's build number: targo --unverified ship yank <build>")?;
+            let build = it.next().ok_or(
+                "yank needs the bad release's build number: targo --unverified ship yank <build>",
+            )?;
             let build: u64 = build
                 .parse()
                 .map_err(|_| format!("yank: {build:?} is not a build number (u64)"))?;
@@ -340,7 +340,9 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     while let Some(flag) = it.next() {
         match flag {
             "--retire-unmirrored" => {
-                let v = it.next().ok_or("--retire-unmirrored needs a version (vX.Y.Z)")?;
+                let v = it
+                    .next()
+                    .ok_or("--retire-unmirrored needs a version (vX.Y.Z)")?;
                 retire_unmirrored = Some(normalize_version(v)?);
             }
             "--dry-run" => opts.dry_run = true,
@@ -498,7 +500,8 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
         .map_err(|e| Error::new(format!("failed to run git rev-parse --show-toplevel: {e}")))?;
     if !out.status.success() {
         return Err(Error::new(
-            "not inside a git checkout — run `targo --unverified ship` from the aterm workspace".to_string(),
+            "not inside a git checkout — run `targo --unverified ship` from the aterm workspace"
+                .to_string(),
         ));
     }
     let root = String::from_utf8_lossy(&out.stdout).trim().to_string();

@@ -63,8 +63,8 @@
 //!   and any divergence (the app drew a different glyph, or the cursor jumped) flushes
 //!   the whole set — so a wrong guess is corrected within one output burst.
 
-use std::time::Duration;
 use aterm_time::Instant;
+use std::time::Duration;
 
 /// How aggressively to DISPLAY predictions. Tracking happens regardless; this only
 /// gates what is painted. Parsed from the `predictive_echo` config string.

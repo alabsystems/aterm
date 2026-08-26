@@ -581,7 +581,9 @@ mod tests {
                 ProbeKind::response_sink(),
             )
             .is_some();
-            let compiled = PolicyGates::compile(Some(&eng)).response_sink().resolve(true);
+            let compiled = PolicyGates::compile(Some(&eng))
+                .response_sink()
+                .resolve(true);
             assert_eq!(
                 compiled, minted,
                 "compiled response-sink gate disagrees with the per-dispatch mint"
@@ -659,7 +661,6 @@ mod tests {
              would keep suppressing replies under no policy at all"
         );
     }
-
 
     /// AMB-1..4 AS A COUNT — the one thing the equivalence tests above cannot
     /// see.
@@ -829,7 +830,10 @@ mod tests {
         // The discriminating case, spelled out: `CSI 20 t = Execute` must open
         // Ps 20 and ONLY Ps 20.
         let mut state = PolicyState::new();
-        state.install(PolicyEngine::new(policy_with_rule("CSI 20 t", Response::Execute)));
+        state.install(PolicyEngine::new(policy_with_rule(
+            "CSI 20 t",
+            Response::Execute,
+        )));
         assert_eq!(state.xtwinops_gate(20), BridgeDecision::Allow);
         assert_eq!(state.xtwinops_gate(21), BridgeDecision::Fallback);
     }
@@ -874,7 +878,10 @@ mod tests {
         };
 
         let mut term = Terminal::new(24, 80);
-        assert!(!reports(&mut term), "no engine, legacy bool false: no report");
+        assert!(
+            !reports(&mut term),
+            "no engine, legacy bool false: no report"
+        );
 
         term.apply_policy_engine(PolicyEngine::new(policy_with_rule(
             "CSI t",
@@ -885,10 +892,7 @@ mod tests {
             "installing `CSI t = Execute` must open the gate immediately"
         );
 
-        term.apply_policy_engine(PolicyEngine::new(policy_with_rule(
-            "CSI t",
-            Response::Drop,
-        )));
+        term.apply_policy_engine(PolicyEngine::new(policy_with_rule("CSI t", Response::Drop)));
         assert!(
             !reports(&mut term),
             "swapping to Drop must shut it; a stale memo would keep leaking \
@@ -980,11 +984,17 @@ mod tests {
             BridgeDecision::Deny,
             "a multi-byte subcommand must reach a live evaluation"
         );
-        assert_eq!(state.shell_integration_gate(133, &upper), BridgeDecision::Fallback);
+        assert_eq!(
+            state.shell_integration_gate(133, &upper),
+            BridgeDecision::Fallback
+        );
 
         // An uncovered MAJOR likewise falls through to a live evaluation.
         let mut state = PolicyState::new();
-        state.install(PolicyEngine::new(policy_with_rule("OSC 1337", Response::Drop)));
+        state.install(PolicyEngine::new(policy_with_rule(
+            "OSC 1337",
+            Response::Drop,
+        )));
         let a: [&[u8]; 2] = [b"1337", b"A"];
         assert_eq!(state.shell_integration_gate(1337, &a), BridgeDecision::Deny);
     }
@@ -1206,7 +1216,10 @@ mod tests {
             RESPONSE_LIMIT_ID,
             0,
         )])));
-        assert!(!replies(&mut term), "re-installing the hard block must bite");
+        assert!(
+            !replies(&mut term),
+            "re-installing the hard block must bite"
+        );
 
         term.clear_policy_engine();
         assert!(

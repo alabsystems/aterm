@@ -28,9 +28,9 @@
 //! (macOS removed subpixel OS-wide; Windows has no aterm LCD story yet).
 
 use skrifa::{
+    FontRef, MetadataProvider,
     instance::{LocationRef, Size},
     outline::{DrawSettings, Engine, HintingInstance, HintingOptions, SmoothMode, Target},
-    FontRef, MetadataProvider,
 };
 
 use crate::hinted::PathPen;
@@ -151,7 +151,9 @@ pub(crate) fn subpixel_glyph_raster(
     // Pedantic OFF on the hinted path (a bytecode error degrades to the
     // unhinted outline, same as the grayscale seam).
     match hint {
-        Some(h) => outline.draw(DrawSettings::hinted(h, false), &mut pen).ok()?,
+        Some(h) => outline
+            .draw(DrawSettings::hinted(h, false), &mut pen)
+            .ok()?,
         None => outline
             .draw(
                 DrawSettings::unhinted(Size::new(px), LocationRef::default()),
@@ -228,7 +230,7 @@ pub(crate) fn subpixel_glyph_raster(
 #[cfg(all(test, feature = "embedded-font"))]
 mod tests {
     use super::*;
-    use crate::hinted::{unicode_gid, HintBank};
+    use crate::hinted::{HintBank, unicode_gid};
 
     fn dejavu() -> &'static [u8] {
         crate::embedded_font()

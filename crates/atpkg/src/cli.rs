@@ -70,7 +70,9 @@ const VERBS: &[&str] = &[
 const VERB_TIERS: &[(&str, &[&str])] = &[
     (
         "daily",
-        &["install", "list", "update", "doctor", "status", "which", "run"],
+        &[
+            "install", "list", "update", "doctor", "status", "which", "run",
+        ],
     ),
     (
         "occasional",
@@ -106,7 +108,13 @@ fn verb_tier_lines() -> Vec<String> {
             let shown: Vec<&str> = verbs
                 .iter()
                 .filter(|v| **v != "status")
-                .map(|v| if *v == "doctor" { "doctor (or: status)" } else { *v })
+                .map(|v| {
+                    if *v == "doctor" {
+                        "doctor (or: status)"
+                    } else {
+                        *v
+                    }
+                })
                 .collect();
             format!("atpkg:   {tier:<12} {}", shown.join(", "))
         })
@@ -468,10 +476,10 @@ fn pending_state_lines(layout: &crate::store::Layout, tool: &str) -> Vec<String>
                     (Some(p), Some(cur), true) => {
                         // `cur` came off disk: it is echoed only after its own
                         // ToolName round-trip (queue names are untrusted).
-                        let cur = crate::store::ToolName::new(cur)
-                            .map_or_else(|| "the current program".to_string(), |t| {
-                                t.as_str().to_string()
-                            });
+                        let cur = crate::store::ToolName::new(cur).map_or_else(
+                            || "the current program".to_string(),
+                            |t| t.as_str().to_string(),
+                        );
                         out.push(format!(
                             "atpkg: {name} was queued {} of {}; it is now BUMPED to \
                              install next, after {cur} finishes. Re-run it in a minute.",
@@ -704,8 +712,7 @@ fn bare_lines(counts: Option<(usize, usize)>) -> Vec<String> {
                 .to_string(),
         ),
         Some(_) => lines.push(
-            "atpkg: next: aterm pkg list — what you have · full manual: aterm help pkg"
-                .to_string(),
+            "atpkg: next: aterm pkg list — what you have · full manual: aterm help pkg".to_string(),
         ),
         None => {}
     }
@@ -909,7 +916,10 @@ fn run_list(layout: Option<crate::store::Layout>, human: bool) -> ExitCode {
     let mut pinned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (program, _) in &installed {
         if !linked.contains_key(program) && crate::linkmode::is_linked(&layout, program) {
-            linked.insert(program.clone(), crate::linkmode::linked_checkout(&layout, program));
+            linked.insert(
+                program.clone(),
+                crate::linkmode::linked_checkout(&layout, program),
+            );
         }
         if crate::pin::is_pinned(&layout, program) {
             pinned.insert(program.clone());
@@ -2754,9 +2764,8 @@ fn cmd_update_all() -> ExitCode {
     // destroyed the resume state and the next 6-hour tick refetched a multi-GB archive
     // from byte 0 (resume-across-passes survived only a process kill). Programs the pass
     // resolved nothing for are swept exactly as before; `atpkg gc` still reclaims all.
-    let report = crate::gc::run_keeping_pinned_partials(&layout, &|p| {
-        resolved_assets.get(p).cloned()
-    });
+    let report =
+        crate::gc::run_keeping_pinned_partials(&layout, &|p| resolved_assets.get(p).cloned());
     print_gc_sweeps("update", &report);
     print_gc_abstentions("update", &report);
     // Refresh the interactive-shell PATH hook at the CLI edge (§16), best-effort.
@@ -3167,14 +3176,9 @@ fn install_default_set_inner(
             .iter()
             .flat_map(|(_, missing)| missing.iter())
             .map(|m| {
-                let size = crate::flow::planned_artifact_size(
-                    fetcher,
-                    &index,
-                    ch,
-                    m,
-                    current_triple(),
-                )
-                .unwrap_or(0);
+                let size =
+                    crate::flow::planned_artifact_size(fetcher, &index, ch, m, current_triple())
+                        .unwrap_or(0);
                 (m.clone(), size)
             })
             .collect();
@@ -5565,7 +5569,10 @@ mod tests {
                 .split(|c: char| !(c.is_alphanumeric() || c == '-'))
                 .filter(|w| w == v)
                 .count();
-            assert_eq!(count, 1, "{v} must appear exactly once in the tier block:\n{block}");
+            assert_eq!(
+                count, 1,
+                "{v} must appear exactly once in the tier block:\n{block}"
+            );
         }
         assert!(
             block.contains("doctor (or: status)"),
@@ -5594,7 +5601,10 @@ mod tests {
                 "the stable head leads: {:?}",
                 lines[0]
             );
-            let nexts = lines.iter().filter(|l| l.starts_with("atpkg: next:")).count();
+            let nexts = lines
+                .iter()
+                .filter(|l| l.starts_with("atpkg: next:"))
+                .count();
             assert_eq!(
                 nexts,
                 usize::from(counts.is_some()),
@@ -5673,7 +5683,9 @@ mod tests {
         let lines = list_human_lines(&installed, &live, &none_linked, &none_pinned);
         assert_eq!(lines[0], "atpkg: 2 program(s) — 2 live");
         assert!(
-            lines.iter().any(|l| l.contains("(1 older build(s) kept for rollback)")),
+            lines
+                .iter()
+                .any(|l| l.contains("(1 older build(s) kept for rollback)")),
             "the superseded build survives as a count: {lines:?}"
         );
         assert!(
@@ -5681,10 +5693,12 @@ mod tests {
             "a healthy listing names no next act: {lines:?}"
         );
         // A program with builds on disk and nothing live is the row that needs doctor.
-        let dead_live: std::collections::BTreeMap<String, u64> =
-            [("ay".to_string(), 8256)].into();
+        let dead_live: std::collections::BTreeMap<String, u64> = [("ay".to_string(), 8256)].into();
         let lines = list_human_lines(&installed, &dead_live, &none_linked, &none_pinned);
-        assert_eq!(lines[0], "atpkg: 2 program(s) — 1 live, 1 without a live build");
+        assert_eq!(
+            lines[0],
+            "atpkg: 2 program(s) — 1 live, 1 without a live build"
+        );
         assert!(
             lines.iter().any(|l| l.contains("NO LIVE BUILD")),
             "the dead program is loud: {lines:?}"
@@ -5757,7 +5771,14 @@ mod tests {
             // Needles assembled at runtime so this test's own source (inside
             // cli.rs's include_str!) never contains them.
             for head in ["try: ", "run `", ": "] {
-                let needle = format!("{head}atpkg {}", if head == ": " { "install --default-set" } else { "" });
+                let needle = format!(
+                    "{head}atpkg {}",
+                    if head == ": " {
+                        "install --default-set"
+                    } else {
+                        ""
+                    }
+                );
                 assert!(
                     !source.contains(&needle),
                     "{file} still spells a remedy as `atpkg` ({needle:?}) — remedies say \
@@ -7094,7 +7115,10 @@ mod tests {
             ProvisionLane::Network,
             0,
         );
-        assert_eq!(out.failures, 0, "unserved is a correct state, not a failure");
+        assert_eq!(
+            out.failures, 0,
+            "unserved is a correct state, not a failure"
+        );
         let active = crate::active_builds(&layout);
         assert!(!active.contains_key("ay"), "no artifact, no install");
         assert_eq!(
@@ -7453,14 +7477,23 @@ mod tests {
     fn pending_not_started_names_the_next_act() {
         let l = temp_layout("pend-notstarted");
         let lines = pending_state_lines(&l, "trust");
-        assert!(lines[0].contains("trust:"), "leads with what the tool IS: {lines:?}");
         assert!(
-            lines.iter().any(|x| x.contains("nothing is installing right now")
-                && x.contains("open aterm")
-                && x.contains("aterm pkg update")),
+            lines[0].contains("trust:"),
+            "leads with what the tool IS: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|x| x.contains("nothing is installing right now")
+                    && x.contains("open aterm")
+                    && x.contains("aterm pkg update")),
             "the not-started state names its fixes: {lines:?}"
         );
-        assert_eq!(bump_contents(&l), "trust\n", "the wish is recorded for the next pass");
+        assert_eq!(
+            bump_contents(&l),
+            "trust\n",
+            "the wish is recorded for the next pass"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -7483,7 +7516,9 @@ mod tests {
             "overall progress renders: {lines:?}"
         );
         assert!(
-            lines.iter().any(|x| x.contains("downloading NOW") && x.contains("4.1 of 9.8 MB")),
+            lines
+                .iter()
+                .any(|x| x.contains("downloading NOW") && x.contains("4.1 of 9.8 MB")),
             "live MB from the snapshot: {lines:?}"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -7534,9 +7569,15 @@ mod tests {
             .iter()
             .find(|x| x.contains("FAILED"))
             .expect("the failure renders");
-        assert!(failed.contains("mirror said [2Jno"), "escapes stripped: {failed}");
+        assert!(
+            failed.contains("mirror said [2Jno"),
+            "escapes stripped: {failed}"
+        );
         assert!(!failed.contains('\u{1b}'), "no ESC byte reaches the TTY");
-        assert!(failed.contains("fix: aterm pkg update"), "every failure names its next act");
+        assert!(
+            failed.contains("fix: aterm pkg update"),
+            "every failure names its next act"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -7554,7 +7595,9 @@ mod tests {
         std::fs::write(l.progress_file(), stale).unwrap();
         let lines = pending_state_lines(&l, "trust");
         assert!(
-            lines.iter().any(|x| x.contains("nothing is installing right now")),
+            lines
+                .iter()
+                .any(|x| x.contains("nothing is installing right now")),
             "stale = not running: {lines:?}"
         );
         assert!(
@@ -7577,7 +7620,9 @@ mod tests {
         .unwrap();
         let lines = pending_state_lines(&l, "trust");
         assert!(
-            lines.iter().any(|x| x.contains("no longer part of the default set")),
+            lines
+                .iter()
+                .any(|x| x.contains("no longer part of the default set")),
             "{lines:?}"
         );
         assert!(
@@ -7594,7 +7639,10 @@ mod tests {
     fn pending_refuses_inadmissible_names() {
         let l = temp_layout("pend-refuse");
         let lines = pending_state_lines(&l, "../sudo");
-        assert_eq!(lines, vec!["atpkg: that is not an installable program name".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["atpkg: that is not an installable program name".to_string()]
+        );
         assert_eq!(bump_contents(&l), "");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -7619,7 +7667,11 @@ mod tests {
         for bump in [
             vec![],
             vec!["ty".to_string()],
-            vec!["nonsense".to_string(), "trust-cg".to_string(), "ty".to_string()],
+            vec![
+                "nonsense".to_string(),
+                "trust-cg".to_string(),
+                "ty".to_string(),
+            ],
             vec!["ay".to_string(), "ay".to_string()],
         ] {
             let mut sorted = original.clone();
@@ -7662,7 +7714,11 @@ mod tests {
         );
         assert_eq!(
             plan[0].1,
-            vec!["trust".to_string(), "trust-cg".to_string(), "trust-ir".to_string()],
+            vec![
+                "trust".to_string(),
+                "trust-cg".to_string(),
+                "trust-ir".to_string()
+            ],
             "membership untouched — activation stays all-or-nothing"
         );
     }

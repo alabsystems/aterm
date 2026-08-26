@@ -690,7 +690,9 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            eprintln!("aterm: unknown update sub-command {other:?} (usage: aterm update [status|check])");
+            eprintln!(
+                "aterm: unknown update sub-command {other:?} (usage: aterm update [status|check])"
+            );
             ExitCode::from(2)
         }
     }
@@ -722,7 +724,10 @@ fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
         } else {
             st.failing_checks_kind.as_str()
         };
-        println!("  failing checks: {} consecutive ({kind})", st.failing_checks);
+        println!(
+            "  failing checks: {} consecutive ({kind})",
+            st.failing_checks
+        );
     }
     if st.failing_applies > 0 {
         println!(
@@ -818,7 +823,10 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--window", "open the GPU window explicitly"),
     ("--session", "force the transparent shell session"),
     ("--headless", "engine + control socket, no window"),
-    ("--containment", "containment mode (master|user|safety|containment)"),
+    (
+        "--containment",
+        "containment mode (master|user|safety|containment)",
+    ),
     ("--sandbox", "shorthand for --containment containment"),
     ("--no-sandbox", "shorthand for --containment user"),
     ("--quiet", "suppress the interactive startup notice"),

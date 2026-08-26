@@ -79,9 +79,14 @@ pub const SEED_DIR_NAME: &str = "toolchain-seed.lproj";
 /// candidate from it, and reporting one would let the status surface out-run
 /// the proof.
 fn holds_signed_registry(dir: &Path) -> bool {
-    ["index.toml", "index.toml.sig", "aterm-machines.toml", "aterm-machines.toml.sig"]
-        .iter()
-        .all(|f| dir.join(f).is_file())
+    [
+        "index.toml",
+        "index.toml.sig",
+        "aterm-machines.toml",
+        "aterm-machines.toml.sig",
+    ]
+    .iter()
+    .all(|f| dir.join(f).is_file())
 }
 
 /// Resolve the bundled seed registry, if this executable ships one.

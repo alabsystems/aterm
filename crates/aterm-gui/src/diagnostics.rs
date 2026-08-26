@@ -281,7 +281,6 @@ fn keybinding_row_warning(
     })
 }
 
-
 /// Semantic checks that require no filesystem, platform service, or ambient
 /// capability. Keeping this subset separate lets the config editor stay pure
 /// and responsive while sharing the exact keybinding/sequence and palette
@@ -3054,17 +3053,18 @@ ink = "rainbow"
             joined.contains("trail_sound_style") && joined.contains("glas bel"),
             "typo'd typing sound must be flagged: {joined}"
         );
-        for ok in crate::prefs::TRAIL_SOUND_STYLES
-            .iter()
-            .copied()
-            .chain(["Glass Bell", "water", "mech", "thock", "raindrop", " felt "])
-        {
-            let clean = validate_config_text(&format!("trail_sound_style = \"{ok}\"\n"))
-                .expect("valid");
+        for ok in crate::prefs::TRAIL_SOUND_STYLES.iter().copied().chain([
+            "Glass Bell",
+            "water",
+            "mech",
+            "thock",
+            "raindrop",
+            " felt ",
+        ]) {
+            let clean =
+                validate_config_text(&format!("trail_sound_style = \"{ok}\"\n")).expect("valid");
             assert!(
-                clean
-                    .iter()
-                    .all(|w| !w.contains("is not a typing sound")),
+                clean.iter().all(|w| !w.contains("is not a typing sound")),
                 "{ok:?} must validate green: {clean:?}"
             );
         }
@@ -3191,7 +3191,10 @@ ink = "rainbow"
         }
         #[cfg(not(target_os = "macos"))]
         {
-            assert!(out.contains("built-in default keybindings"), "builtin header");
+            assert!(
+                out.contains("built-in default keybindings"),
+                "builtin header"
+            );
             // The section is GENERATED from the seed table, so every seeded
             // chord and action is documented — drift is structurally impossible,
             // and this asserts the generation stays wired.

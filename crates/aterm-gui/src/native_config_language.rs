@@ -645,7 +645,15 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: FONT_HINTINGS,
         }),
-        &["hint", "grid", "autohinter", "crisp", "linux", "windows", "stem"],
+        &[
+            "hint",
+            "grid",
+            "autohinter",
+            "crisp",
+            "linux",
+            "windows",
+            "stem",
+        ],
         true,
     ),
     manual(
@@ -5386,10 +5394,7 @@ expect_nonce = "pin"
         assert!(help_for("trail_sounds").contains("audio playback is macOS-only"));
         assert!(help_for("columns").contains("default 80"));
         assert!(help_for("lines").contains("default 24"));
-        assert!(
-            help_for("confirm_multiline_paste")
-                .contains("live on every platform")
-        );
+        assert!(help_for("confirm_multiline_paste").contains("live on every platform"));
         assert!(
             help_for("allow_notifications")
                 .contains("desktop delivery is implemented on macOS and Windows")

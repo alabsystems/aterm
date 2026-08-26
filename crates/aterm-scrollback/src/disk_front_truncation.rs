@@ -73,7 +73,9 @@ impl DiskColdTier {
         // Amortized O(1): compaction rewrites O(live_bytes), but only fires
         // after accumulating dead_bytes > live_bytes, so each byte is rewritten
         // at most once per full rotation of the scrollback.
-        if self.file.is_some() && !self.live_index().is_empty() && self.dead_bytes() > self.live_bytes()
+        if self.file.is_some()
+            && !self.live_index().is_empty()
+            && self.dead_bytes() > self.live_bytes()
         {
             // Compaction failure is non-fatal — file works fine with dead space.
             let _ = self.compact();

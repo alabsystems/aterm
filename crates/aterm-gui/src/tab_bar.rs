@@ -41,16 +41,16 @@ use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_render::Theme;
 
+/// The connection-mark role (design §4), re-exported beside the icon kind for the
+/// same reason: both renderers consume one typed vocabulary defined on the tab
+/// model, so the strips cannot drift on what a mark means.
+pub(crate) use crate::tab_model::TabConnRole;
 /// The four first-party *non-terminal* tab application identities. The type lives
 /// beside `TabPresentation`, so a terminal is structurally `None` before either
 /// chrome renderer sees it. Every renderer consumes the same code-native primitive
 /// geometry below; no installed icon font, Unicode symbol, or external asset can
 /// change what an aterm app tab means.
 pub(crate) use crate::tab_model::TabIconKind;
-/// The connection-mark role (design §4), re-exported beside the icon kind for the
-/// same reason: both renderers consume one typed vocabulary defined on the tab
-/// model, so the strips cannot drift on what a mark means.
-pub(crate) use crate::tab_model::TabConnRole;
 
 /// Canonical non-title presentation metadata consumed by both tab-strip renderers.
 /// Titles remain separate because terminal titles are live OSC state; these fields are
@@ -204,7 +204,9 @@ pub(crate) enum TabIconPrimitive {
     /// IR's only filled polygon: `Dot` cannot point and `RoundedRect` only
     /// strokes, so a solid arrow was inexpressible before this. Hollow
     /// triangles remain compositions of `Line` (the attention-diamond idiom).
-    Triangle { points: [[f32; 2]; 3] },
+    Triangle {
+        points: [[f32; 2]; 3],
+    },
 }
 
 pub(crate) const TAB_ICON_DESIGN_SIZE: f32 = 16.0;
@@ -653,8 +655,7 @@ fn tab_content_layout(seg: &TabSegment, metadata: TabStripMetadata) -> TabConten
     // identity instead: under pressure every distinguishing character
     // outranks a pad.
     let pad = u16::from(
-        STRIP_CHIP_CARDS
-            && seg.end_col.saturating_sub(seg.start_col) >= PREFERRED_MIN_TAB_COLS,
+        STRIP_CHIP_CARDS && seg.end_col.saturating_sub(seg.start_col) >= PREFERRED_MIN_TAB_COLS,
     );
     let leading = seg.start_col.saturating_add(1 + pad);
     let mut title_end = match seg.close_col {
@@ -1908,7 +1909,13 @@ fn paint_strip_impl(
     // `take`n per segment below; a tab this pass skipped (solo, renaming, or a
     // platform with no band) computes its label the shipped way.
     let mut labels = if STRIP_DISTINCT_LABELS {
-        distinct_chip_labels(segments, titles, metadata, active, paint.rename.map(|edit| edit.tab))
+        distinct_chip_labels(
+            segments,
+            titles,
+            metadata,
+            active,
+            paint.rename.map(|edit| edit.tab),
+        )
     } else {
         Vec::new()
     };
@@ -1928,9 +1935,9 @@ fn paint_strip_impl(
         // tone) so the target reads across window boundaries where the OS
         // cursor alone is ambiguous. Purely paint: hit geometry is untouched.
         let drop = match seg.kind {
-            TabHit::Select(i) => {
-                metadata.and_then(|items| items.get(i)).is_some_and(|item| item.drop_target)
-            }
+            TabHit::Select(i) => metadata
+                .and_then(|items| items.get(i))
+                .is_some_and(|item| item.drop_target),
             _ => false,
         };
         let tab_role = if drop {
@@ -1996,7 +2003,11 @@ fn paint_strip_impl(
                 } else {
                     StripRole::Inactive
                 };
-                let title_role = if drop { StripRole::Update } else { StripRole::Title };
+                let title_role = if drop {
+                    StripRole::Update
+                } else {
+                    StripRole::Title
+                };
                 for c in seg.start_col..seg.end_col {
                     put(row, c, ' ', band_role);
                 }
@@ -2063,13 +2074,12 @@ fn paint_strip_impl(
                 // — `hit_test` still answers `Select(i)` for the column, so the
                 // click target never shrinks. A card compressed below two cells
                 // keeps both cells (an invisible tab is worse than a fused one).
-                let card_start = if STRIP_CHIP_CARDS
-                    && seg.end_col.saturating_sub(seg.start_col) >= 2
-                {
-                    seg.start_col + 1
-                } else {
-                    seg.start_col
-                };
+                let card_start =
+                    if STRIP_CHIP_CARDS && seg.end_col.saturating_sub(seg.start_col) >= 2 {
+                        seg.start_col + 1
+                    } else {
+                        seg.start_col
+                    };
                 for c in seg.start_col..card_start {
                     put(row, c, ' ', StripRole::Inactive);
                 }
@@ -2158,13 +2168,10 @@ fn paint_strip_impl(
                     // keep the tail that distinguishes this tab from its
                     // neighbours. Solo/renaming tabs (and the platforms with no
                     // band) compute the shipped head-truncation here.
-                    let label = labels
-                        .get_mut(i)
-                        .and_then(Option::take)
-                        .unwrap_or_else(|| {
-                            let avail = layout.title_end.saturating_sub(layout.title_start);
-                            truncate_title(raw, avail as usize)
-                        });
+                    let label = labels.get_mut(i).and_then(Option::take).unwrap_or_else(|| {
+                        let avail = layout.title_end.saturating_sub(layout.title_start);
+                        truncate_title(raw, avail as usize)
+                    });
                     // DISPLAY cells: a width-2 char takes a lead + continuation
                     // pair and one that would straddle `title_end` is dropped
                     // whole, so a title can never bleed into the status canvas,
@@ -3024,9 +3031,9 @@ fn distinct_chip_labels(
         // title, so their min slices safely even when the cluster's shared
         // head and shared tail overlap on a short member.
         let head = &core[..prefix.min(core.len())];
-        let boundary = head
-            .rfind(char::is_whitespace)
-            .map_or(head.len(), |p| p + head[p..].chars().next().map_or(1, char::len_utf8));
+        let boundary = head.rfind(char::is_whitespace).map_or(head.len(), |p| {
+            p + head[p..].chars().next().map_or(1, char::len_utf8)
+        });
         let remainder = &core[boundary..];
         // The cluster members OTHER than this one, by title — what the survivor
         // check measures this label's furniture against, and what the ordinal's
@@ -3043,23 +3050,19 @@ fn distinct_chip_labels(
         let twins = members.iter().filter(|&&m| titles[m] == titles[i]).count();
         if twins >= 2 && i != active {
             labels[i] = Some(ordinal_chip_label(
-                i,
-                &titles[i],
-                core,
-                remainder,
-                avail,
-                &siblings,
+                i, &titles[i], core, remainder, avail, &siblings,
             ));
             continue;
         }
-        let label = if !remainder.is_empty()
-            && strip_display_cells(remainder) <= avail.saturating_sub(1)
-        {
-            format!("…{remainder}")
-        } else {
-            truncate_title_tail(core, avail)
-        };
-        labels[i] = Some(furniture_survivor_recut(&titles[i], &siblings, avail, label));
+        let label =
+            if !remainder.is_empty() && strip_display_cells(remainder) <= avail.saturating_sub(1) {
+                format!("…{remainder}")
+            } else {
+                truncate_title_tail(core, avail)
+            };
+        labels[i] = Some(furniture_survivor_recut(
+            &titles[i], &siblings, avail, label,
+        ));
     }
     // ONE DIALECT PER STRIP under pressure: a flipped cluster beside a
     // head-cut loner mixes `…oml` with `REA…` in windows too small for either
@@ -3629,11 +3632,7 @@ pub(crate) mod pixel_band {
                     fallback.push((seg.start_col, end));
                 }
                 TabHit::Select(i) => {
-                    if input
-                        .paint
-                        .rename
-                        .is_some_and(|edit| edit.tab == i)
-                    {
+                    if input.paint.rename.is_some_and(|edit| edit.tab == i) {
                         // The inline rename WELL (field, caret, ‹› markers, IME
                         // preedit splice) stays the shipped cell machinery.
                         fallback.push((seg.start_col, end));
@@ -3651,7 +3650,8 @@ pub(crate) mod pixel_band {
                     // draws that string; it never re-cuts it (the ACTIVE chip's
                     // glyph-level fit is the one exception, and the repair
                     // exempts the active label anyway — [`fit_labels_distinctly`]).
-                    let label: String = labels.get_mut(i).and_then(Option::take).unwrap_or_default();
+                    let label: String =
+                        labels.get_mut(i).and_then(Option::take).unwrap_or_default();
                     if !crate::tray_raster::strip_band_run_coverable(&label) {
                         fallback.push((seg.start_col, end));
                         continue;
@@ -3796,9 +3796,8 @@ pub(crate) mod pixel_band {
                                 // never saw can hand two chips one string.
                                 // Centred by the SAME measure the pen draws
                                 // with, so alignment and paint cannot drift.
-                                let width = crate::tray_raster::ui_text_width_for(
-                                    face, &label, label_px,
-                                );
+                                let width =
+                                    crate::tray_raster::ui_text_width_for(face, &label, label_px);
                                 let x = ((span_px - width) * 0.5).max(0.0) + x0;
                                 prims.push(DrawPrim::ClipPush {
                                     x: x0,
@@ -3883,10 +3882,7 @@ pub(crate) mod pixel_band {
                                 w: side,
                                 h: side,
                                 radius: design.radius.min(side * 0.5),
-                                fill: rgba(
-                                    if hot { colors.hover_bg } else { colors.chip_bg },
-                                    255,
-                                ),
+                                fill: rgba(if hot { colors.hover_bg } else { colors.chip_bg }, 255),
                                 blur: false,
                             });
                         }
@@ -4316,9 +4312,7 @@ pub(crate) mod pixel_band {
             .map(|entry| {
                 (
                     entry.tab,
-                    fit_label(entry.text.clone(), entry.span_px, |s| {
-                        measure(entry.tab, s)
-                    }),
+                    fit_label(entry.text.clone(), entry.span_px, |s| measure(entry.tab, s)),
                 )
             })
             .collect();
@@ -4354,8 +4348,8 @@ pub(crate) mod pixel_band {
             // to an ordinal the cell pass had already resolved (`10` at a span
             // that seats one glyph), which would undo the twins' answer on the
             // only lane that paints.
-            let lost = label_says_nothing(&fitted[n].1)
-                || taken.iter().any(|other| *other == fitted[n].1);
+            let lost =
+                label_says_nothing(&fitted[n].1) || taken.iter().any(|other| *other == fitted[n].1);
             if !lost {
                 taken.push(fitted[n].1.clone());
                 continue;
@@ -4879,11 +4873,7 @@ pub(crate) mod pixel_band {
             let ImageFormat::RawRgba8 { width, height } = image.format else {
                 panic!("the band is a RawRgba8 raster");
             };
-            (
-                image.bytes.clone(),
-                usize::from(width),
-                usize::from(height),
-            )
+            (image.bytes.clone(), usize::from(width), usize::from(height))
         }
 
         /// Inked bounding box `(x0, y0, x1, y1)` (exclusive) over `[px0, px1)`.
@@ -4923,7 +4913,11 @@ pub(crate) mod pixel_band {
             surfaces: &[[u8; 3]],
         ) -> Option<(usize, usize, usize, usize)> {
             let far = |px: &[u8], s: &[u8; 3]| {
-                px[0].abs_diff(s[0]).max(px[1].abs_diff(s[1])).max(px[2].abs_diff(s[2])) > 40
+                px[0]
+                    .abs_diff(s[0])
+                    .max(px[1].abs_diff(s[1]))
+                    .max(px[2].abs_diff(s[2]))
+                    > 40
             };
             let mut bbox: Option<(usize, usize, usize, usize)> = None;
             for y in 0..h {
@@ -4982,7 +4976,11 @@ pub(crate) mod pixel_band {
             let rows = raster_band(&input, &[]).expect("UI faces installed ⇒ a band");
             assert_eq!(rows.len(), 1, "one ref list per strip row");
             let cols: Vec<usize> = rows[0].iter().map(|(c, _)| *c).collect();
-            assert_eq!(cols, (0..80).collect::<Vec<_>>(), "every column covered, sorted");
+            assert_eq!(
+                cols,
+                (0..80).collect::<Vec<_>>(),
+                "every column covered, sorted"
+            );
             let first = &rows[0][0].1.image;
             assert!(
                 rows[0].iter().all(|(_, r)| Arc::ptr_eq(&r.image, first)),
@@ -5033,9 +5031,8 @@ pub(crate) mod pixel_band {
             // optical centre.
             let colors = strip_colors_with_active(Theme::default(), None);
             let surfaces = [colors.band_bg, colors.active_bg, colors.chip_bg];
-            let (x0, y0, x1, y1) =
-                ink_bbox_off_surfaces(&rgba, w, h, span.0, span.1, &surfaces)
-                    .expect("the active title inks its span");
+            let (x0, y0, x1, y1) = ink_bbox_off_surfaces(&rgba, w, h, span.0, span.1, &surfaces)
+                .expect("the active title inks its span");
             assert!(
                 x0 >= span.0 && x1 <= span.1,
                 "ink stays in span: {x0}..{x1} vs {span:?}"
@@ -5083,7 +5080,10 @@ pub(crate) mod pixel_band {
             let edited = segments[0];
             let covered: Vec<usize> = rows[0].iter().map(|(c, _)| *c).collect();
             for col in usize::from(edited.start_col)..usize::from(edited.end_col) {
-                assert!(!covered.contains(&col), "col {col} belongs to the rename well");
+                assert!(
+                    !covered.contains(&col),
+                    "col {col} belongs to the rename well"
+                );
             }
             let other = segments[1];
             assert!(covered.contains(&usize::from(other.start_col + 1)));
@@ -5109,7 +5109,10 @@ pub(crate) mod pixel_band {
             // under a pixel segment is dropped (the band bakes those itself).
             let icon = Arc::new(ImageData {
                 bytes: vec![0; 4],
-                format: ImageFormat::RawRgba8 { width: 1, height: 1 },
+                format: ImageFormat::RawRgba8 {
+                    width: 1,
+                    height: 1,
+                },
                 cols: 1,
                 rows: 1,
                 z_index: 0,
@@ -5135,11 +5138,22 @@ pub(crate) mod pixel_band {
                     .find(|(c, _)| *c == usize::from(col))
                     .map(|(_, r)| Arc::ptr_eq(&r.image, &icon))
             };
-            assert_eq!(find(kept_col), Some(true), "fallback segment keeps its icon");
-            assert_eq!(find(dropped_col), Some(false), "pixel segment is band-covered");
+            assert_eq!(
+                find(kept_col),
+                Some(true),
+                "fallback segment keeps its icon"
+            );
+            assert_eq!(
+                find(dropped_col),
+                Some(false),
+                "pixel segment is band-covered"
+            );
             let mut sorted = rows[0].iter().map(|(c, _)| *c).collect::<Vec<_>>();
             sorted.dedup();
-            assert!(sorted.windows(2).all(|p| p[0] < p[1]), "refs stay sorted by column");
+            assert!(
+                sorted.windows(2).all(|p| p[0] < p[1]),
+                "refs stay sorted by column"
+            );
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
@@ -5396,8 +5410,7 @@ pub(crate) mod pixel_band {
                 .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
                 .collect();
             let metadata = plain(titles.len());
-            let segments =
-                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let segments = layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
             let cell: Vec<String> =
                 distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
                     .into_iter()
@@ -5428,14 +5441,16 @@ pub(crate) mod pixel_band {
             let naive: Vec<String> = entries
                 .iter()
                 .map(|entry| {
-                    fit_label(entry.text.clone(), entry.span_px, |s| wide_face(entry.tab, s))
+                    fit_label(entry.text.clone(), entry.span_px, |s| {
+                        wide_face(entry.tab, s)
+                    })
                 })
                 .collect();
             assert!(
-                naive.iter().enumerate().any(|(a, x)| naive
+                naive
                     .iter()
                     .enumerate()
-                    .any(|(b, y)| a != b && x == y)),
+                    .any(|(a, x)| naive.iter().enumerate().any(|(b, y)| a != b && x == y)),
                 "fixture: the naive per-chip fit must collide, else this test \
                  proves nothing: {naive:?}"
             );
@@ -5686,8 +5701,7 @@ pub(crate) mod pixel_band {
                 .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
                 .collect();
             let metadata = plain(titles.len());
-            let segments =
-                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let segments = layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
             let cell: Vec<String> =
                 distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
                     .into_iter()
@@ -5763,8 +5777,7 @@ pub(crate) mod pixel_band {
                 .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
                 .collect();
             let metadata = plain(titles.len());
-            let segments =
-                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let segments = layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
             let paint = StripPaint {
                 rename: Some(StripRenameField {
                     tab: 2,
@@ -5831,7 +5844,11 @@ pub(crate) mod pixel_band {
                     geometry(80, 1),
                 )
             };
-            assert_eq!(input.selected(), 1, "the layout's selection is the last chip");
+            assert_eq!(
+                input.selected(),
+                1,
+                "the layout's selection is the last chip"
+            );
             // A label size well past the mono cell, so the fit bites on any
             // host face rather than only on a wide one.
             let big = 30.0;
@@ -5898,8 +5915,7 @@ pub(crate) mod pixel_band {
                 .map(|leaf| format!("WMWM: ~/WWWWWWWWWW{leaf}"))
                 .collect();
             let metadata = plain(titles.len());
-            let segments =
-                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let segments = layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
             let geometry = geometry(80, 1);
             let label_px = band_label_px((BAND_TOP + CELL_H) as f32, 1.0);
             let cell: Vec<String> =
@@ -6219,15 +6235,9 @@ pub(crate) mod pixel_band {
                 usize::from(plus.end_col) * CELL_W,
             );
             let colors = strip_colors_with_active(Theme::default(), None);
-            let (x0, y0, x1, y1) = ink_bbox_off_surfaces(
-                &rgba,
-                w,
-                h,
-                px0,
-                px1,
-                &[colors.band_bg, colors.chip_bg],
-            )
-            .expect("the + inks its segment");
+            let (x0, y0, x1, y1) =
+                ink_bbox_off_surfaces(&rgba, w, h, px0, px1, &[colors.band_bg, colors.chip_bg])
+                    .expect("the + inks its segment");
             let seg_mid = (px0 + px1) as f32 / 2.0;
             let ink_mid = (x0 + x1) as f32 / 2.0;
             assert!(
@@ -6261,7 +6271,13 @@ pub(crate) mod pixel_band {
             let seam_top = BAND_TOP + CELL_H - 4;
             let mut geometry = geometry(80, 1);
             geometry.seam_top_px = Some(seam_top);
-            let input = band(&segments, &titles, &metadata, StripPaint::default(), geometry);
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
             let rows = raster_band(&input, &[]).expect("band");
             let (rgba, w, h) = image_of(&rows);
             let colors = strip_colors_with_active(Theme::default(), None);
@@ -6304,7 +6320,10 @@ pub(crate) mod pixel_band {
             [(19, 13, 10), (17, 15, 12), (13, 19, 15), (9, 23, 18)];
 
         /// A one-window band at `(band_top, cell_h, underline_y)`.
-        fn win_geometry(cols: usize, (band_top, cell_h, underline_y): (usize, usize, usize)) -> BandGeometry {
+        fn win_geometry(
+            cols: usize,
+            (band_top, cell_h, underline_y): (usize, usize, usize),
+        ) -> BandGeometry {
             BandGeometry {
                 cols,
                 cell_w: CELL_W,
@@ -6339,8 +6358,13 @@ pub(crate) mod pixel_band {
                 // true optical extent rather than an x-height band.
                 let titles = vec!["Apply".to_string(), "gypsy".to_string()];
                 let geometry = win_geometry(80, win);
-                let input =
-                    band(&segments, &titles, &metadata, StripPaint::default(), geometry);
+                let input = band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry,
+                );
                 let rows = raster_band(&input, &[]).expect("band");
                 let (rgba, w, h) = image_of(&rows);
                 assert_eq!(
@@ -6416,7 +6440,13 @@ pub(crate) mod pixel_band {
             let segments = layout_segments_with_metadata(90, 3, &metadata, 0, false);
             let titles = vec!["one".to_string(), "two".to_string(), "three".to_string()];
             let geometry = win_geometry(90, win);
-            let input = band(&segments, &titles, &metadata, StripPaint::default(), geometry);
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
             let rows = raster_band(&input, &[]).expect("band");
             let (rgba, w, h) = image_of(&rows);
             let label_px = band_label_px(h as f32, 1.0);
@@ -6434,7 +6464,11 @@ pub(crate) mod pixel_band {
             {
                 let (x0, x1) = card(seg);
                 let mid_x = (x0 + x1) / 2;
-                let fill = if i == 0 { colors.active_bg } else { colors.chip_bg };
+                let fill = if i == 0 {
+                    colors.active_bg
+                } else {
+                    colors.chip_bg
+                };
                 // The card's own surface, sampled ABOVE the label's own rows and
                 // clear of the corner radius.
                 let inside = px_at(&rgba, w, mid_x, (d.card_top as usize) + 2);
@@ -6509,15 +6543,9 @@ pub(crate) mod pixel_band {
                 .expect("an 80-col two-tab strip keeps its +");
             // A point on the button's square but OFF the glyph's own strokes:
             // a quarter of the way in from the square's left edge.
-            let label_px = band_label_px(
-                (geometry.band_top_px + geometry.cell_h) as f32,
-                1.0,
-            );
-            let d = BandDesign::resolve(
-                &geometry,
-                geometry.band_top_px + geometry.cell_h,
-                label_px,
-            );
+            let label_px = band_label_px((geometry.band_top_px + geometry.cell_h) as f32, 1.0);
+            let d =
+                BandDesign::resolve(&geometry, geometry.band_top_px + geometry.cell_h, label_px);
             let seg0 = f32::from(plus.start_col) * CELL_W as f32;
             let seg1 = f32::from(plus.end_col) * CELL_W as f32;
             let centre = (seg0 + seg1) * 0.5;
@@ -6542,7 +6570,10 @@ pub(crate) mod pixel_band {
                 px_at(&rgba, w, probe.0, probe.1)
             };
             let quiet = sample(false);
-            assert_eq!(quiet, colors.chip_bg, "the resting `+` sits on the quiet chip tone");
+            assert_eq!(
+                quiet, colors.chip_bg,
+                "the resting `+` sits on the quiet chip tone"
+            );
             assert_ne!(
                 quiet, colors.active_bg,
                 "…which is NOT the selected card's tone — the primary affordance \
@@ -6576,10 +6607,7 @@ pub(crate) mod pixel_band {
             // Clear of the corner radius, and above the label's own rows.
             let probe_x =
                 (f32::from(seg.start_col) * CELL_W as f32 + d.gap_h).round() as usize + 10;
-            let close_span = (
-                usize::from(close) * CELL_W,
-                usize::from(close + 1) * CELL_W,
-            );
+            let close_span = (usize::from(close) * CELL_W, usize::from(close + 1) * CELL_W);
             let sample = |hovered: Option<usize>| {
                 let paint = StripPaint {
                     hovered,
@@ -6597,14 +6625,25 @@ pub(crate) mod pixel_band {
                     h,
                     close_span.0,
                     close_span.1,
-                    &[colors.band_bg, colors.chip_bg, colors.hover_bg, colors.active_bg],
+                    &[
+                        colors.band_bg,
+                        colors.chip_bg,
+                        colors.hover_bg,
+                        colors.active_bg,
+                    ],
                 );
                 (card, mark.is_some())
             };
             let (quiet_card, quiet_mark) = sample(None);
             let (hot_card, hot_mark) = sample(Some(1));
-            assert_eq!(quiet_card, colors.chip_bg, "resting: the quiet chip's own card");
-            assert_eq!(hot_card, colors.hover_bg, "hovered: the wash a full rung up");
+            assert_eq!(
+                quiet_card, colors.chip_bg,
+                "resting: the quiet chip's own card"
+            );
+            assert_eq!(
+                hot_card, colors.hover_bg,
+                "hovered: the wash a full rung up"
+            );
             assert_ne!(quiet_card, hot_card, "the hover is a REAL surface change");
             assert!(!quiet_mark, "a quiet chip shows no ✕ (the mis-click trap)");
             assert!(hot_mark, "…and the hovered one does");
@@ -6824,9 +6863,7 @@ mod tests {
         busy.indicators.busy = true;
         let metadata = [
             TabStripMetadata::from_presentation(&busy),
-            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal(
-                "b",
-            )),
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("b")),
         ];
         let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
         let seg = segments[0];
@@ -6837,12 +6874,18 @@ mod tests {
             hit_test(&segments, seg.close_col.expect("wide chip has a ✕")),
             Some(TabHit::Close(0))
         );
-        assert_eq!(hit_test(&segments, seg.start_col + 1), Some(TabHit::Select(0)));
+        assert_eq!(
+            hit_test(&segments, seg.start_col + 1),
+            Some(TabHit::Select(0))
+        );
         assert_eq!(
             segments[1].connector_col, None,
             "a markless chip has no connector; its whole interior selects"
         );
-        assert_eq!(hit_test(&segments, segments[1].start_col + 3), Some(TabHit::Select(1)));
+        assert_eq!(
+            hit_test(&segments, segments[1].start_col + 3),
+            Some(TabHit::Select(1))
+        );
 
         // Hit geometry == painted geometry: the status image lands on the SAME
         // cell the hit region claims.
@@ -7891,7 +7934,10 @@ mod tests {
             TabIconPrimitive::Dot { center, radius } => (center[0] - radius, center[0] + radius),
             TabIconPrimitive::Triangle { points } => (
                 points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min),
-                points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max),
+                points
+                    .iter()
+                    .map(|p| p[0])
+                    .fold(f32::NEG_INFINITY, f32::max),
             ),
         }
     }
@@ -8155,10 +8201,7 @@ mod tests {
         for (i, a) in resolved.iter().enumerate() {
             for (j, b) in resolved.iter().enumerate() {
                 if i != j {
-                    assert_ne!(
-                        a, b,
-                        "tabs {i} and {j} must be tellable apart at a glance"
-                    );
+                    assert_ne!(a, b, "tabs {i} and {j} must be tellable apart at a glance");
                 }
             }
         }
@@ -8436,7 +8479,9 @@ mod tests {
                     let segments = layout_segments(cols, tabs, active, false);
                     let labels = distinct_chip_labels(&segments, &titles, None, active, None);
                     for seg in &segments {
-                        let TabHit::Select(i) = seg.kind else { continue };
+                        let TabHit::Select(i) = seg.kind else {
+                            continue;
+                        };
                         if i == active {
                             continue;
                         }
@@ -8563,8 +8608,7 @@ mod tests {
             let clamped = layout_segments(cols, titles.len(), titles.len() - 1, false);
             assert_eq!(segments, clamped, "fixture: the LAYOUT already clamps");
             let out_of_range = distinct_chip_labels(&segments, &titles, None, 99, None);
-            let in_range =
-                distinct_chip_labels(&segments, &titles, None, titles.len() - 1, None);
+            let in_range = distinct_chip_labels(&segments, &titles, None, titles.len() - 1, None);
             assert_eq!(
                 out_of_range, in_range,
                 "{cols} cols: the labels follow the same clamp the layout did"
@@ -8586,8 +8630,7 @@ mod tests {
     /// the shipped rule — distinct heads stay head-cut there.
     #[test]
     fn a_pressure_strip_speaks_one_truncation_dialect() {
-        let mut titles: Vec<String> =
-            (0..6).map(|_| "Settings.toml".to_string()).collect();
+        let mut titles: Vec<String> = (0..6).map(|_| "Settings.toml".to_string()).collect();
         titles.push("README.md".to_string()); // loner: shares no head
         titles.push("Setup.sh".to_string()); // clusters via the `Set` head
         titles.push("cargo build".to_string()); // loner
@@ -8673,7 +8716,18 @@ mod tests {
             .collect();
         assert_eq!(
             resolved,
-            ["Settings.toml", "2", "3", "4", "5", "6", "R…", "…h", "c…", "…k"],
+            [
+                "Settings.toml",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "R…",
+                "…h",
+                "c…",
+                "…k"
+            ],
             "distinctness outranks dialect when the tail cut cannot distinguish"
         );
         for (i, a) in resolved.iter().enumerate() {
@@ -8741,8 +8795,7 @@ mod tests {
             .filter_map(|seg| match seg.kind {
                 TabHit::Select(i) if !seg.solo => {
                     let layout = tab_content_layout(seg, PLAIN_TAB);
-                    let avail =
-                        usize::from(layout.title_end.saturating_sub(layout.title_start));
+                    let avail = usize::from(layout.title_end.saturating_sub(layout.title_start));
                     Some(truncate_title(&titles[i], avail))
                 }
                 _ => None,
@@ -8875,10 +8928,7 @@ mod tests {
                 "inactive tab bg = the band (recedes)"
             );
         }
-        assert_ne!(
-            row[card1].bg, row[card0].bg,
-            "inactive differs from active"
-        );
+        assert_ne!(row[card1].bg, row[card0].bg, "inactive differs from active");
         assert!(!row[card1].bold, "inactive tab text is not bold");
     }
 
@@ -9456,8 +9506,7 @@ mod tests {
             );
             let cx = segments[0].close_col.expect("a lone chip keeps its ✕");
             assert_eq!(
-                row[cx as usize].ch,
-                '✕',
+                row[cx as usize].ch, '✕',
                 "and the selected card's close mark is resident"
             );
         } else {

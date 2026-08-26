@@ -870,7 +870,6 @@ const BONK_DUCK_TAU: f32 = 0.28;
 /// compounds over 256 multiplies rather than over a whole note.
 const ENV_REANCHOR: u32 = 64;
 
-
 /// One celebration riff bar in seconds — 4 beats at the sing-along's
 /// 150 BPM. Pinned equal to the VISUAL clock's `kitty_sing::SING_BAR_SECONDS`
 /// by `celebration_bar_matches_the_visual_clock`, so the host can schedule
@@ -6237,7 +6236,11 @@ mod tests {
     #[test]
     fn voice_roster_round_trips() {
         assert_eq!(SoundVoice::parse("auto"), Some(SoundVoice::Style));
-        assert_eq!(SoundVoice::ALL[0], SoundVoice::Style, "auto leads the picker");
+        assert_eq!(
+            SoundVoice::ALL[0],
+            SoundVoice::Style,
+            "auto leads the picker"
+        );
         for &v in SoundVoice::ALL {
             assert_eq!(SoundVoice::parse(v.name()), Some(v), "{v:?}");
             // Case- and whitespace-insensitive, like every other enum key.
@@ -6269,7 +6272,10 @@ mod tests {
             "a Trail Pack is a look, not a sound"
         );
         assert_eq!(SoundVoice::Of(GlowStyle::Custom).name(), "warm pluck");
-        assert_eq!(SoundVoice::parse("warm pluck"), Some(SoundVoice::Of(GlowStyle::Lumen)));
+        assert_eq!(
+            SoundVoice::parse("warm pluck"),
+            Some(SoundVoice::Of(GlowStyle::Lumen))
+        );
         for junk in ["", "  ", "plasma", "glass", "auto bell", "pack:foo"] {
             assert_eq!(SoundVoice::parse(junk), None, "{junk:?}");
         }
@@ -6391,7 +6397,11 @@ mod tests {
             (SoundVoice::Marimba, -21.0),
             (SoundVoice::Felt, -21.0),
         ];
-        assert_eq!(table.len(), SoundVoice::ALL.len(), "every voice is measured");
+        assert_eq!(
+            table.len(),
+            SoundVoice::ALL.len(),
+            "every voice is measured"
+        );
         for (voice, expect) in table {
             assert!(SoundVoice::ALL.contains(&voice));
             let got = peak_db(voice);
@@ -6449,14 +6459,26 @@ mod tests {
             let mut e = voiced(SoundVoice::Typewriter, GlowStyle::Lumen, kind);
             e.bed = false;
             s.push(e);
-            s.voices.iter().filter(|v| v.on).copied().collect::<Vec<_>>()
+            s.voices
+                .iter()
+                .filter(|v| v.on)
+                .copied()
+                .collect::<Vec<_>>()
         };
         let typed = spawned(SoundKind::Typed);
         let back = spawned(SoundKind::Backspace);
         assert_eq!(typed.len(), 3, "a slug strike is clack + ring + platen");
         assert_eq!(back.len(), 2, "the lever is clack + platen — no ring");
-        let ring = |vs: &[Voice]| vs.iter().filter(|v| v.p[0].lvl > 0.0 && v.p[1].lvl > 0.0).count();
-        assert_eq!(ring(&typed), 1, "the strike carries the typebar's metal pair");
+        let ring = |vs: &[Voice]| {
+            vs.iter()
+                .filter(|v| v.p[0].lvl > 0.0 && v.p[1].lvl > 0.0)
+                .count()
+        };
+        assert_eq!(
+            ring(&typed),
+            1,
+            "the strike carries the typebar's metal pair"
+        );
         assert_eq!(ring(&back), 0, "the deletion carries none");
         let body = |vs: &[Voice]| {
             vs.iter()
@@ -6509,9 +6531,15 @@ mod tests {
                             peak = peak.max(x.abs());
                         }
                     }
-                    assert!(peak > 1e-4, "{voice:?}/{gesture:?} was inaudible (peak {peak})");
+                    assert!(
+                        peak > 1e-4,
+                        "{voice:?}/{gesture:?} was inaudible (peak {peak})"
+                    );
                     assert!(peak <= 0.98, "{voice:?}/{gesture:?} clipped (peak {peak})");
-                    assert!(s.is_quiet(), "{voice:?}/{gesture:?} never decayed to silence");
+                    assert!(
+                        s.is_quiet(),
+                        "{voice:?}/{gesture:?} never decayed to silence"
+                    );
                     s.render(&mut buf);
                     assert!(
                         buf.iter().all(|&x| x == 0.0),
@@ -6540,7 +6568,10 @@ mod tests {
                     }
                 }
             }
-            assert!(peak < 0.5, "{voice:?} flood must stay governed (peak {peak})");
+            assert!(
+                peak < 0.5,
+                "{voice:?} flood must stay governed (peak {peak})"
+            );
         }
     }
 
@@ -6597,7 +6628,10 @@ mod tests {
         };
         let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
         assert!(
-            same(&run(SoundVoice::Typewriter, true), &run(SoundVoice::Typewriter, false)),
+            same(
+                &run(SoundVoice::Typewriter, true),
+                &run(SoundVoice::Typewriter, false)
+            ),
             "the typewriter bed must contribute exactly zero samples"
         );
         for voice in [SoundVoice::Marimba, SoundVoice::Felt] {
@@ -6629,12 +6663,30 @@ mod tests {
             // The look does not leak in.
             assert_ne!(*a, kill_swoosh_band(SoundVoice::Style, GlowStyle::Sparkle));
         }
-        assert_eq!(kill_swoosh_band(SoundVoice::Mech, GlowStyle::Lumen), (1000.0, 220.0));
-        assert_eq!(kill_swoosh_band(SoundVoice::Style, GlowStyle::Water), (900.0, 250.0));
-        assert_eq!(kill_swoosh_band(SoundVoice::Style, GlowStyle::Fire), (1400.0, 300.0));
-        assert_eq!(kill_swoosh_band(SoundVoice::Style, GlowStyle::Sparkle), (2600.0, 700.0));
-        assert_eq!(kill_swoosh_band(SoundVoice::Style, GlowStyle::Comet), (1200.0, 280.0));
-        assert_eq!(kill_swoosh_band(SoundVoice::Style, GlowStyle::Lumen), (1600.0, 350.0));
+        assert_eq!(
+            kill_swoosh_band(SoundVoice::Mech, GlowStyle::Lumen),
+            (1000.0, 220.0)
+        );
+        assert_eq!(
+            kill_swoosh_band(SoundVoice::Style, GlowStyle::Water),
+            (900.0, 250.0)
+        );
+        assert_eq!(
+            kill_swoosh_band(SoundVoice::Style, GlowStyle::Fire),
+            (1400.0, 300.0)
+        );
+        assert_eq!(
+            kill_swoosh_band(SoundVoice::Style, GlowStyle::Sparkle),
+            (2600.0, 700.0)
+        );
+        assert_eq!(
+            kill_swoosh_band(SoundVoice::Style, GlowStyle::Comet),
+            (1200.0, 280.0)
+        );
+        assert_eq!(
+            kill_swoosh_band(SoundVoice::Style, GlowStyle::Lumen),
+            (1600.0, 350.0)
+        );
     }
 
     /// A sustained 25 cps flood must NOT get louder than a single event —

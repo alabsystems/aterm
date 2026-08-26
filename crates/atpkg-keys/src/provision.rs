@@ -1239,8 +1239,14 @@ pub fn preflight(verb: Verb, id: &str, head_id: &str, paths: &Paths) -> Result<P
     // The directories this run will write into, created before anything secret exists.
     // See this function's doc for the ENOENT-at-the-last-step failure this closes.
     for path in [&paths.key, &paths.machine_pub, &paths.roster] {
-        ensure_parent_dir(path)
-            .map_err(|e| concat(&["cannot create the directory for ", path, ": ", &e.to_string()]))?;
+        ensure_parent_dir(path).map_err(|e| {
+            concat(&[
+                "cannot create the directory for ",
+                path,
+                ": ",
+                &e.to_string(),
+            ])
+        })?;
     }
 
     // The key-file check comes AFTER the verb checks, deliberately. An operator who runs
@@ -1412,7 +1418,13 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
         ]
         .map(str::to_string);
         let refs: Vec<&str> = comment.iter().map(String::as_str).collect();
-        match append_member(&text, MASTER_ANCHOR, &master_pubkey, &refs, MAX_MASTER_MEMBERS)? {
+        match append_member(
+            &text,
+            MASTER_ANCHOR,
+            &master_pubkey,
+            &refs,
+            MAX_MASTER_MEMBERS,
+        )? {
             Edit::AlreadyPresent { members } => master_after = members,
             Edit::Changed {
                 text: next,
@@ -1771,8 +1783,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
         }
     })?;
 
-    let machine_is_committed_head =
-        planned.channel_after.first() == Some(&planned.machine_pubkey);
+    let machine_is_committed_head = planned.channel_after.first() == Some(&planned.machine_pubkey);
 
     Ok(Report {
         verb: planned.verb,
@@ -1970,7 +1981,12 @@ mod tests {
     const HEAD_KEY: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
 
     fn paths_in(dir: &std::path::Path) -> Paths {
-        let s = |n: &str| dir.join(n).to_str().expect("utf-8 scratch path").to_string();
+        let s = |n: &str| {
+            dir.join(n)
+                .to_str()
+                .expect("utf-8 scratch path")
+                .to_string()
+        };
         Paths {
             pins: s("pins.rs"),
             roster: s("aterm-machines.toml"),
@@ -2053,12 +2069,9 @@ mod tests {
         // The roster verifies under the master and names the machine.
         let bytes = std::fs::read(&paths.roster).unwrap();
         let sig = std::fs::read(concat(&[&paths.roster, ".sig"])).unwrap();
-        let verified = aterm_update_core::roster::verify_roster(
-            &[report.master_pubkey.as_str()],
-            bytes,
-            &sig,
-        )
-        .expect("the roster verifies under the armed master");
+        let verified =
+            aterm_update_core::roster::verify_roster(&[report.master_pubkey.as_str()], bytes, &sig)
+                .expect("the roster verifies under the armed master");
         let roster = Roster::parse(&verified).unwrap();
         // THE FIRST ROSTER NAMES THE INCUMBENT HEAD FIRST. Without this entry, committing
         // the anchor would leave the one machine every shipped client can verify unable to
@@ -2371,15 +2384,24 @@ mod tests {
         // chasing a "wrong phrase" diagnosis.
         let master_pub = seed_of(PAPER).pubkey_b64().unwrap();
         assert!(
-            load_roster(&paths.roster, &master_pub, NOW, RosterExpectation::MustExist)
-                .is_ok(),
+            load_roster(
+                &paths.roster,
+                &master_pub,
+                NOW,
+                RosterExpectation::MustExist
+            )
+            .is_ok(),
             "the pair left behind by a failed publish must be the consistent old one"
         );
 
         // A FIRST publish with the same obstruction likewise writes neither half: no
         // half-pair is left to misdiagnose.
         let fresh = scratch("pair-rollback-fresh");
-        let fresh_roster = fresh.join("aterm-machines.toml").to_str().unwrap().to_string();
+        let fresh_roster = fresh
+            .join("aterm-machines.toml")
+            .to_str()
+            .unwrap()
+            .to_string();
         let fresh_sig = concat(&[&fresh_roster, ".sig"]);
         std::fs::create_dir(&fresh_sig).unwrap();
         let err = publish_roster(&fresh_roster, b"BODY", b"SIG").unwrap_err();
@@ -2652,13 +2674,28 @@ mod tests {
         let paths = Paths {
             pins: dir.join("pins.rs").to_str().unwrap().to_string(),
             // Every one of these sits under a directory that does not exist yet.
-            roster: dir.join("dist/aterm-machines.toml").to_str().unwrap().to_string(),
-            key: dir.join("home/.aterm/machine.key").to_str().unwrap().to_string(),
-            machine_pub: dir.join("home/.aterm/machine.toml").to_str().unwrap().to_string(),
+            roster: dir
+                .join("dist/aterm-machines.toml")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            key: dir
+                .join("home/.aterm/machine.key")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            machine_pub: dir
+                .join("home/.aterm/machine.toml")
+                .to_str()
+                .unwrap()
+                .to_string(),
             pins_explicit: true,
         };
         write_fixture(&paths);
-        assert!(!dir.join("home/.aterm").exists(), "the premise: no $HOME/.aterm");
+        assert!(
+            !dir.join("home/.aterm").exists(),
+            "the premise: no $HOME/.aterm"
+        );
 
         let report = run_setup(&paths, "m3").expect("setup completes on a fresh machine");
 
@@ -2705,7 +2742,10 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(err.contains("Nothing authorizes this machine yet"), "{err}");
-        assert!(err.contains("git checkout --"), "the recovery names both files: {err}");
+        assert!(
+            err.contains("git checkout --"),
+            "the recovery names both files: {err}"
+        );
         assert!(err.contains("rm "), "{err}");
         assert!(
             std::path::Path::new(&paths.key).exists(),
@@ -2755,7 +2795,10 @@ mod tests {
         write_pins(&planned).expect("a plan built from the current bytes writes");
         let after = std::fs::read_to_string(&paths.pins).unwrap();
         assert!(after.contains(REPLACEMENT), "{after}");
-        assert!(!after.contains(HEAD_KEY), "the retired key was not resurrected");
+        assert!(
+            !after.contains(HEAD_KEY),
+            "the retired key was not resurrected"
+        );
     }
 
     /// JOIN REFUSES THE WRONG PAPER — twice over, and before writing anything. The anchor
@@ -2774,7 +2817,8 @@ mod tests {
         let before = std::fs::read_to_string(&paths.pins).unwrap();
         let roster_before = std::fs::read(&paths.roster).unwrap();
 
-        let pre = preflight(Verb::Join, "m11", "incumbent-head", &second).expect("preflight is fine");
+        let pre =
+            preflight(Verb::Join, "m11", "incumbent-head", &second).expect("preflight is fine");
         let wrong = seed_of(OTHER_PAPER);
         let err = verify_master(&pre, &wrong).unwrap_err();
         assert!(err.contains("is NOT the master committed"), "{err}");
@@ -2793,13 +2837,19 @@ mod tests {
             &wrong.pubkey_b64().unwrap(),
             NOW,
             RosterExpectation::MustExist,
-            )
+        )
         .unwrap_err();
-        assert!(err.contains("does not verify under the master you typed"), "{err}");
+        assert!(
+            err.contains("does not verify under the master you typed"),
+            "{err}"
+        );
 
         assert_eq!(std::fs::read_to_string(&paths.pins).unwrap(), before);
         assert_eq!(std::fs::read(&paths.roster).unwrap(), roster_before);
-        assert!(!std::path::Path::new(&second.key).exists(), "no key was minted");
+        assert!(
+            !std::path::Path::new(&second.key).exists(),
+            "no key was minted"
+        );
 
         // NEGATIVE CONTROL: the RIGHT paper is accepted on the same inputs.
         let pre = preflight(Verb::Join, "m11", "incumbent-head", &second).unwrap();
@@ -2863,7 +2913,10 @@ mod tests {
         run_setup(&paths, "m3").expect("setup");
         let err = preflight(Verb::Join, "m3", "incumbent-head", &paths).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
-        assert!(err.contains("never overwrite a key the roster still names"), "{err}");
+        assert!(
+            err.contains("never overwrite a key the roster still names"),
+            "{err}"
+        );
     }
 
     /// `setup` will not write over a roster some other master signed.
@@ -2938,10 +2991,15 @@ mod tests {
         // the plan changed, so a passing result here would prove the check is decorative.
         std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
         let planned2 = {
-            let pre = preflight(Verb::Setup, "m3-b", "incumbent-head", &Paths {
-                key: dir.join("m3b.key").to_str().unwrap().to_string(),
-                ..paths.clone()
-            })
+            let pre = preflight(
+                Verb::Setup,
+                "m3-b",
+                "incumbent-head",
+                &Paths {
+                    key: dir.join("m3b.key").to_str().unwrap().to_string(),
+                    ..paths.clone()
+                },
+            )
             .unwrap();
             plan(pre, &seed, NOW).unwrap()
         };
@@ -2969,8 +3027,11 @@ mod tests {
         let report = run_setup(&paths, "m3").expect("setup");
         let text = render_report(&report).join("\n");
 
-        assert!(text.contains("=== DONE (working tree only — a commit makes it durable) ==="), "{text}");
-        
+        assert!(
+            text.contains("=== DONE (working tree only — a commit makes it durable) ==="),
+            "{text}"
+        );
+
         assert!(text.contains("=== NEXT ==="), "{text}");
         assert!(text.contains("commit — durable from here"), "{text}");
         // The two halves of the truth, both required: who this machine reaches, and who

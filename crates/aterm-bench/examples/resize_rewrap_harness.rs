@@ -232,7 +232,10 @@ fn converge_probe() -> (u64, usize) {
 
     let grid = term.grid();
     let depth = grid.scrollback_lines();
-    assert!(depth > 40_000, "reach: deep history survived ({depth} lines)");
+    assert!(
+        depth > 40_000,
+        "reach: deep history survived ({depth} lines)"
+    );
     // Sample the OLDEST region — that is the tiered store the job rewrapped;
     // the ring was rewrapped synchronously at 72 and would mask staleness.
     let mut max_width = 0usize;

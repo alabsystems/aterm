@@ -209,7 +209,10 @@ fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> St
     if std::env::var("PROFILE").as_deref() == Ok("debug") {
         flags |= VS_FF_DEBUG;
     }
-    if !std::env::var("CARGO_PKG_VERSION_PRE").unwrap_or_default().is_empty() {
+    if !std::env::var("CARGO_PKG_VERSION_PRE")
+        .unwrap_or_default()
+        .is_empty()
+    {
         flags |= VS_FF_PRERELEASE;
     }
 

@@ -486,7 +486,12 @@ fn unfocused_typed_window_paints_its_trail_under_an_unpinned_capture() {
 #[cfg(target_os = "macos")]
 #[test]
 fn unfocused_idle_window_paints_nothing_under_an_unpinned_capture() {
-    probe_with("cold-spinner", "", Expect::Quiet, Capture::UnpinnedUnfocused);
+    probe_with(
+        "cold-spinner",
+        "",
+        Expect::Quiet,
+        Capture::UnpinnedUnfocused,
+    );
 }
 
 /// Matrix rows 6a-6c: THE OWNER'S ACTUAL CONFIGURATION — a FOCUSED window,

@@ -1714,9 +1714,7 @@ fn pump<W: Write, P: FnMut() -> bool>(
     // that needs `instance` must not have to widen the signature to get it, and a
     // caller must never be able to hand `pump` a scope set the connection did not
     // actually prove.
-    let PushScopes {
-        streams, adopt, ..
-    } = scopes;
+    let PushScopes { streams, adopt, .. } = scopes;
     let PushCursors { roster, adopt_seq } = cursors;
     let since_turn = opts.since_turn;
     // The catch-up is a wake like any other, so it opens one: its frames share a
@@ -2175,7 +2173,8 @@ pub(crate) mod bench_seam {
                         }
                     }
                 }
-                f.watches.push(seeded_watch(i as u64, &fixture_term, &ledger, &tl));
+                f.watches
+                    .push(seeded_watch(i as u64, &fixture_term, &ledger, &tl));
                 f.terms.push(fixture_term);
                 f.turns.push(ledger);
                 f.timelines.push(tl);

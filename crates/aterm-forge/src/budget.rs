@@ -130,54 +130,75 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
             continue;
         }
         if raw.starts_with('#') {
-            return Err(bad(n, raw, &format!(
-                "comments are not supported. This file is pure TSV so one `awk -F'\\t'` idiom \
+            return Err(bad(
+                n,
+                raw,
+                &format!(
+                    "comments are not supported. This file is pure TSV so one `awk -F'\\t'` idiom \
                  reads it and {BUDGET_PATH}'s sibling tools/trust-gate-ratchet.tsv. Delete the \
                  line; the prose belongs in aterm_forge::budget's module docs"
-            )));
+                ),
+            ));
         }
         let f: Vec<&str> = raw.split('\t').collect();
         if f.len() == 1 && raw.split_whitespace().count() >= 3 {
             return Err(bad(n, raw, "the columns are separated by TABS, not spaces"));
         }
         if f.len() < 3 || f.len() > 4 {
-            return Err(bad(n, raw, &format!(
-                "expected 3 or 4 tab-separated columns, found {}",
-                f.len()
-            )));
+            return Err(bad(
+                n,
+                raw,
+                &format!("expected 3 or 4 tab-separated columns, found {}", f.len()),
+            ));
         }
         let (scope, metric, ceiling) = (f[0].trim(), f[1].trim(), f[2].trim());
         if scope.is_empty() || metric.is_empty() {
-            return Err(bad(n, raw, "the scope and metric columns must both be non-empty"));
+            return Err(bad(
+                n,
+                raw,
+                "the scope and metric columns must both be non-empty",
+            ));
         }
-        let ceiling: u64 = ceiling.parse().map_err(|_| {
-            bad(n, raw, &format!("`{ceiling}` is not a whole number"))
-        })?;
+        let ceiling: u64 = ceiling
+            .parse()
+            .map_err(|_| bad(n, raw, &format!("`{ceiling}` is not a whole number")))?;
         let regress_reason = match f.get(3) {
             None => None,
             Some(r) if r.trim().is_empty() => {
-                return Err(bad(n, raw, &format!(
-                    "the 4th column is empty. It holds an accepted --allow-regress reason of \
+                return Err(bad(
+                    n,
+                    raw,
+                    &format!(
+                        "the 4th column is empty. It holds an accepted --allow-regress reason of \
                      at least {MIN_REASON_CHARS} characters; delete the trailing tab if there \
                      is no regression to explain"
-                )));
+                    ),
+                ));
             }
             Some(r) if r.chars().count() < MIN_REASON_CHARS => {
-                return Err(bad(n, raw, &format!(
-                    "the recorded regress reason is {} characters; a raise needs at least \
+                return Err(bad(
+                    n,
+                    raw,
+                    &format!(
+                        "the recorded regress reason is {} characters; a raise needs at least \
                      {MIN_REASON_CHARS}. Write what grew, why it had to, and what would shrink \
                      it again",
-                    r.chars().count()
-                )));
+                        r.chars().count()
+                    ),
+                ));
             }
             Some(r) => Some((*r).to_string()),
         };
         if let Some(prev) = rows.iter().find(|p| p.scope == scope && p.metric == metric) {
-            return Err(bad(n, raw, &format!(
-                "`{} {}` already has a ceiling of {} earlier in this file — one row per \
+            return Err(bad(
+                n,
+                raw,
+                &format!(
+                    "`{} {}` already has a ceiling of {} earlier in this file — one row per \
                  scope+metric",
-                prev.scope, prev.metric, prev.ceiling
-            )));
+                    prev.scope, prev.metric, prev.ceiling
+                ),
+            ));
         }
         rows.push(Row {
             scope: scope.to_string(),
@@ -246,16 +267,30 @@ pub fn seed_from_live(root: &Path) -> Result<String, String> {
     let live = measure(root)?;
     let mut rows = Vec::new();
     for (scope, metric) in seed_shape(&live) {
-        let Some(&ceiling) = live.values.get(&(scope.clone(), metric.clone())) else { continue };
-        rows.push(Row { scope, metric, ceiling, regress_reason: None });
+        let Some(&ceiling) = live.values.get(&(scope.clone(), metric.clone())) else {
+            continue;
+        };
+        rows.push(Row {
+            scope,
+            metric,
+            ceiling,
+            regress_reason: None,
+        });
     }
     if !live.unavailable.is_empty() {
         return Err(format!(
             "refusing to seed {BUDGET_PATH} from an incomplete measurement — {} could not be \
              resolved ({}). A ceiling seeded from a partial survey is a ceiling nobody can \
              trust; fix the cell first, or seed by hand from `cargo forge survey`",
-            live.unavailable.keys().cloned().collect::<Vec<_>>().join(", "),
-            live.unavailable.values().next().map_or(String::new(), Clone::clone)
+            live.unavailable
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            live.unavailable
+                .values()
+                .next()
+                .map_or(String::new(), Clone::clone)
         ));
     }
     Ok(render(&rows))
@@ -305,10 +340,13 @@ struct Live {
 
 impl Live {
     fn set(&mut self, scope: &str, metric: &str, value: u64) {
-        self.values.insert((scope.to_string(), metric.to_string()), value);
+        self.values
+            .insert((scope.to_string(), metric.to_string()), value);
     }
     fn get(&self, scope: &str, metric: &str) -> Option<u64> {
-        self.values.get(&(scope.to_string(), metric.to_string())).copied()
+        self.values
+            .get(&(scope.to_string(), metric.to_string()))
+            .copied()
     }
 }
 
@@ -352,11 +390,19 @@ fn measure(root: &Path) -> Result<Live, String> {
         .count();
     live.scopes.push("lock".to_string());
     live.set("lock", "packages", u(lock.len()));
-    live.set("lock", "third_party_packages", u(lock.len().saturating_sub(workspace)));
+    live.set(
+        "lock",
+        "third_party_packages",
+        u(lock.len().saturating_sub(workspace)),
+    );
 
     live.scopes.push("patch".to_string());
     live.set("patch", "entries", u(patches.len()));
-    live.set("patch", "live_entries", u(patches.iter().filter(|p| p.is_live()).count()));
+    live.set(
+        "patch",
+        "live_entries",
+        u(patches.iter().filter(|p| p.is_live()).count()),
+    );
     for p in &patches {
         if !p.is_live() {
             live.notes.push(format!(
@@ -636,7 +682,11 @@ pub fn run(root: &Path, update: bool, allow_regress: Option<&str>) -> Result<Out
         );
     }
 
-    let recorded: Vec<&Row> = plan.rows.iter().filter(|r| r.regress_reason.is_some()).collect();
+    let recorded: Vec<&Row> = plan
+        .rows
+        .iter()
+        .filter(|r| r.regress_reason.is_some())
+        .collect();
     if !recorded.is_empty() {
         log.push_str("\n    RECORDED REGRESSIONS (reprinted every run, by design):\n");
         for r in recorded {
@@ -724,7 +774,12 @@ fn unarmed(root: &Path, live: &Live, update: bool) -> Outcome {
         let mut rows = Vec::new();
         for (scope, metric) in seed_shape(live) {
             if let Some(&ceiling) = live.values.get(&(scope.clone(), metric.clone())) {
-                rows.push(Row { scope, metric, ceiling, regress_reason: None });
+                rows.push(Row {
+                    scope,
+                    metric,
+                    ceiling,
+                    regress_reason: None,
+                });
             }
         }
         render(&rows)
@@ -879,7 +934,14 @@ mod tests {
     #[test]
     fn a_three_column_line_parses() {
         let rows = parse("shipped.aarch64-apple-darwin\tthird_party_loc\t2130888\n").unwrap();
-        assert_eq!(rows, vec![row("shipped.aarch64-apple-darwin", "third_party_loc", 2_130_888)]);
+        assert_eq!(
+            rows,
+            vec![row(
+                "shipped.aarch64-apple-darwin",
+                "third_party_loc",
+                2_130_888
+            )]
+        );
     }
 
     #[test]
@@ -888,7 +950,10 @@ mod tests {
         let e = parse(text).unwrap_err();
         assert!(e.starts_with(&format!("{BUDGET_PATH}:2:")), "{e}");
         assert!(e.contains("found 2"), "{e}");
-        assert!(e.contains("<scope>"), "the refusal must show the shape: {e}");
+        assert!(
+            e.contains("<scope>"),
+            "the refusal must show the shape: {e}"
+        );
     }
 
     #[test]
@@ -962,8 +1027,8 @@ mod tests {
         let e = validate_metric(&row("lock", "lines_of_code", 1), &live).unwrap_err();
         assert!(e.contains("lines_of_code"), "{e}");
         assert!(e.contains("third_party_packages"), "{e}");
-        let e = validate_metric(&row("shipped.sparc-unknown-none", "packages", 1), &live)
-            .unwrap_err();
+        let e =
+            validate_metric(&row("shipped.sparc-unknown-none", "packages", 1), &live).unwrap_err();
         assert!(e.contains("default_cells"), "{e}");
     }
 
@@ -996,7 +1061,11 @@ mod tests {
         assert!(!p.ok);
         assert!(!p.changed, "a raise must never be written without a reason");
         assert_eq!(p.rows[0].ceiling, 6);
-        assert!(p.problems[0].contains("--allow-regress"), "{}", p.problems[0]);
+        assert!(
+            p.problems[0].contains("--allow-regress"),
+            "{}",
+            p.problems[0]
+        );
     }
 
     #[test]
@@ -1013,7 +1082,12 @@ mod tests {
         let reason = validate_reason(true, Some(REASON_80)).unwrap();
         assert_eq!(reason.as_deref(), Some(REASON_80));
         let live = live_with("patch", "entries", 9);
-        let p = plan(&[row("patch", "entries", 6)], &live, true, reason.as_deref());
+        let p = plan(
+            &[row("patch", "entries", 6)],
+            &live,
+            true,
+            reason.as_deref(),
+        );
         assert!(p.ok);
         assert!(p.changed);
         assert_eq!(p.rows[0].ceiling, 9);
@@ -1053,8 +1127,10 @@ mod tests {
     #[test]
     fn an_unmeasured_scope_is_never_a_pass() {
         let mut live = Live::default();
-        live.unavailable
-            .insert("shipped.x86_64-pc-windows-msvc".to_string(), "no such target".to_string());
+        live.unavailable.insert(
+            "shipped.x86_64-pc-windows-msvc".to_string(),
+            "no such target".to_string(),
+        );
         let p = plan(
             &[row("shipped.x86_64-pc-windows-msvc", "third_party_loc", 10)],
             &live,
@@ -1063,7 +1139,11 @@ mod tests {
         );
         assert!(!p.ok);
         assert_eq!(p.table[0][3], "?");
-        assert!(p.problems[0].contains("no such target"), "{}", p.problems[0]);
+        assert!(
+            p.problems[0].contains("no such target"),
+            "{}",
+            p.problems[0]
+        );
     }
 
     #[test]
@@ -1085,7 +1165,10 @@ mod tests {
         assert!(!p.ok);
         let m = &p.problems[0];
         assert!(m.contains("3 over the ceiling of 8"), "{m}");
-        assert!(m.contains("hashbrown"), "the RED must name what it is made of: {m}");
+        assert!(
+            m.contains("hashbrown"),
+            "the RED must name what it is made of: {m}"
+        );
         assert!(m.contains("git diff -- Cargo.lock"), "{m}");
         assert!(m.contains("--allow-regress"), "{m}");
     }

@@ -30,9 +30,6 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -63,6 +60,9 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)]
+mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -87,13 +87,22 @@ fn sources() -> Vec<(PathBuf, String)> {
             // the line numbers honest while taking prose out of the census.
             let code = text
                 .lines()
-                .map(|l| if l.trim_start().starts_with("//") { "" } else { l })
+                .map(|l| {
+                    if l.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             out.push((path, code));
         }
     }
-    assert!(out.len() > 10, "the mount list says there are more modules than this");
+    assert!(
+        out.len() > 10,
+        "the mount list says there are more modules than this"
+    );
     out
 }
 
@@ -138,14 +147,25 @@ fn every_label_in_the_crate_fits_the_gutter() {
             }
         }
     }
-    assert!(checked > 60, "the census found only {checked} labels — did the call spelling change?");
-    assert!(over.is_empty(), "labels that eat their own separator:\n{}", over.join("\n"));
+    assert!(
+        checked > 60,
+        "the census found only {checked} labels — did the call spelling change?"
+    );
+    assert!(
+        over.is_empty(),
+        "labels that eat their own separator:\n{}",
+        over.join("\n")
+    );
 }
 
 /// The constant labels reached through a `const` rather than a literal.
 #[test]
 fn the_named_labels_fit_the_gutter_too() {
-    assert!(apple::APPLE_LABEL.chars().count() <= LABEL_MAX, "{:?}", apple::APPLE_LABEL);
+    assert!(
+        apple::APPLE_LABEL.chars().count() <= LABEL_MAX,
+        "{:?}",
+        apple::APPLE_LABEL
+    );
 }
 
 /// A label at the limit still gets its separator. This is the exact shape of the bug:
@@ -156,11 +176,19 @@ fn a_label_at_the_limit_never_touches_its_value() {
     let long = "x".repeat(LABEL_MAX);
     let line = grid_block(&long, "10 program(s) staged");
     assert!(line.starts_with(&format!("  {long} ")), "{line:?}");
-    assert_eq!(&line[..VALUE_COL], format!("  {long} "), "the value must start at {VALUE_COL}");
+    assert_eq!(
+        &line[..VALUE_COL],
+        format!("  {long} "),
+        "the value must start at {VALUE_COL}"
+    );
     // And every shorter label lands in the same column, so the values line up.
     for label in ["seed", "apple id", "channel", ""] {
         let line = grid_block(label, "value");
-        assert_eq!(&line[VALUE_COL..], "value", "{label:?} put its value in the wrong column");
+        assert_eq!(
+            &line[VALUE_COL..],
+            "value",
+            "{label:?} put its value in the wrong column"
+        );
     }
 }
 
@@ -180,13 +208,19 @@ fn an_empty_message_prints_a_genuinely_empty_line() {
             "a whitespace-only row leaves invisible trailing space: {row:?}"
         );
     }
-    assert!(block.contains("\n\n"), "the author's blank line must survive: {block:?}");
+    assert!(
+        block.contains("\n\n"),
+        "the author's blank line must survive: {block:?}"
+    );
 }
 
 /// A prompt ends `"… [y/N] "` and the cursor has to sit one space clear of the question.
 #[test]
 fn a_prompts_trailing_space_survives_the_wrap() {
-    let block = grid_block("apple id", "spend one of five permanent slots? Continue? [y/N] ");
+    let block = grid_block(
+        "apple id",
+        "spend one of five permanent slots? Continue? [y/N] ",
+    );
     assert!(block.ends_with("[y/N] "), "{block:?}");
 }
 
@@ -198,7 +232,8 @@ fn a_long_token_overruns_rather_than_breaking() {
     let key = concat!("cw5gIGYQzX6xrhTXjXU9", "nYfLWeoIkiZ1yUX7d1wmdz8=");
     let block = grid_block("roster", &format!("the head key {key} signs a real cut"));
     assert!(block.contains(key), "the key must survive intact:\n{block}");
-    let path = "/Users//example/aterm/dist/toolchain-seed/a-very-long-artifact-name-that-overruns.tar.zst";
+    let path =
+        "/Users//example/aterm/dist/toolchain-seed/a-very-long-artifact-name-that-overruns.tar.zst";
     assert!(grid_block("seed", path).contains(path));
 }
 
@@ -213,8 +248,15 @@ fn authored_structure_survives_and_sub_bullets_hang() {
     let rows: Vec<&str> = block.lines().collect();
     assert!(rows[0].starts_with("  seed"), "{:?}", rows[0]);
     assert!(rows[1].starts_with(&" ".repeat(VALUE_COL)), "{:?}", rows[1]);
-    assert!(rows[1].trim_start().starts_with("ship it anyway"), "{:?}", rows[1]);
-    let bullet = rows.iter().position(|r| r.contains("· an Intel Mac")).expect("the bullet");
+    assert!(
+        rows[1].trim_start().starts_with("ship it anyway"),
+        "{:?}",
+        rows[1]
+    );
+    let bullet = rows
+        .iter()
+        .position(|r| r.contains("· an Intel Mac"))
+        .expect("the bullet");
     let cont = rows[bullet + 1];
     assert!(
         cont.starts_with(&format!("{}  ", " ".repeat(VALUE_COL))),
@@ -262,7 +304,11 @@ fn hand_authored_structure_fits_an_eighty_column_window() {
             }
         }
     }
-    assert!(over.is_empty(), "wider than an 80-column window:\n{}", over.join("\n"));
+    assert!(
+        over.is_empty(),
+        "wider than an 80-column window:\n{}",
+        over.join("\n")
+    );
 }
 
 /// A list stays a list when it wraps. Continuations hang under the marker's TEXT — a
@@ -298,17 +344,19 @@ fn a_wrapped_list_item_hangs_under_its_marker() {
 /// test over `errand_lines`' contents cannot see a `step` added below the loop.
 #[test]
 fn nothing_is_printed_after_the_errand() {
-    let text = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/apple.rs"),
-    )
-    .expect("apple.rs");
+    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/apple.rs"))
+        .expect("apple.rs");
     let body = &text[text.find("fn await_then_install(").expect("the function")..];
-    let loop_at = body.find("for line in errand_lines(").expect("the errand loop");
+    let loop_at = body
+        .find("for line in errand_lines(")
+        .expect("the errand loop");
     // Past the loop's own body — its `step(label, &line)` is the errand itself.
     let after = &body[loop_at + body[loop_at..].find("\n    }").expect("the loop's close")..];
     // Up to the end of the wait loop's opening — everything between the errand and the
     // first `while` is unconditional output on the way into a thirty-minute wait.
-    let head = &after[..after.find("while started.elapsed()").expect("the wait loop")];
+    let head = &after[..after
+        .find("while started.elapsed()")
+        .expect("the wait loop")];
     assert!(
         !head.contains("step("),
         "the errand's trap must be the last line before the wait, and this prints below \
@@ -325,10 +373,9 @@ fn nothing_is_printed_after_the_errand() {
 /// first, the ACT second (it used to be word 91), then one fact per line.
 #[test]
 fn the_x86_warning_keeps_its_facts_its_order_and_its_space() {
-    let text = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/seedpack.rs"),
-    )
-    .expect("seedpack.rs");
+    let text =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/seedpack.rs"))
+            .expect("seedpack.rs");
     // As the compiler sees it: the `\` continuations joined, so a lost space shows up.
     let joined = text.replace("\\\n", "").replace("\\", "");
     let mut lines = joined
@@ -360,9 +407,15 @@ fn the_x86_warning_keeps_its_facts_its_order_and_its_space() {
         "pkg-trust-6808.toml carries the row",
         "dmg_x86_64",
     ] {
-        assert!(block.contains(fact), "the warning dropped {fact:?}: {block}");
+        assert!(
+            block.contains(fact),
+            "the warning dropped {fact:?}: {block}"
+        );
     }
     // The class of defect that started all this: a space lost across a `\`
     // continuation ("doesNOT"). The joined form must never fuse words.
-    assert!(!block.contains("doesNOT") && !block.contains("NOTfall"), "{block}");
+    assert!(
+        !block.contains("doesNOT") && !block.contains("NOTfall"),
+        "{block}"
+    );
 }

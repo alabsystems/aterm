@@ -178,12 +178,7 @@ impl Terminal {
     /// The grid scan and destination growth are both bounded by `prefix_len`;
     /// a sparse row's implicit blank tail is left for the caller to pad when a
     /// fixed-width prefix is required.
-    pub fn row_cols_prefix_into(
-        &self,
-        row: usize,
-        prefix_len: usize,
-        out: &mut Vec<char>,
-    ) -> u16 {
+    pub fn row_cols_prefix_into(&self, row: usize, prefix_len: usize, out: &mut Vec<char>) -> u16 {
         let rows = usize::from(self.grid.rows());
         if row >= rows {
             out.clear();

@@ -67,12 +67,16 @@ static CHECK_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 
 /// Attach `note` to every status record until [`clear_check_note`].
 pub(crate) fn set_check_note(note: String) {
-    *CHECK_NOTE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+    *CHECK_NOTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
 }
 
 /// Forget the current check note (the next check starts clean).
 pub(crate) fn clear_check_note() {
-    *CHECK_NOTE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *CHECK_NOTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// Atomically write the status record (temp + rename). Best-effort: failures are

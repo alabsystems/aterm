@@ -77,8 +77,13 @@ unsafe extern "system" {
         result: *mut Hkey,
         disposition: *mut u32,
     ) -> i32;
-    fn RegOpenKeyExW(hkey: Hkey, subkey: *const u16, options: u32, sam: u32, result: *mut Hkey)
-    -> i32;
+    fn RegOpenKeyExW(
+        hkey: Hkey,
+        subkey: *const u16,
+        options: u32,
+        sam: u32,
+        result: *mut Hkey,
+    ) -> i32;
     fn RegSetValueExW(
         hkey: Hkey,
         name: *const u16,

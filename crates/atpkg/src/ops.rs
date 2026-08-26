@@ -146,7 +146,6 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
     out
 }
 
-
 /// The **tool names** whose `bin/` shims currently point into `store/<program>/<build>/`
 /// — the exact tool set a rollback must re-point (or drop). Reuses
 /// [`program_build_of_target`], so it matches only shims that actually resolve into this

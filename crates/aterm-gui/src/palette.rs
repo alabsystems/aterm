@@ -1596,7 +1596,11 @@ mod tests {
             ("", "", ""),
         ];
         for (source, mac, other) in cases {
-            let want = if cfg!(target_os = "macos") { mac } else { other };
+            let want = if cfg!(target_os = "macos") {
+                mac
+            } else {
+                other
+            };
             assert_eq!(platform_accel(source), want, "{source:?}");
         }
     }
@@ -1731,7 +1735,11 @@ mod tests {
         // The row's METADATA is preserved verbatim (that is this test's subject);
         // its PROJECTION is platform-aware — a lone macOS key-equivalent leaves
         // nothing behind off macOS (audit I9).
-        let expect_accel = if cfg!(target_os = "macos") { "Cmd-S" } else { "" };
+        let expect_accel = if cfg!(target_os = "macos") {
+            "Cmd-S"
+        } else {
+            ""
+        };
         assert_eq!(row_accel(&s.rows[0]), expect_accel);
         assert!(matches!(
             &s.rows[0].action,

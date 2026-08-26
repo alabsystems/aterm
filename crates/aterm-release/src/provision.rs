@@ -90,13 +90,21 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
              there is no release to seed the roster from and no channel to provision for",
         )
     })?;
-    let mode = if check_only { " --check (no writes)" } else { "" };
+    let mode = if check_only {
+        " --check (no writes)"
+    } else {
+        ""
+    };
     println!("aterm-release · provision {id} (channel {slug}){mode}");
     // No table of contents above the phases. The five names it listed are the five phase
     // headers printed below it, one at a time, each already carrying `[n/5]` — so it was
     // the plan said twice, at the top, where the operator is scanning for the first real
     // line.
-    phase(1, "roster", "the master-signed list of machines allowed to publish");
+    phase(
+        1,
+        "roster",
+        "the master-signed list of machines allowed to publish",
+    );
 
     // ---- 1. the roster pair: newest verified generation into dist/ ----------------
     let home = std::env::var("HOME").map_err(|_| Error::new("HOME is not set"))?;
@@ -305,7 +313,11 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
         print_check(label, &check);
         into.push((label, check));
     };
-    phase(2, "build stack", "the toolchain and SDK a cut compiles with");
+    phase(
+        2,
+        "build stack",
+        "the toolchain and SDK a cut compiles with",
+    );
     // The two checks below run only behind a PROVEN stage2. Without one they had nothing
     // to look at and returned a Skip whose whole content was "see the toolchain line" —
     // two full lines carrying nothing, in the densest part of the output, directly under
@@ -327,7 +339,11 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     record("x86 slice", x86_slice_check(), &mut checks);
     record("apple sdk", apple_clt_check(), &mut checks);
 
-    phase(3, "Apple certificate", "this machine's own Developer ID identity");
+    phase(
+        3,
+        "Apple certificate",
+        "this machine's own Developer ID identity",
+    );
     // The SHA-1 the profile pins comes back BESIDE the check, not out of it. It used to be
     // formatted into an English sentence and then scraped back out with a 40-hex regex over
     // the printed line — and on a machine with two certificates that regex pinned whichever
@@ -335,12 +351,20 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     let (apple_check, apple_sha1) = apple_identity_check(id, !check_only);
     record(crate::apple::APPLE_LABEL, apple_check, &mut checks);
 
-    phase(4, "notary", "the credential Apple's notarization service answers to");
+    phase(
+        4,
+        "notary",
+        "the credential Apple's notarization service answers to",
+    );
     record("notary", notary_acquire(!check_only), &mut checks);
 
     phase(5, "credentials", "the tokens and profile a cut is handed");
     record("github", gh_check(), &mut checks);
-    record("channel", channel_token_check(&slug, !check_only), &mut checks);
+    record(
+        "channel",
+        channel_token_check(&slug, !check_only),
+        &mut checks,
+    );
 
     // The profile is deliberately NOT audited here, and not yet written. It is the one
     // item provision PRODUCES, and it is produced from the key the mint below writes —
@@ -902,8 +926,8 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provisi
         // This is the checkout's own discovered anchor, not another tree's.
         pins_explicit: false,
     };
-    let pre = prov::preflight(prov::Verb::Join, id, prov::DEFAULT_HEAD_ID, &paths)
-        .map_err(Error::new)?;
+    let pre =
+        prov::preflight(prov::Verb::Join, id, prov::DEFAULT_HEAD_ID, &paths).map_err(Error::new)?;
     let phrase = prompt_master_with_retries()?;
     let seed = phrase.seed();
     // The fingerprint is printed HERE and nowhere else. It used to be printed on the way
@@ -986,12 +1010,7 @@ fn prompt_master_with_retries() -> Result<atpkg_keys::master::MasterPhrase> {
             Ok(phrase) => return Ok(phrase),
             Err(typo) if left > 0 => {
                 step("master", &typo.message());
-                step(
-                    "",
-                    &format!(
-                        "nothing written — try again ({left} left)"
-                    ),
-                );
+                step("", &format!("nothing written — try again ({left} left)"));
             }
             Err(typo) => {
                 return Err(Error::new(format!(
@@ -1024,8 +1043,9 @@ fn admit_candidate(
     bytes: Vec<u8>,
     sig: Vec<u8>,
 ) -> std::result::Result<Candidate, String> {
-    let verified = roster::verify_roster(master_pubkeys, bytes.clone(), &sig)
-        .map_err(|e| format!("the roster did not verify under the committed paper master ({e:?})"))?;
+    let verified = roster::verify_roster(master_pubkeys, bytes.clone(), &sig).map_err(|e| {
+        format!("the roster did not verify under the committed paper master ({e:?})")
+    })?;
     let parsed = Roster::parse(&verified)
         .map_err(|e| format!("the roster verified but did not parse ({e:?})"))?;
     Ok(Candidate {
@@ -1063,32 +1083,32 @@ fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
         )));
     }
     let doc = machines::RosterDocument::read(roster_path)?;
-    let c = admit_candidate(pins::PAPER_MASTER_PUBKEYS, doc.bytes, doc.signature)
-        .map_err(|e| {
-            Error::new(format!(
-                "the dist/ roster pair is unusable: {e}. Refusing to overwrite local \
+    let c = admit_candidate(pins::PAPER_MASTER_PUBKEYS, doc.bytes, doc.signature).map_err(|e| {
+        Error::new(format!(
+            "the dist/ roster pair is unusable: {e}. Refusing to overwrite local \
                  roster state this tool cannot prove — if it was a hand-copy, re-copy \
                  BOTH files from the source machine; remove both files to accept the \
                  channel release's pair instead",
-            ))
-        })?;
+        ))
+    })?;
     Ok(Some(c))
 }
 
 /// The latest channel release's pair, fetched anonymously and admitted.
 #[cfg(unix)]
 fn fetch_channel_candidate(slug: &str) -> std::result::Result<Candidate, String> {
-    let bytes = curl_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
-        // Only the BODY's clean 404 means "no roster published yet"; everything else
-        // (a missing signature beside a present body, 429/403, a timeout, a
-        // wrongly-slugged or private repo answering 404 for the sig only) is "cannot
-        // tell" — the mint gate treats those differently.
-        if e.contains("returned error: 404") {
-            format!("{NO_CHANNEL_ROSTER}: {e}")
-        } else {
-            e
-        }
-    })?;
+    let bytes =
+        curl_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
+            // Only the BODY's clean 404 means "no roster published yet"; everything else
+            // (a missing signature beside a present body, 429/403, a timeout, a
+            // wrongly-slugged or private repo answering 404 for the sig only) is "cannot
+            // tell" — the mint gate treats those differently.
+            if e.contains("returned error: 404") {
+                format!("{NO_CHANNEL_ROSTER}: {e}")
+            } else {
+                e
+            }
+        })?;
     let sig = curl_fetch(&release_asset_url(slug, roster::ROSTER_SIG_ASSET), 4_096)
         .map_err(|e| format!("roster present but its signature could not be fetched: {e}"))?;
     admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, sig)
@@ -1338,7 +1358,10 @@ pub(crate) fn publish_proven_pair(
 /// itself, and outside any checkout a `git clean` can sweep.
 #[cfg(unix)]
 fn kept_roster_path(home: &str) -> PathBuf {
-    Path::new(home).join(".aterm").join("roster").join(roster::ROSTER_ASSET)
+    Path::new(home)
+        .join(".aterm")
+        .join("roster")
+        .join(roster::ROSTER_ASSET)
 }
 
 /// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`. `Ok(true)` when a
@@ -1418,12 +1441,18 @@ fn restore_kept_pair(
 #[cfg(unix)]
 enum Check {
     Pass(String),
-    Fail { what: String, fix: String },
+    Fail {
+        what: String,
+        fix: String,
+    },
     /// Progress, waiting on the operator — the certificate request is at Apple. Distinct
     /// from `Fail` because "MISSING" reads as a fault to repair and this is a step to
     /// take, but it counts against READY TO CUT all the same, and it defers the mint for
     /// the same reason a Fail does: a roster id is irreversible.
-    Todo { what: String, next: String },
+    Todo {
+        what: String,
+        next: String,
+    },
     Skip(String),
 }
 
@@ -1500,7 +1529,10 @@ fn verifiers_check(bin: &Path) -> Check {
         .filter(|t| !bin.join(t).is_file())
         .collect();
     if missing.is_empty() {
-        Check::Pass(format!("targo + tippy + ty + trustdoc present in {}", bin.display()))
+        Check::Pass(format!(
+            "targo + tippy + ty + trustdoc present in {}",
+            bin.display()
+        ))
     } else {
         // Not `bootstrap-publisher.sh`: it resolves an existing stage2 and stops, so it
         // would report success over exactly this gap. A stage2 missing its tools has to
@@ -1680,8 +1712,9 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
         }
         // Dangling: following the link finds nothing, so replacing it destroys
         // nothing.
-        Ok(m) if m.file_type().is_symlink()
-            && matches!(&std::fs::metadata(farm),
+        Ok(m)
+            if m.file_type().is_symlink()
+                && matches!(&std::fs::metadata(farm),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound) => {}
         Ok(_) => {
             return Err(format!(
@@ -1810,7 +1843,9 @@ fn x86_slice_check() -> Check {
         return Check::Skip("universal DMG builds run on macOS".into());
     }
     match gates::x86_target_probe() {
-        Ok(()) => Check::Pass("stable x86_64-apple-darwin target installed (universal slice)".into()),
+        Ok(()) => {
+            Check::Pass("stable x86_64-apple-darwin target installed (universal slice)".into())
+        }
         // The WHOLE fault, and the shared remedy text. The probe no longer carries a
         // hand-indented `fix:`/`or:` block of its own, so nothing has to be truncated to
         // keep this line on the grid — and truncating it used to throw away the rustup
@@ -1879,7 +1914,7 @@ fn apple_identity_check(id: &str, may_change: bool) -> (Check, Option<String>) {
                             fix: format!("re-run `cargo ship provision --id {id}`"),
                         },
                         None,
-                    )
+                    );
                 }
                 1 => format!("Developer ID Application [{}]", ids[0]),
                 n => format!(
@@ -1943,7 +1978,13 @@ fn gaps(fails: usize, waiting: usize) -> String {
 /// bind cannot drift apart — including the refusal, which is where the whole value is.
 #[cfg(unix)]
 fn authorize(bytes: Vec<u8>, sig: &[u8], pubkey: &str) -> Result<roster::Attribution> {
-    machines::authorize_cut(pins::PAPER_MASTER_PUBKEYS, bytes, sig, pubkey, now_unix()? as i64)
+    machines::authorize_cut(
+        pins::PAPER_MASTER_PUBKEYS,
+        bytes,
+        sig,
+        pubkey,
+        now_unix()? as i64,
+    )
     .map_err(|e| {
         Error::new(format!(
             "{e}\nprovision: the machine key exists but the roster on disk does not \
@@ -2007,9 +2048,9 @@ fn notary_check() -> Check {
         .args(["notarytool", "history", "--keychain-profile", profile])
         .output()
     {
-        Ok(out) if out.status.success() => {
-            Check::Pass(format!("notarytool profile '{profile}' answers (live-checked)"))
-        }
+        Ok(out) if out.status.success() => Check::Pass(format!(
+            "notarytool profile '{profile}' answers (live-checked)"
+        )),
         Ok(out) => Check::Fail {
             what: format!(
                 "notarytool profile '{profile}' did not authenticate: {}",
@@ -2075,8 +2116,7 @@ fn profile_check(
                 what: "not written yet: it pins the Developer ID certificate, and the \
                        apple id line above has not produced one"
                     .into(),
-                next: "nothing to do here — settle the apple id line and this writes itself"
-                    .into(),
+                next: "nothing to do here — settle the apple id line and this writes itself".into(),
             };
         }
         return Check::Fail {
@@ -2089,7 +2129,12 @@ fn profile_check(
         // `load`'s error already names the file and the exact defect — the missing
         // `signing_key`, the mode the cut refuses, a key that is not PKCS#8 Ed25519 — in
         // the words the cut itself would use.
-        Err(e) => return Check::Fail { what: e, fix: rewrite },
+        Err(e) => {
+            return Check::Fail {
+                what: e,
+                fix: rewrite,
+            };
+        }
     };
     // Everything below is what `load` cannot know: the world this run just measured.
     if creds.notary().is_none() {
@@ -2102,7 +2147,10 @@ fn profile_check(
     // profile carried over from another machine is refused here instead of there.
     if let Some(declared) = creds.machine_id().filter(|d| *d != id) {
         return Check::Fail {
-            what: format!("{} declares machine_id = \"{declared}\", not '{id}'", path.display()),
+            what: format!(
+                "{} declares machine_id = \"{declared}\", not '{id}'",
+                path.display()
+            ),
             fix: rewrite,
         };
     }
@@ -2169,7 +2217,10 @@ fn profile_check(
         // The line claims exactly what was demonstrated: `load` accepted this file. It
         // does not list the keys, because listing them is what the old check did instead
         // of proving them.
-        _ => Check::Pass(format!("{} loads under the cut's own rules", path.display())),
+        _ => Check::Pass(format!(
+            "{} loads under the cut's own rules",
+            path.display()
+        )),
     }
 }
 
@@ -2371,8 +2422,7 @@ mod tests {
         // local ahead → keep, never downgrade
         let (_, b, s) = signed_candidate(9);
         let local = admit_candidate(&[&master], b, s).unwrap();
-        let (chosen, install, how) =
-            choose_candidate(path, "o/r", Some(local), Ok(older)).unwrap();
+        let (chosen, install, how) = choose_candidate(path, "o/r", Some(local), Ok(older)).unwrap();
         assert_eq!(chosen.roster.roster_seq, 9);
         assert!(!install);
         assert!(how.contains("AHEAD"), "{how}");
@@ -2381,8 +2431,7 @@ mod tests {
         let (_, b, s) = signed_candidate(4);
         let local = admit_candidate(&[&master], b.clone(), s.clone()).unwrap();
         let fetched = admit_candidate(&[&master], b, s).unwrap();
-        let (_, install, how) =
-            choose_candidate(path, "o/r", Some(local), Ok(fetched)).unwrap();
+        let (_, install, how) = choose_candidate(path, "o/r", Some(local), Ok(fetched)).unwrap();
         assert!(!install);
         assert!(how.contains("byte-identical"), "{how}");
 
@@ -2484,7 +2533,10 @@ mod tests {
         let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("keypair");
         let pair = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).expect("keypair");
         let b64 = base64::engine::general_purpose::STANDARD;
-        (b64.encode(doc.as_ref()), b64.encode(pair.public_key().as_ref()))
+        (
+            b64.encode(doc.as_ref()),
+            b64.encode(pair.public_key().as_ref()),
+        )
     }
 
     /// The audit must refuse exactly what the cut refuses. Each profile below is a way
@@ -2559,7 +2611,10 @@ mod tests {
         // A roster path that no longer exists: dist/ is gitignored and sweepable, and the
         // cut reads whatever the profile names.
         write(
-            &format!("{good}machine_roster = \"{}\"\n", home.join("gone/roster.toml").display()),
+            &format!(
+                "{good}machine_roster = \"{}\"\n",
+                home.join("gone/roster.toml").display()
+            ),
             0o600,
         );
         let what = refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
@@ -2587,8 +2642,14 @@ mod tests {
     /// the one line an operator reads as a verdict. It used to call both FAILED.
     #[test]
     fn waiting_on_apple_is_counted_apart_from_a_fault() {
-        let fail = || Check::Fail { what: String::new(), fix: String::new() };
-        let todo = || Check::Todo { what: String::new(), next: String::new() };
+        let fail = || Check::Fail {
+            what: String::new(),
+            fix: String::new(),
+        };
+        let todo = || Check::Todo {
+            what: String::new(),
+            next: String::new(),
+        };
         let checks = vec![
             ("a", fail()),
             ("b", todo()),
@@ -2701,13 +2762,19 @@ mod tests {
         // Executable in the later dir resolves…
         std::fs::set_permissions(b.join("trustdoc"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        assert_eq!(resolve_on_path("trustdoc", &joined), Some(b.join("trustdoc")));
+        assert_eq!(
+            resolve_on_path("trustdoc", &joined),
+            Some(b.join("trustdoc"))
+        );
 
         // …and the earlier dir wins once it has one, exactly like exec.
         std::fs::write(a.join("trustdoc"), b"").unwrap();
         std::fs::set_permissions(a.join("trustdoc"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        assert_eq!(resolve_on_path("trustdoc", &joined), Some(a.join("trustdoc")));
+        assert_eq!(
+            resolve_on_path("trustdoc", &joined),
+            Some(a.join("trustdoc"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

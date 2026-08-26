@@ -117,10 +117,18 @@ fn main() {
     // nonzero third component is an unambiguous dev signature. "0" when git
     // or the tag is unavailable (a source-tarball build still marks DEV via
     // the release-env discriminator; only the counter degrades).
-    let dev_commits = run("git", &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
-        .and_then(|tag| run("git", &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"]))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "0".into());
+    let dev_commits = run(
+        "git",
+        &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"],
+    )
+    .and_then(|tag| {
+        run(
+            "git",
+            &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"],
+        )
+    })
+    .map(|s| s.trim().to_string())
+    .unwrap_or_else(|| "0".into());
     println!("cargo:rustc-env=ATERM_DEV_COMMITS={dev_commits}");
 
     // Monotonic build number, epoch-scale (seconds). The updater's "apply only if
@@ -157,11 +165,13 @@ fn main() {
         // BSD date spells "format this epoch" `-r <epoch>`; GNU date spells it
         // `-d @<epoch>` (its -r means "a file's mtime"). Try BSD first — on GNU
         // the bare number is a missing file, a clean failure — then GNU.
-        Ok(epoch) if !epoch.is_empty() => {
-            run("date", &["-u", "-r", &epoch, "+%Y-%m-%dT%H:%M:%SZ"]).or_else(|| {
-                run("date", &["-u", "-d", &format!("@{epoch}"), "+%Y-%m-%dT%H:%M:%SZ"])
-            })
-        }
+        Ok(epoch) if !epoch.is_empty() => run("date", &["-u", "-r", &epoch, "+%Y-%m-%dT%H:%M:%SZ"])
+            .or_else(|| {
+                run(
+                    "date",
+                    &["-u", "-d", &format!("@{epoch}"), "+%Y-%m-%dT%H:%M:%SZ"],
+                )
+            }),
         _ => run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
     }
     .unwrap_or_else(|| "unknown".into());
@@ -241,7 +251,6 @@ fn main() {
         }
     }
 }
-
 
 /// `"on"` iff this compile really runs the Trust verification pipeline.
 ///

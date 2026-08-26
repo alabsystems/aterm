@@ -50,11 +50,23 @@ EXIT CODES
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Cmd {
-    Survey { cells: Vec<String>, top: usize, json: Option<PathBuf> },
-    Blame { pkg: String, cells: Vec<String> },
-    Budget { update: bool, allow_regress: Option<String> },
+    Survey {
+        cells: Vec<String>,
+        top: usize,
+        json: Option<PathBuf>,
+    },
+    Blame {
+        pkg: String,
+        cells: Vec<String>,
+    },
+    Budget {
+        update: bool,
+        allow_regress: Option<String>,
+    },
     Attest,
-    Check { cells: Vec<String> },
+    Check {
+        cells: Vec<String>,
+    },
     Help,
 }
 
@@ -102,9 +114,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
     let mut operand: Option<String> = None;
 
     let verb = loop {
-        let Some(a) = it.next() else { return Err(ParseError::NoVerb) };
+        let Some(a) = it.next() else {
+            return Err(ParseError::NoVerb);
+        };
         match a.as_str() {
-            "-h" | "--help" | "help" => return Ok(Invocation { root, cmd: Cmd::Help }),
+            "-h" | "--help" | "help" => {
+                return Ok(Invocation {
+                    root,
+                    cmd: Cmd::Help,
+                });
+            }
             "--root" => root = Some(PathBuf::from(next(&mut it, "--root")?)),
             other if other.starts_with('-') => return Err(ParseError::UnexpectedArg(other.into())),
             other => break other.to_string(),
@@ -113,7 +132,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
 
     while let Some(a) = it.next() {
         match a.as_str() {
-            "-h" | "--help" => return Ok(Invocation { root, cmd: Cmd::Help }),
+            "-h" | "--help" => {
+                return Ok(Invocation {
+                    root,
+                    cmd: Cmd::Help,
+                });
+            }
             "--root" => root = Some(PathBuf::from(next(&mut it, "--root")?)),
             "--cell" => cells.push(next(&mut it, "--cell")?),
             "--top" => {
@@ -134,7 +158,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
             pkg: operand.ok_or(ParseError::MissingOperand("a package name"))?,
             cells,
         },
-        "budget" => Cmd::Budget { update, allow_regress },
+        "budget" => Cmd::Budget {
+            update,
+            allow_regress,
+        },
         "attest" => Cmd::Attest,
         "check" => Cmd::Check { cells },
         other => return Err(ParseError::UnknownVerb(other.to_string())),
@@ -157,19 +184,31 @@ mod tests {
     #[test]
     fn survey_defaults_to_every_cell_and_forty_rows() {
         let inv = p(&["survey"]).unwrap();
-        assert_eq!(inv.cmd, Cmd::Survey { cells: vec![], top: 40, json: None });
+        assert_eq!(
+            inv.cmd,
+            Cmd::Survey {
+                cells: vec![],
+                top: 40,
+                json: None
+            }
+        );
     }
 
     #[test]
     fn cell_flag_repeats() {
         let inv = p(&["survey", "--cell", "mac-arm", "--cell", "linux"]).unwrap();
-        let Cmd::Survey { cells, .. } = inv.cmd else { panic!("wrong verb") };
+        let Cmd::Survey { cells, .. } = inv.cmd else {
+            panic!("wrong verb")
+        };
         assert_eq!(cells, vec!["mac-arm", "linux"]);
     }
 
     #[test]
     fn blame_requires_a_package() {
-        assert_eq!(p(&["blame"]).unwrap_err(), ParseError::MissingOperand("a package name"));
+        assert_eq!(
+            p(&["blame"]).unwrap_err(),
+            ParseError::MissingOperand("a package name")
+        );
     }
 
     #[test]
@@ -180,7 +219,10 @@ mod tests {
 
     #[test]
     fn a_flag_missing_its_value_is_a_typed_error_not_a_panic() {
-        assert_eq!(p(&["survey", "--top"]).unwrap_err(), ParseError::MissingValue("--top"));
+        assert_eq!(
+            p(&["survey", "--top"]).unwrap_err(),
+            ParseError::MissingValue("--top")
+        );
     }
 
     #[test]

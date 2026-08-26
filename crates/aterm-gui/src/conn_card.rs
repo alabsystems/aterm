@@ -202,12 +202,18 @@ impl ConnCardState {
 
     /// Whether the S→T half is selected under the current direction.
     fn src_to_dst_selected(&self) -> bool {
-        matches!(self.direction, CardDirection::SrcToDst | CardDirection::Both)
+        matches!(
+            self.direction,
+            CardDirection::SrcToDst | CardDirection::Both
+        )
     }
 
     /// Whether the T→S half is selected.
     fn dst_to_src_selected(&self) -> bool {
-        matches!(self.direction, CardDirection::DstToSrc | CardDirection::Both)
+        matches!(
+            self.direction,
+            CardDirection::DstToSrc | CardDirection::Both
+        )
     }
 
     /// The Confirm plan — pure §2.5 SET semantics against the open-time
@@ -275,8 +281,7 @@ impl ConnCardState {
             CardRow::Kind => {
                 let i = KINDS.iter().position(|k| *k == self.kind).unwrap_or(0);
                 let n = KINDS.len() as isize;
-                self.kind =
-                    KINDS[usize::try_from((i as isize + delta).rem_euclid(n)).unwrap_or(0)];
+                self.kind = KINDS[usize::try_from((i as isize + delta).rem_euclid(n)).unwrap_or(0)];
             }
         }
     }
@@ -356,7 +361,11 @@ impl ConnCardState {
     pub(crate) fn title_line(&self) -> String {
         let cap = |t: &str| {
             let s = crate::session_timeline::sanitize_presentation_line(t, 64);
-            if s.is_empty() { "(untitled)".to_string() } else { s }
+            if s.is_empty() {
+                "(untitled)".to_string()
+            } else {
+                s
+            }
         };
         format!(
             "@{} \"{}\" {} @{} \"{}\"",
@@ -475,12 +484,7 @@ fn conn_card_layout(state: &ConnCardState, g: &SettingsGeom) -> ConnCardLayout {
     let rows = CARD_ROWS.min(g.panel_rows.max(1));
     let anchor_row = state.anchor_row.min(g.panel_rows.saturating_sub(rows));
     ConnCardLayout {
-        card: (
-            card_x,
-            anchor_row as f32 * g.ch,
-            card_w,
-            rows as f32 * g.ch,
-        ),
+        card: (card_x, anchor_row as f32 * g.ch, card_w, rows as f32 * g.ch),
     }
 }
 
@@ -507,7 +511,11 @@ fn conn_card_hit_rects(
         let h = (g.ch - 2.0).max(0.0);
         let mut x = card_x
             + INSET_CELLS * g.cw
-            + if from_label_col { LABEL_CELLS * g.cw } else { 0.0 };
+            + if from_label_col {
+                LABEL_CELLS * g.cw
+            } else {
+                0.0
+            };
         for (hit, label) in hits {
             let w = text_w(label, body_px) + 2.0 * CHIP_PAD_CELLS * g.cw;
             let w = w.min((card_x + card_w - x - g.cw).max(0.0));
@@ -901,11 +909,19 @@ mod tests {
         c.move_focus();
         c.cycle_value(1); // Both -> wraps to Pull
         assert_eq!(c.kind, ConnectionKind::Pull);
-        assert_eq!(c.direction, CardDirection::SrcToDst, "kind cycling never moves direction");
+        assert_eq!(
+            c.direction,
+            CardDirection::SrcToDst,
+            "kind cycling never moves direction"
+        );
         c.move_focus();
         c.cycle_value(1);
         assert_eq!(c.direction, CardDirection::DstToSrc);
-        assert_eq!(c.kind, ConnectionKind::Pull, "direction cycling never moves kind");
+        assert_eq!(
+            c.kind,
+            ConnectionKind::Pull,
+            "direction cycling never moves kind"
+        );
     }
 
     /// The title names S and T by sid+title and its arrow tracks the live

@@ -419,9 +419,7 @@ impl BenchApp {
         let App {
             backend, windows, ..
         } = &mut self.app;
-        let ws = windows
-            .get_mut(&self.wid)
-            .expect("bench fixture window");
+        let ws = windows.get_mut(&self.wid).expect("bench fixture window");
         let BackendSlot::Ready(Backend::Cpu(renderer)) = backend else {
             unreachable!("headless_for_test always builds a ready CPU backend");
         };
@@ -464,7 +462,6 @@ impl BenchApp {
         }
         h
     }
-
 
     /// THE TAB-STRIP FRAME (D-2 SPLICE / DMG-1 reach), modelled at exactly the
     /// three seams the strip-lane fix touches and in the shipping order —
@@ -545,7 +542,11 @@ impl BenchApp {
     /// would advance `base_y` and honestly force the full arm on both sides).
     pub fn strip_echo(&mut self, tick: &mut u8) {
         *tick = tick.wrapping_add(1);
-        let bytes: &[u8] = if tick.is_multiple_of(2) { b"\rx" } else { b"\ry" };
+        let bytes: &[u8] = if tick.is_multiple_of(2) {
+            b"\rx"
+        } else {
+            b"\ry"
+        };
         let term = self
             .app
             .pool

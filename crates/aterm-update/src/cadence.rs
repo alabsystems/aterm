@@ -428,7 +428,11 @@ mod tests {
         let mut c = Cadence::new(hour);
         assert_eq!(c.nominal(), hour);
         c.failed();
-        assert_eq!(c.nominal(), hour, "the first retry is still the base interval");
+        assert_eq!(
+            c.nominal(),
+            hour,
+            "the first retry is still the base interval"
+        );
         c.failed();
         assert!(
             c.nominal() > hour,
@@ -451,7 +455,11 @@ mod tests {
         let anon = Duration::from_secs(ANONYMOUS_INTERVAL_SECS);
         let mut c = Cadence::new(anon);
         c.failed();
-        assert_eq!(c.nominal(), anon, "the first retry is still the base interval");
+        assert_eq!(
+            c.nominal(),
+            anon,
+            "the first retry is still the base interval"
+        );
         c.failed();
         assert!(
             c.nominal() > anon,

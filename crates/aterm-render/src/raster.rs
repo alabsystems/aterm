@@ -227,10 +227,8 @@ impl Rasterizer {
                     let base = linestart as isize;
                     let lo = (x0i as isize + 2).max(-base);
                     let hi = (x1i as isize - 1).min(self.a.len() as isize - base);
-                    let mut idx = base + lo;
-                    for _ in lo..hi {
-                        self.add(idx, d * s);
-                        idx += 1;
+                    for i in lo..hi {
+                        self.add(base + i, d * s);
                     }
                     let a2 = a1 + (x1i - x0i - 3) as f32 * s;
                     self.add(linestart as isize + (x1i - 1) as isize, d * (1.0 - a2 - am));

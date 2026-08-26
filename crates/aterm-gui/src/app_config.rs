@@ -31,36 +31,40 @@ use crate::{
 /// defaults OFF; correct the stale tests") restored that after a test-driven revert
 /// put them back.
 ///
-/// TODAY IT OWNS EXACTLY ONE KEY: `pkg_progress_effects`, the provisioning card's
-/// party trim — the cat that stands on the progress bar of the first-run "Installing
-/// the ALab toolchain" toast. It is the decoration the 2026-08 Windows audit actually
-/// caught covering text a user needed, and it is the one whose default no other
-/// surface re-derives, so flipping it changes the product and nothing else.
+/// IT OWNS TWO KEYS.
 ///
-/// WHAT IS NOT IN IT YET, and why — read before adding a key:
-///
-/// * `cursor_trail` (and `cursor_trail_bloom`, which only decorates it). This is the
-///   audit's headline — the default STYLE became `rainbow kitty pet`, a permanently
-///   resident, walking, full-body cat drawn `FreeZ::OverText` across live output,
-///   long after `5b11ff2c` made the "batteries-on delight" call about a ~260 ms
-///   aurora. Flipping it here is a one-line change and it is NOT the work: native
-///   Settings seeds every row from the RESOLVED config, so a Windows default of OFF
-///   re-baselines eleven projection tests — the disclosure ladder ("Inactive · Cursor
+/// * `pkg_progress_effects` — the provisioning card's party trim, the cat that stands
+///   on the progress bar of the first-run "Installing the ALab toolchain" toast.
+/// * `cursor_trail` — the audit's HEADLINE, and the one this family exists for. The
+///   default STYLE became `rainbow kitty pet` long after `5b11ff2c` made the
+///   "batteries-on delight" call about a ~260 ms aurora, so the master now seats a
+///   permanently resident, walking, full-body cat drawn `FreeZ::OverText` across live
+///   output; the auditor photographed it sitting on a line of real terminal text
+///   beside the caret. The owner's own `aterm.toml` already writes
+///   `cursor_trail = false` by hand — a default a user has to undo is not a default.
+///   Native Settings seeds every row from the RESOLVED config, so this default
+///   re-baselines the Windows projection of the disclosure ladder ("Inactive · Cursor
 ///   trail Off" on every dependent row), the music-suppression reason, the
-///   cursor-runway preview, the compact pickers' pagination and two paint-overflow
-///   matrices. Those new screens are CORRECT (they are what a macOS user with
-///   `cursor_trail = false` sees today) but nobody has reviewed them, and the
-///   fixtures cannot dodge it by seeding the key: writing it makes the row Modified,
-///   which changes the very projection they measure. A cheaper aim at the same
-///   target is to split the default STYLE instead of the master, leaving the aurora
-///   (the thing that was actually decided) alone.
+///   cursor-runway preview and the compact pickers' pagination — those screens are
+///   exactly what a macOS owner with `cursor_trail = false` sees today, and they were
+///   reviewed as part of this change rather than left to a later hand.
+///
+/// WHAT IS NOT IN IT, and why — read before adding a key:
+///
+/// * `cursor_trail_bloom`. Every consumer reads it as `cursor_trail_or_default() && …`,
+///   so with the master off it can already emit nothing; splitting it would buy no
+///   pixel and no millisecond, and would only degrade the look for the Windows owner
+///   who opts back in with `cursor_trail = true`.
 /// * `[sparkle_words] enabled` — the word engine pushes its animal heads
-///   `FreeZ::UnderText`, so every glyph still draws on top of the fur and it never
-///   covers live output. (It is also a live product gate in native Settings with its
-///   own disclosure ladder and migration path.) See
-///   [`Config::sparkle_words_enabled_or_default`].
+///   `FreeZ::UnderText`, so every glyph still draws on top of the fur: it decorates
+///   output rather than covering it, and its population is capped (`MAX_CATS = 8`)
+///   rather than accumulating. (It is also a live product gate in native Settings with
+///   its own disclosure ladder and migration path.) See
+///   [`Config::sparkle_words_enabled_or_default`], which also names the one honest
+///   exception.
 /// * `hdr_glow`, `cursor_fire_shimmer` — both default ON, and both only do work on
-///   frames carrying cursor-GLOW quads, which the trail produces.
+///   frames carrying cursor-GLOW quads, which only the trail produces; with the
+///   Windows trail default off, a fresh Windows config already pays neither.
 /// * `stream_fade` (already OFF everywhere since `6272bd7a`), `show_hud` (a retired
 ///   key — the HUD is gone), functional motion, the visual bell, cursor blink, and
 ///   everything already opt-in (Robi, the ambient sound bed).
@@ -2820,21 +2824,32 @@ impl Config {
         ))
     }
 
-    /// Whether the cursor motion-trail ("streaming trailer") is on. DEFAULT ON with the
-    /// `rainbow kitty` style (owner call — batteries-on delight): the trail ignites a ~260ms
-    /// additive aurora on each cursor move and decays to EXACTLY 0% idle, so a still
-    /// screen costs nothing. The GPU bloom pass is effect-frame-only and load-sheds
-    /// under pressure. Opt out with `cursor_trail = false`.
+    /// Whether the cursor motion-trail ("streaming trailer") is on. Default
+    /// [`DEFAULT_DECORATIVE_EFFECTS`]: ON as an opt-OUT everywhere except Windows,
+    /// where the minimal-fast directive makes it an opt-IN.
     ///
-    /// STILL ON ON WINDOWS, and that is an open question rather than a settled one:
-    /// see [`DEFAULT_DECORATIVE_EFFECTS`], which carries the platform split and spells
-    /// out exactly what this key would cost. The resident walking cat it brings (the
-    /// default STYLE became `rainbow kitty pet` after the delight call was made about
-    /// a ~260 ms aurora) is what the 2026-08 Windows audit objected to, and turning
-    /// this key off by platform re-baselines eleven native-Settings projection tests —
-    /// a Settings review, not a default change.
+    /// ON (mac/Linux, and any host that says `cursor_trail = true`) the trail ignites a
+    /// ~260 ms additive aurora on each cursor move and decays to EXACTLY 0% idle, so a
+    /// still screen costs nothing; the GPU bloom pass is effect-frame-only and
+    /// load-sheds under pressure. That aurora is what `5b11ff2c` decided — the owner's
+    /// batteries-on delight call — and it stands, unchanged, on those platforms.
+    ///
+    /// OFF ON WINDOWS, because the key stopped meaning the thing that was decided. The
+    /// default STYLE later became `rainbow kitty pet`, so this master now also seats a
+    /// PERMANENTLY RESIDENT walking cat drawn `FreeZ::OverText` across live output — the
+    /// 2026-08 Windows audit photographed it sitting on a line of real terminal text
+    /// beside the caret. A decoration that covers output it did not produce is the one
+    /// thing the minimal-fast directive rules out, and the owner's own `aterm.toml`
+    /// already wrote `cursor_trail = false` by hand: a default a user has to undo is not
+    /// a default. Turning it off also stops the four expensive effect pipelines this
+    /// master alone can bind (see [`Self::warms_effect_pipelines`]) from ever being
+    /// asked for.
+    ///
+    /// This is a DEFAULT, never a veto: a Windows user who wants the cat writes
+    /// `cursor_trail = true` and gets it, whole. Nothing about the trail's behaviour,
+    /// its style, or its gates differs by platform once it is on.
     pub(crate) fn cursor_trail_or_default(&self) -> bool {
-        self.cursor_trail.unwrap_or(true)
+        self.cursor_trail.unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
     }
 
     /// Whether a config APPLY should warm the demand-driven effect pipelines
@@ -3626,21 +3641,34 @@ impl Config {
     /// default so no consumer re-types it.
     ///
     /// DEFAULT ON, on every platform, and deliberately NOT a member of the
-    /// [`DEFAULT_DECORATIVE_EFFECTS`] family. Two reasons, both checked rather than
-    /// assumed:
+    /// [`DEFAULT_DECORATIVE_EFFECTS`] family — re-decided in 2026-08 when
+    /// `cursor_trail` DID join it, so this is a live judgement and not an omission.
+    /// Three reasons, all checked against the code rather than assumed:
     ///
-    /// * It does not paint OVER terminal output. A matched word gets its animal head
-    ///   pushed `FreeZ::UnderText` (`word_decorations`), so every glyph still draws
-    ///   on top of the fur — the 2026-08 Windows audit's claim that the engine
-    ///   "REPLACES the words fox and dog" is wrong on the code. The resident cat, the
-    ///   trail bloom and the provisioning card's cat are the three that really do
-    ///   cover live pixels, and those are the three `6272bd7a` named.
+    /// * It DECORATES output; it does not cover it. A matched word gets its animal
+    ///   head pushed `FreeZ::UnderText` (`word_decorations`), so every glyph still
+    ///   draws on top of the fur — the 2026-08 Windows audit's claim that the engine
+    ///   "REPLACES the words fox and dog" is wrong on the code. The resident pet, the
+    ///   trail bloom and the provisioning card's cat are the ones that really do cover
+    ///   live pixels, and each of those now has its own answer.
+    /// * It does not ACCUMULATE. `MAX_CATS = 8` caps the on-screen population no
+    ///   matter how long the dump runs; `persist` (cap `PERSIST_CAP = 512`) is
+    ///   identity bookkeeping, not sprites. The audit's "accumulating across a
+    ///   4000-line dump" is bounded at eight heads.
     /// * This key is not only a config default: native Settings treats it as a LIVE
     ///   PRODUCT GATE, with its own disclosure ladder ("Inactive · Sparkle Words
     ///   master Off"), its own migration path (the patch writer retires it in favour
     ///   of the two independent toy keys), and a dozen projection tests that read it.
     ///   Flipping its default by platform is a Settings redesign, not a default
     ///   change.
+    ///
+    /// THE ONE HONEST EXCEPTION, recorded rather than hidden: the profanity family's
+    /// `supernova` escalation (`[sparkle_words.profanity] supernova_chance`, default
+    /// 30) pushes its blast cloud `FreeZ::OverText`. That is a transient burst, capped
+    /// by `supernova::MAX_ACTIVE_SUPERNOVAE = 1`, and it can only fire when a curse
+    /// word is already on screen — it is not the resident, unprompted decoration on
+    /// ORDINARY output that the minimal-fast directive rules out. If that one path
+    /// ever wants a Windows answer, the aim is `supernova_chance`, not this master.
     pub(crate) fn sparkle_words_enabled_or_default(&self) -> bool {
         self.sparkle_words
             .as_ref()
@@ -4057,15 +4085,20 @@ impl Config {
         }
     }
 
-    /// GPU cursor-comet bloom — the light CROWN around the comet head. DEFAULT ON
-    /// (paired with the on-by-default `cursor_trail`): with the comet's continuous
+    /// GPU cursor-comet bloom — the light CROWN around the comet head. DEFAULT ON,
+    /// paired with whatever `cursor_trail` resolves to: with the comet's continuous
     /// beam this is the shipped "luminous streak" signature. The cost (a half-res
     /// blur pass) runs only on effect frames, which the present-paced pump drives
     /// at the display rate with ~0.2ms frame cost (measured, AMD 780M iGPU); the
     /// `perf_reduced` load-shed latch and `motion` policy both drop it under
     /// pressure/accessibility, and `cursor_trail_bloom = false` opts out.
-    /// (Still ON on Windows: it decorates the trail, so it follows whatever
-    /// `cursor_trail` decides — see that key's note.)
+    ///
+    /// ON EVERY PLATFORM, Windows included, and deliberately NOT a member of the
+    /// [`DEFAULT_DECORATIVE_EFFECTS`] family: every consumer reads this as
+    /// `cursor_trail_or_default() && …`, so the Windows trail default already makes it
+    /// inert on a fresh config. Splitting it too would buy no pixel and no
+    /// millisecond there, and would hand the Windows owner who writes
+    /// `cursor_trail = true` a trail missing its crown.
     pub(crate) fn cursor_trail_bloom_or_default(&self) -> bool {
         self.cursor_trail_bloom.unwrap_or(true)
     }
@@ -9783,9 +9816,13 @@ mod descriptive_title_config_tests {
         // inline on the first frame that ignites is a hitch the eye sees.
         let on: Config = toml::from_str("cursor_trail = true\n").unwrap();
         assert!(on.warms_effect_pipelines());
-        assert!(
+        // …and the ABSENT key follows the platform default, so the warm is exactly
+        // as demand-driven as the trail itself: paid where the trail ships on,
+        // never paid on Windows, where a fresh config can bind none of it.
+        assert_eq!(
             Config::default().warms_effect_pipelines(),
-            "the shipped default leaves the trail on, so the warm still applies"
+            super::DEFAULT_DECORATIVE_EFFECTS,
+            "the warm rides the trail's own platform default, never its own opinion"
         );
     }
     use super::{
@@ -12244,21 +12281,40 @@ mod decorative_effect_default_tests {
         assert!(!cfg("pkg_progress_effects = false").pkg_progress_effects_or_default());
     }
 
-    /// THE KEYS THIS FAMILY DOES NOT OWN — pinned so a later hand cannot quietly
-    /// widen it without meeting the cost the constant documents. `cursor_trail` and
-    /// its bloom re-baseline eleven native-Settings projection tests; the word
-    /// engine draws `FreeZ::UnderText` and is a live Settings product gate. All
-    /// three stay ON everywhere until that work is done and reviewed.
+    /// THE TRAIL MASTER JOINED THE FAMILY, and the two keys beside it did NOT.
+    /// This test pins that boundary in both directions so neither half drifts.
+    ///
+    /// * `cursor_trail` is IN. It is the only key that seats a permanently resident
+    ///   sprite `FreeZ::OverText` on live terminal output, which is the exact thing
+    ///   the minimal-fast directive rules out.
+    /// * `cursor_trail_bloom` is OUT, and that is not an oversight: every consumer
+    ///   reads it as `cursor_trail_or_default() && …`, so with the master off it can
+    ///   emit nothing at all. Splitting an already-inert key would buy no pixel and
+    ///   no millisecond, and would rob the Windows owner who writes
+    ///   `cursor_trail = true` of the crown that makes the trail look shipped.
+    /// * `[sparkle_words] enabled` is OUT on the merits — see
+    ///   [`Config::sparkle_words_enabled_or_default`], which carries the argument
+    ///   and the one honest exception to it.
     #[test]
-    fn the_trail_and_the_word_engine_are_not_platform_split_yet() {
+    fn the_trail_master_is_platform_split_and_its_two_neighbours_are_not() {
         let fresh = Config::default();
-        assert!(
+        assert_eq!(
             fresh.cursor_trail_or_default(),
-            "the trail master is still ON on every platform — see DEFAULT_DECORATIVE_EFFECTS"
+            DEFAULT_DECORATIVE_EFFECTS,
+            "a fresh Windows config stands no resident cat on live output; \
+             elsewhere the delight stays on"
         );
+        // A config that merely EXISTS is still a fresh config for this key.
+        assert_eq!(
+            cfg("font_px = 14.0").cursor_trail_or_default(),
+            DEFAULT_DECORATIVE_EFFECTS
+        );
+        // The two neighbours stay ON everywhere, for the reasons above.
         assert!(fresh.cursor_trail_bloom_or_default());
         assert!(fresh.sparkle_words_enabled_or_default());
-        // …and each still answers to its own key, in both directions.
+        // …and each still answers to its own key, in both directions, on every
+        // platform: this is a DEFAULT, never a veto.
+        assert!(cfg("cursor_trail = true").cursor_trail_or_default());
         assert!(!cfg("cursor_trail = false").cursor_trail_or_default());
         assert!(!cfg("cursor_trail_bloom = false").cursor_trail_bloom_or_default());
         assert!(!cfg("[sparkle_words]\nenabled = false").sparkle_words_enabled_or_default());

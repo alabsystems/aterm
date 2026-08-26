@@ -14,9 +14,6 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -41,6 +38,9 @@ mod manifest_out;
 #[path = "../src/mirror.rs"]
 #[allow(dead_code)]
 mod mirror;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 // Mounted for publish.rs, whose roster reconstruction publishes the pair through the
 // provisioning module's writer lock and redo transaction.
 #[path = "../src/provision.rs"]

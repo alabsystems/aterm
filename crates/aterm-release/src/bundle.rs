@@ -267,7 +267,8 @@ pub fn place_finished_bundle(dist: &Path, version: &str, build: u64) -> Result<u
         .map_err(|e| format!("read {}: {e}", staged.join("Contents/Info.plist").display()))?;
     let sealed_version = sealed_plist_string(&plist, "CFBundleShortVersionString");
     let sealed_build = sealed_plist_string(&plist, "CFBundleVersion");
-    if sealed_version.as_deref() != Some(version) || sealed_build.as_deref() != Some(&build.to_string())
+    if sealed_version.as_deref() != Some(version)
+        || sealed_build.as_deref() != Some(&build.to_string())
     {
         return Err(format!(
             "{} carries {} build {}, not this cut's {version} build {build} — refusing to \
@@ -303,7 +304,11 @@ pub fn place_finished_bundle(dist: &Path, version: &str, build: u64) -> Result<u
             .status()
             .map_err(|e| format!("cp -R into {}: {e}", incoming.display()))?;
         if !plain.success() {
-            return Err(format!("cp -R {} -> {}", staged.display(), incoming.display()));
+            return Err(format!(
+                "cp -R {} -> {}",
+                staged.display(),
+                incoming.display()
+            ));
         }
     }
     let had_live = live.exists();

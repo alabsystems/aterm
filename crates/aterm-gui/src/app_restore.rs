@@ -3285,7 +3285,10 @@ mod tests {
 
         app.remint_carried_connections();
 
-        assert!(app.pending_conn_carry.is_empty(), "the carry drains (one-shot)");
+        assert!(
+            app.pending_conn_carry.is_empty(),
+            "the carry drains (one-shot)"
+        );
         // b's table holds exactly the re-minted `both` rows, all src = a.
         let rows = {
             let ctx = {
@@ -3306,7 +3309,10 @@ mod tests {
             let edges = ctx.edges.lock().unwrap();
             edges.edges()
         };
-        assert!(a_rows.is_empty(), "the lone push half must not mint: {a_rows:?}");
+        assert!(
+            a_rows.is_empty(),
+            "the lone push half must not mint: {a_rows:?}"
+        );
         // The record store was REBUILT (dissolution stays pair-precise).
         {
             let records = app.connections.records();

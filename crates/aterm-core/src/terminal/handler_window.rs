@@ -69,10 +69,8 @@ impl TerminalHandler<'_> {
         // a matching rule (Execute | !Execute) wins over the legacy
         // `allow_window_ops` bool. On fallthrough the bool is authoritative
         // (design §6.3 Release N backward-compat).
-        let window_cap = mint_authority.try_mint_with_engine(
-            self.policy.xtwinops_gate(ps),
-            self.modes.allow_window_ops,
-        );
+        let window_cap = mint_authority
+            .try_mint_with_engine(self.policy.xtwinops_gate(ps), self.modes.allow_window_ops);
 
         match window_cap.as_ref() {
             Some(cap) => {

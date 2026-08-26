@@ -242,7 +242,11 @@ pub fn parse(text: &str) -> Result<Policy, String> {
         }
     }
 
-    Ok(Policy { forge, forks, doc: Some(doc) })
+    Ok(Policy {
+        forge,
+        forks,
+        doc: Some(doc),
+    })
 }
 
 fn header(item: &Item) -> Result<ForgeHeader, String> {
@@ -276,9 +280,9 @@ fn header(item: &Item) -> Result<ForgeHeader, String> {
              package = \"aterm\" }}]"
         )
     })?;
-    let arr = cells_item.as_array().ok_or_else(|| {
-        format!("{POLICY_PATH}: [forge] cells must be an array of inline tables")
-    })?;
+    let arr = cells_item
+        .as_array()
+        .ok_or_else(|| format!("{POLICY_PATH}: [forge] cells must be an array of inline tables"))?;
     let mut cells = Vec::new();
     for (n, v) in arr.iter().enumerate() {
         let ct = v.as_inline_table().ok_or_else(|| {
@@ -302,7 +306,11 @@ fn header(item: &Item) -> Result<ForgeHeader, String> {
         ));
     }
 
-    Ok(ForgeHeader { loc_method, graph_method, cells })
+    Ok(ForgeHeader {
+        loc_method,
+        graph_method,
+        cells,
+    })
 }
 
 fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
@@ -313,7 +321,14 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
     let ctx = format!("[[fork]] `{name}`");
     check_keys(
         t,
-        &["name", "version", "path", "license", "apache_notice", "census"],
+        &[
+            "name",
+            "version",
+            "path",
+            "license",
+            "apache_notice",
+            "census",
+        ],
         &ctx,
     )?;
 
@@ -374,7 +389,15 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
         _ => {}
     }
 
-    Ok(Fork { name, version, path, license, apache_notice, census_mode, census_namespace })
+    Ok(Fork {
+        name,
+        version,
+        path,
+        license,
+        apache_notice,
+        census_mode,
+        census_namespace,
+    })
 }
 
 // --- small typed accessors, each refusal naming the fix ---------------------
@@ -456,19 +479,27 @@ pub fn lock_entries(root: &Path) -> Result<Vec<LockEntry>, String> {
         .parse()
         .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
     let Some(item) = doc.get("package") else {
-        return Err(format!("{}: no `[[package]]` entries — the lock is empty", path.display()));
+        return Err(format!(
+            "{}: no `[[package]]` entries — the lock is empty",
+            path.display()
+        ));
     };
     let arr = item.as_array_of_tables().ok_or_else(|| {
-        format!("{}: `package` is not a sequence of `[[package]]` tables", path.display())
+        format!(
+            "{}: `package` is not a sequence of `[[package]]` tables",
+            path.display()
+        )
     })?;
     let mut out = Vec::with_capacity(arr.len());
     for t in arr {
-        let name = t.get("name").and_then(Item::as_str).ok_or_else(|| {
-            format!("{}: a `[[package]]` block has no `name`", path.display())
-        })?;
-        let version = t.get("version").and_then(Item::as_str).ok_or_else(|| {
-            format!("{}: `[[package]] {name}` has no `version`", path.display())
-        })?;
+        let name = t
+            .get("name")
+            .and_then(Item::as_str)
+            .ok_or_else(|| format!("{}: a `[[package]]` block has no `name`", path.display()))?;
+        let version = t
+            .get("version")
+            .and_then(Item::as_str)
+            .ok_or_else(|| format!("{}: `[[package]] {name}` has no `version`", path.display()))?;
         out.push(LockEntry {
             name: name.to_string(),
             version: version.to_string(),
@@ -524,9 +555,9 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let Some(patch) = doc.get("patch").and_then(|i| i.get("crates-io")) else {
         return Ok(Vec::new());
     };
-    let pt = patch.as_table_like().ok_or_else(|| {
-        format!("{}: `[patch.crates-io]` is not a table", manifest.display())
-    })?;
+    let pt = patch
+        .as_table_like()
+        .ok_or_else(|| format!("{}: `[patch.crates-io]` is not a table", manifest.display()))?;
 
     let lock = lock_entries(root)?;
     let mut out = Vec::new();
@@ -601,11 +632,13 @@ fn vendored_manifest(root: &Path, rel: &str) -> Result<(String, String, String),
     let doc: DocumentMut = text
         .parse()
         .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
-    let pkg = doc.get("package").and_then(Item::as_table_like).ok_or_else(|| {
-        format!("{}: no `[package]` table", path.display())
-    })?;
-    let get = |key: &str| -> Result<String, String> {
-        pkg.get(key).and_then(Item::as_str).map(str::to_string).ok_or_else(|| {
+    let pkg = doc
+        .get("package")
+        .and_then(Item::as_table_like)
+        .ok_or_else(|| format!("{}: no `[package]` table", path.display()))?;
+    let get =
+        |key: &str| -> Result<String, String> {
+            pkg.get(key).and_then(Item::as_str).map(str::to_string).ok_or_else(|| {
             format!(
                 "{}: `[package] {key}` is missing or not a plain string — a vendored fork's \
                  manifest must state it literally (workspace inheritance does not reach \
@@ -613,7 +646,7 @@ fn vendored_manifest(root: &Path, rel: &str) -> Result<(String, String, String),
                 path.display()
             )
         })
-    };
+        };
     Ok((get("name")?, get("version")?, get("license")?))
 }
 
@@ -726,9 +759,13 @@ pub fn seed_from_vendor(root: &Path) -> Result<String, String> {
         let (mode, namespace, note) = census_classification(&p.name, &p.path)?;
         let notice = apache_notice_binds(&p.license);
 
-        let _ = writeln!(s, "\n# --- {} {} {}", p.name, p.manifest_version, "-".repeat(
-            72usize.saturating_sub(p.name.len() + p.manifest_version.len())
-        ));
+        let _ = writeln!(
+            s,
+            "\n# --- {} {} {}",
+            p.name,
+            p.manifest_version,
+            "-".repeat(72usize.saturating_sub(p.name.len() + p.manifest_version.len()))
+        );
         s.push_str(&comment("# census review: ", "#   ", note));
         if notice {
             s.push_str(&comment(
@@ -854,9 +891,9 @@ fn census_classification(
         ));
     }
     Ok(match &v.mode {
-        VendoredMode::Scanned { namespace, audit, .. } => {
-            (CensusMode::Scanned, Some(namespace), *audit)
-        }
+        VendoredMode::Scanned {
+            namespace, audit, ..
+        } => (CensusMode::Scanned, Some(namespace), *audit),
         VendoredMode::BuildDepOnly { justification } => {
             (CensusMode::BuildDepOnly, None, *justification)
         }
@@ -937,7 +974,10 @@ census.mode = "build-dep-only"
     fn round_trip_is_byte_identical_including_every_comment() {
         let p = parse(SAMPLE).expect("sample parses");
         let back = p.render().expect("a parsed policy renders");
-        assert_eq!(back, SAMPLE, "toml_edit round-trip must not move a single byte");
+        assert_eq!(
+            back, SAMPLE,
+            "toml_edit round-trip must not move a single byte"
+        );
         assert!(back.contains("THIS PARAGRAPH is why the fork exists"));
     }
 
@@ -1043,7 +1083,12 @@ census.mode = "build-dep-only"
     fn the_real_patch_table_is_six_live_vendored_forks() {
         let root = repo_root();
         let p = patch_entries(&root).expect("the real patch table reads");
-        assert_eq!(p.len(), 6, "measured 2026-08-22: {:?}", p.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(
+            p.len(),
+            6,
+            "measured 2026-08-22: {:?}",
+            p.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
         for e in &p {
             assert!(e.path.starts_with("vendor/"), "{} -> {}", e.name, e.path);
             assert!(
@@ -1077,8 +1122,14 @@ census.mode = "build-dep-only"
         let root = repo_root();
         let lock = lock_entries(&root).expect("the real lock reads");
         assert!(lock.len() > 500, "{} entries", lock.len());
-        let forks = lock.iter().filter(|e| e.source.is_none() && e.name == "winit").count();
-        assert_eq!(forks, 1, "the vendored winit is a path package with no source/checksum");
+        let forks = lock
+            .iter()
+            .filter(|e| e.source.is_none() && e.name == "winit")
+            .count();
+        assert_eq!(
+            forks, 1,
+            "the vendored winit is a path package with no source/checksum"
+        );
     }
 
     #[test]
@@ -1095,7 +1146,10 @@ census.mode = "build-dep-only"
         assert!(!pc.apache_notice, "pkg-config is dual MIT OR Apache-2.0");
         // The seed carries the census's own review notes as comments.
         assert!(body.contains("# census review:"), "{body}");
-        assert!(body.contains("PATCH LIVENESS"), "the winnow shadowing is recorded");
+        assert!(
+            body.contains("PATCH LIVENESS"),
+            "the winnow shadowing is recorded"
+        );
         // And the round-trip of the emitted body is byte-identical too.
         assert_eq!(p.render().unwrap(), body);
     }

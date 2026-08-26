@@ -112,7 +112,11 @@ fn delete_by_id_uppercase_frees_that_data_and_no_other() {
     transmit_and_display(&mut term, 2);
 
     control(&mut term, "a=d,d=I,i=1");
-    assert_eq!(rows_with_images(&term, 8), vec![1], "image 1 gone from screen");
+    assert_eq!(
+        rows_with_images(&term, 8),
+        vec![1],
+        "image 1 gone from screen"
+    );
 
     control(&mut term, "a=p,i=1");
     assert_eq!(

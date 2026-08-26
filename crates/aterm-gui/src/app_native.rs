@@ -4960,7 +4960,10 @@ impl App {
     fn spawn_staged_handoff_preverification(&mut self, build: u64) {
         let snapshot = self.native_updater_service.snapshot();
         let current_build = snapshot.current_build;
-        let stage = snapshot.staged.as_ref().filter(|staged| staged.build == build);
+        let stage = snapshot
+            .staged
+            .as_ref()
+            .filter(|staged| staged.build == build);
         // An ACTIVATION verifies the bundle under the executable, not a staged `.app`.
         let installed_activation = stage.is_some_and(|staged| staged.is_installed_activation());
         let commit = stage.and_then(|staged| staged.commit.clone());
@@ -5001,7 +5004,11 @@ impl App {
                 if let Err(error) = passed.as_ref() {
                     aterm_log::warn!(
                         "update apply: {} build {build} failed pre-park verification: {error}",
-                        if installed_activation { "installed" } else { "staged" }
+                        if installed_activation {
+                            "installed"
+                        } else {
+                            "staged"
+                        }
                     );
                 }
                 *slot
@@ -8407,14 +8414,18 @@ mod tests {
     /// The stage the ACTIVATION lane imports for an installed bundle: the sealed
     /// identity under `installed_activation_digest`, and nothing else.
     fn assert_activation_stage(app: &App, build: u64, commit: &str) {
-        let staged = app
-            .native_updater_service
-            .snapshot()
-            .staged
-            .clone()
-            .expect("an installed bundle newer than the process is imported as an activation stage");
-        assert_eq!(staged.build, build, "the activation names the installed build");
-        assert_eq!(staged.commit.as_deref(), Some(commit), "…and its sealed commit");
+        let staged = app.native_updater_service.snapshot().staged.clone().expect(
+            "an installed bundle newer than the process is imported as an activation stage",
+        );
+        assert_eq!(
+            staged.build, build,
+            "the activation names the installed build"
+        );
+        assert_eq!(
+            staged.commit.as_deref(),
+            Some(commit),
+            "…and its sealed commit"
+        );
         assert!(
             staged.is_installed_activation(),
             "…under the activation identity, not any DMG digest: {}",
@@ -8511,10 +8522,16 @@ mod tests {
             "the disposition names the installed build, got {outcome:?}"
         );
         assert_activation_stage(&app, build, PREFLIGHT_TEST_COMMIT);
-        let staged = app.native_updater_service.snapshot().staged.clone().unwrap();
+        let staged = app
+            .native_updater_service
+            .snapshot()
+            .staged
+            .clone()
+            .unwrap();
         assert!(
-            app.auto_apply_intent.is_some_and(|intent| intent.build == build
-                && intent.dmg_sha256 == decode_dmg_sha256(&staged.dmg_sha256).unwrap()),
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build
+                    && intent.dmg_sha256 == decode_dmg_sha256(&staged.dmg_sha256).unwrap()),
             "the activation the returned facts imported is ARMED, not merely described"
         );
     }
@@ -8550,12 +8567,18 @@ mod tests {
         };
         app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::StageAvailable, facts());
         assert_eq!(
-            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            app.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|s| s.build),
             Some(build),
             "PRECONDITION: the stage imported"
         );
         assert!(
-            app.notice.as_ref().is_some_and(crate::notice::TransientNotice::is_update_ready),
+            app.notice
+                .as_ref()
+                .is_some_and(crate::notice::TransientNotice::is_update_ready),
             "a newly imported stage shows the Update ready toast (present: {})",
             app.notice.is_some()
         );
@@ -8569,7 +8592,10 @@ mod tests {
             request_sequence: 2,
         };
         app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::StageAvailable, again);
-        assert!(app.notice.is_none() && app.level_up.is_none(), "a repeat import is quiet");
+        assert!(
+            app.notice.is_none() && app.level_up.is_none(),
+            "a repeat import is quiet"
+        );
     }
 
     #[test]
@@ -8797,11 +8823,18 @@ mod tests {
                 Some(installed_update(running)),
             ),
         );
-        assert!(app.deferred_native_update_reconcile.is_some(), "PRECONDITION: parked");
+        assert!(
+            app.deferred_native_update_reconcile.is_some(),
+            "PRECONDITION: parked"
+        );
         // The check completes WITH a stage.
         app.finish_native_update_check(ticket, status(Some(build), 0));
         assert_eq!(
-            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            app.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|s| s.build),
             Some(build),
             "the stage the check imported survives the parked pre-stage facts"
         );
@@ -8829,11 +8862,18 @@ mod tests {
         early.observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let ticket = start(&mut app.native_updater_service);
         app.finish_native_update_check(ticket, status(Some(build), 0));
-        assert!(app.native_stage_imported_at.is_some(), "PRECONDITION: the import is floored");
+        assert!(
+            app.native_stage_imported_at.is_some(),
+            "PRECONDITION: the import is floored"
+        );
         // …and its wake lands after the check completed (reducer free, not parked).
         app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::Refresh, early);
         assert_eq!(
-            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            app.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|s| s.build),
             Some(build),
             "a pre-import observation is stale by construction and retires nothing"
         );
@@ -8849,7 +8889,11 @@ mod tests {
             ),
         );
         assert_eq!(
-            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            app.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|s| s.build),
             Some(build)
         );
     }
@@ -8898,11 +8942,17 @@ mod tests {
         // observable as a surfaced control-request outcome rather than silence.
         let outcome = app.native_updater_service.snapshot().outcome.clone();
         assert!(
-            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build) == Some(build),
+            app.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|s| s.build)
+                == Some(build),
             "the newer facts imported the stage, got outcome {outcome:?}"
         );
         assert!(
-            app.notice.is_some() || app.native_updater_service.snapshot().phase != UpdaterPhase::Staged,
+            app.notice.is_some()
+                || app.native_updater_service.snapshot().phase != UpdaterPhase::Staged,
             "the control apply was acted on (surfaced or moved the phase), not dropped"
         );
     }
@@ -11527,10 +11577,7 @@ mod tests {
         assert!(app.native_input_event(wid, &left(Modifiers::ALT)));
         let alt_word_stop = search(&app).1;
         // Back to the end, then Ctrl+←: the SAME stop.
-        assert!(app.native_input_event(
-            wid,
-            &chord(Key::Character('e'), Modifiers::CTRL)
-        ));
+        assert!(app.native_input_event(wid, &chord(Key::Character('e'), Modifiers::CTRL)));
         assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
         assert_eq!(search(&app).1, alt_word_stop, "Ctrl+← = Alt+← (word left)");
         assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
@@ -11548,20 +11595,14 @@ mod tests {
             "Ctrl+→ = Alt+→ (word right)"
         );
         // Ctrl+⌫ from the end kills the last word — exactly Ctrl+W's cut.
-        assert!(app.native_input_event(
-            wid,
-            &chord(Key::Character('e'), Modifiers::CTRL)
-        ));
+        assert!(app.native_input_event(wid, &chord(Key::Character('e'), Modifiers::CTRL)));
         assert!(app.native_input_event(
             wid,
             &chord(Key::Named(NamedKey::Backspace), Modifiers::CTRL)
         ));
         assert_eq!(search(&app).0, "cursor ", "Ctrl+⌫ = backward-kill-word");
         // The ctrl-LETTER readline arms match first: ^B is still ONE character.
-        assert!(app.native_input_event(
-            wid,
-            &chord(Key::Character('b'), Modifiers::CTRL)
-        ));
+        assert!(app.native_input_event(wid, &chord(Key::Character('b'), Modifiers::CTRL)));
         assert_eq!(search(&app).1, 6..6, "^B stays by-character");
     }
 

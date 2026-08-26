@@ -255,9 +255,7 @@ pub fn create_arch_filtered(
             ));
         }
     };
-    let seed_dir = app
-        .join("Contents/Resources")
-        .join(atpkg::SEED_DIR_NAME);
+    let seed_dir = app.join("Contents/Resources").join(atpkg::SEED_DIR_NAME);
     // The keep-set comes from the SEALED seed's own signed [[artifact]] rows,
     // read back through the full client chain — never from filename suffixes,
     // so every byte-selection decision stays anchored in attested data.
@@ -552,8 +550,7 @@ fn restage_with_seed_filter(
     match filter {
         SeedFilter::Remove { .. } => {
             let bytes = dir_size(&seed);
-            std::fs::remove_dir_all(&seed)
-                .map_err(|e| format!("strip {}: {e}", seed.display()))?;
+            std::fs::remove_dir_all(&seed).map_err(|e| format!("strip {}: {e}", seed.display()))?;
             println!(
                 "    stripped {} from the lean restage ({:.1} MB — the seeded DMG keeps it)",
                 atpkg::SEED_DIR_NAME,
@@ -586,9 +583,8 @@ fn restage_with_seed_filter(
                     continue;
                 }
                 let path = entry.path();
-                dropped_bytes = dropped_bytes.saturating_add(
-                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-                );
+                dropped_bytes = dropped_bytes
+                    .saturating_add(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("filter {}: {e}", path.display()))?;
                 dropped += 1;
@@ -685,7 +681,9 @@ fn verify_restaged_bundle(
             Ok(())
         }
         Ok(out) => {
-            let why = String::from_utf8_lossy(&out.stderr).trim().replace('\n', "; ");
+            let why = String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .replace('\n', "; ");
             if notarized {
                 Err(format!(
                     "the RESTAGED bundle is rejected by Gatekeeper: {why}. This cut is \

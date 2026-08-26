@@ -776,7 +776,11 @@ mod tests {
         assert_ne!(misread, SYNTHETIC, "the fixture must actually differ");
         assert_eq!(
             parse_master(&misread).unwrap().seed().pubkey_b64().unwrap(),
-            parse_master(SYNTHETIC).unwrap().seed().pubkey_b64().unwrap(),
+            parse_master(SYNTHETIC)
+                .unwrap()
+                .seed()
+                .pubkey_b64()
+                .unwrap(),
             "a misread spelling must name the same master"
         );
     }
@@ -880,15 +884,25 @@ mod tests {
     /// name the same master (the fingerprint agrees), while its top bit is significant.
     #[test]
     fn the_padding_bits_of_the_last_character_are_masked() {
-        let base = parse_master(SYNTHETIC).unwrap().seed().pubkey_b64().unwrap();
+        let base = parse_master(SYNTHETIC)
+            .unwrap()
+            .seed()
+            .pubkey_b64()
+            .unwrap();
         // '7' = 0b00111: same top bit as '0', different padding bits — same master.
         let mut pad = String::from(SYNTHETIC);
         pad.replace_range(51..52, "7");
-        assert_eq!(parse_master(&pad).unwrap().seed().pubkey_b64().unwrap(), base);
+        assert_eq!(
+            parse_master(&pad).unwrap().seed().pubkey_b64().unwrap(),
+            base
+        );
         // 'g' = 0b10000: different top bit — different master.
         let mut sig = String::from(SYNTHETIC);
         sig.replace_range(51..52, "g");
-        assert_ne!(parse_master(&sig).unwrap().seed().pubkey_b64().unwrap(), base);
+        assert_ne!(
+            parse_master(&sig).unwrap().seed().pubkey_b64().unwrap(),
+            base
+        );
     }
 
     /// THE FINGERPRINT'S JOB: same key ⇒ same fingerprint, different key ⇒ different, and
@@ -901,10 +915,9 @@ mod tests {
         assert_eq!(&fp[4..5], "-", "{fp}");
 
         // A correct type-back reproduces it — this is the eyeball check.
-        let typed_back = parse_master(
-            "0123 4567 89ab cdef ghjk mnpq rstv wxyz 0123 4567 89ab cdef ghj0",
-        )
-        .unwrap();
+        let typed_back =
+            parse_master("0123 4567 89ab cdef ghjk mnpq rstv wxyz 0123 4567 89ab cdef ghj0")
+                .unwrap();
         assert_eq!(typed_back.seed().fingerprint().unwrap(), fp);
 
         // A ONE-CHARACTER mistranscription changes it. This is the whole reason the

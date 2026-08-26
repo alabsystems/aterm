@@ -222,12 +222,18 @@ mod tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
 
         std::fs::write(&marker, "not-a-pid").unwrap();
-        assert!(!seal_read_active_at(marker.clone()), "malformed is not active");
+        assert!(
+            !seal_read_active_at(marker.clone()),
+            "malformed is not active"
+        );
         assert!(!marker.exists(), "malformed self-heals");
 
         // A pid that cannot be alive (beyond pid_max on every macOS).
         std::fs::write(&marker, "999999999").unwrap();
-        assert!(!seal_read_active_at(marker.clone()), "dead pid is not active");
+        assert!(
+            !seal_read_active_at(marker.clone()),
+            "dead pid is not active"
+        );
         assert!(!marker.exists(), "stale self-heals");
     }
 

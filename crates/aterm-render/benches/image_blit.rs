@@ -118,11 +118,7 @@ fn with_images(input: &RenderInput, imgs: &[Arc<ImageData>], rows_per: usize) ->
 /// renderer's own cell metrics.
 fn placement(cw: usize, ch: usize, rows_per: usize, seed: u32) -> Arc<ImageData> {
     Arc::new(ImageData {
-        bytes: footprint_png(
-            (IMG_COLS * cw) as u32,
-            (rows_per * ch) as u32,
-            seed,
-        ),
+        bytes: footprint_png((IMG_COLS * cw) as u32, (rows_per * ch) as u32, seed),
         format: ImageFormat::Png,
         cols: IMG_COLS as u16,
         rows: rows_per as u16,

@@ -455,10 +455,7 @@ fn is_not_modified(code: &str, sent_validator: bool) -> bool {
 /// and with them the two flags appear exactly once each and still BEFORE the `--`
 /// end-of-options marker `curl_argv` appends (a caller-side `--` is the v0.5.10
 /// auto-update-bricking regression).
-fn conditional_args<'a>(
-    inm_header: Option<&'a str>,
-    header_dump: Option<&'a str>,
-) -> Vec<&'a str> {
+fn conditional_args<'a>(inm_header: Option<&'a str>, header_dump: Option<&'a str>) -> Vec<&'a str> {
     let mut args: Vec<&str> = api_get_args().to_vec();
     if let Some(header) = inm_header {
         args.push("-H");
@@ -881,7 +878,11 @@ pub fn download_to(
         {
             return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
         }
-        return Err(format!("curl download failed ({}): {}", out.status, stderr.trim()));
+        return Err(format!(
+            "curl download failed ({}): {}",
+            out.status,
+            stderr.trim()
+        ));
     }
     Ok(())
 }
@@ -1546,16 +1547,26 @@ mod tests {
             Some("/tmp/aterm-updates/catalog.headers"),
         );
         let base = api_get_args().len();
-        assert_eq!(args.len(), base + 4, "two flag pairs and nothing else: {args:?}");
+        assert_eq!(
+            args.len(),
+            base + 4,
+            "two flag pairs and nothing else: {args:?}"
+        );
         assert_eq!(args[base], "-H");
         assert_eq!(args[base + 1], "If-None-Match: W/\"deadbeef\"");
         assert_eq!(args[base + 2], "--dump-header");
         assert_eq!(args[base + 3], "/tmp/aterm-updates/catalog.headers");
-        assert!(!args.contains(&"--"), "no caller-side end-of-options marker: {args:?}");
+        assert!(
+            !args.contains(&"--"),
+            "no caller-side end-of-options marker: {args:?}"
+        );
         // The base list survives verbatim underneath.
         assert_eq!(&args[..base], &api_get_args()[..]);
         // Each half is independently optional.
-        assert_eq!(conditional_args(Some("If-None-Match: \"x\""), None).len(), base + 2);
+        assert_eq!(
+            conditional_args(Some("If-None-Match: \"x\""), None).len(),
+            base + 2
+        );
         assert_eq!(conditional_args(None, Some("/tmp/h")).len(), base + 2);
     }
 
@@ -1566,7 +1577,10 @@ mod tests {
     #[test]
     fn only_a_request_that_sent_a_validator_may_be_told_nothing_changed() {
         assert!(is_not_modified("304", true));
-        assert!(!is_not_modified("304", false), "unsolicited 304 must not be honoured");
+        assert!(
+            !is_not_modified("304", false),
+            "unsolicited 304 must not be honoured"
+        );
         for code in ["200", "301", "403", "404", "500", "3040", "", "30"] {
             assert!(!is_not_modified(code, true), "{code} is not a 304");
         }
@@ -1585,17 +1599,20 @@ mod tests {
             assert!(validator_safe(good), "real ETag rejected: {good:?}");
         }
         for bad in [
-            "",                        // absent
-            "6f1c8b1e",                // unquoted
-            "\"a",                     // unterminated
-            "\"a\"\r\nX-Evil: 1",      // CRLF header injection
-            "\"a\nb\"",                // newline
-            "\"a b\"",                 // space (would split the header)
-            "\"a\"b\"",                // interior quote closes the value early
-            "\"a\tb\"",                // control character
-            "W/",                      // prefix only
+            "",                   // absent
+            "6f1c8b1e",           // unquoted
+            "\"a",                // unterminated
+            "\"a\"\r\nX-Evil: 1", // CRLF header injection
+            "\"a\nb\"",           // newline
+            "\"a b\"",            // space (would split the header)
+            "\"a\"b\"",           // interior quote closes the value early
+            "\"a\tb\"",           // control character
+            "W/",                 // prefix only
         ] {
-            assert!(!validator_safe(bad), "injection-shaped validator accepted: {bad:?}");
+            assert!(
+                !validator_safe(bad),
+                "injection-shaped validator accepted: {bad:?}"
+            );
         }
         // Absurdly long values are refused too (bounded argv).
         let long = format!("\"{}\"", "a".repeat(200));
@@ -1623,10 +1640,18 @@ mod tests {
         );
 
         std::fs::write(&p, "HTTP/2 200\r\nContent-Type: application/json\r\n\r\n").unwrap();
-        assert_eq!(etag_from_header_dump(&p), None, "no ETag ⇒ no conditional next time");
+        assert_eq!(
+            etag_from_header_dump(&p),
+            None,
+            "no ETag ⇒ no conditional next time"
+        );
 
         std::fs::write(&p, "HTTP/2 200\r\nETag: not-quoted\r\n\r\n").unwrap();
-        assert_eq!(etag_from_header_dump(&p), None, "an unsafe validator is dropped");
+        assert_eq!(
+            etag_from_header_dump(&p),
+            None,
+            "an unsafe validator is dropped"
+        );
 
         assert_eq!(etag_from_header_dump(&dir.join("absent")), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1695,15 +1720,27 @@ mod tests {
         let resumed = download_resume_args("60", "600", "/s/a.tar.zst.part", Some("40"));
         assert_eq!(resumed.len(), fresh.len() + 2);
         assert_eq!(resumed[fresh.len()], "--continue-at");
-        assert_eq!(resumed[fresh.len() + 1], "40", "an EXPLICIT offset, never `-`");
+        assert_eq!(
+            resumed[fresh.len() + 1],
+            "40",
+            "an EXPLICIT offset, never `-`"
+        );
         // The sink is the PART, never the destination: `dest` only ever exists complete.
         let sink = resumed[resumed.iter().position(|a| *a == "-o").unwrap() + 1];
         assert!(sink.ends_with(".part"), "{resumed:?}");
         // The stall detector and the derived wall clock are untouched by resuming.
-        for flag in ["--speed-limit", "--speed-time", "--connect-timeout", "--retry"] {
+        for flag in [
+            "--speed-limit",
+            "--speed-time",
+            "--connect-timeout",
+            "--retry",
+        ] {
             assert!(resumed.contains(&flag), "{flag} must survive: {resumed:?}");
         }
-        assert!(!resumed.contains(&"--"), "no caller-side end-of-options marker");
+        assert!(
+            !resumed.contains(&"--"),
+            "no caller-side end-of-options marker"
+        );
     }
 
     /// The anti-wedge rule: a failed attempt keeps its prefix only if it MOVED. A 416
@@ -1715,7 +1752,10 @@ mod tests {
         assert!(keep_partial(600_000_000, 629_000_000));
         assert!(!keep_partial(0, 0), "nothing arrived");
         assert!(!keep_partial(600_000_000, 600_000_000), "a dead offset");
-        assert!(!keep_partial(600_000_000, 4), "a truncated/clobbered prefix");
+        assert!(
+            !keep_partial(600_000_000, 4),
+            "a truncated/clobbered prefix"
+        );
     }
 
     /// The in-call fresh-retry trigger: exactly the failures that name the RANGE (curl
@@ -1724,12 +1764,12 @@ mod tests {
     /// retrying them fresh would only double the cost of an already-failed attempt.
     #[test]
     fn only_a_range_refusal_earns_the_in_call_fresh_retry() {
-        assert!(range_refused(Some(33), ""), "curl 33: server refuses ranges");
         assert!(
-            range_refused(
-                Some(22),
-                "curl: (22) The requested URL returned error: 416"
-            ),
+            range_refused(Some(33), ""),
+            "curl 33: server refuses ranges"
+        );
+        assert!(
+            range_refused(Some(22), "curl: (22) The requested URL returned error: 416"),
             "416: the offset is past what the upstream object now holds"
         );
         assert!(
@@ -1744,7 +1784,10 @@ mod tests {
             !range_refused(Some(22), "curl: (22) The requested URL returned error: 429"),
             "a rate limit must reach the rate-limit classifier, not a retry"
         );
-        assert!(!range_refused(None, ""), "a signal-killed curl proves nothing");
+        assert!(
+            !range_refused(None, ""),
+            "a signal-killed curl proves nothing"
+        );
     }
 
     /// A refused URL fails before anything is created, and leaves no part behind — the

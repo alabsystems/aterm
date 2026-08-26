@@ -55,11 +55,11 @@ pub mod hdr;
 /// path and compiles none of it (the dependency is target-gated to match).
 #[cfg(any(all(unix, not(target_os = "macos")), windows))]
 mod hinted;
+pub mod ligature_shaping;
+pub mod procedural;
 /// The scanline signed-area coverage rasterizer every outline fill in this
 /// crate runs through (retired `ab_glyph_rasterizer`; see `src/raster.rs`).
 pub mod raster;
-pub mod ligature_shaping;
-pub mod procedural;
 pub mod scroll_translate;
 pub mod spill;
 #[cfg(all(unix, not(target_os = "macos")))]

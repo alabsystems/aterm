@@ -504,13 +504,19 @@ impl std::fmt::Display for ScreenDigestRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::TooManySessions { count, max } => {
-                write!(formatter, "{count} sessions exceeds the {max}-session limit")
+                write!(
+                    formatter,
+                    "{count} sessions exceeds the {max}-session limit"
+                )
             }
             Self::DuplicateLocalId { local_id } => {
                 write!(formatter, "two checkpoints claim local id {local_id}")
             }
             Self::Alloc { what, count } => {
-                write!(formatter, "could not reserve the {what} for {count} session(s)")
+                write!(
+                    formatter,
+                    "could not reserve the {what} for {count} session(s)"
+                )
             }
             Self::MetaUnbounded {
                 local_id,
@@ -540,7 +546,10 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 "session {local_id}: admission priced the grid at {admitted} bytes but the meta caps it at {meta_cap}"
             ),
             Self::ParserNotGround { local_id } => {
-                write!(formatter, "session {local_id}: parser was not in Ground state")
+                write!(
+                    formatter,
+                    "session {local_id}: parser was not in Ground state"
+                )
             }
             Self::AltPairingMismatch {
                 local_id,
@@ -5417,8 +5426,7 @@ mod f4_adoption_proof_asymmetry {
     #[test]
     fn an_over_long_inactive_grid_blob_names_itself() {
         let mut cp = live_checkpoint();
-        let over_long =
-            vec![aterm_core::scrollback::Line::new(); usize::from(cp.rows) + 1];
+        let over_long = vec![aterm_core::scrollback::Line::new(); usize::from(cp.rows) + 1];
         cp.alt_grid = Some(aterm_core::scrollback::serialize_lines(&over_long));
         cp.alt_cursor = Some(cp.cursor.clone());
 

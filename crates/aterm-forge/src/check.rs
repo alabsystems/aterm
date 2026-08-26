@@ -130,8 +130,14 @@ pub fn run(root: &Path, cells: &[String]) -> Result<Outcome, String> {
         // The reason FIRST — `main` prefixes it with "could not run:" — and the
         // whole transcript after it, because the obligations that DID run are
         // still the most useful thing on the screen.
-        Some(why) => Err(format!("{why}\n\nthe transcript up to that point:\n{}", v.log)),
-        None => Ok(Outcome { ok: v.ok, log: v.log }),
+        Some(why) => Err(format!(
+            "{why}\n\nthe transcript up to that point:\n{}",
+            v.log
+        )),
+        None => Ok(Outcome {
+            ok: v.ok,
+            log: v.log,
+        }),
     }
 }
 
@@ -160,7 +166,11 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     let _ = writeln!(
         log,
         "  cells: {}",
-        cells.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+        cells
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     // -- [OB-1]..[OB-10] provenance, license, NOTICE, markers ---------------
@@ -210,7 +220,10 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     );
     let mut missing_on_disk = false;
     for e in &patches {
-        match REVIEWED_VENDORED_CRATES.iter().find(|r| r.package == e.name) {
+        match REVIEWED_VENDORED_CRATES
+            .iter()
+            .find(|r| r.package == e.name)
+        {
             None => {
                 fails += 1;
                 let _ = writeln!(
@@ -235,7 +248,13 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                 );
             }
             Some(r) => {
-                let _ = writeln!(log, "    ✓ {} → {} ({})", e.name, e.path, mode_label(&r.mode));
+                let _ = writeln!(
+                    log,
+                    "    ✓ {} → {} ({})",
+                    e.name,
+                    e.path,
+                    mode_label(&r.mode)
+                );
             }
         }
         if !root.join(&e.path).join("Cargo.toml").is_file() {
@@ -251,7 +270,11 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         }
     }
     if patches.is_empty() {
-        let _ = writeln!(log, "    (no path forks declared in {})", manifest.display());
+        let _ = writeln!(
+            log,
+            "    (no path forks declared in {})",
+            manifest.display()
+        );
     } else {
         notes += 1;
         let _ = writeln!(
@@ -302,7 +325,10 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                 let want = canon(&root.join(&e.path));
                 let (live, siblings) = classify(&graph, &paths, &e.name, &want);
                 if live {
-                    live_in.entry(e.name.as_str()).or_default().push(cell.name.clone());
+                    live_in
+                        .entry(e.name.as_str())
+                        .or_default()
+                        .push(cell.name.clone());
                 }
                 for sib in &siblings {
                     fails += 1;
@@ -352,7 +378,9 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                     e.name,
                     live,
                     cells.len(),
-                    live_in.get(e.name.as_str()).map_or(String::new(), |v| v.join(", "))
+                    live_in
+                        .get(e.name.as_str())
+                        .map_or(String::new(), |v| v.join(", "))
                 );
                 continue;
             }
@@ -459,7 +487,11 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                  intended — remove its `[[carved]]` row from {POLICY_FILE} in the SAME commit, \
                  so the ledger and the tree never disagree.",
                 c.path,
-                if c.reason.is_empty() { "(none recorded)" } else { c.reason.as_str() }
+                if c.reason.is_empty() {
+                    "(none recorded)"
+                } else {
+                    c.reason.as_str()
+                }
             );
         } else {
             let _ = writeln!(log, "    ✓ {} still absent", c.path);
@@ -467,7 +499,10 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     }
 
     // -- [OB-14] the ratchet --------------------------------------------------
-    let _ = writeln!(log, "  [OB-14] RATCHET — the measured surface conforms to {BUDGET_FILE}:");
+    let _ = writeln!(
+        log,
+        "  [OB-14] RATCHET — the measured surface conforms to {BUDGET_FILE}:"
+    );
     if root.join(BUDGET_FILE).is_file() {
         match budget::run(root, false, None) {
             Ok(out) => {
@@ -488,7 +523,10 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
             Err(e) => {
                 fails += 1;
                 could_not_run.get_or_insert(e.clone());
-                let _ = writeln!(log, "  ✗ FAIL [OB-14] the ratchet could not be evaluated: {e}");
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-14] the ratchet could not be evaluated: {e}"
+                );
             }
         }
     } else {
@@ -521,7 +559,11 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         log.push_str(PRECISION_NOTE);
         log.push('\n');
     }
-    Verdict { ok: fails == 0, log, could_not_run }
+    Verdict {
+        ok: fails == 0,
+        log,
+        could_not_run,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,7 +608,10 @@ fn read_manifest_patches(root: &Path) -> Result<(Vec<PatchEntry>, Vec<String>), 
 
 fn parse_patch_table(text: &str, whence: &Path) -> Result<(Vec<PatchEntry>, Vec<String>), String> {
     let doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        format!("{} is not valid TOML: {e} — fix the manifest, then re-run.", whence.display())
+        format!(
+            "{} is not valid TOML: {e} — fix the manifest, then re-run.",
+            whence.display()
+        )
     })?;
     let Some(table) = doc
         .get("patch")
@@ -580,7 +625,10 @@ fn parse_patch_table(text: &str, whence: &Path) -> Result<(Vec<PatchEntry>, Vec<
     for (name, item) in table.iter() {
         match item.get("path").and_then(toml_edit::Item::as_str) {
             Some(path) => {
-                forks.push(PatchEntry { name: name.to_string(), path: path.to_string() });
+                forks.push(PatchEntry {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                });
             }
             None => other.push(name.to_string()),
         }
@@ -604,9 +652,14 @@ fn read_carve_ledger(root: &Path) -> Result<Vec<Carved>, String> {
 
 fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> {
     let doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        format!("{} is not valid TOML: {e} — fix the policy file, then re-run.", whence.display())
+        format!(
+            "{} is not valid TOML: {e} — fix the policy file, then re-run.",
+            whence.display()
+        )
     })?;
-    let Some(item) = doc.get("carved") else { return Ok(Vec::new()) };
+    let Some(item) = doc.get("carved") else {
+        return Ok(Vec::new());
+    };
 
     // `[[carved]]` array-of-tables is the written form; an inline array of
     // tables is accepted too, because a hand-edited policy file may use either
@@ -615,8 +668,13 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
     if let Some(tables) = item.as_array_of_tables() {
         for t in tables {
             rows.push((
-                t.get("path").and_then(toml_edit::Item::as_str).map(ToString::to_string),
-                t.get("reason").and_then(toml_edit::Item::as_str).unwrap_or_default().to_string(),
+                t.get("path")
+                    .and_then(toml_edit::Item::as_str)
+                    .map(ToString::to_string),
+                t.get("reason")
+                    .and_then(toml_edit::Item::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             ));
         }
     } else if let Some(array) = item.as_array() {
@@ -629,8 +687,13 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
                 ));
             };
             rows.push((
-                t.get("path").and_then(toml_edit::Value::as_str).map(ToString::to_string),
-                t.get("reason").and_then(toml_edit::Value::as_str).unwrap_or_default().to_string(),
+                t.get("path")
+                    .and_then(toml_edit::Value::as_str)
+                    .map(ToString::to_string),
+                t.get("reason")
+                    .and_then(toml_edit::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             ));
         }
     } else {
@@ -737,10 +800,28 @@ mod tests {
     fn the_root_patch_table_is_read_as_path_forks() {
         let (forks, other) = read_manifest_patches(&repo_root()).expect("root manifest reads");
         let names: Vec<&str> = forks.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["indexmap", "libm", "pkg-config", "smol_str", "winit", "winnow"]);
-        assert!(other.is_empty(), "this repo patches only path forks: {other:?}");
+        assert_eq!(
+            names,
+            [
+                "indexmap",
+                "libm",
+                "pkg-config",
+                "smol_str",
+                "winit",
+                "winnow"
+            ]
+        );
+        assert!(
+            other.is_empty(),
+            "this repo patches only path forks: {other:?}"
+        );
         for f in &forks {
-            assert_eq!(f.path, format!("vendor/{}", f.name), "declared path for {}", f.name);
+            assert_eq!(
+                f.path,
+                format!("vendor/{}", f.name),
+                "declared path for {}",
+                f.name
+            );
         }
     }
 
@@ -766,13 +847,20 @@ gamma = { version = \"1.2.3\" }
 ";
         let (forks, other) = parse_patch_table(text, Path::new("/w/Cargo.toml")).unwrap();
         assert_eq!(forks.len(), 1);
-        assert_eq!(forks[0], PatchEntry { name: "alpha".into(), path: "vendor/alpha".into() });
+        assert_eq!(
+            forks[0],
+            PatchEntry {
+                name: "alpha".into(),
+                path: "vendor/alpha".into()
+            }
+        );
         assert_eq!(other, ["beta", "gamma"]);
     }
 
     #[test]
     fn a_manifest_with_no_patch_table_yields_no_forks() {
-        let (forks, other) = parse_patch_table("[package]\nname = \"x\"\n", Path::new("x")).unwrap();
+        let (forks, other) =
+            parse_patch_table("[package]\nname = \"x\"\n", Path::new("x")).unwrap();
         assert!(forks.is_empty() && other.is_empty());
     }
 
@@ -808,7 +896,10 @@ reason = \"no arch intrinsics reach the shipped build\"
     fn a_carved_row_without_a_path_refuses_and_names_the_fix() {
         let err = parse_carve_ledger("[[carved]]\nreason = \"x\"\n", Path::new("f")).unwrap_err();
         assert!(err.contains("no `path` key"), "{err}");
-        assert!(err.contains("path = "), "the refusal must say what to type: {err}");
+        assert!(
+            err.contains("path = "),
+            "the refusal must say what to type: {err}"
+        );
     }
 
     #[test]
@@ -853,7 +944,10 @@ reason = \"no arch intrinsics reach the shipped build\"
         let Err(err) = run(&repo_root(), &["macos".to_string()]) else {
             panic!("an unknown cell must be could-not-run, never a verdict");
         };
-        assert!(err.contains("mac-arm"), "the refusal must list the real cells: {err}");
+        assert!(
+            err.contains("mac-arm"),
+            "the refusal must list the real cells: {err}"
+        );
     }
 
     /// EVERY cell resolves ONLY the forked version of each vendored crate.
@@ -881,7 +975,10 @@ reason = \"no arch intrinsics reach the shipped build\"
     fn no_cell_carries_an_unpatched_sibling_of_a_vendored_fork() {
         let root = repo_root();
         let (forks, _) = read_manifest_patches(&root).unwrap();
-        assert!(!forks.is_empty(), "there is nothing to check if nothing is vendored");
+        assert!(
+            !forks.is_empty(),
+            "there is nothing to check if nothing is vendored"
+        );
         for cell in resolve::default_cells() {
             let mut log = String::new();
             let (graph, paths) = resolve::graph_and_paths(&root, &cell, &mut log)
@@ -902,8 +999,12 @@ reason = \"no arch intrinsics reach the shipped build\"
                  `cargo forge blame <name>` names the edge that drags it in",
                 cell.name
             );
-            assert!(live > 0, "cell `{}` reaches no fork at all — the patch table is dead \
-                 there, and a cell with no forks would pass this vacuously", cell.name);
+            assert!(
+                live > 0,
+                "cell `{}` reaches no fork at all — the patch table is dead \
+                 there, and a cell with no forks would pass this vacuously",
+                cell.name
+            );
         }
     }
 
@@ -937,11 +1038,20 @@ reason = \"no arch intrinsics reach the shipped build\"
             );
         }
         if !expected.is_empty() {
-            assert!(!ok, "a gate that found an unpatched sibling cannot be GREEN:\n{log}");
-            assert!(log.contains(PRECISION_NOTE), "a RED report carries the precision note");
+            assert!(
+                !ok,
+                "a gate that found an unpatched sibling cannot be GREEN:\n{log}"
+            );
+            assert!(
+                log.contains(PRECISION_NOTE),
+                "a RED report carries the precision note"
+            );
         }
         for tag in ["[OB-1..OB-10]", "[OB-11]", "[OB-12]", "[OB-13]", "[OB-14]"] {
-            assert!(log.contains(tag), "every obligation must report; `{tag}` did not:\n{log}");
+            assert!(
+                log.contains(tag),
+                "every obligation must report; `{tag}` did not:\n{log}"
+            );
         }
     }
 }

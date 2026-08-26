@@ -1181,8 +1181,6 @@ fn an_exit_and_re_entry_in_one_batch_kills_the_previous_alt_selection() {
     );
 }
 
-
-
 /// A shrink that only TRIMS moves nothing, so the selection must not move either.
 ///
 /// The relabel distance is the DEMOTE count, not the height delta. Trailing blank

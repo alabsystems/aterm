@@ -26,10 +26,7 @@ use super::*;
 /// Helper: build an Rle from raw runs without compaction.
 /// This allows constructing deliberately uncompacted state for testing.
 fn rle_from_raw_runs(runs: Vec<Run<u8>>, total_length: u32) -> Rle<u8> {
-    Rle {
-        runs,
-        total_length,
-    }
+    Rle { runs, total_length }
 }
 
 // compact/compact_around only branch on adjacent equality, so a binary value

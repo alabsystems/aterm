@@ -39,18 +39,9 @@ fn bottom_scroll_material_hold_preserves_only_translated_resident_cells() {
     assert_eq!(confirmed["non_cell_transient"], 0);
     assert_eq!(confirmed["armed"], 0);
     assert_eq!(confirmed["trail_lit"], 0);
-    assert!(healthy.check_invariant(
-        "BottomScrollHoldPreservesTranslatedTrail",
-        &confirmed,
-    ));
-    assert!(healthy.check_invariant(
-        "BottomScrollHoldClearsNonCellTransients",
-        &confirmed,
-    ));
-    assert!(healthy.check_invariant(
-        "BottomScrollHoldCannotAdmitFreshTrail",
-        &confirmed,
-    ));
+    assert!(healthy.check_invariant("BottomScrollHoldPreservesTranslatedTrail", &confirmed,));
+    assert!(healthy.check_invariant("BottomScrollHoldClearsNonCellTransients", &confirmed,));
+    assert!(healthy.check_invariant("BottomScrollHoldCannotAdmitFreshTrail", &confirmed,));
 
     assert!(healthy.fire("ConfirmHeldBottomScrollMaterial", &mut confirmed));
     assert_eq!(confirmed["phase"], 2);
@@ -100,12 +91,6 @@ fn bottom_scroll_material_hold_preserves_only_translated_resident_cells() {
         !buggy.check_invariant("BottomScrollHoldPreservesTranslatedTrail", &blackout),
         "the historical blackout must be a concrete invariant counterexample"
     );
-    assert!(buggy.check_invariant(
-        "BottomScrollHoldClearsNonCellTransients",
-        &blackout,
-    ));
-    assert!(buggy.check_invariant(
-        "BottomScrollHoldCannotAdmitFreshTrail",
-        &blackout,
-    ));
+    assert!(buggy.check_invariant("BottomScrollHoldClearsNonCellTransients", &blackout,));
+    assert!(buggy.check_invariant("BottomScrollHoldCannotAdmitFreshTrail", &blackout,));
 }

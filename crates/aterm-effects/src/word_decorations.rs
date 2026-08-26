@@ -29,10 +29,10 @@
 //! copied text, or recordings — the decorations are purely visual, exactly like
 //! the cursor trail.
 
+use aterm_time::Instant;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use aterm_time::Instant;
 
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::{RenderCell, Terminal};
@@ -8047,8 +8047,7 @@ fn emit_nova_axis(
                 None
             };
             // Palette-only decode: the residual star reads one field, not nine.
-            let (_, ember) =
-                nova::ember_pair(nova::palette(nova_palette(occ.genome.gkey)), magic);
+            let (_, ember) = nova::ember_pair(nova::palette(nova_palette(occ.genome.gkey)), magic);
             let d = WordDecoration {
                 row: occ.row,
                 col: occ.start_col,
@@ -22448,7 +22447,10 @@ mod tests {
         wd.hard_reset_words();
 
         assert!(!wd.have_scanned, "word scan state retires immediately");
-        assert!(wd.active_until.is_none(), "word cadence retires immediately");
+        assert!(
+            wd.active_until.is_none(),
+            "word cadence retires immediately"
+        );
         assert_eq!(wd.kitty_cursor_placement.key, key_before);
         assert_eq!(wd.kitty_cursor_placement.last_target, target_before);
         let atlas_after = wd.free_atlas().expect("companion atlas stays resident");
@@ -23843,8 +23845,16 @@ mod pet_handoff_emission_tests {
         wd.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
         wd.cat_baker_ready = true;
         let scratch = vec![0u8; 4 * 4 * 4];
-        assert!(wd.cat_baker.host_tile(0xDEAD_0001, 4, 4, &scratch).is_some());
-        assert!(wd.cat_baker.host_tile(0xDEAD_0002, 4, 4, &scratch).is_some());
+        assert!(
+            wd.cat_baker
+                .host_tile(0xDEAD_0001, 4, 4, &scratch)
+                .is_some()
+        );
+        assert!(
+            wd.cat_baker
+                .host_tile(0xDEAD_0002, 4, 4, &scratch)
+                .is_some()
+        );
         dress(&mut wd, 9, 4, &mut free);
         assert!(
             free.is_empty(),

@@ -1409,7 +1409,10 @@ mod tests {
         // An empty value carries no information, and an unrecognised key is not a record:
         // both are "absent", which is accept — never a reinstall.
         assert!(ready_text_accepts("ok\nplatform=\n", "aarch64-macos"));
-        assert!(ready_text_accepts("ok\narch=x86_64-macos\n", "aarch64-macos"));
+        assert!(ready_text_accepts(
+            "ok\narch=x86_64-macos\n",
+            "aarch64-macos"
+        ));
     }
 
     #[test]

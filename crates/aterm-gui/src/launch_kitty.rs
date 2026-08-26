@@ -136,6 +136,9 @@ mod tests {
         // The fallback mixes the clock: at least it is not the mixing constant
         // itself, and it never returns zero for a live clock.
         let f = fallback_seed();
-        assert_ne!(f, 0x9E37_79B9_7F4A_7C15, "the fallback is not the bare constant");
+        assert_ne!(
+            f, 0x9E37_79B9_7F4A_7C15,
+            "the fallback is not the bare constant"
+        );
     }
 }

@@ -83,26 +83,41 @@
 //!   the hand-run tool cannot diverge. Compiles nothing: it reads `Cargo.lock`,
 //!   the `vendor/` tree, `vendor/forge.toml`, `tools/forge-budget.tsv` and four
 //!   offline `cargo tree` resolutions.
-//! - `lint`: TRUST's linter and formatter — `targo-tippy -D warnings` + `cargo fmt`
-//!   through the stage2 cargo — plus grep_guard + license headers. Stock
-//!   `cargo clippy` is wrong here and fails closed: the stage2 tree ships no
-//!   `cargo-clippy`, so it would resolve one off PATH and drive a stable rustc
-//!   that rejects this workspace's `-Ztrust-verify=off`.
+//! - `lint`: TRUST's linter and formatter — `targo-tippy -D warnings` +
+//!   `targo-fmt --all --check` — plus grep_guard + license headers. BOTH are
+//!   the stage2's own branded drivers, invoked directly and never resolved off
+//!   PATH: the stage2 ships no `cargo-clippy` and no `cargo-fmt`, so `cargo
+//!   clippy` / `cargo fmt` would either die at component lookup or find stock
+//!   Rust's, which drives a stable rustc that rejects this workspace's
+//!   `-Ztrust-verify=off` and formats to a different style than the tree is in.
 //!
-//!   THIS IS THE PUSH GATE. `.githooks/pre-push` runs `gate lint --no-fmt`
-//!   beside the L0 temporal gate, so lint-red code cannot reach `main` (it
-//!   repeatedly did: three regressions on 2026-08-11 — atpkg dead code, an
-//!   aterm-effects lint the atpkg abort hid, and a rebase-reverted install
-//!   staging — every one of them caught by a human running lint BY HAND after
-//!   the push). `--no-fmt` excludes formatting and only formatting; the
-//!   exclusion prints on every run. See [`gate_lint_with`].
+//!   THE FMT LANE IS ARMED (2026-08-26). It was not, for a month: `cargo fmt`
+//!   could not dispatch, the lane reported NOT RUN, and its NOT RUN was
+//!   exempted from blocking. The tree was reformatted (254 files) and the lane
+//!   pointed at `targo-fmt`, which the stage2 has shipped all along. This
+//!   REVERSES a standing rule of this repo — "never mass-reformat; keep the
+//!   linter green instead" — at the owner's explicit instruction; the rule is
+//!   gone rather than merely unenforced, and every place that stated it has
+//!   been updated. `--no-fmt` still excludes formatting and only formatting,
+//!   and now prints itself as an opt-out rather than as policy. See
+//!   [`gate_lint_with`].
+//!
+//!   WHAT THE ARMING DOES AND DOES NOT REACH. It arms `gate lint` and, through
+//!   [`ALL_ROSTER`], `gate all`. It does NOT arm `tools/verify.sh`: that gate is
+//!   a different binary (`crates/aterm-verify`) with its own stage list, which
+//!   has a Tippy stage and NO fmt stage — so `verify --fast`, the command the
+//!   pre-push advisory calls "the merge contract", still does not look at
+//!   formatting. Nor does `--all` reach the four out-of-workspace crates; both
+//!   limits are restated at the lane itself.
 //!
 //!   A LANE THAT DID NOT RUN IS NOT A LANE THAT FAILED. [`LaneVerdict`] is
-//!   three-valued for that reason, and it is not academic: `cargo fmt` cannot
-//!   dispatch on a stage2 that ships no `cargo-fmt`, and reporting that as
-//!   `trustfmt: FAILED` made this verb unable to pass on this machine for any
-//!   input — so it stopped being read, which is how the three regressions
-//!   above got their cover. [`LintLane::not_run_blocks`] carries the policy.
+//!   three-valued for that reason, and it is not academic: it is what
+//!   `trustfmt: FAILED (exit Some(1))` was really saying for that month, which
+//!   made this verb unable to pass on this machine for any input — so it
+//!   stopped being read, which is how three lint regressions on 2026-08-11
+//!   (atpkg dead code, an aterm-effects lint the atpkg abort hid, a
+//!   rebase-reverted install staging) reached `main` under a gate that was red
+//!   about something else entirely. [`LintLane`] carries the blocking policy.
 //!
 //!   THE IDENTITY-GUARD ABORT IS NOT A LINT RESULT. Branded Tippy authenticates
 //!   its own toolchain (see [`TIPPY_IDENTITY_ABORTS`]), and any create/unlink/
@@ -142,10 +157,11 @@
 //!   except `linux` (needs the Linux target), `miri` (needs a nightly miri
 //!   toolchain), `web` and `certified`.
 //!   MANUAL ONLY — nothing invokes `all` itself. This line used to read "what the
-//!   pre-push hook runs"; MEASURED 2026-07-31, that was false. `.githooks/pre-push`
-//!   now runs exactly TWO commands — the `tools/freeze-safety-gate` build (which
-//!   fuses the mainloop / lockorder / wasmloop / scope censuses) and
-//!   `gate lint --no-fmt` — and tools/verify.sh invokes only `drift`, `dormant`,
+//!   pre-push hook runs"; MEASURED 2026-07-31, that was false, and it is now
+//!   false twice over: `.githooks/pre-push` was demoted to ADVISORY on
+//!   2026-08-24 (it prints one line and exits 0 — it runs no gate at all, the
+//!   paint guard having made a blocking hook cost twelve minutes). Nothing
+//!   automatic runs this verb; tools/verify.sh invokes only `drift`, `dormant`,
 //!   `mainloop` and `counts`. So `fault`, `forge` and `perf` still have NO
 //!   automated caller: run them by hand, or wire them into verify.sh (`fault` is
 //!   cheap and toolchain-free; `forge` costs four offline `cargo tree` resolves
@@ -492,18 +508,23 @@ const NON_VACUITY_REGISTRY: &[RedFixture] = &[
                      lane at a time a FINDING (tippy / trustfmt / guards), each \
                      required to turn the verdict red on its own, plus a clean sweep \
                      pinning order and arity. The NO-VERDICT half is \
-                     a_not_run_lane_blocks_exactly_when_its_policy_says_so, which \
-                     drives the same verb with one lane NOT RUN and requires both \
-                     answers of LintLane::not_run_blocks to be exercised — so the fmt \
-                     lane's non-blocking exemption cannot silently spread to tippy or \
-                     the guards. The fail-closed branches are driven for real by \
+                     every_not_run_lane_blocks_the_verdict, which drives the same verb \
+                     with one lane NOT RUN and requires EACH to block on its own — it \
+                     replaced a fixture that required both answers of the old \
+                     LintLane::not_run_blocks, an exemption removed when the fmt lane \
+                     was armed; only_an_explicit_no_fmt_lets_the_fmt_lane_sit_out \
+                     pins that the surviving non-blocking path is the FLAG and \
+                     nothing else. The fail-closed branches are driven for real by \
                      an_absent_toolchain_fails_each_lint_lane_closed_on_its_own, which \
                      runs LiveLintLanes against a stage2 dir holding neither \
-                     targo-tippy nor cargo and requires each lane to answer NotRun \
+                     targo-tippy nor targo-fmt and requires each lane to answer NotRun \
                      SEPARATELY — an earlier fixture asserted only their conjunction, \
                      which left any single arm free to stop failing closed unnoticed \
-                     — and by the_fmt_lane_reports_not_run_when_cargo_fmt_is_missing, \
-                     which mutates a stub stage2 through NotRun / Finding / Clean.",
+                     — and by \
+                     the_armed_fmt_lane_separates_drift_from_a_toolchain_that_never_looked, \
+                     which mutates a stub targo-fmt through absent / drift-on-stdout / \
+                     error-on-stderr / clean, so the ARMED lane is proven able to go \
+                     red AND proven not to go red for the wrong reason.",
             calls: "gate_lint_with",
             verb_level: true,
         },
@@ -1729,6 +1750,54 @@ fn run_shell_env_capturing(
     }
 }
 
+/// Run a tool capturing BOTH streams, teeing each so the operator sees the
+/// report exactly as a hand-run prints it. Returns `(exit-ok, stdout, stderr)`.
+///
+/// Why not [`run_shell_env_capturing`]: that one pipes stderr and drains it to
+/// EOF before reaping the child, which is correct only while nothing is written
+/// to the OTHER stream. The fmt lane needs both — its findings land on stdout
+/// and its environment faults on stderr — and draining two pipes in sequence
+/// DEADLOCKS the moment the one not being read fills its 64 KiB buffer. A real
+/// drift report does that immediately: the 254-file one measured here is ~250
+/// KiB of stdout. `Command::output()` drains both concurrently, which is the
+/// whole reason it is used instead.
+fn run_capturing_both(
+    desc: &str,
+    program: &Path,
+    args: &[&str],
+    path_prefix: &Path,
+    cwd: &Path,
+) -> (bool, String, String) {
+    eprintln!("  $ {} {}", program.display(), args.join(" "));
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries = vec![path_prefix.to_path_buf()];
+    entries.extend(std::env::split_paths(&existing));
+    match std::env::join_paths(entries) {
+        Ok(joined) => {
+            command.env("PATH", joined);
+        }
+        Err(e) => eprintln!("  {desc}: could not extend PATH ({e}); using inherited PATH"),
+    }
+    match command.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if !out.status.success() {
+                eprintln!("  {desc}: exited {:?}", out.status.code());
+            }
+            (out.status.success(), stdout, stderr)
+        }
+        Err(e) => {
+            eprintln!("  {desc}: could not run ({e})");
+            (false, String::new(), e.to_string())
+        }
+    }
+}
+
 fn run_shell(desc: &str, program: &str, args: &[&str]) -> bool {
     eprintln!("  $ {program} {}", args.join(" "));
     let status = Command::new(program)
@@ -1896,7 +1965,7 @@ enum LaneVerdict {
     /// The lane RAN and found something. Always blocks, on every lane.
     Finding,
     /// The lane did not run. It is NOT clean and it is NOT a finding: nothing
-    /// about the tree was learned. Whether it blocks is [`LintLane::not_run_blocks`].
+    /// about the tree was learned. It blocks on every lane (see [`LintLane`]).
     NotRun,
 }
 
@@ -1926,10 +1995,9 @@ impl LaneVerdict {
 /// with no `else` let `gate lint` print GREEN with two of its four components
 /// never run, while tools/verify.sh's `run_guard` fails closed on the identical
 /// condition ("$label missing or not executable"). It now answers `NotRun`
-/// rather than `Finding` — a distinction with no effect on whether the push is
-/// blocked (see [`LintLane::not_run_blocks`]: the guards lane blocks either
-/// way) and every effect on what the operator is told to go fix, which is a
-/// checkout, not the code.
+/// rather than `Finding` — a distinction with no effect on whether the verdict
+/// is blocked (every NOT RUN blocks; see [`LintLane`]) and every effect on what
+/// the operator is told to go fix, which is a checkout, not the code.
 fn run_repo_guards(root: &Path) -> LaneVerdict {
     let root_str = root.to_string_lossy().into_owned();
     let mut verdict = LaneVerdict::Clean;
@@ -1979,6 +2047,25 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
 }
 
 /// The three lanes `gate lint` folds into one verdict, in run order.
+///
+/// A [`LaneVerdict::NotRun`] on ANY of them blocks. There used to be one
+/// exemption — the fmt lane's — and it was removed when the lane was armed
+/// (2026-08-26), because the argument that bought it is dead. That argument was
+/// STRUCTURAL: "no change to this repository can conjure a `cargo-fmt` into a
+/// stage2 that does not ship one", so blocking would have been a PERMANENT red
+/// rather than a repair request, and a permanent red is what teaches operators
+/// to stop reading a gate. But the stage2 does ship a formatter — `targo-fmt`,
+/// beside `trustfmt` — and this lane now calls it directly, so NOT RUN here is
+/// once again an ordinary repairable environment fault: build the stage2. It is
+/// also the SAME fault the tippy lane already blocks on out of the same
+/// directory, which means the exemption was buying nothing but a quieter report
+/// on a machine that was already blocked.
+///
+/// The escape hatch survives, and it is now the only one: `--no-fmt`, which a
+/// caller has to ask for OUT LOUD and which prints itself on every run. A lane
+/// that goes quiet because a binary is missing is how this one sat unchecked
+/// for a month; a lane that goes quiet because someone typed a flag is a
+/// decision with a name on it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LintLane {
     Tippy,
@@ -1989,35 +2076,6 @@ enum LintLane {
 const LINT_LANES: [LintLane; 3] = [LintLane::Tippy, LintLane::Trustfmt, LintLane::Guards];
 
 impl LintLane {
-    /// Does a [`LaneVerdict::NotRun`] on this lane block the verdict?
-    ///
-    /// The rule of this repo is that "cannot tell" is never "clean", so the
-    /// answer is YES by default, and tippy and the guards take the default.
-    /// Their absence is a REPAIRABLE environment fault — an unbuilt or
-    /// mid-rebuild stage2, a checkout missing tools/ — the tree behind it may
-    /// be filthy, and finding that out is the entire reason this gate exists.
-    ///
-    /// The fmt lane is the single exception, and the ground is STRUCTURAL, not
-    /// convenience. No change to this repository can conjure a `cargo-fmt` into
-    /// a stage2 that does not ship one, so "blocked until you fix it" is not a
-    /// repair request here; it is a permanent red, and a permanent red is
-    /// precisely the state that taught this machine's operators to ignore
-    /// `gate lint` while three lint-red commits went by.
-    ///
-    /// The exemption is deliberately NARROW: it covers NOT RUN only. A fmt lane
-    /// that actually runs and reports drift returns [`LaneVerdict::Finding`]
-    /// and blocks like any other lane, so a machine that HAS `cargo-fmt` still
-    /// gets enforcement, and no lane can go quiet merely by being inconvenient.
-    /// What a NOT-RUN fmt lane does buy is a loud line in the report and a
-    /// qualified verdict word — GREEN is never printed bare while a lane sat
-    /// out.
-    const fn not_run_blocks(self) -> bool {
-        match self {
-            Self::Tippy | Self::Guards => true,
-            Self::Trustfmt => false,
-        }
-    }
-
     /// The lane's name in the report, and in the hook's diagnostics.
     const fn label(self) -> &'static str {
         match self {
@@ -2089,9 +2147,9 @@ impl LintLanes for LiveLintLanes<'_> {
                     // The identity abort is the OTHER not-run hiding in this
                     // gate: when it exhausts the retries NOTHING WAS LINTED, so
                     // the honest answer is `NotRun` — which still blocks (see
-                    // [`LintLane::not_run_blocks`]), but tells the operator to
-                    // wait for the tree to go quiet rather than to hunt a lint
-                    // finding that was never reported.
+                    // [`LintLane`]), but tells the operator to wait for the
+                    // tree to go quiet rather than to hunt a lint finding that
+                    // was never reported.
                     let mut outcome = LaneVerdict::Finding;
                     for attempt in 1..=TIPPY_IDENTITY_RETRIES {
                         let (ok, stderr) = run_shell_env_capturing(
@@ -2145,63 +2203,92 @@ impl LintLanes for LiveLintLanes<'_> {
                     LaneVerdict::NotRun
                 }
             },
-            // `fmt` goes through the stage2 cargo so it picks up Trust's
-            // `trustfmt` from the same directory, rather than a stock rustfmt
-            // that would reformat to a different style than the tree is in.
+            // THE FORMATTER IS `targo-fmt`, INVOKED DIRECTLY — never `cargo fmt`.
             //
-            // TWO WAYS THIS LANE CAN FAIL TO EXIST, and both are NOT RUN. The
-            // second is the live one on every Trust box measured so far: the
-            // stage2 ships `trustfmt` and `targo-fmt`, and ships no `cargo-fmt`
-            // for `cargo fmt` to dispatch to, so the invocation dies at
-            // component lookup having read not one line of Rust. It is checked
-            // BEFORE spawning, both because the answer is a stat() and because
-            // a spawn would print a `FAILED (exit …)` line this lane would then
-            // have to retract.
+            // This lane spent a month reporting NOT RUN behind a `cargo fmt`
+            // that could not dispatch: the Trust stage2 ships `trustfmt` AND
+            // the branded driver `targo-fmt` beside it, and ships no
+            // `cargo-fmt`, so `cargo fmt` died at rustup's component lookup
+            // having read not one line of Rust. The driver was there the whole
+            // time. Nothing was ever wrong with this tree's access to a
+            // formatter — only with how this lane asked for one.
+            //
+            // ONLY the stage2's own driver is accepted, and it is NOT resolved
+            // off PATH. A `cargo-fmt`/`rustfmt` found on PATH is stock Rust's
+            // formatter — a different formatter with a different style — and
+            // holding this tree to it under the pinned toolchain's name is the
+            // same accident [`resolve_tippy`]'s pin check exists to prevent.
+            //
+            // SCOPE, stated out loud because a lane whose limits go unsaid is a
+            // lane that skips silently: `--all` is the WORKSPACE, i.e.
+            // `crates/*`. The out-of-workspace crates (astream-oracle,
+            // experiments/title-neural-poc, tools/temporal-extract,
+            // tools/freeze-safety-gate) are NOT covered by this lane and are
+            // not claimed to be.
             LintLane::Trustfmt => {
-                let stage2_cargo = self.tools.join("cargo");
-                if !stage2_cargo.is_file() {
+                let driver = self.tools.join(TRUSTFMT_DRIVER);
+                if !driver.is_file() {
+                    // Checked BEFORE spawning: the answer is a stat(), and a
+                    // spawn would print a `FAILED (exit …)` line this lane
+                    // would then have to retract.
                     eprintln!(
-                        "  trustfmt: NOT RUN — no cargo in {}. Formatting was NOT checked.",
+                        "  trustfmt: NOT RUN — no `{TRUSTFMT_DRIVER}` in {}. FORMATTING WAS NOT \
+                         CHECKED, so nothing was learned about this tree. This is a missing \
+                         toolchain, NOT a clean tree and NOT a finding. Build the Trust stage2 \
+                         (`python3 x.py build --stage 2` in $HOME/trust), or point TRUST_STAGE2_BIN \
+                         at one that is built, and re-run. To run the rest of the lint without \
+                         this lane, ask for it OUT LOUD: `gate lint --no-fmt`.",
                         self.tools.display()
                     );
-                    LaneVerdict::NotRun
-                } else if !self.tools.join("cargo-fmt").is_file() {
+                    return LaneVerdict::NotRun;
+                }
+                let (ok, stdout, stderr) = run_capturing_both(
+                    "trustfmt",
+                    &driver,
+                    &["--all", "--check"],
+                    self.tools,
+                    self.root,
+                );
+                if ok {
+                    return LaneVerdict::Clean;
+                }
+                // A NON-ZERO EXIT IS NOT YET A FINDING. `targo-fmt` exits 1
+                // both for "the tree is unformatted" and for "I could not look
+                // at the tree" (an unresolvable manifest, a `trustfmt` missing
+                // from PATH). Telling those apart by exit code is the exact
+                // mislabel that made this verb unreadable for a month, so it is
+                // told apart by OUTPUT instead — see [`FMT_DIFF_MARKER`].
+                if stdout.contains(FMT_DIFF_MARKER) {
+                    // PATHS, not files. `targo-fmt` reports one path per MODULE
+                    // PATH it reached a source through, so a file pulled into a
+                    // test target with `#[path = "../src/x.rs"]` is listed twice
+                    // — MEASURED: the 254-file reformat that armed this lane was
+                    // reported as 264 paths, ten of them aterm-release `src/`
+                    // files seen a second time through `tests/../src/`.
+                    let paths = stdout
+                        .lines()
+                        .filter(|l| l.starts_with(FMT_DIFF_MARKER))
+                        .filter_map(|l| l.split_once(':').map(|(path, _)| path))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len();
                     eprintln!(
-                        "  trustfmt: NOT RUN — {} has no `cargo-fmt`, so `cargo fmt` cannot \
-                         dispatch (it answers \"'cargo-fmt' is not installed for the custom \
-                         toolchain 'trust'\" and exits 1). FORMATTING WAS NOT CHECKED — this is \
-                         a missing toolchain component, NOT a clean tree and NOT a finding. The \
-                         stage2 does ship `trustfmt` for hand use; this repo does not hold the \
-                         tree to it (owner's standing rule: never mass-reformat — keep the \
-                         linter green instead), which is why this lane is reported and not \
-                         blocking.",
-                        self.tools.display()
+                        "  trustfmt: FINDING — drift at {paths} path(s) (a source reached \
+                         through two module paths is listed under each, so this is an upper \
+                         bound on files). The diff is printed above. Fix the whole tree with \
+                         `{} --all` from {}.",
+                        driver.display(),
+                        self.root.display()
                     );
-                    LaneVerdict::NotRun
+                    LaneVerdict::Finding
                 } else {
-                    let (ok, stderr) = run_shell_env_capturing(
-                        "trustfmt",
-                        &stage2_cargo.to_string_lossy(),
-                        &["fmt", "--all", "--", "--check"],
-                        &[],
-                        Some(self.tools),
-                        self.root,
+                    eprintln!(
+                        "  trustfmt: NOT RUN — `{TRUSTFMT_DRIVER}` exited non-zero WITHOUT \
+                         reporting a single `{FMT_DIFF_MARKER}…` line, so it never got as far as \
+                         reading the tree. That is an environment fault, not a formatting \
+                         finding. Its own words were:\n{}",
+                        stderr.trim_end()
                     );
-                    if ok {
-                        LaneVerdict::Clean
-                    } else if stderr.contains(FMT_COMPONENT_MISSING) {
-                        // Belt and braces: a `cargo-fmt` that exists but is not
-                        // the component cargo will dispatch to lands here. Say
-                        // out loud that the FAILED line above is not a finding.
-                        eprintln!(
-                            "  trustfmt: NOT RUN — the exit above is NOT a formatting finding: \
-                             cargo reports `cargo-fmt` is not installed for this toolchain. \
-                             Formatting was NOT checked."
-                        );
-                        LaneVerdict::NotRun
-                    } else {
-                        LaneVerdict::Finding
-                    }
+                    LaneVerdict::NotRun
                 }
             }
             LintLane::Guards => run_repo_guards(self.root),
@@ -2209,10 +2296,22 @@ impl LintLanes for LiveLintLanes<'_> {
     }
 }
 
-/// The stage2 cargo's answer when the toolchain ships no `cargo-fmt`. Matched
-/// as a substring, on the quoted component name alone, so the rest of rustup's
-/// wording is free to change.
-const FMT_COMPONENT_MISSING: &str = "'cargo-fmt' is not installed";
+/// Trust's branded `cargo fmt` driver, as it is named in the stage2 bin dir.
+/// It drives `trustfmt`, which it finds as a sibling on PATH — which is why
+/// the lane hands it [`LiveLintLanes::tools`] as a PATH prefix.
+const TRUSTFMT_DRIVER: &str = "targo-fmt";
+
+/// How a formatting FINDING names each file, on STDOUT.
+///
+/// MEASURED on this tree, both directions. A real drift report — the 254-file
+/// one this lane was armed against — writes 2,685 `Diff in <path>:<line>:`
+/// lines to STDOUT and exactly ZERO bytes to stderr. An environment fault
+/// (`targo-fmt` run with `trustfmt` off PATH; an unresolvable dependency
+/// manifest) writes its complaint to STDERR and emits no `Diff in` line at all.
+/// Both exit 1. So the presence of this marker, and not the exit code, is what
+/// separates "the tree is unformatted" from "the check never read the tree" —
+/// the distinction [`LaneVerdict`] exists for.
+const FMT_DIFF_MARKER: &str = "Diff in ";
 
 /// The tippy binary in `tools`, by the same candidate order `tools/verify.sh`
 /// uses. `None` means NOT RUN — never "clean".
@@ -2271,19 +2370,16 @@ fn gate_lint_args(args: &[String]) -> bool {
 /// `atpkg`'s errors aborted the workspace run before tippy reached it.
 ///
 /// THREE OUTCOMES, not two. A FINDING is a statement about the tree and blocks.
-/// A blocking NOT-RUN is a statement about the machine and also blocks, under a
+/// A NOT-RUN is a statement about the MACHINE and also blocks, under a
 /// different headline, because "we could not tell" is not "clean" — but the
-/// operator is sent to fix a toolchain, not to hunt a lint. A non-blocking
-/// NOT-RUN (only the fmt lane, and only for the structural reason argued at
-/// [`LintLane::not_run_blocks`]) passes, and never silently: the verdict word is
-/// qualified with exactly which lane sat out, so bare `GREEN` continues to mean
-/// what it has always meant — every lane ran, every lane was clean.
+/// operator is sent to fix a toolchain, not to hunt a lint. Every lane blocks on
+/// both; see [`LintLane`] for why the fmt lane's old exemption is gone.
 ///
-/// `include_fmt` is the same idea one level up. The push gate must not block on
-/// formatting AT ALL (owner's standing rule: never mass-reformat this tree), and
-/// on a machine that does have `cargo-fmt` a fmt FINDING would block. Rather
-/// than let that hinge on which binaries happen to be installed, the hook
-/// declares the exclusion with `--no-fmt` and this function prints it.
+/// THE ONE NON-BLOCKING PATH IS `include_fmt == false`, and it is a decision
+/// rather than an accident: somebody typed `--no-fmt`. It still never passes
+/// silently — the verdict word is qualified with exactly which lane sat out, so
+/// bare `GREEN` continues to mean what it has always meant: every lane ran, and
+/// every lane was clean.
 fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
     eprintln!(
         "=== gate lint (tippy -D warnings + trustfmt + \
@@ -2296,9 +2392,9 @@ fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
         if lane == LintLane::Trustfmt && !include_fmt {
             eprintln!(
                 "  trustfmt: NOT RUN — excluded by --no-fmt. FORMATTING WAS NOT CHECKED. This \
-                 is the push gate's setting and it is deliberate: the tree is not held to this \
-                 toolchain's formatter (owner's standing rule — never mass-reformat; keep the \
-                 linter green instead). Nothing else is narrowed."
+                 is an explicit opt-out asked for on the command line, not a default: the tree \
+                 IS held to this toolchain's formatter (`targo-fmt --all`), and a plain \
+                 `gate lint` checks it and blocks on drift. Nothing else is narrowed."
             );
             skipped.push(lane.label());
             continue;
@@ -2306,13 +2402,7 @@ fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
         match lanes.run(lane) {
             LaneVerdict::Clean => {}
             LaneVerdict::Finding => findings.push(lane.label()),
-            LaneVerdict::NotRun => {
-                if lane.not_run_blocks() {
-                    blocked_not_run.push(lane.label());
-                } else {
-                    skipped.push(lane.label());
-                }
-            }
+            LaneVerdict::NotRun => blocked_not_run.push(lane.label()),
         }
     }
     // A FINDING OUTRANKS A NOT-RUN in the headline. If tippy found real errors
@@ -2320,7 +2410,10 @@ fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
     // on is the errors; the missing script is reported on its own line and
     // still blocks, so nothing is lost by ranking it second.
     if !findings.is_empty() {
-        eprintln!("{LINT_VERDICT_FAILED} — findings in: {}", findings.join(", "));
+        eprintln!(
+            "{LINT_VERDICT_FAILED} — findings in: {}",
+            findings.join(", ")
+        );
         if !blocked_not_run.is_empty() {
             eprintln!(
                 "  (and {} reached no verdict at all — see above)",
@@ -2960,16 +3053,19 @@ mod tests {
         }
     }
 
-    /// THE VERDICT RULE, stated as a test: a NOT-RUN lane blocks iff
-    /// [`LintLane::not_run_blocks`] says so, and the two answers are BOTH
-    /// exercised. If a future edit made every lane blocking (or none), one half
-    /// of this loop fails — which is the point, because the whole usability of
-    /// this gate on this machine rests on the fmt lane being the exception and
-    /// on tippy NOT being one.
+    /// THE VERDICT RULE, stated as a test: a NOT-RUN lane blocks, on EVERY
+    /// lane, and the loop proves it lane by lane rather than in conjunction —
+    /// so a single arm cannot quietly stop failing closed.
+    ///
+    /// This replaces `a_not_run_lane_blocks_exactly_when_its_policy_says_so`,
+    /// which required BOTH answers of the old `LintLane::not_run_blocks` to be
+    /// exercised and so would fail on today's uniform policy. That is the right
+    /// failure for it to have had: the fmt lane's exemption was the one thing it
+    /// pinned, and the exemption is gone (see [`LintLane`]). What must NOT be
+    /// lost with it is the other half — that a lane which never ran is never
+    /// read as clean — so that is asserted here for all three.
     #[test]
-    fn a_not_run_lane_blocks_exactly_when_its_policy_says_so() {
-        let mut saw_blocking = false;
-        let mut saw_passing = false;
+    fn every_not_run_lane_blocks_the_verdict() {
         for lane in LINT_LANES {
             let mut stub = StubLintLanes::not_running(lane);
             let verdict = gate_lint_with(&mut stub, true);
@@ -2977,40 +3073,43 @@ mod tests {
                 stub.seen.contains(&lane),
                 "lane {lane:?} was never asked, so this case proved nothing"
             );
-            if lane.not_run_blocks() {
-                saw_blocking = true;
-                assert!(
-                    !verdict,
-                    "lane {lane:?} reached NO VERDICT and gate lint passed anyway — \
-                     'cannot tell' was rendered as 'clean'"
-                );
-            } else {
-                saw_passing = true;
-                assert!(
-                    verdict,
-                    "lane {lane:?} is structurally unavailable on this toolchain; a \
-                     NOT RUN there must not permanently red the gate"
-                );
-            }
+            assert!(
+                !verdict,
+                "lane {lane:?} reached NO VERDICT and gate lint passed anyway — \
+                 'cannot tell' was rendered as 'clean'"
+            );
         }
+    }
+
+    /// THE ONE NON-BLOCKING PATH, pinned so it stays the only one: an explicit
+    /// `--no-fmt` passes where the identical lane reporting NOT RUN blocks.
+    /// A lane that goes quiet because someone typed a flag is a decision; a lane
+    /// that goes quiet because a binary is missing is the month-long outage this
+    /// change ended, and the two must never be spelled the same way.
+    #[test]
+    fn only_an_explicit_no_fmt_lets_the_fmt_lane_sit_out() {
+        let mut asked = StubLintLanes::not_running(LintLane::Trustfmt);
         assert!(
-            saw_blocking && saw_passing,
-            "the policy collapsed to one answer for every lane — this test then \
-             asserts nothing about the distinction it exists to pin"
+            !gate_lint_with(&mut asked, true),
+            "a fmt lane that reached no verdict must block like any other lane"
+        );
+
+        let mut excluded = StubLintLanes::all_clean();
+        assert!(gate_lint_with(&mut excluded, false));
+        assert!(
+            !excluded.seen.contains(&LintLane::Trustfmt),
+            "--no-fmt must SKIP the lane, not run it and ignore the answer"
         );
     }
 
     /// Tippy specifically. Named because it is the load-bearing half: a linter
     /// that never started must never be mistaken for a clean lint, which is the
-    /// exact confusion the fmt fix could have spread if the exemption were
+    /// exact confusion the fmt fix could have spread if the exemption had been
     /// written per-outcome instead of per-lane.
     #[test]
     fn a_missing_linter_is_blocked_with_no_verdict_not_a_pass() {
         let mut stub = StubLintLanes::not_running(LintLane::Tippy);
         assert!(!gate_lint_with(&mut stub, true));
-        assert!(LintLane::Tippy.not_run_blocks());
-        assert!(LintLane::Guards.not_run_blocks());
-        assert!(!LintLane::Trustfmt.not_run_blocks());
     }
 
     #[test]
@@ -3040,7 +3139,7 @@ mod tests {
     #[test]
     fn an_absent_toolchain_fails_each_lint_lane_closed_on_its_own() {
         // The REAL lanes, each isolated: with a stage2 dir holding neither
-        // targo-tippy nor cargo, nothing was linted and nothing was
+        // targo-tippy nor targo-fmt, nothing was linted and nothing was
         // format-checked. "Nothing ran" must never read as "clean" — and here
         // it reads as NOT RUN, which is stronger than "not clean": it is the
         // only answer that also tells the operator the tree was never examined.
@@ -3108,8 +3207,8 @@ mod tests {
         };
         assert_eq!(refused.run(LintLane::Tippy), LaneVerdict::NotRun);
         assert!(
-            LintLane::Tippy.not_run_blocks(),
-            "and a NOT-RUN tippy blocks the push"
+            !gate_lint_with(&mut StubLintLanes::not_running(LintLane::Tippy), true),
+            "and a NOT-RUN tippy blocks the verdict"
         );
 
         let mut unguarded = LiveLintLanes {
@@ -3125,19 +3224,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// THE BUG THIS TASK EXISTS FOR, reproduced against the real lane.
+    /// THE ARMED LANE, driven through all four verdicts against the real
+    /// `LiveLintLanes` — because an armed lane that cannot go red is worse than
+    /// an unarmed one, and an armed lane that goes red for the WRONG reason is
+    /// how this one lost a month.
     ///
-    /// A stage2 with a `cargo` and no `cargo-fmt` is this machine, exactly:
-    /// `cargo fmt` prints `'cargo-fmt' is not installed for the custom
-    /// toolchain 'trust'` and exits 1, and the lane used to render that as
-    /// `trustfmt: FAILED`, which made `gate lint` unable to pass for any input.
+    /// The four cases are the four things the driver can do to this gate:
+    ///   1. absent                            -> NOT RUN (the toolchain, not the tree)
+    ///   2. exit 1, `Diff in` on STDOUT       -> FINDING (blocks)
+    ///   3. exit 1, nothing on stdout         -> NOT RUN (environment fault)
+    ///   4. exit 0                            -> CLEAN
     ///
-    /// PROVED BY MUTATION: the same lane, over the same root, with `cargo-fmt`
-    /// ADDED and the stub cargo made to exit non-zero on real drift output,
-    /// answers `Finding`. So NOT RUN here is a reading of the toolchain and not
-    /// a lane that has simply stopped being able to fail.
+    /// Case 3 is the one worth writing down. `targo-fmt` exits 1 both when the
+    /// tree is unformatted and when it could not read the tree at all (an
+    /// unresolvable manifest, `trustfmt` off PATH — MEASURED: it complains on
+    /// stderr and emits no `Diff in` line). Telling those apart by EXIT CODE is
+    /// exactly the mislabel this lane's history is made of, so cases 2 and 3
+    /// differ here ONLY in which stream the stub writes to, and the lane is
+    /// required to tell them apart anyway.
     #[test]
-    fn the_fmt_lane_reports_not_run_when_cargo_fmt_is_missing() {
+    fn the_armed_fmt_lane_separates_drift_from_a_toolchain_that_never_looked() {
         let tmp = std::env::temp_dir().join(format!("aterm-fmt-lane-{}", std::process::id()));
         let root = tmp.join("root");
         let tools = tmp.join("stage2");
@@ -3145,58 +3251,46 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         std::fs::create_dir_all(&tools).expect("stage2");
 
-        // A `cargo` that behaves like this machine's: refuses the fmt verb
-        // because the component is absent.
-        write_exec(
-            &tools.join("cargo"),
-            "#!/bin/sh\n\
-             echo \"error: 'cargo-fmt' is not installed for the custom toolchain 'trust'.\" >&2\n\
-             exit 1\n",
-        );
         let mut live = LiveLintLanes {
             root: &root,
             tools: &tools,
             pin_refusal: None,
         };
+
+        // 1. No driver at all: a missing toolchain is never a clean tree.
         assert_eq!(
             live.run(LintLane::Trustfmt),
             LaneVerdict::NotRun,
-            "a stage2 with no cargo-fmt must report NOT RUN, never FAILED — a \
-             missing component is not a formatting finding"
+            "a stage2 with no `{TRUSTFMT_DRIVER}` must report NOT RUN — never \
+             FAILED, and never CLEAN: nothing was read"
         );
 
-        // MUTATION 1: give it a cargo-fmt and let the run report real drift.
+        // 2. Real drift: the marker on STDOUT, which is where targo-fmt puts it.
         write_exec(
-            &tools.join("cargo-fmt"),
-            "#!/bin/sh\nexit 0\n", // presence is what the pre-check reads
-        );
-        write_exec(
-            &tools.join("cargo"),
-            "#!/bin/sh\necho 'Diff in /x/y.rs at line 3:' >&2\nexit 1\n",
+            &tools.join(TRUSTFMT_DRIVER),
+            "#!/bin/sh\necho 'Diff in /x/y.rs:3:'\nexit 1\n",
         );
         assert_eq!(
             live.run(LintLane::Trustfmt),
             LaneVerdict::Finding,
-            "with cargo-fmt present, a non-zero fmt run IS a finding and must block"
+            "a run that named a drifted file IS a finding and must block"
         );
 
-        // MUTATION 2: same presence, but cargo still reports the component
-        // missing — the belt-and-braces stderr path, still NOT RUN.
+        // 3. Same exit code, same driver — but it never got as far as a file.
+        //    Only the STREAM differs, and that has to be enough.
         write_exec(
-            &tools.join("cargo"),
-            "#!/bin/sh\n\
-             echo \"error: 'cargo-fmt' is not installed for the custom toolchain 'trust'.\" >&2\n\
-             exit 1\n",
+            &tools.join(TRUSTFMT_DRIVER),
+            "#!/bin/sh\necho 'failed to start cargo metadata' >&2\nexit 1\n",
         );
         assert_eq!(
             live.run(LintLane::Trustfmt),
             LaneVerdict::NotRun,
-            "the component-missing signature must survive a cargo-fmt file existing"
+            "a non-zero exit with no `Diff in` line is an environment fault, not \
+             a formatting finding — rendering it as one is the original bug"
         );
 
-        // MUTATION 3: a clean fmt run is Clean, so none of the above is the
-        // lane having quietly stopped answering.
-        write_exec(&tools.join("cargo"), "#!/bin/sh\nexit 0\n");
+        // 4. Clean, so none of the above is the lane having stopped answering.
+        write_exec(&tools.join(TRUSTFMT_DRIVER), "#!/bin/sh\nexit 0\n");
         assert_eq!(live.run(LintLane::Trustfmt), LaneVerdict::Clean);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3219,10 +3313,48 @@ mod tests {
     /// from the gate's side: if the marker text changes here and not there, the
     /// hook silently degrades to reporting every failure as a finding, which is
     /// the mislabel this whole change removes.
+    ///
+    /// KNOWN RED, AND NOT BY THIS CHANGE. `.githooks/pre-push` was demoted to
+    /// ADVISORY on 2026-08-24 — it prints one line and exits 0 — so it greps
+    /// for nothing and the marker half of this test has been failing ever
+    /// since. Repairing that coupling means deciding what the hook is FOR, which
+    /// is a separate question from which formatter `gate lint` drives; it is
+    /// left alone here deliberately, red exactly as it was found, so that the
+    /// before/after of the fmt-lane arming is an exact comparison rather than a
+    /// fix smuggled in beside it.
+    ///
+    /// The LAST assertion is this change's, and it is the reverse of what it
+    /// used to say. It used to require `--no-fmt` in the hook, on the ground
+    /// that "a push must not be blocked by formatting". That was the owner's
+    /// standing rule; the owner has reversed it, the tree has been formatted,
+    /// and the lane is armed — so the command this file teaches must be the one
+    /// that actually checks formatting.
     #[test]
     fn the_hook_greps_the_verdict_markers_this_gate_prints() {
         let hook = std::fs::read_to_string(workspace_root().join(".githooks/pre-push"))
             .expect("read .githooks/pre-push");
+        // FIRST, deliberately: the marker loop below is known-red (see the doc
+        // comment), and a panic there would make every assertion after it dead
+        // code. An assertion that cannot execute proves nothing.
+        // Only the RUNNABLE lines. The prose above them recounts what the hook
+        // used to run before its 2026-08-24 demotion — `gate lint --no-fmt` —
+        // and that sentence is history, still true, and not this test's
+        // business.
+        let taught: Vec<&str> = hook
+            .lines()
+            .filter(|l| l.contains("run -p xtask -- gate lint"))
+            .collect();
+        assert!(
+            !taught.is_empty(),
+            "the hook no longer shows how to run `gate lint` at all — the checks \
+             it stopped enforcing survive only as the commands it names"
+        );
+        assert!(
+            taught.iter().all(|l| !l.contains("--no-fmt")),
+            "the hook must teach `gate lint` WITHOUT --no-fmt: the fmt lane is \
+             armed, and a documented command that opts out of it by default \
+             re-creates the unchecked month this change ended. Offending: {taught:?}"
+        );
         for marker in [LINT_VERDICT_FAILED, LINT_VERDICT_NO_VERDICT] {
             assert!(
                 hook.contains(marker),
@@ -3230,11 +3362,6 @@ mod tests {
                  distinguish a finding from a no-verdict without it"
             );
         }
-        assert!(
-            hook.contains("gate lint --no-fmt"),
-            "the hook must invoke the lint gate with --no-fmt: a push must not be \
-             blocked by formatting"
-        );
     }
 
     // The census walker's unit tests (parse_fn_def / guard_vars / term_hop_calls
@@ -3414,9 +3541,9 @@ mod tests {
     /// could print GREEN with grep_guard and license_check never run.
     ///
     /// It reports NOT RUN rather than a finding (nothing about the tree was
-    /// learned), and the assertion pairs that with the policy so the pair keeps
-    /// meaning "blocked": a NOT-RUN that stopped blocking would pass the first
-    /// assert and fail the second.
+    /// learned), and the second assertion drives the VERB with that same verdict
+    /// so the pair keeps meaning "blocked": a NOT-RUN that stopped blocking
+    /// would pass the first assert and fail the second.
     #[test]
     fn missing_guard_scripts_fail_the_lint_closed() {
         let dir = std::env::temp_dir().join("aterm_gate_guards_absent_test");
@@ -3428,8 +3555,8 @@ mod tests {
             "a root with no tools/ passed the guard stage"
         );
         assert!(
-            LintLane::Guards.not_run_blocks(),
-            "a guards lane that never ran must still block the push"
+            !gate_lint_with(&mut StubLintLanes::not_running(LintLane::Guards), true),
+            "a guards lane that never ran must still block the verdict"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

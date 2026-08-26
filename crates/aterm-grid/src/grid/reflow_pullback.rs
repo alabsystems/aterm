@@ -142,7 +142,9 @@ impl Grid {
         self.storage.visible_rows -= belt_u16;
         // Live extras follow their rows up; the belt rows' entries drop (their
         // content now rides the extracted `Line`s).
-        self.storage.extras.shift_region_up_by(0, old_bottom, belt_u16);
+        self.storage
+            .extras
+            .shift_region_up_by(0, old_bottom, belt_u16);
         self.storage.cursor.row -= belt_u16;
         if self.storage.saved_cursor.valid {
             self.storage.saved_cursor.cursor.row = self

@@ -1640,7 +1640,10 @@ mod tests {
         table.insert("f11".to_string(), "unbind".to_string());
         table.insert("ctrl+alt+f9".to_string(), "none".to_string()); // never bound: no-op
         let (kb, warns) = Keybindings::resolved_warn(Some(&table));
-        assert!(warns.is_empty(), "unbind is not an unknown action: {warns:?}");
+        assert!(
+            warns.is_empty(),
+            "unbind is not an unknown action: {warns:?}"
+        );
         assert_eq!(
             kb.lookup(&WinitKey::Named(NamedKey::Tab), ModifiersState::CONTROL),
             None,
@@ -1901,9 +1904,18 @@ mod tests {
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
         assert_eq!(builtin_shadow_label_when("cmd+c", true), Some("Copy"));
-        assert_eq!(builtin_shadow_label_when("cmd+shift+]", true), Some("Next Tab"));
-        assert_eq!(builtin_shadow_label_when("cmd+1", true), Some("Switch to Tab 1"));
-        assert_eq!(builtin_shadow_label_when("shift+cmd+]", true), Some("Next Tab"));
+        assert_eq!(
+            builtin_shadow_label_when("cmd+shift+]", true),
+            Some("Next Tab")
+        );
+        assert_eq!(
+            builtin_shadow_label_when("cmd+1", true),
+            Some("Switch to Tab 1")
+        );
+        assert_eq!(
+            builtin_shadow_label_when("shift+cmd+]", true),
+            Some("Next Tab")
+        );
         assert_eq!(builtin_shadow_label_when("cmd+k", true), None);
         assert_eq!(builtin_shadow_label_when("garbage++", true), None);
     }

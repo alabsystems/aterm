@@ -140,7 +140,11 @@ mod hid_lock_state {
             connect: *mut IoConnect,
         ) -> KernReturn;
         fn IOObjectRelease(object: IoObject) -> KernReturn;
-        fn IOHIDGetModifierLockState(handle: IoConnect, selector: c_int, state: *mut bool) -> KernReturn;
+        fn IOHIDGetModifierLockState(
+            handle: IoConnect,
+            selector: c_int,
+            state: *mut bool,
+        ) -> KernReturn;
     }
 
     /// The process-wide user client, `None` once the open has failed.
@@ -403,7 +407,11 @@ pub fn build_key_input(
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
     let key = aterm_winit_keymap::map_logical_key(&ev.key_without_modifiers())?;
-    Some((key, mods, aterm_winit_keymap::base_layout_key_for(ev.physical_key)))
+    Some((
+        key,
+        mods,
+        aterm_winit_keymap::base_layout_key_for(ev.physical_key),
+    ))
 }
 
 /// Fallback for [`build_key_input`] on platforms WITHOUT

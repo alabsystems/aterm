@@ -1157,7 +1157,8 @@ mod tests {
         // Hold the peer open and silent: the ONLY thing that can end our read is the
         // watchdog force-closing our own socket.
         let _peer = accepting.join().unwrap();
-        tcp.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
 
         let started = Instant::now();
         let watchdog = HandshakeWatchdog::arm(&tcp, DEADLINE).unwrap();

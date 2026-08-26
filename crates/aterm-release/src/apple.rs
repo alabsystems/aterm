@@ -210,7 +210,9 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
     // identity" about a keychain it never managed to open.
     if let Some(why) = seen.lookup_failed.as_deref() {
         return Outcome::Blocked {
-            what: format!("cannot read the keychain, so this machine's Apple state is unknown: {why}"),
+            what: format!(
+                "cannot read the keychain, so this machine's Apple state is unknown: {why}"
+            ),
             fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
         };
     }
@@ -231,7 +233,10 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
                     .into(),
             },
             (true, false) => Outcome::Todo {
-                what: format!("no Developer ID Application identity for team {}", pins::APPLE_TEAM_ID),
+                what: format!(
+                    "no Developer ID Application identity for team {}",
+                    pins::APPLE_TEAM_ID
+                ),
                 next: format!(
                     "re-run without --check: it will ask before spending one of five \
                      permanent certificate slots, then generate '{id}'s request"
@@ -258,7 +263,6 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
         // just made valid stays invisible to every branch below until we re-read.
         seen = Observed::look(id);
     }
-
 
     // An identity is installed — prove it can actually sign, every run, and say so.
     if !seen.identities.is_empty() {
@@ -301,7 +305,10 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
                 plural(seen.invalid_present),
             )
         } else {
-            format!("delete {} and re-run to mint a fresh key and request", csr.display())
+            format!(
+                "delete {} and re-run to mint a fresh key and request",
+                csr.display()
+            )
         };
         return Outcome::Blocked {
             what: format!(
@@ -318,10 +325,13 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
     if let Some(key) = &seen.key {
         return match write_csr(key, &csr_path(&dir, id)) {
             Ok(csr) => {
-                step(APPLE_LABEL, &format!(
-                    "rebuilt the certificate request for '{id}' from the key already here \
+                step(
+                    APPLE_LABEL,
+                    &format!(
+                        "rebuilt the certificate request for '{id}' from the key already here \
                      — no new key, no new slot"
-                ));
+                    ),
+                );
                 await_then_install(key, &csr, id, &dir, seen.invalid_present)
             }
             Err(e) => Outcome::Blocked {
@@ -334,7 +344,9 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
     // !I && !K && !C — run 1. This is the only branch that spends a slot.
     match confirm_slot(id, seen.invalid_present) {
         Ok(true) => match generate(&dir, id) {
-            Ok(csr) => await_then_install(&key_path(&dir, id), &csr, id, &dir, seen.invalid_present),
+            Ok(csr) => {
+                await_then_install(&key_path(&dir, id), &csr, id, &dir, seen.invalid_present)
+            }
             Err(outcome) => outcome,
         },
         Ok(false) => Outcome::Waiting {
@@ -365,13 +377,7 @@ const WAIT_FOR_CERT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 /// disk and the keychain, never from a progress marker, so a re-run resumes exactly here.
 /// Without a terminal (CI, a pipe) it does not wait at all — it reports the errand and
 /// returns, because there is nobody to do it.
-fn await_then_install(
-    key: &Path,
-    csr: &Path,
-    id: &str,
-    dir: &Path,
-    invalid: usize,
-) -> Outcome {
+fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usize) -> Outcome {
     // Two causes, two remedies, and they are NOT interchangeable. `find_matching_cert`
     // fails either because a directory it must read is unreadable, or because this
     // machine's OWN request key could not be read — and the second is not a certificate
@@ -385,7 +391,7 @@ fn await_then_install(
                 what: format!(
                     "this machine's own certificate request key cannot be read, so nothing \
                      can be matched against it: {why}",
-                    ),
+                ),
                 fix: format!(
                     "prove it first: openssl rsa -in {} -noout -check\n\
                      if that fails the key is damaged. A NEW request costs another of team \
@@ -480,7 +486,10 @@ fn await_then_install(
         std::thread::sleep(std::time::Duration::from_secs(3));
         match find_matching_cert(key) {
             Ok((Some(cer), _)) => {
-                step(APPLE_LABEL, &format!("certificate found: {}", cer.path.display()));
+                step(
+                    APPLE_LABEL,
+                    &format!("certificate found: {}", cer.path.display()),
+                );
                 return install(&cer, key, id);
             }
             Err(why) => return blocked(why),
@@ -509,7 +518,10 @@ fn await_then_install(
                     // verdict, a note beginning "examined, not this request's" reads as
                     // progress — the tool looking at files — rather than as a refusal of
                     // the file the operator downloaded four seconds ago.
-                    step(APPLE_LABEL, "⚠ THE .cer THAT JUST ARRIVED IS NOT THIS REQUEST'S");
+                    step(
+                        APPLE_LABEL,
+                        "⚠ THE .cer THAT JUST ARRIVED IS NOT THIS REQUEST'S",
+                    );
                     step("", &note);
                 }
                 rejected = seen;
@@ -523,7 +535,10 @@ fn await_then_install(
         if mins > announced {
             announced = mins;
             let of = WAIT_FOR_CERT.as_secs() / 60;
-            step("", &format!("still waiting for the .cer… {mins} min of {of}"));
+            step(
+                "",
+                &format!("still waiting for the .cer… {mins} min of {of}"),
+            );
         }
     }
     // Said out loud rather than left implied by a verdict that could equally be a crash.
@@ -631,7 +646,11 @@ fn installed_cert_spki(sha1: &str) -> Option<String> {
         &["x509", "-pubkey", "-noout"],
         Some(pem.as_bytes()),
     )?;
-    let der = capture("/usr/bin/openssl", &["pkey", "-pubin", "-outform", "DER"], Some(&der))?;
+    let der = capture(
+        "/usr/bin/openssl",
+        &["pkey", "-pubin", "-outform", "DER"],
+        Some(&der),
+    )?;
     digest(&der)
 }
 
@@ -645,7 +664,14 @@ fn installed_cert_spki(sha1: &str) -> Option<String> {
 fn installed_leaf_pem(sha1: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/security",
-        &["find-certificate", "-a", "-c", "Developer ID Application", "-p", "-Z"],
+        &[
+            "find-certificate",
+            "-a",
+            "-c",
+            "Developer ID Application",
+            "-p",
+            "-Z",
+        ],
         None,
     )?;
     leaf_pem_by_sha1(&String::from_utf8_lossy(&out), sha1)
@@ -797,11 +823,7 @@ fn identity_label(sha1: &str) -> Option<String> {
 /// reads as a bug in the tool rather than a fact about the machine — the same rule
 /// `provision::gaps` follows for the summary line.
 fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 { "" } else { "s" }
 }
 
 /// The verdict when no certificate has arrived.
@@ -815,7 +837,9 @@ fn plural(n: usize) -> &'static str {
 /// non-interactive path keeps `None` on purpose: nothing has been surfaced there, so the
 /// search-location fact is the true one.
 fn waiting_text(id: &str, invalid: usize, rejected: &[PathBuf], csr: Option<&Path>) -> String {
-    let mut s = format!("a certificate request for '{id}' is out for signature and no matching certificate has arrived yet");
+    let mut s = format!(
+        "a certificate request for '{id}' is out for signature and no matching certificate has arrived yet"
+    );
     if let Some(note) = rejected_note(rejected, csr) {
         s.push_str("; ");
         s.push_str(&note);
@@ -1002,7 +1026,7 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
                      --team-id {}",
                     pins::APPLE_TEAM_ID
                 ),
-            }
+            };
         }
     };
     if apple_id.is_empty() {
@@ -1094,7 +1118,10 @@ fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
                 .into(),
         });
     }
-    if let Err(e) = run("/usr/bin/openssl", &["genrsa", "-out", &key.to_string_lossy(), "2048"]) {
+    if let Err(e) = run(
+        "/usr/bin/openssl",
+        &["genrsa", "-out", &key.to_string_lossy(), "2048"],
+    ) {
         return Err(Outcome::Blocked {
             what: format!("could not generate a private key: {e}"),
             fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
@@ -1119,7 +1146,10 @@ fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
 fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
     // The subject Keychain Access produces for a Developer ID request: Apple replaces the
     // common name with the team's own on issuance, so what matters is that it parses.
-    let subject = format!("/CN=Developer ID Application/O={}/C=US", pins::APPLE_TEAM_ID);
+    let subject = format!(
+        "/CN=Developer ID Application/O={}/C=US",
+        pins::APPLE_TEAM_ID
+    );
     run(
         "/usr/bin/openssl",
         &[
@@ -1218,8 +1248,7 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
     // permanently. Spending a Developer ID slot is exactly that: five exist per team,
     // ever, and revoking one stops every app it already signed from launching.
     out.push(
-        "⚠ THE TRAP: the portal's list may ALREADY show a Developer ID certificate."
-            .to_string(),
+        "⚠ THE TRAP: the portal's list may ALREADY show a Developer ID certificate.".to_string(),
     );
     out.push(
         "  Download it ONLY if YOU created it from the request named above — then it \
@@ -1271,7 +1300,10 @@ fn surface_csr(csr: &Path, id: &str) -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join("Downloads"))?
         .join(format!("devid-{id}.certSigningRequest"));
     std::fs::copy(csr, &visible).ok()?;
-    let _ = Command::new("/usr/bin/open").arg("-R").arg(&visible).status();
+    let _ = Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(&visible)
+        .status();
     Some(visible)
 }
 
@@ -1383,7 +1415,14 @@ fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>) -> Option<String> {
 fn key_spki_sha256(key: &Path) -> Option<String> {
     let der = capture(
         "/usr/bin/openssl",
-        &["rsa", "-in", &key.to_string_lossy(), "-pubout", "-outform", "DER"],
+        &[
+            "rsa",
+            "-in",
+            &key.to_string_lossy(),
+            "-pubout",
+            "-outform",
+            "DER",
+        ],
         None,
     )?;
     digest(&der)
@@ -1394,7 +1433,15 @@ fn key_spki_sha256(key: &Path) -> Option<String> {
 fn cert_spki_sha256(cer: &Path, form: &str) -> Option<String> {
     let pem_pub = capture(
         "/usr/bin/openssl",
-        &["x509", "-inform", form, "-in", &cer.to_string_lossy(), "-pubkey", "-noout"],
+        &[
+            "x509",
+            "-inform",
+            form,
+            "-in",
+            &cer.to_string_lossy(),
+            "-pubkey",
+            "-noout",
+        ],
         None,
     )?;
     let der = capture(
@@ -1440,7 +1487,7 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
                 what: format!("could not read the subject of {}", cer.path.display()),
                 fix: "check the file is the certificate Apple issued, not an HTML error page"
                     .into(),
-            }
+            };
         }
     };
     if !subject.contains(pins::APPLE_TEAM_ID) {
@@ -1548,7 +1595,7 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
                         cer.form,
                         cer.path.display()
                     ),
-                }
+                };
             }
         }
     }
@@ -1583,7 +1630,8 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     // login keychain password on this terminal; with `Command::output()` its stdin is
     // /dev/null and the prompt has nowhere to go. No `-k`: a password on argv is visible
     // in `ps`.
-    let label = cert_common_name(&subject).unwrap_or_else(|| format!("Developer ID Application: {id}"));
+    let label =
+        cert_common_name(&subject).unwrap_or_else(|| format!("Developer ID Application: {id}"));
     let _ = Command::new("/usr/bin/security")
         .args([
             "set-key-partition-list",
@@ -1754,7 +1802,15 @@ const SUBJECT_KEY_ID: &str = "X509v3 Subject Key Identifier:";
 fn cert_key_id(cer: &Path, form: &str, header: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/openssl",
-        &["x509", "-inform", form, "-in", &cer.to_string_lossy(), "-noout", "-text"],
+        &[
+            "x509",
+            "-inform",
+            form,
+            "-in",
+            &cer.to_string_lossy(),
+            "-noout",
+            "-text",
+        ],
         None,
     )?;
     key_id_from_text(&String::from_utf8_lossy(&out), header)
@@ -1771,7 +1827,11 @@ fn key_id_from_text(text: &str, header: &str) -> Option<String> {
     let header_line = lines.next()?;
     // OpenSSL has printed the value on the header line itself in some releases.
     let inline = header_line.trim().strip_prefix(header).unwrap_or("").trim();
-    let raw = if inline.is_empty() { lines.next()?.trim() } else { inline };
+    let raw = if inline.is_empty() {
+        lines.next()?.trim()
+    } else {
+        inline
+    };
     let hex: String = raw
         .trim_start_matches("keyid:")
         .trim()
@@ -1799,7 +1859,13 @@ fn key_id_from_text(text: &str, header: &str) -> Option<String> {
 fn repair_installed_chain() -> Option<String> {
     let pems = capture(
         "/usr/bin/security",
-        &["find-certificate", "-a", "-c", "Developer ID Application", "-p"],
+        &[
+            "find-certificate",
+            "-a",
+            "-c",
+            "Developer ID Application",
+            "-p",
+        ],
         None,
     )?;
     // One PEM block per certificate, and `-c` matches on the common name alone, so blocks
@@ -1838,7 +1904,10 @@ fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let dir = std::env::temp_dir();
     for n in 0..16u32 {
-        let path = dir.join(format!("aterm-provision-leaf-{}-{n}.pem", std::process::id()));
+        let path = dir.join(format!(
+            "aterm-provision-leaf-{}-{n}.pem",
+            std::process::id()
+        ));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1846,7 +1915,8 @@ fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
             .open(&path)
         {
             Ok(mut f) => {
-                f.write_all(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+                f.write_all(bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
                 return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1865,7 +1935,13 @@ fn keychain_has_subject(subject: &str) -> bool {
 fn keychain_cert_with_subject(subject: &str) -> Option<String> {
     let pems = capture(
         "/usr/bin/security",
-        &["find-certificate", "-a", "-c", "Developer ID Certification Authority", "-p"],
+        &[
+            "find-certificate",
+            "-a",
+            "-c",
+            "Developer ID Certification Authority",
+            "-p",
+        ],
         None,
     )?;
     // One PEM block per certificate; compare each subject rather than trusting the
@@ -1894,7 +1970,15 @@ fn keychain_cert_with_subject(subject: &str) -> Option<String> {
 fn cert_field(cer: &Path, form: &str, field: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/openssl",
-        &["x509", "-inform", form, "-in", &cer.to_string_lossy(), "-noout", field],
+        &[
+            "x509",
+            "-inform",
+            form,
+            "-in",
+            &cer.to_string_lossy(),
+            "-noout",
+            field,
+        ],
         None,
     )?;
     Some(String::from_utf8_lossy(&out).to_string())
@@ -1903,7 +1987,15 @@ fn cert_field(cer: &Path, form: &str, field: &str) -> Option<String> {
 fn cert_subject(cer: &Path, form: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/openssl",
-        &["x509", "-inform", form, "-in", &cer.to_string_lossy(), "-noout", "-subject"],
+        &[
+            "x509",
+            "-inform",
+            form,
+            "-in",
+            &cer.to_string_lossy(),
+            "-noout",
+            "-subject",
+        ],
         None,
     )?;
     Some(String::from_utf8_lossy(&out).to_string())
@@ -2143,11 +2235,18 @@ mod tests {
         assert!(text.contains("/tmp/devid-m9.certSigningRequest"));
         assert!(text.contains("nobody else create"), "{text}");
         assert!(text.contains("G2 Sub-CA"));
-        assert!(text.contains("~/Downloads"), "the download has to land somewhere: {text}");
+        assert!(
+            text.contains("~/Downloads"),
+            "the download has to land somewhere: {text}"
+        );
         assert!(!text.contains("re-run"), "{text}");
         // The path that does NOT wait may not promise one.
         assert!(!text.contains("watching ~/Downloads"), "{text}");
-        assert!(errand_lines(Path::new("/tmp/x.csr"), true).iter().any(|l| l.contains("watching ~/Downloads")));
+        assert!(
+            errand_lines(Path::new("/tmp/x.csr"), true)
+                .iter()
+                .any(|l| l.contains("watching ~/Downloads"))
+        );
     }
 
     /// The interactive errand must be SCANNABLE, and the trap must be the last thing
@@ -2155,7 +2254,10 @@ mod tests {
     /// wasted certificate slot; these assertions pin the shape that replaced it.
     #[test]
     fn the_errand_lines_put_the_upload_target_and_the_trap_where_they_are_seen() {
-        let lines = errand_lines(Path::new("/Users//x/Downloads/devid-m9.certSigningRequest"), true);
+        let lines = errand_lines(
+            Path::new("/Users//x/Downloads/devid-m9.certSigningRequest"),
+            true,
+        );
         // The file to upload gets a line to ITSELF — not buried mid-sentence.
         assert!(
             lines
@@ -2174,12 +2276,18 @@ mod tests {
         // What IS pinned here is that no element hand-breaks its own prose: the wrapper
         // owns the breaks, so a line frozen at the author's window is the defect.
         for line in &lines {
-            assert!(!line.contains('\n'), "the wrapper owns the breaks: {line:?}");
+            assert!(
+                !line.contains('\n'),
+                "the wrapper owns the breaks: {line:?}"
+            );
         }
         let joined = lines.join("\n");
-        assert!(joined.contains("nobody else create"), "the Account Holder rule is about \
+        assert!(
+            joined.contains("nobody else create"),
+            "the Account Holder rule is about \
             CREATING a certificate — truncated to \"nobody else\" it reads as \"nobody else \
-            may sign in\", which is false and stops a legitimate role account: {joined}");
+            may sign in\", which is false and stops a legitimate role account: {joined}"
+        );
         assert!(
             joined.contains("matched against this request by public key"),
             "the matching mechanism is what makes the trap credible rather than a rule to \
@@ -2201,7 +2309,9 @@ mod tests {
             "the trap must say WHY: {lines:#?}"
         );
         assert!(
-            lines[trap..].iter().any(|l| l.contains("Already downloaded one?")),
+            lines[trap..]
+                .iter()
+                .any(|l| l.contains("Already downloaded one?")),
             "a prohibition with no corrective act leaves the field case — the operator who \
              ALREADY downloaded the wrong one — with nothing to do: {lines:#?}"
         );
@@ -2235,7 +2345,9 @@ mod tests {
     /// on a problem that was never about the certificate.
     #[test]
     fn a_refused_certificate_names_the_upload_that_fixes_it() {
-        let rejected = vec![PathBuf::from("/Users//x/Downloads/developerID_application.cer")];
+        let rejected = vec![PathBuf::from(
+            "/Users//x/Downloads/developerID_application.cer",
+        )];
         let csr = PathBuf::from("/Users//x/Downloads/devid-m9.certSigningRequest");
         let note = rejected_note(&rejected, Some(&csr)).expect("a refusal must be explained");
         assert!(note.contains("developerID_application.cer"), "{note}");
@@ -2268,8 +2380,10 @@ mod tests {
         assert!(second.contains("newer"), "{second}");
         assert!(!second.contains("older"), "{second}");
         // `find-identity` prints the digest uppercase; the comparison may not care.
-        assert!(leaf_pem_by_sha1(stream, "1111111111111111111111111111111111111111")
-            .is_some_and(|p| p.contains("older")));
+        assert!(
+            leaf_pem_by_sha1(stream, "1111111111111111111111111111111111111111")
+                .is_some_and(|p| p.contains("older"))
+        );
         assert!(leaf_pem_by_sha1(stream, &"3".repeat(40)).is_none());
     }
 
@@ -2295,7 +2409,9 @@ mod tests {
             Some("7A7CDC1EA9B4E0951A801B6C69468D94C26D6157")
         );
         // A certificate carrying neither is not one this code may guess about.
-        assert!(key_id_from_text("X509v3 Basic Constraints: critical\n", AUTHORITY_KEY_ID).is_none());
+        assert!(
+            key_id_from_text("X509v3 Basic Constraints: critical\n", AUTHORITY_KEY_ID).is_none()
+        );
     }
 
     /// MEASURED: `openssl x509 -noout -enddate` over the installed Developer ID
@@ -2318,7 +2434,8 @@ mod tests {
     /// re-runs the same command after any interruption.
     #[test]
     fn a_duplicate_keychain_item_is_not_a_failure() {
-        let dup = "security: SecKeychainItemImport: The specified item already exists in the keychain.";
+        let dup =
+            "security: SecKeychainItemImport: The specified item already exists in the keychain.";
         assert!(dup.to_ascii_lowercase().contains("already exists"));
     }
 }

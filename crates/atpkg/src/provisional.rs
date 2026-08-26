@@ -61,7 +61,8 @@ pub fn builds_for(layout: &Layout, program: &str) -> BTreeSet<u64> {
 /// Forget every recorded pair whose build is no longer installed — called after a GC
 /// sweep so the record tracks reality rather than accumulating dead entries.
 pub fn prune(layout: &Layout) {
-    let installed: BTreeSet<(String, u64)> = crate::ops::list_installed(layout).into_iter().collect();
+    let installed: BTreeSet<(String, u64)> =
+        crate::ops::list_installed(layout).into_iter().collect();
     let kept: BTreeSet<(String, u64)> = read(layout)
         .into_iter()
         .filter(|pair| installed.contains(pair))
@@ -89,10 +90,7 @@ fn write(layout: &Layout, pairs: &BTreeSet<(String, u64)>) {
         let _ = std::fs::remove_file(&path);
         return;
     }
-    let body: String = pairs
-        .iter()
-        .map(|(p, b)| format!("{p} {b}\n"))
-        .collect();
+    let body: String = pairs.iter().map(|(p, b)| format!("{p} {b}\n")).collect();
     if let Ok(mut f) = crate::platform::open_create_write(&path, 0o600) {
         use std::io::Write as _;
         let _ = f.write_all(body.as_bytes());
@@ -113,7 +111,10 @@ mod tests {
     #[test]
     fn records_merges_and_reads_back_per_program() {
         let layout = scratch("rw");
-        assert!(builds_for(&layout, "trust").is_empty(), "nothing recorded yet");
+        assert!(
+            builds_for(&layout, "trust").is_empty(),
+            "nothing recorded yet"
+        );
 
         record(&layout, &[("trust".into(), 5520), ("ay".into(), 6255)]);
         assert_eq!(builds_for(&layout, "trust"), [5520].into_iter().collect());
@@ -137,5 +138,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
-
 }

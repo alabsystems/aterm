@@ -158,8 +158,8 @@ use aterm_effects::word_decorations::{
 };
 use aterm_lexicon::{Class, Lexicon};
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, WordDecoration};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use aterm_time::Instant;
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 /// 10x20 px cells: comfortably past CAT_MIN_CELL_W = 7 / CAT_MIN_CELL_H = 14,
 /// and a plausible real metric for a 14 pt monospace face on a HiDPI display.

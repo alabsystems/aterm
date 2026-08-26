@@ -74,7 +74,11 @@ fn cell_px(r: &Renderer, pixels: &[u32], w: usize, row: usize, col: usize) -> u3
 
 /// Render `input` through the shipping damage-tracked entry and hand back the
 /// framebuffer.
-fn frame(r: &mut Renderer, wc: &mut WindowCpu, input: &aterm_core::render::RenderInput) -> Vec<u32> {
+fn frame(
+    r: &mut Renderer,
+    wc: &mut WindowCpu,
+    input: &aterm_core::render::RenderInput,
+) -> Vec<u32> {
     let view = r.render_input_cached(wc, input);
     view.pixels().to_vec()
 }

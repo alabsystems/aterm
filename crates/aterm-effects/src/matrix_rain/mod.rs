@@ -25,10 +25,10 @@
 //!   ([`field::col_params`]), the 350 ms dither grid, and the ≤ 2
 //!   ignitions/s wave limiter live in the math, not in host policy.
 
+pub mod bake;
 /// The 8x8 bitmap glyph table literal material mode draws with — public-domain
 /// data copied in-tree, retiring the `font8x8` crate (see `bitmap_font.rs`).
 mod bitmap_font;
-pub mod bake;
 pub mod field;
 pub mod rom;
 

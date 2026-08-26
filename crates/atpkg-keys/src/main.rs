@@ -159,7 +159,12 @@ const MASTER_FLAGS: &[&str] = &[
 ///
 /// `allowed` lists the flags the verb reads; `max_positional` bounds its bare arguments.
 #[cfg(unix)]
-fn vet_args(verb: &str, argv: &Argv, allowed: &[&str], max_positional: usize) -> Result<(), String> {
+fn vet_args(
+    verb: &str,
+    argv: &Argv,
+    allowed: &[&str],
+    max_positional: usize,
+) -> Result<(), String> {
     let mut positional = 0usize;
     let mut i = 0usize;
     while i < MAX_ARGS {
@@ -302,30 +307,34 @@ fn main() -> ExitCode {
         ]))
     } else {
         match verb.as_deref() {
-        Some("pubkey") => vetted("pubkey", &argv, &[], 1).and_then(|()| pubkey(positional(&argv, 0))),
-        Some("sign") => vetted("sign", &argv, &[], 3).and_then(|()| {
-            sign(
-                positional(&argv, 0),
-                positional(&argv, 1),
-                positional(&argv, 2),
-            )
-        }),
-        Some("master-check") => vetted("master-check", &argv, &[], 0).and_then(|()| master_check()),
-        Some("setup") => vetted("setup", &argv, PROVISION_FLAGS, 0)
-            .and_then(|()| provision(atpkg_keys::provision::Verb::Setup, &argv)),
-        Some("join") => vetted("join", &argv, PROVISION_FLAGS, 0)
-            .and_then(|()| provision(atpkg_keys::provision::Verb::Join, &argv)),
-        Some("machine-revoke") => vetted("machine-revoke", &argv, &["id", "roster"], 0)
-            .and_then(|()| machine_revoke(&argv)),
-        Some(other) => Err(concat(&[
-            "unknown verb '",
-            other,
-            "' (try: setup, join, machine-revoke, master-check, pubkey, sign)",
-        ])),
-        None => Err(
-            "usage: atpkg-keys <setup|join|machine-revoke|master-check|pubkey|sign> …"
-                .to_string(),
-        ),
+            Some("pubkey") => {
+                vetted("pubkey", &argv, &[], 1).and_then(|()| pubkey(positional(&argv, 0)))
+            }
+            Some("sign") => vetted("sign", &argv, &[], 3).and_then(|()| {
+                sign(
+                    positional(&argv, 0),
+                    positional(&argv, 1),
+                    positional(&argv, 2),
+                )
+            }),
+            Some("master-check") => {
+                vetted("master-check", &argv, &[], 0).and_then(|()| master_check())
+            }
+            Some("setup") => vetted("setup", &argv, PROVISION_FLAGS, 0)
+                .and_then(|()| provision(atpkg_keys::provision::Verb::Setup, &argv)),
+            Some("join") => vetted("join", &argv, PROVISION_FLAGS, 0)
+                .and_then(|()| provision(atpkg_keys::provision::Verb::Join, &argv)),
+            Some("machine-revoke") => vetted("machine-revoke", &argv, &["id", "roster"], 0)
+                .and_then(|()| machine_revoke(&argv)),
+            Some(other) => Err(concat(&[
+                "unknown verb '",
+                other,
+                "' (try: setup, join, machine-revoke, master-check, pubkey, sign)",
+            ])),
+            None => Err(
+                "usage: atpkg-keys <setup|join|machine-revoke|master-check|pubkey|sign> …"
+                    .to_string(),
+            ),
         }
     };
     match r {
@@ -483,7 +492,11 @@ fn show_phrase(
     tty.write_line(PHRASE_HEADING)?;
     tty.write_line(PHRASE_RULE)?;
     tty.write_phrase(phrase)?;
-    tty.write_line(&concat(&["fingerprint: ", &seed.fingerprint()?, "  (write it beside the phrase)"]))?;
+    tty.write_line(&concat(&[
+        "fingerprint: ",
+        &seed.fingerprint()?,
+        "  (write it beside the phrase)",
+    ]))?;
     tty.write_line(PHRASE_RULE)?;
     Ok(())
 }
@@ -639,9 +652,8 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
     // Before anything sensitive exists in this process (leak vector 7).
     atpkg_keys::master::forbid_core_dumps();
 
-    let id = flag(argv, "id").ok_or_else(|| {
-        concat(&["usage: atpkg-keys ", verb.name(), " --id <machine-id>"])
-    })?;
+    let id = flag(argv, "id")
+        .ok_or_else(|| concat(&["usage: atpkg-keys ", verb.name(), " --id <machine-id>"]))?;
     let head_id = flag(argv, "head-id").unwrap_or(prov::DEFAULT_HEAD_ID);
     let now = now_unix()?;
     let paths = prov::Paths {
@@ -829,7 +841,6 @@ fn show_roster(r: &aterm_update_core::roster::Roster) {
         print_line(&concat(&["  REVOKED ", id]));
     }
 }
-
 
 /// `machine-revoke --id <id>` — withdraw a machine's authority.
 ///

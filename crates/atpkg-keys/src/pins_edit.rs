@@ -247,7 +247,9 @@ fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
             Some(i) => start + i + 1,
             None => src.len(),
         };
-        let text = src[start..end].trim_end_matches('\n').trim_end_matches('\r');
+        let text = src[start..end]
+            .trim_end_matches('\n')
+            .trim_end_matches('\r');
         out.push((text, Span { start, end }));
         start = end;
     }
@@ -407,10 +409,7 @@ pub enum Edit {
     /// finishing an interrupted `join`, lands here rather than adding a second entry.
     AlreadyPresent { members: Vec<String> },
     /// The edit to write, and the members the file must hold afterwards.
-    Changed {
-        text: String,
-        members: Vec<String>,
-    },
+    Changed { text: String, members: Vec<String> },
 }
 
 /// Plan an APPEND of `key` to the named anchor, with `comment` lines above it.
@@ -483,7 +482,11 @@ pub fn append_member(
             // replacement reproduces the declaration verbatim, so the diff is this line
             // plus the entry and nothing else.
             let raw = &src[anchor.decl.start..anchor.decl.end];
-            let nl = if raw.ends_with('\n') { anchor.newline } else { "" };
+            let nl = if raw.ends_with('\n') {
+                anchor.newline
+            } else {
+                ""
+            };
             text.push_str(&src[..anchor.decl.start]);
             text.push_str("pub const ");
             text.push_str(name);
@@ -495,9 +498,9 @@ pub fn append_member(
             text.push_str(&src[anchor.decl.end..]);
         }
         Form::Open => {
-            let t = anchor.terminator.ok_or_else(|| {
-                "internal: an open anchor with no terminator span".to_string()
-            })?;
+            let t = anchor
+                .terminator
+                .ok_or_else(|| "internal: an open anchor with no terminator span".to_string())?;
             text.push_str(&src[..t.start]);
             text.push_str(&entry);
             text.push_str(&src[t.start..]);
@@ -543,8 +546,8 @@ pub fn append_member(
 /// "nothing has been written" and "the file on disk may be damaged" are opposite
 /// instructions and printing the wrong one is worse than printing neither.
 pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), String> {
-    let anchor = read_anchor(src, name)
-        .map_err(|e| cat(&["`", name, "` could not be read back: ", &e]))?;
+    let anchor =
+        read_anchor(src, name).map_err(|e| cat(&["`", name, "` could not be read back: ", &e]))?;
     if anchor.members.len() != expected.len() {
         return Err(cat(&[
             "`",
@@ -637,10 +640,19 @@ mod tests {
     fn appending_the_same_key_twice_produces_one_entry() {
         let src = fixture();
         let (once, members) = changed(
-            append_member(&src, CHANNEL_ANCHOR, NEW, &["first pass"], MAX_CHANNEL_MEMBERS)
-                .expect("the first append plans"),
+            append_member(
+                &src,
+                CHANNEL_ANCHOR,
+                NEW,
+                &["first pass"],
+                MAX_CHANNEL_MEMBERS,
+            )
+            .expect("the first append plans"),
         );
-        assert_eq!(members, vec![K1.to_string(), K2.to_string(), NEW.to_string()]);
+        assert_eq!(
+            members,
+            vec![K1.to_string(), K2.to_string(), NEW.to_string()]
+        );
         assert_eq!(once.matches(NEW).count(), 1, "one entry after one append");
 
         let second = append_member(
@@ -653,7 +665,10 @@ mod tests {
         .expect("the second append plans");
         match second {
             Edit::AlreadyPresent { members } => {
-                assert_eq!(members, vec![K1.to_string(), K2.to_string(), NEW.to_string()]);
+                assert_eq!(
+                    members,
+                    vec![K1.to_string(), K2.to_string(), NEW.to_string()]
+                );
             }
             Edit::Changed { .. } => panic!("a re-append must be a no-op, not a second entry"),
         }
@@ -681,8 +696,9 @@ mod tests {
         assert_eq!(after.head(), Some(K1), "the head is never reordered");
 
         // A second machine appends behind the first, still without disturbing the head.
-        let (text2, _) =
-            changed(append_member(&text, CHANNEL_ANCHOR, NEW2, &["m11"], MAX_CHANNEL_MEMBERS).unwrap());
+        let (text2, _) = changed(
+            append_member(&text, CHANNEL_ANCHOR, NEW2, &["m11"], MAX_CHANNEL_MEMBERS).unwrap(),
+        );
         let after2 = read_anchor(&text2, CHANNEL_ANCHOR).unwrap();
         assert_eq!(after2.head(), Some(K1));
         assert_eq!(after2.members.len(), 4);
@@ -694,12 +710,23 @@ mod tests {
     fn nothing_outside_the_edited_block_is_disturbed() {
         let src = fixture();
         let (text, _) = changed(
-            append_member(&src, CHANNEL_ANCHOR, NEW, &["provenance"], MAX_CHANNEL_MEMBERS).unwrap(),
+            append_member(
+                &src,
+                CHANNEL_ANCHOR,
+                NEW,
+                &["provenance"],
+                MAX_CHANNEL_MEMBERS,
+            )
+            .unwrap(),
         );
         // Every original line still present, in order, with exactly two lines added.
         let before: Vec<&str> = src.lines().collect();
         let after: Vec<&str> = text.lines().collect();
-        assert_eq!(after.len(), before.len() + 2, "one comment line and one key line");
+        assert_eq!(
+            after.len(),
+            before.len() + 2,
+            "one comment line and one key line"
+        );
         let mut i = 0usize;
         for line in &before {
             let pos = after[i..]
@@ -712,7 +739,12 @@ mod tests {
         assert!(text.contains("/// The channel keyset. ORDER IS A CONTRACT: index 0 is the head."));
         assert!(text.contains("pub const PKG_ROOT_PUBKEY: &str = \"whatever\";"));
         // The OTHER anchor is untouched.
-        assert!(read_anchor(&text, MASTER_ANCHOR).unwrap().members.is_empty());
+        assert!(
+            read_anchor(&text, MASTER_ANCHOR)
+                .unwrap()
+                .members
+                .is_empty()
+        );
     }
 
     /// The empty single-line form becomes the open form carrying exactly one key, and its
@@ -765,20 +797,30 @@ mod tests {
                 "    \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",",
                 "    \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",   ",
             );
-        assert_ne!(src, fixture(), "the fixture must actually carry the whitespace");
+        assert_ne!(
+            src,
+            fixture(),
+            "the fixture must actually carry the whitespace"
+        );
 
         let (text, members) = changed(
             append_member(&src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS)
                 .expect("a line with trailing whitespace is still a line"),
         );
-        assert_eq!(members, vec![K1.to_string(), K2.to_string(), NEW.to_string()]);
+        assert_eq!(
+            members,
+            vec![K1.to_string(), K2.to_string(), NEW.to_string()]
+        );
         // The appended lines carry the indent and NOTHING else.
         assert!(text.contains("\n    // m3\n"), "{text}");
         let mut entry = String::from("\n    \"");
         entry.push_str(NEW);
         entry.push_str("\",\n");
         assert!(text.contains(&entry), "{text}");
-        assert!(!text.contains("\"cw//"), "no key bytes leaked into the comment: {text}");
+        assert!(
+            !text.contains("\"cw//"),
+            "no key bytes leaked into the comment: {text}"
+        );
         // And it reads back — which is what the writer's own pre-write check now enforces.
         assert_eq!(read_anchor(&text, CHANNEL_ANCHOR).unwrap().members, members);
     }
@@ -796,10 +838,16 @@ mod tests {
              ];\n";
         let anchor = read_anchor(src, CHANNEL_ANCHOR).expect("this must not panic");
         assert_eq!(anchor.members, vec![K1.to_string()]);
-        assert_eq!(anchor.indent, "    ", "the indent is the leading run and nothing else");
+        assert_eq!(
+            anchor.indent, "    ",
+            "the indent is the leading run and nothing else"
+        );
         let (text, _) =
             changed(append_member(src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap());
-        assert!(text.contains("    // é    \n"), "the comment survives verbatim: {text}");
+        assert!(
+            text.contains("    // é    \n"),
+            "the comment survives verbatim: {text}"
+        );
         assert_eq!(read_anchor(&text, CHANNEL_ANCHOR).unwrap().members.len(), 2);
     }
 
@@ -815,14 +863,25 @@ mod tests {
         let (text, _) =
             changed(append_member(src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap());
         assert!(text.contains("    // m3\r\n"), "{text:?}");
-        assert!(!text.contains("// m3\n    \""), "no bare LF was spliced in: {text:?}");
+        assert!(
+            !text.contains("// m3\n    \""),
+            "no bare LF was spliced in: {text:?}"
+        );
         assert_eq!(text.matches('\n').count(), text.matches("\r\n").count());
 
         // The empty form converts to the open form in the file's own ending too.
-        let (text, _) =
-            changed(append_member(src, MASTER_ANCHOR, NEW2, &["master"], MAX_MASTER_MEMBERS).unwrap());
-        assert_eq!(text.matches('\n').count(), text.matches("\r\n").count(), "{text:?}");
-        assert_eq!(read_anchor(&text, MASTER_ANCHOR).unwrap().members, vec![NEW2.to_string()]);
+        let (text, _) = changed(
+            append_member(src, MASTER_ANCHOR, NEW2, &["master"], MAX_MASTER_MEMBERS).unwrap(),
+        );
+        assert_eq!(
+            text.matches('\n').count(),
+            text.matches("\r\n").count(),
+            "{text:?}"
+        );
+        assert_eq!(
+            read_anchor(&text, MASTER_ANCHOR).unwrap().members,
+            vec![NEW2.to_string()]
+        );
     }
 
     /// REFUSE RATHER THAN GUESS: every unrecognised shape is an error naming what it saw.
@@ -895,7 +954,10 @@ mod tests {
         );
         // The read still succeeds — the shape is legal — so the refusal is a real decision
         // and not a parse accident.
-        assert_eq!(read_anchor(&bricked, CHANNEL_ANCHOR).unwrap().members[0], "");
+        assert_eq!(
+            read_anchor(&bricked, CHANNEL_ANCHOR).unwrap().members[0],
+            ""
+        );
         let err = append_member(&bricked, CHANNEL_ANCHOR, NEW, &[], 4).unwrap_err();
         assert!(err.contains("empty string"), "{err}");
         assert!(err.contains("brick"), "{err}");
@@ -929,7 +991,8 @@ mod tests {
     fn the_keyset_ceiling_is_enforced_by_the_writer() {
         let src = fixture();
         // Master: one key fits, a second fits, a third does not.
-        let (one, _) = changed(append_member(&src, MASTER_ANCHOR, NEW, &[], MAX_MASTER_MEMBERS).unwrap());
+        let (one, _) =
+            changed(append_member(&src, MASTER_ANCHOR, NEW, &[], MAX_MASTER_MEMBERS).unwrap());
         let (two, _) =
             changed(append_member(&one, MASTER_ANCHOR, NEW2, &[], MAX_MASTER_MEMBERS).unwrap());
         let third = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
@@ -943,8 +1006,9 @@ mod tests {
     #[test]
     fn verification_catches_a_write_that_did_not_land() {
         let src = fixture();
-        let (text, members) =
-            changed(append_member(&src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap());
+        let (text, members) = changed(
+            append_member(&src, CHANNEL_ANCHOR, NEW, &["m3"], MAX_CHANNEL_MEMBERS).unwrap(),
+        );
         verify_members(&text, CHANNEL_ANCHOR, &members).expect("the intended write verifies");
 
         // The write never happened (the original file is still on disk).
@@ -977,7 +1041,10 @@ mod tests {
     /// guess at it.
     #[test]
     fn the_shipped_pins_file_is_a_shape_this_writer_understands() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../aterm-update-core/src/pins.rs");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aterm-update-core/src/pins.rs"
+        );
         let src = std::fs::read_to_string(path).expect("the anchor file is in the tree");
         let channel = read_anchor(&src, CHANNEL_ANCHOR).expect("the channel keyset is readable");
         assert_eq!(

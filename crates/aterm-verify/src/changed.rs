@@ -932,7 +932,11 @@ mod tests {
         // Bin-only: a manifest with no [lib] and no src/lib.rs answers NO.
         let bin_only = tmp.join("crates/binonly");
         std::fs::create_dir_all(bin_only.join("src")).unwrap();
-        std::fs::write(bin_only.join("Cargo.toml"), "[package]\nname = \"binonly\"\n").unwrap();
+        std::fs::write(
+            bin_only.join("Cargo.toml"),
+            "[package]\nname = \"binonly\"\n",
+        )
+        .unwrap();
         assert!(!crate_dir_has_lib(&tmp, "binonly"));
         // The autodiscovered src/lib.rs half of cargo's rule.
         std::fs::write(bin_only.join("src/lib.rs"), "").unwrap();

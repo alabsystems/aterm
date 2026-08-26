@@ -60,8 +60,16 @@ pub fn line_cells_tail(
     let available = major + i64::from(include_destination);
     let keep = available.min(i64::try_from(limit).unwrap_or(i64::MAX));
     let start = available - keep;
-    let sr = if origin.0 < destination.0 { 1i128 } else { -1i128 };
-    let sc = if origin.1 < destination.1 { 1i128 } else { -1i128 };
+    let sr = if origin.0 < destination.0 {
+        1i128
+    } else {
+        -1i128
+    };
+    let sc = if origin.1 < destination.1 {
+        1i128
+    } else {
+        -1i128
+    };
     let bias = i128::from(major.saturating_sub(1)) / 2;
 
     for k in start..available {
@@ -69,15 +77,9 @@ pub fn line_cells_tail(
         let (r_steps, c_steps) = if major == 0 {
             (0, 0)
         } else if dc >= dr {
-            (
-                (k * i128::from(dr) + bias) / i128::from(major),
-                k,
-            )
+            ((k * i128::from(dr) + bias) / i128::from(major), k)
         } else {
-            (
-                k,
-                (k * i128::from(dc) + bias) / i128::from(major),
-            )
+            (k, (k * i128::from(dc) + bias) / i128::from(major))
         };
         let r = i128::from(origin.0) + sr * r_steps;
         let c = i128::from(origin.1) + sc * c_steps;

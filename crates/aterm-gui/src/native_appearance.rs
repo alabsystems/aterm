@@ -951,13 +951,22 @@ mod tests {
         };
 
         // Auto follows the system on both bands: terminal theme, untouched.
-        assert!(same(resolve_chrome_palette(WindowTheme::Auto, dark_term), dark_term));
-        assert!(same(resolve_chrome_palette(WindowTheme::Auto, light_term), light_term));
+        assert!(same(
+            resolve_chrome_palette(WindowTheme::Auto, dark_term),
+            dark_term
+        ));
+        assert!(same(
+            resolve_chrome_palette(WindowTheme::Auto, light_term),
+            light_term
+        ));
 
         // Forced LIGHT over a DARK terminal authors a LIGHT chrome — the band
         // no longer keeps the dark terminal palette under a light caption.
         let forced = resolve_chrome_palette(WindowTheme::Light, dark_term);
-        assert!(!same(forced, dark_term), "forced light must re-author, not pass the dark band through");
+        assert!(
+            !same(forced, dark_term),
+            "forced light must re-author, not pass the dark band through"
+        );
         assert!(
             !crate::tab_bar::theme_is_dark(forced.bg),
             "forced light must yield a LIGHT chrome bg (matches the light caption)"
@@ -972,8 +981,14 @@ mod tests {
 
         // A forced value whose darkness ALREADY matches keeps the terminal
         // theme — no needless re-authoring (a dark terminal + forced dark).
-        assert!(same(resolve_chrome_palette(WindowTheme::Dark, dark_term), dark_term));
-        assert!(same(resolve_chrome_palette(WindowTheme::Light, light_term), light_term));
+        assert!(same(
+            resolve_chrome_palette(WindowTheme::Dark, dark_term),
+            dark_term
+        ));
+        assert!(same(
+            resolve_chrome_palette(WindowTheme::Light, light_term),
+            light_term
+        ));
     }
 
     /// The FORCED chrome palettes (`window_theme = light|dark` against the

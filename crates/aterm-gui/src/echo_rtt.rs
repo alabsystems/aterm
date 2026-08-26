@@ -73,8 +73,8 @@
 //! recorded sample — at most one per keystroke. The PTY reader never blocks:
 //! a contended window is dropped and counted (`echo_dropped_locked`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::WindowId;
 
@@ -212,7 +212,12 @@ fn arm_at(session: u64, now_us: u64) {
         }
     }
     if ARMED
-        .compare_exchange(0, pack(session, now_us.max(1)), Ordering::AcqRel, Ordering::Relaxed)
+        .compare_exchange(
+            0,
+            pack(session, now_us.max(1)),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
         .is_ok()
     {
         ARMS.fetch_add(1, Ordering::Relaxed);
@@ -464,7 +469,11 @@ mod tests {
         arm_at(7, 1_000);
         assert_eq!(close_at(8, 2_000), None);
         assert_eq!(snapshot().total, 0);
-        assert_eq!(close_at(7, 3_000), Some(2_000), "the real session still can");
+        assert_eq!(
+            close_at(7, 3_000),
+            Some(2_000),
+            "the real session still can"
+        );
     }
 
     /// Nothing armed ⇒ output records nothing at all. This is the property that

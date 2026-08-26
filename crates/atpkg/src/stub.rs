@@ -56,10 +56,19 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
         "trust",
         "the Trust compiler bundle — a Rust compiler that verifies what it compiles",
     ),
-    ("trust-cg", "the Trust compiler's codegen member (coherence group)"),
-    ("trust-ir", "the Trust compiler's IR member (coherence group)"),
+    (
+        "trust-cg",
+        "the Trust compiler's codegen member (coherence group)",
+    ),
+    (
+        "trust-ir",
+        "the Trust compiler's IR member (coherence group)",
+    ),
     ("trust-mc", "the Trust model checker"),
-    ("trust-vc", "the Trust compiler's verification-condition member (coherence group)"),
+    (
+        "trust-vc",
+        "the Trust compiler's verification-condition member (coherence group)",
+    ),
     ("ty", "ALab's specification checker"),
 ];
 
@@ -160,7 +169,9 @@ fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
     s.push_str(&format!(
         "where atpkg >nul 2>nul\r\nif not errorlevel 1 (\r\n  atpkg __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
     ));
-    s.push_str(&format!("echo {STUB_UNREACHABLE_MSG} 1>&2\r\nexit /b 127\r\n"));
+    s.push_str(&format!(
+        "echo {STUB_UNREACHABLE_MSG} 1>&2\r\nexit /b 127\r\n"
+    ));
     s
 }
 
@@ -174,9 +185,12 @@ fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
 /// `[a-z0-9-]` and all pass.
 #[must_use]
 fn cmd_stub_name_safe(name: &str) -> bool {
-    !name
-        .chars()
-        .any(|c| matches!(c, '"' | '%' | '^' | '&' | '<' | '>' | '|' | '!' | '\r' | '\n'))
+    !name.chars().any(|c| {
+        matches!(
+            c,
+            '"' | '%' | '^' | '&' | '<' | '>' | '|' | '!' | '\r' | '\n'
+        )
+    })
 }
 
 /// The co-located `atpkg` alias beside the running executable — fallback 1's
@@ -234,7 +248,7 @@ pub fn write_pending_stub(layout: &Layout, tool: &ToolName) -> io::Result<()> {
     }
     let shim = layout.shim(tool);
     match std::fs::symlink_metadata(&shim) {
-        Err(_) => {} // absent: ours to claim
+        Err(_) => {}                          // absent: ours to claim
         Ok(_) if is_pending_stub(&shim) => {} // ours: rewrite refreshes the embedded path
         Ok(_) => return Ok(()), // someone else's file (shim/tombstone/hand-made): never touch
     }
@@ -319,11 +333,7 @@ pub fn lay_adoption_stubs(layout: &Layout) {
 /// matter of course), then sweeps every pending stub whose name is no longer
 /// wanted-and-missing — de-listed, removed on purpose, or now installed under a
 /// name its real shims do not expose.
-pub fn reconcile(
-    layout: &Layout,
-    wanted: &BTreeSet<String>,
-    installed: &BTreeMap<String, u64>,
-) {
+pub fn reconcile(layout: &Layout, wanted: &BTreeSet<String>, installed: &BTreeMap<String, u64>) {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     for name in wanted {
         if installed.contains_key(name.as_str()) {
@@ -351,9 +361,7 @@ pub fn reconcile(
             continue;
         };
         let logical = ToolName::from_shim_file(name);
-        let stays = logical
-            .as_ref()
-            .is_some_and(|t| keep.contains(t.as_str()));
+        let stays = logical.as_ref().is_some_and(|t| keep.contains(t.as_str()));
         if !stays {
             let _ = std::fs::remove_file(&path);
         }
@@ -401,8 +409,10 @@ mod tests {
     fn stub_content_shape_and_shim_invisibility() {
         // The sh body directly — `stub_content` dispatches by compile target,
         // and this shape must stay pinned from every build host.
-        let body =
-            stub_content_sh(&tool("trust"), Path::new("/Apps/aterm.app/Contents/MacOS/atpkg"));
+        let body = stub_content_sh(
+            &tool("trust"),
+            Path::new("/Apps/aterm.app/Contents/MacOS/atpkg"),
+        );
         assert!(body.starts_with("#!/bin/sh\n"));
         assert!(body.contains(STUB_MARKER));
         let atpkg_pos = body.find("[ -x \"$ATPKG\" ]").unwrap();
@@ -410,7 +420,10 @@ mod tests {
         // The message embeds sh-quoted (its apostrophe becomes '\''), so probe a
         // quote-free distinctive slice of it.
         let static_msg = body.find("package manager is not reachable").unwrap();
-        assert!(atpkg_pos < command_v && command_v < static_msg, "fallbacks in order");
+        assert!(
+            atpkg_pos < command_v && command_v < static_msg,
+            "fallbacks in order"
+        );
         assert!(body.contains("__pending 'trust'"));
         assert!(body.trim_end().ends_with("exit 127"));
         assert_eq!(
@@ -445,7 +458,10 @@ mod tests {
             "fallbacks in order"
         );
         assert!(body.contains("__pending \"trust\""));
-        assert!(body.matches("exit /b 127").count() >= 3, "every arm exits 127");
+        assert!(
+            body.matches("exit /b 127").count() >= 3,
+            "every arm exits 127"
+        );
         // Recognition round-trips through the `rem` spelling.
         assert!(
             body.lines().any(|l| l
@@ -518,7 +534,10 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|e| e.file_name() != "trust")
             .collect();
-        assert!(strays.is_empty(), "temp+rename leaves nothing beside the shim: {strays:?}");
+        assert!(
+            strays.is_empty(),
+            "temp+rename leaves nothing beside the shim: {strays:?}"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -535,11 +554,16 @@ mod tests {
         std::fs::write(&shim, "#!/bin/sh\n# someone's own file\nexit 3\n").unwrap();
         write_pending_stub(&l, &t).unwrap();
         assert!(
-            std::fs::read_to_string(&shim).unwrap().contains("someone's own file"),
+            std::fs::read_to_string(&shim)
+                .unwrap()
+                .contains("someone's own file"),
             "a foreign file wins over the stub"
         );
         remove_stub(&l, "ty");
-        assert!(shim.exists(), "removal only removes what the marker proves ours");
+        assert!(
+            shim.exists(),
+            "removal only removes what the marker proves ours"
+        );
         // A tombstone survives too.
         crate::activate::install_tombstone_shim(&l, &t).unwrap();
         write_pending_stub(&l, &t).unwrap();
@@ -581,15 +605,28 @@ mod tests {
         let l = layout("reconcile");
         lay_adoption_stubs(&l);
         assert!(pending_stub_exists(&l, "ay"));
-        let wanted: BTreeSet<String> = ["brandnew".to_string(), "trust".to_string(), "sudo".to_string()]
-            .into_iter()
-            .collect();
+        let wanted: BTreeSet<String> = [
+            "brandnew".to_string(),
+            "trust".to_string(),
+            "sudo".to_string(),
+        ]
+        .into_iter()
+        .collect();
         let installed: BTreeMap<String, u64> = BTreeMap::new();
         reconcile(&l, &wanted, &installed);
-        assert!(pending_stub_exists(&l, "brandnew"), "newly listed name gains a stub");
+        assert!(
+            pending_stub_exists(&l, "brandnew"),
+            "newly listed name gains a stub"
+        );
         assert!(pending_stub_exists(&l, "trust"));
-        assert!(!pending_stub_exists(&l, "sudo"), "the sensitive-name refusal binds stubs");
-        assert!(!pending_stub_exists(&l, "ay"), "a de-listed name loses its stub");
+        assert!(
+            !pending_stub_exists(&l, "sudo"),
+            "the sensitive-name refusal binds stubs"
+        );
+        assert!(
+            !pending_stub_exists(&l, "ay"),
+            "a de-listed name loses its stub"
+        );
         // Installed ⇒ stub retired even if the real shims expose other names.
         let installed: BTreeMap<String, u64> = [("trust".to_string(), 210)].into_iter().collect();
         reconcile(&l, &wanted, &installed);
@@ -621,19 +658,32 @@ mod tests {
         // 1: embedded path exists and is executable.
         let out = run(&stub_content(&t, &fake), "/nonexistent");
         assert_eq!(out.status.code(), Some(127));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "co-located: __pending trust\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "co-located: __pending trust\n"
+        );
         // 2: embedded dangles; PATH carries an `atpkg`.
         let path_dir = l.prefix.join("pathbin");
         std::fs::create_dir_all(&path_dir).unwrap();
-        std::fs::write(path_dir.join("atpkg"), "#!/bin/sh\necho \"path: $*\"\nexit 127\n").unwrap();
-        std::fs::set_permissions(path_dir.join("atpkg"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::write(
+            path_dir.join("atpkg"),
+            "#!/bin/sh\necho \"path: $*\"\nexit 127\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            path_dir.join("atpkg"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let out = run(
             &stub_content(&t, Path::new("/gone/after/relocation/atpkg")),
             path_dir.to_str().unwrap(),
         );
         assert_eq!(out.status.code(), Some(127));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "path: __pending trust\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "path: __pending trust\n"
+        );
         // 3: nothing reachable — the static honest message, exit 127.
         let out = run(&stub_content(&t, Path::new("/gone/atpkg")), "/nonexistent");
         assert_eq!(out.status.code(), Some(127));

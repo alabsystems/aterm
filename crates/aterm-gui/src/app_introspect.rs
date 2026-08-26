@@ -6819,6 +6819,9 @@ mod split_capture_tests {
     fn first_headless_split_capture_keeps_the_pet_without_sparkle_words() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // The trail is asked for, not inherited — its absent-key default is
+        // platform-split and this fixture measures the SPLIT-capture pet, on every host.
+        app.config.cursor_trail = Some(true);
         app.split_active_stub_tab(wid);
         app.recompute_sparkle();
         app.sparkle = None;
@@ -8051,6 +8054,12 @@ mod terminal_split_capture_tests {
     #[test]
     fn image_capture_reports_split_composite_and_splices_chrome_once() {
         let (mut app, wid, right) = split_fixture();
+        // The single-splice law and the one-companion law below are both about
+        // what the composed route DRAWS, so the trail master is asked for rather
+        // than inherited: its absent-key default is platform-split
+        // (`app_config::DEFAULT_DECORATIVE_EFFECTS`) and this coverage must hold
+        // on Windows too.
+        app.config.cursor_trail = Some(true);
         app.recompute_sparkle();
         // Cursor companions share the sprite atlas with Sparkle Words, but do
         // not belong to that feature. Exercise the actual composed-image route
@@ -10719,6 +10728,10 @@ mod headless_cursor_fx_tests {
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // The companion this measures is the trail's; ask for its master explicitly so
+        // the reduced-motion singing law is proved on Windows too, where the absent-key
+        // default is OFF.
+        app.config.cursor_trail = Some(true);
         app.config.motion = Some("reduced".into());
         app.recompute_sparkle();
         app.sparkle = None;
@@ -10855,6 +10868,11 @@ mod headless_cursor_fx_tests {
     fn first_headless_capture_keeps_the_default_pet_without_sparkle_words() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // ASK for the trail rather than inherit it: the master's absent-key default is
+        // platform-split (`DEFAULT_DECORATIVE_EFFECTS`), and this fixture is about what
+        // the pet RENDERS once it is on, which must hold identically on every host.
+        // The STYLE is still the shipped default, asserted immediately below.
+        app.config.cursor_trail = Some(true);
         assert_eq!(
             app.config.cursor_trail_style_raw(),
             crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
@@ -10933,6 +10951,9 @@ mod headless_cursor_fx_tests {
     fn alt_screen_word_suppression_keeps_the_independent_capture_pet() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // The pet must be ON for "the word switch cannot blank it" to mean anything, so
+        // the fixture asks for it instead of leaning on a platform-split default.
+        app.config.cursor_trail = Some(true);
         app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
             enabled: Some(true),
             suppress_in_alt_screen: Some(true),

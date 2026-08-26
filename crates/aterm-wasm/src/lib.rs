@@ -1638,8 +1638,8 @@ impl AtermTerminal {
     /// the highlight paints.
     pub fn selection_word(&mut self, row: i32, col: u16) -> Option<String> {
         self.note_host_visual_change(); // WF-1 gate (see selection_start)
-        // smart_word_at is display-offset-aware (takes the DISPLAY row); the
-        // selection anchor must be terminal-relative.
+                                        // smart_word_at is display-offset-aware (takes the DISPLAY row); the
+                                        // selection anchor must be terminal-relative.
         let (start, last) = match self
             .term
             .smart_word_at(row as usize, col as usize, &self.smart)
@@ -4296,7 +4296,12 @@ mod tests {
         for _ in 0..40 {
             if t.spill_rev() > 0
                 && t.spill_rect_count() > 0
-                && t.spill.rgba().as_chunks::<4>().0.iter().any(|px| px[3] != 0)
+                && t.spill
+                    .rgba()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|px| px[3] != 0)
             {
                 lit_frame = true;
                 break;
@@ -4950,7 +4955,10 @@ mod tests {
         assert!(!t.last_render_skipped(), "a blink flip must draw");
         t.set_cursor_blink_phase(false); // same phase again: shadow de-dups
         t.render();
-        assert!(t.last_render_skipped(), "an idempotent blink re-assert must gate");
+        assert!(
+            t.last_render_skipped(),
+            "an idempotent blink re-assert must gate"
+        );
 
         // REOPEN side 3: selection (Terminal-held, no grid damage).
         t.selection_start(2, 1);
@@ -5102,4 +5110,3 @@ mod tests {
         );
     }
 }
-

@@ -848,7 +848,10 @@ mod tests {
         assert_eq!(m.set("role", Some("operator".into())), Some(true));
         assert_eq!(m.get("role"), Some("operator"));
         assert!(m.any_set());
-        assert_eq!(m.set("attention", Some("needs human: approval".into())), Some(true));
+        assert_eq!(
+            m.set("attention", Some("needs human: approval".into())),
+            Some(true)
+        );
         assert_eq!(m.get("attention"), Some("needs human: approval"));
         assert_eq!(m.set("role", None), Some(true));
         assert_eq!(m.set("attention", None), Some(true));

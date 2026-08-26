@@ -918,7 +918,13 @@ impl Grid {
             .has_any_data()
             .then(|| std::mem::take(&mut self.storage.extras));
         let old_extras_ref = old_extras.as_ref();
-        self.reflow_rewrap_columns(target_rows, new_cols, cursor_row, cursor_col, old_extras_ref);
+        self.reflow_rewrap_columns(
+            target_rows,
+            new_cols,
+            cursor_row,
+            cursor_col,
+            old_extras_ref,
+        );
     }
 
     /// Pad or truncate to target row count and update grid state after reflow.
@@ -1290,7 +1296,6 @@ impl Grid {
             }
         }
     }
-
 }
 
 #[cfg(test)]

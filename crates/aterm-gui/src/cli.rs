@@ -219,7 +219,11 @@ fn keys_help() -> String {
         .into_iter()
         .map(|(action, chords)| (chords.join(", "), action))
         .collect();
-    let width = rows.iter().map(|(chords, _)| chords.len()).max().unwrap_or(0);
+    let width = rows
+        .iter()
+        .map(|(chords, _)| chords.len())
+        .max()
+        .unwrap_or(0);
     let mut s = String::from(
         "KEYS (in the window; no menu bar off macOS, so these chords ARE the app menu —\n",
     );
@@ -430,7 +434,7 @@ const STARTER_CONFIG: &str = "\
 # robi = true                      # Robi the helper robot lives on your terminal (walks your typed row, ladder up, tab-bar monkey bars, tips above his head); type robi to make him greet you (default OFF)
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
-# cursor_trail = true              # the cursor motion trail + light crown (default ON)
+# cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
 # cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the banded rainbow ribbon with the full-body cat that walks, runs and pounces along your line; aliases \"kitty pet\"/\"pet kitty\") | rainbow kitty (the same ribbon under the FLYING kitty head; old spellings \"nyan rainbow\"/\"nyan\"/\"rainbow\" still work) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
@@ -1088,7 +1092,14 @@ mod tests {
     #[test]
     fn macos_keys_help_covers_the_common_chords_and_admits_it_is_partial() {
         let keys = super::keys_help();
-        for chord in ["Cmd-T", "Cmd-W", "Cmd-N", "Cmd-F", "Cmd-Shift-T", "Cmd-Shift-P"] {
+        for chord in [
+            "Cmd-T",
+            "Cmd-W",
+            "Cmd-N",
+            "Cmd-F",
+            "Cmd-Shift-T",
+            "Cmd-Shift-P",
+        ] {
             assert!(keys.contains(chord), "{chord} must be documented:\n{keys}");
         }
         assert!(

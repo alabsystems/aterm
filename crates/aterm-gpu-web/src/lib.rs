@@ -708,16 +708,16 @@ impl AtermGpuTerminal {
     /// (the `String` Err surfaces as a catchable JS exception).
     pub fn set_emoji_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
-        // Intern ONCE up front and install/retain that shared Arc, mirroring the
-        // `_registered` twin below. The old shape paid THREE full ~180MB copies of
-        // the same slice (CPU install, GPU install, retention) where the last two
-        // were pure waste: `set_color_font_bytes` already interned the blob, so the
-        // retention intern only memcmp'd a fresh copy against that very entry and
-        // dropped it. `set_color_font_arc` runs the identical `ttf_parser` validation
-        // and ends in the identical `install_color_font`, so the no-throw contract
-        // and the installed face are unchanged — only the copies are gone. (A
-        // MALFORMED blob now lands in the intern store before validation rejects it,
-        // exactly as `register_font` above already does; no new class of retention.)
+                                        // Intern ONCE up front and install/retain that shared Arc, mirroring the
+                                        // `_registered` twin below. The old shape paid THREE full ~180MB copies of
+                                        // the same slice (CPU install, GPU install, retention) where the last two
+                                        // were pure waste: `set_color_font_bytes` already interned the blob, so the
+                                        // retention intern only memcmp'd a fresh copy against that very entry and
+                                        // dropped it. `set_color_font_arc` runs the identical `ttf_parser` validation
+                                        // and ends in the identical `install_color_font`, so the no-throw contract
+                                        // and the installed face are unchanged — only the copies are gone. (A
+                                        // MALFORMED blob now lands in the intern store before validation rejects it,
+                                        // exactly as `register_font` above already does; no new class of retention.)
         let arc = aterm_render::intern_font_bytes_slice(bytes);
         self.cpu.set_color_font_arc(arc.clone())?;
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1152,8 +1152,8 @@ impl AtermGpuTerminal {
     /// without a device/face rebuild.
     pub fn set_theme(&mut self, fg: u32, bg: u32, cursor: u32, selection: u32) {
         self.note_host_visual_change(); // WF-1 gate
-        // Keep the effects' derive-from-theme default in sync (glow/trail colours
-        // passed as `None` follow the cursor colour, like the native app).
+                                        // Keep the effects' derive-from-theme default in sync (glow/trail colours
+                                        // passed as `None` follow the cursor colour, like the native app).
         self.theme_cursor = cursor & 0x00FF_FFFF;
         self.theme_fg = fg & 0x00FF_FFFF;
         self.theme_bg = bg & 0x00FF_FFFF;
@@ -1943,8 +1943,8 @@ impl AtermGpuTerminal {
     /// the highlight paints.
     pub fn selection_word(&mut self, row: i32, col: u16) -> Option<String> {
         self.note_host_visual_change(); // WF-1 gate
-        // smart_word_at is display-offset-aware (takes the DISPLAY row); the
-        // selection anchor must be terminal-relative.
+                                        // smart_word_at is display-offset-aware (takes the DISPLAY row); the
+                                        // selection anchor must be terminal-relative.
         let (start, last) = match self
             .term
             .smart_word_at(row as usize, col as usize, &self.smart)
@@ -3171,7 +3171,9 @@ mod tests {
             ("set_cursor_glow", |t| {
                 t.set_cursor_glow(true, "lumen", None, None, 300, 8, 1.0, 0.0, false)
             }),
-            ("set_cursor_trail", |t| t.set_cursor_trail(true, 300, 8, None)),
+            ("set_cursor_trail", |t| {
+                t.set_cursor_trail(true, 300, 8, None)
+            }),
             ("set_matrix_rain_enabled", |t| {
                 t.set_matrix_rain_enabled(true)
             }),
@@ -3380,7 +3382,9 @@ mod tests {
             ("set_theme", |t| {
                 t.set_theme(0x0011_2233, 0x0044_5566, 0x0077_8899, 0x000A_0B0C)
             }),
-            ("set_selection_fg", |t| t.set_selection_fg(Some(0x0012_3456))),
+            ("set_selection_fg", |t| {
+                t.set_selection_fg(Some(0x0012_3456))
+            }),
             ("set_minimum_contrast", |t| t.set_minimum_contrast(4.5)),
             ("set_background_opacity", |t| t.set_background_opacity(0.8)),
             ("set_chrome", |t| t.set_chrome(4, 2)),
@@ -3390,10 +3394,16 @@ mod tests {
                 t.set_selection_inactive_bg(Some(0x0020_2020))
             }),
             ("set_px", |t| t.set_px(15.0)),
-            ("set_spill_include_veils", |t| t.set_spill_include_veils(true)),
-            ("set_default_cursor_style", |t| t.set_default_cursor_style(3)),
+            ("set_spill_include_veils", |t| {
+                t.set_spill_include_veils(true)
+            }),
+            ("set_default_cursor_style", |t| {
+                t.set_default_cursor_style(3)
+            }),
             ("set_color_scheme", |t| t.set_color_scheme(true)),
-            ("set_cursor_blink_phase", |t| t.set_cursor_blink_phase(false)),
+            ("set_cursor_blink_phase", |t| {
+                t.set_cursor_blink_phase(false)
+            }),
             ("set_cursor_hollow", |t| t.set_cursor_hollow(true)),
             ("selection_start", |t| t.selection_start(2, 1)),
             ("selection_extend", |t| t.selection_extend(2, 7)),
@@ -3929,7 +3939,12 @@ mod tests {
         for _ in 0..40 {
             if t.spill_rev() > 0
                 && t.spill_rect_count() > 0
-                && t.spill.rgba().as_chunks::<4>().0.iter().any(|px| px[3] != 0)
+                && t.spill
+                    .rgba()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|px| px[3] != 0)
             {
                 lit_frame = true;
                 break;
@@ -3944,7 +3959,10 @@ mod tests {
             (w * (pad + head) + w * pad + 2 * pad * grid_h) * 4,
             "spill buffer sized to the four band strips"
         );
-        assert!(lit_frame, "witnessed splash droplets must reach the band live");
+        assert!(
+            lit_frame,
+            "witnessed splash droplets must reach the band live"
+        );
         assert!(t.spill_rev() > 0, "splash droplets must reach the band");
         assert!(t.spill_rect_count() > 0, "band content must report rects");
 
@@ -4003,13 +4021,21 @@ mod tests {
             t.advance_effects(16.0);
             fill_frame(&mut t);
             if t.frame_scratch.cursor_glow_add.is_empty()
-                && t.spill.rgba().as_chunks::<4>().0.iter().all(|px| px[3] == 0)
+                && t.spill
+                    .rgba()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|px| px[3] == 0)
             {
                 drained = true;
                 break;
             }
         }
-        assert!(drained, "an unwitnessed leap retires the wake — cold movement stays dark");
+        assert!(
+            drained,
+            "an unwitnessed leap retires the wake — cold movement stays dark"
+        );
 
         // Pointer stability across an animating content frame.
         let ptr = t.spill_ptr();

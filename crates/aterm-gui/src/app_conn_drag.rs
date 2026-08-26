@@ -32,7 +32,9 @@ use aterm_session::SessionId;
 
 use crate::App;
 use crate::WindowId;
-use crate::conn_drag::{ConnDragOutcome, ConnDragState, ConnDropTarget, FrameRegistry, WindowFrame};
+use crate::conn_drag::{
+    ConnDragOutcome, ConnDragState, ConnDropTarget, FrameRegistry, WindowFrame,
+};
 
 impl App {
     /// The stable [`SessionId`] labeling tab `index` of `window` (its focused
@@ -72,7 +74,9 @@ impl App {
         let mut reg = FrameRegistry::default();
         for (wid, ws) in &self.windows {
             let Some(w) = &ws.os_window else { continue };
-            let Ok(pos) = w.inner_position() else { continue };
+            let Ok(pos) = w.inner_position() else {
+                continue;
+            };
             let size = w.inner_size();
             reg.push(WindowFrame {
                 window: *wid,
@@ -174,7 +178,9 @@ impl App {
             .windows
             .get(&state.src_window)
             .is_some_and(|ws| match ws.win_px {
-                Some(s) => x >= 0.0 && y >= 0.0 && x < f64::from(s.width) && y < f64::from(s.height),
+                Some(s) => {
+                    x >= 0.0 && y >= 0.0 && x < f64::from(s.width) && y < f64::from(s.height)
+                }
                 None => true,
             });
         if inside {
@@ -225,7 +231,10 @@ impl App {
         };
         // The highlight rides the ACTIVE tab's chip (a visible pane belongs
         // to it); `session` stays the authority the drop acts on.
-        let chip = self.windows.get(&wid).and_then(|ws| ws.tab_set.active_index());
+        let chip = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active_index());
         Some(ConnDropTarget {
             window: wid,
             chip,
@@ -294,7 +303,11 @@ impl App {
     /// `Wake::ConnDragBegin`: the native connector press crossed AppKit-side
     /// threshold. Resolves the STABLE tab id to today's index + session and
     /// starts the drag in screen space.
-    pub(crate) fn conn_drag_native_begin(&mut self, window: WindowId, tab: crate::tab_model::TabId) {
+    pub(crate) fn conn_drag_native_begin(
+        &mut self,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+    ) {
         self.conn_drag_abort();
         let Some(index) = self.tab_index_for_id(window, tab) else {
             return;
@@ -616,7 +629,10 @@ mod tests {
         );
         // …for the PRESSED chip, and the modal overlay slot is untouched (the
         // in-grid tab menu is its own window-state surface, not an overlay).
-        assert_eq!(app.windows[&wid].tab_menu.as_ref().map(|m| m.index), Some(0));
+        assert_eq!(
+            app.windows[&wid].tab_menu.as_ref().map(|m| m.index),
+            Some(0)
+        );
         assert!(app.windows[&wid].overlay().is_none());
         // §3.1: THE CONNECTOR PRESS NEVER SELECTS THE TAB. The right-press
         // opening switches first (a context menu's subject must be the front
@@ -644,7 +660,10 @@ mod tests {
         // Cross the threshold toward the target, then land on it.
         let (ox, oy) = app.conn_drag.as_ref().unwrap().origin;
         app.conn_drag_motion(wid, ox + CONN_DRAG_THRESHOLD_PX * 2.0, oy);
-        assert!(app.conn_drag.as_ref().unwrap().dragging, "past the threshold");
+        assert!(
+            app.conn_drag.as_ref().unwrap().dragging,
+            "past the threshold"
+        );
         app.conn_drag_motion(wid, tx, ty);
         let over = app
             .conn_drag
@@ -662,7 +681,10 @@ mod tests {
         // The wire renders on the source window's own layer while dragging.
         assert_ne!(app.conn_wire_fingerprint(wid), 0, "wire fp live");
         app.splice_conn_wire(wid);
-        assert!(app.windows[&wid].conn_wire_card.is_some(), "wire card built");
+        assert!(
+            app.windows[&wid].conn_wire_card.is_some(),
+            "wire card built"
+        );
 
         app.conn_drag_release();
         assert!(app.conn_drag.is_none());

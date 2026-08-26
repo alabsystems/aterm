@@ -325,8 +325,7 @@ impl ProgressSink {
     pub fn plan(&self, planned: &[(String, u64)]) {
         self.with(|s| {
             s.file.queue = planned.iter().map(|(n, _)| n.clone()).collect();
-            s.file.overall.programs_total =
-                u32::try_from(planned.len()).unwrap_or(u32::MAX);
+            s.file.overall.programs_total = u32::try_from(planned.len()).unwrap_or(u32::MAX);
             let mut total = 0u64;
             for (name, size) in planned {
                 total = total.saturating_add(*size);
@@ -353,16 +352,18 @@ impl ProgressSink {
     /// count never renders under an extract label.
     pub fn phase(&self, program: &str, phase: Phase) {
         self.with(|s| {
-            let row = s.file.programs.entry(program.to_string()).or_insert_with(|| {
-                ProgramProgress {
+            let row = s
+                .file
+                .programs
+                .entry(program.to_string())
+                .or_insert_with(|| ProgramProgress {
                     phase,
                     bytes_done: 0,
                     bytes_total: 0,
                     build: None,
                     bumped: false,
                     error: None,
-                }
-            });
+                });
             if row.phase != phase {
                 row.phase = phase;
                 row.bytes_done = 0;
@@ -574,9 +575,7 @@ fn write_now(s: &mut SinkState) {
     let mut tmp_name = String::from("progress.json.tmp-");
     tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
     let tmp = s.path.with_file_name(tmp_name);
-    if crate::call2(std::fs::write, &tmp, text).is_ok()
-        && std::fs::rename(&tmp, &s.path).is_ok()
-    {
+    if crate::call2(std::fs::write, &tmp, text).is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
         s.last_write = Some(Instant::now());
         s.dirty = false;
     } else {
@@ -687,8 +686,7 @@ pub fn end_pass() {
     let Ok(mut g) = GLOBAL_SINK.lock() else {
         return;
     };
-    if g
-        .as_ref()
+    if g.as_ref()
         .is_some_and(|(_, owner, _)| *owner == std::thread::current().id())
         && let Some((sink, _, heartbeat)) = g.take()
     {
@@ -861,8 +859,7 @@ impl Drop for DownloadWatch {
 #[must_use]
 pub fn read_progress(layout: &crate::store::Layout) -> Option<ProgressFile> {
     let cap = usize::try_from(PROGRESS_READ_CAP).unwrap_or(usize::MAX);
-    let text =
-        crate::metadata_io::read_bounded_regular_utf8(&layout.progress_file(), cap).ok()?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(&layout.progress_file(), cap).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -970,8 +967,7 @@ pub fn append_bump(
 #[must_use]
 pub fn read_bump(layout: &crate::store::Layout) -> Vec<String> {
     let cap = usize::try_from(BUMP_READ_CAP).unwrap_or(usize::MAX);
-    let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&layout.bump_file(), cap)
-    else {
+    let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&layout.bump_file(), cap) else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
@@ -1083,10 +1079,7 @@ mod writer_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     fn layout(label: &str) -> crate::store::Layout {
-        let p = std::env::temp_dir().join(format!(
-            "atpkg-progress-{label}-{}",
-            std::process::id()
-        ));
+        let p = std::env::temp_dir().join(format!("atpkg-progress-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         #[cfg(unix)]
@@ -1217,9 +1210,15 @@ mod writer_tests {
         file.heartbeat_unix = now;
         assert!(snapshot_running(&file, now));
         file.heartbeat_unix = now - HEARTBEAT_STALE_SECS - 1;
-        assert!(!snapshot_running(&file, now), "stale heartbeat = not running");
+        assert!(
+            !snapshot_running(&file, now),
+            "stale heartbeat = not running"
+        );
         file.heartbeat_unix = now + HEARTBEAT_STALE_SECS + 1;
-        assert!(!snapshot_running(&file, now), "future heartbeat = not running");
+        assert!(
+            !snapshot_running(&file, now),
+            "future heartbeat = not running"
+        );
         file.heartbeat_unix = now;
         file.pid = None;
         assert!(!snapshot_running(&file, now), "no pid = not running");
@@ -1235,11 +1234,13 @@ mod writer_tests {
             .status()
             .map(|_| ())
             .ok();
-        let dead = std::process::Command::new("/usr/bin/true").spawn().map(|mut c| {
-            let pid = c.id();
-            let _ = c.wait();
-            pid
-        });
+        let dead = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .map(|mut c| {
+                let pid = c.id();
+                let _ = c.wait();
+                pid
+            });
         let _ = child;
         let Ok(dead_pid) = dead else {
             return; // cannot build the fixture on this host — skip, don't lie
@@ -1302,7 +1303,10 @@ mod writer_tests {
         std::fs::write(&victim, "trust\n").unwrap();
         std::os::unix::fs::symlink(&victim, l.bump_file()).unwrap();
         let trust = crate::store::ToolName::new("trust").unwrap();
-        assert!(append_bump(&l, &trust).is_err(), "append must not follow a link");
+        assert!(
+            append_bump(&l, &trust).is_err(),
+            "append must not follow a link"
+        );
         assert!(read_bump(&l).is_empty(), "read must not follow a link");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "trust\n");
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1335,7 +1339,10 @@ mod writer_tests {
         // is seed-scoped, never a silencing of the phase itself.
         assert!(begin_pass(&l.progress_file(), "net"));
         let watch = watch_download("trust", &l.prefix.join("trust-1.tar.zst"), 1000);
-        assert!(watch.handle.is_some(), "the net pass keeps its live download watch");
+        assert!(
+            watch.handle.is_some(),
+            "the net pass keeps its live download watch"
+        );
         drop(watch);
         end_pass();
         let _ = std::fs::remove_dir_all(&l.prefix);

@@ -1229,7 +1229,8 @@ mod tests {
             assert_eq!(h.decode(&mut via_table_reader), Ok(want16));
             assert_eq!(h.decode_bitwise(&mut via_walk_reader), Ok(want16));
             assert_eq!(
-                via_table_reader.bits_in_buffer, via_walk_reader.bits_in_buffer
+                via_table_reader.bits_in_buffer,
+                via_walk_reader.bits_in_buffer
             );
         }
     }
@@ -1289,7 +1290,10 @@ mod tests {
             checked > 1000,
             "the oracle must actually cover a wide space, only {checked} cases"
         );
-        assert!(ok_seen > 0, "no case decoded successfully — corpus is broken");
+        assert!(
+            ok_seen > 0,
+            "no case decoded successfully — corpus is broken"
+        );
         // Two-sided: the malformed half must really have produced the error
         // classes the table could plausibly get wrong.
         for want in ["BadSymbol", "Truncated"] {

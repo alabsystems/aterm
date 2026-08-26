@@ -423,7 +423,9 @@ impl DiskColdTier {
     /// Live region of the cumulative index (parallel to [`Self::live_index`]).
     #[inline]
     pub(super) fn live_cumulative(&self) -> &[usize] {
-        self.cumulative_lines.get(self.front_dropped..).unwrap_or(&[])
+        self.cumulative_lines
+            .get(self.front_dropped..)
+            .unwrap_or(&[])
     }
 
     /// Drop the first `k` LIVE pages from the index in O(k) amortized:

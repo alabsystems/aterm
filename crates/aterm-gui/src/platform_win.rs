@@ -1129,8 +1129,7 @@ fn caption_tint(
     } else {
         crate::chrome_band::mix3(ink, bg_bytes, CAPTION_TEXT_UNFOCUSED_DIM)
     };
-    let ink_rgb =
-        (u32::from(ink[0]) << 16) | (u32::from(ink[1]) << 8) | u32::from(ink[2]);
+    let ink_rgb = (u32::from(ink[0]) << 16) | (u32::from(ink[1]) << 8) | u32::from(ink[2]);
     (colorref_swap(bg), colorref_swap(ink_rgb))
 }
 
@@ -1417,19 +1416,16 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
     // path (see the fn doc), and the tint has gates of its own that are
     // independent of the immersive-dark ladder's early returns below.
     apply_caption_tint(window, hwnd, policy, /* force= */ false);
-    let want_dark = match resolve_chrome_theme(
-        policy,
-        CHROME_BG.load(Ordering::Relaxed),
-        high_contrast,
-    ) {
-        WindowTheme::Dark => true,
-        WindowTheme::Light => false,
-        // The EXPLICIT High-Contrast deferral (immersive-dark OFF; winit's own HC
-        // probe is dead — see the HC arm in `apply_chrome_appearance`) is an
-        // override like any other and must survive winit's re-themes.
-        WindowTheme::Auto if high_contrast => false,
-        WindowTheme::Auto => return, // the OS owns it; winit's re-theme IS the answer
-    };
+    let want_dark =
+        match resolve_chrome_theme(policy, CHROME_BG.load(Ordering::Relaxed), high_contrast) {
+            WindowTheme::Dark => true,
+            WindowTheme::Light => false,
+            // The EXPLICIT High-Contrast deferral (immersive-dark OFF; winit's own HC
+            // probe is dead — see the HC arm in `apply_chrome_appearance`) is an
+            // override like any other and must survive winit's re-themes.
+            WindowTheme::Auto if high_contrast => false,
+            WindowTheme::Auto => return, // the OS owns it; winit's re-theme IS the answer
+        };
     if matches!(window.theme(), Some(winit::window::Theme::Dark)) == want_dark {
         return; // OS preference already agrees — a clobber cannot do damage
     }
@@ -3098,11 +3094,20 @@ mod tests {
     /// churning is strictly worse than leaving it to the event-driven seams.
     #[test]
     fn the_frame_guard_writes_only_on_a_disagreeing_readback() {
-        assert!(chrome_reassert_needed(true, Some(0)), "dark wanted, light applied");
-        assert!(chrome_reassert_needed(false, Some(1)), "light wanted, dark applied");
+        assert!(
+            chrome_reassert_needed(true, Some(0)),
+            "dark wanted, light applied"
+        );
+        assert!(
+            chrome_reassert_needed(false, Some(1)),
+            "light wanted, dark applied"
+        );
         assert!(!chrome_reassert_needed(true, Some(1)));
         assert!(!chrome_reassert_needed(false, Some(0)));
-        assert!(!chrome_reassert_needed(true, None), "no readback ⇒ no evidence ⇒ no write");
+        assert!(
+            !chrome_reassert_needed(true, None),
+            "no readback ⇒ no evidence ⇒ no write"
+        );
         assert!(!chrome_reassert_needed(false, None));
     }
 
@@ -3195,7 +3200,11 @@ mod tests {
     fn colorref_swap_reverses_r_and_b_and_is_an_involution() {
         assert_eq!(colorref_swap(0x11_1318), 0x18_1311);
         assert_eq!(colorref_swap(colorref_swap(0xAB_CDEF)), 0xAB_CDEF);
-        assert_eq!(colorref_swap(0xFF00_0000), 0, "top byte must not leak into a channel");
+        assert_eq!(
+            colorref_swap(0xFF00_0000),
+            0,
+            "top byte must not leak into a channel"
+        );
     }
 
     /// H3 happy path: under the `Auto` policy with no backdrop and no HC scheme, the
@@ -3205,13 +3214,14 @@ mod tests {
     #[test]
     fn caption_tint_paints_the_terminal_background_under_auto() {
         // The live audit machine's dark default (#111318).
-        let (caption, text) =
-            caption_tint(WindowTheme::Auto, 0x11_1318, DWMSBT_NONE, false, true);
-        assert_eq!(caption, 0x18_1311, "caption = theme bg in COLORREF byte order");
+        let (caption, text) = caption_tint(WindowTheme::Auto, 0x11_1318, DWMSBT_NONE, false, true);
+        assert_eq!(
+            caption, 0x18_1311,
+            "caption = theme bg in COLORREF byte order"
+        );
         assert_eq!(text, 0x00FF_FFFF, "dark grid gets white title text");
         // Solarized-light paper → black ink.
-        let (caption, text) =
-            caption_tint(WindowTheme::Auto, 0xFD_F6E3, DWMSBT_NONE, false, true);
+        let (caption, text) = caption_tint(WindowTheme::Auto, 0xFD_F6E3, DWMSBT_NONE, false, true);
         assert_eq!(caption, 0xE3_F6FD);
         assert_eq!(text, 0x0000_0000, "light grid gets black title text");
     }
@@ -3238,9 +3248,8 @@ mod tests {
             [0x11, 0x13, 0x18],
             super::CAPTION_TEXT_UNFOCUSED_DIM,
         );
-        let expected_rgb = (u32::from(expected[0]) << 16)
-            | (u32::from(expected[1]) << 8)
-            | u32::from(expected[2]);
+        let expected_rgb =
+            (u32::from(expected[0]) << 16) | (u32::from(expected[1]) << 8) | u32::from(expected[2]);
         assert_eq!(text_unfocused, colorref_swap(expected_rgb));
     }
 
@@ -3276,7 +3285,13 @@ mod tests {
                 "explicit dark keeps the stock OS caption"
             );
             assert_eq!(
-                caption_tint(WindowTheme::Auto, CHROME_BG_UNKNOWN, DWMSBT_NONE, false, focused),
+                caption_tint(
+                    WindowTheme::Auto,
+                    CHROME_BG_UNKNOWN,
+                    DWMSBT_NONE,
+                    false,
+                    focused
+                ),
                 default,
                 "no published background yet — nothing to tint with"
             );

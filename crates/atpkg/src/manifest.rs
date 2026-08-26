@@ -363,7 +363,6 @@ thread_local! {
     static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

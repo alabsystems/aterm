@@ -275,7 +275,10 @@ mod tests {
 
     /// The anchor the tests select under.
     fn anchor(roster_floor: u64) -> Anchor {
-        Anchor::of(vec![testkit::pubkey_b64(&testkit::MASTER_SEED)], roster_floor)
+        Anchor::of(
+            vec![testkit::pubkey_b64(&testkit::MASTER_SEED)],
+            roster_floor,
+        )
     }
 
     /// A build floor of `build`, recorded under the fixture's own generation — i.e. one
@@ -301,7 +304,12 @@ mod tests {
     #[test]
     fn an_unarmed_anchor_selects_nothing() {
         let cands = vec![signed("v60", 60)];
-        let out = select_index(&Anchor::of(vec![], 0), cands.clone(), no_floor(), testkit::NOW);
+        let out = select_index(
+            &Anchor::of(vec![], 0),
+            cands.clone(),
+            no_floor(),
+            testkit::NOW,
+        );
         assert!(
             out.selected.is_none(),
             "an unpinned build must install nothing, not everything"
@@ -397,7 +405,10 @@ mod tests {
         )
         .selected
         .expect("the intact candidate still qualifies");
-        assert_eq!(sel.index.index_build, 60, "the higher build had no authority");
+        assert_eq!(
+            sel.index.index_build, 60,
+            "the higher build had no authority"
+        );
     }
 
     // A REPLAYED roster generation is refused by the durable roster floor, even though the
@@ -510,7 +521,9 @@ mod tests {
             no_floor(),
             testkit::NOW,
         );
-        let sel = out.selected.expect("the newest generation has a valid index");
+        let sel = out
+            .selected
+            .expect("the newest generation has a valid index");
         assert_eq!(
             sel.label, "newest-generation",
             "index_build must not outrank the generation that authorizes the signer"
@@ -543,9 +556,14 @@ mod tests {
             index_build: u64::MAX,
             roster_seq: testkit::SEQ - 1,
         };
-        let sel = select_index(&anchor(0), vec![signed("rescue", 41)], poisoned, testkit::NOW)
-            .selected
-            .expect("a newer generation re-bases the floor");
+        let sel = select_index(
+            &anchor(0),
+            vec![signed("rescue", 41)],
+            poisoned,
+            testkit::NOW,
+        )
+        .selected
+        .expect("a newer generation re-bases the floor");
         assert_eq!(sel.index.index_build, 41);
 
         // NON-VACUITY, and the fail-closed direction: the SAME absurd floor recorded under

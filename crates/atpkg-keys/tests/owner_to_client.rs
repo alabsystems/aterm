@@ -158,13 +158,8 @@ fn publish(dir: &Path, machine_id: &str, revoked: &[&str]) -> Published {
     // per-run keypair) and the machine key it will authorize.
     let (master_key, master_pub) = atpkg_keys::generate().expect("paper master keypair");
     let (machine_key, machine_pub) = atpkg_keys::generate().expect("machine keypair");
-    let mut roster = add(
-        empty(NOW as u64),
-        machine_id,
-        &machine_pub,
-        NOW as u64,
-    )
-    .expect("the machine joins the roster");
+    let mut roster = add(empty(NOW as u64), machine_id, &machine_pub, NOW as u64)
+        .expect("the machine joins the roster");
     for id in revoked {
         roster = revoke(roster, id, NOW as u64).expect("revocation applies");
     }
@@ -206,10 +201,7 @@ fn publish(dir: &Path, machine_id: &str, revoked: &[&str]) -> Published {
         atpkg_keys::sign(&machine_key, index_body.as_bytes()).expect("machine signs index");
 
     let mut pkg = HashMap::new();
-    pkg.insert(
-        ("ay".to_string(), 18u64),
-        (pkg_body.into_bytes(), pkg_sig),
-    );
+    pkg.insert(("ay".to_string(), 18u64), (pkg_body.into_bytes(), pkg_sig));
     let mut archives = HashMap::new();
     archives.insert("ay-18.tar.zst".to_string(), archive);
 
@@ -282,8 +274,15 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
     // not a package-specific key. That equality is the entire point of this test.
     let anchor = atpkg::Anchor::of(vec![p.master_pub.clone()], 0);
     let layout = store_at(&dir, "prefix");
-    let report = atpkg::install(&p.registry, &layout, &anchor, &request(), atpkg::BuildFloor::none(), NOW)
-        .expect("the toolchain installs under the very same paper master");
+    let report = atpkg::install(
+        &p.registry,
+        &layout,
+        &anchor,
+        &request(),
+        atpkg::BuildFloor::none(),
+        NOW,
+    )
+    .expect("the toolchain installs under the very same paper master");
     assert_eq!(report.build, 18);
     assert_eq!(report.roster_seq, parsed.roster_seq);
     assert_eq!(report.shimmed, vec!["ay".to_string()]);
@@ -316,8 +315,15 @@ fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
 
     let inert = atpkg::Anchor::of(vec![], 0);
     assert!(!inert.is_armed(), "precondition: nothing is pinned");
-    let err = atpkg::install(&p.registry, &layout, &inert, &request(), atpkg::BuildFloor::none(), NOW)
-        .expect_err("an unpinned client must install NOTHING, not everything");
+    let err = atpkg::install(
+        &p.registry,
+        &layout,
+        &inert,
+        &request(),
+        atpkg::BuildFloor::none(),
+        NOW,
+    )
+    .expect_err("an unpinned client must install NOTHING, not everything");
     assert!(
         matches!(err, atpkg::FlowError::NoIndex),
         "the refusal is 'no index I can trust', not a permissive fallthrough: {err:?}"
@@ -331,7 +337,15 @@ fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
     // so the refusal above is the anchor and not a broken fixture.
     let armed = atpkg::Anchor::of(vec![p.master_pub.clone()], 0);
     assert!(
-        atpkg::install(&p.registry, &layout, &armed, &request(), atpkg::BuildFloor::none(), NOW).is_ok(),
+        atpkg::install(
+            &p.registry,
+            &layout,
+            &armed,
+            &request(),
+            atpkg::BuildFloor::none(),
+            NOW
+        )
+        .is_ok(),
         "the same bytes install under the pinned master"
     );
 
@@ -395,8 +409,7 @@ fn revoking_one_machine_stops_the_release_and_the_toolchain_at_once() {
     );
 
     // Product 1 — the aterm release: refused.
-    let verified =
-        verify_roster(&[&p.master_pub], p.roster_bytes.clone(), &p.roster_sig).unwrap();
+    let verified = verify_roster(&[&p.master_pub], p.roster_bytes.clone(), &p.roster_sig).unwrap();
     let parsed = Roster::parse(&verified).unwrap();
     parsed.admit(0, NOW).unwrap();
     assert_eq!(
@@ -412,8 +425,15 @@ fn revoking_one_machine_stops_the_release_and_the_toolchain_at_once() {
     );
 
     // Product 2 — the atpkg toolchain: refused, through the real install flow.
-    let err = atpkg::install(&p.registry, &layout, &anchor, &request(), atpkg::BuildFloor::none(), NOW)
-        .expect_err("a revoked machine's index must not install");
+    let err = atpkg::install(
+        &p.registry,
+        &layout,
+        &anchor,
+        &request(),
+        atpkg::BuildFloor::none(),
+        NOW,
+    )
+    .expect_err("a revoked machine's index must not install");
     assert!(matches!(err, atpkg::FlowError::NoIndex), "{err:?}");
     assert!(atpkg::which(&layout, "ay").is_none(), "nothing landed");
 
@@ -575,13 +595,7 @@ fn two_machines() -> TwoMachines {
 /// `add`/`revoke` bumps `roster_seq`, so a roster with a revocation is always the NEWER
 /// generation — which is the whole shape these tests exercise.
 fn both_rostered(o: &TwoMachines, revoked: &[&str]) -> (Roster, Vec<u8>, Vec<u8>) {
-    let mut r = add(
-        empty(NOW as u64),
-        "m3",
-        &o.m3_pub,
-        NOW as u64,
-    )
-    .unwrap();
+    let mut r = add(empty(NOW as u64), "m3", &o.m3_pub, NOW as u64).unwrap();
     r = add(r, "m11", &o.m11_pub, NOW as u64).unwrap();
     for id in revoked {
         r = revoke(r, id, NOW as u64).unwrap();
@@ -655,14 +669,9 @@ fn a_revoked_machine_cannot_outbid_the_generation_that_revokes_it() {
     ]);
     let layout = store_at(&dir, "prefix");
     let anchor = atpkg::Anchor::of(vec![o.master_pub.clone()], 0);
-    let index = atpkg::resolve_verified_index(
-        &fetcher,
-        &layout,
-        &anchor,
-        atpkg::BuildFloor::none(),
-        NOW,
-    )
-    .expect("the owner's release is perfectly valid");
+    let index =
+        atpkg::resolve_verified_index(&fetcher, &layout, &anchor, atpkg::BuildFloor::none(), NOW)
+            .expect("the owner's release is perfectly valid");
     assert_eq!(
         index.attribution().machine_id,
         "m3",

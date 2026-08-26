@@ -1220,7 +1220,11 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
     live.update_selection(5, 7, SelectionSide::Right);
     live.complete_selection();
     assert!(live.adjust_for_rows_shrink(6, 4, 50));
-    assert_eq!(live.start().row, -2, "a live row moves by the rows given up");
+    assert_eq!(
+        live.start().row,
+        -2,
+        "a live row moves by the rows given up"
+    );
     assert_eq!(live.end().row, 1);
 
     let mut bottom = TextSelection::new();
@@ -1228,7 +1232,11 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
     bottom.update_selection(9, 3, SelectionSide::Right);
     bottom.complete_selection();
     assert!(bottom.adjust_for_rows_shrink(6, 4, 50));
-    assert_eq!(bottom.start().row, 2, "the bottom rows stay live under the cursor");
+    assert_eq!(
+        bottom.start().row,
+        2,
+        "the bottom rows stay live under the cursor"
+    );
     assert_eq!(bottom.end().row, 5);
     assert_eq!(bottom.start().col, 0, "columns are untouched");
     assert!(bottom.is_complete(), "and so is the lifecycle state");
@@ -1280,7 +1288,10 @@ fn a_shrink_spares_a_span_that_crosses_the_cut() {
     sel.start_selection(4, 0, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(7, 5, SelectionSide::Right);
     sel.complete_selection();
-    assert!(sel.adjust_for_rows_shrink(6, 4, 100), "the span survives the shrink");
+    assert!(
+        sel.adjust_for_rows_shrink(6, 4, 100),
+        "the span survives the shrink"
+    );
     assert_eq!(sel.start().row, 0, "…relabelled by the rows given up");
     assert_eq!(sel.end().row, 3);
     assert!(
@@ -1302,4 +1313,3 @@ fn a_shrink_spares_a_span_that_crosses_the_cut() {
     assert_eq!(across.end().row, -2);
     assert!(across.start().row <= across.end().row, "order again");
 }
-

@@ -232,7 +232,6 @@ impl RosterDocument {
 /// PRE-CLAIM — while refusing is free — is strictly the better place to find out.
 pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 
-
 /// THE CUT-TIME GATE. Prove that `signing_pubkey` belongs to a machine the roster
 /// authorizes, and return the attribution the manifest will carry.
 ///
@@ -296,7 +295,9 @@ pub(crate) fn channel_roster_document(
     };
     let sig = anonymous_fetch(&url(aterm_update_core::roster::ROSTER_SIG_ASSET), 4_096)?;
     let verified = verify_roster(aterm_update_core::pins::PAPER_MASTER_PUBKEYS, bytes, &sig)
-        .map_err(|e| format!("the channel roster did not verify under the committed paper master ({e:?})"))?;
+        .map_err(|e| {
+            format!("the channel roster did not verify under the committed paper master ({e:?})")
+        })?;
     let parsed = Roster::parse(&verified)
         .map_err(|e| format!("the channel roster verified but did not parse ({e:?})"))?;
     Ok(Some((parsed.roster_seq, verified.as_slice().to_vec())))
@@ -312,7 +313,9 @@ pub(crate) fn roster_lineage_agrees(
     channel: Option<&(u64, Vec<u8>)>,
 ) -> std::result::Result<(), String> {
     match (carried_seq, channel) {
-        (Some(carried), Some((observed, bytes))) if carried == *observed && local_roster != bytes.as_slice() => {
+        (Some(carried), Some((observed, bytes)))
+            if carried == *observed && local_roster != bytes.as_slice() =>
+        {
             Err(format!(
                 "LINEAGE FORK: this cut carries machine-roster generation {carried} and the public \
                  channel's head carries generation {observed} too, but the two documents differ \
@@ -630,7 +633,6 @@ mod tests {
         assert!(err.to_string().contains("does not verify"), "{err}");
     }
 
-
     /// A LAPSED ROSTER refuses the cut. Publishing under it would produce a release every
     /// client refuses, so failing at the cutter is strictly the better place to find out.
     #[test]
@@ -717,8 +719,7 @@ mod tests {
         let err =
             verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(7)).unwrap_err();
         assert!(err.to_string().contains("roster_seq"), "{err}");
-        let err =
-            verify_published_roster(&[&master], bytes.clone(), &sig, "m3", None).unwrap_err();
+        let err = verify_published_roster(&[&master], bytes.clone(), &sig, "m3", None).unwrap_err();
         assert!(err.to_string().contains("roster_seq"), "{err}");
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(5))
             .expect("a newer roster asset over an older attribution is what a join produces");

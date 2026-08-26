@@ -40,9 +40,10 @@ fn main() -> ExitCode {
             aterm_forge::survey::run(&root, &cells, top, json.as_deref())
         }
         cli::Cmd::Blame { pkg, cells } => aterm_forge::blame::run(&root, &pkg, &cells),
-        cli::Cmd::Budget { update, allow_regress } => {
-            aterm_forge::budget::run(&root, update, allow_regress.as_deref())
-        }
+        cli::Cmd::Budget {
+            update,
+            allow_regress,
+        } => aterm_forge::budget::run(&root, update, allow_regress.as_deref()),
         cli::Cmd::Attest => aterm_forge::attest::run(&root),
         cli::Cmd::Check { cells } => aterm_forge::check::run(&root, &cells),
     };

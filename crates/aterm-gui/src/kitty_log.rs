@@ -3228,7 +3228,11 @@ mod tests {
         let mut host = KittyLogHost::in_memory();
         let now = Instant::now();
 
-        assert_eq!(host.favourite_look(), None, "fresh install: the launch kitty");
+        assert_eq!(
+            host.favourite_look(),
+            None,
+            "fresh install: the launch kitty"
+        );
 
         let stumbled = coated(CatGlyphId::S100, 3);
         host.observe(4, [look_sighting(11, stumbled)], lex, now, true);
@@ -3513,7 +3517,11 @@ mod tests {
         let mut on_disk = KittyLog::default();
         let _ = on_disk.record(&look_sighting(1, disk_pin), lex, "2026-08-01T00:00:00Z");
         on_disk.favourite_collectible(disk_pin, "2026-08-01T00:00:00Z");
-        assert_eq!(on_disk.favourite_look(), Some(disk_pin), "fixture: the disk carries a pin");
+        assert_eq!(
+            on_disk.favourite_look(),
+            Some(disk_pin),
+            "fixture: the disk carries a pin"
+        );
 
         // CONTROL: no session choice ⇒ the import elects the disk pin.
         let mut untouched = KittyLogHost::in_memory();

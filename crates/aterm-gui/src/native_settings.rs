@@ -4155,7 +4155,16 @@ fn preview_cursor_trail_enabled(state: &SettingsViewState) -> bool {
             .as_deref()
             .is_none_or(|style| !style.eq_ignore_ascii_case("off"));
     }
-    field_bool(state, prefs::EDIT_CURSOR_TRAIL, true)
+    // THE FALLBACK IS THE PLATFORM DEFAULT, not `true`. The committed row always
+    // carries a resolved seed, so this arm is reached only when a candidate patch
+    // RESETS the key (`value: None`) — "use the built-in default", which on Windows
+    // is OFF (`app_config::DEFAULT_DECORATIVE_EFFECTS`). Typing `true` here would
+    // preview a trail that the reset is about to remove.
+    field_bool(
+        state,
+        prefs::EDIT_CURSOR_TRAIL,
+        crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+    )
 }
 
 fn field_number<T>(state: &SettingsViewState, key: &str, fallback: T) -> T
@@ -7785,7 +7794,13 @@ fn top_projected_toy_value(state: &SettingsViewState, key: &str) -> bool {
 }
 
 fn top_authored_trail_value(state: &SettingsViewState) -> String {
-    if field_bool(state, prefs::EDIT_CURSOR_TRAIL, true) {
+    // Reset-to-default resolves to the PLATFORM default; see
+    // `preview_cursor_trail_enabled` for why this may never be a typed `true`.
+    if field_bool(
+        state,
+        prefs::EDIT_CURSOR_TRAIL,
+        crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+    ) {
         field_text(
             state,
             prefs::EDIT_CURSOR_TRAIL_STYLE,
@@ -11696,8 +11711,17 @@ fn parent_or_motion_inactivity(
             key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.style.is_some();
         let trail_style_invalid =
             key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.issue.is_some();
+        // A patch that RESETS the master means "use the built-in default", which is
+        // platform-split — so the candidate resolves against
+        // `DEFAULT_DECORATIVE_EFFECTS`, never a typed `true`, or a Windows reset
+        // would be read as switching the trail ON.
         let trail_master_enabling = key == prefs::EDIT_CURSOR_TRAIL
-            && candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL, true);
+            && candidate_setting_bool(
+                state,
+                patch,
+                prefs::EDIT_CURSOR_TRAIL,
+                crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+            );
         let music_switch_enabling =
             key == prefs::EDIT_TRAIL_SOUNDS && candidate_setting_bool(state, patch, key, true);
         if trail_tuning
@@ -11725,8 +11749,12 @@ fn parent_or_motion_inactivity(
                     ),
                 });
             }
-            if !candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL, true)
-                || trail_resolution.style.is_none()
+            if !candidate_setting_bool(
+                state,
+                patch,
+                prefs::EDIT_CURSOR_TRAIL,
+                crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+            ) || trail_resolution.style.is_none()
             {
                 return Some(inactive(
                     "This cursor-trail setting is saved but inactive while Cursor trail is Off",
@@ -16744,6 +16772,26 @@ mod tests {
         } else {
             Config::default()
         };
+        // AND THE TRAIL-GATED ROWS GET THEIR MASTER. `TRAIL_TUNING_KEYS` is this
+        // module's own list of rows the trail master gates — with it off they draw
+        // nothing, so a candidate could only move the badge, never the specimen
+        // body this fixture measures. The master's absent-key default is
+        // platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`), so authoring it
+        // is what keeps the pixel matrix honest on Windows instead of pixel-blind.
+        //
+        // `cursor_trail` itself is excluded on purpose: there the master IS the
+        // candidate, and its base must stay the platform default or the candidate
+        // could not differ from it.
+        let config = if key != prefs::EDIT_CURSOR_TRAIL
+            && (TRAIL_TUNING_KEYS.contains(&key) || key == prefs::EDIT_CURSOR_TRAIL_STYLE)
+        {
+            Config {
+                cursor_trail: Some(true),
+                ..config
+            }
+        } else {
+            config
+        };
         let mut state = SettingsViewState::new(&config);
         state.route = preview_route_for_key(key).expect("visual route");
         state.common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
@@ -16864,6 +16912,17 @@ mod tests {
         } else {
             "light"
         };
+        // Same rule, same reason, for the trail master: a candidate only moves
+        // pixels if it lands on the side OPPOSITE the committed state, and the
+        // committed state for an unwritten `cursor_trail` is the PLATFORM default
+        // (`app_config::DEFAULT_DECORATIVE_EFFECTS`). A typed "false" would be a
+        // no-op candidate on Windows and this fixture would go pixel-blind on
+        // exactly the platform whose default just moved.
+        const CURSOR_TRAIL_CANDIDATE: &str = if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+            "false"
+        } else {
+            "true"
+        };
         let cases: [(&str, &str); 58] = [
             (prefs::EDIT_THEME, "Nord"),
             (prefs::EDIT_FOREGROUND, "#00FF66"),
@@ -16907,7 +16966,7 @@ mod tests {
             (prefs::EDIT_FONT_VARIATION, "wdth=85, slnt=-8"),
             (prefs::EDIT_CURSOR_STYLE, "bar"),
             (prefs::EDIT_CURSOR_BLINK, "false"),
-            (prefs::EDIT_CURSOR_TRAIL, "false"),
+            (prefs::EDIT_CURSOR_TRAIL, CURSOR_TRAIL_CANDIDATE),
             (prefs::EDIT_CURSOR_TRAIL_STYLE, "water"),
             (prefs::EDIT_CURSOR_TRAIL_MS, "900"),
             (prefs::EDIT_CURSOR_TRAIL_LENGTH, "48"),
@@ -17599,7 +17658,14 @@ mod tests {
 
     #[test]
     fn preview_activity_comes_from_the_exact_authored_spec() {
-        let mut home = SettingsViewState::new(&Config::default());
+        // The runway ANIMATES because the trail draws on it; the master is asked
+        // for rather than inherited, because its absent-key default is
+        // platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`) and this test
+        // is about the preview's activity resolution, not about the default.
+        let mut home = SettingsViewState::new(&Config {
+            cursor_trail: Some(true),
+            ..Config::default()
+        });
         let motion = crate::native_app::ViewMotionCx::default();
         let theme = aterm_render::Theme::default();
         assert_eq!(
@@ -18009,7 +18075,19 @@ mod tests {
     #[test]
     fn music_suppression_resolver_covers_every_reason_and_priority() {
         let motion = crate::native_app::ViewMotionCx::default();
-        let state = |config: Config| SettingsViewState::new(&config);
+        // THE LADDER NEEDS ITS TOP RUNG STANDING. "Cursor trail is Off" outranks
+        // every runtime suppression below it, and the master's absent-key default
+        // is platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`) — so an
+        // inherited default would mask every LOWER reason this test exists to
+        // order. Each case therefore ASKS for the master unless it authors one
+        // itself; the trail-Off rung below still reaches its reason through
+        // `cursor_trail_style = "off"`, which is the same Off by a different door.
+        let state = |config: Config| {
+            SettingsViewState::new(&Config {
+                cursor_trail: config.cursor_trail.or(Some(true)),
+                ..config
+            })
+        };
 
         assert_eq!(
             top_music_suppression_reason_for_output(&state(Config::default()), motion, false),
@@ -18304,61 +18382,72 @@ mod tests {
             let mut cx = view_cx_at(width, height);
             cx.motion.serious = true;
             let mut seen = BTreeSet::new();
-            for _ in 0..16 {
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                compiled.validate_parity().unwrap();
-                for key in [
-                    "settings/top/serious-mode",
-                    "settings/top/choice-preview",
-                    "settings/choice-close",
-                    "settings/choice-page-prev",
-                    "settings/choice-page-next",
-                ] {
-                    let node = compiled
-                        .semantic(&UiKey::new(key))
-                        .unwrap_or_else(|| panic!("{width}×{height} picker is missing {key}"));
-                    assert!(node.rect.right() <= width + 0.01, "{key}: {:?}", node.rect);
-                    assert!(
-                        node.rect.bottom() <= height + 0.01,
-                        "{key}: {:?}",
-                        node.rect
-                    );
-                }
-                for node in &compiled.semantics {
-                    if node.key.as_str().starts_with(&format!(
-                        "settings/choice/{}/",
-                        prefs::EDIT_CURSOR_TRAIL_STYLE
-                    )) {
-                        seen.insert(node.key.as_str().to_string());
+            // THE SWEEP GOES BOTH WAYS, and that is not belt-and-braces. The picker
+            // opens on the AUTHORED candidate (`top_authored_trail_value`), and with
+            // no `cursor_trail` key that value follows the platform default: a
+            // mid-list style where the trail ships on, and the LAST option (`off`)
+            // on Windows, where `DEFAULT_DECORATIVE_EFFECTS` makes the resident pet
+            // an opt-in. A next-only walk would therefore have measured one page on
+            // Windows and called it reachability. Paging back to the first page and
+            // then forward to the last runs the same containment assertions over
+            // every page on every host, from wherever the picker happened to open.
+            for step in ["settings/choice-page-prev", "settings/choice-page-next"] {
+                for _ in 0..16 {
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    compiled.validate_parity().unwrap();
+                    for key in [
+                        "settings/top/serious-mode",
+                        "settings/top/choice-preview",
+                        "settings/choice-close",
+                        "settings/choice-page-prev",
+                        "settings/choice-page-next",
+                    ] {
+                        let node = compiled
+                            .semantic(&UiKey::new(key))
+                            .unwrap_or_else(|| panic!("{width}×{height} picker is missing {key}"));
+                        assert!(node.rect.right() <= width + 0.01, "{key}: {:?}", node.rect);
+                        assert!(
+                            node.rect.bottom() <= height + 0.01,
+                            "{key}: {:?}",
+                            node.rect
+                        );
                     }
+                    for node in &compiled.semantics {
+                        if node.key.as_str().starts_with(&format!(
+                            "settings/choice/{}/",
+                            prefs::EDIT_CURSOR_TRAIL_STYLE
+                        )) {
+                            seen.insert(node.key.as_str().to_string());
+                        }
+                    }
+                    for hit in &compiled.hits {
+                        assert!(
+                            hit.rect.right() <= width + 0.01,
+                            "{width}×{height}: {hit:?}"
+                        );
+                        assert!(
+                            hit.rect.bottom() <= height + 0.01,
+                            "{width}×{height}: {hit:?}"
+                        );
+                    }
+                    let more = compiled
+                        .semantic(&UiKey::new(step))
+                        .and_then(|node| node.state.as_ref())
+                        .is_some_and(|state| state.enabled);
+                    if !more {
+                        break;
+                    }
+                    runtime
+                        .dispatch(
+                            instance,
+                            view,
+                            AppEvent::Action(ActionInvocation {
+                                id: ActionId::new(step),
+                                value: None,
+                            }),
+                        )
+                        .unwrap();
                 }
-                for hit in &compiled.hits {
-                    assert!(
-                        hit.rect.right() <= width + 0.01,
-                        "{width}×{height}: {hit:?}"
-                    );
-                    assert!(
-                        hit.rect.bottom() <= height + 0.01,
-                        "{width}×{height}: {hit:?}"
-                    );
-                }
-                let next = compiled
-                    .semantic(&UiKey::new("settings/choice-page-next"))
-                    .and_then(|node| node.state.as_ref())
-                    .is_some_and(|state| state.enabled);
-                if !next {
-                    break;
-                }
-                runtime
-                    .dispatch(
-                        instance,
-                        view,
-                        AppEvent::Action(ActionInvocation {
-                            id: ActionId::new("settings/choice-page-next"),
-                            value: None,
-                        }),
-                    )
-                    .unwrap();
             }
             let AppViewState::Settings(state) = runtime.view_state(view).unwrap() else {
                 unreachable!()
@@ -28381,11 +28470,21 @@ mod tests {
             for (key, page, values) in &cases {
                 for value in values {
                     let (mut runtime, instance, view) = setup();
-                    replace_settings_source(
-                        &mut runtime,
-                        view,
-                        format!("{key} = {}\n", quote(value)),
-                    );
+                    // THE TRAIL CASE AUTHORS ITS MASTER. Top Settings presents the
+                    // trail's style and its ENABLEMENT as one honest choice, so a
+                    // committed style alone cannot make the control read that style
+                    // while the master is off — and the master's absent-key default
+                    // is platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`).
+                    // Writing both is exactly what the picker itself writes: one
+                    // patch carrying the style AND `cursor_trail = true`. The `off`
+                    // style still projects "off" through this source, so the value
+                    // list keeps its full span.
+                    let source = if *key == prefs::EDIT_CURSOR_TRAIL_STYLE {
+                        format!("cursor_trail = true\n{key} = {}\n", quote(value))
+                    } else {
+                        format!("{key} = {}\n", quote(value))
+                    };
+                    replace_settings_source(&mut runtime, view, source);
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
@@ -29114,60 +29213,85 @@ mod tests {
             after
         }
 
+        // THE SIBLING-PIN IS PLATFORM-CONDITIONAL, and that is the law working
+        // rather than an exception to it. Escaping Serious Mode writes an explicit
+        // `false` for every sibling that would otherwise spring back to life on the
+        // way out. Where `cursor_trail` is un-authored AND its platform default is
+        // already OFF (`app_config::DEFAULT_DECORATIVE_EFFECTS`, i.e. Windows), the
+        // trail springs back to nothing — so there is nothing to pin and the honest
+        // patch leaves the key unwritten. "Only the selected effect may change" is
+        // the invariant under test; the edit list is its consequence, and the
+        // PROJECTION assertions below are identical on every host.
+        //
+        // Only a `false` PIN is conditional. An edit that turns the trail ON is the
+        // user's own selection and appears everywhere.
+        fn expect(
+            edits: &[(&'static str, Option<&'static str>)],
+        ) -> Vec<(&'static str, Option<&'static str>)> {
+            edits
+                .iter()
+                .copied()
+                .filter(|(key, value)| {
+                    crate::app_config::DEFAULT_DECORATIVE_EFFECTS
+                        || !(*key == prefs::EDIT_CURSOR_TRAIL && *value == Some("false"))
+                })
+                .collect()
+        }
+
         let defaulted = "serious_mode = true\n";
         assert_transition(
             defaulted,
             prefs::EDIT_CURSOR_TRAIL_STYLE,
             SemanticInput::Text("water".to_string()),
-            &[
+            &expect(&[
                 (prefs::EDIT_CURSOR_TRAIL_STYLE, Some("water")),
                 (prefs::EDIT_CURSOR_TRAIL, Some("true")),
                 (prefs::EDIT_TRAIL_SOUNDS, Some("false")),
                 (SPARKLE_WORDS_KEY, Some("false")),
                 (KEYWORD_KITTIES_KEY, Some("false")),
                 (prefs::EDIT_SERIOUS_MODE, None),
-            ],
+            ]),
             ("water", false, false, false),
         );
         assert_transition(
             defaulted,
             prefs::EDIT_TRAIL_SOUNDS,
             SemanticInput::Bool(true),
-            &[
+            &expect(&[
                 (prefs::EDIT_TRAIL_SOUNDS, None),
                 (prefs::EDIT_CURSOR_TRAIL, Some("false")),
                 (SPARKLE_WORDS_KEY, Some("false")),
                 (KEYWORD_KITTIES_KEY, Some("false")),
                 (prefs::EDIT_SERIOUS_MODE, None),
-            ],
+            ]),
             ("off", true, false, false),
         );
         assert_transition(
             defaulted,
             SPARKLE_WORDS_KEY,
             SemanticInput::Bool(true),
-            &[
+            &expect(&[
                 (SPARKLE_MASTER_KEY, None),
                 (SPARKLE_WORDS_KEY, None),
                 (KEYWORD_KITTIES_KEY, Some("false")),
                 (prefs::EDIT_CURSOR_TRAIL, Some("false")),
                 (prefs::EDIT_TRAIL_SOUNDS, Some("false")),
                 (prefs::EDIT_SERIOUS_MODE, None),
-            ],
+            ]),
             ("off", false, true, false),
         );
         assert_transition(
             defaulted,
             KEYWORD_KITTIES_KEY,
             SemanticInput::Bool(true),
-            &[
+            &expect(&[
                 (SPARKLE_MASTER_KEY, None),
                 (SPARKLE_WORDS_KEY, Some("false")),
                 (KEYWORD_KITTIES_KEY, None),
                 (prefs::EDIT_CURSOR_TRAIL, Some("false")),
                 (prefs::EDIT_TRAIL_SOUNDS, Some("false")),
                 (prefs::EDIT_SERIOUS_MODE, None),
-            ],
+            ]),
             ("off", false, false, true),
         );
 
@@ -30369,6 +30493,8 @@ enabled = true
     fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
         let availability = audited_availability();
         let motion = crate::native_app::ViewMotionCx::default();
+        const TRAIL_ON: &str = "cursor_trail = true\n";
+        const TRAIL_ON_SERIOUS: &str = "cursor_trail = true\nserious_mode = true\n";
 
         for key in [
             prefs::EDIT_TRAIL_SOUND_VOLUME,
@@ -30382,12 +30508,17 @@ enabled = true
             prefs::EDIT_SPARKLE_BONK,
             prefs::EDIT_SPARKLE_BONK_DETONATION,
         ] {
-            let quiet = projected_effect("", &[], key, availability, motion);
+            // Both postures AUTHOR the trail master. It is the top rung of the
+            // same disclosure ladder ("Inactive · Cursor trail Off" outranks the
+            // Serious Mode note), and its absent-key default is platform-split —
+            // so leaving it unwritten would make the quiet case pass for the
+            // wrong reason on Windows and the serious case fail outright.
+            let quiet = projected_effect(TRAIL_ON, &[], key, availability, motion);
             assert!(
                 !effect_note_contains(&quiet, "Serious Mode"),
                 "{key} must not claim Serious Mode with Serious Mode off: {quiet:?}"
             );
-            let serious = projected_effect("serious_mode = true\n", &[], key, availability, motion);
+            let serious = projected_effect(TRAIL_ON_SERIOUS, &[], key, availability, motion);
             assert!(
                 effect_note_contains(&serious, "Serious Mode"),
                 "{key} is silent under Serious Mode and must say so: {serious:?}"
@@ -30407,7 +30538,7 @@ enabled = true
         // than being suppressed by it —
         // `top_effect_controls_truthfully_escape_the_serious_mode_override`).
         let master = projected_effect(
-            "serious_mode = true\n",
+            TRAIL_ON_SERIOUS,
             &[],
             prefs::EDIT_TRAIL_SOUNDS,
             availability,
@@ -31676,7 +31807,14 @@ enabled = true
 
     #[test]
     fn config_feedback_projection_distinguishes_unavailable_from_mixed_live_edits() {
-        let state = SettingsViewState::new(&Config::default());
+        // HDR glow only has a live consumer while the trail is producing glow
+        // quads, so the trail master is authored here rather than inherited from
+        // a platform-split default — this test classifies edits as live vs
+        // unavailable, and that classification must be exercised on every host.
+        let state = SettingsViewState::new(&Config {
+            cursor_trail: Some(true),
+            ..Config::default()
+        });
         let availability = SettingsAvailability {
             backend_gpu: false,
             macos: true,

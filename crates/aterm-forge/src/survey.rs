@@ -102,7 +102,12 @@ pub fn run(
                 path.display()
             )
         })?;
-        let _ = writeln!(log, "\n  JSON written: {} ({} bytes)", path.display(), body.len());
+        let _ = writeln!(
+            log,
+            "\n  JSON written: {} ({} bytes)",
+            path.display(),
+            body.len()
+        );
     }
 
     if !skipped.is_empty() {
@@ -122,7 +127,10 @@ pub fn run(
         let _ = writeln!(log, "{PRECISION_NOTE}");
     }
 
-    Ok(Outcome { ok: skipped.is_empty(), log })
+    Ok(Outcome {
+        ok: skipped.is_empty(),
+        log,
+    })
 }
 
 // ---------------------------------------------------------------- report body
@@ -148,8 +156,11 @@ fn cell_section(out: &mut String, s: &CellSurvey, top: usize) {
     let third = s.third_party().count();
     let workspace = total.saturating_sub(third);
     let loc_total = s.third_party_loc();
-    let unsafe_total: u64 =
-        s.third_party().filter_map(|p| s.facts.get(p)).map(|f| f.unsafe_tokens).sum();
+    let unsafe_total: u64 = s
+        .third_party()
+        .filter_map(|p| s.facts.get(p))
+        .map(|f| f.unsafe_tokens)
+        .sum();
     let dups = s.duplicate_names();
 
     let _ = writeln!(out, "\n{}", "=".repeat(W_LINE));
@@ -224,7 +235,11 @@ fn ranked_table(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost)], t
         }
     }
 
-    let shown = if top == 0 { ranked.len() } else { top.min(ranked.len()) };
+    let shown = if top == 0 {
+        ranked.len()
+    } else {
+        top.min(ranked.len())
+    };
     let _ = writeln!(
         out,
         "  `.` marks a NESTED row: it is already inside a higher row's cost. The column\n  \
@@ -284,8 +299,10 @@ fn partition_check(
     ranked: &[(PkgId, DomCost)],
     covered: &BTreeSet<&PkgId>,
 ) {
-    let roots: Vec<&(PkgId, DomCost)> =
-        ranked.iter().filter(|(id, _)| !covered.contains(id)).collect();
+    let roots: Vec<&(PkgId, DomCost)> = ranked
+        .iter()
+        .filter(|(id, _)| !covered.contains(id))
+        .collect();
     let sum: u64 = roots.iter().map(|(_, c)| c.loc).sum();
     let pkgs: usize = roots.iter().map(|(_, c)| c.pkgs).sum();
     let total = s.third_party_loc();
@@ -319,7 +336,10 @@ fn partition_check(
 }
 
 fn duplicate_section(out: &mut String, s: &CellSurvey, dups: &BTreeMap<String, Vec<String>>) {
-    let _ = writeln!(out, "\n  DUPLICATE VERSIONS — one name resolved at two or more versions.");
+    let _ = writeln!(
+        out,
+        "\n  DUPLICATE VERSIONS — one name resolved at two or more versions."
+    );
     if dups.is_empty() {
         let _ = writeln!(out, "    none in this cell.");
         return;
@@ -330,14 +350,28 @@ fn duplicate_section(out: &mut String, s: &CellSurvey, dups: &BTreeMap<String, V
          copy but the largest, and it is won by moving a dependant's requirement, not by\n  \
          deleting code."
     );
-    let _ = writeln!(out, "\n    {:<24}  {:<40}  {:>11}", "NAME", "VERSIONS", "DEDUP LOC");
-    let _ = writeln!(out, "    {}  {}  {}", "-".repeat(24), "-".repeat(40), "-".repeat(11));
+    let _ = writeln!(
+        out,
+        "\n    {:<24}  {:<40}  {:>11}",
+        "NAME", "VERSIONS", "DEDUP LOC"
+    );
+    let _ = writeln!(
+        out,
+        "    {}  {}  {}",
+        "-".repeat(24),
+        "-".repeat(40),
+        "-".repeat(11)
+    );
     let mut rows: Vec<(String, String, u64)> = Vec::new();
     let mut prize_total = 0u64;
     for (name, versions) in dups {
         let mut locs: Vec<u64> = versions
             .iter()
-            .map(|v| s.facts.get(&PkgId::new(name.clone(), v.clone())).map_or(0, |f| f.loc))
+            .map(|v| {
+                s.facts
+                    .get(&PkgId::new(name.clone(), v.clone()))
+                    .map_or(0, |f| f.loc)
+            })
             .collect();
         locs.sort_unstable();
         let prize: u64 = locs.iter().rev().skip(1).sum();
@@ -390,7 +424,10 @@ fn zero_cost_section(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost
     let half = leaves.len().div_ceil(2);
     for i in 0..half {
         let left = entry(leaves[i].0, leaves[i].1);
-        let right = leaves.get(i + half).map(|(id, l)| entry(id, *l)).unwrap_or_default();
+        let right = leaves
+            .get(i + half)
+            .map(|(id, l)| entry(id, *l))
+            .unwrap_or_default();
         let line = format!("    {left:<40}    {right}");
         let _ = writeln!(out, "{}", line.trim_end());
     }
@@ -400,7 +437,9 @@ fn zero_cost_section(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost
     let mut by_license: BTreeMap<&str, usize> = BTreeMap::new();
     for (id, _) in &leaves {
         let lic = s.facts.get(*id).map_or("", |f| f.license.as_str());
-        *by_license.entry(if lic.is_empty() { "(unstated)" } else { lic }).or_insert(0) += 1;
+        *by_license
+            .entry(if lic.is_empty() { "(unstated)" } else { lic })
+            .or_insert(0) += 1;
     }
     let mut census: Vec<(&str, usize)> = by_license.into_iter().collect();
     census.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -409,11 +448,19 @@ fn zero_cost_section(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost
         .map(|(lic, n)| format!("{lic} x{n}"))
         .collect::<Vec<_>>()
         .join(";  ");
-    wrap(out, "    ", &format!("licences in this tier: {text}"), W_LINE);
+    wrap(
+        out,
+        "    ",
+        &format!("licences in this tier: {text}"),
+        W_LINE,
+    );
 }
 
 fn entry(id: &PkgId, loc_lines: u64) -> String {
-    fit(&format!("{:>7}  {} {}", commas(loc_lines), id.name, id.version), 40)
+    fit(
+        &format!("{:>7}  {} {}", commas(loc_lines), id.name, id.version),
+        40,
+    )
 }
 
 fn cross_cell(out: &mut String, surveys: &[CellSurvey]) {
@@ -429,8 +476,11 @@ fn cross_cell(out: &mut String, surveys: &[CellSurvey]) {
     for s in surveys {
         let total = s.graph.nodes.len();
         let third = s.third_party().count();
-        let unsafe_total: u64 =
-            s.third_party().filter_map(|p| s.facts.get(p)).map(|f| f.unsafe_tokens).sum();
+        let unsafe_total: u64 = s
+            .third_party()
+            .filter_map(|p| s.facts.get(p))
+            .map(|f| f.unsafe_tokens)
+            .sum();
         let _ = writeln!(
             out,
             "    {:<9}{:>6}{:>6}{:>13}{:>12}{:>9}{:>11}{:>7}{:>6}",
@@ -551,7 +601,11 @@ fn also_column(s: &CellSurvey, also: &[PkgId], target: &PkgId, width: usize) -> 
         let text = format!("{} {}", p.name, p.version);
         let sep = if i == 0 { "" } else { ", " };
         let rest = items.len() - i;
-        let tail = if rest > 1 { format!(", +{} more", rest - 1) } else { String::new() };
+        let tail = if rest > 1 {
+            format!(", +{} more", rest - 1)
+        } else {
+            String::new()
+        };
         let width_if_taken =
             out.chars().count() + sep.chars().count() + text.chars().count() + tail.chars().count();
         if i > 0 && width_if_taken > width {
@@ -574,7 +628,9 @@ fn reach_from(s: &CellSurvey, id: &PkgId) -> BTreeSet<PkgId> {
     seen.insert(id.clone());
     let mut stack = vec![id.clone()];
     while let Some(u) = stack.pop() {
-        let Some(children) = s.graph.edges.get(&u) else { continue };
+        let Some(children) = s.graph.edges.get(&u) else {
+            continue;
+        };
         for v in children {
             if seen.insert(v.clone()) {
                 stack.push(v.clone());
@@ -598,7 +654,10 @@ fn json_report(root: &Path, surveys: &[CellSurvey], skipped: &[(String, String)]
     o.push_str(",\n");
     o.push_str("  \"loc_method\": \"rs-physical-all-files-v1\",\n");
     o.push_str("  \"cost_method\": ");
-    jstr(&mut o, "dominator: dom(C) = reach(root) \\ reach(root, block C)");
+    jstr(
+        &mut o,
+        "dominator: dom(C) = reach(root) \\ reach(root, block C)",
+    );
     o.push_str(",\n");
     o.push_str("  \"cells\": [\n");
     for (i, s) in surveys.iter().enumerate() {
@@ -616,7 +675,13 @@ fn json_report(root: &Path, surveys: &[CellSurvey], skipped: &[(String, String)]
     o.push_str("  \"union_third_party\": ");
     o.push_str(&seen_in.len().to_string());
     o.push_str(",\n  \"in_every_cell\": ");
-    o.push_str(&seen_in.values().filter(|n| **n == surveys.len()).count().to_string());
+    o.push_str(
+        &seen_in
+            .values()
+            .filter(|n| **n == surveys.len())
+            .count()
+            .to_string(),
+    );
     o.push_str(",\n  \"skipped\": [");
     for (i, (cell, why)) in skipped.iter().enumerate() {
         if i > 0 {
@@ -640,8 +705,11 @@ fn json_cell(o: &mut String, s: &CellSurvey) {
     let ranked = dominator::ranked(s);
     let total = s.graph.nodes.len();
     let third = s.third_party().count();
-    let unsafe_total: u64 =
-        s.third_party().filter_map(|p| s.facts.get(p)).map(|f| f.unsafe_tokens).sum();
+    let unsafe_total: u64 = s
+        .third_party()
+        .filter_map(|p| s.facts.get(p))
+        .map(|f| f.unsafe_tokens)
+        .sum();
 
     o.push_str("    {\n      \"name\": ");
     jstr(o, &s.cell.name);
@@ -694,7 +762,11 @@ fn json_cell(o: &mut String, s: &CellSurvey) {
         }
         let mut locs: Vec<u64> = versions
             .iter()
-            .map(|v| s.facts.get(&PkgId::new(name.clone(), v.clone())).map_or(0, |f| f.loc))
+            .map(|v| {
+                s.facts
+                    .get(&PkgId::new(name.clone(), v.clone()))
+                    .map_or(0, |f| f.loc)
+            })
             .collect();
         locs.sort_unstable();
         o.push_str("\n        {");
@@ -842,7 +914,9 @@ mod tests {
         }
         fn value(b: &[char], i: &mut usize) -> Result<(), String> {
             ws(b, i);
-            let Some(&c) = b.get(*i) else { return Err(format!("value expected at {i}")) };
+            let Some(&c) = b.get(*i) else {
+                return Err(format!("value expected at {i}"));
+            };
             match c {
                 '{' | '[' => {
                     let close = if c == '{' { '}' } else { ']' };
@@ -878,7 +952,13 @@ mod tests {
                 }
                 '"' => string(b, i),
                 't' | 'f' | 'n' => {
-                    let word = if c == 't' { "true" } else if c == 'f' { "false" } else { "null" };
+                    let word = if c == 't' {
+                        "true"
+                    } else if c == 'f' {
+                        "false"
+                    } else {
+                        "null"
+                    };
                     for w in word.chars() {
                         if b.get(*i) != Some(&w) {
                             return Err(format!("bad literal at {i}"));
@@ -943,10 +1023,26 @@ mod tests {
         let root = repo_root();
         let want = measured::MAC_ARM;
         let s = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves offline");
-        assert_eq!(s.graph.nodes.len(), want.resolved, "total packages in the shipped graph");
-        assert_eq!(s.third_party().count(), want.third_party, "third-party packages");
-        assert_eq!(s.third_party_loc(), want.third_party_loc, "third-party physical LOC");
-        assert_eq!(s.duplicate_names().len(), want.duplicate_names, "names at 2+ versions");
+        assert_eq!(
+            s.graph.nodes.len(),
+            want.resolved,
+            "total packages in the shipped graph"
+        );
+        assert_eq!(
+            s.third_party().count(),
+            want.third_party,
+            "third-party packages"
+        );
+        assert_eq!(
+            s.third_party_loc(),
+            want.third_party_loc,
+            "third-party physical LOC"
+        );
+        assert_eq!(
+            s.duplicate_names().len(),
+            want.duplicate_names,
+            "names at 2+ versions"
+        );
     }
 
     /// The invariant the report prints: non-nested dominator sets are disjoint
@@ -964,8 +1060,10 @@ mod tests {
                 }
             }
         }
-        let roots: Vec<&(PkgId, DomCost)> =
-            ranked.iter().filter(|(id, _)| !covered.contains(id)).collect();
+        let roots: Vec<&(PkgId, DomCost)> = ranked
+            .iter()
+            .filter(|(id, _)| !covered.contains(id))
+            .collect();
         assert_eq!(
             roots.iter().map(|(_, c)| c.loc).sum::<u64>(),
             s.third_party_loc(),
@@ -985,12 +1083,20 @@ mod tests {
         assert!(out.ok, "a resolvable cell is not a failure:\n{}", out.log);
         let want = measured::MAC_ARM;
         let loc_text = commas(want.third_party_loc);
-        assert!(out.log.contains(&loc_text), "third-party LOC is printed:\n{}", out.log);
+        assert!(
+            out.log.contains(&loc_text),
+            "third-party LOC is printed:\n{}",
+            out.log
+        );
         assert!(
             out.log.contains(&want.third_party.to_string()),
             "third-party count is printed"
         );
-        assert!(out.log.contains("PARTITION CHECK OK"), "the check must hold:\n{}", out.log);
+        assert!(
+            out.log.contains("PARTITION CHECK OK"),
+            "the check must hold:\n{}",
+            out.log
+        );
         assert!(out.log.contains("ZERO-COST LEAVES"));
         assert!(out.log.contains("DUPLICATE VERSIONS"));
         for line in out.log.lines() {
@@ -1005,8 +1111,11 @@ mod tests {
     #[test]
     fn json_output_is_wellformed_and_carries_the_measured_totals() {
         let root = repo_root();
-        let path = std::env::temp_dir()
-            .join(format!("forge-survey-{}-{}.json", std::process::id(), line!()));
+        let path = std::env::temp_dir().join(format!(
+            "forge-survey-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
         let out = run(&root, &["mac-arm".to_string()], 5, Some(&path)).expect("survey runs");
         assert!(out.ok);
         let body = std::fs::read_to_string(&path).expect("the JSON file was written");

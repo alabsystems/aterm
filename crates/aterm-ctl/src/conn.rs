@@ -127,19 +127,20 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         if arg == "-h" || arg == "--help" {
             return print_usage();
         } else if arg == "--sock" {
-            sock = Some(
-                args.next()
-                    .ok_or_else(|| usage("--sock requires a PATH"))?,
-            );
+            sock = Some(args.next().ok_or_else(|| usage("--sock requires a PATH"))?);
         } else if let Some(p) = arg.strip_prefix("--sock=") {
             sock = Some(p.to_string());
         } else if arg == "--pid" {
-            let v = args
-                .next()
-                .ok_or_else(|| usage("--pid requires a PID"))?;
-            pid = Some(v.parse().map_err(|_| usage("--pid requires a numeric PID"))?);
+            let v = args.next().ok_or_else(|| usage("--pid requires a PID"))?;
+            pid = Some(
+                v.parse()
+                    .map_err(|_| usage("--pid requires a numeric PID"))?,
+            );
         } else if let Some(v) = arg.strip_prefix("--pid=") {
-            pid = Some(v.parse().map_err(|_| usage("--pid requires a numeric PID"))?);
+            pid = Some(
+                v.parse()
+                    .map_err(|_| usage("--pid requires a numeric PID"))?,
+            );
         } else {
             // First positional is the subverb; the remainder is its argument list.
             rest.push(arg);
@@ -152,9 +153,7 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     if rest.first().map(String::as_str) == Some("help") {
         return print_usage();
     }
-    let self_sid = env::var(super::SELF_SID_ENV)
-        .ok()
-        .filter(|s| !s.is_empty());
+    let self_sid = env::var(super::SELF_SID_ENV).ok().filter(|s| !s.is_empty());
     let path = super::resolve_path(
         sock,
         pid,
@@ -251,8 +250,8 @@ impl ConnWire {
             == aterm_types::control_verbs::Framing::Lines
             && let Some(tail) = status.strip_prefix("OK ")
         {
-            let count = super::stream_count(tail)
-                .ok_or_else(|| super::malformed_header_error(&status))?;
+            let count =
+                super::stream_count(tail).ok_or_else(|| super::malformed_header_error(&status))?;
             for _ in 0..count {
                 let mut line = String::new();
                 if super::read_bounded_line(&mut reader, &mut line)? == 0 {
@@ -487,9 +486,7 @@ fn parse_spawn_args(args: &[String]) -> io::Result<SpawnSpec> {
             "--tab" => place = "tab",
             "--window" => place = "window",
             "--of" => {
-                let v = it
-                    .next()
-                    .ok_or_else(|| usage("--of requires a selector"))?;
+                let v = it.next().ok_or_else(|| usage("--of requires a selector"))?;
                 of = Some(v.clone());
             }
             k => {
@@ -743,8 +740,7 @@ fn cmd_status(wire: &ConnWire, self_sid: Option<&str>) -> io::Result<ExitCode> {
 
     // Group the inbound per-op rows by source; the flows pairs arrive grouped.
     let mut inbound: Vec<(String, Vec<String>)> = Vec::new();
-    for (src, _dst, op) in parse_edges_json(edges.lines.first().map(String::as_str).unwrap_or(""))
-    {
+    for (src, _dst, op) in parse_edges_json(edges.lines.first().map(String::as_str).unwrap_or("")) {
         match inbound.iter_mut().find(|(s, _)| *s == src) {
             Some((_, ops)) => ops.push(op),
             None => inbound.push((src, vec![op])),
@@ -864,7 +860,12 @@ fn cmd_rm(wire: &ConnWire, self_sid: Option<&str>, args: &[String]) -> io::Resul
         parts.push(format!("kind={kind}"));
     }
     let reply = require_ok(wire.request(&parts)?)?;
-    let n = reply.tail().split_whitespace().next().unwrap_or("0").to_string();
+    let n = reply
+        .tail()
+        .split_whitespace()
+        .next()
+        .unwrap_or("0")
+        .to_string();
     super::print_stdout_line(&format!("disconnected {src} -> {dst} ({n} revoked)"))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1014,9 +1015,8 @@ mod tests {
         assert_eq!(ok, "s-me");
         let ok = resolve_selector_with("@s-peer", None, &mut no_lookup).unwrap();
         assert_eq!(ok, "s-peer");
-        let mut lookup = |n: u64| -> io::Result<Option<String>> {
-            Ok((n == 3).then(|| "s-three".to_string()))
-        };
+        let mut lookup =
+            |n: u64| -> io::Result<Option<String>> { Ok((n == 3).then(|| "s-three".to_string())) };
         assert_eq!(
             resolve_selector_with("@3", None, &mut lookup).unwrap(),
             "s-three"
