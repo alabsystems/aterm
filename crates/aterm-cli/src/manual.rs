@@ -164,10 +164,12 @@ WHAT IT IS
   the block tells the agent to ignore itself, so installing it is harmless everywhere.
 
   It ALSO installs the bundled SKILLS: whole files aterm ships and owns, written into
-  the agent's own skills directory (today `~/.claude/skills/drive-aterm/SKILL.md` for
-  Claude Code — how to drive ANOTHER aterm session over the control socket). The skill
-  content is compiled into the binary, so it updates with aterm and there is no second
-  copy to drift.
+  the agent's own skills directory (today, for Claude Code:
+  `~/.claude/skills/drive-aterm/SKILL.md` — how to drive/observe ONE other aterm
+  session over the control socket — and `~/.claude/skills/supervise-agent/SKILL.md` —
+  the SUPERVISION loop on top: run a worker agent, review each turn against ground
+  truth, escalate, resume). The skill content is compiled into the binary, so it
+  updates with aterm and there is no second copy to drift.
 
 KEY USAGE
   aterm agents               status: each agent, its context file + skills,

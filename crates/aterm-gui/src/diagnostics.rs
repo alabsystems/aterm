@@ -691,12 +691,14 @@ pub(crate) fn config_semantic_warnings(
     if config.allow_window_ops == Some(true) {
         // Linux wires the manipulation half (frame audit #4: `spawn::
         // configure_window_ops` → `App::on_window_op`); the surviving gap there
-        // is the position/pixel-geometry reports. Elsewhere the pre-wiring
-        // statement is still the honest one.
+        // is the POSITION and screen reports. The pixel-geometry pair (CSI 14 t
+        // text area, CSI 16 t cell size) is answered in-core on every platform
+        // from the host's reported cell metrics, so it is no longer part of the
+        // gap on either branch.
         let message = if cfg!(target_os = "linux") {
-            "allow_window_ops is wired to the window on Linux: manipulations (iconify, maximize, fullscreen, resize) apply and move stays denied; position/pixel-geometry reports beyond the window-title and text-grid-size fallbacks remain unanswered"
+            "allow_window_ops is wired to the window on Linux: manipulations (iconify, maximize, fullscreen, resize) apply and move stays denied; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
         } else {
-            "allow_window_ops enables only the GUI's XTWINOPS window-title and text-grid-size fallback reports; no window callback is installed, so host manipulation and most state/geometry requests are ignored"
+            "allow_window_ops enables only the GUI's XTWINOPS window-title, text-grid-size, text-area-pixels and cell-size fallback reports; no window callback is installed, so host manipulation and window/screen position and size requests are ignored"
         };
         warnings.push(ConfigSemanticWarning {
             key: "allow_window_ops",
@@ -1076,10 +1078,12 @@ fn shell_config_warning(shell: &str) -> Option<String> {
 /// explicit path that stage 2 cannot run. Advice never names a POSIX path.
 #[cfg(windows)]
 fn shell_config_warning(shell: &str) -> Option<String> {
-    // `shell` names ONE program. A quoted value, or one carrying arguments, is
-    // a FILENAME containing `"`/spaces to `lpApplicationName` — measured
-    // ERROR_INVALID_NAME, never a parsed command line. Checked first: it is a
-    // grammar error, so no resolution verdict below could describe it.
+    // `shell` names ONE program. A QUOTED value is a FILENAME containing `"` to
+    // `lpApplicationName` — measured ERROR_INVALID_NAME, never a parsed command
+    // line. Checked first and unconditionally: the quotes make it a grammar
+    // error whatever is inside them, so no resolution verdict below could
+    // describe it. (The same mistake written WITHOUT quotes still resolves like
+    // a name, so it is caught as a refinement further down.)
     if shell.contains('"') {
         return Some(format!(
             "shell: {shell:?} is quoted, and `shell` names one program rather than a \
@@ -1109,14 +1113,63 @@ fn shell_config_warning(shell: &str) -> Option<String> {
     // of its own: `%` is a legal Windows filename character, so a directory
     // literally named `%tools%` must keep validating clean rather than be
     // second-guessed by a heuristic about what the author "meant".
-    verdict.map(|message| match unexpanded_windows_env_var(shell) {
-        Some(var) => format!(
-            "shell: {shell:?} contains %{var}%, and `shell` is never environment-expanded \
-             — new sessions will fail. Write the value the variable holds \
-             (e.g. C:\\Windows\\System32\\cmd.exe)"
-        ),
-        None => message,
+    //
+    // The ARGUMENTS refinement below is the same shape, and closes the half of
+    // the quoted-value rule above that was only ever a comment: an UNQUOTED
+    // `wsl -d Debian` is the same grammar error as a quoted one, but resolution
+    // described it as `is not on %PATH%`, and `cmd /K dir` — path-like only
+    // because `/K` holds a slash — came out as `is a relative path`. Both are
+    // true of the string and useless to the author.
+    //
+    // The two refinements cannot both fire: this one requires the head token to
+    // RESOLVE, and an unexpanded `%VAR%` head never does.
+    verdict.map(|message| {
+        if let Some(var) = unexpanded_windows_env_var(shell) {
+            format!(
+                "shell: {shell:?} contains %{var}%, and `shell` is never environment-expanded \
+                 — new sessions will fail. Write the value the variable holds \
+                 (e.g. C:\\Windows\\System32\\cmd.exe)"
+            )
+        } else if let Some(program) = windows_shell_command_line_head(shell) {
+            format!(
+                "shell: {shell:?} carries arguments, and `shell` names one program rather \
+                 than a command line — new sessions will fail. Write shell = {program:?} \
+                 and put the arguments in `shell_args`"
+            )
+        } else {
+            message
+        }
     })
+}
+
+/// The program at the head of `value` when `value` is a COMMAND LINE rather than
+/// one program's name — i.e. the author put arguments in `shell`.
+///
+/// A space is not evidence on its own: `C:\Program Files\Git\bin\bash.exe` is
+/// the most ordinary Windows shell path there is, and it must keep validating
+/// clean. The evidence is that the head token ALONE is runnable while the whole
+/// string is not, so this is only ever consulted to reword a value that already
+/// failed to resolve — the same discipline as [`unexpanded_windows_env_var`].
+///
+/// The head qualifies when the spawn's own resolution finds it (`pwsh`, `wsl`,
+/// `cmd`) or when it is an absolute path to a real file
+/// (`C:\Windows\System32\cmd.exe /K dir`). A head that is merely the first word
+/// of a spaced path — `C:\Program` of a MISTYPED `C:\Program Files\…` — is not
+/// a file, so a genuinely missing path keeps its "does not exist" verdict.
+#[cfg(windows)]
+fn windows_shell_command_line_head(value: &str) -> Option<&str> {
+    let (head, args) = value.split_once(char::is_whitespace)?;
+    if head.is_empty() || args.trim().is_empty() {
+        return None;
+    }
+    match aterm_pty::classify_shell_name(std::ffi::OsStr::new(head)) {
+        aterm_pty::ShellResolution::Resolved(_) => Some(head),
+        aterm_pty::ShellResolution::Unresolved => None,
+        aterm_pty::ShellResolution::Verbatim(path) => {
+            let path = std::path::Path::new(&path);
+            (path.is_absolute() && path.is_file()).then_some(head)
+        }
+    }
 }
 
 /// The name inside the first `%VAR%` pair in `value`, if it looks like a real
@@ -2315,16 +2368,21 @@ palette = ["#112233"]
         }));
         assert!(enabled.iter().any(|warning| {
             warning.key == "allow_window_ops"
-                && warning.message.contains("window-title and text-grid-size")
+                // The report set that actually answers — the pixel pair
+                // (CSI 14 t / CSI 16 t) joined it once the engine gained a
+                // host-reported cell box to answer from.
+                && warning
+                    .message
+                    .contains("text-grid-size, text-area-pixels and cell-size")
                 && if cfg!(target_os = "linux") {
                     // The manipulation half is wired there (frame audit #4);
-                    // the honest residue is the geometry-report gap.
+                    // the honest residue is the POSITION/screen-report gap.
                     warning.message.contains("wired to the window")
                         && warning.message.contains("move stays denied")
                         && warning.message.contains("remain unanswered")
                 } else {
                     warning.message.contains("host manipulation")
-                        && warning.message.contains("most state/geometry")
+                        && warning.message.contains("position and size requests")
                 }
         }));
 
@@ -2615,12 +2673,18 @@ ink = "rainbow"
         assert!(validate_config_text("font_px = = 1").is_err());
     }
 
-    /// Collect just the `shell:` warnings an authored TOML line produces.
+    /// The `shell` VALIDITY warnings an authored TOML line produces.
+    ///
+    /// The `$ATERM_SHELL` precedence notice is dropped. It also starts `shell:`,
+    /// but it is emitted for ANY authored `shell` whenever that variable happens
+    /// to be set in the harness's environment, and it says nothing about whether
+    /// the value can spawn — leaving it in would make every "validates clean"
+    /// assertion below depend on the environment the suite was launched from.
     fn shell_warns(toml: &str) -> Vec<String> {
         validate_config_text(toml)
             .expect("parses")
             .into_iter()
-            .filter(|w| w.starts_with("shell:"))
+            .filter(|w| w.starts_with("shell:") && !w.contains("overrides the saved value"))
             .collect()
     }
 
@@ -2754,6 +2818,7 @@ ink = "rainbow"
 
         // --- rejected: things that genuinely cannot run, each with its own advice
         let missing_path = format!("{sysroot}\\System32\\aterm-no-such-shell-xyz.exe");
+        let cmd_with_args = format!("{cmd_backslash} /K dir");
         let mut rejections = Vec::new();
         for (value, needle) in [
             // A bare name that resolves to nothing.
@@ -2770,6 +2835,13 @@ ink = "rainbow"
             ("C:cmd.exe", "relative path"),
             // `shell` takes no arguments/quoting — that is what shell_args is for.
             (r#""C:\Windows\System32\cmd.exe" /K dir"#, "quoted"),
+            // The same mistake UNQUOTED, which is how it is actually written.
+            // Neither shape can spawn, and before this both were described by
+            // resolution instead of by the grammar: a bare head came out "is
+            // not on %PATH%", and `cmd /K dir` — path-like ONLY because `/K`
+            // holds a slash — came out "is a relative path".
+            ("cmd /K dir", "carries arguments"),
+            (cmd_with_args.as_str(), "carries arguments"),
             // `%VAR%` is never expanded, in either shape. The spawn's own
             // fallback chain names %COMSPEC%, which is what makes this tempting.
             ("%COMSPEC%", "never environment-expanded"),
@@ -2782,6 +2854,38 @@ ink = "rainbow"
             );
             rejections.extend(warnings);
         }
+
+        // The arguments rejection must spell out the LINE TO WRITE, so the fix
+        // is a copy rather than a re-derivation. Quoted the way the warning
+        // renders it, which is also the way the author must type it back.
+        for (value, program) in [
+            ("cmd /K dir", "cmd"),
+            (cmd_with_args.as_str(), cmd_backslash.as_str()),
+        ] {
+            let keep = format!("Write shell = {program:?}");
+            let warnings = shell_warns(&authored(value));
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(&keep) && w.contains("shell_args")),
+                "{value:?} must say {keep:?} and point at shell_args, got {warnings:?}"
+            );
+        }
+
+        // …and it must fire on EVIDENCE, not on a space. A space is ordinary in
+        // a Windows shell path (`spaced`, asserted clean above), so a MISSING
+        // spaced path keeps its own verdict instead of being re-read as a
+        // command line whose first word happens to be a directory prefix.
+        let missing_spaced = format!("{}\\Program Files\\Git\\bin\\nosuch.exe", root.display());
+        let spaced_warnings = shell_warns(&authored(&missing_spaced));
+        assert!(
+            spaced_warnings.iter().any(|w| w.contains("does not exist"))
+                && !spaced_warnings
+                    .iter()
+                    .any(|w| w.contains("carries arguments")),
+            "a missing path that merely holds a space is not a command line: {spaced_warnings:?}"
+        );
+        rejections.extend(spaced_warnings);
 
         // A full path missing only its EXTENSION is the one rejection that can
         // name the spelling that would have worked — CreateProcessW appends no
@@ -2808,6 +2912,28 @@ ink = "rainbow"
             assert!(
                 !warning.contains("bare name"),
                 "a Windows bare name is legal and must not be called out as the defect: {warning:?}"
+            );
+        }
+
+        // The command-line matcher itself: a head that resolves plus a non-empty
+        // tail, and nothing else. `%COMSPEC% /K dir` is the overlap case — its
+        // head never resolves, so the `%VAR%` wording above stays in charge.
+        assert_eq!(
+            super::windows_shell_command_line_head("cmd /K dir"),
+            Some("cmd")
+        );
+        for not_a_command_line in [
+            "cmd",
+            "cmd ",
+            " ",
+            spaced.as_str(),
+            "aterm-no-such-shell-xyz -l",
+            "%COMSPEC% /K dir",
+        ] {
+            assert_eq!(
+                super::windows_shell_command_line_head(not_a_command_line),
+                None,
+                "{not_a_command_line:?} is one program's name, not a command line"
             );
         }
 

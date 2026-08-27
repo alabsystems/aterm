@@ -85,6 +85,9 @@ fn main() {
     let cfg = PhaserConfig {
         enabled: true,
         intensity: 1.0,
+        // No host cursor colour in a raw demo: the theme-polar base stands in,
+        // exactly as it does for an embedder that resolves no cursor colour.
+        base: None,
     };
     let text = "the quick brown fox phases out";
     let cursor_row = 3u16;

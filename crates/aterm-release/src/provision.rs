@@ -375,37 +375,9 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     let blocking = blockers(&checks);
     let host_cannot_cut = checks.iter().any(|(_, c)| matches!(c, Check::Skip(_)));
 
-    // The batteries-included seed (§9.1) is audited but deliberately NOT part of
-    // `blocking`, and the distinction is load-bearing. Everything in `checks` above
-    // is a MACHINE CAPABILITY — a compiler, a credential, a signing identity —
-    // and `blocking > 0` defers the mint because consuming an irreversible roster id
-    // on a machine that cannot build or publish is unrecoverable. A seed is not a
-    // capability: it is a per-CUT build input that any provisioned machine can
-    // stage in one command, so letting its absence block the MINT would gate this
-    // machine's permanent identity on a 600 MB download it does not need to
-    // possess an identity. It does gate READY TO CUT, because the cut's own
-    // pre-claim gate refuses without it — so it is reported here, counted
-    // separately, and folded into the verdict below.
-    // `seed`, not `seed source`: the word "source" was already carried by the value
-    // ("staged at <path>"), and at eleven characters the label ate its own separator —
-    // `{:<11}` pads only a SHORTER label, so this one printed `seed source10 program(s)
-    // staged at …`. It is also the label `publish.rs` uses for the same subject on the
-    // cut side, so the two lanes now spell one thing one way.
-    //
-    // The BAND is what makes that argument visible for the first time. Under the
-    // `[5/5] credentials` header the seed read as the seventh credential, which is the
-    // one thing the paragraph above says it is not.
-    band("SEED");
-    let (seed, seed_warnings) = seed_source_check(repo);
-    print_check("seed", &seed);
-    // Placed by the CALLER, under the `seed` label, so the warning has a subject above
-    // it. It used to be printed from inside `seedpack::validate` at a hardcoded
-    // four-space indent, which put a 120-word orphan paragraph under the `[5/5]
-    // credentials` header — a phase this file argues at length the seed is not part of.
-    for w in &seed_warnings {
-        step("", w);
-    }
-    let seed_blocks_cut = matches!(seed, Check::Fail { .. });
+    // RETIRED 2026-08-26: the `SEED` audit band (`dist/toolchain-seed` validation
+    // and its READY-TO-CUT gate). aterm ships ONE lean self-provisioning
+    // download, so a cut needs no staged seed and the audit has none to report.
 
     // ---- 3. mint LAST -------------------------------------------------------------
     // A roster id is irreversible, so it is never consumed on a machine the audit just
@@ -555,7 +527,6 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
         fails,
         waiting,
         host_cannot_cut,
-        seed_blocks_cut,
     })
 }
 
@@ -582,7 +553,6 @@ struct Closing<'a> {
     /// pointed at no item, no file and no act; `checks` has held the answer all along.
     open: Vec<String>,
     host_cannot_cut: bool,
-    seed_blocks_cut: bool,
 }
 
 /// The mint's DONE facts, re-rendered on THIS transcript's grid as `(label, value)`.
@@ -809,15 +779,6 @@ fn close(c: Closing<'_>) -> Result<()> {
     // is what a stressed operator does — was handed the one command the machine was not
     // yet allowed to run.
     if c.key_exists && !c.host_cannot_cut && c.fails + c.waiting == 0 {
-        if c.seed_blocks_cut {
-            // The act, not a scolding: a cut refuses pre-claim without a validated seed,
-            // so this is the step between here and a release.
-            next.push(
-                "stage the toolchain seed: tools/atpkg-seed-from-published.sh\n\
-                 or cut deliberately seedless: ATERM_SEEDLESS=1"
-                    .to_string(),
-            );
-        }
         // The command as printed RUNS. It used to spell the profile `<profile>` even
         // though the audit had printed its real path two lines up, so the one thing the
         // operator came here to copy had to be assembled by hand.
@@ -893,12 +854,6 @@ fn close(c: Closing<'_>) -> Result<()> {
             "ROSTERED — but cuts run on macOS (Tier APPLE): this machine can sign the atpkg \
              index, and can never say READY TO CUT"
         );
-    } else if c.seed_blocks_cut {
-        // Every CAPABILITY passed — this machine is provisioned and minted — but
-        // `cargo ship cut` refuses pre-claim without a validated seed, so saying "READY TO
-        // CUT" here would be the label out-running the proof. The remedy is NEXT step 1;
-        // the verdict names the state, once.
-        println!("ROSTERED — but no toolchain seed is staged, so a cut is refused (NEXT 1)");
     } else {
         println!("READY TO CUT");
     }
@@ -1739,55 +1694,6 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
         let _ = std::fs::remove_file(&staged);
         format!("rename {} into place: {e}", staged.display())
     })
-}
-
-/// The batteries-included toolchain seed a cut seals into the app (§9.1,
-/// reinstated 2026-08-17): `cargo ship cut` refuses without a validated
-/// `dist/toolchain-seed` (or an explicit `ATERM_SEEDLESS=1`), so an unstaged or
-/// drifted seed is a provisioning gap on this machine like any other. Audit
-/// only — materializing one downloads the published artifacts (~600 MB), which
-/// is the named remedy's job, never a silent side effect of an audit.
-#[cfg(unix)]
-fn seed_source_check(repo: &Path) -> (Check, Vec<String>) {
-    let dist = repo.join("dist");
-    match crate::seedpack::resolve(&dist) {
-        Some(dir) => match crate::seedpack::validate(&dir) {
-            Ok(stat) => (
-                Check::Pass(format!(
-                    "{} program(s) staged at {}\n\
-                     index_build {}, valid_until {} — not a credential and does not gate the \
-                     mint; it gates READY TO CUT, because the cut's own pre-claim gate \
-                     refuses without it",
-                    stat.programs.len(),
-                    dir.display(),
-                    stat.index_build,
-                    stat.valid_until
-                )),
-                stat.warnings,
-            ),
-            Err(e) => (
-                Check::Fail {
-                    what: format!("{} does not validate: {e}", dir.display()),
-                    fix: "restage it: tools/atpkg-seed-from-published.sh (downloads + \
-                          verifies the published index and artifacts, lays them flat into \
-                          dist/toolchain-seed)"
-                        .into(),
-                },
-                Vec::new(),
-            ),
-        },
-        None => (
-            Check::Fail {
-                what: "no toolchain seed staged — `cargo ship cut` will refuse\n\
-                       looked at: dist/toolchain-seed, and ATERM_SEED_DIR (unset)"
-                    .into(),
-                fix: "stage one: tools/atpkg-seed-from-published.sh\nor cut deliberately \
-                      seedless: ATERM_SEEDLESS=1"
-                    .into(),
-            },
-            Vec::new(),
-        ),
-    }
 }
 
 /// The rustup front door: `cargo` in this repo must dispatch INTO the trust stage2 —

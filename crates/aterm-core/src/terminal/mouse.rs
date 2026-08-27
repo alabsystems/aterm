@@ -73,9 +73,9 @@ impl Terminal {
         }
 
         // Pass the ORIGINAL button: the encoder substitutes the legacy
-        // button-3 release code only for the formats that need it, so the SGR
-        // fallback for out-of-range X10 coordinates keeps the button identity
-        // and the 'm' terminator (#7473).
+        // button-3 release code only for the single-byte formats that need it,
+        // so an SGR release keeps the button identity and the 'm' terminator
+        // (#7473).
         Some(encode_mouse(
             button | modifiers,
             col,

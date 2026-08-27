@@ -30,9 +30,8 @@
 //!      frame, including frame zero, AND rainbow ink with no interior blackout
 //!   8. classic flying-kitty style, sustained typing → kitty is EARNED and its
 //!      whole-head bitmap survives into three isolated final stills
-//!   9. alt-screen COLD TOKEN STREAMER whose RESTING CARET ADVANCES every
-//!      batch (append-shaped, DECTCEM SHOWN, NOTHING typed)
-//!                                                    → ZERO ink in EVERY frame
+//!   9. alt-screen COLD TOKEN STREAMER whose RESTING CARET ADVANCES every batch
+//!      (append-shaped, DECTCEM SHOWN, NOTHING typed) → ZERO ink in EVERY frame
 //!
 //! Rows 7 and 8 close a different false-green class. The first six rows pin
 //! `rainbow kitty` and accept generic dynamic rainbow pixels; they neither run
@@ -252,8 +251,26 @@ enum Expect {
     /// 12 hue buckets, a visible clump in some single frame, and no interior
     /// multi-frame rainbow blackout or status/raster contradiction.
     Ink,
-    /// The dark control: ZERO dynamic saturated px in EVERY frame.
+    /// The dark control: ZERO dynamic saturated px in EVERY frame. Only valid
+    /// for a style with NO RESIDENT COMPANION — see [`Expect::TrailDark`].
     Dark,
+    /// ZERO TRAIL, resident companion allowed: no rainbow frame and no claimed
+    /// ribbon, however many pixels the style's resident animal legitimately
+    /// paints.
+    ///
+    /// This exists because `rainbow kitty` now carries the RESIDENT PET, and a
+    /// resident is on glass at rest by definition — so `Dark` (literally zero
+    /// lit pixels) became unsatisfiable for the owner's own spelling and read a
+    /// legitimately drawn cat as a cold-output LEAK. Measured on one binary and
+    /// one shape, the two are cleanly separable:
+    ///   --style flying  (no resident)  total_ink=0                    Dark PASS
+    ///   --style classic (resident pet) total_ink=40, ribbon_claimed=0,
+    ///                                  rainbow_frames=0          TrailDark PASS
+    /// The cold-output law is about LIGHT THE PROGRAM EARNED, and a resident
+    /// companion earns nothing — it is simply present. Weakening `Dark` itself
+    /// would have thrown away the absolute-zero statement for every style that
+    /// can still make it; this keeps both claims instead of trading one away.
+    TrailDark,
     /// The control for a path that carries an unavoidable cursor-cell
     /// artifact: the take FAILS the exact ink predicate, read the other way.
     /// See the probe's `--expect quiet` note for the
@@ -290,12 +307,23 @@ enum Capture {
 }
 
 /// A companion whose engine state and captured bitmap are both obligations.
+///
+/// Each variant carries its STYLE ARM as well as its animal, because after the
+/// 2026-08-26 rename the two are not independent: `rainbow kitty` and
+/// `rainbow kitty pet` both name the resident, and only the explicit
+/// `rainbow kitty flying` earns a flypast.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 enum Companion {
-    /// The shipped-default full-body resident cat, present from frame zero.
+    /// The shipped-default full-body resident cat, present from frame zero
+    /// (`--style default`: the config key is left ABSENT).
     Pet,
-    /// The classic flying head, earned by a sustained typing run.
+    /// The SAME resident, selected by the owner's literal config line
+    /// `cursor_trail_style = "rainbow kitty"` (`--style classic`). A separate
+    /// row from [`Companion::Pet`] on purpose — see row 10.
+    PetOwnerSpelling,
+    /// The old flying head, earned by a sustained typing run, behind its
+    /// explicit opt-in spelling (`--style flying`).
     Cat,
 }
 
@@ -307,7 +335,15 @@ enum Companion {
 /// gate must never fail because of its own harness load.
 #[cfg(target_os = "macos")]
 fn probe_with(shape: &str, keys: &str, expect: Expect, capture: Capture) {
-    probe_with_companion(shape, keys, expect, capture, None);
+    probe_with_companion_style(shape, keys, expect, capture, None, None);
+}
+
+/// A row that pins an explicit `--style` with NO companion obligation — the
+/// absolute-zero cold control needs a companion-free style (`flying`) to make a
+/// literal-zero claim that a resident-pet style no longer can.
+#[cfg(target_os = "macos")]
+fn probe_with_style(shape: &str, keys: &str, expect: Expect, capture: Capture, style: &str) {
+    probe_with_companion_style(shape, keys, expect, capture, None, Some(style));
 }
 
 #[cfg(target_os = "macos")]
@@ -317,6 +353,18 @@ fn probe_with_companion(
     expect: Expect,
     capture: Capture,
     companion: Option<Companion>,
+) {
+    probe_with_companion_style(shape, keys, expect, capture, companion, None);
+}
+
+#[cfg(target_os = "macos")]
+fn probe_with_companion_style(
+    shape: &str,
+    keys: &str,
+    expect: Expect,
+    capture: Capture,
+    companion: Option<Companion>,
+    style: Option<&str>,
 ) {
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -329,6 +377,10 @@ fn probe_with_companion(
     let (expect_arg, what) = match expect {
         Expect::Ink => ("ink", "effect ink present"),
         Expect::Dark => ("dark", "zero effect ink in every frame"),
+        Expect::TrailDark => (
+            "trail-dark",
+            "zero trail (no rainbow frame, no claimed ribbon) — a resident companion may paint",
+        ),
         Expect::Quiet => (
             "quiet",
             "a take that the ink gate itself would NOT score as effect ink",
@@ -352,9 +404,19 @@ fn probe_with_companion(
         Some(Companion::Pet) => {
             cmd.args(["--style", "default", "--companion", "pet"]);
         }
-        Some(Companion::Cat) => {
-            cmd.args(["--style", "classic", "--companion", "cat"]);
+        Some(Companion::PetOwnerSpelling) => {
+            cmd.args(["--style", "classic", "--companion", "pet"]);
         }
+        Some(Companion::Cat) => {
+            cmd.args(["--style", "flying", "--companion", "cat"]);
+        }
+    }
+    // An explicitly pinned style is only meaningful when no companion arm
+    // already selected one; the companion arms own their style by construction.
+    if let Some(style) = style
+        && companion.is_none()
+    {
+        cmd.args(["--style", style]);
     }
     if !keys.is_empty() {
         cmd.args(["--keys", keys]);
@@ -425,7 +487,7 @@ fn alt_screen_fake_claude_typing_paints_trail_ink() {
 #[cfg(target_os = "macos")]
 #[test]
 fn alt_screen_cold_spinner_paints_zero_ink() {
-    probe("cold-spinner", "", Expect::Dark);
+    probe("cold-spinner", "", Expect::TrailDark);
 }
 
 /// Matrix row 4: typing beside an ESC7/ESC8 token streamer (unowned batches
@@ -555,7 +617,12 @@ fn focused_streamer_typing_paints_trail_ink_without_a_recording_pin() {
 #[cfg(target_os = "macos")]
 #[test]
 fn focused_cold_spinner_paints_zero_ink_without_a_recording_pin() {
-    probe_with("cold-spinner", "", Expect::Dark, Capture::UnpinnedFocused);
+    probe_with(
+        "cold-spinner",
+        "",
+        Expect::TrailDark,
+        Capture::UnpinnedFocused,
+    );
 }
 
 /// Matrix row 7: THE SHIPPED DEFAULT, not the classic style the historical
@@ -575,15 +642,47 @@ fn shipped_default_first_still_and_typing_carry_the_resident_pet() {
     );
 }
 
+/// THE ABSOLUTE-ZERO CONTROL, kept alive after the resident pet landed.
+///
+/// The three cold rows now assert [`Expect::TrailDark`] because the owner's
+/// `rainbow kitty` carries a RESIDENT companion, and a resident is on glass at
+/// rest — literal zero is unsatisfiable for that spelling. That is a correct
+/// relaxation for THAT style and a bad one to apply everywhere, because it
+/// would leave nothing in the tree still making the strongest possible claim.
+/// So this row makes it: a style with NO resident (`flying`), cold output, and
+/// literally ZERO lit pixels in every frame.
+///
+/// MEASURED 2026-08-26, same binary, same shape, the only variable the style:
+///   --style flying   total_ink=0                                  Dark PASS
+///   --style classic  total_ink=40 ribbon_claimed=0 rainbow_frames=0
+/// If a cold-output leak ever reappears, this row goes red on pixel one.
+#[cfg(target_os = "macos")]
+#[test]
+fn cold_output_paints_literally_nothing_for_a_companion_free_style() {
+    probe_with_style(
+        "cold-spinner",
+        "",
+        Expect::Dark,
+        Capture::UnpinnedFocused,
+        "flying",
+    );
+}
+
 /// Matrix row 8: the old flying kitty is rare by design and needs a sustained
 /// high-band run. Four repetitions are 48 forward keys at the image probe's
 /// 80ms cadence — comfortably past its ~2.6s earn law. The row requires at
 /// least four `cat_active` captures and three consecutive isolated final
 /// stills with a whole-head bitmap. Generic rainbow pixels alone satisfy none
 /// of those terms.
+///
+/// SINCE 2026-08-26 THIS ROW DRIVES `cursor_trail_style = "rainbow kitty
+/// flying"`, not `rainbow kitty` — the head's explicit opt-in. It is the proof
+/// that widening the pet predicate REROUTED the head rather than deleting it:
+/// the row's `pet_claimed == 0` term would go red the moment the escape hatch
+/// stopped selecting the flypast, and row 10 holds the other side.
 #[cfg(target_os = "macos")]
 #[test]
-fn classic_style_sustained_typing_earns_and_paints_the_flying_kitty() {
+fn flying_style_sustained_typing_earns_and_paints_the_flying_kitty() {
     const RUN: &str = concat!(
         "r,a,i,n,b,o,w,k,i,t,t,y,",
         "r,a,i,n,b,o,w,k,i,t,t,y,",
@@ -656,5 +755,34 @@ fn classic_style_sustained_typing_earns_and_paints_the_flying_kitty() {
 #[cfg(target_os = "macos")]
 #[test]
 fn alt_screen_cold_token_streamer_with_a_walking_caret_paints_zero_ink() {
-    probe("cold-streamer", "", Expect::Dark);
+    probe("cold-streamer", "", Expect::TrailDark);
+}
+
+/// Matrix row 10 — THE OWNER'S LITERAL CONFIG LINE, added 2026-08-26 after the
+/// owner said twice, against v0.60.0, "I STILL don't see the cursor kitty pet,
+/// I see the old style kitty head".
+///
+/// Their `~/.config/aterm/aterm.toml` reads `cursor_trail_style = "rainbow
+/// kitty"`. Row 7 proves the shipped DEFAULT carries the resident, and it was
+/// green through every one of those releases — because the default spelling is
+/// `rainbow kitty pet` and nobody's row ever drove the string the owner
+/// actually has. That is the gap this row closes: it writes their exact line
+/// and demands the same three companion obligations row 7 demands
+/// (`pet_claimed == frames`, `cat_claimed == 0`, `pet_final_run >= 3`), so a
+/// spelling that resolves to the wrong animal cannot be green here no matter
+/// how healthy the rainbow underneath it is.
+///
+/// The pair is the whole point: this row and row 8 together say the rename
+/// MOVED the flying head to `rainbow kitty flying` rather than dropping it, and
+/// neither can be satisfied by the other's animal.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_owners_rainbow_kitty_spelling_carries_the_resident_pet() {
+    probe_with_companion(
+        "prompt",
+        "r,a,i,n,b,o,w,k,i,t,t,y",
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        Some(Companion::PetOwnerSpelling),
+    );
 }

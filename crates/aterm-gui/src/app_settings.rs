@@ -2108,6 +2108,8 @@ mod tests {
                         enabled: true,
                         intensity: 1.0,
                         blinking: true,
+                        base: None,
+                        head_rgb: None,
                     },
                     &mut quads,
                 );
@@ -2186,6 +2188,9 @@ mod tests {
                     &crate::cursor_phaser::PhaserConfig {
                         enabled: true,
                         intensity: 1.0,
+                        // This fixture only needs a CHARGED emitter; the base is
+                        // the scheduler's business, not this test's.
+                        base: None,
                     },
                     &mut quads,
                 );
@@ -2251,7 +2256,17 @@ mod tests {
     }
 
     fn activate_all_terminal_dependents(app: &mut App, now: Instant) {
+        // The word-decoration fixture exercises the real shared render tick.
+        // That tick correctly settles cursor-body engines whose styles are not
+        // enabled by this app's config, so establish the decoration first and
+        // charge the independent scheduler inputs afterwards. Otherwise this
+        // supposedly non-vacuous native-boundary test arrives with its rainbow
+        // body already dormant.
+        activate_dependent(app, CursorDependent::WordDecoration, now);
         for effect in CURSOR_DEPENDENTS {
+            if matches!(effect, CursorDependent::WordDecoration) {
+                continue;
+            }
             activate_dependent(app, effect, now);
         }
         let ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
@@ -2286,7 +2301,7 @@ mod tests {
         assert!(!ws.cursor_fx_active(now, true));
         assert!(!ws.cursor_fx_active(now, false));
         assert!(!ws.terminal_effect_frame_active(now, true));
-        assert_eq!(ws.static_cursor_cat_deadline(now, false), None);
+        assert_eq!(ws.static_cursor_cat_deadline(now, false, false), None);
         // The decoration latch is the one input with no focus gate of its own,
         // so the canonical-front boundary is the ONLY thing keeping Robi from
         // pacing a native tab. `park_terminal_effect_scheduler` drops it on the

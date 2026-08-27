@@ -474,7 +474,19 @@ impl PaneTree {
         if matches!(self.root, PaneNode::Leaf(_)) {
             return CloseOutcome::LastPane { closed };
         }
-        debug_assert_eq!(self.root.remove_leaf(closed), RemoveLeaf::Removed);
+        // THE REMOVAL IS THE TRANSITION — it is BOUND, never carried inside the
+        // assertion. `debug_assert_eq!` expands to `if cfg!(debug_assertions) { … }`,
+        // so a RELEASE build compiles its argument away: this line used to read
+        // `debug_assert_eq!(self.root.remove_leaf(closed), RemoveLeaf::Removed)`
+        // and every shipped binary therefore returned `Collapsed` for a tree that
+        // still held the closed leaf. The caller believed it, retired the session
+        // and its stable view, and the canonical tab tree was left naming a view
+        // the `ViewStore` no longer had — the leaf that
+        // `App::active_visible_content_route` fails closed on, which returns from
+        // `redraw_window` BEFORE any present and freezes the window for the rest
+        // of its life. Every debug test passed; only the shipped build froze.
+        let removed = self.root.remove_leaf(closed);
+        debug_assert_eq!(removed, RemoveLeaf::Removed);
         // Re-seat focus on the nearest surviving leaf if the focused pane was the
         // one removed; otherwise focus stays where it was (a background pane's EOF
         // must not steal focus from the pane the user is typing in).

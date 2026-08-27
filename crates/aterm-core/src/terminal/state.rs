@@ -23,7 +23,7 @@ use aterm_types::{KittyKeyboardState, Rgb, XtermKeyboardState};
 /// Cumulative, non-consuming summary of terminal content-coordinate motion.
 ///
 /// Hosts keep a previous copy and diff it against a later snapshot. An advance
-/// in [`uniform_up_rows`](Self::uniform_up_rows) means the entire primary-screen
+/// in [`uniform_up_rows`](Self::uniform_up_rows) means the entire active-screen
 /// viewport moved upward by that many rows. An advance in
 /// [`invalidation_epoch`](Self::invalidation_epoch) means at least one
 /// non-uniform or otherwise ambiguous mutation occurred, so cached coordinates
@@ -33,7 +33,7 @@ use aterm_types::{KittyKeyboardState, Rgb, XtermKeyboardState};
 /// and direct [`Terminal::reset`], and are intentionally not checkpointed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentScrollState {
-    /// Total rows of composable, full-screen upward motion on the primary screen.
+    /// Total rows of composable, full-screen upward motion on the active screen.
     pub uniform_up_rows: u64,
     /// Number of coordinate-invalidating content-motion batches observed.
     pub invalidation_epoch: u64,
@@ -602,6 +602,20 @@ impl Terminal {
     #[must_use]
     pub fn sync_end_seq(&self) -> u64 {
         self.transient.sync_end_seq
+    }
+
+    /// Whether the currently-open synchronized-output window has accepted a
+    /// complete PTY action since its opening `?2026h`.
+    ///
+    /// This is a conservative glass-safety signal, not a damage predicate:
+    /// queries and no-op actions count too. A presenter may use `false` with an
+    /// advanced [`sync_end_seq`](Self::sync_end_seq) to show the just-closed
+    /// endpoint while a new, still-clean window is already open. `true` means
+    /// the mutable grid may contain a prefix of the next frame and must remain
+    /// held (subject to the ordinary timeout safety valve).
+    #[must_use]
+    pub fn sync_open_dirty(&self) -> bool {
+        self.modes.synchronized_output && self.transient.sync_open_dirty
     }
 
     // format_paste in buffer_api.rs.

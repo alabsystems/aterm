@@ -132,7 +132,7 @@ const PRESENT_TAINT_TAIL_NS: u64 = 1_000_000_000;
 static SYNC_HOLDS_ARMED: AtomicU64 = AtomicU64::new(0);
 static SYNC_RELEASES_END: AtomicU64 = AtomicU64::new(0);
 static SYNC_RELEASES_TIMEOUT: AtomicU64 = AtomicU64::new(0);
-static SYNC_HOLDING: AtomicBool = AtomicBool::new(false);
+static SYNC_HOLDING_WINDOWS: AtomicU64 = AtomicU64::new(0);
 
 // Load-adaptive shedding state (the `perf_reduced` latch + `MotionPolicy` fold).
 // `PERF_REDUCED` mirrors the latch; `SHED_TRANSITIONS` counts its edges since
@@ -205,6 +205,22 @@ static REDRAW_RETRY_GATED: AtomicU64 = AtomicU64::new(0);
 // actually reaching this machine's frames.
 static FRAME_REFILLS_SCOPED: AtomicU64 = AtomicU64::new(0);
 static FRAME_REFILLS_FULL: AtomicU64 = AtomicU64::new(0);
+// …and the presented frames that took NO extraction at all because the engine
+// had not moved since the snapshot was filled (the effect-only reuse gate). This
+// counter is what keeps the gate honest: `scoped + full + skipped` still
+// accounts for every presented non-rescan frame, so a fall in `scoped` can be
+// read as work AVOIDED rather than work gone missing.
+static FRAME_REFILLS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+// …and WHICH continuity clause refused, per clause. `frame_refills_full` says
+// the chain broke; this says what broke it, which is the difference between an
+// actionable number and a worrying one — a host mutator that forgot its
+// `snapshot_seq` bump, a scratch shared across panes, a window whose row count
+// disagrees with its engine, and a workload that is simply scrolling all read
+// as the same climbing counter and have four different answers (the last one
+// being "nothing, that is correct"). Indexed by `FullRefillCause::index()`; one
+// relaxed `fetch_add` on the arm that was already paying for a full re-extract.
+static FRAME_REFILL_FULL_BY_CAUSE: [AtomicU64; aterm_core::render::FullRefillCause::COUNT] =
+    [const { AtomicU64::new(0) }; aterm_core::render::FullRefillCause::COUNT];
 static PRE_PRESENT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static LAST_PRE_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 static PRE_PRESENT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -462,12 +478,12 @@ pub(crate) enum DeadlineOwner {
     /// The program cat's tenure gate (`app_kitty::KittyTenure`): one wake at
     /// the instant a pending claim earns or releases the cursor.
     KittyTenure = 33,
-    /// The toolchain-provisioning progress card (`crate::PkgProgressUi`): 16ms
-    /// frame wakes ONLY while the card is visible AND animating — bytes moved
-    /// within the last second, or a completion flourish in flight. Hidden or
-    /// settled, it folds nothing (FL-1: data arrives solely as
-    /// `Wake::PkgProgress`, so an idle window never wakes for it).
-    PkgProgress = 34,
+    /// The status bars (`crate::status_bars`): ONE wake per bar, at the fold of
+    /// a bar holding a terminal outcome. A live bar folds nothing (its paints
+    /// ride `Wake::PkgProgress` / `Wake::UpdateProgress`), and no bar folds
+    /// nothing — an idle window never wakes for them (FL-1). Slot 34 was the
+    /// retired floating progress card's; the name moved with the surface.
+    StatusBars = 34,
     /// The per-session STATUS observer (`SessionStatus::next_wake`): a candidate
     /// serving its dwell, or a Running session aging into Quiet. Split out of
     /// `TitleSummary` (item 8) because the two fold at the same seam in
@@ -513,7 +529,7 @@ impl DeadlineOwner {
             31 => Self::SessionChrome,
             32 => Self::TitleDrift,
             33 => Self::KittyTenure,
-            34 => Self::PkgProgress,
+            34 => Self::StatusBars,
             35 => Self::SessionStatus,
             _ => Self::None,
         }
@@ -556,7 +572,7 @@ impl DeadlineOwner {
             Self::SessionChrome => "session_chrome",
             Self::TitleDrift => "title_drift",
             Self::KittyTenure => "kitty_tenure",
-            Self::PkgProgress => "pkg_progress",
+            Self::StatusBars => "status_bars",
             Self::SessionStatus => "session_status",
         }
     }
@@ -1966,7 +1982,6 @@ pub fn note_sync_armed() {
 /// release cause.
 pub fn note_sync_release_end() {
     SYNC_RELEASES_END.fetch_add(1, Ordering::Relaxed);
-    SYNC_HOLDING.store(false, Ordering::Relaxed);
 }
 
 /// An armed episode released by the safety-valve deadline — the app went silent
@@ -1974,12 +1989,87 @@ pub fn note_sync_release_end() {
 /// typing = the SYNC-1 failure class.
 pub fn note_sync_release_timeout() {
     SYNC_RELEASES_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-    SYNC_HOLDING.store(false, Ordering::Relaxed);
 }
 
-/// Whether a present was just held (gauge, not a counter).
-pub fn set_sync_holding(on: bool) {
-    SYNC_HOLDING.store(on, Ordering::Relaxed);
+/// Per-window lease behind the process-wide synchronized-output hold gauge.
+///
+/// A last-writer boolean is incorrect with multiple windows (or multiple pane
+/// releases): one release can overwrite a sibling's still-active hold. Each
+/// window instead contributes at most one count, idempotently, and dropping a
+/// window releases its contribution automatically.
+pub(crate) struct SyncHoldingGauge {
+    held: bool,
+}
+
+fn transition_sync_holding(held: &mut bool, new: bool, count: &AtomicU64) {
+    if *held == new {
+        return;
+    }
+    *held = new;
+    if new {
+        count.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let previous = count.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "sync holding gauge underflow");
+    }
+}
+
+impl SyncHoldingGauge {
+    pub(crate) const fn new() -> Self {
+        Self { held: false }
+    }
+
+    pub(crate) fn set(&mut self, held: bool) {
+        transition_sync_holding(&mut self.held, held, &SYNC_HOLDING_WINDOWS);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_held_for_test(&self) -> bool {
+        self.held
+    }
+}
+
+impl Default for SyncHoldingGauge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SyncHoldingGauge {
+    fn drop(&mut self) {
+        transition_sync_holding(&mut self.held, false, &SYNC_HOLDING_WINDOWS);
+    }
+}
+
+#[cfg(test)]
+mod sync_holding_gauge_tests {
+    use super::transition_sync_holding;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn independent_window_leases_are_idempotent_and_release_on_drop_transition() {
+        let count = AtomicU64::new(0);
+        let mut a = false;
+        let mut b = false;
+
+        transition_sync_holding(&mut a, true, &count);
+        transition_sync_holding(&mut a, true, &count);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        transition_sync_holding(&mut b, true, &count);
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+
+        transition_sync_holding(&mut a, false, &count);
+        transition_sync_holding(&mut a, false, &count);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "one window releasing cannot clear its held sibling"
+        );
+
+        transition_sync_holding(&mut b, false, &count);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 }
 
 /// The `perf_reduced` load-shed latch flipped (called on the EDGE only).
@@ -2013,16 +2103,38 @@ pub fn note_redraw_early_out() {
 }
 
 /// The presented-path frame extraction completed: which arm refilled the
-/// snapshot (`Scoped` retains undamaged rows; `Full` is the fallback walk).
+/// snapshot (`Scoped` retains undamaged rows; `Full` is the fallback walk), and
+/// on the full arm, WHICH continuity clause refused.
+///
+/// The scoped arm's cost is unchanged (one `fetch_add`, as before); the full
+/// arm pays a second `fetch_add` on a line indexed by the cause's discriminant,
+/// which is noise beside the O(rows x cols) re-extract it just did.
 pub fn note_frame_refill(refill: aterm_core::render::FrameRefill) {
     match refill {
         aterm_core::render::FrameRefill::Scoped { .. } => {
             FRAME_REFILLS_SCOPED.fetch_add(1, Ordering::Relaxed);
         }
-        aterm_core::render::FrameRefill::Full => {
+        aterm_core::render::FrameRefill::Full { cause } => {
             FRAME_REFILLS_FULL.fetch_add(1, Ordering::Relaxed);
+            // `index()` is the discriminant and `ALL` is pinned to be dense and
+            // in index order by aterm-core's own test, so this cannot be out of
+            // bounds; `get` keeps that a fact rather than a panic anyway.
+            if let Some(slot) = FRAME_REFILL_FULL_BY_CAUSE.get(cause.index()) {
+                slot.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// A presented frame REUSED the existing snapshot: the engine had marked no
+/// damage and processed no bytes since the snapshot was filled, so re-extracting
+/// the grid under the terminal mutex would have reproduced it exactly.
+///
+/// Counted so the reuse gate can never hide work instead of avoiding it —
+/// `frame_refills_scoped + frame_refills_full + frame_refills_skipped` is still
+/// one per presented non-rescan frame.
+pub fn note_frame_refill_skipped() {
+    FRAME_REFILLS_SKIPPED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A synchronized-output hold intentionally retained the previous frame.
@@ -2228,6 +2340,40 @@ pub struct OwnerArms {
     pub past_arms: u64,
 }
 
+/// One continuity clause's refusal ledger since the last [`reset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefillCause {
+    /// The stable wire label (`FullRefillCause::as_str`).
+    pub cause: &'static str,
+    /// Presented-path frames the full arm refused under this clause.
+    pub frames: u64,
+}
+
+/// Per-clause attribution of the damage-scoped refill's FULL arm, NON-ZERO
+/// CLAUSES ONLY — the follow-up a78dd8a1 deferred when it wired DMG-1 into the
+/// shipping frontend with only a scoped/full split.
+///
+/// Same shape and same reasoning as [`deadline_arm_attribution`]: sparse, so a
+/// healthy instance prints one or two pairs and a degraded one puts its culprit
+/// in plain sight, and deliberately NOT a [`Snapshot`] field (a `Copy` snapshot
+/// read per introspection call should not grow an array whose only consumer is
+/// this attribution).
+#[must_use]
+pub fn frame_refill_full_causes() -> Vec<RefillCause> {
+    aterm_core::render::FullRefillCause::ALL
+        .iter()
+        .filter_map(|cause| {
+            let frames = FRAME_REFILL_FULL_BY_CAUSE
+                .get(cause.index())
+                .map_or(0, |slot| slot.load(Ordering::Relaxed));
+            (frames != 0).then_some(RefillCause {
+                cause: cause.as_str(),
+                frames,
+            })
+        })
+        .collect()
+}
+
 /// Per-owner arm attribution, NON-ZERO OWNERS ONLY (item 6).
 ///
 /// Deliberately not a [`Snapshot`] field: `snapshot()` is `Copy` and read per
@@ -2360,6 +2506,10 @@ pub fn reset() {
     REDRAW_RETRY_GATED.store(0, Ordering::Relaxed);
     FRAME_REFILLS_SCOPED.store(0, Ordering::Relaxed);
     FRAME_REFILLS_FULL.store(0, Ordering::Relaxed);
+    FRAME_REFILLS_SKIPPED.store(0, Ordering::Relaxed);
+    for slot in &FRAME_REFILL_FULL_BY_CAUSE {
+        slot.store(0, Ordering::Relaxed);
+    }
     PRE_PRESENT_ATTEMPTS.store(0, Ordering::Relaxed);
     LAST_PRE_PRESENT_NS.store(0, Ordering::Relaxed);
     PRE_PRESENT_TOTAL_NS.store(0, Ordering::Relaxed);
@@ -2489,6 +2639,10 @@ pub struct Snapshot {
     /// full O(rows×cols) fallback — see the statics' note.
     pub frame_refills_scoped: u64,
     pub frame_refills_full: u64,
+    /// Presented frames that reused the existing snapshot outright — no
+    /// extraction, no terminal-mutex grid walk — because the engine had not
+    /// moved since the fill. See [`note_frame_refill_skipped`].
+    pub frame_refills_skipped: u64,
     pub pre_present_attempts: u64,
     pub last_pre_present_ns: u64,
     pub pre_present_total_ns: u64,
@@ -2706,7 +2860,7 @@ pub fn snapshot() -> Snapshot {
         sync_holds_armed: SYNC_HOLDS_ARMED.load(Ordering::Relaxed),
         sync_releases_end: SYNC_RELEASES_END.load(Ordering::Relaxed),
         sync_releases_timeout: SYNC_RELEASES_TIMEOUT.load(Ordering::Relaxed),
-        sync_holding: SYNC_HOLDING.load(Ordering::Relaxed),
+        sync_holding: SYNC_HOLDING_WINDOWS.load(Ordering::Relaxed) != 0,
         perf_reduced: PERF_REDUCED.load(Ordering::Relaxed),
         shed_transitions: SHED_TRANSITIONS.load(Ordering::Relaxed),
         last_input_present_ns: LAST_INPUT_PRESENT_NS.load(Ordering::Relaxed),
@@ -2726,6 +2880,7 @@ pub fn snapshot() -> Snapshot {
         redraw_retry_gated: REDRAW_RETRY_GATED.load(Ordering::Relaxed),
         frame_refills_scoped: FRAME_REFILLS_SCOPED.load(Ordering::Relaxed),
         frame_refills_full: FRAME_REFILLS_FULL.load(Ordering::Relaxed),
+        frame_refills_skipped: FRAME_REFILLS_SKIPPED.load(Ordering::Relaxed),
         pre_present_attempts: PRE_PRESENT_ATTEMPTS.load(Ordering::Relaxed),
         last_pre_present_ns: LAST_PRE_PRESENT_NS.load(Ordering::Relaxed),
         pre_present_total_ns: PRE_PRESENT_TOTAL_NS.load(Ordering::Relaxed),

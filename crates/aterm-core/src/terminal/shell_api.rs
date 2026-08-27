@@ -275,14 +275,41 @@ impl Terminal {
     /// requests (`width=10`) never consult this. A zero on either axis is clamped
     /// to 1 at use to avoid a divide-by-zero. Defaults to a sane 8×16 so headless
     /// tests are self-contained.
+    ///
+    /// Calling this is also what makes the metric REPORTABLE: it is the only
+    /// writer of the flag [`Self::host_cell_pixel_size`] reads, and the XTWINOPS
+    /// pixel reports (CSI 14 t / 16 t) answer from that and stay silent until a
+    /// host has spoken. A host with real font metrics should call this as soon as
+    /// they exist and again whenever they change (font zoom, a DPI move).
     pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
         self.iterm2.cell_px = (width, height);
+        self.iterm2.cell_px_from_host = true;
     }
 
     /// The cell pixel size used for inline-image footprint math (OSC 1337).
+    ///
+    /// Always a usable pair — the [`DEFAULT_CELL_PX`](super::grouped_state) 8×16
+    /// placeholder until a host reports. Use [`Self::host_cell_pixel_size`] when
+    /// the caller must not pass the placeholder off as a measurement.
     #[must_use]
     pub fn cell_pixel_size(&self) -> (u16, u16) {
         self.iterm2.cell_px
+    }
+
+    /// The cell pixel size a HOST actually reported, or `None` if none has.
+    ///
+    /// The engine cannot measure a glyph — only the frontend holding the
+    /// rasterizer can. So this is `None` for a headless engine, and for a live
+    /// session whose renderer has not published metrics yet. A zero on either
+    /// axis is treated as unreported too: it is not a cell box any font could
+    /// have, and reporting it would tell an application to divide by zero.
+    ///
+    /// Callers that answer a wire QUERY must use this and stay silent on `None`
+    /// rather than fall back to [`Self::cell_pixel_size`]; see
+    /// `handler_window`'s XTWINOPS pixel reports.
+    #[must_use]
+    pub fn host_cell_pixel_size(&self) -> Option<(u16, u16)> {
+        self.iterm2.host_cell_px()
     }
 
     /// Get all user variables (OSC 1337 SetUserVar).

@@ -101,6 +101,7 @@ impl Grid {
                 absolute_row_counter: u64::from(rows),
                 // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
                 content_gen: 1,
+                wrap_serial: 0,
                 any_double_width: false,
                 has_horizontal_margins: false,
                 #[cfg(feature = "disk-tier")]
@@ -200,6 +201,7 @@ impl Grid {
                 absolute_row_counter: u64::from(rows),
                 // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
                 content_gen: 1,
+                wrap_serial: 0,
                 any_double_width: false,
                 has_horizontal_margins: false,
                 #[cfg(feature = "disk-tier")]

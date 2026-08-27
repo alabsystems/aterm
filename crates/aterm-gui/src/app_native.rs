@@ -1751,13 +1751,14 @@ impl App {
     }
 
     /// Device-pixel Y where native content begins: effective top pad + OS head band +
-    /// in-frame tab-strip rows. The painter and pointer projection share this one
-    /// origin so a native card can neither cover the strip nor hit-test one pad off.
+    /// in-frame chrome rows (tab strip + status bars). The painter and pointer
+    /// projection share this one origin so a native card can neither cover the
+    /// chrome nor hit-test one pad off.
     pub(crate) fn native_content_origin_y(&self, wid: WindowId) -> usize {
         let (_, ch) = self.win_cell_size(wid);
         self.win_pad_top(wid)
             .saturating_add(self.win_head(wid))
-            .saturating_add(usize::from(self.tab_strip_rows).saturating_mul(ch))
+            .saturating_add(usize::from(self.chrome_rows()).saturating_mul(ch))
     }
 
     pub(crate) fn native_ui_compile_stamp(

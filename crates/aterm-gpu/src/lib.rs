@@ -294,6 +294,10 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
 ///   A terminal's per-frame GPU cost is trivial, and LowPower keeps hybrid
 ///   laptops on the iGPU (a dGPU-only machine still picks its dGPU); `high`
 ///   restores the always-discrete behavior.
+/// * `ATERM_GPU_MEMBLOCK=performance|small|default|<4..=256>` — the wgpu
+///   suballocator's block-size floor; `<N>` is the DEVICE floor in MiB (the host
+///   floor is half of it). Defaults to 16 MiB. See [`terminal_memory_hints`] for
+///   what the wgpu `Performance` default costs and why this exists.
 #[cfg(not(target_arch = "wasm32"))]
 fn backends_from_env() -> wgpu::Backends {
     // Default backend: DX12 on Windows, `PRIMARY` elsewhere. DX12 is the native
@@ -325,6 +329,116 @@ fn power_preference_from_env() -> wgpu::PowerPreference {
             wgpu::PowerPreference::LowPower
         }),
         _ => wgpu::PowerPreference::LowPower,
+    }
+}
+
+/// The SUBALLOCATOR BLOCK FLOOR, in MiB: the smallest driver heap wgpu-hal's
+/// allocator will create for the first buffer/texture of a memory type.
+///
+/// wgpu turns [`wgpu::MemoryHints`] into a `(min, max)` block size per memory
+/// type, and gpu-allocator creates a heap of exactly `min` the FIRST time that
+/// memory type is touched — whether the resource is 256 bytes or 8 MiB. So the
+/// floor is a fixed, unavoidable, *empty* reservation, paid once per memory type.
+///
+/// A resource LARGER than the block size never joins a pool: gpu-allocator gives
+/// it a dedicated heap of its exact size. That is the property that makes a small
+/// floor safe here — a terminal's one big GPU resource is the full-surface
+/// offscreen (33.7 MB at 4180×2016), and it is dedicated either way. The pool is
+/// only ever holding the small stuff: the glyph atlas, the uniform buffers, the
+/// per-frame instance streams.
+const MEMBLOCK_FLOOR_MIB: u64 = 16;
+
+/// The block-size CEILING, in MiB. gpu-allocator doubles the block size per
+/// additional live block of a memory type (`min << active_blocks`), capped here,
+/// so a workload that genuinely needs pooled memory still converges on big blocks
+/// after a few — it just does not START there.
+const MEMBLOCK_CEILING_MIB: u64 = 128;
+
+/// Parse `ATERM_GPU_MEMBLOCK` (see [`terminal_memory_hints`]).
+/// `None` = unrecognized (caller warns and keeps the default).
+fn parse_memblock(v: &str) -> Option<wgpu::MemoryHints> {
+    match v.to_ascii_lowercase().as_str() {
+        "performance" => Some(wgpu::MemoryHints::Performance),
+        "small" => Some(wgpu::MemoryHints::MemoryUsage),
+        "default" => Some(terminal_memory_hints_default()),
+        other => {
+            let mib: u64 = other.parse().ok()?;
+            // gpu-allocator clamps to 4..=256 MiB itself; refuse a value outside
+            // that rather than silently honouring a different number.
+            if !(4..=256).contains(&mib) {
+                return None;
+            }
+            Some(memblock_hints(mib, mib.max(MEMBLOCK_CEILING_MIB)))
+        }
+    }
+}
+
+/// Build a `MemoryHints::Manual` from a `(min, max)` DEVICE block size in MiB.
+///
+/// wgpu-hal derives the HOST (upload/readback) block sizes as half the device
+/// ones, so `(16, 128)` MiB device means `(8, 64)` MiB host — a 24 MiB floor
+/// across the two memory types a terminal touches first, against the 192 MiB
+/// (128 device + 64 host) that [`wgpu::MemoryHints::Performance`] floors at.
+fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
+    const MIB: u64 = 1024 * 1024;
+    wgpu::MemoryHints::Manual {
+        suballocated_device_memory_block_size: (min_mib * MIB)..(max_mib * MIB),
+    }
+}
+
+/// The shipped block sizing, before the env override.
+fn terminal_memory_hints_default() -> wgpu::MemoryHints {
+    memblock_hints(MEMBLOCK_FLOOR_MIB, MEMBLOCK_CEILING_MIB)
+}
+
+/// THE SUBALLOCATOR SIZING aterm asks its GPU device for.
+///
+/// This used to be [`wgpu::MemoryHints::Performance`], which is wgpu's sizing for
+/// an application that streams tens of megabytes of geometry and textures per
+/// frame. It floors the suballocator at **128 MiB device + 64 MiB host = 192 MiB
+/// of empty driver heap**, created eagerly at the first buffer and the first
+/// texture — i.e. during renderer construction, before a single frame.
+///
+/// MEASURED on this Windows box (AMD Radeon 780M, DX12, an INTEGRATED adapter, so
+/// every D3D12 heap is system RAM and every byte of it lands in the process
+/// working set), headless renderer, `tests/gpu_memory_floor.rs`:
+///
+/// | | reserved after construct | actually used |
+/// |---|---:|---:|
+/// | `MemoryHints::Performance` | 192.00 MB | 2.94 MB |
+/// | this policy | 24.00 MB | 2.94 MB |
+///
+/// and after rendering a 4180×2016 frame (a 4K terminal — the largest resource a
+/// terminal ever allocates) the used figure is 46.8 MB, of which 33.7 MB is the
+/// offscreen texture, which gets a DEDICATED exact-size heap under either policy.
+/// So the 168 MB the old hint reserved was never going to be sub-allocated from.
+///
+/// End to end, 3 paired runs per arm (construct + 60 readback frames at
+/// 1914×1071, `K32GetProcessMemoryInfo` working set): **337.7 / 337.9 / 337.7 MB
+/// before, 97.8 / 97.8 / 97.9 MB after — −240 MB**. Holding the bloom change out
+/// of it, this hint alone accounts for all but ~2.6 MB of that: with the eager
+/// bloom still in place the *used* figure is 16.12 MB under both hints and only
+/// the *reserved* figure moves (256 MB → 32 MB). The floor was swept
+/// (4/8/16/32 MiB and `Performance`): 16 MiB is where the curve flattens — 4 and
+/// 8 MiB buy only 4 MB more working set while costing ~2 ms on the first frame
+/// (more `CreateHeap` calls), and 32 MiB gives 48 MB back.
+///
+/// Overridable via `ATERM_GPU_MEMBLOCK=performance|small|default|<MiB>` (the
+/// `<MiB>` arm sets the device-block FLOOR, clamped to gpu-allocator's own
+/// 4..=256 MiB range) for a workload that turns out to want bigger pools, in the
+/// same spirit as `ATERM_GPU_BACKEND` — see [`backends_from_env`] for the env-var
+/// table.
+#[must_use]
+pub fn terminal_memory_hints() -> wgpu::MemoryHints {
+    match std::env::var("ATERM_GPU_MEMBLOCK") {
+        Ok(v) if !v.is_empty() => parse_memblock(&v).unwrap_or_else(|| {
+            eprintln!(
+                "aterm-gpu: unknown ATERM_GPU_MEMBLOCK {v:?} \
+                 (want performance|small|default|<4..=256 MiB>); using default"
+            );
+            terminal_memory_hints_default()
+        }),
+        _ => terminal_memory_hints_default(),
     }
 }
 
@@ -471,7 +585,10 @@ impl GpuContext {
                 required_features: wgpu::Features::empty(),
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::Performance,
+                // NOT `MemoryHints::Performance`: on DX12 that floors the
+                // suballocator at 192 MiB of empty driver heap before the first
+                // frame. See `terminal_memory_hints`.
+                memory_hints: terminal_memory_hints(),
                 trace: wgpu::Trace::Off,
             })
             .await
@@ -802,6 +919,72 @@ mod env_override_tests {
             Some(wgpu::PowerPreference::LowPower)
         );
         assert_eq!(parse_gpu_power("medium"), None);
+    }
+
+    /// The block-size range a `MemoryHints` carries, in MiB, or `None` for a
+    /// variant that carries no explicit range.
+    fn range_mib(h: &wgpu::MemoryHints) -> Option<(u64, u64)> {
+        const MIB: u64 = 1024 * 1024;
+        match h {
+            wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size: r,
+            } => Some((r.start / MIB, r.end / MIB)),
+            _ => None,
+        }
+    }
+
+    /// THE FLOOR ITSELF. This is the number that turned 2.94 MB of terminal GPU
+    /// resources into 192 MB of reserved driver heap when it was wgpu's
+    /// `Performance` preset (128 device + 64 host); the shipped policy floors at
+    /// 16 MiB device (⇒ 8 MiB host) and still grows to 128 MiB under real
+    /// pressure. See `terminal_memory_hints`.
+    #[test]
+    fn the_shipped_floor_is_terminal_sized_not_streaming_sized() {
+        let d = terminal_memory_hints_default();
+        assert_eq!(
+            range_mib(&d),
+            Some((16, 128)),
+            "the shipped hint must be an explicit Manual range, not a wgpu preset"
+        );
+        // The wgpu presets this replaces, for the record: `Performance` floors at
+        // 128 MiB device / 64 MiB host, which is what regressing to it would cost.
+        assert!(
+            matches!(d, wgpu::MemoryHints::Manual { .. }),
+            "a preset would put the floor back in wgpu's hands"
+        );
+    }
+
+    #[test]
+    fn memblock_env_parses_the_documented_table() {
+        assert!(matches!(
+            parse_memblock("performance"),
+            Some(wgpu::MemoryHints::Performance)
+        ));
+        assert!(matches!(
+            parse_memblock("SMALL"),
+            Some(wgpu::MemoryHints::MemoryUsage)
+        ));
+        assert_eq!(
+            range_mib(&parse_memblock("default").expect("default parses")),
+            Some((16, 128))
+        );
+        // A numeric floor sets the DEVICE minimum; the ceiling never drops below
+        // the shipped one, so growth under pressure is never taken away.
+        assert_eq!(
+            range_mib(&parse_memblock("8").expect("8 parses")),
+            Some((8, 128))
+        );
+        assert_eq!(
+            range_mib(&parse_memblock("256").expect("256 parses")),
+            Some((256, 256))
+        );
+        // gpu-allocator itself clamps to 4..=256 MiB; a value outside that would
+        // silently become a different number, so refuse it instead.
+        assert!(parse_memblock("3").is_none(), "below gpu-allocator's floor");
+        assert!(parse_memblock("257").is_none(), "above its ceiling");
+        assert!(parse_memblock("0").is_none());
+        assert!(parse_memblock("lots").is_none());
+        assert!(parse_memblock("").is_none());
     }
 }
 

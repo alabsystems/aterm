@@ -287,12 +287,31 @@ mod tests {
         for want in measured::LINUX_DOMINATORS {
             assert_dom(&s, want);
         }
-        for gone in ["accesskit", "accesskit_unix", "accesskit_winit"] {
+        // AccessKit is PRESENT on linux, deliberately. It was dropped from the
+        // default feature set on 2026-08-25 and made an UNCONDITIONAL linux
+        // dependency on 2026-08-26 (crates/aterm-gui/Cargo.toml, owner's call):
+        // measured with the feature off, the AT-SPI registry reports zero
+        // applications for aterm while a GTK app sits in the same registry, so a
+        // blind linux user gets no terminal at all rather than a degraded one.
+        // macOS keeps the native `a11y-appkit` surface, which is why it is
+        // absent there and the two cells legitimately disagree.
+        //
+        // Asserting presence, not absence: this test previously demanded the
+        // packages be GONE, which turned a deliberate product decision into a
+        // red suite. The regression it should catch is the stack silently
+        // changing shape, not the owner choosing to ship accessibility.
+        for present in ["accesskit", "accesskit_unix", "accesskit_winit"] {
             assert!(
-                !s.graph.nodes.iter().any(|p| p.name == gone),
-                "`{gone}` is back in the linux graph — the a11y-accesskit default returned"
+                s.graph.nodes.iter().any(|p| p.name == present),
+                "`{present}` left the linux graph — linux carries the AccessKit \
+                 tree unconditionally; if that changed, linux ships no a11y surface"
             );
         }
+        assert!(
+            !s.graph.nodes.iter().any(|p| p.name == "accesskit"
+                && s.cell.triple.contains("darwin")),
+            "macOS must not carry AccessKit — it has the native a11y-appkit path"
+        );
     }
 
     /// `measured::MAC_ARM_DOMINATORS` is held in dominator-LOC order precisely

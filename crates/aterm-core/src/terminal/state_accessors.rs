@@ -833,10 +833,54 @@ impl Terminal {
         self.grid.cursor()
     }
 
+    /// Monotonic autowrap serial of the ACTIVE grid — the emulator wrap fact
+    /// (kitty-motion §4.1). Advances by one each time an autowrap line
+    /// advance actually resolves (`Grid::advance_autowrap_line`, the one
+    /// funnel); hard newlines never advance it. A host diffs it against a
+    /// per-window `(session, last-serial)` baseline read under the SAME lock
+    /// as [`Self::cursor`], so "the serial moved since my last read of this
+    /// session" is the fact that separates a wrap — margin, scrolled
+    /// bottom-row, or margined — from `Home` pressed at the last column.
+    ///
+    /// Transient observability, deliberately unmigrated (the law lives on
+    /// `GridStorage::wrap_serial`): checkpoint/restore omits it and the
+    /// main/alt swaps in `handler_dec` leave each grid its own serial, so a
+    /// restore or buffer switch costs at most one spurious changed/unchanged
+    /// read — which the host's same-session baseline diff tolerates.
+    #[must_use]
+    pub fn wrap_serial(&self) -> u64 {
+        self.grid.wrap_serial()
+    }
+
     /// Check if cursor is visible.
     #[must_use]
     pub fn cursor_visible(&self) -> bool {
         self.modes.cursor_visible
+    }
+
+    /// The VIEWPORT row the cursor projects onto, on screen or not.
+    ///
+    /// The DEC cursor is anchored in the ACTIVE grid; the viewport row it
+    /// occupies is its active-grid row pushed DOWN by the scrollback offset,
+    /// because older history scrolls in at the top and slides live content —
+    /// the cursor's row included — toward the bottom.
+    #[must_use]
+    pub fn projected_cursor_row(&self) -> usize {
+        (self.cursor().row as usize).saturating_add(self.grid().display_offset())
+    }
+
+    /// The viewport row the cursor OCCUPIES in a `rows`-tall frame, or `None`
+    /// when nothing is drawn there: DECTCEM hid it, or a scroll-back pushed its
+    /// projected row off the bottom.
+    ///
+    /// THE ONE PROJECTION. `cell_frame_into` decides `cursor_visible` with this,
+    /// so a host asking "where is this terminal's caret in the frame I am
+    /// looking at" gets the extraction's own answer instead of a second copy of
+    /// the arithmetic that can drift from it.
+    #[must_use]
+    pub fn cursor_row_on_screen(&self, rows: usize) -> Option<usize> {
+        let row = self.projected_cursor_row();
+        (self.cursor_visible() && row < rows).then_some(row)
     }
 
     /// DECSCNM (DEC private mode 5) reverse-video: the whole-screen fg/bg swap is

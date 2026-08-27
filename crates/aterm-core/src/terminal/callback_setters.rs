@@ -31,6 +31,13 @@ impl Terminal {
         // grid publishes only the rows-GROW shift (`take_last_resize_row_shift`).
         // Both grids are always resized to the same `rows`, so one capture serves.
         let rows_before = self.grid.rows();
+        // Inline images live only as cell EXTRAS on rows that carry no glyph, and
+        // reflow copies extras only for the cells inside `Row::len()`. Pin the
+        // image rows' lengths first or every on-screen image is dropped by the
+        // rewrap — see `image_reflow`.
+        if cols_changed {
+            self.pin_image_rows_for_width_change(cols);
+        }
         if self.modes.alternate_screen {
             // Alt screen active: don't reflow current grid (app-managed content).
             // Saved primary grid should reflow normally.
@@ -68,6 +75,11 @@ impl Terminal {
         // Captured BEFORE the resize, as in `resize`.
         let cols_changed = self.grid.cols() != cols;
         let rows_before = self.grid.rows();
+        // Same image pin as the synchronous path: the offloaded resize still
+        // rewraps the VISIBLE grid inline, which is where the placements live.
+        if cols_changed {
+            self.pin_image_rows_for_width_change(cols);
+        }
         let pending = if self.modes.alternate_screen {
             // Alt active: current (alt) grid is app-managed; the SAVED PRIMARY
             // holds the scrollback that reflows.

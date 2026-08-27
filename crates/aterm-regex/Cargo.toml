@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-regex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's first-party regular-expression engine: a bounded Pike VM (parse -> NFA -> parallel simulation) with linear-time matching, replacing the `regex` crate"
+
+[dependencies]
+# None. That is the point: `regex` cost 4 third-party packages / 158,471 lines
+# (regex 11,973 + regex-automata 67,074 + regex-syntax 58,501 + aho-corasick
+# 20,923) to expose `Regex::new`, `RegexBuilder::{size_limit,dfa_size_limit}`,
+# `find_iter`, `is_match` and `Error::Syntax` at six call sites.
+
+[dev-dependencies]
+# The ORACLE, exactly as `aterm-digest` keeps sha2/hmac and `aterm-grapheme`
+# keeps unicode-segmentation: the crate this one replaces, kept as a
+# dev-dependency so every match this engine reports is proved identical to the
+# reference implementation over the built-in selection patterns, a hand-written
+# differential corpus, and a deterministic-LCG fuzz loop of ~40k generated
+# cases. A dev-dependency never enters the shipped graph, so the oracle costs
+# zero packages at ship time while making the replacement checkable forever.
+# Pinned here rather than inherited from [workspace.dependencies]: once the call
+# sites migrate, no shipped member declares `regex` any more.
+regex = "1"
+
+[lints]
+workspace = true

@@ -75,6 +75,16 @@ pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> String {
 ///
 /// Returns `(start_byte, end_byte)` suitable for `&s[start_byte..end_byte]`.
 /// If `start_col` is past all content, returns `(s.len(), s.len())`.
+///
+/// The scrollback twin of [`visible_row_bounds_to_string`]'s
+/// [`glyph_cell_span`](aterm_types::selection::glyph_cell_span) edges, and it
+/// obeys the same rule structurally rather than by a second copy of it: the
+/// walk carries each cluster's WIDTH, so a glyph straddling `start_col` is
+/// admitted whole by `start_col < next_col`, and one straddling `end_col` is
+/// admitted whole by `next_col > end_col`. A stored line therefore copies the
+/// same run of cells the highlight paints, exactly as a live row does.
+///
+/// [`visible_row_bounds_to_string`]: super::content::visible_row_bounds_to_string
 fn column_range_to_byte_offsets(s: &str, start_col: usize, end_col: usize) -> (usize, usize) {
     use crate::grapheme::split_graphemes;
 

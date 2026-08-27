@@ -17,9 +17,123 @@
 # Only run in interactive shells
 [[ $- != *i* ]] && return
 
-# Skip if already loaded
-[[ -n "$ATERM_SHELL_INTEGRATION_INSTALLED" ]] && return
+# ─── The multiplexer boundary (screen / tmux) ───
+#
+# aterm hosts ONE session per PTY. Run screen or tmux in that PTY and the
+# multiplexer owns it: every pane it draws lives inside the SAME aterm session,
+# and aterm has no name for a pane. Two things break at that boundary, and both
+# used to break SILENTLY:
+#
+#  1. $ATERM_PARENT_SESSION_ID is an ordinary exported variable, so it rides into
+#     every pane shell unchanged — and `aterm ctl`'s flagless self-location then
+#     resolves it to the session HOSTING the multiplexer. A flagless call typed
+#     in a pane drove the OUTER terminal, said OK, and moved the wrong session.
+#  2. The loader guard below is exported too, so a pane shell finds it already
+#     set and returns before defining a single hook. No OSC 133 mark is ever
+#     emitted from inside the multiplexer (and neither screen nor tmux forwards
+#     an unknown OSC outward anyway), so command blocks, exit codes and cwd
+#     tracking are ABSENT for the duration — not empty, absent.
+#
+# This block does not try to fix either — a pane is genuinely not an aterm
+# session — it makes them VISIBLE. It MARKS the crossing ($ATERM_MUX, plus the
+# outer sid so a tool can name what a flagless call would have hit), and says so
+# once. `aterm ctl` reads the marks and refuses an implicitly self-targeting call
+# rather than driving the wrong terminal.
+#
+# $ATERM_PARENT_SESSION_ID is deliberately left ALONE: it is also what provisions
+# a nested aterm's parent capability edges, and the outer session really is the
+# parent of anything launched from a pane. Marking costs nothing; unsetting would
+# quietly disarm recursion provisioning to fix a targeting bug.
+#
+# The guard is what makes the detection trustworthy WHERE IT RUNS: aterm's spawn
+# seam forces $ATERM_SHELL_INTEGRATION_INSTALLED to the EMPTY string for every
+# session it starts, so a NON-empty value proves we did not come straight from
+# aterm. That tells a real pane shell apart from an aterm window that was
+# launched FROM a pane and merely inherited $TMUX/$STY.
+#
+# HOW OFTEN IT RUNS is the part worth saying plainly, because the answer is "in
+# a pane, usually never". aterm delivers this file with `bash --rcfile <path>` —
+# argv, chosen once, by whoever starts the shell. A pane shell is started by
+# screen or tmux, so it gets no --rcfile and DOES NOT SOURCE THIS FILE AT ALL.
+# Measured in a real GNU screen 4.09.01 window under a headless aterm on Linux:
+# the pane had STY=…, TERM=screen.xterm-256color and the inherited guard, and
+# $ATERM_MUX still came out EMPTY with no hook defined — the block below had not
+# run. Nothing here can change that: no environment variable makes an
+# INTERACTIVE bash source a file ($BASH_ENV is the non-interactive one), and the
+# user's rc files are not ours to edit. So this block fires only where the file
+# is genuinely sourced in a pane — a hand-installed `source …` line as the header
+# above documents, or fish, whose vendor conf.d rides $XDG_DATA_DIRS into every
+# pane — and `aterm ctl` carries the boundary the rest of the time.
+#
+# What DOES run in every session aterm starts is the tail of this file, past the
+# guard, and that is where the detection now originates: $ATERM_MUX_BASE records
+# the multiplexer environment THIS session shell was born into. See the export
+# below.
+__aterm_mux=""
+if [[ -n "${TMUX:-}" ]]; then
+    __aterm_mux="tmux"
+elif [[ -n "${STY:-}" ]]; then
+    __aterm_mux="screen"
+else
+    # tmux's default TERM is screen-256color, so TERM alone names the family,
+    # not the program; the markers above are consulted first for that reason.
+    case "${TERM:-}" in
+        tmux|tmux-*|tmux.*)       __aterm_mux="tmux" ;;
+        screen|screen-*|screen.*) __aterm_mux="screen" ;;
+    esac
+fi
+
+# Skip if already loaded — marking the boundary on the way out when the
+# inherited guard means we crossed one.
+if [[ -n "$ATERM_SHELL_INTEGRATION_INSTALLED" ]]; then
+    if [[ -n "$__aterm_mux" ]]; then
+        export ATERM_MUX="$__aterm_mux"
+        if [[ -n "${ATERM_PARENT_SESSION_ID:-}" ]]; then
+            export ATERM_MUX_OUTER_SESSION_ID="$ATERM_PARENT_SESSION_ID"
+            # Say it ONCE per multiplexer session — not once per pane, which is
+            # the same true sentence six times before lunch. The stamp is keyed
+            # by the multiplexer's own id ($TMUX / $STY), so every pane of one
+            # screen or tmux shares it.
+            if [[ "${ATERM_MUX_NOTICE:-1}" != "0" ]]; then
+                __aterm_mux_id="${TMUX:-${STY:-$TERM}}"
+                __aterm_mux_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/aterm/mux-notice"
+                __aterm_mux_stamp="$__aterm_mux_dir/${__aterm_mux}-${__aterm_mux_id//[!A-Za-z0-9._-]/_}"
+                if [[ ! -e "$__aterm_mux_stamp" ]] &&
+                   mkdir -p "$__aterm_mux_dir" 2>/dev/null &&
+                   : >"$__aterm_mux_stamp" 2>/dev/null; then
+                    printf 'aterm: inside %s — command blocks, exit codes and cwd tracking do not cross the multiplexer,\n       so aterm records none of them for these panes. `aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences this.\n' "$__aterm_mux" >&2
+                fi
+                unset __aterm_mux_id __aterm_mux_dir __aterm_mux_stamp
+            fi
+        fi
+    fi
+    unset __aterm_mux
+    return
+fi
 export ATERM_SHELL_INTEGRATION_INSTALLED=1
+# Past the guard, so aterm started this shell ITSELF. Record the multiplexer
+# environment this session shell was born into. This is the one detection input
+# that comes from a place which ACTUALLY RUNS for every session, and it reaches a
+# pane the only way anything can: ordinary environment inheritance. A pane's own
+# $TMUX/$STY are the multiplexer's and no longer match this base — that mismatch
+# IS the crossing — while an aterm window merely launched FROM a pane re-runs
+# this file and re-stamps the base as its own, so it matches and is not refused.
+# Same question the guard was invented to answer, asked where the answer exists.
+# It also closes what TERM cannot: a tmux set to default-terminal
+# "xterm-256color" is indistinguishable from an aterm window to TERM, and plainly
+# a pane to this. `aterm ctl` reads it as $ATERM_MUX_BASE.
+# The SPAWN SEAM stamps this for every session (aterm-gui's
+# provision_child_identity_env), including sessions whose shell never sources
+# this file — so an inherited pane stamp cannot masquerade as a fresh session's
+# own. Keep the write only as the fallback for a host that starts a shell
+# without that seam (an embedder, a hand-run integration): set it if unset,
+# never overwrite the seam's answer with a value read after the pane was entered.
+: "${ATERM_MUX_BASE:="${TMUX-}|${STY-}"}"
+export ATERM_MUX_BASE
+# Any ATERM_MUX inherited from the pane we were launched out of describes a
+# multiplexer this session is not inside. Clear it, or every window opened from
+# a tmux pane would inherit a refusal it does not deserve.
+unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID __aterm_mux
 
 # Package bin directory
 if [ -d "$HOME/.aterm/bin" ]; then

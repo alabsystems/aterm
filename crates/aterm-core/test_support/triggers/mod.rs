@@ -180,7 +180,7 @@ impl TriggerBuilder {
         let action = self.action.ok_or(TriggerError::MissingAction)?;
 
         // Validate regex on build
-        regex::Regex::new(&pattern).map_err(|e| TriggerError::InvalidPattern {
+        aterm_regex::Regex::new(&pattern).map_err(|e| TriggerError::InvalidPattern {
             pattern: pattern.clone(),
             reason: e.to_string(),
         })?;
@@ -209,7 +209,7 @@ pub struct Trigger {
     pattern: String,
     /// Compiled regex (lazily populated). Only needed for evaluate() path.
     #[cfg(test)]
-    compiled: Option<regex::Regex>,
+    compiled: Option<aterm_regex::Regex>,
     /// The action to execute on match
     pub action: TriggerAction,
     /// Whether to fire on partial lines (before newline)
@@ -227,7 +227,7 @@ impl Trigger {
     /// Returns an error if the pattern is invalid regex.
     pub fn new(pattern: &str, action: TriggerAction) -> Result<Self, TriggerError> {
         // Validate regex on creation
-        regex::Regex::new(pattern).map_err(|e| TriggerError::InvalidPattern {
+        aterm_regex::Regex::new(pattern).map_err(|e| TriggerError::InvalidPattern {
             pattern: pattern.to_string(),
             reason: e.to_string(),
         })?;
@@ -275,11 +275,11 @@ impl Trigger {
 
     /// Get or compile the regex.
     #[cfg(test)]
-    fn regex(&mut self) -> &regex::Regex {
+    fn regex(&mut self) -> &aterm_regex::Regex {
         if self.compiled.is_none() {
             // Pattern was validated in new(), so this should never fail
             self.compiled = Some(
-                regex::Regex::new(&self.pattern)
+                aterm_regex::Regex::new(&self.pattern)
                     .expect("invariant: pattern validated in constructor"),
             );
         }

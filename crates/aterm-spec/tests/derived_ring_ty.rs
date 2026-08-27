@@ -23,30 +23,30 @@ use aterm_spec::derive::{
     anchored_artifact_transaction_model, artifact_reader_lease_model,
     artifact_reply_publication_model, asymmetric_pad_layout_model, capture_after_present_model,
     channel_bind_model, chrome_face_gate_model, closed_recovery_ledgers_model, coalesce_model,
-    composite_accessibility_route_model, config_catalog_snapshot_model,
+    composed_sync_hold_model, composite_accessibility_route_model, config_catalog_snapshot_model,
     config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
     ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
     cursor_cat_fold_model, cursor_cat_model, cursor_cat_motion_pulse_routing_model,
-    cursor_cutout_clip_model, cursor_effect_scroll_model, cursor_hint_license_model, cursor_model,
-    cursor_scroll_signal_model, cursor_viewport_lifecycle_model, damage_to_present_model,
-    deco_band_containment_model, deco_phase_model, done_mark_lru_model, dsu_quiescence_model,
-    effect_phase_lock_model, effect_present_rebase_model, effect_presentability_settle_model,
-    emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
-    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
-    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
-    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
-    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
-    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
-    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
-    kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
-    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
-    manual_config_completion_model, manual_config_diagnostics_lane_model,
-    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
-    motion_policy_model, native_async_delivery_model, native_capture_source_model,
-    native_close_plan_model, native_config_observation_handoff_model,
-    native_config_transaction_model, native_control_routing_model,
-    native_document_publication_model, native_draft_journal_model,
+    cursor_companion_owner_lifecycle_model, cursor_cutout_clip_model, cursor_effect_scroll_model,
+    cursor_hint_license_model, cursor_model, cursor_scroll_signal_model,
+    cursor_viewport_lifecycle_model, damage_to_present_model, deco_band_containment_model,
+    deco_phase_model, done_mark_lru_model, dsu_quiescence_model, effect_phase_lock_model,
+    effect_present_rebase_model, effect_presentability_settle_model, emacs_search_navigation_model,
+    emacs_search_repeat_work_model, evict_full_model, exact_instance_retention_model,
+    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
+    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
+    flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
+    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
+    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
+    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
+    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
+    kitty_flush_worker_model, kitty_sidecar_durability_model, kitty_sing_detector_model,
+    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
+    manual_config_diagnostics_lane_model, manual_config_handoff_model,
+    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
+    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
+    native_config_observation_handoff_model, native_config_transaction_model,
+    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
@@ -80,9 +80,9 @@ use aterm_spec::derive::{
     sparkle_persist_capacity_model, sparkle_reflow_cardinality_model, sparkle_retype_rearm_model,
     spawn_locale_model, startup_phase_publication_model, stream_fade_gate_model,
     strike_selection_model, styled_run_face_model, subscribe_model, surface_coverage_model,
-    tab_nav_model, tab_stop_handoff_model, tab_strip_model, text_blend_gate_model,
-    tier_residency_model, title_summary_managed_endpoint_model, title_summary_model,
-    title_summary_observation_scheduler_model, title_summary_runtime_model,
+    sync_reopen_visibility_model, tab_nav_model, tab_stop_handoff_model, tab_strip_model,
+    text_blend_gate_model, tier_residency_model, title_summary_managed_endpoint_model,
+    title_summary_model, title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
     vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model,
@@ -7909,6 +7909,132 @@ fn derived_cursor_viewport_lifecycle_proves_and_catches_history_overlays() {
     );
 }
 
+/// A resident cursor companion's visible body and hit target are coordinates,
+/// while its configured identity is not. Pane/tab replacement and a truly
+/// unpresentable blur retire the former; typed-wake and recording pins are
+/// explicit preservation controls. The mutant retains stale coordinates at
+/// the four retiring boundaries.
+#[test]
+fn derived_cursor_companion_owner_lifecycle_proves_and_catches_stale_coordinates() {
+    let model = cursor_companion_owner_lifecycle_model();
+    assert_proves_and_catches(&model);
+
+    let materialized = model.successors("Materialize", &model.init_state())[0].clone();
+    assert_eq!(materialized["pet_visible"], 1);
+    assert_eq!(materialized["hit_target"], 1);
+
+    for action in [
+        "PaneOwnerSwitch",
+        "TabOwnerSwitch",
+        "ScreenBufferSwitch",
+        "UnpresentableFocusLoss",
+    ] {
+        let retired = model.successors(action, &materialized)[0].clone();
+        assert_eq!(retired["pet_visible"], 0, "{action}");
+        assert_eq!(retired["hit_target"], 0, "{action}");
+        assert_eq!(retired["durable_identity"], 1, "{action}");
+        assert!(model.check_invariant("RetiringBoundariesAreDark", &retired));
+    }
+
+    for action in ["TypedWakeFocusLoss", "RecordingFocusLoss"] {
+        let pinned = model.successors(action, &materialized)[0].clone();
+        assert_eq!(pinned["pet_visible"], 1, "{action}");
+        assert_eq!(pinned["hit_target"], 1, "{action}");
+        assert_eq!(pinned["durable_identity"], 1, "{action}");
+        assert!(model.check_invariant("PresentationPinsPreserveTheSighting", &pinned));
+        let mut overbroad_blur = pinned;
+        overbroad_blur.insert("pet_visible", 0);
+        overbroad_blur.insert("hit_target", 0);
+        assert!(
+            !model.check_invariant("PresentationPinsPreserveTheSighting", &overbroad_blur),
+            "{action}: an overbroad raw-blur retirement must be rejected"
+        );
+    }
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let materialized = buggy.successors("Materialize", &buggy.init_state())[0].clone();
+    let stale = buggy.successors("PaneOwnerSwitch", &materialized)[0].clone();
+    assert!(stale["pet_visible"] == 1 && stale["hit_target"] == 1);
+    assert!(
+        !buggy.check_invariant("RetiringBoundariesAreDark", &stale),
+        "the retained-coordinate mutant must expose a visible stale body and hit target"
+    );
+}
+
+#[test]
+fn derived_composed_sync_hold_requires_every_pane_to_release() {
+    let model = composed_sync_hold_model();
+    assert_proves_and_catches(&model);
+
+    let armed = model.successors("ArmBoth", &model.init_state())[0].clone();
+    let a_closed = model.successors("CloseOnlyA", &armed)[0].clone();
+    assert_eq!(a_closed["a_hold"], 0);
+    assert_eq!(a_closed["b_hold"], 1);
+    assert_eq!(a_closed["presented"], 0);
+    assert!(model.check_invariant("NoPartialCompositePresent", &a_closed));
+    let released = model.successors("CloseRemainingB", &a_closed)[0].clone();
+    assert_eq!(released["presented"], 1);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let armed = buggy.successors("ArmBoth", &buggy.init_state())[0].clone();
+    let partial = buggy.successors("CloseOnlyA", &armed)[0].clone();
+    assert!(
+        !buggy.check_invariant("NoPartialCompositePresent", &partial),
+        "the aggregate-close mutant must present while pane B remains held"
+    );
+}
+
+/// A close followed immediately by a clean reopen may still publish the
+/// completed close boundary. Once a parser action dirties that reopened
+/// episode, no part of it is visible until the next close.
+#[test]
+fn derived_sync_reopen_visibility_holds_dirty_new_episode_until_close() {
+    let model = sync_reopen_visibility_model();
+    assert_proves_and_catches(&model);
+    assert!(
+        aterm_spec::xref::model_registry()
+            .into_iter()
+            .any(|candidate| candidate.name == model.name),
+        "the close/reopen visibility law must remain enrolled in the xref registry"
+    );
+
+    let first_closed = model.successors("CloseFirstEpisode", &model.init_state())[0].clone();
+    assert_eq!(first_closed["completed_generation"], 1);
+    assert_eq!(first_closed["hold"], 0);
+
+    let clean_reopen = model.successors("ReopenClean", &first_closed)[0].clone();
+    assert_eq!(clean_reopen["sync_active"], 1);
+    assert_eq!(clean_reopen["open_dirty"], 0);
+    assert_eq!(clean_reopen["hold"], 0);
+    assert_eq!(clean_reopen["presented_generation"], 1);
+    assert!(model.check_invariant("CleanReopenMayPresentCompletedBoundary", &clean_reopen));
+
+    let dirty_reopen = model.successors("DirtyReopenedEpisode", &clean_reopen)[0].clone();
+    assert_eq!(dirty_reopen["open_dirty"], 1);
+    assert_eq!(dirty_reopen["hold"], 1);
+    assert_eq!(dirty_reopen["partial_visible"], 0);
+    assert_eq!(dirty_reopen["presented_generation"], 1);
+    assert!(model.check_invariant("DirtyReopenHoldsUntilClose", &dirty_reopen));
+
+    let reopened_closed = model.successors("CloseReopenedEpisode", &dirty_reopen)[0].clone();
+    assert_eq!(reopened_closed["open_dirty"], 0);
+    assert_eq!(reopened_closed["hold"], 0);
+    assert_eq!(reopened_closed["completed_generation"], 2);
+    assert_eq!(reopened_closed["presented_generation"], 2);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let first_closed = buggy.successors("CloseFirstEpisode", &buggy.init_state())[0].clone();
+    let clean_reopen = buggy.successors("ReopenClean", &first_closed)[0].clone();
+    let leaked = buggy.successors("DirtyReopenedEpisode", &clean_reopen)[0].clone();
+    assert_eq!(leaked["open_dirty"], 1);
+    assert_eq!(leaked["hold"], 0);
+    assert_eq!(leaked["partial_visible"], 1);
+    assert!(
+        !buggy.check_invariant("DirtyReopenHoldsUntilClose", &leaked),
+        "the close-sequence-only mutant must leak the dirty reopened episode"
+    );
+}
+
 /// Every surviving cursor-effect anchor follows a PTY scroll by the exact row
 /// delta and every off-top member is retired. The mutant strands both families
 /// in their old coordinates.
@@ -7917,9 +8043,10 @@ fn derived_cursor_effect_scroll_proves_and_catches_stranded_geometry() {
     assert_proves_and_catches(&cursor_effect_scroll_model());
 }
 
-/// Capped/zero retained history cannot hide a uniform scroll from the host;
-/// non-uniform region/alt/reset motion instead invalidates all cached effect
-/// coordinates. The mutant restores retained-count diffing and strands light.
+/// Capped/zero retained history cannot hide a uniform scroll from the host,
+/// including on the active alternate screen; non-uniform region/reset motion
+/// instead invalidates all cached effect coordinates. The mutant restores
+/// retained-count diffing (and the old alt-only reset) and strands light.
 #[test]
 fn derived_cursor_scroll_signal_proves_and_catches_capped_history_stranding() {
     assert_proves_and_catches(&cursor_scroll_signal_model());

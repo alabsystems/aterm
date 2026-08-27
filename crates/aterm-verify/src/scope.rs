@@ -174,6 +174,21 @@ impl Scope {
         }
     }
 
+    /// Would this selection compile `name`? `--workspace` selects everything;
+    /// the narrowings select exactly what they name.
+    ///
+    /// The whole-tree answer is TRUE rather than "unanswerable" on purpose: a
+    /// pass that keys off this decides whether it has anything to run, and a
+    /// whole-tree run always does.
+    #[must_use]
+    pub fn includes_crate(&self, name: &str) -> bool {
+        match self {
+            Self::Workspace => true,
+            Self::Crate(c) => c == name,
+            Self::Changed(c) => c.crates.iter().any(|n| n == name),
+        }
+    }
+
     /// The regex search lane runs whole-tree or when the selection CONTAINS
     /// `aterm-search`.
     ///
@@ -182,11 +197,7 @@ impl Scope {
     /// scope that excludes `aterm-search` there is nothing for it to run.
     #[must_use]
     pub fn includes_regex_lane(&self) -> bool {
-        match self {
-            Self::Workspace => true,
-            Self::Crate(c) => c == "aterm-search",
-            Self::Changed(c) => c.crates.iter().any(|n| n == "aterm-search"),
-        }
+        self.includes_crate("aterm-search")
     }
 }
 

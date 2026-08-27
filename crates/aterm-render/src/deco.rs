@@ -31,6 +31,15 @@
 //!   remove coverage, never add or recolour it (coverage-monotonicity,
 //!   `tests/deco_lines.rs::ink_skip_*`), and a cell with no descender ink
 //!   takes the identical code path as the feature turned off.
+//!
+//! * **…and only where descenders exist.** [`ink_skip_applies_to_width`] holds
+//!   the skip to SINGLE-column cells. A double-width cell is an ideograph or a
+//!   fullwidth form, scripts with no descenders whose feet merely rest on the
+//!   baseline — carving around those turned an IME composition rule into a row
+//!   of dashes under every character (`tests/deco_lines.rs::
+//!   cjk_composition_underline_is_continuous`). Narrow cells are untouched by
+//!   the rule, so the Latin behaviour the feature exists for is preserved by
+//!   construction.
 
 use aterm_core::terminal::UnderlineStyle;
 
@@ -301,6 +310,57 @@ pub fn underline_band(
         }
         UnderlineStyle::Curly => Some((uy, cell_h)),
     }
+}
+
+/// Whether descender ink-skip may carve the underline of a cell whose glyph
+/// occupies `cols` terminal columns.
+///
+/// **Single-column cells only.** A double-width cell is, by Unicode East Asian
+/// Width, an ideograph or a fullwidth form — Han, Kana, Hangul, wide emoji —
+/// and those scripts have NO DESCENDERS. Their glyphs are set in the em square
+/// with the foot resting on the baseline, and the rule underneath is meant to
+/// run unbroken.
+///
+/// # The defect this closes (composition underlines under CJK)
+///
+/// The skip's subject is a descender TAIL: the narrow stroke of `g/y/j/p/q`
+/// that pierces the rule, which the probe finds by looking at the row(s)
+/// strictly below the baseline. An ideograph puts ink in those same rows for a
+/// completely different reason — its foot AA-overshoots the baseline by a pixel
+/// or two — and the probe cannot tell the two apart from one row of coverage.
+///
+/// Measured with the embedded face (`tests/deco_lines.rs::
+/// cjk_composition_underline_is_continuous`), the lead cell of an IME-composed
+/// `日` had its underline cut into THREE fragments at every size from 13px up
+/// — a short dash at each margin and a stub between the character's two
+/// vertical strokes (18px: kept spans `[(0,2), (7,7), (19,3)]` of a 22px
+/// advance). A user composing Japanese saw that under every character, so the
+/// composition rule — the ONLY thing marking the preedit as uncommitted — was
+/// a dotted mess instead of a line.
+///
+/// Depth cannot separate the two cases at a fixed threshold: measured on the
+/// embedded face, Latin tails reach 2 rows below the baseline at 12px and 6 at
+/// 32px, while CJK feet reach 1 and 2 — the ranges overlap once you cross font
+/// sizes, and any em-fraction cut sits on rasterizer hinting noise. Column
+/// width does separate them, exactly and by definition.
+///
+/// # Why this cannot regress Latin
+///
+/// Latin, Greek, Cyrillic — every script with a descender — is narrow. This
+/// predicate is FALSE only for cells the terminal itself measured at 2 columns,
+/// so no narrow cell changes code path, and the descender behaviour the feature
+/// exists for is byte-identical by construction (pinned by
+/// `latin_descender_skip_survives_the_wide_glyph_exemption`).
+///
+/// # Known, deliberate limit
+///
+/// Fullwidth Latin (`ｇ`, U+FF47) is wide AND has a descender, so its tail is
+/// no longer carved around. CJK faces draw those inside the em square, the
+/// character is vanishingly rare in terminal text, and accepting one cosmetic
+/// miss is the price of a rule that is provably inert for every narrow cell.
+#[must_use]
+pub fn ink_skip_applies_to_width(cols: usize) -> bool {
+    cols <= 1
 }
 
 /// Descender ink-skip core: given per-column glyph-ink presence over a cell's

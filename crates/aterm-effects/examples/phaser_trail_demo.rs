@@ -130,6 +130,8 @@ fn main() {
     let em_cfg = PhaserConfig {
         enabled: true,
         intensity: 1.0,
+        // No host cursor colour in a raw demo: the theme-polar base stands in.
+        base: None,
     };
 
     let typed = "# the words stay readable in the beam";

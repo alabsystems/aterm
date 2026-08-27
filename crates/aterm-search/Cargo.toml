@@ -13,7 +13,7 @@ description = "Search primitives for aterm terminal content"
 default = []
 # Enables regex-mode scrollback search (SearchIndex::search_*_opts with
 # is_regex = true). Left opt-in here; a later slice flips it on for the GUI.
-regex = ["dep:regex"]
+regex = ["dep:aterm-regex"]
 # TRUST_NATIVE_TLA: compile the streaming-search `#[refines]` anchors and the
 # kani `proof_anchor!`s as part of the LIBRARY so a downstream test binary (the
 # `spec_xref_closure` gate in aterm-gui) can collect them via `inventory`. OFF by
@@ -28,7 +28,7 @@ aterm-hash = { workspace = true }
 # truncated search results are observable rather than silent (DL-2).
 aterm-log = { workspace = true }
 aterm-grapheme = { workspace = true }
-regex = { workspace = true, optional = true }
+aterm-regex = { workspace = true, optional = true }
 memchr = { workspace = true }
 # Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
 # feature (the anchor macros emit `::aterm_spec::inventory::submit!`). Still a

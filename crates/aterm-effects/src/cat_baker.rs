@@ -897,6 +897,20 @@ fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     mix3(coat, pale, hi)
 }
 
+/// The coat stop as it resolves on the DARK background classes (bands 0 and
+/// the mixed band 4): `COAT_RAMP[coat]` through [`lift_coat_luminance`] at
+/// [`COAT_MIN_LUM_DARK_BG`] — exactly the rescue `from_context` applies
+/// there, minus the 12 % accent nudge (context-local and identity-
+/// preserving, so it cancels out of any two-coat comparison). Test-only and
+/// crate-private on purpose: it exists so `kitty_registry`'s pinned
+/// `coat_distance` table can be verified against the LIVE lift math without
+/// exporting the lift itself — this baker stays the single colour authority.
+#[cfg(test)]
+pub(crate) fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
+    let stop = rgb(COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)]);
+    lift_coat_luminance(stop, COAT_MIN_LUM_DARK_BG)
+}
+
 fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
     let a = relative_luminance(packed_rgb(a));
     let b = relative_luminance(packed_rgb(b));

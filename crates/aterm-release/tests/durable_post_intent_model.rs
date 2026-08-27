@@ -42,9 +42,6 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -77,7 +74,6 @@ fn journal() -> Journal {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
-        lite_dmg_sha256: None,
         done: Vec::new(),
     }
 }
@@ -121,7 +117,6 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
-        lite_dmg_sha256: None,
         kind: CutKind::Real,
         no_paint_smoke: false,
         lease: None,

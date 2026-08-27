@@ -213,6 +213,38 @@ impl TerminalHandler<'_> {
     ///
     /// Reached only when the [`WindowOpsCapability`] has been minted.
     /// `response_cap` gates `send_response` for the report paths.
+    ///
+    /// # Who can actually answer
+    ///
+    /// A report needs a SYNCHRONOUS value. The window callback is the host's
+    /// only seam into this dispatch, and in this project's GUI it declines
+    /// every report by design — the host answers window ops by posting an async
+    /// wake, and a wake cannot carry a reply back into the parser frame it came
+    /// from. So in practice a report is answered only if the ENGINE can answer
+    /// it from state it truly holds:
+    ///
+    /// - `18 t` (text area in cells): the grid. Exact.
+    /// - `14 t` (text area in pixels) and `16 t` (cell size in pixels): the grid
+    ///   and the cell box the host reported through
+    ///   [`super::Terminal::set_cell_pixel_size`]. Exact once reported, SILENT
+    ///   before — see [`Self::report_cell_size_pixels`].
+    /// - `20 t` / `21 t` (icon label, window title): the engine's own title
+    ///   state.
+    ///
+    /// The rest have no in-core truth and therefore stay silent — an honest
+    /// non-answer, not an oversight:
+    ///
+    /// - `11 t` window state (iconified?) — a window-manager fact.
+    /// - `13 t` window / text-area POSITION — a window-manager fact.
+    /// - `14 ; 2 t` whole-window pixels — text area plus interior padding plus
+    ///   whatever the WM drew around it; the engine knows none of the three.
+    /// - `15 t` screen size in pixels, `19 t` screen size in cells — properties
+    ///   of the DISPLAY, which the engine has never been told about.
+    ///
+    /// Fabricating any of those (a plausible-looking 0,0 origin, the engine's
+    /// 8x16 placeholder cell) would be strictly worse than silence: an
+    /// application can retry or fall back when a query goes unanswered, but it
+    /// cannot tell a confident wrong number from a right one.
     fn handle_window_reports(
         &mut self,
         response_cap: &ResponseCapability,
@@ -309,24 +341,53 @@ impl TerminalHandler<'_> {
         }
     }
 
+    /// CSI 14 t (text area, pixels) and CSI 14 ; 2 t (whole window, pixels).
+    ///
+    /// The host gets first refusal. When it declines — which is the norm, see
+    /// [`Self::handle_window_reports`] — the TEXT AREA arm answers in-core:
+    /// the text area is by definition `rows x cols` of the host's reported cell
+    /// box, so the product is a measurement, not a guess.
+    ///
+    /// The `; 2` arm has no such identity (window = text area + interior
+    /// padding + window-manager decoration, none of which the engine holds) and
+    /// stays silent rather than pass the text area off as the window.
     fn report_window_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
         sub: u16,
         cap: &WindowOpsCapability,
     ) {
-        let op = if sub == 2 {
+        let whole_window = sub == 2;
+        let op = if whole_window {
             WindowOperation::ReportWindowSizePixels
         } else {
             WindowOperation::ReportTextAreaSizePixels
         };
-        if let Some(WindowResponse::SizePixels { height, width }) =
-            self.invoke_window_callback(op, cap)
-        {
+        let size = match self.invoke_window_callback(op, cap) {
+            Some(WindowResponse::SizePixels { height, width }) => {
+                Some((u32::from(height), u32::from(width)))
+            }
+            _ if whole_window => None,
+            _ => self.text_area_size_pixels(),
+        };
+        if let Some((height, width)) = size {
             // CSI 4 ; height ; width t
             let response = format!("\x1b[4;{height};{width}t");
             self.send_response(response_cap, response.as_bytes());
         }
+    }
+
+    /// The text area in pixels, or `None` while no host has reported a cell box.
+    ///
+    /// `u32` because a `u16` grid times a `u16` cell does not fit `u16`; the
+    /// product of two `u16`s always fits `u32`, so the saturation below is a
+    /// formality that keeps the arithmetic obligation-free.
+    fn text_area_size_pixels(&self) -> Option<(u32, u32)> {
+        let (cell_w, cell_h) = self.iterm2.host_cell_px()?;
+        Some((
+            u32::from(self.grid.rows()).saturating_mul(u32::from(cell_h)),
+            u32::from(self.grid.cols()).saturating_mul(u32::from(cell_w)),
+        ))
     }
 
     fn report_screen_size_pixels(
@@ -343,14 +404,29 @@ impl TerminalHandler<'_> {
         }
     }
 
+    /// CSI 16 t — the size of one character cell in pixels.
+    ///
+    /// This is the report image-capable TUIs lean on: aterm ships sixel, and a
+    /// program that wants its picture to occupy a known number of rows has to
+    /// ask how tall a row is. Answering it in-core is the whole point of the
+    /// host reporting metrics through
+    /// [`super::Terminal::set_cell_pixel_size`].
+    ///
+    /// SILENT while nothing has reported. The engine carries an 8x16
+    /// placeholder for inline-image footprint arithmetic — which must produce
+    /// some cell count either way — but a placeholder is not a measurement, and
+    /// handing it to an application that asked a direct question would send it
+    /// off to render at a font size that exists nowhere.
     fn report_cell_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
         cap: &WindowOpsCapability,
     ) {
-        if let Some(WindowResponse::CellSize { height, width }) =
-            self.invoke_window_callback(WindowOperation::ReportCellSizePixels, cap)
-        {
+        let size = match self.invoke_window_callback(WindowOperation::ReportCellSizePixels, cap) {
+            Some(WindowResponse::CellSize { height, width }) => Some((height, width)),
+            _ => self.iterm2.host_cell_px().map(|(w, h)| (h, w)),
+        };
+        if let Some((height, width)) = size {
             // CSI 6 ; height ; width t
             let response = format!("\x1b[6;{height};{width}t");
             self.send_response(response_cap, response.as_bytes());
@@ -710,6 +786,182 @@ mod tests {
         assert!(
             term.take_response().is_none(),
             "CSI 21 t policy rule must not accidentally authorize CSI 20 t"
+        );
+    }
+
+    // =====================================================================
+    // XTWINOPS PIXEL REPORTS
+    //
+    // 14t/16t are what a sixel or image-capable TUI asks before it decides
+    // how big to draw. Both used to be structurally unanswerable: the
+    // handlers replied only through `invoke_window_callback`, the GUI host
+    // declines every report (its window ops ride an async wake, which cannot
+    // carry a synchronous reply), and unlike 20t/21t neither had an in-core
+    // fallback. `allow_window_ops = true` changed nothing — the query simply
+    // went into the void. They now answer from the grid and the host's
+    // reported cell box, and stay silent when that box does not exist.
+    // =====================================================================
+
+    /// A window with `allow_window_ops` alone — no window callback, exactly
+    /// the shape of a real GUI session, whose callback declines reports.
+    fn windowed_term(rows: u16, cols: u16) -> Terminal {
+        let mut term = Terminal::new(rows, cols);
+        term.modes_mut().allow_window_ops = true;
+        term
+    }
+
+    fn response_string(term: &mut Terminal) -> Option<String> {
+        term.take_response()
+            .map(|r| String::from_utf8(r).expect("XTWINOPS reports are ASCII"))
+    }
+
+    /// CSI 16 t reports the host's cell box, height first (`CSI 6 ; h ; w t`).
+    #[test]
+    fn csi_16t_reports_the_host_reported_cell_box() {
+        let mut term = windowed_term(24, 80);
+        term.set_cell_pixel_size(9, 19);
+
+        term.process(b"\x1b[16t");
+
+        assert_eq!(
+            response_string(&mut term).as_deref(),
+            Some("\x1b[6;19;9t"),
+            "CSI 16 t must answer the real cell box, height then width"
+        );
+    }
+
+    /// CSI 14 t reports the TEXT AREA in pixels: the grid times the cell box.
+    #[test]
+    fn csi_14t_reports_the_text_area_in_pixels() {
+        let mut term = windowed_term(24, 80);
+        term.set_cell_pixel_size(9, 19);
+
+        term.process(b"\x1b[14t");
+
+        // 24 rows x 19 px = 456 tall; 80 cols x 9 px = 720 wide.
+        assert_eq!(
+            response_string(&mut term).as_deref(),
+            Some("\x1b[4;456;720t")
+        );
+    }
+
+    /// The text area tracks the GRID, not the size at construction — a report
+    /// after a resize describes the terminal the application is looking at.
+    #[test]
+    fn csi_14t_follows_the_grid_across_a_resize() {
+        let mut term = windowed_term(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        term.resize(30, 100);
+
+        term.process(b"\x1b[14t");
+
+        assert_eq!(
+            response_string(&mut term).as_deref(),
+            Some("\x1b[4;600;1000t")
+        );
+    }
+
+    /// NO FABRICATION. The engine carries an 8x16 placeholder cell for
+    /// inline-image footprint arithmetic. It is not a measurement, so a
+    /// terminal no host has measured answers NOTHING — never `CSI 6 ; 16 ; 8 t`,
+    /// which would send an image-capable TUI off to render at a font size that
+    /// exists nowhere.
+    #[test]
+    fn the_pixel_reports_stay_silent_when_no_host_has_measured_a_cell() {
+        for query in [b"\x1b[14t".as_slice(), b"\x1b[16t".as_slice()] {
+            let mut term = windowed_term(24, 80);
+            // Deliberately NOT calling set_cell_pixel_size.
+            term.process(query);
+            assert_eq!(
+                response_string(&mut term),
+                None,
+                "{query:?} must not pass the 8x16 placeholder off as a measurement"
+            );
+        }
+        // Negative control: the same queries DO answer once a host measures,
+        // so the silence above is the missing metric and not a dead path.
+        let mut term = windowed_term(24, 80);
+        term.set_cell_pixel_size(8, 16);
+        term.process(b"\x1b[16t");
+        assert_eq!(response_string(&mut term).as_deref(), Some("\x1b[6;16;8t"));
+    }
+
+    /// A zero axis is not a cell box any font could have, and reporting one
+    /// invites a divide-by-zero in the application. Treated as unmeasured.
+    #[test]
+    fn a_zero_axis_cell_box_is_not_a_measurement() {
+        let mut term = windowed_term(24, 80);
+        term.set_cell_pixel_size(0, 19);
+        term.process(b"\x1b[16t");
+        assert_eq!(response_string(&mut term), None);
+    }
+
+    /// The reports the engine genuinely cannot answer stay silent even with a
+    /// measured cell box and window ops fully authorized. Each is a fact about
+    /// the window manager or the display, not about the terminal:
+    /// `14 ; 2 t` whole-window pixels (text area + padding + decoration),
+    /// `15 t` screen pixels, `19 t` screen cells, `11 t` iconified state,
+    /// `13 t` window position.
+    #[test]
+    fn reports_with_no_in_core_truth_stay_silent_rather_than_guess() {
+        for query in [
+            b"\x1b[14;2t".as_slice(),
+            b"\x1b[15t".as_slice(),
+            b"\x1b[19t".as_slice(),
+            b"\x1b[11t".as_slice(),
+            b"\x1b[13t".as_slice(),
+            b"\x1b[13;2t".as_slice(),
+        ] {
+            let mut term = windowed_term(24, 80);
+            term.set_cell_pixel_size(9, 19);
+            term.process(query);
+            assert_eq!(
+                response_string(&mut term),
+                None,
+                "{query:?} has no in-core truth; silence is the honest answer"
+            );
+        }
+    }
+
+    /// The new fallbacks live INSIDE the capability gate: an unauthorized host
+    /// still leaks no font metrics to the PTY (#7454, #7643, #7876).
+    #[test]
+    fn the_pixel_reports_are_still_gated_by_allow_window_ops() {
+        for query in [b"\x1b[14t".as_slice(), b"\x1b[16t".as_slice()] {
+            let mut term = Terminal::new(24, 80);
+            term.modes_mut().allow_window_ops = false;
+            term.set_cell_pixel_size(9, 19);
+            term.process(query);
+            assert_eq!(
+                response_string(&mut term),
+                None,
+                "{query:?} must not answer without window-ops authorization"
+            );
+        }
+    }
+
+    /// A host that CAN answer synchronously still wins: the callback's value is
+    /// used verbatim and the in-core fallback never runs.
+    #[test]
+    fn a_host_that_answers_a_pixel_report_overrides_the_in_core_fallback() {
+        let mut term = windowed_term(24, 80);
+        term.set_cell_pixel_size(9, 19);
+        term.set_window_callback(|op| match op {
+            aterm_types::WindowOperation::ReportCellSizePixels => {
+                Some(aterm_types::WindowResponse::CellSize {
+                    height: 40,
+                    width: 20,
+                })
+            }
+            _ => None,
+        });
+
+        term.process(b"\x1b[16t");
+
+        assert_eq!(
+            response_string(&mut term).as_deref(),
+            Some("\x1b[6;40;20t"),
+            "the host's own metrics take precedence over the engine's"
         );
     }
 

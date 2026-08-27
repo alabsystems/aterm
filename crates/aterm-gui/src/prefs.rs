@@ -87,15 +87,6 @@ pub(crate) const EDIT_ROBI: &str = "robi";
 /// changes the wording, the timing, or what the notice is for, and reduced motion
 /// holds the colours still.
 pub(crate) const EDIT_NOTICE_SPARKLE: &str = "notice_sparkle";
-/// Progress-card party trim (`Config::pkg_progress_effects`, default ON —
-/// user-facing features ship enabled; this is an opt-OUT). The toolchain
-/// install's progress card wears the rainbow-filled bar, per-program completion
-/// sparkles, and the cursor kitty riding the bar's leading edge. Decorative
-/// only: OFF keeps the card fully functional as a plain themed accent bar —
-/// the numbers, phases, queue order, and honest failure states never change.
-/// Reduced motion and serious mode strip the same trim without touching this
-/// preference.
-pub(crate) const EDIT_PKG_PROGRESS_EFFECTS: &str = "pkg_progress_effects";
 /// Ambient-bed toggle (`Config::trail_sound_bed`, default OFF — the owner
 /// dislikes the drone): ON re-enables the continuous per-style background
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
@@ -220,6 +211,9 @@ pub(crate) const EDIT_LINE_HEIGHT: &str = "line_height";
 pub(crate) const EDIT_ADJUST_BASELINE: &str = "adjust_baseline";
 pub(crate) const EDIT_MINIMUM_CONTRAST: &str = "minimum_contrast";
 pub(crate) const EDIT_SELECTION_INACTIVE: &str = "selection_inactive";
+/// Whether a split inks a hairline along the edges of the pane that takes
+/// keystrokes (`Config::split_focus_mark`), a Bool, default ON.
+pub(crate) const EDIT_SPLIT_FOCUS_MARK: &str = "split_focus_mark";
 pub(crate) const EDIT_CURSOR_BREAK_LIGATURES: &str = "cursor_break_ligatures";
 /// M4 — admit Cascadia N:1 MERGED ligatures (`Config::merged_ligatures`), a Bool,
 /// default OFF. Registered so `edit_kind` types it correctly (a serde
@@ -1110,9 +1104,6 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // Decorative, previewed by the thing itself (the celebration card appears after
     // an update) rather than by the Settings workbench — same rationale as `robi`.
     EDIT_NOTICE_SPARKLE,
-    // Same rationale again: the progress card appears during a real toolchain
-    // install, not in the workbench scene.
-    EDIT_PKG_PROGRESS_EFFECTS,
     // Aural, no pixels — the same rationale as their five siblings above.
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
@@ -1159,6 +1150,13 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_TAB_CONNECTION_BADGE,
     EDIT_STREAM_FADE,
     EDIT_STREAM_FADE_MS,
+    // The split's focus mark is a RELATION between panes — it inks the divider
+    // gap between the pane taking keystrokes and its neighbour. The workbench
+    // scene is ONE mock terminal, so it has no divider gap to draw the mark in
+    // and no second pane for the mark to distinguish it from; a projection would
+    // have to invent both. The honest preview is already on the reader's glass,
+    // since a real split re-composes the moment the value is saved.
+    EDIT_SPLIT_FOCUS_MARK,
 ];
 
 /// Default scrollback line cap when `scrollback_lines` is unset (mirrors the engine
@@ -1172,48 +1170,33 @@ const DEFAULT_SCROLLBACK_LINES: usize = 100_000;
 const DEFAULT_CURSOR_STYLE: &str = "block";
 
 /// The default `cursor_trail_style` when unset — the RAINBOW KITTY PET: the same
-/// banded rainbow ribbon, trailed by the full-body cat that WALKS, runs and pounces
+/// smooth full-height rainbow ribbon, trailed by the full-body cat that WALKS, runs and pounces
 /// along the line instead of the flying head (the owner's own machine has run this
 /// spelling for weeks, and shipping anything else made the default a stranger to the
 /// product). The name has changed three times: the original single-word `nyan` became
 /// the two-word `nyan rainbow`, then `rainbow kitty` (the owner's name for the ribbon —
 /// it says what you SEE), and the default now names the PET companion on top of it.
 /// Every historical spelling still resolves via [`CURSOR_TRAIL_STYLE_ALIASES`], so old
-/// configs keep working — and a config that says `rainbow kitty` explicitly still gets
-/// the flying head, untouched. The placeholder hint for the row.
+/// configs keep working. `rainbow kitty` and bare `kitty` now name the visible resident;
+/// the historical `nyan`/`rainbow` aliases retain the earned flying head. The placeholder
+/// hint for the row.
 ///
 /// This is the SINGLE definition of the default: `app_config`, `native_settings` and
 /// `settings_preview` read it rather than re-typing the literal, so the next rename is
 /// one line.
 pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty pet";
 
-/// The selectable values for `cursor_trail_style`: the additive `phaser` sweep (a
-/// full-spectrum hue streak), `rainbow kitty` (the banded rainbow ribbon under the
-/// flying head), `rainbow kitty pet` (the DEFAULT — that ribbon with the walking cat),
-/// the native cadence-`comet` (a directional fading comet under the light
-/// crown), the other additive LUMEN-wake looks
-/// (lumen / sparkle / fire / laser / water), the `beam` style (a clean steady TUBE of
-/// cool light that powers down — promoted from a bloom-free preset to its own
-/// [`crate::cursor_glow::GlowStyle::Beam`]), and `off`. This is the SINGLE source of
-/// truth for the [`EditKind::Enum`] control's options, the save-time domain
-/// validation in [`typed_item`], AND the `controls settings` introspection options
-/// dump — so the three can never disagree. Mirrors the documented set in the starter
-/// config (`cli.rs`) and the cases of [`crate::cursor_glow::GlowStyle::parse`]
-/// (whose extra alias spellings resolve through [`CURSOR_TRAIL_STYLE_ALIASES`]).
+/// Selectable `cursor_trail_style` values. Every rainbow entry shares one continuous
+/// spectrum, animation clock, fade, and sparkle engine; the raw spelling chooses only
+/// companion and geometry. This table is also the save-time and introspection domain.
 pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "phaser",
     "rainbow kitty",
-    // The same banded-ribbon trail, with the full-body PET companion instead of
-    // the flying kitty (`GlowStyle::style_names_kitty_pet`) — and the SHIPPED
-    // DEFAULT ([`DEFAULT_CURSOR_TRAIL_STYLE`]). A first-class option rather than
-    // an alias: it is a real choice the picker must offer, even though both
-    // spellings resolve to one `GlowStyle`.
     "rainbow kitty pet",
-    // The same banded-ribbon trail and the same full-body pet, drawn as a DOG
-    // (`PetSpecies::Dog`). A first-class option beside the kitty pet for the
-    // same reason that one is: it is a real choice the picker must offer, and
-    // all three spellings still resolve to one `GlowStyle`.
     "rainbow dog pet",
+    "rainbow kitty flying",
+    "rainbow kitty underline",
+    "rainbow kitty tall",
     "comet",
     "lumen",
     "sparkle",
@@ -1295,26 +1278,27 @@ pub(crate) fn cursor_trail_style_options<'a>(
     out
 }
 
-/// The documented ALIAS spellings `GlowStyle::parse` (and the `glow_config`
-/// enablement gate) accepts for `cursor_trail_style`, mapped to their canonical
-/// [`CURSOR_TRAIL_STYLES`] option. NOTE `nyan rainbow`/`nyan`/`rainbow` →
-/// `rainbow kitty`: the banded-ribbon style's canonical (displayed) name is now
-/// `rainbow kitty`, and EVERY name it has ever shipped under keeps resolving to
-/// it, so a config written against any past release still selects the same
-/// effect. `rainbow` maps to the ACTUAL banded rainbow ribbon, not the old
-/// laser-like sweep (which lives on as the explicit `phaser`). The single alias
-/// source shared by the Settings panel (`enum_alias`), `--validate-config`, and
-/// the load-time unknown-style warning — so the UI, the validator, and the
-/// engine can never disagree about which spellings are real.
+/// Documented aliases accepted by both the runtime and Settings. Historical
+/// `nyan`/`rainbow` spellings retain the flying companion; geometry aliases map
+/// to their explicit picker entries so validation and rendering cannot disagree.
 pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
-    ("nyan rainbow", "rainbow kitty"),
-    ("nyan", "rainbow kitty"),
-    ("rainbow", "rainbow kitty"),
+    ("nyan rainbow", "rainbow kitty flying"),
+    ("nyan", "rainbow kitty flying"),
+    ("rainbow", "rainbow kitty flying"),
+    ("flying kitty", "rainbow kitty flying"),
+    ("kitty flying", "rainbow kitty flying"),
+    ("kitty", "rainbow kitty"),
     ("kitty pet", "rainbow kitty pet"),
     ("pet kitty", "rainbow kitty pet"),
     ("dog pet", "rainbow dog pet"),
     ("pet dog", "rainbow dog pet"),
     ("rainbow puppy pet", "rainbow dog pet"),
+    ("rainbow underline", "rainbow kitty underline"),
+    ("underline rainbow", "rainbow kitty underline"),
+    ("nyan underline", "rainbow kitty underline"),
+    ("rainbow tall", "rainbow kitty tall"),
+    ("tall rainbow", "rainbow kitty tall"),
+    ("nyan tall", "rainbow kitty tall"),
     ("sparkles", "sparkle"),
     ("phaser-sparkle", "sparkle"),
     ("rainbow-sparkle", "sparkle"),
@@ -1493,7 +1477,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TONE_MELODY
         | EDIT_ROBI
         | EDIT_NOTICE_SPARKLE
-        | EDIT_PKG_PROGRESS_EFFECTS
         | EDIT_TRAIL_SOUND_BED
         | EDIT_TRAIL_SOUND_RIFF
         | EDIT_BELL_SOUND
@@ -1501,6 +1484,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_OPTION_AS_META
         | EDIT_CONFIRM_MULTILINE_PASTE
         | EDIT_SELECTION_INACTIVE
+        | EDIT_SPLIT_FOCUS_MARK
         | EDIT_CURSOR_BREAK_LIGATURES
         | EDIT_MERGED_LIGATURES
         | EDIT_FONT_SYNTHETIC_STYLE
@@ -2375,6 +2359,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         // W5/SGR text-appearance knobs sit beside Theme + Colors: they all answer
         // "how does color behave on my screen", so Appearance is their matched tab.
         EDIT_SELECTION_INACTIVE
+        | EDIT_SPLIT_FOCUS_MARK
         | EDIT_MINIMUM_CONTRAST
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FAINT_OPACITY => Section::Appearance,
@@ -2447,10 +2432,8 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_SERIOUS_MODE
         // The update-celebration sparkles ride the FX page beside serious
         // mode — its "Effect policy" group is where "how much fun is this
-        // terminal allowed to have" questions already live; the provisioning
-        // progress card's trim answers the same question.
+        // terminal allowed to have" questions already live.
         | EDIT_NOTICE_SPARKLE
-        | EDIT_PKG_PROGRESS_EFFECTS
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
         // The rest of the trail/aurora surface (packs — the colour overrides
         // route via the early trail-colour return above) + the stream-fade
@@ -2551,6 +2534,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         // brightness/faintness) — beside Theme + Colors, its matched tab.
         EDIT_MINIMUM_CONTRAST
         | EDIT_SELECTION_INACTIVE
+        | EDIT_SPLIT_FOCUS_MARK
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FAINT_OPACITY => ("Text & Contrast", 2),
         // M5 window glass (opacity + vibrancy material).
@@ -2560,7 +2544,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => ("Wallpaper", 4),
         // The celebration sparkles ride beside the process-wide effect switch:
         // both answer "how much fun is this terminal allowed to have".
-        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE | EDIT_PKG_PROGRESS_EFFECTS => ("Effect policy", 0),
+        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE => ("Effect policy", 0),
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
@@ -2874,7 +2858,11 @@ fn security_label(key: &str) -> &'static str {
                 // The manipulation half is wired there (frame audit #4).
                 "Allow window control & size queries (XTWINOPS)"
             } else {
-                "Allow title / text-grid-size queries (XTWINOPS)"
+                // No host callback off-Linux, so this is reports only — but
+                // "text-grid-size" undersold them once the engine gained its
+                // in-core pixel answers (CSI 14 t text area, CSI 16 t cell
+                // box). The Manual entry enumerates; the row says "size".
+                "Allow title & size queries (XTWINOPS)"
             }
         }
         EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
@@ -3238,6 +3226,7 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_UNDERLINE_SKIP_DESCENDERS => &["underline", "descender", "skip", "ink", "gap"],
         EDIT_MINIMUM_CONTRAST => &["contrast", "legibility", "wcag", "accessibility"],
         EDIT_SELECTION_INACTIVE => &["selection", "focus", "dim", "unfocused"],
+        EDIT_SPLIT_FOCUS_MARK => &["split", "pane", "focus", "active", "border", "divider"],
         EDIT_CURSOR_BREAK_LIGATURES => &["ligature", "cursor", "break"],
         EDIT_MERGED_LIGATURES => &["ligature", "merged", "cascadia", "collapse", "n:1"],
         EDIT_BOLD_IS_BRIGHT => &["bold", "bright", "ansi", "promote"],
@@ -3266,19 +3255,6 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "rainbow",
             "confetti",
             "badge",
-        ],
-        // "kitty" deliberately absent: the cursor-companion searches
-        // (`wide_search_page_one_lists_native_rows_beside_the_manual_result`
-        // pins the "kitty" roster) belong to the trail/companion settings;
-        // "cat" already lands anyone hunting the walker on the bar.
-        EDIT_PKG_PROGRESS_EFFECTS => &[
-            "progress",
-            "install",
-            "toolchain",
-            "packages",
-            "rainbow",
-            "sparkle",
-            "cat",
         ],
         EDIT_SECURE_KEYBOARD_ENTRY => &[
             "secure",
@@ -3750,6 +3726,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_SELECTION_INACTIVE,
             kind: EditKind::Bool,
             seed: Some(cfg.selection_inactive_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            label: "Mark the active split pane",
+            key: EDIT_SPLIT_FOCUS_MARK,
+            kind: EditKind::Bool,
+            // The checkbox reflects the RESOLVED state (default ON); Save writes
+            // the explicit bool.
+            seed: Some(cfg.split_focus_mark_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {
@@ -4731,18 +4716,6 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // The toolchain-install progress card's party trim (rainbow bar,
-            // completion sparkles, the cat). Default ON (opt-OUT); decorative
-            // only — the card's information and behaviour are identical with
-            // it off, and reduced motion / serious mode strip the same trim
-            // without touching this preference.
-            label: "Install-progress rainbow & cat",
-            key: EDIT_PKG_PROGRESS_EFFECTS,
-            kind: EditKind::Bool,
-            seed: Some(cfg.pkg_progress_effects_or_default().to_string()),
-            placeholder: String::new(),
-        },
-        EditField {
             label: "Background material",
             key: EDIT_BACKGROUND_MATERIAL,
             kind: EditKind::Enum {
@@ -5116,6 +5089,9 @@ mod trail_style_tests {
             "lumen" => GlowStyle::Lumen,
             "phaser" => GlowStyle::Phaser,
             "rainbow kitty" => GlowStyle::RainbowKitty,
+            // Underline changes only the ribbon geometry; it deliberately
+            // shares the continuous rainbow engine and lifecycle.
+            "rainbow kitty underline" => GlowStyle::RainbowKitty,
             // The pet is a COMPANION swap, not a trail: it deliberately shares
             // `RainbowKitty` so the ribbon, starfield and sound palette are
             // literally the same code. `GlowStyle::style_names_kitty_pet` is
@@ -5124,6 +5100,14 @@ mod trail_style_tests {
             // …and the dog pet, for the same reason: a species of the pet, not
             // a trail of its own.
             "rainbow dog pet" => GlowStyle::RainbowKitty,
+            // …and the explicit flying head, for the same reason once more: the
+            // companion forks, the trail does not.
+            "rainbow kitty flying" => GlowStyle::RainbowKitty,
+            // …and the TALL presentation, for the third time: `ribbon_tall`
+            // forks the ribbon's geometry at the one place that draws it, so
+            // the style — and therefore the momentum law, the starfield and the
+            // sound palette — is the same one.
+            "rainbow kitty tall" => GlowStyle::RainbowKitty,
             "sparkle" => GlowStyle::Sparkle,
             "fire" => GlowStyle::Fire,
             "laser" => GlowStyle::Laser,
@@ -5140,28 +5124,50 @@ mod trail_style_tests {
         }
     }
 
-    /// The pet's twin pin: exactly one canonical style (and its documented
-    /// aliases) selects the full-body CAT companion, and every other spelling —
-    /// including the plain `rainbow kitty` it shares a `GlowStyle` with, and
-    /// the dog pet it shares the pet machinery with — does not. Without this,
-    /// the three rainbow-kitty entries would be indistinguishable to the picker
-    /// and the draw path could never disagree with the trail.
+    /// The pet's twin pin: the KITTY-NAMED canonical styles (and their
+    /// documented aliases) select the full-body CAT companion, and every other
+    /// spelling — the explicit flying head they share a `GlowStyle` with, and
+    /// the dog pet they share the pet machinery with — does not.
+    ///
+    /// TWO ENTRIES, NOT ONE, since 2026-08-26: `rainbow kitty` joined
+    /// `rainbow kitty pet` because the owner asked twice for the kitty their
+    /// config names and kept getting the flying head. The pin that matters is
+    /// unchanged in kind — the picker's kitty entries and the draw path's
+    /// predicate agree, and nothing else in the domain drifts into the pet.
     #[test]
-    fn exactly_one_trail_style_selects_the_full_body_pet() {
+    fn the_kitty_named_trail_styles_select_the_full_body_pet() {
         for &s in CURSOR_TRAIL_STYLES {
             assert_eq!(
                 GlowStyle::style_names_kitty_pet(s),
-                s == "rainbow kitty pet",
+                s == "rainbow kitty pet" || s == "rainbow kitty",
                 "style {s:?}"
             );
         }
-        for alias in ["kitty pet", "pet kitty", "  Kitty Pet  "] {
+        for alias in [
+            "kitty pet",
+            "pet kitty",
+            "  Kitty Pet  ",
+            // The owner's spelling and the bare word.
+            "rainbow kitty",
+            "kitty",
+            "  Rainbow Kitty  ",
+        ] {
             assert!(
                 GlowStyle::style_names_kitty_pet(alias),
                 "documented alias {alias:?} must select the pet"
             );
         }
-        for other in ["rainbow", "nyan", "pet", "kitty", "rainbowkittypet"] {
+        for other in [
+            "rainbow",
+            "nyan",
+            "pet",
+            "rainbowkittypet",
+            // The explicit flying-head spellings are the escape hatch: they must
+            // never be swallowed by the widened kitty list.
+            "rainbow kitty flying",
+            "flying kitty",
+            "kitty flying",
+        ] {
             assert!(
                 !GlowStyle::style_names_kitty_pet(other),
                 "{other:?} must NOT select the pet"
@@ -5191,7 +5197,7 @@ mod trail_style_tests {
             );
             assert_eq!(
                 GlowStyle::style_names_any_pet(s),
-                s == "rainbow dog pet" || s == "rainbow kitty pet",
+                s == "rainbow dog pet" || s == "rainbow kitty pet" || s == "rainbow kitty",
                 "any-pet union, style {s:?}"
             );
         }
@@ -5207,6 +5213,11 @@ mod trail_style_tests {
             "puppy",
             "rainbowdogpet",
             "rainbow kitty pet",
+            // THE DOG OPT-IN IS UNCHANGED by the kitty widening: no kitty
+            // spelling, old or new, may reach the dog skin.
+            "rainbow kitty",
+            "kitty",
+            "rainbow kitty flying",
         ] {
             assert!(
                 !GlowStyle::style_names_dog_pet(other),
@@ -5244,15 +5255,36 @@ mod trail_style_tests {
             GlowStyle::RainbowKitty,
             "the pet still rides the rainbow ribbon"
         );
-        // The flying head is not gone — it is one explicit line of config away,
-        // and every historical spelling still selects it.
-        assert!(!GlowStyle::style_names_kitty_pet("rainbow kitty"));
+        // The flying head is not gone — it is one explicit line of config away.
+        // `rainbow kitty` is NO LONGER that line (owner, twice, 2026-08-26: the
+        // style named kitty must draw the kitty); the explicit spellings and
+        // every historical alias are.
+        assert!(GlowStyle::style_names_kitty_pet("rainbow kitty"));
+        assert!(GlowStyle::style_names_kitty_pet("kitty"));
+        for flying in ["rainbow kitty flying", "flying kitty", "kitty flying"] {
+            let canonical =
+                super::cursor_trail_style_canonical(flying).expect("documented flying spelling");
+            assert!(
+                CURSOR_TRAIL_STYLES.contains(&canonical),
+                "the flying head must stay a real picker option, got {canonical:?}"
+            );
+            assert!(
+                !GlowStyle::style_names_any_pet(flying)
+                    && !GlowStyle::style_names_any_pet(canonical),
+                "{flying:?} must keep drawing the flying head"
+            );
+            assert_eq!(GlowStyle::parse(flying), GlowStyle::RainbowKitty);
+        }
         for legacy in ["nyan", "nyan rainbow", "rainbow"] {
+            assert!(
+                !GlowStyle::style_names_kitty_pet(legacy),
+                "{legacy:?} must keep resolving to the flying head"
+            );
             assert!(
                 !GlowStyle::style_names_kitty_pet(
                     super::cursor_trail_style_canonical(legacy).expect("documented alias")
                 ),
-                "{legacy:?} must keep resolving to the flying head"
+                "{legacy:?}'s canonical name must draw the same animal it does"
             );
         }
     }
@@ -5274,6 +5306,22 @@ mod trail_style_tests {
                 GlowStyle::parse(canonical),
                 "alias {alias:?} and its canonical {canonical:?} diverge in the engine"
             );
+            // …AND THE SAME COMPANION. The style alone stopped being the whole
+            // answer once `rainbow kitty` became the walking pet: an alias whose
+            // canonical draws a different animal would make the Settings panel
+            // name a companion the engine does not draw for that config, which
+            // is exactly the split this table exists to prevent (it is why
+            // `nyan`/`rainbow`/`nyan rainbow` canonicalise to the flying head).
+            assert_eq!(
+                GlowStyle::style_names_kitty_pet(alias),
+                GlowStyle::style_names_kitty_pet(canonical),
+                "alias {alias:?} and its canonical {canonical:?} draw different cats"
+            );
+            assert_eq!(
+                GlowStyle::style_names_dog_pet(alias),
+                GlowStyle::style_names_dog_pet(canonical),
+                "alias {alias:?} and its canonical {canonical:?} draw different species"
+            );
             assert_eq!(
                 super::cursor_trail_style_canonical(alias),
                 Some(canonical),
@@ -5291,6 +5339,82 @@ mod trail_style_tests {
         // …and a genuinely unknown spelling is refused (the validator's arm).
         assert_eq!(super::cursor_trail_style_canonical("plasma"), None);
         assert_eq!(super::cursor_trail_style_canonical(""), None);
+    }
+
+    /// THE TALL RIBBON MUST NOT BE A TRAPDOOR — the pin for the defect measured
+    /// on v0.60.0 (build 1787762776), where asking for a look the engine
+    /// implements switched the cursor effect OFF.
+    ///
+    /// `cursor_trail_style_canonical` returning `None` is not "no style"; it is
+    /// `TrailStyleIssue::Unknown`, and `resolve_trail_style` answers that by
+    /// disabling the whole trail (`effective=false intensity=0.00`). So every
+    /// spelling the ENGINE advertises has to be a spelling THIS module resolves,
+    /// or the two halves disagree in the one direction the user cannot see: the
+    /// diagnostic still says `ribbon_look=tall` while nothing is drawn at all,
+    /// and the only warning goes to stderr.
+    ///
+    /// Both directions are pinned. Forward: each historical explicit-tall
+    /// spelling resolves to a canonical picker option that is itself still tall
+    /// (an alias that canonicalised to an underline spelling would re-enable the
+    /// trail while silently dropping the requested geometry). Backward: every
+    /// canonical rainbow-kitty spelling uses the restored v0.43 full-height body
+    /// except the one explicitly named `underline`; companion selection must not
+    /// accidentally change the ribbon geometry.
+    ///
+    /// The four spellings are written out rather than imported because the
+    /// engine exports the predicate, not the list; `cursor_glow`'s own
+    /// `rainbow_standard_spellings_use_v043_body_and_underline_aliases_keep_hybrid`
+    /// holds the other copy.
+    #[test]
+    fn every_tall_ribbon_spelling_stays_selectable() {
+        for tall in [
+            "rainbow kitty tall",
+            "rainbow tall",
+            "tall rainbow",
+            "nyan tall",
+        ] {
+            assert!(
+                GlowStyle::style_names_tall_ribbon(tall),
+                "{tall:?} is one of the engine's tall spellings"
+            );
+            let canonical = super::cursor_trail_style_canonical(tall).unwrap_or_else(|| {
+                panic!(
+                    "{tall:?} resolves to None — the enablement gate would DISABLE the whole \
+                     cursor effect for a look the engine implements"
+                )
+            });
+            assert!(
+                CURSOR_TRAIL_STYLES.contains(&canonical),
+                "{tall:?} canonicalises outside the picker domain: {canonical:?}"
+            );
+            assert!(
+                GlowStyle::style_names_tall_ribbon(canonical),
+                "{tall:?} canonicalises to {canonical:?}, which is NOT tall — the trail would \
+                 come back as the flat strip and the look would be silently dropped"
+            );
+            assert_eq!(
+                GlowStyle::parse(tall),
+                GlowStyle::RainbowKitty,
+                "the tall body is a presentation of the rainbow ribbon, not a style of its own"
+            );
+        }
+        // The restored v0.43 full-height body is the rainbow family's default;
+        // only the explicitly named alternate keeps the later underline shape.
+        for &s in CURSOR_TRAIL_STYLES {
+            let expected = matches!(
+                s,
+                "rainbow kitty"
+                    | "rainbow kitty pet"
+                    | "rainbow dog pet"
+                    | "rainbow kitty flying"
+                    | "rainbow kitty tall"
+            );
+            assert_eq!(
+                GlowStyle::style_names_tall_ribbon(s),
+                expected,
+                "style {s:?}"
+            );
+        }
     }
 
     /// THE TYPING-SOUND PICKER IS THE SYNTH'S ROSTER: `TRAIL_SOUND_STYLES` is
@@ -5791,6 +5915,40 @@ mod edit_tests {
             .find(|f| f.key == key)
             .unwrap();
         assert_eq!(row_on.seed.as_deref(), Some("true"), "resolved ON");
+    }
+
+    /// The split's focus mark is a SETTING, not a compile-time constant: a real
+    /// Appearance row, Bool-typed, searchable, seeded from the resolved default
+    /// (ON) and from an explicit `false`, and — because the workbench scene is a
+    /// single mock terminal with no divider gap for the mark to live in —
+    /// carrying a documented preview exemption rather than a dead control.
+    #[test]
+    fn the_split_focus_mark_row_is_a_real_appearance_setting_defaulting_on() {
+        let key = super::EDIT_SPLIT_FOCUS_MARK;
+        assert_eq!(super::edit_kind(key), EditKind::Bool);
+        assert_eq!(super::section_of(key), super::Section::Appearance);
+        assert_eq!(super::group_of(key), ("Text & Contrast", 2));
+        assert!(keywords_of(key).contains(&"split"));
+        assert!(
+            !super::VISUAL_PREVIEW_KEYS.contains(&key)
+                && super::VISUAL_PREVIEW_EXEMPT_KEYS.contains(&key),
+            "a relation between panes has no single-pane workbench projection"
+        );
+
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Mark the active split pane");
+        assert_eq!(row.seed.as_deref(), Some("true"), "resolved default ON");
+
+        let off: Config = toml::from_str("split_focus_mark = false").unwrap();
+        assert!(!off.split_focus_mark_or_default());
+        let row_off = editable_fields(&off)
+            .into_iter()
+            .find(|f| f.key == key)
+            .unwrap();
+        assert_eq!(row_off.seed.as_deref(), Some("false"), "resolved OFF");
     }
 
     /// The `[packages]` maintenance switches: Bool-typed dotted keys, sectioned in
@@ -7832,7 +7990,6 @@ enabled = true
             super::EDIT_TEMPORAL_RECORDING,
             super::EDIT_TRAIL_SOUND_BED,
             super::EDIT_NOTICE_SPARKLE,
-            super::EDIT_PKG_PROGRESS_EFFECTS,
         ] {
             assert!(
                 matches!(edit_kind(k), EditKind::Bool),

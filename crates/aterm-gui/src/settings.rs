@@ -6361,9 +6361,15 @@ mod tests {
         // Trail-style aliases resolve through the shared prefs table: a
         // configured "rainbow" (or legacy "nyan"/"nyan rainbow") renders the
         // banded ribbon LIVE, so the panel row (and the demo lane + cycle anchor
-        // riding on it) must show the canonical "rainbow kitty" — previously
-        // every alias clobbered to options[0] = "phaser" while the glass
-        // played a different effect.
+        // riding on it) must show its canonical name — previously every alias
+        // clobbered to options[0] = "phaser" while the glass played a different
+        // effect.
+        //
+        // Those three canonicalise to "rainbow kitty FLYING" since 2026-08-26.
+        // They draw the flying head and always have; `rainbow kitty` now draws
+        // the walking pet, so pointing them there would have made this row
+        // display a companion the engine does not draw for those configs — the
+        // display/engine split this alias table exists to prevent.
         let trail = |seed: &str| EditField {
             label: "Trail effect",
             key: crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
@@ -6373,9 +6379,13 @@ mod tests {
             seed: Some(seed.to_string()),
             placeholder: String::new(),
         };
-        assert_eq!(enum_current(&trail("rainbow")), "rainbow kitty");
-        assert_eq!(enum_current(&trail("nyan")), "rainbow kitty");
-        assert_eq!(enum_current(&trail("nyan rainbow")), "rainbow kitty");
+        assert_eq!(enum_current(&trail("rainbow")), "rainbow kitty flying");
+        assert_eq!(enum_current(&trail("nyan")), "rainbow kitty flying");
+        assert_eq!(enum_current(&trail("nyan rainbow")), "rainbow kitty flying");
+        // …and the kitty-named spellings show the resident's canonical name.
+        assert_eq!(enum_current(&trail("kitty")), "rainbow kitty");
+        assert_eq!(enum_current(&trail("kitty pet")), "rainbow kitty pet");
+        assert_eq!(enum_current(&trail("flying kitty")), "rainbow kitty flying");
         assert_eq!(enum_current(&trail("embers")), "fire");
         assert_eq!(enum_current(&trail("ocean")), "water");
         assert_eq!(enum_current(&trail("light-beam")), "beam");
@@ -8202,10 +8212,14 @@ mod tests {
             prefs::EDIT_SELECTION_FOREGROUND,
             // The indexed ANSI palette closes the Colors box (build order).
             prefs::EDIT_PALETTE,
-            // The "how color behaves" quartet — the Text & Contrast group
-            // (order 2) sorts after the Colors box, in field build order.
+            // The "how color behaves" group — Text & Contrast (order 2) sorts
+            // after the Colors box, in field build order. The split's focus mark
+            // rides beside the selection's because they answer the same question
+            // in two places: what does this window do about the thing you are
+            // not currently working in.
             prefs::EDIT_MINIMUM_CONTRAST,
             prefs::EDIT_SELECTION_INACTIVE,
+            prefs::EDIT_SPLIT_FOCUS_MARK,
             prefs::EDIT_BOLD_IS_BRIGHT,
             prefs::EDIT_FAINT_OPACITY,
             // Transparency: opacity then material.

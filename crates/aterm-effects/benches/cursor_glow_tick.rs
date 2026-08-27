@@ -100,8 +100,8 @@
 // TWO STREAMS ARE THE EXCEPTION, and they say so at their declaration:
 //
 //   * `halos` is CAPPED at MAX_HALOS = 512 and the truncation happens inside
-//     `tick`, so a saturated halo stream reads 512 whatever was pushed. The six
-//     workloads that saturate it (`rainbow_typing_{retina,1x,light}`,
+//     `tick`, so a saturated halo stream reads 512 whatever was pushed. The seven
+//     workloads that saturate it (`rainbow_typing_{default_retina,retina,1x,light}`,
 //     `rainbow_jump_bursts`, `beam_tube_jump`, `style_crossfade`) therefore
 //     assert `AT_HALO_CAP` — an explicit SATURATION guard, live only in the
 //     "fell off the cap" direction. The two-sided halo guards live on the
@@ -604,6 +604,11 @@ fn arm_jump(f: &mut Fixture) {
 /// `emit_water`'s per-segment walk (see `arm_glide`).
 fn arm_sweep(f: &mut Fixture) {
     f.now += f.dt;
+    // This is an authored same-row teleport (mouse selection / deliberate
+    // navigation), not ambient program output. Drive the same explicit input
+    // provenance the shipping host supplies or the anti-stray license quite
+    // correctly keeps this synthetic benchmark dark.
+    f.glow.note_synthetic_move(f.now);
     f.col = if f.n.is_multiple_of(2) {
         5
     } else {
@@ -619,6 +624,9 @@ fn arm_sweep(f: &mut Fixture) {
 /// segment of it is rasterized instead of being shed by the load-shed return.
 fn arm_glide(f: &mut Fixture) {
     f.now += f.dt;
+    // A mouse/word-motion glide is user-authored too; raw cursor deltas are
+    // deliberately unlicensed and would turn this into a vacuous dark cost.
+    f.glow.note_synthetic_move(f.now);
     let leg_frames = u64::from(GLIDE_SPAN / GLIDE_COLS);
     let k = (f.n % leg_frames) as u16 * GLIDE_COLS;
     f.col = if (f.n / leg_frames).is_multiple_of(2) {
@@ -1042,8 +1050,20 @@ fn f_rainbow_retina() -> Fixture {
     Fixture::new(cfg_for(GlowStyle::RainbowKitty), RETINA, TYPE_DT)
 }
 
-fn f_rainbow_lodpi() -> Fixture {
-    Fixture::new(cfg_for(GlowStyle::RainbowKitty), LODPI, TYPE_DT)
+/// The explicitly selected TALL presentation: the animated multi-strip body
+/// whose 2x/1x cost and emitted-volume ratio the hot-ribbon workloads guard.
+/// The shipping-default fixtures above stay on the restored underline so the
+/// off-path controls and host-seam measurements keep their default shape.
+fn f_rainbow_tall_retina() -> Fixture {
+    let mut cfg = cfg_for(GlowStyle::RainbowKitty);
+    cfg.ribbon_tall = true;
+    Fixture::new(cfg, RETINA, TYPE_DT)
+}
+
+fn f_rainbow_tall_lodpi() -> Fixture {
+    let mut cfg = cfg_for(GlowStyle::RainbowKitty);
+    cfg.ribbon_tall = true;
+    Fixture::new(cfg, LODPI, TYPE_DT)
 }
 
 /// The light-theme arm — a genuinely light palette, not the dark pair with the
@@ -1207,9 +1227,36 @@ fn workloads() -> Vec<Workload> {
         },
         // ---- the ON costs --------------------------------------------------
         Workload {
-            name: "rainbow_typing_retina",
-            note: "2x hot ribbon + ink pops + wake, dark",
+            name: "rainbow_typing_default_retina",
+            note: "2x hot shipping-default underline + ink pops + wake, dark",
             build: f_rainbow_retina,
+            arm: arm_typing,
+            bounds: [
+                (5_350, 6_500),
+                // The actual user-path geometry witness: the full-width flat
+                // strip emits a deterministic 960 under-quads here. Its tight
+                // ceiling also proves this workload did NOT silently fall onto
+                // the tall row-by-row body guarded immediately below (10_764
+                // under-quads on the identical Retina typing script).
+                (850, 1_080),
+                AT_HALO_CAP,
+                (0, 0),
+                (0, 0),
+                (0, 0),
+            ],
+            state: [(0.90, 1.0), ANY, (0.0, 0.0)],
+            lit_pct: (100, 100),
+            witness: Witness::Dimmer {
+                what: "the same default-underline script without its typed license",
+                control: f_rainbow_retina,
+                arm: arm_typing_unhinted,
+                ratio: 3,
+            },
+        },
+        Workload {
+            name: "rainbow_typing_retina",
+            note: "2x hot TALL ribbon + ink pops + wake, dark",
+            build: f_rainbow_tall_retina,
             arm: arm_typing,
             bounds: [
                 (5_350, 6_500),
@@ -1227,15 +1274,15 @@ fn workloads() -> Vec<Workload> {
             witness: Witness::Dimmer {
                 what: "the same script with no note_typed: no ink pops, and a spine \
                        that never leaves zero",
-                control: f_rainbow_retina,
+                control: f_rainbow_tall_retina,
                 arm: arm_typing_unhinted,
                 ratio: 3,
             },
         },
         Workload {
             name: "rainbow_typing_1x",
-            note: "1x hot ribbon + ink pops + wake, dark",
-            build: f_rainbow_lodpi,
+            note: "1x hot TALL ribbon + ink pops + wake, dark",
+            build: f_rainbow_tall_lodpi,
             arm: arm_typing,
             bounds: [
                 (3_280, 4_000),
@@ -1255,7 +1302,14 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_light,
             arm: arm_typing,
             bounds: [
-                (370, 455),
+                // Light-theme flying marks may replace ink (the shooter arm is
+                // source-over), so the shared text-first policy now sheds the
+                // whole family whenever this realistic three-row probe reports
+                // occupied or unknown. `Fixture::probe` explicitly captures a
+                // blank row below the caret; that proved-clear sky still emits
+                // a measured peak of 210 quads. The positive lower bound is the
+                // non-vacuity control for that surviving sparkle population.
+                (185, 235),
                 // The light body is source-over VEIL RAILS in `halos`, not
                 // additive quads in `under`: an empty under-stream here is the
                 // theme fork working, and a non-empty one would mean the dark
@@ -1283,7 +1337,13 @@ fn workloads() -> Vec<Workload> {
             arm: arm_jump,
             bounds: [
                 (6_400, 7_800),
-                (7_690, 9_370),
+                // The jump ZOOM owns this stream, with the ordinary ribbon
+                // body behind it. Since the shipping presentation returned to
+                // the flat underline, that background body no longer pays the
+                // tall path's row-by-row quad count; the ZOOM remains live at
+                // the deterministic 7_469 peak. Keep the default-path guard
+                // tight instead of opting this transient workload into tall.
+                (6_570, 8_370),
                 AT_HALO_CAP,
                 (0, 0),
                 (0, 0),
@@ -1409,7 +1469,13 @@ fn workloads() -> Vec<Workload> {
             arm: arm_crossfade,
             bounds: [
                 (1_890, 2_300),
-                (620, 760),
+                // The rainbow half intentionally uses the shipping underline,
+                // so its under stream is one compact flat strip rather than a
+                // tall row-by-row body. A measured peak of 64 remains a strict
+                // positive witness that the rainbow ghost contributes while
+                // Fire is live; `Witness::Ghost` below independently proves the
+                // reverse (Fire's patch stream while rainbow is live).
+                (56, 72),
                 AT_HALO_CAP,
                 (89, 109),
                 (0, 0),

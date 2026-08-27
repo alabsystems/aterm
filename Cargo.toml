@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.61.0"
+version = "0.62.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -86,7 +86,6 @@ serde_json = "1"   # aterm-update only: parse the GitHub Releases API response
 zstd = "0.13"    # aterm-scrollback warm-tier compression
 libc = "0.2"     # aterm-scrollback mmap/disk tier
 toml = "0.8"
-regex = "1"
 memchr = "2"
 # aterm-net (L3 network drive): TLS 1.3 (rustls, ring provider) with the RFC 5705
 # keying-material exporter. rustls uses the `ring` backend (no aws-lc C build).
@@ -197,6 +196,28 @@ aterm-hash = { path = "crates/aterm-hash" }
 # directly, so it stays and `aterm_digest::ct_eq` replaces our USE of it. Strictly
 # separate from `aterm-hash`, which is and stays NON-cryptographic.
 aterm-digest = { path = "crates/aterm-digest" }
+# The workspace regular-expression engine: parse → NFA → bounded Pike VM,
+# first-party and dependency-free. Replaces `regex`, the largest single import
+# left in the shipped graph at 4 packages / 158,471 lines of third-party source
+# (regex 11,973 + regex-automata 67,074 + regex-syntax 58,501 + aho-corasick
+# 20,923) for a surface of six call sites — `Regex::new`, the
+# `size_limit`/`dfa_size_limit` builder, `find_iter`, `is_match` and
+# `Error::Syntax`.
+#
+# It is a replacement and not a reduction: `regex` is a finite-automaton engine
+# with a linear-time guarantee, no backreferences and no look-around, and
+# leftmost-first semantics — a Pike VM has exactly those properties, which is why
+# the size ceilings the call sites already pass carry over unchanged. Patterns
+# here are user input (selection rules, `await match <re>`, the search verb), so
+# the engine is bounded on every axis: a byte ceiling on the compiled program,
+# re-checked per instruction; a 250-level nesting cap; and linear match time.
+#
+# `regex` stays on as this crate's dev-dependency ORACLE, exactly as `aterm-digest`
+# keeps sha2/hmac: every match is proved identical to the reference over the eleven
+# shipped selection patterns, a hand-written corpus, all of Unicode for `\d`/`\w`/`\s`
+# and case folding, and a deterministic-LCG fuzz loop. A dev-dependency never enters
+# the shipped graph, so the proof costs nothing at ship time.
+aterm-regex = { path = "crates/aterm-regex" }
 aterm-log = { path = "crates/aterm-log" }
 aterm-alloc = { path = "crates/aterm-alloc" }
 aterm-update = { path = "crates/aterm-update" }
@@ -226,8 +247,14 @@ aterm-verify = { path = "crates/aterm-verify" }
 
 # --- workspace-wide lint policy (inherited via `[lints] workspace = true`) ---
 # One central ratchet for every crate. The whole tree is kept clean under
-# `cargo clippy --workspace --all-targets -- -D warnings` (tools/verify.sh runs it);
-# there is no CI, so this local gate IS the contract.
+# `targo-tippy --workspace --all-targets --keep-going -- -D warnings` (tools/verify.sh
+# and `cargo xtask gate lint` both run exactly that, from one argv builder —
+# `aterm_verify::stages::tippy_args`); there is no CI, so this local gate IS the
+# contract. TWO WORDS IN IT ARE LOAD-BEARING. `targo-tippy`, not `cargo clippy`: the
+# pinned stage2 ships no `cargo-clippy`, so `cargo clippy` finds stock Rust's on PATH
+# or nothing at all. And `--keep-going`, without which cargo stops at the FIRST crate
+# that trips `-D warnings` and the rest of the workspace is never linted — a run that
+# reports three findings and reads like it reported all of them.
 [workspace.lints.rust]
 # Edition 2024 already warns here; deny it workspace-wide so an unsafe op outside an
 # explicit `unsafe {}` inside an `unsafe fn` can never sneak in.

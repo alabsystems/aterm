@@ -19,13 +19,18 @@ use aterm_core::terminal::Terminal;
 use aterm_render::Frame;
 
 use crate::WindowId;
+#[cfg(test)]
+use crate::app_render::sync_cursor_effect_scroll;
 use crate::app_render::{
     OverlayGlow, apply_bell_invert, apply_drop_overlay, apply_host_chrome_at, apply_overlay_at,
-    composite_tray_quad_at, sync_cursor_effect_scroll, tray_quad_below_y,
+    composite_tray_quad_at, prepare_resident_pet_tick, sync_cursor_effect_coordinate_space,
+    tray_quad_below_y,
 };
 use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
-use crate::{App, accessibility, control_auth, snapshot_path, term_lock};
+#[cfg(test)]
+use crate::term_lock;
+use crate::{App, accessibility, control_auth, snapshot_path};
 
 /// Headless capture may arrive long after the output wake that created a word.
 /// Ten seconds is the effects engine's episode-retention horizon: older stamps
@@ -52,6 +57,18 @@ struct PresentedTerminalCapture {
     overlay: Option<OverlayGlow>,
     serial: u64,
     cell_size: (usize, usize),
+    theme_fingerprint: u64,
+    overlay_fingerprint: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PresentedTerminalAuthority {
+    invert: bool,
+    overlay: Option<OverlayGlow>,
+    serial: u64,
+    cell_size: (usize, usize),
+    theme_fingerprint: u64,
+    overlay_fingerprint: u64,
 }
 
 /// Route-neutral owned projection of one application present submission. Native and
@@ -62,6 +79,28 @@ struct PresentedFrameCapture {
     input: aterm_render::RenderInput,
     invert: bool,
     overlay: Option<OverlayGlow>,
+    serial: u64,
+}
+
+/// One recording-owned successful-present tuple resolved against the GPU's
+/// still-resident input epoch. Every validation happens before the input clone;
+/// callers then own an immutable model while this main-thread request renders.
+struct RecordingPresentedFrame {
+    frame: PresentedFrameCapture,
+    terminal_grid: Option<crate::app_render::TerminalCaptureGrid>,
+    cell_size: (usize, usize),
+    theme_fingerprint: u64,
+    overlay_fingerprint: u64,
+    native_metadata: Option<crate::control::ImageFrameMetadata>,
+}
+
+/// Exact pixels of the current persistent headless destination, bound to the
+/// recording's last successful application-present tuple. This is deliberately
+/// independent of the semantic resident model: later renderer/card state may
+/// change while these already-presented bytes remain authoritative.
+struct RecordingPresentedDestination {
+    frame: Frame,
+    route: crate::VisibleContentRoute,
     serial: u64,
 }
 
@@ -90,6 +129,14 @@ struct NativeImageRequest<'a> {
     /// The successful application present this capture is bound to. `None` means
     /// no present authority exists, so the route stages its own input scratch.
     presented: Option<PresentedFrameCapture>,
+    /// Success-time template carried only by a headless recording artifact.
+    /// Windowed synchronous captures build metadata immediately from the same
+    /// successful-present turn and therefore leave this `None`.
+    presented_metadata: Option<crate::control::ImageFrameMetadata>,
+    /// Exact current VirtualTarget pixels for a non-clean headless recording
+    /// image. Semantic `presented` data may still supply metadata, but these
+    /// bytes bypass every reraster and host-chrome recomposition step.
+    exact_frame: Option<Frame>,
     target: crate::control_auth::ConfinedImage,
     want_bytes: bool,
     want_metadata: bool,
@@ -255,10 +302,16 @@ pub(crate) enum EncodeJob {
         /// only the reply can tell "measured zero" from "could not measure".
         keys_enabled: bool,
         inputs: Vec<(u64, crate::VideoInputSample)>,
-        /// Input egresses during this take that took the control-thread path
-        /// and therefore CANNOT be in `inputs` (see
-        /// [`crate::unseamed_control_inputs`]).
+        /// TOTAL input attempts during this take that could not be put on this
+        /// recording's frame clock, and therefore CANNOT be in `inputs`: the
+        /// control-thread egresses (see [`crate::unseamed_control_inputs`])
+        /// plus `unlogged_other_window`.
         unlogged_inputs: u64,
+        /// The subset of `unlogged_inputs` that reached the App input seam but
+        /// belonged to a window this recording was not capturing. Kept apart so
+        /// `analysis.note` can name the RIGHT cause: "drive the front tab" and
+        /// "drive the window being recorded" are different corrections.
+        unlogged_other_window: u64,
         started_us: u64,
         dir: crate::control_auth::ConfinedVideoDir,
         reply: std::sync::mpsc::Sender<crate::control::Retained<String>>,
@@ -589,27 +642,53 @@ pub(crate) fn video_keys_status_tokens(keys_enabled: bool, logged: usize, unlogg
 /// at once (and named `send`/`feed` as an unloggable path, which the active-tab
 /// arms no longer are), so a driver could not tell an idle screen from a
 /// misrouted one.
-pub(crate) fn video_empty_ledger_note(keys_enabled: bool, unlogged: u64) -> String {
+pub(crate) fn video_empty_ledger_note(
+    keys_enabled: bool,
+    unlogged: u64,
+    unlogged_other_window: u64,
+) -> String {
     if !keys_enabled {
         return "no keystroke ledger was recorded: this take did not pass the `keys` flag. \
                 Re-record as `video <secs> keys` (owner scope) to correlate input with frames."
             .to_string();
     }
     if unlogged > 0 {
+        // The two causes need DIFFERENT corrections, so the note names whichever
+        // actually happened (and both when both did) rather than blaming the
+        // control-thread path for a key that simply went to another window.
+        let control_thread = unlogged.saturating_sub(unlogged_other_window);
+        let mut causes = String::new();
+        if control_thread > 0 {
+            causes.push_str(&format!(
+                " {control_thread} of them reached a PTY on the CONTROL-THREAD path — a verb \
+                 aimed at a session that is NOT the tab on screen (`@<sid>` naming a background \
+                 tab, which is what `@self` expands to when the driving session is not front). A \
+                 BACKGROUND target has no active tab to touch, so it never enters the App input \
+                 seam and this ledger cannot timestamp it. Drive the tab that is ON \
+                 SCREEN — flagless `key`/`ctrl`/`send`/`feed`/`paste`, or an explicit `@<sid>` \
+                 naming the front tab, both of which ARE logged."
+            ));
+        }
+        if unlogged_other_window > 0 {
+            causes.push_str(&format!(
+                " {unlogged_other_window} of them DID pass the App input seam but arrived on a \
+                 WINDOW this recording was not capturing (the front window changed during the \
+                 take — an `aterm ctl spawn` alone does it). No frame in frames[] can answer \
+                 those keys, so logging them would have published a key->frame latency for a key \
+                 that never touched the recorded surface. Re-record with the target window front \
+                 for the whole take."
+            ));
+        }
         return format!(
-            "MEASUREMENT GAP, not silence: {unlogged} input attempt(s) reached a PTY in this \
-             process during this take on the CONTROL-THREAD path — a verb aimed at a session that \
-             is NOT the tab on screen (`@<sid>` naming a background tab, which is what `@self` \
-             expands to when the driving session is not front). A BACKGROUND target has no active \
-             tab to touch, so it deliberately never enters the App input seam and this ledger \
-             cannot timestamp it: inputs[] is empty DESPITE those attempts. Drive the tab that is \
-             ON SCREEN — flagless `key`/`ctrl`/`send`/`feed`/`paste`, or an explicit `@<sid>` \
-             naming the front tab, both of which ARE logged — to get key->frame latency."
+            "MEASUREMENT GAP, not silence: {unlogged} input attempt(s) happened during this take \
+             that this ledger could not stamp on its own frame clock, so inputs[] is empty DESPITE \
+             them.{causes}"
         );
     }
     "no input reached this instance during the take: the ledger measured zero, it did not fail \
-     to measure (unlogged_inputs is 0, so nothing took the unobservable control-thread path \
-     either). Active-tab `key`/`ctrl`/`send`/`feed`/`paste` and hardware keys are all logged."
+     to measure (unlogged_inputs is 0, so nothing took the unobservable control-thread path and \
+     nothing landed on another window either). Active-tab `key`/`ctrl`/`send`/`feed`/`paste` and \
+     hardware keys on the recorded window are all logged."
         .to_string()
 }
 
@@ -657,7 +736,7 @@ mod video_keys_honesty_tests {
     fn empty_ledger_note_separates_measured_zero_from_unmeasurable() {
         // (1) The take never asked for a ledger. Saying "no input attempts
         // logged" here implied a measurement that was never attempted.
-        let no_flag = video_empty_ledger_note(false, 0);
+        let no_flag = video_empty_ledger_note(false, 0, 0);
         assert!(
             no_flag.contains("`keys` flag"),
             "a take without `keys` must say so: {no_flag}"
@@ -667,9 +746,9 @@ mod video_keys_honesty_tests {
             "an unrequested ledger never measured anything: {no_flag}"
         );
 
-        // (2) Input DID happen, on the one path this ledger structurally cannot
+        // (2) Input DID happen, on the path this ledger structurally cannot
         // observe. The count is stated, so the reader is never left guessing.
-        let gap = video_empty_ledger_note(true, 4);
+        let gap = video_empty_ledger_note(true, 4, 0);
         assert!(
             gap.contains("MEASUREMENT GAP") && gap.contains('4'),
             "a bypassed drive must be named AND counted: {gap}"
@@ -678,10 +757,44 @@ mod video_keys_honesty_tests {
             gap.contains("@<sid>"),
             "the note must name the path that bypassed it: {gap}"
         );
+        assert!(
+            !gap.contains("WINDOW"),
+            "no attempt landed on another window; the note must not invent that cause: {gap}"
+        );
+
+        // (2b) The OTHER unobservable cause: the attempts passed the App input
+        // seam but belonged to a window this take was not capturing. It needs a
+        // DIFFERENT correction from the background-target one ("re-record with
+        // the target window front", not "drive the front tab"), so the note must
+        // name it — and must not blame the control-thread path it never took.
+        let other_window = video_empty_ledger_note(true, 3, 3);
+        assert!(
+            other_window.contains("MEASUREMENT GAP") && other_window.contains('3'),
+            "a foreign-window drive must be named AND counted: {other_window}"
+        );
+        assert!(
+            other_window.contains("WINDOW this recording was not capturing"),
+            "the note must name the window cause: {other_window}"
+        );
+        assert!(
+            !other_window.contains("CONTROL-THREAD"),
+            "nothing took the control-thread path; blaming it misdirects the fix: {other_window}"
+        );
+        // Both causes at once: 5 total, 2 of them foreign-window, so 3 took the
+        // control thread. Both are named with their own count.
+        let both = video_empty_ledger_note(true, 5, 2);
+        assert!(
+            both.contains("CONTROL-THREAD") && both.contains("3 of them"),
+            "the control-thread share must be derived and stated: {both}"
+        );
+        assert!(
+            both.contains("2 of them") && both.contains("WINDOW"),
+            "the foreign-window share must be stated too: {both}"
+        );
 
         // (3) A genuine zero — and it says so positively, citing the evidence
         // (`unlogged_inputs` is 0) rather than guessing at causes.
-        let quiet = video_empty_ledger_note(true, 0);
+        let quiet = video_empty_ledger_note(true, 0, 0);
         assert!(
             quiet.contains("measured zero"),
             "a real zero must be claimed as a measurement: {quiet}"
@@ -694,7 +807,7 @@ mod video_keys_honesty_tests {
         // The stale advice is gone from every branch: flagless `send`/`feed` now
         // reach the App input seam and ARE logged, so no note may still tell a
         // driver they "write to the PTY directly and are not input attempts".
-        for note in [&no_flag, &gap, &quiet] {
+        for note in [&no_flag, &gap, &other_window, &both, &quiet] {
             assert!(
                 !note.contains("are not input attempts"),
                 "the send/feed exclusion is obsolete: {note}"
@@ -1100,6 +1213,7 @@ fn run_encode_job(job: EncodeJob) {
             keys_enabled,
             inputs,
             unlogged_inputs,
+            unlogged_other_window,
             started_us,
             dir,
             reply,
@@ -1165,7 +1279,7 @@ fn run_encode_job(job: EncodeJob) {
             let analysis = if inputs.is_empty() {
                 format!(
                     "  \"analysis\": {{\"note\": \"{}\"}},\n",
-                    video_empty_ledger_note(keys_enabled, unlogged_inputs)
+                    video_empty_ledger_note(keys_enabled, unlogged_inputs, unlogged_other_window)
                 )
             } else if lats_ms.is_empty() {
                 format!(
@@ -1300,7 +1414,8 @@ fn run_encode_job(job: EncodeJob) {
                  \"clock\": \"metrics now_us; same epoch as inputs[] — attempt->later-frame delta = frame.t_us - input.t_us\",\n    \
                  \"input_semantics\": \"pre-routing attempts (`ch` = character, `key` = named key with no character); not PTY-delivery or visible-glyph receipts\",\n    \
                  \"keys_requested\": {keys_enabled}, \"inputs_logged\": {}, \"unlogged_inputs\": {unlogged_inputs},\n    \
-                 \"unlogged_input_semantics\": \"input attempts during this take that reached a PTY on the CONTROL-THREAD path — a verb aimed at a session that is NOT the tab on screen (`@<sid>` naming a background tab; `@self` when the driving session is not front). A background target has no active tab to touch, so it never enters the App input seam this ledger hooks and cannot be timestamped here. Same unit as inputs_logged (one per would-be inputs[] row), process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
+                 \"unlogged_other_window\": {unlogged_other_window},\n    \
+                 \"unlogged_input_semantics\": \"input attempts during this take that this recording could not stamp on its own frame clock, from two causes. (1) The CONTROL-THREAD path: a verb aimed at a session that is NOT the tab on screen (`@<sid>` naming a background tab; `@self` when the driving session is not front). A background target has no active tab to touch, so it never enters the App input seam this ledger hooks. (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. unlogged_inputs is the TOTAL and includes unlogged_other_window. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
                  \"stamp_semantics\": \"{stamp_semantics}\",\n    \
                  \"wall_start_us\": {started_us}, \"wall_stop_us\": {stop_us},\n    \
                  \"requested_ms\": {requested_ms}, \"covered_us\": {covered_us},\n    \
@@ -1986,7 +2101,7 @@ impl App {
             let pad = u32::try_from(ws.metrics.pad).unwrap_or(u32::MAX);
             let pad_top = u32::try_from(ws.metrics.pad_top).unwrap_or(u32::MAX);
             let head = u32::try_from(ws.metrics.head).unwrap_or(u32::MAX);
-            let tab_rows = u32::from(self.tab_strip_rows);
+            let tab_rows = u32::from(self.chrome_rows());
             let window_rows = u32::from(ws.rows);
             let window_cols = u32::from(ws.cols);
             let composed_rows = window_rows.saturating_add(tab_rows);
@@ -2156,7 +2271,12 @@ impl App {
     /// Reusing `compose_word_decorations` rather than a second pipeline is what
     /// makes the capture WYSIWYG by construction — same engine, same per-pane
     /// binding, same damage gate, same translation into window coords.
-    fn splice_composed_capture_decorations(&mut self, wid: WindowId, now: Instant) {
+    fn splice_composed_capture_decorations(
+        &mut self,
+        wid: WindowId,
+        now: Instant,
+        exact_focus: crate::app_render::TerminalCaptureFocus,
+    ) {
         let Some(rects) = self
             .active_tree(wid)
             .zip(self.windows.get(&wid))
@@ -2193,6 +2313,7 @@ impl App {
         let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
             self.config.cursor_trail_style_raw(),
         );
+        let pet_species = self.trail_pet_species();
         // The ONE companion verdict (favourite > program with tenure > launch
         // kitty) — the same seam the composed PRESENT resolves through, so a
         // capture shows the breed the glass wears (gauntlet F3: a capture
@@ -2204,18 +2325,18 @@ impl App {
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
         // The focused pane's caret, in PANE-LOCAL cells: the companion's anchor.
-        let (focus_live_viewport, focus_cursor) = self.pool.get(focus).map_or((false, None), |s| {
-            let term = term_lock(&s.term);
-            let live = term.grid().display_offset() == 0;
-            let cursor = (term.cursor_visible() && live).then(|| {
-                let cp = term.cursor();
-                (cp.row, cp.col)
-            });
-            (live, cursor)
-        });
+        if exact_focus.session != focus {
+            return;
+        }
+        let focus_live_viewport = exact_focus.live_viewport;
+        let focus_cursor = exact_focus.cursor;
+        let focus_coordinate_space = Some((exact_focus.terminal_id, exact_focus.alternate_screen));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        if let Some((terminal_id, alternate_screen)) = focus_coordinate_space {
+            sync_cursor_effect_coordinate_space(ws, terminal_id, alternate_screen);
+        }
         let (win_rows, win_cols) = (ws.rows, ws.cols);
         ws.cursor_cat.set_look(companion_look);
         let cursor_companion_presentable =
@@ -2282,10 +2403,28 @@ impl App {
             pet_visible,
             !animate_cat,
         );
-        let (pane_rows, pane_cols) = panes
+        let (pane_rows, pane_cols, pane_origin) = panes
             .iter()
             .find(|(r, _)| r.session == focus)
-            .map_or((0, 0), |(r, _)| (r.rows, r.cols));
+            .map_or((0, 0, (0, 0)), |(r, _)| {
+                (
+                    r.rows,
+                    r.cols,
+                    (
+                        i32::from(r.col_off) * cell_w as i32,
+                        i32::from(r.row_off) * cell_h as i32,
+                    ),
+                )
+            });
+        if !capture_focused {
+            ws.retire_cursor_pet_coordinate_space();
+        }
+        prepare_resident_pet_tick(
+            &mut ws.word_decos,
+            &mut ws.cursor_pet,
+            pet_species,
+            Some((focus, pane_origin)),
+        );
         let pet_sense = aterm_effects::kitty_pet::PetSense {
             now,
             caret: if pet_caret_live { focus_cursor } else { None },
@@ -2297,9 +2436,12 @@ impl App {
             // A capture is one isolated frame: the burst probe is a
             // frame-over-frame diff the windowed presents own, and a capture
             // must never charge the watch (or steal the diff's baseline).
-            // No live pointer either — a capture has no mouse.
+            // No live pointer either — a capture has no mouse. The wrap fact
+            // is the same kind of present-owned frame-over-frame diff
+            // (`wrap_fact_edge`), so a capture never reads — or spends — it.
             output_burst: false,
             pointer: None,
+            wrapped: false,
         };
         // The switch, on the capture path too: an unowned resident retires
         // outright, so a capture can never immortalize a sprite the live window
@@ -2330,25 +2472,18 @@ impl App {
             cat_frame,
             pet,
             pet_visible: pet_on_glass,
+            // A CAPTURE, not a drawn present: the pet sync site must not
+            // spend a hello for a frame nobody's window presented (the
+            // `kitty_summon` precedent — see `sync_pet_companion_look`).
+            present: false,
             accent: glow_cfg.accent,
             cursor_color: ws.input_scratch.cursor_color,
             now,
         };
         self.compose_word_decorations(wid, &ctx);
-        // Consume EVERY visible pane's damage session — the capture IS this
-        // surface's present. `Terminal::damage_epoch` counts at most once per
-        // session and is re-armed only by `take_damage`, and nothing else
-        // re-arms it in HEADLESS mode (no OS window ⇒ `redraw_compose` never
-        // runs). Without this the epoch froze after the first capture and the
-        // rescan gate said "unchanged" forever: newly typed words in a split
-        // never decorated, and stale cats painted over new text. The single-pane
-        // arm has consumed it here for the same reason since the capture path
-        // was written; a windowed present is unaffected (its early-out compares
-        // epoch VALUES, and the main thread serializes captures against the
-        // redraw).
-        for (_, term) in &panes {
-            term_lock(term).take_damage();
-        }
+        // The advancing capture already consumed every pane's represented
+        // damage under its exact extraction lock. Nothing below may relock a
+        // terminal and swallow a newer synchronized-output episode.
         if let Some(ws) = self.windows.get_mut(&wid) {
             crate::app_render::splice_word_deco_channels(ws);
         }
@@ -2361,7 +2496,26 @@ impl App {
     /// Word-owned channels are omitted when the feature is off, or on the
     /// alt-screen with `suppress_in_alt_screen` set. Cursor companions remain
     /// independent and still follow their own presentation policy.
+    #[cfg(test)]
     pub(crate) fn splice_word_decorations(&mut self, wid: crate::WindowId, now: Instant) {
+        let Some(focus) = self
+            .prepare_terminal_capture_grid_with_cursor_fx(
+                wid,
+                crate::app_render::ComposedCursorFxClock::Advance(now),
+            )
+            .and_then(|grid| grid.focus)
+        else {
+            return;
+        };
+        self.splice_word_decorations_sampled(wid, now, focus);
+    }
+
+    fn splice_word_decorations_sampled(
+        &mut self,
+        wid: crate::WindowId,
+        now: Instant,
+        exact_focus: crate::app_render::TerminalCaptureFocus,
+    ) {
         // ONE CLOCK OWNER, including the companion engines. A windowed capture
         // reuses the application-present artifact; a concurrent still during a
         // headless recording reuses the recording loop's artifact. Rebuilding
@@ -2440,7 +2594,7 @@ impl App {
             .active_tree(wid)
             .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
         {
-            self.splice_composed_capture_decorations(wid, now);
+            self.splice_composed_capture_decorations(wid, now, exact_focus);
             return;
         }
         let sparkle = self
@@ -2485,6 +2639,7 @@ impl App {
         let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
             self.config.cursor_trail_style_raw(),
         );
+        let pet_species = self.trail_pet_species();
         // The same alt-screen policy the live application-present resolves: only a
         // configured `suppress_in_alt_screen` blanks the capture's decorations.
         let suppress_alt = sparkle.is_some() && self.config.sparkle_suppress_alt_screen();
@@ -2496,29 +2651,27 @@ impl App {
             .windows
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
-        let Some(front_terminal) = self.front_terminal_mirror(wid) else {
+        if exact_focus.session != capture_front_session || !exact_focus.damage_consumed {
+            // A one-pane headless decoration pass is admitted only by the
+            // exact extraction that consumed its own damage session. Missing
+            // or mismatched custody fails closed instead of re-locking a
+            // possibly newer synchronized-output episode.
             return;
-        };
+        }
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         let (rows, cols) = (ws.rows as usize, ws.cols as usize);
-        let mut term = term_lock(&front_terminal.term);
-        // Refill before resolving cursor-owned presentation. The exact
-        // `display_offset` stamped by this same extraction is the coordinate
-        // class for the cursor, trail, flying body and resident pet; a separate
-        // preflight read could race a viewport scroll and mix live companions
-        // with history cells.
-        term.cell_frame_into(&mut ws.input_scratch, rows, cols);
-        let live_viewport = ws.input_scratch.display_offset == 0;
-        let default_bg = if term.modes().reverse_video() {
-            term.default_foreground()
-        } else {
-            term.default_background()
-        };
-        ws.input_scratch.default_bg =
-            aterm_render::rgb_to_u32([default_bg.r, default_bg.g, default_bg.b]);
-        ws.input_scratch.cursor_color = crate::app_render::terminal_cursor_color(&term);
+        let live_viewport = exact_focus.live_viewport;
+        let grid_cursor = (
+            u16::try_from(ws.input_scratch.cursor_row).unwrap_or(u16::MAX),
+            u16::try_from(ws.input_scratch.cursor_col).unwrap_or(u16::MAX),
+        );
+        sync_cursor_effect_coordinate_space(
+            ws,
+            exact_focus.terminal_id,
+            exact_focus.alternate_screen,
+        );
         // Capture consumes the same admitted catalog Arc as application-present. Asset
         // installation above is Arc/scalar-only and cannot perform filesystem
         // or decode work.
@@ -2542,7 +2695,7 @@ impl App {
         // keystroke still a live re-arm witness. Declared BEFORE the
         // suspension fork below for the same reason the glass path declares
         // above its own: identity does not depend on whether this frame draws.
-        ws.word_decos.set_scan_session(Some(front_terminal.session));
+        ws.word_decos.set_scan_session(Some(exact_focus.session));
         let sing_drive = {
             let (detector, cat, glow, riff_bar) = (
                 &mut ws.kitty_sing,
@@ -2605,7 +2758,24 @@ impl App {
             rows: rows as u16,
             cols: cols as u16,
         };
-        let words_suspended = term.is_alternate_screen() && suppress_alt;
+        // The capture owns this tick only on the headless/no-recording arm.
+        // Feed the same species and one-frame-stale scanner map as live glass;
+        // `set_scan_session` already ran above, before any rescan decision.
+        if !capture_focused {
+            ws.retire_cursor_pet_coordinate_space();
+        }
+        prepare_resident_pet_tick(&mut ws.word_decos, &mut ws.cursor_pet, pet_species, None);
+        // The ownership switch precedes every presentation fork, including
+        // load shedding's cleared early return. Load shedding is a temporary
+        // visibility freeze; it cannot immortalize a brain/mote cadence whose
+        // trail or style owner was removed on this capture.
+        crate::app_render::retire_pet_without_owner(
+            pet_mode,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+            &mut ws.cursor_pet,
+        );
+        let words_suspended = exact_focus.alternate_screen && suppress_alt;
         if load_shed {
             // Load shedding owns the complete decorative surface. Undo the
             // companion presentation opportunity sampled above at the same
@@ -2647,11 +2817,9 @@ impl App {
             ws.nova_scratch.clear();
             ws.word_decos.begin_host_frame();
 
-            // This capture is still the surface's presentation boundary even
-            // when there is no word scanner to consume the damage epoch.
-            term.take_damage();
-            let cpos = term.cursor();
-            let cur = (live_viewport && term.cursor_visible()).then_some((cpos.row, cpos.col));
+            // The authorized extraction already consumed this capture's exact
+            // damage session, even when no word scanner is enabled.
+            let cur = exact_focus.cursor;
             let pet_sense = aterm_effects::kitty_pet::PetSense {
                 now,
                 caret: if pet_caret_live { cur } else { None },
@@ -2662,15 +2830,10 @@ impl App {
                 reduced_motion: !animate_cat,
                 output_burst: false,
                 pointer: None,
+                // Present-owned frame-over-frame diffs (burst, wrap fact)
+                // stay inert in a capture — see the composed capture's law.
+                wrapped: false,
             };
-            // The switch (`retire_pet_without_owner`) — the twin of the
-            // composed capture arm's call above.
-            crate::app_render::retire_pet_without_owner(
-                pet_mode,
-                glow_cfg.enabled && cursor_companions_allowed,
-                glow_cfg.style,
-                &mut ws.cursor_pet,
-            );
             let pet = if windowless {
                 ws.cursor_pet.tick_static_capture(pet_sense)
             } else {
@@ -2683,6 +2846,8 @@ impl App {
                 effect_geom,
                 cur,
                 pet_on_glass && pet.alpha > 0,
+                // A CAPTURE: never a spent hello (`sync_pet_companion_look`).
+                false,
                 pet,
                 cat_frame,
                 kitty_alpha,
@@ -2692,7 +2857,6 @@ impl App {
                 cursor_color,
                 glow_cfg.accent,
             );
-            drop(term);
             crate::app_render::splice_word_deco_channels(ws);
             return;
         }
@@ -2704,11 +2868,8 @@ impl App {
         // suppression) before the rescan/tick read the clock — a no-op when
         // not frozen. Mirrors app_render's thaw-before-rescan ordering.
         ws.word_decos.thaw(now);
-        let epoch = term.damage_epoch();
-        let word_cursor = (term.grid().display_offset() == 0).then(|| {
-            let cursor = term.cursor();
-            (cursor.row, cursor.col)
-        });
+        let epoch = ws.input_scratch.snapshot_seq;
+        let word_cursor = live_viewport.then_some(grid_cursor);
         if ws.word_decos.needs_rescan(epoch) {
             // A normal application-present consumes `pending_deco_birth`. If the
             // stamp is still here, capture is this episode's first observable
@@ -2734,23 +2895,15 @@ impl App {
                 prime_at = Some(birth);
             }
         }
-        // Consume the damage session (the capture IS this surface's present).
-        // The epoch latch (`Terminal::damage_epoch` counts at most once per
-        // session, re-armed only by `take_damage`) is otherwise never re-armed
-        // in HEADLESS mode — no OS window means `redraw_window` never runs —
-        // so after the first capture the epoch froze forever: `clear` + new
-        // output kept the OLD occurrences (stale cats painted over new text)
-        // and newly typed words never decorated. A windowed present is
-        // unaffected: its early-out compares epoch VALUES, and the main
-        // thread serializes captures against `redraw_window`.
-        term.take_damage();
+        // The capture preparation consumed this exact damage session while it
+        // still held the sync-authorized extraction lock. Relocking here would
+        // risk swallowing a newer partial DEC-2026 episode.
         // The capture tick shares the window's live effect state, so it must
         // preserve app-present phase parity: the same cursor cell (§5.8 gaze — read
         // under this same lock) and the window's real focus (so a capture
         // never clobbers a focused window's armed blink one-shot, and a
         // headless/unfocused capture arms nothing).
-        let cpos = term.cursor();
-        let cur = (live_viewport && term.cursor_visible()).then_some((cpos.row, cpos.col));
+        let cur = exact_focus.cursor;
         // THE PET BRAIN TICKS on the capture too — the capture shares the
         // window's live effect state (the composed capture arm has always
         // ticked it), and the suppression below needs the animal's LIVE body,
@@ -2767,15 +2920,8 @@ impl App {
             // A capture is one isolated frame — see the windowed capture arm.
             output_burst: false,
             pointer: None,
+            wrapped: false,
         };
-        // The switch (`retire_pet_without_owner`) — the twin of the composed
-        // capture arm's call.
-        crate::app_render::retire_pet_without_owner(
-            pet_mode,
-            glow_cfg.enabled && cursor_companions_allowed,
-            glow_cfg.style,
-            &mut ws.cursor_pet,
-        );
         let pet = if windowless {
             ws.cursor_pet.tick_static_capture(pet_sense)
         } else {
@@ -2788,27 +2934,26 @@ impl App {
         // same single cat the glass does, not the pre-fix pair. The pet counts
         // as the companion too (the windowed present's rule), and hands in its
         // live drawn body as the pixel-yield box.
-        let companion_at = cur.filter(|_| kitty_alpha > 0 || pet_on_glass).map(|cell| {
-            crate::word_decorations::CompanionOnGlass {
-                cell,
-                body_px: pet_on_glass
-                    .then(|| {
-                        pet.body_px(
-                            effect_geom.cell_w,
-                            effect_geom.cell_h,
-                            effect_geom.cols,
-                            effect_geom.rows,
-                        )
-                    })
-                    .flatten(),
-            }
-        });
+        let companion_at = crate::app_render::cursor_companion_on_glass(
+            cur,
+            kitty_alpha,
+            pet_on_glass
+                .then(|| {
+                    pet.body_px(
+                        effect_geom.cell_w,
+                        effect_geom.cell_h,
+                        effect_geom.cols,
+                        effect_geom.rows,
+                    )
+                })
+                .flatten(),
+        );
         // The same selection view the animated tick sees (§6.4 nova ignition
         // deferral / per-quad attenuation) — a capture must not ignite a nova
         // the window itself would defer.
         let sel_view = crate::word_decorations::SelView {
-            sel: term.text_selection(),
-            display_offset: term.grid().display_offset() as i32,
+            sel: &ws.input_scratch.selection,
+            display_offset: ws.input_scratch.display_offset,
         };
         let mut primed_wince_hits = 0u8;
         if let Some(birth) = prime_at {
@@ -2869,7 +3014,7 @@ impl App {
         // never the companion, so no `on_collect` hello can start from a
         // capture either.
         self.kitty_log.observe_ambient(
-            front_terminal.session,
+            exact_focus.session,
             ws.word_decos.drain_kitty_sightings(),
             lexicon,
             now,
@@ -2903,6 +3048,8 @@ impl App {
             effect_geom,
             cur,
             pet_on_glass,
+            // A CAPTURE: never a spent hello (`sync_pet_companion_look`).
+            false,
             pet,
             cat_frame,
             kitty_alpha,
@@ -2912,7 +3059,6 @@ impl App {
             cursor_color,
             glow_cfg.accent,
         );
-        drop(term);
         ws.input_scratch
             .word_decorations
             .clone_from(&ws.deco_scratch);
@@ -2959,7 +3105,7 @@ impl App {
         if capture_ticks_cursor_fx(has_os_window, recording_here) {
             crate::app_render::ComposedCursorFxClock::Advance(now)
         } else {
-            crate::app_render::ComposedCursorFxClock::Retain
+            crate::app_render::ComposedCursorFxClock::Retain { observed_at: now }
         }
     }
 
@@ -2968,41 +3114,246 @@ impl App {
     /// in the exact pane extraction loop that built `input_scratch`; the
     /// synchronous present barrier guarantees no later staged frame can replace
     /// either half before this function runs.
-    fn presented_terminal_capture_grid(
+    pub(crate) fn presented_terminal_capture_grid(
         &self,
         wid: crate::WindowId,
     ) -> Option<crate::app_render::TerminalCaptureGrid> {
+        let mut grid = crate::app_render::TerminalCaptureGrid {
+            composed: false,
+            focus: None,
+            leaves: Vec::new(),
+        };
         let crate::VisibleContentRoute::Terminal { composed } =
             self.active_visible_content_route(wid)?
         else {
             return None;
         };
         let plan = self.active_visible_leaf_plan(wid)?;
-        let window = self.windows.get(&wid)?;
+        self.refill_presented_terminal_capture_grid(wid, composed, &plan, &mut grid)
+            .then_some(grid)
+    }
+
+    /// Allocation-reusing twin used by the 60fps recording success hook.
+    fn refill_presented_terminal_capture_grid(
+        &self,
+        wid: crate::WindowId,
+        composed: bool,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        grid: &mut crate::app_render::TerminalCaptureGrid,
+    ) -> bool {
+        let Some(window) = self.windows.get(&wid) else {
+            return false;
+        };
         if plan.leaves.is_empty() || plan.leaves.len() != window.capture_leaf_snapshot_seqs.len() {
-            return None;
+            return false;
         }
-        let leaves = plan
-            .leaves
-            .iter()
-            .zip(&window.capture_leaf_snapshot_seqs)
-            .map(|(leaf, snapshot_seq)| {
-                let crate::tab_model::View::Terminal(terminal) =
-                    self.view_store.get(leaf.view).copied()?
-                else {
-                    return None;
-                };
-                Some(crate::app_render::TerminalCaptureLeaf {
-                    view: leaf.view,
-                    session: terminal.session,
+        grid.composed = composed;
+        grid.focus = None;
+        grid.leaves.clear();
+        for (leaf, snapshot_seq) in plan.leaves.iter().zip(&window.capture_leaf_snapshot_seqs) {
+            let Some(crate::tab_model::View::Terminal(terminal)) =
+                self.view_store.get(leaf.view).copied()
+            else {
+                grid.leaves.clear();
+                return false;
+            };
+            grid.leaves.push(crate::app_render::TerminalCaptureLeaf {
+                view: leaf.view,
+                session: terminal.session,
+                focused: leaf.focused,
+                rows: (leaf.rect.size.height.round() as usize).max(1),
+                cols: (leaf.rect.size.width.round() as usize).max(1),
+                snapshot_seq: *snapshot_seq,
+            });
+        }
+        true
+    }
+
+    fn recording_card_identity(
+        card: Option<&crate::SettingsCard>,
+    ) -> Option<crate::VideoPresentedCardIdentity> {
+        card.map(|card| crate::VideoPresentedCardIdentity {
+            width: card.pw,
+            height: card.ph,
+            x: card.dx,
+            y: card.dy,
+            model: card.fp,
+            geometry: card.geom,
+        })
+    }
+
+    /// Compact identity of every leaf in a native/mixed frame. Later stills
+    /// compare this exact list before consulting retained native caches; a
+    /// staged tab/layout/document change therefore defers instead of pairing
+    /// the recording's resident input with newer semantic metadata.
+    fn refill_recording_native_leaf_identities(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        identities: &mut Vec<crate::VideoPresentedLeafIdentity>,
+    ) -> Option<bool> {
+        let window = self.windows.get(&wid)?;
+        let (cell_w, cell_h) = self.win_cell_size(wid);
+        let mut changed = identities.len() != plan.leaves.len();
+        for (index, leaf) in plan.leaves.iter().enumerate() {
+            let retained = window.leaf_render_cache.get(&leaf.view)?;
+            let identity = match self.view_store.get(leaf.view).copied()? {
+                crate::tab_model::View::Terminal(terminal) => crate::VideoPresentedLeafIdentity {
+                    kind: "terminal",
+                    view: leaf.view.get(),
+                    session: Some(terminal.session),
                     focused: leaf.focused,
-                    rows: (leaf.rect.size.height.round() as usize).max(1),
-                    cols: (leaf.rect.size.width.round() as usize).max(1),
-                    snapshot_seq: *snapshot_seq,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(crate::app_render::TerminalCaptureGrid { composed, leaves })
+                    width: (leaf.rect.size.width * cell_w as f32).round().max(1.0) as u32,
+                    height: (leaf.rect.size.height * cell_h as f32).round().max(1.0) as u32,
+                    snapshot_seq: Some(retained.input.snapshot_seq),
+                    native_stamp: None,
+                },
+                crate::tab_model::View::Native(_) => {
+                    let raster = retained.native.as_ref()?;
+                    crate::VideoPresentedLeafIdentity {
+                        kind: "native",
+                        view: leaf.view.get(),
+                        session: None,
+                        focused: leaf.focused,
+                        width: raster.width,
+                        height: raster.height,
+                        snapshot_seq: None,
+                        native_stamp: Some(raster.stamp),
+                    }
+                }
+            };
+            if let Some(slot) = identities.get_mut(index) {
+                changed |= *slot != identity;
+                *slot = identity;
+            } else {
+                identities.push(identity);
+                changed = true;
+            }
+        }
+        identities.truncate(plan.leaves.len());
+        Some(changed)
+    }
+
+    /// Commit the lightweight semantic half of the just-successful video
+    /// present. The GPU's resident input is identified, not copied: explicit
+    /// still/snapshot consumers pay the one owned clone later.
+    pub(crate) fn commit_recording_presented_meta(
+        &mut self,
+        wid: crate::WindowId,
+        route: crate::VisibleContentRoute,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+        if !self.video_rec.as_ref().is_some_and(|rec| rec.window == wid) {
+            return;
+        }
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        let input_epoch = match &window.present {
+            Some(
+                crate::PresentTarget::Gpu { window_gpu, .. }
+                | crate::PresentTarget::Virtual { window_gpu },
+            ) => window_gpu.resident_input_epoch(),
+            _ => 0,
+        };
+        if input_epoch == 0 || input_epoch == u64::MAX {
+            return;
+        }
+        let serial = window.capture_present_serial;
+        let invert = window.capture_present_invert;
+        let overlay = window.capture_present_overlay;
+        let metrics = window.metrics;
+        let cell_size = self.win_cell_size(wid);
+        let destination_height = window.win_px.map(|size| size.height.max(1) as usize);
+        let overlay_fingerprint = window
+            .last_present
+            .map_or_else(|| window.overlay_fp(), |key| key.settings_fp);
+        let card = Self::recording_card_identity(window.present_card());
+        let theme = crate::VideoPresentedThemeIdentity {
+            fg: self.theme.fg,
+            bg: self.theme.bg,
+            cursor: self.theme.cursor,
+            selection: self.theme.selection,
+        };
+        let blink_phase = window.blink_phase;
+        let cursor_override = (!window.focused && window.os_window.is_some())
+            .then_some(aterm_core::terminal::CursorStyle::HollowBlock);
+        let selection_inactive = self.render_knobs.selection_inactive && !window.focused;
+        let previous = self
+            .video_rec
+            .as_mut()
+            .filter(|recording| recording.window == wid)
+            .and_then(|recording| recording.presented.take());
+        let (mut terminal_grid, mut native_leaves) = previous.map_or_else(
+            || {
+                (
+                    crate::app_render::TerminalCaptureGrid {
+                        composed: false,
+                        focus: None,
+                        leaves: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+            },
+            |mut previous| {
+                (
+                    previous.terminal_grid.take().unwrap_or(
+                        crate::app_render::TerminalCaptureGrid {
+                            composed: false,
+                            focus: None,
+                            leaves: Vec::new(),
+                        },
+                    ),
+                    previous.native_leaves.take().unwrap_or_default(),
+                )
+            },
+        );
+
+        let terminal_grid = if let crate::VisibleContentRoute::Terminal { composed } = route {
+            if !self.refill_presented_terminal_capture_grid(wid, composed, plan, &mut terminal_grid)
+            {
+                return;
+            }
+            Some(terminal_grid)
+        } else {
+            None
+        };
+        let native_leaves = if route.has_visible_native() {
+            let Some(_) =
+                self.refill_recording_native_leaf_identities(wid, plan, &mut native_leaves)
+            else {
+                return;
+            };
+            Some(native_leaves)
+        } else {
+            None
+        };
+
+        let presented = crate::VideoPresentedMeta {
+            input_epoch,
+            route,
+            serial,
+            invert,
+            overlay,
+            terminal_grid,
+            metrics,
+            cell_size,
+            destination_height,
+            theme,
+            overlay_fingerprint,
+            blink_phase,
+            cursor_override,
+            selection_inactive,
+            card,
+            native_leaves,
+        };
+        if let Some(recording) = self
+            .video_rec
+            .as_mut()
+            .filter(|recording| recording.window == wid)
+        {
+            recording.presented = Some(presented);
+        }
     }
 
     /// Clone the staged model only when a successful-present serial proves it
@@ -3021,6 +3372,8 @@ impl App {
             overlay: presented.overlay,
             serial: presented.serial,
             cell_size: self.win_cell_size(wid),
+            theme_fingerprint: self.image_theme_fingerprint(),
+            overlay_fingerprint: self.windows.get(&wid)?.overlay_fp(),
         })
     }
 
@@ -3043,6 +3396,226 @@ impl App {
             input: window.input_scratch.clone(),
             invert: window.capture_present_invert,
             overlay: window.capture_present_overlay,
+            serial,
+        })
+    }
+
+    /// Resolve the recording loop's latest successful application present.
+    ///
+    /// The lightweight metadata is committed only after video submission
+    /// succeeds; the large input stays resident in `WindowGpu`. Every encode
+    /// attempt advances that resident epoch, so a later failed or in-flight
+    /// attempt makes the old metadata non-consumable instead of letting a still
+    /// pair old semantics with newer pixels. Explicit captures alone pay the
+    /// owned `RenderInput` clone.
+    fn recording_presented_frame_capture(
+        &self,
+        wid: crate::WindowId,
+        include_terminal_grid: bool,
+        include_native_metadata: bool,
+    ) -> Result<RecordingPresentedFrame, String> {
+        let recording = self
+            .video_rec
+            .as_ref()
+            .filter(|recording| recording.window == wid)
+            .ok_or_else(|| "image has no active recording for this window".to_string())?;
+        let presented = recording
+            .presented
+            .as_ref()
+            .ok_or_else(|| "image deferred: recording has not presented a frame yet".to_string())?;
+        let window = self
+            .windows
+            .get(&wid)
+            .ok_or_else(|| "image deferred: recorded window closed before capture".to_string())?;
+
+        let current_route = self.active_visible_content_route(wid);
+        let current_plan = self
+            .active_visible_leaf_plan(wid)
+            .ok_or_else(|| "image deferred: recording layout changed before capture".to_string())?;
+        let current_destination_height = window.win_px.map(|size| size.height.max(1) as usize);
+        let current_card = Self::recording_card_identity(window.present_card());
+        let current_theme = crate::VideoPresentedThemeIdentity {
+            fg: self.theme.fg,
+            bg: self.theme.bg,
+            cursor: self.theme.cursor,
+            selection: self.theme.selection,
+        };
+        let current_cursor_override = (!window.focused && window.os_window.is_some())
+            .then_some(aterm_core::terminal::CursorStyle::HollowBlock);
+        let current_selection_inactive = self.render_knobs.selection_inactive && !window.focused;
+        if current_route != Some(presented.route)
+            || window.capture_present_serial != presented.serial
+            || window.metrics != presented.metrics
+            || self.win_cell_size(wid) != presented.cell_size
+            || current_destination_height != presented.destination_height
+            || current_theme != presented.theme
+            || window.overlay_fp() != presented.overlay_fingerprint
+            || window.blink_phase != presented.blink_phase
+            || current_cursor_override != presented.cursor_override
+            || current_selection_inactive != presented.selection_inactive
+            || current_card != presented.card
+        {
+            return Err(
+                "image deferred: recording frame geometry or chrome changed before capture"
+                    .to_string(),
+            );
+        }
+
+        if let Some(grid) = presented.terminal_grid.as_ref() {
+            if current_plan.leaves.len() != grid.leaves.len()
+                || !current_plan
+                    .leaves
+                    .iter()
+                    .zip(&grid.leaves)
+                    .all(|(leaf, captured)| {
+                        let session = match self.view_store.get(leaf.view).copied() {
+                            Some(crate::tab_model::View::Terminal(terminal)) => terminal.session,
+                            _ => return false,
+                        };
+                        leaf.view == captured.view
+                            && session == captured.session
+                            && leaf.focused == captured.focused
+                            && (leaf.rect.size.height.round() as usize).max(1) == captured.rows
+                            && (leaf.rect.size.width.round() as usize).max(1) == captured.cols
+                    })
+            {
+                return Err(
+                    "image deferred: recording terminal layout changed before capture".to_string(),
+                );
+            }
+        } else if matches!(presented.route, crate::VisibleContentRoute::Terminal { .. }) {
+            return Err("image deferred: recorded terminal inventory is unavailable".to_string());
+        }
+
+        if presented.route.has_visible_native() {
+            let expected = presented.native_leaves.as_ref().ok_or_else(|| {
+                "image deferred: recorded native inventory is unavailable".to_string()
+            })?;
+            let mut current = Vec::with_capacity(expected.len());
+            self.refill_recording_native_leaf_identities(wid, &current_plan, &mut current)
+                .ok_or_else(|| {
+                    "image deferred: recording native layout changed before capture".to_string()
+                })?;
+            if &current != expected {
+                return Err(
+                    "image deferred: recording native content changed before capture".to_string(),
+                );
+            }
+        }
+
+        let native_metadata = if include_native_metadata && presented.route.has_visible_native() {
+            Some(self.native_image_metadata(wid, "presented", Some(presented.serial), 0, 0, 0)?)
+        } else {
+            None
+        };
+
+        let window_gpu = match window.present.as_ref() {
+            Some(
+                crate::PresentTarget::Gpu { window_gpu, .. }
+                | crate::PresentTarget::Virtual { window_gpu },
+            ) => window_gpu,
+            _ => {
+                return Err("image deferred: recording resident frame is unavailable".to_string());
+            }
+        };
+        let (mut input, effects_transport_shift_y) = window_gpu
+            .clone_resident_input_with_transport_at(presented.input_epoch)
+            .ok_or_else(|| {
+                "image deferred: recording advanced before capture could clone its frame"
+                    .to_string()
+            })?;
+        if effects_transport_shift_y != 0 {
+            let canonical_shift = effects_transport_shift_y.checked_neg().ok_or_else(|| {
+                "image deferred: recording effect transport shift is invalid".to_string()
+            })?;
+            if !crate::try_shift_window_absolute_effects_y(&mut input, canonical_shift) {
+                return Err(
+                    "image deferred: recording effect transport could not be canonicalized"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(RecordingPresentedFrame {
+            frame: PresentedFrameCapture {
+                input,
+                invert: presented.invert,
+                overlay: presented.overlay,
+                serial: presented.serial,
+            },
+            terminal_grid: include_terminal_grid
+                .then(|| presented.terminal_grid.clone())
+                .flatten(),
+            cell_size: presented.cell_size,
+            theme_fingerprint: self.image_theme_fingerprint(),
+            overlay_fingerprint: presented.overlay_fingerprint,
+            native_metadata,
+        })
+    }
+
+    /// Read the CURRENT persistent VirtualTarget without forcing another
+    /// present. The application serial binds the frontend success seam and the
+    /// GPU's submitted-input epoch binds the target generation. Live knob,
+    /// chrome and layout state are intentionally irrelevant to these extant
+    /// pixels; semantic callers validate those separately when they need
+    /// metadata, text, or a clean reraster.
+    fn recording_presented_destination_capture(
+        &mut self,
+        wid: crate::WindowId,
+    ) -> Result<RecordingPresentedDestination, String> {
+        let (input_epoch, serial, route) = {
+            let recording = self
+                .video_rec
+                .as_ref()
+                .filter(|recording| recording.window == wid)
+                .ok_or_else(|| "image has no active recording for this window".to_string())?;
+            let presented = recording.presented.as_ref().ok_or_else(|| {
+                "image deferred: recording has not presented a frame yet".to_string()
+            })?;
+            (presented.input_epoch, presented.serial, presented.route)
+        };
+        let window = self
+            .windows
+            .get(&wid)
+            .ok_or_else(|| "image deferred: recorded window closed before capture".to_string())?;
+        if window.capture_present_serial != serial {
+            return Err(
+                "image deferred: recording destination advanced before capture".to_string(),
+            );
+        }
+        if window.os_window.is_some() {
+            return Err(
+                "image deferred: recording destination is not a headless virtual target"
+                    .to_string(),
+            );
+        }
+
+        let App {
+            backend, windows, ..
+        } = self;
+        let gpu = backend.gpu_mut().ok_or_else(|| {
+            "image deferred: recording virtual GPU backend is unavailable".to_string()
+        })?;
+        let window_gpu = match windows.get(&wid).and_then(|window| window.present.as_ref()) {
+            Some(crate::PresentTarget::Virtual { window_gpu }) => window_gpu,
+            _ => {
+                return Err(
+                    "image deferred: recording virtual destination is unavailable".to_string(),
+                );
+            }
+        };
+        let captured = gpu.virtual_presented_snapshot_current(
+            window_gpu,
+            input_epoch,
+            crate::metrics::now_us(),
+        )?;
+        let client = crate::PresentedClientFrame {
+            width: captured.w,
+            height: captured.h,
+            rgba: captured.rgba,
+        };
+        Ok(RecordingPresentedDestination {
+            frame: snapshot_frame_from_presented_client(&client)?,
+            route,
             serial,
         })
     }
@@ -3144,14 +3717,16 @@ impl App {
     /// WINDOWED target keeps its last-present quads. `image plain` still strips
     /// the spliced layers via `clear_overlays` downstream, and this runs BEFORE
     /// `splice_tab_strip` (the strip shifts the quads down with the grid).
+    #[cfg(test)]
     fn splice_cursor_fx(&mut self, wid: crate::WindowId, now: Instant) {
-        // SPLIT TABS (split-pane audit): the headless capture tick drives the
+        // LEGACY TEST HELPER: the headless capture tick below drives the
         // SINGLE-PANE effect machinery (front-terminal cursor, window-content
         // coords) — on a composed multi-pane frame its quads would land at
         // un-offset positions over the composite. A windowed capture keeps
         // its last-present quads (already composed-correct) via the gate
-        // inside; the composed HEADLESS capture skips the tick and stays
-        // effect-free — honest, never wrong-place light.
+        // inside, while shipping composed captures use the composed preparation
+        // path instead of this helper. Keep this helper split-gated so tests can
+        // never stamp single-pane coordinates onto a composed frame.
         if self
             .active_tree(wid)
             .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
@@ -3196,6 +3771,7 @@ impl App {
             let is_alt = term.is_alternate_screen();
             // Invalidation resets engine context; apply it before this exact
             // capture re-feeds alt/blink state below.
+            sync_cursor_effect_coordinate_space(ws, term.render_identity(), is_alt);
             let scroll_change = sync_cursor_effect_scroll(ws, content_scroll_state);
             // REPAINT-BLINK edge + context feed — the windowed LOCK A
             // detector's twin, so a headless capture classifies the same.
@@ -3213,6 +3789,12 @@ impl App {
             }
             ws.cursor_glow.note_context(is_alt);
             ws.cursor_trail.note_context(is_alt);
+            // `splice_cursor_fx` only ticks a single/zoomed pane, in the
+            // capture grid's zero-based coordinate space. Restamp that shape
+            // explicitly so a prior composed-frame offset cannot survive a
+            // split/zoom transition and misclassify the physical margin.
+            ws.cursor_glow.note_pane_columns(0, cols);
+            ws.cursor_trail.note_pane_columns(0, cols);
             let blink_recent = ws.last_blink_at.is_some_and(|t| {
                 now.saturating_duration_since(t) <= crate::app_render::BLINK_RECENT_MAX
             });
@@ -3258,6 +3840,7 @@ impl App {
                     crate::app_render::terminal_blank_cell(&term).fg,
                 ),
                 row_probe,
+                row_probe_neighbors: None,
             }
         };
         let Some(fx) = self.tick_cursor_fx(wid, inputs) else {
@@ -3294,16 +3877,17 @@ impl App {
         ws.input_scratch
             .fire_halo
             .extend_from_slice(ws.cursor_glow.halo_cells());
-        // The full fill-override chain, mirroring `redraw_window`'s splice (the
-        // styles are mutually exclusive, so at most one is ever `Some`).
-        ws.input_scratch.cursor_fill_override = fx
-            .rainbow_fill
-            .or(fx.forge_fill)
-            .or(fx.bolt_fill)
-            .or(fx.phaser_fill)
-            .or(fx.comet_fill)
-            .or(fx.droplet_fill)
-            .or(fx.beamrod_fill);
+        // Shape and the canonical resolved fill, mirroring `redraw_window`.
+        // `tick_cursor_fx` already applied precedence and presentation opacity;
+        // rebuilding the seven raw candidates here would bypass the shed fade.
+        ws.input_scratch.cursor_effect_style_override = if fx.bolt_cursor {
+            Some(aterm_core::terminal::CursorStyle::Bolt)
+        } else if fx.twinkle_cursor {
+            Some(aterm_core::terminal::CursorStyle::SteadyBlock)
+        } else {
+            None
+        };
+        ws.input_scratch.cursor_fill_override = fx.block_fill.map(|owned| owned.fill);
         ws.input_scratch.cursor_trail.clone_from(&ws.trail_scratch);
         ws.input_scratch.cursor_trail_color = fx.trail_color;
     }
@@ -3407,11 +3991,41 @@ impl App {
         // is the one a boot-built device would have written. No-op everywhere
         // else (windowed, and headless once redeemed or declined).
         self.ensure_pixel_backend();
-        let strip_rows = self.tab_strip_rows as usize;
+        let strip_rows = usize::from(self.chrome_rows());
         let has_os_window = self
             .windows
             .get(&front)
             .is_some_and(|window| window.os_window.is_some());
+        let recording_presented = if !has_os_window
+            && self
+                .video_rec
+                .as_ref()
+                .is_some_and(|recording| recording.window == front)
+        {
+            match self.recording_presented_frame_capture(front, false, false) {
+                Ok(presented) => Some(presented),
+                Err(error) => {
+                    eprintln!("aterm-gui: snapshot deferred: {error}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let recording_destination = if recording_presented.is_some() {
+            match self.recording_presented_destination_capture(front) {
+                Ok(destination) => Some(destination),
+                Err(error) => {
+                    eprintln!("aterm-gui: snapshot deferred: {error}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let route = recording_destination
+            .as_ref()
+            .map_or(route, |presented| presented.route);
         let exact_presented = if has_os_window {
             let has_gpu_surface = self.windows.get(&front).is_some_and(|window| {
                 matches!(window.present, Some(crate::PresentTarget::Gpu { .. }))
@@ -3444,7 +4058,8 @@ impl App {
         };
         let presented = exact_presented
             .as_ref()
-            .map(|presented| presented.frame.clone());
+            .map(|presented| presented.frame.clone())
+            .or_else(|| recording_presented.map(|presented| presented.frame));
         if presented.is_none() {
             // Headless has no surface destination to copy. Stage one
             // zoom-aware semantic-renderer artifact; this path intentionally
@@ -3457,9 +4072,9 @@ impl App {
                     // live default background), never the front pane stretched over the
                     // window. Single-pane keeps the historical front-terminal refill,
                     // byte-for-byte. The pass takes the presentation path's grid without
-                    // its semantics: it consumes no damage, reconciles no predictions,
-                    // and stamps no present. Only the cursor-effect clock advances —
-                    // a glass-less window has no present to advance it.
+                    // its semantics: it reconciles no predictions and stamps no
+                    // glass present. The advancing headless arm consumes exactly
+                    // the damage paired with this explicit present-real capture.
                     let capture_now = Instant::now();
                     let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
                     let Some(capture_grid) =
@@ -3467,13 +4082,13 @@ impl App {
                     else {
                         return;
                     };
-                    if !capture_grid.composed {
-                        self.splice_cursor_fx(front, capture_now);
-                    }
+                    let Some(capture_focus) = capture_grid.focus else {
+                        return;
+                    };
                     // Both one-pane and composed captures need the companion
                     // splice. The helper dispatches the split path itself and
                     // retains (rather than advances) under a recording owner.
-                    self.splice_word_decorations(front, capture_now);
+                    self.splice_word_decorations_sampled(front, capture_now, capture_focus);
                     self.splice_tab_strip(front);
                     self.splice_find_bar(front);
                     self.splice_settings_panel(front);
@@ -3512,6 +4127,11 @@ impl App {
             }
             self.splice_config_notice(front);
             self.splice_paste_banner(front);
+            // A capture that omitted the link caption would tell a driving AI a
+            // hyperlink is undisclosed while a human is reading its destination.
+            // Last of the row bands, as on the presentation routes: it takes
+            // only a row no other band declared.
+            self.splice_link_target(front);
             // C5: the open tab context menu is the topmost chrome on the glass,
             // so it must be the topmost chrome in the capture too — an
             // introspection frame that omits it would tell a driving AI the
@@ -3523,12 +4143,23 @@ impl App {
             Some(ws) => ws.cols as usize,
             None => return,
         };
-        let mut capture_input = presented.as_ref().map_or_else(
-            || self.windows[&front].input_scratch.clone(),
-            |presented| presented.input.clone(),
-        );
+        let presented_visuals = presented
+            .as_ref()
+            .map(|presented| (presented.invert, presented.overlay));
+        let mut capture_input = match presented {
+            Some(presented) => presented.input,
+            None => self.windows[&front].input_scratch.clone(),
+        };
         let text = self.snapshot_visible_text(front, route, &capture_input, strip_rows, cols);
-        if let Some(exact) = exact_presented {
+        if let Some(recording_destination) = recording_destination {
+            self.submit_encode_job(EncodeJob::Snapshot {
+                frame: recording_destination.frame,
+                text,
+                transaction,
+            });
+            return;
+        }
+        if let Some(exact) = exact_presented.as_ref() {
             let frame = match snapshot_frame_from_presented_client(&exact.client) {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -3612,15 +4243,15 @@ impl App {
         // app-owned transient state. Suppress it under any modal overlay, as the
         // application-present path does. The compositor and scanout remain
         // outside this comparison.
-        let invert = presented.as_ref().map_or_else(
+        let invert = presented_visuals.map_or_else(
             || ws.bell_flash.is_active(Instant::now()) && !ws.overlay_open(),
-            |presented| presented.invert,
+            |(invert, _)| invert,
         );
         apply_bell_invert(&mut frame, invert);
         // Match application-present drop-target/LEVEL-UP overlay composition so
         // capture preserves the same app-owned transient state. Suppressed under
         // a modal, matching the live `!overlay_open` gate.
-        let retained_overlay = presented.as_ref().and_then(|presented| presented.overlay);
+        let retained_overlay = presented_visuals.and_then(|(_, overlay)| overlay);
         if let Some(overlay) = retained_overlay {
             apply_overlay_at(
                 &mut frame.pixels,
@@ -3632,7 +4263,7 @@ impl App {
                 frame.height,
                 overlay,
             );
-        } else if presented.is_none() {
+        } else if presented_visuals.is_none() {
             if ws.drag_hover && !ws.overlay_open() {
                 apply_drop_overlay(&mut frame.pixels, frame.width, frame.height, accent);
             } else if !ws.overlay_open()
@@ -3746,6 +4377,8 @@ impl App {
             front,
             clean,
             presented,
+            presented_metadata,
+            exact_frame,
             target,
             want_bytes,
             want_metadata,
@@ -3761,12 +4394,28 @@ impl App {
         // the caller: this is the entry the direct (test) callers use, and a second
         // call from `render_image` is a no-op.
         self.ensure_pixel_backend();
-        if presented.is_none() {
+        let exact_frame = (!clean).then_some(exact_frame).flatten();
+        if presented.is_none() && exact_frame.is_none() {
             let prepared = match self.active_visible_content_route(front) {
                 Some(crate::VisibleContentRoute::Heterogeneous) => {
                     let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
-                    self.prepare_heterogeneous_input_scratch_with_cursor_fx(front, Some(clock))
-                        .is_some()
+                    match self.prepare_heterogeneous_input_scratch_with_cursor_fx_outcome(
+                        front,
+                        Some(clock),
+                    ) {
+                        crate::app_render::CapturePreparation::Ready(_) => true,
+                        crate::app_render::CapturePreparation::Held { retry_at } => {
+                            let retry_ms = retry_at
+                                .saturating_duration_since(Instant::now())
+                                .as_millis()
+                                .max(1);
+                            let _ = reply.send(Err(format!(
+                                "image deferred: synchronized terminal update in progress; retry after {retry_ms} ms"
+                            )));
+                            return;
+                        }
+                        crate::app_render::CapturePreparation::Unavailable => false,
+                    }
                 }
                 Some(crate::VisibleContentRoute::Native { .. }) => {
                     self.prepare_native_input_scratch(front)
@@ -3789,89 +4438,98 @@ impl App {
             // diagnostic cells afterward, exactly like the application-present path.
             self.splice_config_notice(front);
             self.splice_paste_banner(front);
+            self.splice_link_target(front);
             // C5 — topmost chrome; see the `chrome`-capture route above.
             self.splice_tab_menu(front);
         }
-        let visuals = presented.as_ref().map_or_else(
-            || self.host_visual_state(front, Instant::now()),
-            |presented| crate::app_render::HostVisualState {
-                invert: presented.invert,
-                overlay: presented.overlay,
-            },
-        );
-        let phase = if presented.is_some() {
+        let (presented_visuals, capture_serial, mut capture_input) = match presented {
+            Some(presented) => (
+                Some(crate::app_render::HostVisualState {
+                    invert: presented.invert,
+                    overlay: presented.overlay,
+                }),
+                Some(presented.serial),
+                presented.input,
+            ),
+            None => (None, None, self.windows[&front].input_scratch.clone()),
+        };
+        let visuals =
+            presented_visuals.unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
+        let phase = if presented_visuals.is_some() {
             "presented"
         } else {
             "staged"
         };
-        let capture_serial = presented.as_ref().map(|presented| presented.serial);
-        let mut capture_input = presented.as_ref().map_or_else(
-            || self.windows[&front].input_scratch.clone(),
-            |presented| presented.input.clone(),
-        );
         if clean {
             capture_input.clear_overlays();
         }
-        let tray_floor_y = self.config_notice_tray_floor_y(front);
-        self.bind_window_renderer_state(front);
-        let render_t0 = Instant::now();
-        let App {
-            backend,
-            introspect_gpu,
-            windows,
-            ..
-        } = self;
-        let Some(ws) = windows.get_mut(&front) else {
-            let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-            return;
-        };
-        let crate::WindowState {
-            route_card,
-            settings_card,
-            conn_wire_card,
-            level_up_card,
-            notice_card,
-            badge_card,
-            win_px,
-            ..
-        } = ws;
-        let tray_arg = route_card
-            .as_ref()
-            .or(settings_card.as_ref())
-            .or(conn_wire_card.as_ref())
-            .or(level_up_card.as_ref())
-            .or(notice_card.as_ref())
-            .or(badge_card.as_ref())
-            .and_then(|card| tray_quad_below_y(card, tray_floor_y));
-        let destination_height = win_px.map(|size| size.height.max(1) as usize);
-        let mut frame = match backend.render_input_for_destination(
-            introspect_gpu,
-            &mut capture_input,
-            tray_arg,
-            destination_height,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                let _ = reply.send(Err(error));
+        let frame = if let Some(frame) = exact_frame {
+            // Already post-blit/post-crown/post-chrome. Re-applying any live
+            // renderer or host state here would corrupt exact-present semantics.
+            frame
+        } else {
+            let tray_floor_y = self.config_notice_tray_floor_y(front);
+            self.bind_window_renderer_state(front);
+            let render_t0 = Instant::now();
+            let App {
+                backend,
+                introspect_gpu,
+                windows,
+                ..
+            } = self;
+            let Some(ws) = windows.get_mut(&front) else {
+                let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
                 return;
-            }
+            };
+            let crate::WindowState {
+                route_card,
+                settings_card,
+                conn_wire_card,
+                level_up_card,
+                notice_card,
+                badge_card,
+                win_px,
+                ..
+            } = ws;
+            let tray_arg = route_card
+                .as_ref()
+                .or(settings_card.as_ref())
+                .or(conn_wire_card.as_ref())
+                .or(level_up_card.as_ref())
+                .or(notice_card.as_ref())
+                .or(badge_card.as_ref())
+                .and_then(|card| tray_quad_below_y(card, tray_floor_y));
+            let destination_height = win_px.map(|size| size.height.max(1) as usize);
+            let mut frame = match backend.render_input_for_destination(
+                introspect_gpu,
+                &mut capture_input,
+                tray_arg,
+                destination_height,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let cpu_tray = (!backend.is_gpu()).then_some(tray_arg).flatten();
+            let (frame_width, frame_height) = (frame.width, frame.height);
+            apply_host_chrome_at(
+                &mut frame.pixels,
+                frame_width,
+                frame_height,
+                0,
+                0,
+                frame_width,
+                frame_height,
+                cpu_tray,
+                visuals.invert,
+                visuals.overlay,
+            );
+            let render_ns = render_t0.elapsed().as_nanos() as u64;
+            crate::metrics::record_offscreen_raster(render_ns);
+            frame
         };
-        let cpu_tray = (!backend.is_gpu()).then_some(tray_arg).flatten();
-        let (frame_width, frame_height) = (frame.width, frame.height);
-        apply_host_chrome_at(
-            &mut frame.pixels,
-            frame_width,
-            frame_height,
-            0,
-            0,
-            frame_width,
-            frame_height,
-            cpu_tray,
-            visuals.invert,
-            visuals.overlay,
-        );
-        let render_ns = render_t0.elapsed().as_nanos() as u64;
-        crate::metrics::record_offscreen_raster(render_ns);
         if want_metadata {
             let Ok(width) = u32::try_from(frame.width) else {
                 let _ = reply.send(Err("native image metadata width overflow".to_string()));
@@ -3881,14 +4539,24 @@ impl App {
                 let _ = reply.send(Err("native image metadata height overflow".to_string()));
                 return;
             };
-            match self.native_image_metadata(
-                front,
-                phase,
-                capture_serial,
-                width,
-                height,
-                Self::image_pixel_fingerprint(frame.width, frame.height, &frame.pixels),
-            ) {
+            let pixel_fingerprint =
+                Self::image_pixel_fingerprint(frame.width, frame.height, &frame.pixels);
+            let metadata = if let Some(mut metadata) = presented_metadata {
+                metadata.width = width;
+                metadata.height = height;
+                metadata.pixel_fingerprint = pixel_fingerprint;
+                Ok(metadata)
+            } else {
+                self.native_image_metadata(
+                    front,
+                    phase,
+                    capture_serial,
+                    width,
+                    height,
+                    pixel_fingerprint,
+                )
+            };
+            match metadata {
                 Ok(metadata) => {
                     let _ = frame_metadata.set(metadata);
                 }
@@ -4373,6 +5041,36 @@ impl App {
             let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
             return;
         };
+        let recording_here = self
+            .video_rec
+            .as_ref()
+            .is_some_and(|recording| recording.window == front);
+        let mut recording_destination = if recording_here && !clean {
+            match self.recording_presented_destination_capture(front) {
+                Ok(destination) => Some(destination),
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let route = recording_destination
+            .as_ref()
+            .map_or(route, |destination| destination.route);
+        if !want_metadata && let Some(destination) = recording_destination.take() {
+            // The common live-repro path: no semantic clone, hash or reraster.
+            // The explicit request pays one destination copy/readback only.
+            self.submit_encode_job(EncodeJob::Image {
+                frame: destination.frame,
+                target,
+                want_bytes,
+                cancel,
+                reply,
+            });
+            return;
+        }
         if matches!(
             route,
             crate::VisibleContentRoute::Native { .. } | crate::VisibleContentRoute::Heterogeneous
@@ -4391,10 +5089,27 @@ impl App {
                     return;
                 }
             };
+            let mut presented_metadata = None;
+            let presented = if presented.is_some() || !recording_here {
+                presented
+            } else {
+                let resolved =
+                    match self.recording_presented_frame_capture(front, false, want_metadata) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            return;
+                        }
+                    };
+                presented_metadata = resolved.native_metadata;
+                Some(resolved.frame)
+            };
             self.render_native_image(NativeImageRequest {
                 front,
                 clean,
                 presented,
+                presented_metadata,
+                exact_frame: recording_destination.map(|destination| destination.frame),
                 target,
                 want_bytes,
                 want_metadata,
@@ -4419,30 +5134,79 @@ impl App {
                 return;
             }
         };
-        let capture_grid = if let Some(presented) = presented.as_ref() {
-            crate::app_render::TerminalCaptureGrid {
-                composed: presented.grid.composed,
-                leaves: presented.grid.leaves.clone(),
-            }
+        let presented = if presented.is_some() || !recording_here {
+            presented
+        } else {
+            let resolved = match self.recording_presented_frame_capture(front, true, false) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let Some(grid) = resolved.terminal_grid else {
+                let _ = reply.send(Err(
+                    "image deferred: recorded terminal inventory is unavailable".to_string(),
+                ));
+                return;
+            };
+            Some(PresentedTerminalCapture {
+                input: resolved.frame.input,
+                grid,
+                invert: resolved.frame.invert,
+                overlay: resolved.frame.overlay,
+                serial: resolved.frame.serial,
+                cell_size: resolved.cell_size,
+                theme_fingerprint: resolved.theme_fingerprint,
+                overlay_fingerprint: resolved.overlay_fingerprint,
+            })
+        };
+        let mut presented_authority = None;
+        let mut presented_input = None;
+        let capture_grid = if let Some(presented) = presented {
+            presented_authority = Some(PresentedTerminalAuthority {
+                invert: presented.invert,
+                overlay: presented.overlay,
+                serial: presented.serial,
+                cell_size: presented.cell_size,
+                theme_fingerprint: presented.theme_fingerprint,
+                overlay_fingerprint: presented.overlay_fingerprint,
+            });
+            presented_input = Some(presented.input);
+            presented.grid
         } else {
             // A window without an OS presentation target has no prior
             // application-present artifact. Its explicit image is the one
             // present-real tick, built from current terminals.
             let capture_now = Instant::now();
             let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
-            let Some(capture_grid) =
-                self.prepare_terminal_capture_grid_with_cursor_fx(front, clock)
-            else {
+            let capture_grid = match self
+                .prepare_terminal_capture_grid_with_cursor_fx_outcome(front, clock)
+            {
+                crate::app_render::CapturePreparation::Ready(grid) => grid,
+                crate::app_render::CapturePreparation::Held { retry_at } => {
+                    let retry_ms = retry_at
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .max(1);
+                    let _ = reply.send(Err(format!(
+                        "image deferred: synchronized terminal update in progress; retry after {retry_ms} ms"
+                    )));
+                    return;
+                }
+                crate::app_render::CapturePreparation::Unavailable => {
+                    let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
+                    return;
+                }
+            };
+            let Some(capture_focus) = capture_grid.focus else {
                 let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
                 return;
             };
-            if !capture_grid.composed {
-                self.splice_cursor_fx(front, capture_now);
-            }
             // Unlike the cursor light extractor, the decoration splice already
             // dispatches on one-pane versus composed geometry. It also owns the
             // capture/recording clock boundary, so this is safe in both modes.
-            self.splice_word_decorations(front, capture_now);
+            self.splice_word_decorations_sampled(front, capture_now, capture_focus);
             self.splice_tab_strip(front);
             self.splice_find_bar(front);
             self.splice_settings_panel(front);
@@ -4451,6 +5215,7 @@ impl App {
             self.splice_level_up(front);
             self.splice_config_notice(front);
             self.splice_paste_banner(front);
+            self.splice_link_target(front);
             // C5 — topmost chrome; see the `chrome`-capture route above.
             self.splice_tab_menu(front);
             capture_grid
@@ -4458,10 +5223,8 @@ impl App {
         // Always rasterize an owned explicit-capture snapshot. In particular,
         // `image plain` clears overlays on this clone, never on the retained
         // window scratch that a later present/capture reuses.
-        let mut capture_input = presented.as_ref().map_or_else(
-            || self.windows[&front].input_scratch.clone(),
-            |presented| presented.input.clone(),
-        );
+        let mut capture_input =
+            presented_input.unwrap_or_else(|| self.windows[&front].input_scratch.clone());
         // Accent for the drop-target highlight / level-up glow, read before the disjoint
         // borrow. The level-up glow's breathing alphas are sampled here too,
         // matching application-present transient state.
@@ -4471,12 +5234,24 @@ impl App {
             .as_ref()
             .map(|l| (l.wash_alpha(Instant::now()), l.border_alpha(Instant::now())));
         let tray_floor_y = self.config_notice_tray_floor_y(front);
-        let theme_fingerprint = self.image_theme_fingerprint();
-        let capture_cell_size = presented.as_ref().map_or_else(
+        let theme_fingerprint = presented_authority.map_or_else(
+            || self.image_theme_fingerprint(),
+            |presented| presented.theme_fingerprint,
+        );
+        let capture_cell_size = presented_authority.map_or_else(
             || self.win_cell_size(front),
             |presented| presented.cell_size,
         );
-        self.bind_window_renderer_state(front);
+        if let (Some(destination), Some(authority)) =
+            (recording_destination.as_ref(), presented_authority)
+        {
+            debug_assert_eq!(destination.serial, authority.serial);
+        }
+        let exact_frame = recording_destination.map(|destination| destination.frame);
+        let exact_destination = exact_frame.is_some();
+        if !exact_destination {
+            self.bind_window_renderer_state(front);
+        }
         // Disjoint borrows: `self.backend` (renderer), the introspection GPU
         // scratch, and the front window's input_scratch are separate fields.
         let App {
@@ -4503,7 +5278,7 @@ impl App {
         // so a perf audit driven over the control socket could measure nothing.
         // Present latency is recorded as 0 — honest: the `image` verb rasterizes to
         // a buffer; it does not submit to an OS presentation target.
-        let render_t0 = Instant::now();
+        let render_t0 = (!exact_destination).then(Instant::now);
         // P3 settings card → raw bytes + device-px rect for the GPU tray quad (same
         // builder application-present uses). The GPU arm bakes it into the
         // offscreen so capture and application-present share composition; the
@@ -4513,58 +5288,52 @@ impl App {
             .present_card()
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
         let destination_height = ws.win_px.map(|size| size.height.max(1) as usize);
-        let mut frame = match backend.render_input_for_destination(
-            introspect_gpu,
-            &mut capture_input,
-            tray_arg,
-            destination_height,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
+        let mut frame = if let Some(frame) = exact_frame {
+            // Exact current VirtualTarget destination. It already contains the
+            // success-time crop, tray, bell/overlay and GPU-only crown passes.
+            frame
+        } else {
+            match backend.render_input_for_destination(
+                introspect_gpu,
+                &mut capture_input,
+                tray_arg,
+                destination_height,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
             }
         };
-        if !backend.is_gpu()
+        if !exact_destination
+            && !backend.is_gpu()
             && let Some(quad) = ws
                 .present_card()
                 .and_then(|card| tray_quad_below_y(card, tray_floor_y))
         {
             composite_tray_quad_at(&mut frame.pixels, frame.width, frame.height, 0, 0, quad);
         }
-        let render_ns = render_t0.elapsed().as_nanos() as u64;
-        crate::metrics::record_offscreen_raster(render_ns);
+        if let Some(render_t0) = render_t0 {
+            let render_ns = render_t0.elapsed().as_nanos() as u64;
+            crate::metrics::record_offscreen_raster(render_ns);
+        }
         // I-2: match the on-screen visual-bell invert (see `snapshot`) so the
         // `image` verb is WYSIWYG even during a bell flash. Suppressed while ANY modal
         // overlay is open — the SAME `overlay_open()` gate the glass present and the
         // snapshot path consult, so all three can never disagree (SACRED WYSIWYG).
         // The boundary is the APPLICATION surface: the compositor and scanout stay
         // outside this comparison.
-        let invert = presented.as_ref().map_or_else(
-            || ws.bell_flash.is_active(Instant::now()) && !ws.overlay_open(),
-            |presented| presented.invert,
-        );
-        apply_bell_invert(&mut frame, invert);
-        // Match application-present drop-target/LEVEL-UP overlay composition;
-        // both are suppressed under the same modal-overlay predicate.
-        let retained_overlay = presented.as_ref().and_then(|presented| presented.overlay);
-        if let Some(overlay) = retained_overlay {
-            apply_overlay_at(
-                &mut frame.pixels,
-                frame.width,
-                frame.height,
-                0,
-                0,
-                frame.width,
-                frame.height,
-                overlay,
+        if !exact_destination {
+            let invert = presented_authority.map_or_else(
+                || ws.bell_flash.is_active(Instant::now()) && !ws.overlay_open(),
+                |presented| presented.invert,
             );
-        } else if presented.is_none() {
-            if ws.drag_hover && !ws.overlay_open() {
-                apply_drop_overlay(&mut frame.pixels, frame.width, frame.height, accent);
-            } else if !ws.overlay_open()
-                && let Some((wash_a, border_a)) = level_up_glow
-            {
+            apply_bell_invert(&mut frame, invert);
+            // Match application-present drop-target/LEVEL-UP overlay composition;
+            // both are suppressed under the same modal-overlay predicate.
+            let retained_overlay = presented_authority.and_then(|presented| presented.overlay);
+            if let Some(overlay) = retained_overlay {
                 apply_overlay_at(
                     &mut frame.pixels,
                     frame.width,
@@ -4573,12 +5342,29 @@ impl App {
                     0,
                     frame.width,
                     frame.height,
-                    OverlayGlow {
-                        accent,
-                        wash_a,
-                        border_a,
-                    },
+                    overlay,
                 );
+            } else if presented_authority.is_none() {
+                if ws.drag_hover && !ws.overlay_open() {
+                    apply_drop_overlay(&mut frame.pixels, frame.width, frame.height, accent);
+                } else if !ws.overlay_open()
+                    && let Some((wash_a, border_a)) = level_up_glow
+                {
+                    apply_overlay_at(
+                        &mut frame.pixels,
+                        frame.width,
+                        frame.height,
+                        0,
+                        0,
+                        frame.width,
+                        frame.height,
+                        OverlayGlow {
+                            accent,
+                            wash_a,
+                            border_a,
+                        },
+                    );
+                }
             }
         }
         if want_metadata {
@@ -4650,8 +5436,7 @@ impl App {
                 document_seq: None,
                 presentation_revision: None,
                 paint_revision: None,
-                capture_serial: presented
-                    .as_ref()
+                capture_serial: presented_authority
                     .map_or(ws.capture_present_serial, |presented| presented.serial),
                 width,
                 height,
@@ -4660,7 +5445,10 @@ impl App {
                 raster_fingerprint: pixel_fingerprint,
                 raster_model_fingerprint: snapshot_fingerprint,
                 raster_geometry: geometry,
-                overlay_fingerprint: ws.overlay_fp(),
+                overlay_fingerprint: presented_authority.map_or_else(
+                    || ws.overlay_fp(),
+                    |presented| presented.overlay_fingerprint,
+                ),
                 theme_fingerprint,
                 leaves,
             };
@@ -6839,6 +7627,46 @@ mod split_capture_tests {
         );
     }
 
+    #[test]
+    fn first_headless_split_capture_applies_dog_species() {
+        let capture = |style: &str| {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.split_active_stub_tab(wid);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some(style.into());
+            app.config.motion = Some("full".into());
+            app.recompute_sparkle();
+            app.sparkle = None;
+            app.windows.get_mut(&wid).expect("window").focused = true;
+
+            app.splice_word_decorations(wid, Instant::now());
+            let ws = app.windows.get(&wid).expect("window");
+            assert!(
+                !ws.input_scratch.free_sprites.is_empty() && ws.input_scratch.free_atlas.is_some(),
+                "the first composed still emits the configured pet and its atlas"
+            );
+            (
+                ws.cursor_pet.species(),
+                std::sync::Arc::clone(
+                    ws.input_scratch
+                        .free_atlas
+                        .as_ref()
+                        .expect("split capture publishes the pet atlas"),
+                ),
+            )
+        };
+
+        let cat = capture("rainbow kitty pet");
+        let dog = capture("rainbow dog pet");
+        assert_eq!(cat.0, aterm_effects::kitty_pet::PetSpecies::Cat);
+        assert_eq!(dog.0, aterm_effects::kitty_pet::PetSpecies::Dog);
+        assert!(
+            dog.1.rgba != cat.1.rgba,
+            "the first composed atlas must contain the configured dog skin"
+        );
+    }
+
     /// T7 — a composed (split) capture splices the sparkle channels. The gate
     /// this replaces returned early on ANY multi-pane tab, so a split capture
     /// was decoration-free no matter what the window was showing.
@@ -6876,6 +7704,172 @@ mod split_capture_tests {
         assert!(
             ws.input_scratch.free_atlas.is_some(),
             "and the atlas those sprites address"
+        );
+    }
+
+    /// The composed capture shares the split glass pass, including its
+    /// visibility-correct companion custody. A DECTCEM-off program relocation
+    /// may not lend the fading resident pet a new word claim at a cursor the
+    /// capture does not draw.
+    #[test]
+    fn split_capture_hidden_pet_fade_does_not_claim_program_relocated_word() {
+        let t0 = Instant::now();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let focus = app.split_active_stub_tab(wid);
+        // Seeded for the same reason as its present-path twin
+        // (`app_render::split_sparkle_tests::split_present_hidden_pet_fade_does_not_
+        // claim_program_relocated_word`): the resident is the subject, and
+        // `cursor_trail`'s default is platform-split since `bda06044`, so an unseeded
+        // fixture measured the platform and went red on Windows.
+        app.config.cursor_trail = Some(true);
+        app.recompute_sparkle();
+        app.windows.get_mut(&wid).expect("window").focused = true;
+
+        app.splice_word_decorations(wid, t0);
+        let term = app.pool.get(focus).expect("focused pane").term.clone();
+        term_lock(&term).process(b"\x1b[11;3Hkitty\x1b[4;31H");
+        app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
+        app.splice_word_decorations(wid, t0 + Duration::from_millis(616));
+        let ambient_before = app.windows[&wid]
+            .input_scratch
+            .free_sprites
+            .iter()
+            .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::UnderText))
+            .count();
+        assert_eq!(
+            ambient_before, 1,
+            "negative control: the isolated far word has one settled ambient kitty"
+        );
+
+        term_lock(&term).process(b"\x1b[?25l\x1b[11;3H");
+        app.splice_word_decorations(wid, t0 + Duration::from_millis(632));
+        {
+            let term = term_lock(&term);
+            assert!(!term.cursor_visible());
+            assert_eq!((term.cursor().row, term.cursor().col), (10, 2));
+        }
+        let ws = &app.windows[&wid];
+        let ambient_after = ws
+            .input_scratch
+            .free_sprites
+            .iter()
+            .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::UnderText))
+            .count();
+        let resident_after = ws
+            .input_scratch
+            .free_sprites
+            .iter()
+            .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText))
+            .count();
+        assert!(
+            resident_after >= 1 && ws.cursor_pet.is_active(),
+            "the capture genuinely contains the hidden-caret resident fade"
+        );
+        assert_eq!(
+            ambient_after, ambient_before,
+            "capture must not suppress a word-cat at the invisible relocated cursor"
+        );
+    }
+
+    #[test]
+    fn split_capture_holds_a_hidden_midflight_pet_and_quick_return_walks() {
+        let t0 = Instant::now();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let focus = app.split_active_stub_tab(wid);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        app.config.motion = Some("full".into());
+        app.recompute_sparkle();
+        app.sparkle = None;
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        app.splice_word_decorations(wid, t0);
+
+        let (pane_rows, pane_cols) = {
+            let ws = &app.windows[&wid];
+            let tree = &ws.layouts[ws.tabs.active];
+            let rect = tree
+                .compute_layout(ws.rows, ws.cols)
+                .into_iter()
+                .find(|rect| rect.session == focus)
+                .expect("focused pane layout");
+            (rect.rows, rect.cols)
+        };
+        let (cw, ch) = app.win_cell_size(wid);
+        let target = (2, 24);
+        let (flight_at, flying) = {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            crate::app_render::seed_resident_pet_mid_flight_for_test(
+                &mut ws.cursor_pet,
+                t0 + Duration::from_millis(16),
+                pane_rows,
+                pane_cols,
+                cw as u16,
+                ch as u16,
+                target,
+            )
+        };
+        let width =
+            aterm_effects::kitty_pet::ART_ROWS * ch as f32 * aterm_effects::kitty_pet::ART_ASPECT
+                / cw as f32;
+        let target_col = aterm_effects::kitty_pet::PetBrain::station(target.1, pane_cols, width);
+        assert!(
+            (flying.col - target_col).abs() > 10.0,
+            "negative control: the capture fixture is visibly mid-flight"
+        );
+
+        let term = app.pool.get(focus).expect("focused pane").term.clone();
+        let captured_body = |app: &App| {
+            let sprite = app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText))
+                .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                .expect("capture contains the resident body");
+            (sprite.x, sprite.y, sprite.w, sprite.h)
+        };
+        term_lock(&term).process(b"\x1b[3;25H\x1b[?25h");
+        let visible_at = flight_at + Duration::from_millis(16);
+        app.splice_word_decorations(wid, visible_at);
+        let before = captured_body(&app);
+
+        term_lock(&term).process(b"\x1b[?25l");
+        let hidden_at = visible_at + Duration::from_millis(16);
+        app.splice_word_decorations(wid, hidden_at);
+        let hidden = captured_body(&app);
+        assert!(
+            (hidden.0 - before.0).abs() <= cw as i32,
+            "hidden capture teleported the fading body: {before:?} -> {hidden:?}"
+        );
+        assert!(
+            ((hidden.1 + i32::from(hidden.3)) - (before.1 + i32::from(before.3))).abs() <= 1,
+            "hidden capture dropped the fading body's feet: {before:?} -> {hidden:?}"
+        );
+        assert!(
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .any(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText)),
+            "the inspected hidden capture really contains the resident body"
+        );
+
+        term_lock(&term).process(b"\x1b[?25h");
+        let returned_at = hidden_at + Duration::from_millis(16);
+        app.splice_word_decorations(wid, returned_at);
+        let returned = captured_body(&app);
+        assert!(
+            (returned.0 - hidden.0).abs() <= (2 * cw) as i32,
+            "quick-return capture applied the deferred far landing: \
+             {hidden:?} -> {returned:?}"
+        );
+        assert!(
+            ((returned.1 + i32::from(returned.3)) - (hidden.1 + i32::from(hidden.3))).abs()
+                <= ch as i32,
+            "quick-return capture jumped the fading body's feet: \
+             {hidden:?} -> {returned:?}"
         );
     }
 }
@@ -7520,6 +8514,315 @@ mod terminal_split_capture_tests {
     }
 
     #[test]
+    fn recording_image_keeps_the_exact_successful_present_cursor_layers() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let now = Instant::now();
+        let font_px = app.windows[&wid].metrics.font_px;
+        let single = app
+            .prepare_terminal_capture_grid(wid)
+            .expect("single-pane model");
+        assert!(
+            !single.composed,
+            "regression covers the normal one-pane route"
+        );
+        let capture_leaf_snapshot_seqs: Vec<_> =
+            single.leaves.iter().map(|leaf| leaf.snapshot_seq).collect();
+        assert_eq!(capture_leaf_snapshot_seqs.len(), 1);
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .capture_leaf_snapshot_seqs = capture_leaf_snapshot_seqs;
+
+        let mut gpu = match aterm_gpu::GpuRenderer::new(font_px, app.theme) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("SKIP: no headless GPU/font available: {error}");
+                return;
+            }
+        };
+        gpu.set_pad(12);
+        gpu.set_pad_top(2);
+        assert_eq!((gpu.pad(), gpu.pad_top()), (12, 2));
+        app.backend = crate::BackendSlot::Ready(crate::Backend::Gpu(crate::GpuBackend::new(gpu)));
+        app.bind_window_renderer_state(wid);
+        let (input_rows, input_cols) = {
+            let input = &app.windows[&wid].input_scratch;
+            (input.rows, input.cols)
+        };
+        let (width, height) = app.backend.frame_size(input_rows, input_cols);
+        let (_, cell_h) = app.backend.cell_size();
+        let mut window_gpu = aterm_gpu::WindowGpu::new();
+        app.backend
+            .gpu_ref()
+            .expect("installed GPU fixture")
+            .virtual_begin(
+                &mut window_gpu,
+                u32::try_from(width).expect("fixture width"),
+                u32::try_from(height).expect("fixture height"),
+                aterm_gpu::video_tap::CaptureOpts {
+                    half_res: false,
+                    budget_bytes: aterm_gpu::video_tap::DEFAULT_BUDGET,
+                    fps_cap: None,
+                    requested_ms: 0,
+                },
+            )
+            .expect("real virtual recording target");
+        app.windows.get_mut(&wid).unwrap().present =
+            Some(crate::PresentTarget::Virtual { window_gpu });
+
+        let root = std::env::temp_dir().join(format!(
+            "aterm-recording-image-retain-{}-{}",
+            std::process::id(),
+            crate::metrics::now_us()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        control_auth::ensure_private_dir(&root).expect("private capture root");
+        let video_dir = control_auth::confine_video_dir(&root).expect("recording directory");
+        let (video_reply, _video_rx) = std::sync::mpsc::channel();
+        app.video_rec = Some(crate::VideoRec {
+            window: wid,
+            deadline: now + Duration::from_secs(3),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            unseamed_at_begin: 0,
+            unlogged_other_window: 0,
+            mode: crate::VideoMode::OffscreenPresentReal,
+            next_frame: None,
+            presented: None,
+            dir: video_dir,
+            cancel: crate::VideoCancellation::new(),
+            reply: video_reply,
+        });
+
+        let (early_reply, early_rx) = std::sync::mpsc::channel();
+        app.render_image(crate::control::ImageReq {
+            target: confined(&root, "too-early.png"),
+            clean: false,
+            session: None,
+            want_bytes: true,
+            want_metadata: false,
+            frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: early_reply,
+        });
+        let early = early_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pre-baseline image reply")
+            .expect_err("a recording with no successful frame must defer");
+        assert!(
+            early.contains("recording has not presented a frame yet"),
+            "unexpected pre-baseline verdict: {early}"
+        );
+
+        let trail_color = 0x00FA_01B5;
+        let kitty_color = [0x22, 0xDD, 0x66, 0xFF];
+        {
+            let window = app.windows.get_mut(&wid).expect("recorded window");
+            window.input_scratch.cursor_trail = vec![aterm_render::TrailCell {
+                row: 4,
+                col: 12,
+                alpha: 255,
+            }];
+            window.input_scratch.cursor_trail_color = trail_color;
+            window.input_scratch.cursor_glow_add = vec![aterm_render::GlowQuad {
+                row: 4,
+                x: 1,
+                y: 1,
+                w: 1,
+                h: 1,
+                color: 0x0001_0101,
+            }];
+            window.input_scratch.glow_halo = vec![aterm_render::RainHalo {
+                row: 4,
+                x: 8,
+                y: 3,
+                w: 3,
+                h: 3,
+                color: 0x0008_1020,
+                cx: 9,
+                cy: 4,
+                rx: 2,
+                ry: 2,
+                mode: aterm_core::render::HaloMode::Add,
+            }];
+            window.input_scratch.word_decorations = vec![aterm_render::WordDecoration {
+                row: 7,
+                col: 20,
+                dx: 0,
+                dy: 0,
+                glyph: aterm_render::DecoGlyph::Dot,
+                blend: aterm_render::DecoBlend::Over,
+                color: 0x00CC_44FF,
+                alpha: 255,
+            }];
+            window.input_scratch.free_atlas = Some(std::sync::Arc::new(aterm_render::SceneAtlas {
+                width: 2,
+                height: 2,
+                rgba: kitty_color.repeat(4),
+                version: 0xC47,
+            }));
+            window.input_scratch.free_sprites = vec![aterm_core::render::FreeSprite {
+                x: 30,
+                y: i32::try_from(6 * cell_h).expect("fixture kitty y"),
+                w: 2,
+                h: 2,
+                ax: 0,
+                ay: 0,
+                aw: 2,
+                ah: 2,
+                tint: 0x00FF_FFFF,
+                alpha: 255,
+                flip_x: false,
+                z: aterm_core::render::FreeZ::OverText,
+                sampler: aterm_core::render::FreeSampler::Nearest,
+            }];
+        }
+        app.bind_window_renderer_state(wid);
+        app.present_input_scratch_for_test(wid, false, None)
+            .expect("the real virtual submission succeeds");
+        let (video_status, device_lost) = {
+            let gpu = app.backend.gpu_ref().expect("installed GPU fixture");
+            let window_gpu = match app.windows[&wid].present.as_ref() {
+                Some(crate::PresentTarget::Virtual { window_gpu }) => window_gpu,
+                _ => panic!("installed virtual recording target"),
+            };
+            (gpu.video_status(window_gpu), gpu.device_lost())
+        };
+        assert_eq!(
+            video_status,
+            Some((0, false)),
+            "fixture must keep its video tap live through the successful virtual submission"
+        );
+        assert!(
+            !device_lost,
+            "fixture GPU must remain live after submission"
+        );
+        assert!(
+            app.video_rec.as_ref().is_some_and(|recording| {
+                !recording.cancel.is_cancelled() && Instant::now() < recording.deadline
+            }),
+            "fixture recording must be live and before its deadline"
+        );
+        let route = app.active_visible_content_route(wid).unwrap();
+        app.finalize_successful_terminal_present_for_test(
+            wid,
+            route,
+            crate::app_render::HostVisualState::default(),
+        );
+        let successful_serial = app.windows[&wid].capture_present_serial;
+        // Font fallback convergence may clear this immediately after a
+        // successful submit. It is deliberately not capture authority.
+        app.windows.get_mut(&wid).unwrap().last_present = None;
+
+        // Interleave the old failure mode: a fresh snapshot/layout extraction
+        // rewrites the shared scratch and its leaf sequence vector after the
+        // video frame succeeds. The recording artifact must remain immutable.
+        app.prepare_terminal_capture_grid(wid)
+            .expect("interleaved terminal snapshot");
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.capture_leaf_snapshot_seqs.clear();
+            let scratch = &mut window.input_scratch;
+            scratch.cursor_trail.clear();
+            scratch.cursor_glow_add.clear();
+            scratch.glow_halo.clear();
+            scratch.word_decorations.clear();
+            scratch.free_sprites.clear();
+            scratch.free_atlas = None;
+        }
+        let retained = app
+            .recording_presented_frame_capture(wid, true, false)
+            .expect("resident successful frame survives scratch interleave");
+        assert_eq!(retained.frame.input.cursor_trail.len(), 1);
+        assert_eq!(retained.frame.input.cursor_trail_color, trail_color);
+        assert_eq!(retained.frame.input.cursor_glow_add.len(), 1);
+        assert_eq!(
+            retained.frame.input.cursor_glow_add[0].y, 1,
+            "resident semantic capture undoes the nonzero pad transport shift"
+        );
+        assert_eq!(retained.frame.input.glow_halo[0].y, 3);
+        assert_eq!(retained.frame.input.word_decorations.len(), 1);
+        assert_eq!(retained.frame.input.free_sprites.len(), 1);
+        drop(retained);
+
+        app.windows.get_mut(&wid).unwrap().blink_phase = false;
+        assert!(
+            app.recording_presented_frame_capture(wid, true, false)
+                .is_err(),
+            "renderer-state drift must defer rather than reraster old input with a new blink phase"
+        );
+        assert!(
+            app.recording_presented_destination_capture(wid).is_ok(),
+            "live renderer drift cannot invalidate already-presented destination pixels"
+        );
+        app.windows.get_mut(&wid).unwrap().blink_phase = true;
+
+        let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
+        let (reply, rx) = std::sync::mpsc::channel();
+        app.render_image(crate::control::ImageReq {
+            target: confined(&root, "retained.png"),
+            clean: false,
+            session: None,
+            want_bytes: true,
+            want_metadata: true,
+            frame_metadata: std::sync::Arc::clone(&metadata),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply,
+        });
+        let (_, _, png) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("image worker reply")
+            .expect("recording still succeeds")
+            .value;
+        let png = png.expect("the retained model is encoded");
+        let (rgba, _, _) = aterm_render::decode_png_rgba8(&png).expect("encoded RGBA8");
+        let expected = [0xFA, 0x01, 0xB5];
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] == expected),
+            "the exact encoded pixels retain the opaque rainbow-trail sentinel"
+        );
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel.as_slice() == kitty_color.as_slice()),
+            "the exact encoded pixels retain the free-sprite/kitty sentinel"
+        );
+        assert_eq!(
+            metadata.get().expect("image metadata").capture_serial,
+            successful_serial,
+            "the still identifies the same successful present as the recording"
+        );
+        let staged = &app.windows[&wid].input_scratch;
+        assert!(staged.cursor_trail.is_empty());
+        assert!(staged.cursor_glow_add.is_empty());
+
+        if let Some(crate::PresentTarget::Virtual { window_gpu }) =
+            app.windows.get_mut(&wid).unwrap().present.as_mut()
+        {
+            window_gpu.invalidate_present();
+        }
+        assert!(
+            app.recording_presented_destination_capture(wid).is_ok(),
+            "semantic invalidation leaves the last successful virtual destination readable"
+        );
+        app.present_input_scratch_for_test(wid, false, None)
+            .expect("stage a newer virtual destination without success authority");
+        assert!(
+            app.recording_presented_destination_capture(wid).is_err(),
+            "a newer destination generation cannot pair with the old successful serial"
+        );
+
+        let _ = app.video_rec.take();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn single_capture_dynamic_cursor_tracks_osc10_in_state_and_pixels() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7632,7 +8935,9 @@ mod terminal_split_capture_tests {
         assert!(
             app.splice_focused_composed_cursor_effects(
                 wid,
-                crate::app_render::ComposedCursorFxClock::Retain,
+                crate::app_render::ComposedCursorFxClock::Retain {
+                    observed_at: predictor_now,
+                },
             ),
             "styled capture projects the retained composed effect tick"
         );
@@ -7644,8 +8949,14 @@ mod terminal_split_capture_tests {
         let divider = usize::from(left_rect.col_off + left_rect.cols);
         assert_eq!(
             row[divider],
-            crate::app_render::divider_cell(app.theme),
-            "only the one-cell layout gap keeps the divider sentinel"
+            crate::app_render::active_pane_edge_cell(
+                app.theme,
+                crate::app_render::ActivePaneEdge::Left
+            ),
+            "the one-cell layout gap is the only cell no pane owns, and this one \
+             borders the FOCUSED (right) pane, so it carries that pane's left-edge \
+             mark — the seam colour as its ground with the ink on the side facing \
+             the pane"
         );
         assert_eq!(
             row[usize::from(left_rect.col_off + left_rect.cols - 1)].bg,
@@ -8950,6 +10261,7 @@ mod encode_worker_tests {
             keys_enabled: false,
             inputs: Vec::new(),
             unlogged_inputs: 0,
+            unlogged_other_window: 0,
             started_us: 0,
             dir,
             reply,
@@ -9013,6 +10325,7 @@ mod encode_worker_tests {
             keys_enabled: false,
             inputs: Vec::new(),
             unlogged_inputs: 0,
+            unlogged_other_window: 0,
             started_us: 0,
             dir,
             reply,
@@ -9141,6 +10454,8 @@ mod encode_worker_tests {
             front: wid,
             clean: false,
             presented: None,
+            presented_metadata: None,
+            exact_frame: None,
             target: confined(&dir, "binding.png"),
             want_bytes: true,
             want_metadata: true,
@@ -9242,6 +10557,8 @@ mod encode_worker_tests {
                 front: wid,
                 clean: false,
                 presented: None,
+                presented_metadata: None,
+                exact_frame: None,
                 target: confined(&dir, name),
                 want_bytes: true,
                 want_metadata: true,
@@ -9414,6 +10731,7 @@ mod encode_worker_tests {
 
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
+        let retained_at = Instant::now();
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let (_, native_view) = app.active_native_view(wid).expect("Settings view");
         let (terminal_session, terminal_view) =
@@ -9484,7 +10802,9 @@ mod encode_worker_tests {
         assert!(
             app.prepare_heterogeneous_input_scratch_with_cursor_fx(
                 wid,
-                Some(crate::app_render::ComposedCursorFxClock::Retain),
+                Some(crate::app_render::ComposedCursorFxClock::Retain {
+                    observed_at: retained_at,
+                }),
             )
             .is_some()
         );
@@ -9542,7 +10862,9 @@ mod encode_worker_tests {
         assert!(
             app.prepare_heterogeneous_input_scratch_with_cursor_fx(
                 wid,
-                Some(crate::app_render::ComposedCursorFxClock::Retain),
+                Some(crate::app_render::ComposedCursorFxClock::Retain {
+                    observed_at: retained_at,
+                }),
             )
             .is_some()
         );
@@ -9604,6 +10926,8 @@ mod encode_worker_tests {
                 front: wid,
                 clean: false,
                 presented: None,
+                presented_metadata: None,
+                exact_frame: None,
                 target: confined(&dir, name),
                 want_bytes: true,
                 want_metadata: true,
@@ -9729,6 +11053,8 @@ mod encode_worker_tests {
                 front: wid,
                 clean,
                 presented: Some(frame),
+                presented_metadata: None,
+                exact_frame: None,
                 target: confined(&dir, name),
                 want_bytes: true,
                 want_metadata: false,
@@ -9816,6 +11142,7 @@ mod encode_worker_tests {
             keys_enabled: false,
             inputs: Vec::new(),
             unlogged_inputs: 0,
+            unlogged_other_window: 0,
             started_us: 500,
             dir,
             reply: tx,
@@ -10306,6 +11633,52 @@ mod encode_worker_tests {
             "the first drawable capture still presents the paused collection hello \
              (UnderText since c92dcf56: a text-scale cat tucks behind the line's \
              ink rather than standing on it)"
+        );
+    }
+
+    #[test]
+    fn load_shed_capture_retires_an_unowned_pet_before_its_early_return() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        app.recompute_sparkle();
+        app.sparkle = None;
+        app.splice_word_decorations(wid, t0);
+        assert!(
+            app.windows[&wid].cursor_pet.is_active(),
+            "negative control: an owned capture materializes the resident pet"
+        );
+
+        app.perf_reduced = true;
+        assert!(
+            app.load_shed_active(),
+            "fixture reaches the early-return arm"
+        );
+        app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
+        assert!(
+            app.windows[&wid].cursor_pet.is_active(),
+            "load shedding alone freezes presentation without revoking ownership"
+        );
+        assert!(app.windows[&wid].input_scratch.free_sprites.is_empty());
+
+        app.config.cursor_trail = Some(false);
+        assert!(
+            app.load_shed_active(),
+            "owner removal does not end load shedding"
+        );
+        app.splice_word_decorations(wid, t0 + Duration::from_millis(32));
+        let ws = &app.windows[&wid];
+        assert!(
+            !ws.cursor_pet.is_active() && !ws.cursor_pet.needs_frames(),
+            "owner removal must retire the brain before load shedding returns"
+        );
+        assert!(
+            ws.free_scratch.is_empty()
+                && ws.input_scratch.free_sprites.is_empty()
+                && ws.input_scratch.free_atlas.is_none(),
+            "the retired capture publishes no companion projection"
         );
     }
 
@@ -10807,7 +12180,12 @@ mod headless_cursor_fx_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        // THE FLYING HEAD'S OWN SPELLING. `rainbow kitty` selected it until
+        // 2026-08-26 and now names the WALKING pet (the owner asked twice for
+        // the kitty their config names), so this fixture — which is about the
+        // earned classic flypast, and asserts `!cursor_pet.is_active()` below —
+        // must say which animal it means.
+        app.config.cursor_trail_style = Some("rainbow kitty flying".into());
         app.config.motion = Some("full".into());
         app.recompute_sparkle();
         app.sparkle = None;
@@ -10905,6 +12283,53 @@ mod headless_cursor_fx_tests {
     }
 
     #[test]
+    fn first_headless_capture_applies_the_configured_pet_species() {
+        use aterm_effects::kitty_pet::PetSpecies;
+
+        let capture = |style: &str| {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some(style.into());
+            app.config.motion = Some("full".into());
+            app.recompute_sparkle();
+            app.sparkle = None;
+            app.splice_word_decorations(wid, Instant::now());
+            let ws = app.windows.get(&wid).expect("headless window 0");
+            let sprite = ws
+                .input_scratch
+                .free_sprites
+                .first()
+                .copied()
+                .expect("first capture emits one pet body");
+            (
+                ws.cursor_pet.species(),
+                sprite,
+                std::sync::Arc::clone(
+                    ws.input_scratch
+                        .free_atlas
+                        .as_ref()
+                        .expect("first capture publishes the pet atlas"),
+                ),
+            )
+        };
+
+        let cat = capture("rainbow kitty pet");
+        let dog = capture("rainbow dog pet");
+        assert_eq!(cat.0, PetSpecies::Cat, "negative control: cat stays cat");
+        assert_eq!(dog.0, PetSpecies::Dog);
+        assert_eq!(
+            (dog.1.ax, dog.1.ay, dog.1.aw, dog.1.ah),
+            (cat.1.ax, cat.1.ay, cat.1.aw, cat.1.ah),
+            "equivalent poses deliberately occupy the same atlas slot"
+        );
+        assert!(
+            dog.2.rgba != cat.2.rgba,
+            "the first captured atlas must contain the configured dog skin"
+        );
+    }
+
+    #[test]
     fn serious_mode_capture_hard_retires_a_song_rearmed_after_transition() {
         use aterm_effects::kitty_sing::SING_ARM_REPEATS;
 
@@ -10982,6 +12407,54 @@ mod headless_cursor_fx_tests {
                 && ws.input_scratch.ink.is_empty()
                 && ws.input_scratch.nova_add.is_empty(),
             "the suppressed word-owned channels remain empty"
+        );
+    }
+
+    #[test]
+    fn composed_capture_decorations_use_the_extracted_screen_sample() {
+        let mut app = App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        let wid = WindowId(0);
+        let focused_session = app.split_active_stub_tab(wid);
+        let term = app
+            .pool
+            .get(focused_session)
+            .expect("focused terminal")
+            .term
+            .clone();
+        term_lock(&term).process(b"\x1b[?1049h\x1b[4;7H");
+        let terminal_id = term_lock(&term).render_identity();
+        let switch_term = term.clone();
+        let now = Instant::now();
+        let capture = app
+            .prepare_terminal_capture_grid_with_cursor_fx_interleaved(
+                wid,
+                crate::app_render::ComposedCursorFxClock::Advance(now),
+                move || term_lock(&switch_term).process(b"\x1b[?1049l\x1b[2;2H"),
+            )
+            .expect("composed capture");
+        assert!(capture.focus.is_some_and(|sample| {
+            sample.terminal_id == terminal_id && sample.alternate_screen
+        }));
+        assert!(
+            !term_lock(&term).is_alternate_screen(),
+            "negative control: the live terminal moved to a newer screen"
+        );
+
+        app.windows
+            .get_mut(&wid)
+            .expect("test window")
+            .cursor_effect_coordinate_space = None;
+        app.splice_word_decorations_sampled(
+            wid,
+            now,
+            capture.focus.expect("focused capture sample"),
+        );
+        assert_eq!(
+            app.windows[&wid].cursor_effect_coordinate_space,
+            Some((terminal_id, true)),
+            "decoration custody must stay on the screen paired with captured cells"
         );
     }
 

@@ -367,21 +367,6 @@ impl App {
                 > 0.0
     }
 
-    /// The same card, held for work that is genuinely still running.
-    ///
-    /// A toolchain install extracts multiple GB over minutes; the default card is
-    /// gone in 5.4 s, and `status.toml` is not written until a member finishes, so
-    /// the page the card points at reads "No package activity yet" the whole time.
-    /// The announcement has to outlive the announcement's own first breath — and it
-    /// is replaced the instant a terminal marker arrives (2026-08-20 round-8 audit).
-    pub(crate) fn surface_held_update_status(&mut self, text: &str) {
-        self.notice = Some(
-            crate::notice::TransientNotice::update_status(text, std::time::Instant::now())
-                .holding(std::time::Duration::from_secs(20 * 60)),
-        );
-        self.request_redraw_all_windows();
-    }
-
     /// Re-sync the macOS VERSION menu (the rightmost menu-bar title) to the live update
     /// state: `v<cur> ⬆️` + the one-click "Update to v<staged> — restart now" first item
     /// while a strictly-newer build is staged; `v<cur> ⬆️` + the "Updated to v<cur> just
@@ -433,13 +418,7 @@ impl App {
     /// flows on).
     pub(crate) fn notice_click(&mut self, wid: crate::WindowId, x: f64, y: f64) -> bool {
         let Some(n) = self.notice.as_ref() else {
-            // No transient notice: the shared slot may hold the provisioning
-            // PROGRESS CARD instead (even fingerprint — the pkg_progress_card
-            // parity contract). A press on it DISMISSES for this pass and is
-            // consumed; a miss flows on. Same seam, same routing rationale as
-            // the pill below — a passive overlay must never let a press fall
-            // through the pixels it visibly caught.
-            return self.pkg_progress_click(wid, x, y);
+            return false;
         };
         let Some(ws) = self.windows.get(&wid) else {
             return false;
@@ -485,63 +464,12 @@ impl App {
         }
     }
 
-    /// Route a left press that landed on the PROVISIONING PROGRESS CARD (the
-    /// notice slot's other resident — `app_render::pkg_progress_card`). A hit
-    /// dismisses the card for THIS pass (`PkgProgressUi::dismiss`; a new pass
-    /// re-shows, and Settings ▸ Packages reopens it) and consumes the press.
-    ///
-    /// The hit region is the COMPOSITED card's own rect (`ws.notice_card`
-    /// dx/dy/pw/ph, shrunk back by the shadow margin the raster was padded
-    /// with) — the pixels and the click target are the same bytes by
-    /// construction, and the ownership test is the even-fingerprint half of
-    /// the parity contract, so a notice pill (odd) can never be dismissed by
-    /// this arm nor the card by the pill's.
-    fn pkg_progress_click(&mut self, wid: crate::WindowId, x: f64, y: f64) -> bool {
-        if !self.pkg_progress.visible() {
-            return false;
-        }
-        let Some(ws) = self.windows.get(&wid) else {
-            return false;
-        };
-        // Same on-glass rule as the pill: only the composited resident counts,
-        // and a modal or the level-up burst covering the slot swallows nothing.
-        if ws.settings_card.is_some() || ws.level_up_card.is_some() {
-            return false;
-        }
-        let Some(card) = ws
-            .notice_card
-            .as_ref()
-            .filter(|c| crate::app_render::pkg_progress_card::owns_slot(c))
-        else {
-            return false;
-        };
-        let m = crate::notice::SHADOW_MARGIN;
-        let (rx, ry) = (card.dx as f32 + m, card.dy as f32 + m);
-        let (rw, rh) = (
-            (card.pw as f32 - 2.0 * m).max(0.0),
-            (card.ph as f32 - 2.0 * m).max(0.0),
-        );
-        let (fx, fy) = self.window_to_frame(wid, x, y);
-        let (fx, fy) = (fx as f32, fy as f32);
-        if fx >= rx && fx < rx + rw && fy >= ry && fy < ry + rh {
-            self.pkg_progress.dismiss();
-            self.request_redraw_all_windows();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// The in-grid chrome rows the notice card must sit BELOW: the tab strip owns the
-    /// first `tab_strip_rows` rows of the terminal area, and the card is not allowed to
-    /// cover chrome the user clicks. One accessor so the painter and the hit test cannot
-    /// disagree about where the card is.
+    /// The in-grid chrome rows the notice card must sit BELOW: the tab strip and the
+    /// status bars own the first [`Self::chrome_rows`] rows of the terminal area, and
+    /// the card is not allowed to cover chrome the user clicks (or reads). One
+    /// accessor so the painter and the hit test cannot disagree about where the card is.
     pub(crate) fn notice_clear_rows(&self) -> f32 {
-        if self.tab_strip_enabled() {
-            f32::from(self.tab_strip_rows)
-        } else {
-            0.0
-        }
+        f32::from(self.chrome_rows())
     }
 
     /// Map a window-px point to what the Update overlay under it hits (close dot / Close /

@@ -2202,8 +2202,22 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
 /// * `trail status` — ONE `trail style= … ribbon_active= …` line of standing
 ///   engine state ([`crate::App::trail_status`]): the resolved style, every
 ///   gate from the `cursor_trail` knob to the glass, the cumulative
-///   `licensed=`/`declined=`/`last_decline_reason=` scoreboard, and the light
-///   alive right now. What is TRUE.
+///   `licensed=`/`declined=`/`last_decline_reason=` scoreboard, the light
+///   alive right now, and — `block_fill=`/`block_fill_base=`/
+///   `block_fill_base_from=` — WHO OWNS THE BLOCK CURSOR and what colour their
+///   body is built from. What is TRUE.
+///
+/// THE BLOCK-FILL FIELDS ARE NOT DECORATION. A cursor-body effect replaces the
+/// caret's colour outright (`RenderInput::cursor_fill_override` is applied
+/// INSTEAD of the frame cursor colour), and the `glow_active`/`pet_active`/
+/// `cat_active` gates say nothing about it — so a style could hold the caret,
+/// and paint it a colour the terminal never asked for, while this row read
+/// quiet end to end. That is exactly how one hard-coded base survived two
+/// investigations (`d602f8cd`, the rainbow block) with its twin sitting in the
+/// phaser beside it. `block_fill=none` now means the terminal's own cursor
+/// colour is on the glass; anything else names the owner, and
+/// `block_fill_base_from=style_identity` marks the owners (fire, water) whose
+/// colour is theirs BY DESIGN rather than a leak.
 ///
 /// READ THEM IN THAT ORDER. A zero `licensed` beside a nonzero `declined`
 /// means every move the engine saw was unlicensed — read

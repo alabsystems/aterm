@@ -414,6 +414,23 @@ pub(crate) fn cmd_dims(
 /// inside your measurement window. Nothing is discarded: `n_present +
 /// n_present_tainted` still accounts for every content present.
 ///
+/// FRAME-EXTRACTION ATTRIBUTION. `frame_refills_scoped` / `frame_refills_full`
+/// split the presented-path refills between the damage-scoped arm and the full
+/// O(rows x cols) walk, and `frame_refill_full_causes=<clause>:<frames>,...` (a
+/// JSON object in the structured twin) names WHICH continuity clause refused on
+/// each of the full ones. The split alone cannot: `host_mutation` (some
+/// per-frame scratch mutator broke the chain — fixable),
+/// `terminal_mismatch` (panes sharing one scratch — fixable), `base_y` (the
+/// content is scrolling — correct, nothing to fix) and `scratch_unstamped` (the
+/// window's first frame — unavoidable) all read as the same climbing
+/// `frame_refills_full`. Non-zero clauses only, so a healthy instance prints
+/// one or two pairs. `frame_refills_skipped` is the third arm: presented frames
+/// that took NO extraction because the effect-only reuse gate proved the engine
+/// had not moved since the snapshot was filled. It is what keeps a FALL in
+/// `frame_refills_scoped` readable as work avoided rather than work gone
+/// missing — `scoped + full + skipped` is still exactly one per presented
+/// non-rescan frame.
+///
 /// SCHEDULER ATTRIBUTION. `past_deadline_arms` is the global spin witness;
 /// `deadline_arms_by_owner=<owner>:<arms>/<past>,...` (a JSON object in the
 /// structured twin) names WHICH producer armed them. `deadline_owner` alone is a
@@ -564,6 +581,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     let arms = crate::metrics::deadline_arm_attribution();
+    let refill_causes = crate::metrics::frame_refill_full_causes();
     let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     format!(
@@ -581,7 +599,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          perf_reduced={} shed_transitions={} wake_heals={} \
          last_redraw_total_ms={:.2} max_redraw_total_ms={:.2} \
          redraw_attempts={} redraw_early_outs={} redraw_sync_holds={} redraw_retry_gated={} \
-         frame_refills_scoped={} frame_refills_full={} \
+         frame_refills_scoped={} frame_refills_full={} frame_refills_skipped={} \
+         frame_refill_full_causes={} \
          pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
          max_pre_present_ms={:.2} \
          present_drops={} last_present_drop_reason={} last_present_drop_parked={} \
@@ -666,6 +685,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.redraw_retry_gated,
         m.frame_refills_scoped,
         m.frame_refills_full,
+        m.frame_refills_skipped,
+        refill_cause_pairs(&refill_causes),
         m.pre_present_attempts,
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
@@ -822,6 +843,42 @@ fn streak_heal_object(heals: &[(&'static str, u64)]) -> String {
     format!("{{{body}}}")
 }
 
+/// Render the damage-scoped refill's FULL-arm attribution as `clause:frames`
+/// pairs, comma-joined — the same ONE self-labelling field discipline as
+/// [`deadline_arm_pairs`], for the same reason.
+///
+/// WHY IT EXISTS. a78dd8a1 wired DMG-1 into the shipping frontend and shipped
+/// `frame_refills_scoped`/`frame_refills_full` with it, closing on the honest
+/// admission that per-cause attribution "needs the engine's validity check to
+/// report its failing clause — deliberately left as follow-up". Three
+/// mechanisms now hang off that continuity chain (the DMG-1 carrier, the D-2
+/// per-row revision lane, the tab-strip lane splice), so a Full-dominated
+/// steady state had become a thing an operator could SEE and not diagnose.
+/// Non-zero clauses only: a healthy instance prints its first-frame
+/// `scratch_unstamped:1` and whatever its content is actually doing.
+fn refill_cause_pairs(causes: &[crate::metrics::RefillCause]) -> String {
+    if causes.is_empty() {
+        // Never emit a bare `key=` — see `deadline_arm_pairs`.
+        return "none".to_string();
+    }
+    causes
+        .iter()
+        .map(|c| format!("{}:{}", c.cause, c.frames))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same attribution as a JSON object, so the structured twin stays
+/// parseable without splitting a string.
+fn refill_cause_object(causes: &[crate::metrics::RefillCause]) -> String {
+    let body = causes
+        .iter()
+        .map(|c| format!("\"{}\":{}", c.cause, c.frames))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
 /// Render the per-cell-pipeline split as `name:ms` pairs, comma-joined.
 ///
 /// ONE self-labelling wire field rather than twelve positional ones: a reader
@@ -948,6 +1005,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     let arms = crate::metrics::deadline_arm_attribution();
+    let refill_causes = crate::metrics::frame_refill_full_causes();
     let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     json_ok(&format!(
@@ -966,7 +1024,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"shed_transitions\":{},\"wake_heals\":{},\"last_redraw_total_ms\":{:.2},\
          \"max_redraw_total_ms\":{:.2},\"redraw_attempts\":{},\"redraw_early_outs\":{},\
          \"redraw_sync_holds\":{},\"redraw_retry_gated\":{},\
-         \"frame_refills_scoped\":{},\"frame_refills_full\":{},\"pre_present_attempts\":{},\
+         \"frame_refills_scoped\":{},\"frame_refills_full\":{},\
+         \"frame_refills_skipped\":{},\
+         \"frame_refill_full_causes\":{},\"pre_present_attempts\":{},\
          \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
          \"max_pre_present_ms\":{:.2},\"present_drops\":{},\
          \"last_present_drop_reason\":\"{}\",\"last_present_drop_parked\":{},\
@@ -1052,6 +1112,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.redraw_retry_gated,
         m.frame_refills_scoped,
         m.frame_refills_full,
+        m.frame_refills_skipped,
+        refill_cause_object(&refill_causes),
         m.pre_present_attempts,
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
@@ -1222,6 +1284,64 @@ pub(crate) fn abs_row_text(t: &Terminal, abs_row: u64) -> AbsRow {
     }
 }
 
+/// Whether absolute row `abs_row` is a soft-wrap CONTINUATION — the grid's
+/// DESTINATION convention, where the row content flowed INTO carries the flag,
+/// so the first row of a logical line always reads `false`.
+///
+/// A row outside the retained range is not a continuation: a run whose head has
+/// been evicted is treated as starting at the oldest row still there, which is
+/// the only logical line the search index can honestly key.
+pub(crate) fn abs_row_wrapped(t: &Terminal, abs_row: u64) -> bool {
+    let grid = t.grid();
+    let oldest = grid.oldest_absolute_row();
+    if abs_row <= oldest {
+        return false;
+    }
+    let scrollback = grid.scrollback_lines() as u64;
+    let rel = abs_row - oldest;
+    if rel < scrollback {
+        return grid
+            .get_history_line(rel as usize)
+            .is_some_and(|line| line.is_wrapped());
+    }
+    let visible = rel - scrollback;
+    if visible >= u64::from(t.rows()) {
+        return false;
+    }
+    u16::try_from(visible)
+        .ok()
+        .and_then(|row| grid.row(row))
+        .is_some_and(aterm_core::grid::Row::is_wrapped)
+}
+
+/// How far back a logical-line walk will look for the row a soft-wrap run
+/// starts on. A run this long is not a wrapped sentence, it is a file with no
+/// newlines catted into the grid, and the walk runs once per anchored search —
+/// so past this depth the callers take their bounded fallback (rebuild from the
+/// retained floor / leave the anchor physical) instead of paying a scan over
+/// the whole retained history for a coordinate nobody is reading.
+const MAX_LOGICAL_LINE_WALK: usize = 1024;
+
+/// The absolute row the search index keyed the logical line containing
+/// `abs_row` under: walk back over soft-wrap continuations to the row the run
+/// starts on, stopping at `floor` (the oldest row the index retains).
+///
+/// Every column the index reports is measured from THIS row's column 0, so a
+/// caller holding a physical `(row, col)` point — a find anchor — has to come
+/// through here before it can address the index at all. `None` means the run
+/// reaches back further than [`MAX_LOGICAL_LINE_WALK`] without meeting either
+/// its head or the floor.
+pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u64> {
+    let mut origin = abs_row;
+    for _ in 0..MAX_LOGICAL_LINE_WALK {
+        if origin <= floor || !abs_row_wrapped(t, origin) {
+            return Some(origin);
+        }
+        origin -= 1;
+    }
+    None
+}
+
 /// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete]\n` then
 /// `<abs_row> <col> <len>` per match.
 ///
@@ -1233,6 +1353,22 @@ pub(crate) fn abs_row_text(t: &Terminal, abs_row: u64) -> AbsRow {
 /// convert at the read site. `col`/`len` are grid/DISPLAY columns within that
 /// row (a wide glyph occupies 2, per the engine's `ColumnMap`) — the same cell
 /// coordinate space `cell <r> <c>` addresses, NOT character offsets.
+///
+/// SOFT WRAP: a long line is ONE line to the reader and several rows on the
+/// grid, so a hit can straddle the boundary. Such a hit is reported ONCE, at
+/// the row and column it starts on, with `col + len` running PAST the grid
+/// width — the overflow continues at column 0 of the following (wrapped) row,
+/// and so on. A client that wants per-row spans splits `len` at the width from
+/// `dims`.
+///
+/// ANCHORS follow from that: the run is matched as the ONE logical line it is on
+/// the glass, so `regex` `^` binds where the reader's line BEGINS and `$` where
+/// it ENDS, never to the grid-row edges the wrap happened to fall on. A
+/// continuation row has no `^` of its own, and the character a wrap merely
+/// pushed to the end of a row is not at `$`. The wrap is the terminal's layout,
+/// not part of the text; a pattern that wants the row edges asks about columns
+/// (`cell`) instead. An UNWRAPPED row is its own logical line, so it anchors at
+/// its own ends exactly as it always has.
 ///
 /// FLAGS: `case` = case-SENSITIVE match (default is case-insensitive); `regex`
 /// = treat the pattern as a regular expression (requires the `aterm-search`
@@ -1346,11 +1482,148 @@ pub(crate) struct FullHistorySearch {
     pub(crate) base_y: i64,
     pub(crate) absolute_row_revision: u64,
     pub(crate) content_seq: u64,
+    /// Grid width the soft-wrap runs were laid out in. It travels WITH the
+    /// results because a match's end column counts straight through a wrap
+    /// boundary, and dividing that by any other width puts the continuation on
+    /// the wrong row.
+    pub(crate) cols: usize,
     /// False when an alt-screen/content transition occurred during the chunked
     /// snapshot. Such a mixed snapshot is never safe for GUI highlighting.
     pub(crate) consistent: bool,
 }
 
+/// The soft-wrap layout one query is answered in.
+///
+/// A run of soft-wrapped grid rows is ONE line to the reader, and a hit that
+/// straddles the boundary lives in neither row's own text, so the index holds
+/// the run JOINED, keyed at its first absolute row. Columns in that line
+/// therefore run past the grid's width and address the run's later rows; `cols`
+/// is the uniform stride that inverts them back to a physical `(row, col)`.
+///
+/// `logical_anchor` is the caller's physical find anchor carried into the same
+/// frame. It is not a convenience: the lazy point walks address the index
+/// directly, and a physical point compared against a joined line's columns
+/// would step over every remaining hit on the line the anchor sits in.
+#[derive(Clone, Copy)]
+struct WrapFrame {
+    /// Display columns one grid row holds — the width each continued row was
+    /// padded out to before the join.
+    cols: usize,
+    /// [`WrapFrame::to_logical`] of the caller's anchor, when it has one.
+    logical_anchor: Option<(usize, usize)>,
+}
+
+impl WrapFrame {
+    /// Carry a physical `(row, col)` point into the joined line's columns,
+    /// given the row that line starts on.
+    fn to_logical(cols: usize, origin: usize, row: usize, col: usize) -> (usize, usize) {
+        (
+            origin,
+            row.saturating_sub(origin)
+                .saturating_mul(cols)
+                .saturating_add(col),
+        )
+    }
+
+    /// Re-express one engine match — keyed at a logical line's first row, its
+    /// columns measured along the joined line — as the physical row and column
+    /// the hit STARTS on, with `end_col` still measured from that row's column
+    /// 0. A hit that straddles the wrap therefore keeps `end_col > cols`: one
+    /// record to navigate to, carrying the span the highlight has to paint
+    /// across the rows below it.
+    fn to_physical(self, m: &SearchMatch) -> SearchMatch {
+        // A zero-width grid cannot lay anything out; treat it as one column so
+        // the division is total and the match keeps its own row.
+        let cols = self.cols.max(1);
+        let row_offset = m.start_col / cols;
+        let start_col = m.start_col % cols;
+        SearchMatch::new(
+            m.line.saturating_add(row_offset),
+            start_col,
+            start_col.saturating_add(m.len()),
+        )
+    }
+
+    /// [`Self::to_physical`] over a whole result set, in place.
+    fn results_to_physical(self, results: &mut SearchResults) {
+        for m in &mut results.matches {
+            *m = self.to_physical(m);
+        }
+    }
+}
+
+/// Fold each soft-wrapped run of snapshot rows into the ONE logical line the
+/// reader sees, in place: the run's head takes the whole text and every
+/// continuation becomes empty, so a hit that straddles the boundary is found
+/// exactly once, keyed at the row it starts on.
+///
+/// Every row a continuation follows is padded back out to the full `cols`
+/// display columns it occupies on the glass, however few of them hold text. Grid
+/// rows are read TRIMMED (the visible-row reader drops trailing blanks), so
+/// without the padding a run whose head ends in spaces — anything printed
+/// through a left-justified `%-Ns` — would splice its neighbour's first column
+/// onto its last non-blank one, both inventing matches that are not on the glass
+/// and shifting every column after it. With it, the joined line has a UNIFORM
+/// stride: column `c` of the run is row `c / cols`, column `c % cols`, which is
+/// the arithmetic [`WrapFrame::to_physical`] inverts. That uniformity is the
+/// whole contract, so the padding is derived from the ROW COUNT and never from
+/// the accumulated column total.
+///
+/// Joining also makes the logical line the unit a regex sees, so `^`/`$` bind to
+/// the reader's line rather than to a grid row — the semantics
+/// [`search_full_history_direction`] documents.
+fn join_wrapped_rows(lines: &mut [String], wrapped: &[bool], cols: usize) {
+    // A zero-column grid lays nothing out; leaving the rows alone keeps every
+    // coordinate the caller already has, and there is no boundary to straddle.
+    if cols == 0 {
+        return;
+    }
+    let mut head = 0usize;
+    while head < lines.len() {
+        let mut end = head.saturating_add(1);
+        while wrapped.get(end).copied().unwrap_or(false) {
+            end = end.saturating_add(1);
+        }
+        let continuations = end.saturating_sub(head).saturating_sub(1);
+        if continuations > 0
+            && let Some((slot, rest)) = lines.get_mut(head..).and_then(<[String]>::split_first_mut)
+        {
+            let mut joined = std::mem::take(slot);
+            // Carried, not re-measured: re-counting the accumulated text once
+            // per continuation would make joining a long run quadratic in its
+            // length, and a `cat` of a file with no newlines is exactly a long
+            // run.
+            let mut columns = aterm_search::display_columns(&joined);
+            // How many columns the run occupies once the rows joined so far are
+            // laid out: one grid width per ROW, counted here rather than derived
+            // from `columns % cols`. A row whose cells are all blank trims to the
+            // empty string, leaving the running count already a multiple of the
+            // width, so a modulo would pad it by nothing and the joined line
+            // would silently lose that row's entire stride — every later hit on
+            // the run then inverts to one grid row too high, and find paints the
+            // blank row while the real match stays dark. A blank row inside a run
+            // is an ordinary redraw, not a corner case: `CSI 2 K` erases a row
+            // without clearing the NEXT row's continuation flag.
+            let mut occupied = cols;
+            for row in rest.iter_mut().take(continuations) {
+                let pad = occupied.saturating_sub(columns);
+                joined.extend(std::iter::repeat_n(' ', pad));
+                columns = columns.saturating_add(pad);
+                let continuation = std::mem::take(row);
+                columns = columns.saturating_add(aterm_search::display_columns(&continuation));
+                joined.push_str(&continuation);
+                occupied = occupied.saturating_add(cols);
+            }
+            *slot = joined;
+        }
+        head = end;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the wrap frame rides alongside the query's own surface, like the anchor"
+)]
 fn query_search_index(
     index: &TerminalSearch,
     query: &str,
@@ -1359,9 +1632,13 @@ fn query_search_index(
     direction: EngineSearchDirection,
     anchor: Option<(usize, usize)>,
     strict: bool,
+    wrap: WrapFrame,
 ) -> Result<(SearchResults, Option<SearchMatch>), SearchOptionsError> {
-    let results =
+    let mut results =
         index.search_results_opts_direction(query, case_sensitive, is_regex, direction)?;
+    // Physical FIRST: `select_point_match` orders results against the caller's
+    // physical anchor, so a joined line's columns must never reach it.
+    wrap.results_to_physical(&mut results);
     let point_match = select_point_match(
         index,
         &results,
@@ -1371,6 +1648,7 @@ fn query_search_index(
         direction,
         anchor,
         strict,
+        wrap,
     )?;
     Ok((results, point_match))
 }
@@ -1391,6 +1669,7 @@ fn select_point_match(
     direction: EngineSearchDirection,
     anchor: Option<(usize, usize)>,
     strict: bool,
+    wrap: WrapFrame,
 ) -> Result<Option<SearchMatch>, SearchOptionsError> {
     let point_match = if let Some(anchor) = anchor {
         if results.matches.len() < MAX_SEARCH_MATCHES {
@@ -1430,17 +1709,22 @@ fn select_point_match(
                 _ => None,
             }
         } else {
-            index.find_direction_opts(
-                query,
-                case_sensitive,
-                is_regex,
-                aterm_search::DirectedFind {
-                    anchor,
-                    direction,
-                    inclusive: !strict,
-                    wrap: true,
-                },
-            )?
+            // Past the batch cap the walk addresses the INDEX, whose lines are
+            // joined soft-wrap runs — so it takes the anchor in that frame and
+            // hands back a match that still has to be re-expressed physically.
+            index
+                .find_direction_opts(
+                    query,
+                    case_sensitive,
+                    is_regex,
+                    aterm_search::DirectedFind {
+                        anchor: wrap.logical_anchor.unwrap_or(anchor),
+                        direction,
+                        inclusive: !strict,
+                        wrap: true,
+                    },
+                )?
+                .map(|found| wrap.to_physical(&found))
         }
     } else {
         None
@@ -1602,6 +1886,7 @@ fn query_search_index_narrowing(
     direction: EngineSearchDirection,
     anchor: Option<(usize, usize)>,
     strict: bool,
+    wrap: WrapFrame,
 ) -> Result<(SearchResults, Option<SearchMatch>), SearchOptionsError> {
     if is_regex || query.is_empty() {
         // Regex has no prefix-subset property; empty is the neutral bar state.
@@ -1613,6 +1898,7 @@ fn query_search_index_narrowing(
             direction,
             anchor,
             strict,
+            wrap,
         );
     }
     let mut session = take_narrow_session(
@@ -1675,11 +1961,13 @@ fn query_search_index_narrowing(
     // a capped BACKWARD batch retains the newest matches instead — fall back
     // so the direction-aware edge semantics stay byte-identical.
     let capped = narrowed_results.matches.len() >= MAX_SEARCH_MATCHES;
-    let results = if capped && direction == EngineSearchDirection::Backward {
+    let mut results = if capped && direction == EngineSearchDirection::Backward {
         index.search_results_opts_direction(query, case_sensitive, false, direction)?
     } else {
         narrowed_results
     };
+    // Physical FIRST, for the reason [`query_search_index`] states.
+    wrap.results_to_physical(&mut results);
     if let Some(occurrence_lines) = occurrence_lines {
         let mut session = session.take().unwrap_or_else(|| NarrowSession {
             term: Arc::downgrade(term),
@@ -1728,6 +2016,7 @@ fn query_search_index_narrowing(
         direction,
         anchor,
         strict,
+        wrap,
     )?;
     Ok((results, point_match))
 }
@@ -1754,6 +2043,23 @@ pub(crate) fn search_full_history(
 /// The socket verb uses [`search_full_history`] and therefore retains the
 /// historical oldest-first capped subset. Cmd-R uses this entry point so a
 /// capped reverse search retains the newest matches instead.
+///
+/// THE UNIT OF MATCHING IS THE LOGICAL LINE, not the grid row. Every soft-wrap
+/// run is joined ([`join_wrapped_rows`]) into the one line the reader sees
+/// before the engine looks at it, so a hit may straddle a wrap; the results
+/// come back in PHYSICAL coordinates ([`WrapFrame::to_physical`]) with such a
+/// hit's `end_col` counting straight through the boundary. Two consequences a
+/// caller has to know about, both deliberate:
+///
+/// - Regex `^`/`$` anchor the LOGICAL line. A continuation row's column 0 is
+///   mid-line and does not match `^`; a character the wrap pushed to a row's
+///   end is mid-line and does not match `$`. This is what "search across soft
+///   wraps" means — the wrap is layout the terminal chose, never text the
+///   program wrote — and an unwrapped row, being its own logical line, anchors
+///   at its own ends unchanged.
+/// - A query of only spaces can match the blank cells a continued row is padded
+///   back out with. Those cells are genuinely blank on the glass and genuinely
+///   inside the line, so they are matchable like any other run of spaces.
 pub(crate) fn search_full_history_direction(
     term: &Arc<Mutex<Terminal>>,
     query: &str,
@@ -1789,6 +2095,33 @@ pub(crate) fn search_full_history_direction(
     // concurrent config reload (a resize bumps content_seq, so the floor tracks it).
     let max_lines = search_max_lines().max(max_cached_for_retained(visible_rows));
 
+    // The indexed window, hoisted above the cache branch because the wrap frame
+    // needs its floor: an anchor's logical-line walk stops where the index does.
+    let total = scrollback + visible_rows;
+    let retained_total = total.min(max_lines);
+    let skipped_prefix = total.saturating_sub(retained_total);
+    let retained_oldest = oldest.saturating_add(skipped_prefix as u64);
+    let retained_base = usize::try_from(retained_oldest).unwrap_or(usize::MAX);
+    let indexed_end = retained_base.saturating_add(retained_total);
+
+    // The soft-wrap layout this query is answered in. `cols` comes from the same
+    // grid the rows do, so the stride that un-joins a logical line's columns can
+    // never belong to a different geometry than the rows that were joined; the
+    // anchor is carried into that frame here, where the runs are readable.
+    let wrap = {
+        let t = term_lock(term);
+        let cols = usize::from(t.grid().cols());
+        WrapFrame {
+            cols,
+            logical_anchor: anchor.and_then(|(row, col)| {
+                let origin =
+                    logical_origin(&t, u64::try_from(row).unwrap_or(u64::MAX), retained_oldest)?;
+                let origin = usize::try_from(origin).unwrap_or(row);
+                Some(WrapFrame::to_logical(cols, origin, row, col))
+            }),
+        }
+    };
+
     // Cache hit: clone the immutable index handle while holding the process-global
     // cache lock, then run the potentially large query after releasing it. Searches
     // in another window can therefore proceed concurrently instead of serializing
@@ -1813,6 +2146,7 @@ pub(crate) fn search_full_history_direction(
             direction,
             anchor,
             strict,
+            wrap,
         )?;
         #[cfg(test)]
         maybe_mutate_search_cache_hit(term);
@@ -1837,6 +2171,7 @@ pub(crate) fn search_full_history_direction(
             base_y,
             absolute_row_revision,
             content_seq: key_seq,
+            cols: wrap.cols,
             consistent,
         });
     }
@@ -1847,12 +2182,6 @@ pub(crate) fn search_full_history_direction(
     // key sorts). `abs_row_text` converts each retained absolute row against the
     // LIVE frame at read time, so a row that scrolls off mid-snapshot reads as
     // evicted (empty) — exactly what a fresh build under the shifted frame lacks.
-    let total = scrollback + visible_rows;
-    let retained_total = total.min(max_lines);
-    let skipped_prefix = total.saturating_sub(retained_total);
-    let retained_oldest = oldest.saturating_add(skipped_prefix as u64);
-    let retained_base = usize::try_from(retained_oldest).unwrap_or(usize::MAX);
-    let indexed_end = retained_base.saturating_add(retained_total);
     let visible_base = usize::try_from(oldest.saturating_add(scrollback_u64)).unwrap_or(usize::MAX);
     let reusable =
         take_reusable_search_index(term, key_alt, absolute_row_revision, max_lines, indexed_end);
@@ -1870,9 +2199,39 @@ pub(crate) fn search_full_history_direction(
             retained_base,
         )
     };
+    // A soft-wrap run is indexed as ONE line keyed at the row it starts on, so a
+    // refresh that began INSIDE a run would re-key its tail as an (empty)
+    // continuation while the run's head still carried its old, unjoined text —
+    // and the hits on the tail would vanish.
+    //
+    // The walk starts one row BELOW the refresh boundary, not at it. The row it
+    // begins on is the previous generation's top VISIBLE row, so the program
+    // could have rewritten it out of a run since; the run whose head must be
+    // re-joined is then the one ending at the row ABOVE, and that row's own
+    // flags are immutable history. Starting a row early catches both shapes and
+    // costs one extra row on the ordinary unwrapped refresh. A run too deep to
+    // walk back over falls to the retained floor, which re-indexes more rows
+    // than needed but can never leave a half-joined line behind.
+    let snapshot_start = {
+        let t = term_lock(term);
+        logical_origin(
+            &t,
+            u64::try_from(snapshot_start)
+                .unwrap_or(u64::MAX)
+                .saturating_sub(1)
+                .max(retained_oldest),
+            retained_oldest,
+        )
+        .and_then(|origin| usize::try_from(origin).ok())
+        .unwrap_or(retained_base)
+    };
     let snapshot_lines = indexed_end.saturating_sub(snapshot_start);
     let snapshot_start_u64 = u64::try_from(snapshot_start).unwrap_or(u64::MAX);
     let mut lines: Vec<String> = Vec::with_capacity(snapshot_lines);
+    // Which snapshot rows are soft-wrap CONTINUATIONS, read in the same lock
+    // holds as the text so the layout and the content can never come from two
+    // different frames.
+    let mut wrapped: Vec<bool> = Vec::with_capacity(snapshot_lines);
     // Track whether the active screen / content generation ever diverged from the cache key
     // DURING the chunked copy — not just at the endpoints. A main→alt→main round-trip leaves
     // the main grid's content_seq unchanged (the alt swap doesn't touch its cells), so an
@@ -1889,16 +2248,19 @@ pub(crate) fn search_full_history_direction(
         }
         let end = (lines.len() + SNAPSHOT_CHUNK_LINES).min(snapshot_lines);
         for j in lines.len()..end {
-            let text = match abs_row_text(
-                &t,
-                snapshot_start_u64.saturating_add(u64::try_from(j).unwrap_or(u64::MAX)),
-            ) {
+            let abs = snapshot_start_u64.saturating_add(u64::try_from(j).unwrap_or(u64::MAX));
+            let text = match abs_row_text(&t, abs) {
                 AbsRow::Text(s) => s,
                 AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
             };
+            // The FIRST snapshot row starts a logical line by construction (the
+            // walk above put it on one), whatever the grid says about the row
+            // above it — the index has nothing older to join it to.
+            wrapped.push(j > 0 && abs_row_wrapped(&t, abs));
             lines.push(text);
         }
     }
+    join_wrapped_rows(&mut lines, &wrapped, wrap.cols);
 
     // Build the index OUTSIDE any lock: line `j` keys at absolute row `oldest + j`, so
     // SearchMatch.line is already an absolute row and the eviction/incomplete semantics
@@ -1922,6 +2284,7 @@ pub(crate) fn search_full_history_direction(
         direction,
         anchor,
         strict,
+        wrap,
     );
 
     // Cache only a PROVEN-consistent snapshot: if the content generation or active screen
@@ -1958,6 +2321,7 @@ pub(crate) fn search_full_history_direction(
         base_y,
         absolute_row_revision,
         content_seq: key_seq,
+        cols: wrap.cols,
         consistent,
     })
 }
@@ -1969,6 +2333,8 @@ pub(crate) struct FullHistoryPoint {
     pub(crate) base_y: i64,
     pub(crate) absolute_row_revision: u64,
     pub(crate) content_seq: u64,
+    /// See [`FullHistorySearch::cols`].
+    pub(crate) cols: usize,
     pub(crate) consistent: bool,
 }
 
@@ -1996,6 +2362,28 @@ pub(crate) fn search_full_history_point(
         i64::try_from(oldest.saturating_add(u64::try_from(scrollback).unwrap_or(u64::MAX)))
             .unwrap_or(i64::MAX);
     let max_lines = search_max_lines().max(max_cached_for_retained(visible_rows));
+    let retained_oldest = oldest.saturating_add(
+        u64::try_from((scrollback + visible_rows).saturating_sub(max_lines)).unwrap_or(0),
+    );
+    // Same frame as the batch path: the index holds soft-wrapped runs joined, so
+    // this walk hands the anchor over in the joined line's columns and hands the
+    // hit back in the grid's.
+    let wrap = {
+        let terminal = term_lock(term);
+        let cols = usize::from(terminal.grid().cols());
+        WrapFrame {
+            cols,
+            logical_anchor: logical_origin(
+                &terminal,
+                u64::try_from(anchor.0).unwrap_or(u64::MAX),
+                retained_oldest,
+            )
+            .map(|origin| {
+                let origin = usize::try_from(origin).unwrap_or(anchor.0);
+                WrapFrame::to_logical(cols, origin, anchor.0, anchor.1)
+            }),
+        }
+    };
     let cached_index =
         cached_search_index(term, key_alt, key_seq, absolute_row_revision, max_lines);
     let Some(index) = cached_index else {
@@ -2013,21 +2401,24 @@ pub(crate) fn search_full_history_point(
             base_y: full.base_y,
             absolute_row_revision: full.absolute_row_revision,
             content_seq: full.content_seq,
+            cols: full.cols,
             consistent: full.consistent,
         });
     };
 
-    let point_match = index.find_direction_opts(
-        query,
-        case_sensitive,
-        is_regex,
-        aterm_search::DirectedFind {
-            anchor,
-            direction,
-            inclusive: !strict,
-            wrap: true,
-        },
-    )?;
+    let point_match = index
+        .find_direction_opts(
+            query,
+            case_sensitive,
+            is_regex,
+            aterm_search::DirectedFind {
+                anchor: wrap.logical_anchor.unwrap_or(anchor),
+                direction,
+                inclusive: !strict,
+                wrap: true,
+            },
+        )?
+        .map(|found| wrap.to_physical(&found));
     let consistent = {
         let terminal = term_lock(term);
         terminal.is_alternate_screen() == key_alt
@@ -2039,6 +2430,7 @@ pub(crate) fn search_full_history_point(
         base_y,
         absolute_row_revision,
         content_seq: key_seq,
+        cols: wrap.cols,
         consistent,
     })
 }
@@ -2711,10 +3103,18 @@ struct StyledCellSnap {
 
 /// Side-adjusted selection geometry for the styled control frame.
 ///
-/// The old frame serialized only `TextSelection::normalized_bounds()`. That lost
-/// both the selection kind (a block and a linear selection can share the same
-/// endpoints but paint different cells) and the anchors' half-cell sides. Store
-/// the renderer-equivalent `TextSelection::project_range` result instead.
+/// Bare `normalized_bounds()` cannot describe a selection: it loses the kind (a
+/// block and a linear selection can share endpoints and paint different cells)
+/// and the anchors' half-cell sides. This carries `TextSelection::project_range`
+/// plus the kind, which recovers both.
+///
+/// It is the LOGICAL span, NOT a cell-for-cell mirror of the paint.
+/// `project_range` sees anchors only, so it applies the renderer's half-cell
+/// side adjustment and line expansion but cannot apply the content-dependent
+/// widening a double-width glyph forces (`glyph_cell_span`): an edge resting on
+/// half such a glyph paints the other half too, one column outside
+/// `start_col`/`end_col`. A watcher that needs the painted cells reads the
+/// frame's `cells` array and its `wide_lead` bits instead.
 struct StyledSelectionSnap {
     start_row: i32,
     start_col: u16,
@@ -2743,7 +3143,8 @@ pub(crate) struct StyledFrameSnapshot {
     /// `rows × cols` cells, blank-padded to the full grid width (no trim).
     cells: Vec<Vec<StyledCellSnap>>,
     line_sizes: Vec<&'static str>,
-    /// Renderer-equivalent selected range (or `None`).
+    /// The selection's LOGICAL span and kind — see [`StyledSelectionSnap`] for
+    /// where it parts company with the painted cells — or `None`.
     selection: Option<StyledSelectionSnap>,
     /// OSC 17 selection fill, or `None` for the renderer/theme default.
     selection_bg: Option<[u8; 3]>,
@@ -2854,9 +3255,16 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
         line_sizes.push(line_size_name(row_line_size(t, r))); // F2: DEC double-width/height
     }
     // F3: text selection highlight (a human/peer-initiated selection a watcher
-    // would otherwise miss). `project_range` applies the SAME half-cell side
-    // adjustment and line expansion as the renderer; the explicit kind preserves
+    // would otherwise miss). `project_range` applies the renderer's half-cell
+    // side adjustment and line expansion; the explicit kind preserves
     // block-vs-linear geometry when endpoints happen to match.
+    //
+    // Everything anchors can express, and nothing more: this is the LOGICAL
+    // span, not a cell-for-cell mirror of the paint. An edge resting on half a
+    // double-width glyph paints its other half too (`glyph_cell_span`), which is
+    // content-dependent and so cannot be read off anchors at all. A watcher that
+    // needs the painted cells has the `cells` array beside this and its
+    // `wide_lead` bits.
     let sel = t.text_selection();
     let selection = sel
         .project_range(t.cols().saturating_sub(1))
@@ -2994,13 +3402,14 @@ pub(crate) fn styled_frame_payload(t: &Terminal) -> String {
 #[allow(dead_code)]
 fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::RenderInput) {
     let aterm_core::render::RenderInput {
-        rows: _,                  // frame "dims.rows"
-        cols: _,                  // frame "dims.cols"
-        cells: _,                 // frame "rows" (per-cell styled_cell_json)
-        cursor_row: _,            // frame "cursor.row"
-        cursor_col: _,            // frame "cursor.col"
-        cursor_visible: _,        // frame "cursor.visible"
-        cursor_style: _,          // frame "cursor.style"
+        rows: _,                         // frame "dims.rows"
+        cols: _,                         // frame "dims.cols"
+        cells: _,                        // frame "rows" (per-cell styled_cell_json)
+        cursor_row: _,                   // frame "cursor.row"
+        cursor_col: _,                   // frame "cursor.col"
+        cursor_visible: _,               // frame "cursor.visible"
+        cursor_style: _,                 // frame "cursor.style"
+        cursor_effect_style_override: _, // OMITTED: host/effect-owned render shape; cursor.style remains terminal DECSCUSR
         cursor_trail: _, // OMITTED: host-owned cursor-trail overlay cells (render bling), not engine cell content
         cursor_trail_color: _, // OMITTED: host-resolved cursor-trail tint, host-owned
         cursor_glow_add: _, // OMITTED: host-owned LUMEN aurora light quads, not engine cell content
@@ -3668,8 +4077,10 @@ mod tests {
         let rb = cmd_search(&term, "NEEDLE_beta");
         assert!(rb.starts_with("OK 1"), "post-write needle found: {rb}");
         assert!(
-            super::take_last_search_snapshot_lines() <= 5,
-            "ordinary output refreshes the four visible rows plus at most one appended row"
+            super::take_last_search_snapshot_lines() <= 6,
+            "ordinary output refreshes the four visible rows, at most one appended row, \
+             and the one row below the boundary that a soft-wrap run could have reached \
+             into it from"
         );
         assert_eq!(
             cmd_search(&term, "NEEDLE_alpha"),
@@ -3696,6 +4107,146 @@ mod tests {
 
         assert!(cmd_search(&term, "NEW_HISTORY_TOKEN").starts_with("OK 1"));
         assert!(cmd_search(&term, "OLD_VISIBLE_TOKEN").starts_with("OK 0"));
+    }
+
+    /// A soft-wrap run is indexed as ONE line keyed at the row it starts on, so
+    /// an incremental refresh that began INSIDE a run would leave that run's
+    /// head holding text for rows the refresh has since re-read — a hit spliced
+    /// out of content that is no longer on the glass. The refresh starts below
+    /// the boundary and walks to the run's head, which is why the bound in
+    /// `repeat_search_stable_and_write_invalidates` is the visible window plus
+    /// one row rather than the visible window exactly.
+    #[test]
+    fn an_incremental_refresh_rejoins_the_run_its_boundary_landed_inside() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
+        // A wrapped run across the screen-top boundary: "0123456789" scrolls
+        // into history, "ABCDEFGHIJ" stays as the top visible (continuation) row.
+        term.lock()
+            .unwrap()
+            .process(b"0123456789ABCDEFGHIJ\r\naa\r\nbb\r\n");
+        assert!(
+            cmd_search(&term, "9A").starts_with("OK 1"),
+            "the straddling pair is found while the run is whole"
+        );
+
+        // Rewrite the top visible row out of the run, then scroll so the next
+        // query takes the incremental path with its boundary on that row.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b[H\x1b[2Kzz\x1b[4;1H\r\n");
+        assert!(
+            cmd_search(&term, "9A").starts_with("OK 0"),
+            "the run's head must be re-joined, not left holding the rows it lost"
+        );
+        assert!(
+            cmd_search(&term, "0123456789").starts_with("OK 1"),
+            "the head keeps its own row's text"
+        );
+    }
+
+    /// Read one absolute row back as the grid renders it, so a test can say
+    /// which row a token is ACTUALLY printed on rather than trusting the search
+    /// it is checking.
+    fn row_text(term: &Arc<Mutex<Terminal>>, abs: u64) -> String {
+        match super::abs_row_text(&term_lock(term), abs) {
+            super::AbsRow::Text(s) => s,
+            super::AbsRow::Evicted | super::AbsRow::OutOfRange => "<evicted>".to_string(),
+        }
+    }
+
+    /// A row erased with `CSI 2 K` trims to the empty string, yet the erase does
+    /// NOT clear the FOLLOWING row's continuation flag — the run still spans it,
+    /// and its blank cells are real columns the reader's line runs through. The
+    /// joined line has to hold that whole width, so the stride is counted per
+    /// ROW; a count derived from the running column total modulo the width would
+    /// pad a blank row by nothing and lose its entire stride, inverting every
+    /// later hit on the run onto a grid row too high. Find would then scroll to
+    /// and paint the blank row while the real match stayed dark.
+    #[test]
+    fn a_blank_row_inside_a_soft_wrap_run_still_holds_its_width_of_the_line() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
+        // Three wrapped rows, then the MIDDLE one erased in place.
+        term.lock()
+            .unwrap()
+            .process(b"0123456789ABCDEFGHIJKLMNOPQRST");
+        term.lock().unwrap().process(b"\x1b[2;1H\x1b[2K");
+        assert_eq!(row_text(&term, 1), "", "the middle row really is blank");
+        assert_eq!(
+            row_text(&term, 2),
+            "KLMNOPQRST",
+            "the tail is printed on grid row 2"
+        );
+        assert_eq!(
+            cmd_search(&term, "KLMNOPQRST"),
+            "OK 1\n2 0 10\n",
+            "the hit is reported on the row it is printed on"
+        );
+    }
+
+    /// The same stride, lost at the run's HEAD rather than inside it: an erased
+    /// first row still occupies the width its continuation is offset by.
+    #[test]
+    fn a_blank_head_row_of_a_soft_wrap_run_still_holds_its_width_of_the_line() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
+        term.lock().unwrap().process(b"0123456789ABCDEFGHIJ");
+        term.lock().unwrap().process(b"\x1b[1;1H\x1b[2K");
+        assert_eq!(row_text(&term, 0), "", "the head row really is blank");
+        assert_eq!(
+            row_text(&term, 1),
+            "ABCDEFGHIJ",
+            "the continuation is printed on grid row 1"
+        );
+        assert_eq!(
+            cmd_search(&term, "ABCDEFGHIJ"),
+            "OK 1\n1 0 10\n",
+            "the hit is reported on the row it is printed on"
+        );
+    }
+
+    /// A soft wrap is the terminal's LAYOUT, never part of the text, so the line
+    /// a regex is matched against is the logical line the reader sees: `^` binds
+    /// where that line begins and `$` where it ends, not to the grid-row edges
+    /// the wrap happened to fall on. A continuation row therefore has no `^` of
+    /// its own, and the character a wrap merely pushed to the end of a row is not
+    /// at `$` — which is what a user asking to search across soft wraps means by
+    /// "the start of the line".
+    #[test]
+    fn regex_anchors_bind_to_the_logical_line_not_the_rows_a_soft_wrap_split_it_into() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
+        // One 20-column logical line, laid out as grid rows 0 and 1.
+        term.lock().unwrap().process(b"0123456789ABCDEFGHIJ");
+
+        // Both wrap-interior positions: the far side of the boundary is not a
+        // beginning, and its near side is not an end.
+        assert_eq!(
+            cmd_search(&term, "^ABC regex"),
+            "OK 0\n",
+            "a continuation row's column 0 is not where the line begins"
+        );
+        assert_eq!(
+            cmd_search(&term, "9$ regex"),
+            "OK 0\n",
+            "the column the wrap pushed to a row's end is not where the line ends"
+        );
+
+        // The line's own ends do anchor, and a match past the boundary is still
+        // re-expressed on the physical row it occupies.
+        assert_eq!(cmd_search(&term, "^0123 regex"), "OK 1\n0 0 4\n");
+        assert_eq!(cmd_search(&term, "J$ regex"), "OK 1\n1 9 1\n");
+        assert_eq!(
+            cmd_search(&term, "^0123456789ABCDEFGHIJ$ regex"),
+            "OK 1\n0 0 20\n",
+            "anchored end to end, the run is ONE line whose len counts through the wrap"
+        );
+
+        // An UNWRAPPED row is its own logical line, so its row edges anchor as
+        // they always did — the rebinding follows the wrap, not the grid.
+        term.lock().unwrap().process(b"\x1b[3;1Hxyz");
+        assert_eq!(cmd_search(&term, "^xyz$ regex"), "OK 1\n2 0 3\n");
     }
 
     /// The snapshot cache is keyed by TERMINAL IDENTITY: a different session
@@ -3930,6 +4481,10 @@ mod tests {
             "redraw_retry_gated=",
             "frame_refills_scoped=",
             "frame_refills_full=",
+            // The effect-only reuse gate's honesty term: scoped + full + skipped
+            // is still one per presented non-rescan frame.
+            "frame_refills_skipped=",
+            "frame_refill_full_causes=",
             "last_pre_present_ms=",
             "pre_present_total_ms=",
             "last_present_drop_reason=",
@@ -4022,6 +4577,8 @@ mod tests {
             "redraw_retry_gated",
             "frame_refills_scoped",
             "frame_refills_full",
+            "frame_refills_skipped",
+            "frame_refill_full_causes",
             "pre_present_attempts",
             "last_pre_present_ms",
             "pre_present_total_ms",
@@ -4250,6 +4807,74 @@ mod tests {
         );
     }
 
+    /// The FULL-arm attribution's wire shape, in both forms — the same
+    /// self-labelling discipline as the per-owner arm ledger, tested the same
+    /// way, so a new `FullRefillCause` cannot shift anyone's column and a
+    /// whitespace-splitting reader always gets a token.
+    ///
+    /// The counters are process-global and every other test in this binary
+    /// shares them, so this asserts SHAPE only, never counts.
+    #[test]
+    fn the_full_refill_cause_attribution_is_self_labelling_in_both_forms() {
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: serde_json::Value = serde_json::from_str(body).expect("valid metrics JSON");
+        let causes = value
+            .get("frame_refill_full_causes")
+            .expect("the per-cause attribution is published");
+        assert!(
+            causes.is_object(),
+            "the attribution must be a keyed object, not a scraped string: {causes}"
+        );
+        for (cause, frames) in causes.as_object().expect("object") {
+            assert!(!cause.is_empty(), "every entry is named");
+            assert!(
+                frames.as_u64().is_some_and(|n| n > 0),
+                "{cause} publishes a non-zero frame count (the ledger is sparse)"
+            );
+        }
+
+        // The text twin: one whitespace-free token, `none` when nothing has
+        // refused yet rather than a bare `key=`.
+        let text = super::cmd_metrics(None, "");
+        let field = text
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("frame_refill_full_causes="))
+            .expect("the text form publishes the attribution");
+        assert!(
+            !field.is_empty(),
+            "an empty attribution renders as `none`, not `\"\"`"
+        );
+        if field != "none" {
+            for pair in field.split(',') {
+                let (cause, frames) = pair
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("`clause:frames` pairs, got `{pair}`"));
+                assert!(!cause.is_empty(), "every pair is named: {field}");
+                assert!(
+                    frames.parse::<u64>().is_ok(),
+                    "every pair carries a count: {field}"
+                );
+            }
+        }
+
+        // Every label the engine can produce must survive the wire round trip
+        // as a distinct, splittable token — checked over the WHOLE enum rather
+        // than over whichever causes this process happened to hit.
+        for cause in aterm_core::render::FullRefillCause::ALL {
+            let label = cause.as_str();
+            assert!(
+                !label.contains(',')
+                    && !label.contains(':')
+                    && !label.contains(char::is_whitespace),
+                "`{label}` would break the `a:1,b:2` text encoding"
+            );
+        }
+    }
+
     #[test]
     fn metrics_remain_available_while_the_terminal_mutex_is_busy() {
         let term = term_with(&[]);
@@ -4288,13 +4913,14 @@ mod tests {
         let _ = super::take_narrowed_query_steps();
 
         let batch_oracle = |q: &str| {
-            let (key_alt, key_seq, revision, rows) = {
+            let (key_alt, key_seq, revision, rows, cols) = {
                 let t = term_lock(&term);
                 (
                     t.is_alternate_screen(),
                     t.content_seq(),
                     t.absolute_row_revision(),
                     t.rows() as usize,
+                    usize::from(t.grid().cols()),
                 )
             };
             let max_lines =
@@ -4309,6 +4935,10 @@ mod tests {
                 super::EngineSearchDirection::Forward,
                 None,
                 false,
+                super::WrapFrame {
+                    cols,
+                    logical_anchor: None,
+                },
             )
             .expect("literal batch query cannot fail");
             results
@@ -4382,13 +5012,14 @@ mod tests {
         let _ = super::take_narrowed_query_steps();
 
         let oracle = |q: &str| {
-            let (key_alt, key_seq, revision, rows) = {
+            let (key_alt, key_seq, revision, rows, cols) = {
                 let t = term_lock(&term);
                 (
                     t.is_alternate_screen(),
                     t.content_seq(),
                     t.absolute_row_revision(),
                     t.rows() as usize,
+                    usize::from(t.grid().cols()),
                 )
             };
             let max_lines =
@@ -4403,6 +5034,10 @@ mod tests {
                 super::EngineSearchDirection::Backward,
                 None,
                 false,
+                super::WrapFrame {
+                    cols,
+                    logical_anchor: None,
+                },
             )
             .expect("literal batch query cannot fail");
             (results, point)
@@ -4457,13 +5092,14 @@ mod tests {
         let _ = super::take_narrowed_query_steps();
 
         let batch_oracle = |q: &str| {
-            let (key_alt, key_seq, revision, rows) = {
+            let (key_alt, key_seq, revision, rows, cols) = {
                 let t = term_lock(&term);
                 (
                     t.is_alternate_screen(),
                     t.content_seq(),
                     t.absolute_row_revision(),
                     t.rows() as usize,
+                    usize::from(t.grid().cols()),
                 )
             };
             let max_lines =
@@ -4478,6 +5114,10 @@ mod tests {
                 super::EngineSearchDirection::Forward,
                 None,
                 false,
+                super::WrapFrame {
+                    cols,
+                    logical_anchor: None,
+                },
             )
             .expect("literal batch query cannot fail");
             results

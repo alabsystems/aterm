@@ -744,8 +744,6 @@ mod tests {
             dmg_sha256: &"ab".repeat(32),
             zip_name: "aterm-0.99.0-mac.zip",
             zip_sha256: &"cd".repeat(32),
-            dmg_x86_64_name: None,
-            dmg_x86_64_sha256: None,
             repo_slug: "owner/repo",
             min_os: "11.0",
             team_id: "",

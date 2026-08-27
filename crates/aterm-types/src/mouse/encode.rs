@@ -154,10 +154,21 @@ pub fn encode_urxvt(cb: u16, col: u16, row: u16) -> Vec<u8> {
 ///
 /// For URXVT, `cb` is automatically offset by 32 (callers pass the raw code).
 ///
-/// For X10 encoding, coordinates > 222 (byte value > 255 after +33 offset)
-/// cannot be represented in a single byte. When either coordinate exceeds
-/// 222, the encoder falls back to SGR format which has no coordinate limit.
-/// This matches the behavior of modern terminals like xterm and foot.
+/// # Out-of-range X10 coordinates keep X10 framing
+///
+/// A coordinate past 222 (1-based 223, byte 255) has no single-byte
+/// representation, so [`encode_x10`] clamps it to that maximum. It does NOT
+/// change the output FORM.
+///
+/// This encoder used to emit the SGR (1006) form instead whenever either
+/// coordinate went out of range — which silently handed an application a
+/// protocol it never enabled. An app that set only mode 1000 scans for the
+/// fixed 6-byte `ESC [ M Cb Cx Cy` frame; `ESC [ < 0 ; 251 ; 6 M` does not
+/// match it, so the parameter bytes are most likely passed through as literal
+/// input. On a wide terminal (>223 columns) that turned every far-right click
+/// into typed garbage. The frame an application asked for is the frame it
+/// gets; an app that wants coordinates past 223 enables SGR (1006) or UTF-8
+/// (1005) itself, and both are honoured here without a limit.
 #[must_use]
 pub fn encode_mouse(cb: u8, col: u16, row: u16, encoding: MouseEncoding, release: bool) -> Vec<u8> {
     // Release signalling is FORMAT-specific, so it is decided here where the
@@ -168,15 +179,10 @@ pub fn encode_mouse(cb: u8, col: u16, row: u16, encoding: MouseEncoding, release
     // button-3 into the SGR fallback (#7473).
     let legacy_cb = if release { (cb & !0b11) | 3 } else { cb };
     match encoding {
-        MouseEncoding::X10 => {
-            // X10 encoding uses single bytes for coordinates (max 223 + 32 = 255).
-            // Fall back to SGR when coordinates exceed the X10 limit.
-            if col > 222 || row > 222 {
-                encode_sgr(cb, col, row, release)
-            } else {
-                encode_x10(legacy_cb, col, row)
-            }
-        }
+        // X10 encoding uses single bytes for coordinates (max 223 + 32 = 255).
+        // Out-of-range coordinates are CLAMPED by `encode_x10`; the framing
+        // never changes under the application's feet (see this fn's docs).
+        MouseEncoding::X10 => encode_x10(legacy_cb, col, row),
         MouseEncoding::Utf8 => encode_utf8(legacy_cb, col, row),
         MouseEncoding::Sgr | MouseEncoding::SgrPixel => encode_sgr(cb, col, row, release),
         MouseEncoding::Urxvt => encode_urxvt(u16::from(legacy_cb.saturating_add(32)), col, row),
@@ -261,6 +267,37 @@ mod tests {
     fn encode_mouse_dispatches_x10() {
         let result = encode_mouse(0, 10, 5, MouseEncoding::X10, false);
         assert_eq!(result, encode_x10(0, 10, 5));
+    }
+
+    /// IN RANGE: the last column the X10 byte form can name. 0-based 222 is
+    /// 1-based 223 is byte 255 — the boundary the clamp is measured against.
+    #[test]
+    fn encode_mouse_x10_in_range_is_the_six_byte_frame() {
+        let result = encode_mouse(0, 222, 5, MouseEncoding::X10, false);
+        assert_eq!(result, vec![0x1b, b'[', b'M', 32, 255, 38]);
+    }
+
+    /// PAST 222: still the six-byte X10 frame, coordinate clamped — NEVER the
+    /// SGR form. The audit case: 24x260 with only DECSET 1000 set, a click at
+    /// 0-based column 250 used to emit `ESC [ < 0 ; 251 ; 6 M`, a 1006 report
+    /// the application never enabled and cannot parse.
+    #[test]
+    fn encode_mouse_x10_past_222_clamps_and_keeps_x10_framing() {
+        let result = encode_mouse(0, 250, 5, MouseEncoding::X10, false);
+        assert_eq!(
+            result,
+            vec![0x1b, b'[', b'M', 32, 255, 38],
+            "out-of-range X10 must clamp, not switch to SGR"
+        );
+        assert_ne!(
+            result,
+            b"\x1b[<0;251;6M".to_vec(),
+            "the pre-fix SGR fallback is exactly what must not come back"
+        );
+        // Both axes out of range, and a RELEASE: still six bytes, and the
+        // legacy button-3 substitution the X10 form requires.
+        let release = encode_mouse(0, 400, 300, MouseEncoding::X10, true);
+        assert_eq!(release, vec![0x1b, b'[', b'M', 32 + 3, 255, 255]);
     }
 
     #[test]

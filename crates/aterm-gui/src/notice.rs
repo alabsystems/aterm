@@ -231,14 +231,6 @@ impl TransientNotice {
         matches!(self.kind, NoticeKind::LevelUp { .. })
     }
 
-    /// Hold this card for `ttl` instead of the default, for work that genuinely
-    /// takes that long. It is still replaced the moment a terminal marker arrives.
-    #[must_use]
-    pub(crate) const fn holding(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
-        self
-    }
-
     /// Fully gone (past its whole lifetime) — the caller drops it.
     pub(crate) fn is_expired(&self, now: Instant) -> bool {
         now.duration_since(self.spawned) >= self.ttl

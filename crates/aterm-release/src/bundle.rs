@@ -44,12 +44,6 @@ pub struct BundleSpec {
     pub git_commit: String,
     /// The ship-ready (universal, stripped) binaries from `buildplan::run`.
     pub aterm_bin: PathBuf,
-    /// A VALIDATED toolchain-seed registry to seal into
-    /// `Contents/Resources/<atpkg::SEED_DIR_NAME>` (batteries-included, §9.1) — the
-    /// caller runs `seedpack::validate` first; `None` ships a seedless bundle
-    /// (the explicit `ATERM_SEEDLESS=1` cut). Data payloads only (tarballs +
-    /// signed manifests), so nothing here changes the one-Mach-O signing story.
-    pub seed: Option<crate::seedpack::SeedStat>,
 }
 
 /// Pure `-dirty` rule, EXACTLY matching crates/aterm-gui/build.rs: the suffix
@@ -462,40 +456,10 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
         println!("    bundled Help.html");
     }
 
-    // --- 6d. toolchain seed (batteries-included) ----------------------------
-    // The VALIDATED signed registry (seedpack::validate ran in step_build) is
-    // sealed under Resources/ as plain data — the client's bundled-seed lane
-    // installs from it offline through atpkg's ordinary signature gates. Flat
-    // copy of regular files only; validate() already refused anything else.
-    // Runs before sign::sign_app by pipeline order, so the seal covers it.
-    if let Some(seed) = &spec.seed {
-        // The ONE spelling of the name, shared with the client that probes for
-        // it (`atpkg::bundled`) — a cutter that sealed `toolchain-seed` while
-        // the client looked for anything else would ship a silent no-op.
-        let dst = resources.join(atpkg::SEED_DIR_NAME);
-        std::fs::create_dir_all(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-        for entry in
-            std::fs::read_dir(&seed.dir).map_err(|e| format!("read {}: {e}", seed.dir.display()))?
-        {
-            let entry = entry.map_err(|e| format!("read {}: {e}", seed.dir.display()))?;
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))
-                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
-        }
-        println!(
-            "    bundled toolchain-seed: {} file(s), {}, index_build={}, programs [{}]",
-            seed.files,
-            // The client's own formatter, not a mirror of it: the cut transcript
-            // and Settings ▸ Packages then report a seed's size in the same
-            // units and rounding by construction rather than by discipline.
-            atpkg::human_bytes(seed.bytes),
-            seed.index_build,
-            seed.programs
-                .iter()
-                .map(|(p, b)| format!("{p}@{b}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    // RETIRED 2026-08-26 (step 6d, the batteries-included toolchain seed sealed
+    // under `Contents/Resources/<atpkg::SEED_DIR_NAME>`): aterm ships ONE lean
+    // self-provisioning bundle — the client's own `atpkg` lane installs the
+    // toolchain from the network on first launch, and nothing is sealed here.
 
     Ok(app)
 }
@@ -542,40 +506,10 @@ pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Resul
     let path = spec
         .out_dir
         .join(format!("aterm-{}-build.txt", spec.short_version));
-    // Batteries-included seed lines (keys appended after the original fields so
-    // every existing consumer keeps parsing): what the seal carries, from the
-    // VALIDATED stat — plus a paranoid recount of the copied dir so the record
-    // describes the actual bundle, not the intent. A seedless cut keeps the
-    // honest constant "seed=no" the retirement era emitted.
-    let seed_lines = match &spec.seed {
-        Some(seed) => {
-            let copied = app.join("Contents/Resources").join(atpkg::SEED_DIR_NAME);
-            let n = std::fs::read_dir(&copied)
-                .map(|it| it.filter_map(Result::ok).count())
-                .unwrap_or(0);
-            if n != seed.files {
-                return Err(format!(
-                    "provenance: bundled seed holds {n} file(s) but the validated registry \
-                     had {} — the copy is not what was audited",
-                    seed.files
-                ));
-            }
-            format!(
-                "seed=yes\nseed_files={}\nseed_bytes={}\nseed_index_build={}\nseed_roster_seq={}\nseed_valid_until={}\nseed_programs={}\n",
-                seed.files,
-                seed.bytes,
-                seed.index_build,
-                seed.roster_seq,
-                seed.valid_until,
-                seed.programs
-                    .iter()
-                    .map(|(p, b)| format!("{p}@{b}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        }
-        None => "seed=no\n".to_string(),
-    };
+    // `seed=no` is a CONSTANT since 2026-08-26 (the batteries-included seal is
+    // retired): kept as a line rather than dropped so every existing consumer
+    // of the provenance record keeps parsing the field it always found.
+    let seed_lines = "seed=no\n";
     let body = format!(
         "name=aterm\n\
          version={}\n\

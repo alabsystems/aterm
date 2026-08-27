@@ -858,6 +858,13 @@ pub struct RenderInput {
     /// NOT baked in here — it lives on the renderer and is applied in
     /// `render_input`.
     pub cursor_style: CursorStyle,
+    /// Host/effect-owned cursor shape for this frame. This is kept
+    /// separate from [`cursor_style`](Self::cursor_style), so a laser/rainbow
+    /// effect never overwrites the terminal's live DECSCUSR state. Renderers
+    /// resolve cursor shape as: backend override (for example the unfocused
+    /// HollowBlock) > this effect override > terminal DECSCUSR. `None` is the
+    /// common, byte-identical terminal-only path.
+    pub cursor_effect_style_override: Option<CursorStyle>,
     /// The cursor MOTION TRAIL for this frame (the "streaming trailer" effect):
     /// recently-swept cells fading out behind the cursor. Owned by the host's
     /// animation clock (the windowed frontend fills it each frame and decays it),
@@ -1424,6 +1431,160 @@ pub enum RowOrder {
     BidiVisual,
 }
 
+/// WHICH continuity clause refused the damage-scoped arm — the per-cause
+/// attribution `FrameRefill::Full` carries.
+///
+/// The scoped refill's validity check is a conjunction of independent clauses
+/// (see
+/// [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into)),
+/// every one of them conservative. Before this existed a caller could see THAT
+/// the chain broke — `frame_refills_full` climbing — but never WHICH clause
+/// broke it, so a Full-dominated steady state was undiagnosable: the fix for a
+/// host mutator that forgot its seq bump, a scratch shared across panes, and a
+/// window whose row count disagrees with its engine are three completely
+/// different repairs behind one number.
+///
+/// The variant is the FIRST clause that refused, in the check's own
+/// short-circuit order — not the set of all clauses that would have refused. A
+/// frame that both scrolled and took full damage reports the scroll, because
+/// that is the clause the predicate stopped at.
+///
+/// A fieldless enum: it costs a register, never an allocation or a format, so
+/// it is affordable on the per-presented-frame path that produces it.
+///
+/// `#[repr(usize)]` IS LOAD-BEARING, and the reason is an ABI cliff rather
+/// than taste. `FrameRefill::Scoped` carries a `usize`; with a `u8` cause the
+/// two variants' payloads are scalars of DIFFERENT widths, which drops the
+/// enum out of rustc's ScalarPair ABI and makes `cell_frame_damage_scoped_into`
+/// return through memory (an `x8` indirect result on AArch64) instead of two
+/// registers. That was measured, not assumed: `#[repr(u8)]` cost +2.68% on
+/// `keystroke_tick/scoped_extract/50x200` in 7/7 paired rounds — a real
+/// regression on the arm this whole carrier exists to make fast — and
+/// widening the discriminant to `usize` returned it to +0.10%, inside the
+/// identical-binary control. The enum never lives anywhere but a register and
+/// a tally index, so the eight bytes cost nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(usize)]
+pub enum FullRefillCause {
+    /// The last engine fill permuted at least one row into BiDi visual order
+    /// (`engine_row_order != Logical`). The permutation is not idempotent, so
+    /// retained rows would be double-permuted. Costs the frame AFTER an RTL row
+    /// is on screen, and recovers once no row reorders.
+    BidiVisual,
+    /// The scratch carries no terminal identity (`terminal_id == 0`): it has
+    /// never been engine-filled. Every first frame of a window reports this
+    /// once, by construction.
+    ScratchUnstamped,
+    /// The scratch was last engine-filled by a DIFFERENT terminal. The split
+    /// compositor's shared pane scratch does this on every hand-off; a steady
+    /// state dominated by it means panes are alternating through one buffer
+    /// that could instead be per-pane.
+    TerminalMismatch,
+    /// Another consumer called `take_damage` since the scratch's fill
+    /// (`extract_gen` moved), so the tracker's bits no longer describe every
+    /// row that changed under this scratch.
+    DamageTaken,
+    /// A HOST mutator wrote content channels after the engine filled the
+    /// scratch and bumped `snapshot_seq` (stream fade, prediction ghosts, find
+    /// bar, strip splice — the ghost-paint bump discipline). The most
+    /// actionable cause: it names a specific per-frame mutator as the thing
+    /// standing between this workload and the scoped arm.
+    HostMutation,
+    /// The scratch still has a host row PREPEND in force (`row_shift != 0`), so
+    /// engine row `r` sits at index `r + row_shift` and retaining "row r" would
+    /// serve a different row's content. The tab-strip splice's inverse
+    /// (`undo_host_row_prepend`) did not run or could not run.
+    RowShift,
+    /// The alternate-screen bit differs between the scratch and the engine.
+    AltScreen,
+    /// The scratch's own `rows`/`cols` disagree with the requested frame size —
+    /// a resize the scratch has not been refilled at yet.
+    ScratchRows,
+    /// The scratch's row COUNT (`cells.len()`) disagrees with the requested
+    /// rows while its `rows` field agrees: a host prepend that grew the
+    /// container without stamping a shift, the shape a tab strip leaves behind.
+    ScratchRowCount,
+    /// The REQUESTED frame size disagrees with the engine's own grid — the
+    /// window and its terminal are momentarily out of step (a resize in
+    /// flight).
+    EngineDims,
+    /// The engine's viewport is scrolled back (`display_offset != 0`). Tracker
+    /// rows are live-grid rows and coincide with viewport rows only at offset
+    /// 0.
+    EngineScrolled,
+    /// The engine is at offset 0 but the SCRATCH was filled while scrolled
+    /// back, so its retained rows are viewport rows from a different mapping.
+    /// The frame that returns to the bottom.
+    ScratchScrolled,
+    /// `base_y` moved: the live grid scrolled, so retained rows shifted out
+    /// from under their indices (scroll damage marks only the exposed strip).
+    /// The cause a scrolling workload — a build log, a `cat` of a large file —
+    /// reports on nearly every frame, and honestly so.
+    BaseY,
+    /// The absolute row revision moved without `base_y` moving: a protected
+    /// footer insertion or another row-identity change.
+    RowRevision,
+    /// The tracker holds `Damage::Full` — a palette recolor, DECSCNM, a reflow,
+    /// or any other whole-grid invalidation. Nothing is retainable.
+    FullDamage,
+}
+
+impl FullRefillCause {
+    /// Every cause, in discriminant order. The tally arrays and the metrics
+    /// wire format are built from this, so a new clause cannot be added without
+    /// its counter appearing.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::BidiVisual,
+        Self::ScratchUnstamped,
+        Self::TerminalMismatch,
+        Self::DamageTaken,
+        Self::HostMutation,
+        Self::RowShift,
+        Self::AltScreen,
+        Self::ScratchRows,
+        Self::ScratchRowCount,
+        Self::EngineDims,
+        Self::EngineScrolled,
+        Self::ScratchScrolled,
+        Self::BaseY,
+        Self::RowRevision,
+        Self::FullDamage,
+    ];
+
+    /// How many causes exist — the width of a per-cause tally.
+    pub const COUNT: usize = 15;
+
+    /// Dense index into a `[_; COUNT]` tally. The discriminant itself, so the
+    /// lookup is a zero-extend.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable wire label, snake_case, for metrics text and JSON. Stable across
+    /// releases: a dashboard keys off these.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BidiVisual => "bidi_visual",
+            Self::ScratchUnstamped => "scratch_unstamped",
+            Self::TerminalMismatch => "terminal_mismatch",
+            Self::DamageTaken => "damage_taken",
+            Self::HostMutation => "host_mutation",
+            Self::RowShift => "row_shift",
+            Self::AltScreen => "alt_screen",
+            Self::ScratchRows => "scratch_rows",
+            Self::ScratchRowCount => "scratch_row_count",
+            Self::EngineDims => "engine_dims",
+            Self::EngineScrolled => "engine_scrolled",
+            Self::ScratchScrolled => "scratch_scrolled",
+            Self::BaseY => "base_y",
+            Self::RowRevision => "row_revision",
+            Self::FullDamage => "full_damage",
+        }
+    }
+}
+
 /// How [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into)
 /// refilled a scratch: the full-viewport fallback, or the damage-scoped arm
 /// that re-resolved only the tracker's damaged rows. Returned (rather than
@@ -1434,7 +1595,14 @@ pub enum RowOrder {
 pub enum FrameRefill {
     /// The whole viewport was re-extracted (continuity break, full damage, or
     /// first fill). Always sound; the cost is the pre-carrier status quo.
-    Full,
+    Full {
+        /// WHICH continuity clause refused the scoped arm — the first one to
+        /// refuse, in the check's short-circuit order. Carried rather than
+        /// logged for the same reason the arm itself is: a caller that only
+        /// learns THAT the chain broke cannot tell a forgotten seq bump from a
+        /// scrolling workload, and those are opposite conclusions.
+        cause: FullRefillCause,
+    },
     /// Only the damage tracker's rows were re-extracted; every other row was
     /// left as-is in the scratch (byte-identical by the continuity invariant).
     Scoped {
@@ -1457,6 +1625,7 @@ impl Clone for RenderInput {
             cursor_col: self.cursor_col,
             cursor_visible: self.cursor_visible,
             cursor_style: self.cursor_style,
+            cursor_effect_style_override: self.cursor_effect_style_override,
             cursor_trail: self.cursor_trail.clone(),
             cursor_trail_color: self.cursor_trail_color,
             cursor_glow_add: self.cursor_glow_add.clone(),
@@ -1531,6 +1700,7 @@ impl Clone for RenderInput {
         self.cursor_col = source.cursor_col;
         self.cursor_visible = source.cursor_visible;
         self.cursor_style = source.cursor_style;
+        self.cursor_effect_style_override = source.cursor_effect_style_override;
         self.cursor_trail.clone_from(&source.cursor_trail);
         self.cursor_trail_color = source.cursor_trail_color;
         // (split-pane audit) `cursor_fill_override` was missing here — the
@@ -1673,6 +1843,7 @@ impl PartialEq for RenderInput {
             && self.cursor_col == other.cursor_col
             && self.cursor_visible == other.cursor_visible
             && self.cursor_style == other.cursor_style
+            && self.cursor_effect_style_override == other.cursor_effect_style_override
             && self.cursor_trail == other.cursor_trail
             && self.cursor_trail_color == other.cursor_trail_color
             && self.cursor_glow_add == other.cursor_glow_add
@@ -1767,6 +1938,7 @@ impl RenderInput {
             cursor_col: 0,
             cursor_visible: false,
             cursor_style: CursorStyle::default(),
+            cursor_effect_style_override: None,
             cursor_trail: Vec::new(),
             cursor_trail_color: 0,
             cursor_glow_add: Vec::new(),
@@ -2088,10 +2260,19 @@ impl RenderInput {
     /// hull can stay fixed while a pane's real span moves inside it. Damage
     /// diffs use [`Self::selection_row_key`].
     ///
-    /// The span is content-independent and conservatively covers
-    /// [`TextSelection`]'s row predicates. Block selections expand one column on
-    /// each side before clipping, because a wide lead/continuation can snap one
-    /// adjacent cell into the painted selection.
+    /// The span is content-independent, so it does not in general cover the
+    /// painted run: [`TextSelection::contains_cell`] snaps a double-width glyph
+    /// whole for EVERY selection kind, and an edge landing on a lead paints the
+    /// continuation one column past `hi`. That widened cell can nonetheless
+    /// never be the omitted tail cell this window exists to catch, and the
+    /// guarantee is structural rather than a property of how the grid fills
+    /// itself: widening fires only when the OTHER half is present in `cells` —
+    /// every renderer site spells `is_wide_lead` as
+    /// `cells.get(c + 1).is_some_and(|n| n.wide)` and takes the continuation bit
+    /// off a materialized cell — so a widened cell is by construction inside the
+    /// materialized prefix, and the sparse-tail loop, which passes both width
+    /// flags `false`, cannot widen at all. Block still pads one column on each
+    /// side, harmlessly: its `lo`/`hi` are rectangle edges shared by every row.
     #[must_use]
     pub fn selection_row_span(&self, frame_row: usize) -> Option<(u16, u16)> {
         if self.selections.is_empty() {
@@ -2159,7 +2340,8 @@ impl RenderInput {
 
     /// Drop every host-owned VISUAL BLING layer, leaving only the terminal cell content
     /// (grid + cursor position/colour + selection + images). Empties the cursor motion
-    /// trail, the LUMEN cursor glow, the GLOW-HALO radial cursor-effect light,
+    /// trail and cursor-shape override, the LUMEN cursor glow, the GLOW-HALO
+    /// radial cursor-effect light,
     /// the EMBERFORGE under-glyph flame-body light, the per-pixel FIRE-FIELD
     /// patches (`fire_patch`) and the charred glyph-ink fg
     /// overrides, the fire contrast-halo strengths (`fire_halo`),
@@ -2171,6 +2353,7 @@ impl RenderInput {
     /// bling is architecturally a set of separate layers, so suppressing it is exactly
     /// this. The cell grid is untouched.
     pub fn clear_overlays(&mut self) {
+        self.cursor_effect_style_override = None;
         self.cursor_trail.clear();
         self.cursor_glow_add.clear();
         self.glow_halo.clear();
@@ -3520,6 +3703,40 @@ mod line_size_span_tests {
         source.clear_overlays();
         assert_eq!(source.cursor_fill_override, None);
         assert_eq!(source, bare);
+    }
+
+    #[test]
+    fn cursor_effect_style_override_is_content_cloned_and_cleared_with_overlays() {
+        use crate::terminal::CursorStyle;
+
+        let mut source = RenderInput::empty();
+        source.cursor_style = CursorStyle::SteadyUnderline;
+        source.cursor_effect_style_override = Some(CursorStyle::Bolt);
+
+        let cloned = source.clone();
+        assert_eq!(cloned.cursor_effect_style_override, Some(CursorStyle::Bolt));
+        assert_eq!(cloned, source);
+
+        let mut reused = RenderInput::empty();
+        reused.clone_from(&source);
+        assert_eq!(reused.cursor_effect_style_override, Some(CursorStyle::Bolt));
+        assert_eq!(reused, source);
+
+        let mut terminal_only = source.clone();
+        terminal_only.cursor_effect_style_override = None;
+        assert_ne!(
+            source, terminal_only,
+            "a stationary effect cursor shape changes rendered content"
+        );
+
+        source.clear_overlays();
+        assert_eq!(source.cursor_effect_style_override, None);
+        assert_eq!(
+            source.cursor_style,
+            CursorStyle::SteadyUnderline,
+            "clearing host overlays must restore, not overwrite, DECSCUSR"
+        );
+        assert_eq!(source, terminal_only);
     }
 }
 

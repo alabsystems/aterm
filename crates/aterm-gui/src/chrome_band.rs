@@ -271,6 +271,17 @@ pub(crate) struct BandColors {
     /// `theme.bg` against a 0.10/0.16 blend, which is what makes the well read as an
     /// inset), so nothing off an OS palette moves.
     pub well_rule: Option<[u8; 3]>,
+    /// The FILL of a determinate meter drawn in the band (the status bars'
+    /// progress): the theme's cursor accent, contrast-floored against
+    /// [`Self::bar_bg`] so a pale cursor on a pale band still reads as a fill.
+    /// Under an OS-forced palette it is `COLOR_HIGHLIGHT` — exactly what a native
+    /// Win32 progress bar paints its fill with under High Contrast.
+    pub accent: [u8; 3],
+    /// The TRACK a meter's unfilled remainder is drawn on: a step off
+    /// [`Self::bar_bg`] toward the ink, so the empty part reads as a recessed
+    /// channel rather than as bare band. Under an OS-forced palette it is the
+    /// document surface (`COLOR_WINDOW`), the HC vocabulary's "well".
+    pub meter_track: [u8; 3],
 }
 
 fn rgb(c: u32) -> [u8; 3] {
@@ -369,6 +380,8 @@ fn forced_band_colors(hc: ForcedChrome) -> BandColors {
         // See [`BandColors::well_rule`]: every stock HC scheme has WINDOW == BTNFACE,
         // so the fill alone leaves the query field with no boundary at all.
         well_rule: (hc.window == hc.btn_face).then_some(in_well),
+        accent: hc.highlight,
+        meter_track: hc.window,
     }
 }
 
@@ -483,6 +496,11 @@ pub(crate) fn band_colors(theme: Theme) -> BandColors {
         // The equality guard is not dead — a user theme is free to land on a `bg`
         // that blends to itself.
         well_rule: (field_bg == bar_bg).then(|| ensure_contrast(rgb(theme.fg), field_bg, AA)),
+        // A meter fill is a SURFACE, not text: the 3:1 non-text floor (the same
+        // one the strip's inks use), so the cursor accent survives on a band it
+        // happens to resemble without being dragged to black/white needlessly.
+        accent: ensure_contrast(rgb(theme.cursor), bar_bg, 3.0),
+        meter_track: mix3(bar_bg, rgb(theme.fg), if light { 0.12 } else { 0.18 }),
     }
 }
 

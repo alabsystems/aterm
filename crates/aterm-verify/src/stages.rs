@@ -101,16 +101,97 @@ pub fn regex_lane_args() -> Vec<String> {
     .collect()
 }
 
-/// `<tippy> <scope> --all-targets -- -D warnings`
+/// `<tippy> <scope> --all-targets --keep-going -- -D warnings`
+///
+/// `--keep-going` IS THE COVERAGE FLAG, not a tuning knob. Without it cargo
+/// stops scheduling new units the moment one fails, so under `-D warnings` the
+/// FIRST crate with a finding ends the run and every crate cargo had not
+/// reached yet goes unlinted — the lint reports a PREFIX of the workspace while
+/// reading like a statement about all of it. MEASURED on this tree 2026-08-26:
+/// the aborting form reported 3 findings in `atpkg`; the same tree under
+/// `--keep-going` reported 9, in `atpkg`, `aterm-conformance` and `aterm-gui`.
+/// That is also the mechanism behind the three "fixed it — no, here is another
+/// one" rounds of 2026-08-11 (see `crates/xtask/src/gate.rs`): each round
+/// fixed the crate that happened to abort first and revealed the next.
+///
+/// It does NOT make coverage unconditional: a member whose DEPENDENCY fails to
+/// compile still cannot be linted, because there is no metadata to lint it
+/// against. `gate lint` says so out loud rather than implying otherwise.
 #[must_use]
 pub fn tippy_args(scope: &Scope) -> Vec<String> {
     let mut a = scope.args();
     a.extend(
-        ["--all-targets", "--", "-D", "warnings"]
+        ["--all-targets", "--keep-going", "--", "-D", "warnings"]
             .into_iter()
             .map(String::from),
     );
     a
+}
+
+/// The workspace's `required-features` targets, as the `(package, feature)`
+/// pairs that switch them on.
+///
+/// SIX TARGETS HANG OFF THESE THREE PAIRS, and `--all-targets` builds none of
+/// them: cargo skips a target whose `required-features` are off, silently and
+/// without a word in its output. So the main tippy pass — `--workspace
+/// --all-targets` — never compiled `aterm-gui`'s three `bench-support`
+/// benches, its `control-conformance` bin, or `aterm-scrollback`'s two
+/// `disk-tier` benches. That is not a theoretical hole: a broken bench build
+/// lived in it for four days in August 2026, and the campaign's count gates
+/// and reach guards LIVE in those benches, so an unbuilt bench is a gate that
+/// silently stopped existing.
+///
+/// The table is checked against the tree by
+/// `xtask`'s `the_gated_feature_table_matches_every_required_features_target`,
+/// so a seventh gated target cannot be added without either extending this or
+/// reddening that test.
+pub const GATED_LINT_FEATURES: [(&str, &str); 3] = [
+    ("aterm-gui", "bench-support"),
+    ("aterm-gui", "control-conformance"),
+    ("aterm-scrollback", "disk-tier"),
+];
+
+/// `<tippy> -p <pkg>… --features <pkg/feat>,… --all-targets --keep-going --
+///  -D warnings` — the SECOND pass, the one that reaches the targets
+/// [`tippy_args`] cannot.
+///
+/// A separate invocation rather than a flag on the first, because the features
+/// belong to specific packages: turning them on for the whole workspace is not
+/// something cargo offers, and `-p <pkg> --features <pkg>/<feat>` is. Its cost
+/// is one re-lint of the two named packages against a wider feature set; every
+/// dependency below them is a cache hit from the first pass.
+///
+/// `None` when the scope selects neither package — under `--scope aterm-core`
+/// there is no gated target to reach, and running the pass anyway would compile
+/// two crates the run had deliberately narrowed away.
+#[must_use]
+pub fn tippy_gated_args(scope: &Scope) -> Option<Vec<String>> {
+    let mut packages: Vec<&str> = Vec::new();
+    let mut features: Vec<String> = Vec::new();
+    for (pkg, feat) in GATED_LINT_FEATURES {
+        if !scope.includes_crate(pkg) {
+            continue;
+        }
+        if !packages.contains(&pkg) {
+            packages.push(pkg);
+        }
+        features.push(format!("{pkg}/{feat}"));
+    }
+    if packages.is_empty() {
+        return None;
+    }
+    let mut a: Vec<String> = packages
+        .iter()
+        .flat_map(|p| ["-p".to_string(), (*p).to_string()])
+        .collect();
+    a.push("--features".to_string());
+    a.push(features.join(","));
+    a.extend(
+        ["--all-targets", "--keep-going", "--", "-D", "warnings"]
+            .into_iter()
+            .map(String::from),
+    );
+    Some(a)
 }
 
 /// `targo --unverified run -q -p xtask -- gate <name>`
@@ -491,13 +572,13 @@ fn regex_lane(ctx: &Ctx, r: &mut Report) {
 /// that must not silently go missing: without it the Trust-toolchain lint
 /// artifacts land in the stock build's target dir and the two lanes clobber
 /// each other's caches.
-fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path) -> Cmd {
+fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
     let dir = bin.parent().unwrap_or(&ctx.tools.stage2_dir).to_path_buf();
     let mut path = std::ffi::OsString::from(dir.as_os_str());
     path.push(":");
     path.push(&ctx.path_env);
     Cmd::new(bin)
-        .args(tippy_args(&ctx.scope))
+        .args(args)
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", ctx.root.join("target-tippy"))
         .env("TRUST_NO_MIGRATE_WARN", "1")
@@ -512,13 +593,25 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         r.skip(ctx.tools.missing_tippy_label());
         return;
     };
-    let cmd = tippy_cmd(ctx, &bin);
     run_scoped(
         ctx,
         r,
         &format!("tippy {} -D warnings", ctx.scope.label()),
-        &cmd,
+        &tippy_cmd(ctx, &bin, tippy_args(&ctx.scope)),
     );
+    // THE SECOND PASS IS NOT OPTIONAL POLISH. `--all-targets` above built no
+    // target whose `required-features` are off, so without this the six in
+    // [`GATED_LINT_FEATURES`] are linted by nobody — which is how a broken
+    // bench build survived four days. Its own row, so the ladder shows whether
+    // it ran.
+    if let Some(args) = tippy_gated_args(&ctx.scope) {
+        run_scoped(
+            ctx,
+            r,
+            "tippy required-features targets -D warnings",
+            &tippy_cmd(ctx, &bin, args),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,7 +1194,14 @@ mod tests {
         );
         assert_eq!(
             tippy_args(&s),
-            ["--workspace", "--all-targets", "--", "-D", "warnings"]
+            [
+                "--workspace",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings"
+            ]
         );
     }
 
@@ -1119,7 +1219,15 @@ mod tests {
         );
         assert_eq!(
             tippy_args(&s),
-            ["-p", "aterm-grid", "--all-targets", "--", "-D", "warnings"]
+            [
+                "-p",
+                "aterm-grid",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings"
+            ]
         );
         // and NOT the whole-tree stages
         assert_eq!(
@@ -1181,6 +1289,7 @@ mod tests {
                 "-p",
                 "aterm-gui",
                 "--all-targets",
+                "--keep-going",
                 "--",
                 "-D",
                 "warnings"
@@ -1231,6 +1340,16 @@ mod tests {
         let sep = a.iter().position(|x| x == "--").expect("a -- separator");
         assert_eq!(&a[sep + 1..], ["-D", "warnings"]);
         assert!(a[..sep].contains(&"--all-targets".to_string()));
+        // `--keep-going` is a COVERAGE guarantee, not a preference: without it
+        // the first crate that trips `-D warnings` ends the run and the rest of
+        // the workspace is never linted at all, while the verdict still reads
+        // like a statement about the whole tree. It must sit on cargo's side of
+        // the separator — passed after `--` it would reach the lint driver,
+        // which does not know the flag.
+        assert!(
+            a[..sep].contains(&"--keep-going".to_string()),
+            "the lint must not stop at the first failing crate: {a:?}"
+        );
     }
 
     #[test]
@@ -1251,7 +1370,11 @@ mod tests {
         // Assert on the command the STAGE builds, not on one this test spells
         // out again: a replica agrees with itself even after the stage stops
         // setting a variable.
-        let cmd = tippy_cmd(&c, std::path::Path::new("/s2/targo-tippy"));
+        let cmd = tippy_cmd(
+            &c,
+            std::path::Path::new("/s2/targo-tippy"),
+            tippy_args(&c.scope),
+        );
         let names: Vec<String> = cmd
             .envs
             .iter()
@@ -1269,6 +1392,62 @@ mod tests {
             "the tippy binary's own dir must LEAD the inherited PATH, so the \
              lint runs under THE toolchain rather than whatever `cargo` the \
              ambient PATH offers first"
+        );
+    }
+
+    #[test]
+    fn the_gated_pass_names_every_required_features_target_and_only_those() {
+        let argv = tippy_gated_args(&Scope::workspace()).expect("the workspace selects both");
+        assert_eq!(
+            argv,
+            [
+                "-p",
+                "aterm-gui",
+                "-p",
+                "aterm-scrollback",
+                "--features",
+                "aterm-gui/bench-support,aterm-gui/control-conformance,\
+                 aterm-scrollback/disk-tier",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            "the second pass turns on exactly the features that unlock the six \
+             `required-features` targets, and keeps going past a red one"
+        );
+    }
+
+    #[test]
+    fn the_gated_pass_narrows_with_the_scope_and_disappears_when_it_has_nothing_to_reach() {
+        // One gated package selected: only its features, only its `-p`.
+        let one = tippy_gated_args(&Scope::crate_only("aterm-scrollback"))
+            .expect("aterm-scrollback owns two gated benches");
+        assert_eq!(
+            one,
+            [
+                "-p",
+                "aterm-scrollback",
+                "--features",
+                "aterm-scrollback/disk-tier",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings",
+            ]
+        );
+        // A scope with no gated target must not compile two crates it was
+        // narrowed away from just to lint nothing.
+        assert_eq!(tippy_gated_args(&Scope::crate_only("aterm-core")), None);
+        assert_eq!(
+            tippy_gated_args(&Scope::changed("main", vec!["aterm-core".into()], true)),
+            None
+        );
+        assert!(
+            tippy_gated_args(&Scope::changed("main", vec!["aterm-gui".into()], true)).is_some(),
+            "a changed-scope run that rebuilt aterm-gui must still lint its benches"
         );
     }
 

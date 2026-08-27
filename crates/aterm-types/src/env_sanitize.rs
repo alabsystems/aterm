@@ -54,6 +54,13 @@ pub const ENV_SESSION_ID: &str = "ATERM_SESSION_ID";
 pub const ENV_LAUNCH_NONCE: &str = "ATERM_LAUNCH_NONCE";
 /// The parent session id (`s-<20hex>`) — becomes the `src` of the child's edges.
 pub const ENV_PARENT_SESSION_ID: &str = "ATERM_PARENT_SESSION_ID";
+/// The multiplexer signature this session was BORN into (`"<$TMUX>|<$STY>"`),
+/// stamped by the spawn seam so `aterm ctl` can tell a session it is speaking
+/// from a tmux/screen PANE — where flagless verbs would otherwise drive the
+/// outer terminal — from one that merely inherited a pane's environment.
+/// Deny-listed like the other provisioning vars: an inherited copy must never
+/// survive a hop, or a fresh session would answer for its parent's birth.
+pub const ENV_MUX_BASE: &str = "ATERM_MUX_BASE";
 /// Path to the 0600 file holding the parent→child edge-token SECRETS (audit
 /// finding F1). The bearer tokens are NOT placed in env — only this PATH is, which
 /// is non-secret: a same-uid peer that cannot read 0600 files (a sandboxed
@@ -134,6 +141,7 @@ pub const ENV_DENY_VARS: &[&str] = &[
     ENV_SESSION_ID,
     ENV_LAUNCH_NONCE,
     ENV_PARENT_SESSION_ID,
+    ENV_MUX_BASE,
     ENV_EDGE_TOKENS,
     ENV_EDGE_READ,
     ENV_EDGE_WRITE,
@@ -219,6 +227,7 @@ mod tests {
             ENV_SESSION_ID,
             ENV_LAUNCH_NONCE,
             ENV_PARENT_SESSION_ID,
+            ENV_MUX_BASE,
             ENV_EDGE_TOKENS,
             ENV_EDGE_READ,
             ENV_EDGE_WRITE,

@@ -1566,7 +1566,7 @@ mod tests {
     #[test]
     fn a_dangling_extension_header_is_refused() {
         for (label, tail) in [("eof", Vec::new()), ("end marker", end())] {
-            for flag in [b'L', b'K', b'x'] {
+            for flag in *b"LKx" {
                 let body = b"dangling\0".to_vec();
                 let mut v = Vec::new();
                 v.extend_from_slice(&header("././@LongLink", flag, body.len() as u64));
@@ -1585,7 +1585,7 @@ mod tests {
     /// A second `L`, `K` or `x` before one member is a rejection.
     #[test]
     fn duplicate_extension_headers_are_refused() {
-        for flag in [b'L', b'K', b'x'] {
+        for flag in *b"LKx" {
             let body = if flag == b'x' {
                 pax("path", "p.txt")
             } else {

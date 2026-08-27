@@ -81,6 +81,11 @@ pub(crate) fn resolved_terminal_title_rung(
     live_title: &str,
     live_cwd: Option<&str>,
 ) -> Option<String> {
+    // A stock prompt's `user@host:` says only where the user already is, and
+    // it says it identically in every tab. Dropped here (never for another
+    // host), an OSC title that carried NOTHING else is now empty and falls
+    // through to the cwd rung below — the rung that actually tells tabs apart.
+    let live_title = crate::tab_label::without_local_identity(live_title);
     user_title
         .filter(|title| !title.is_empty())
         .map(str::to_owned)
@@ -1056,6 +1061,17 @@ impl App {
         self.tab_strip_rows > 0
     }
 
+    /// THE CHROME ROWS above the terminal grid: the in-grid tab strip's rows plus
+    /// the live status bars' (`status_bar_rows`, committed by
+    /// `sync_status_bar_rows`). This — never `tab_strip_rows` alone — is what
+    /// every geometry law reads: the grid fit (`grid_dims_for`), the frame size
+    /// (`window_frame_px`), the pointer's cell mapping, the effects origin, the
+    /// accessibility snapshot. The strip painter alone still reads
+    /// `tab_strip_rows`, because that is how many of these rows are ITS.
+    pub(crate) fn chrome_rows(&self) -> u16 {
+        self.tab_strip_rows.saturating_add(self.status_bar_rows)
+    }
+
     /// One title per TAB (top-level) of window `wid`, for the strip labels: each
     /// tab's label is its presentation title for native content, or — for terminal
     /// content — the session's USER title (`meta set title`, the operator's name
@@ -1184,7 +1200,7 @@ impl App {
                     authored_description.as_deref(),
                     title_format,
                     title_config,
-                    " · ",
+                    crate::title_summary::TAB_LABEL_SEPARATOR,
                 )
             })
             .collect()
@@ -4907,6 +4923,34 @@ impl App {
                 // from the terminal projection exactly during collapse.
                 let synced = self.sync_tab_model_from_layout(wid, tab);
                 debug_assert!(synced);
+                // OWNERSHIP ORDER — topology first, identity second. A `ViewId` may
+                // only be retired once the canonical tree has stopped naming it: a
+                // leaf that outlives its `ViewStore` entry is UNRESOLVABLE, and
+                // `active_visible_content_route` fails closed on exactly that, which
+                // returns from `redraw_window` before any present and freezes the
+                // window for the rest of its life (`pane::PaneTree::close_pane`
+                // documents the release-only elision that used to reach this state).
+                // So a re-projection that still names the leaf means the topology
+                // change did NOT happen: refuse the whole retirement — the session
+                // keeps its view and its PTY — rather than trade a live pane for a
+                // dead window. `close_focused_mixed_leaf` proves the same order on
+                // the heterogeneous side: it refuses to detach ownership unless the
+                // tree removal returned `Removed`.
+                let orphaned = closed_view.is_some_and(|view| {
+                    self.windows
+                        .get(&wid)
+                        .is_some_and(|ws| ws.tab_set.tabs().iter().any(|t| t.root.contains(view)))
+                });
+                if orphaned {
+                    aterm_log::info!(
+                        "pane close refused: session {closed_session}'s leaf survived the \
+                         re-projection, so its view stays live — retiring it would leave an \
+                         unresolvable leaf and stop the window presenting"
+                    );
+                    self.resize_panes(wid);
+                    self.resync_active_or_window(wid);
+                    return false;
+                }
                 if let Some(view) = closed_view {
                     self.view_store.remove(view);
                 }
@@ -7570,6 +7614,249 @@ mod connected_spawn_tests {
         for row in &origin_rows {
             assert_eq!(row.src, supervisor, "the newborn supervises the origin");
             assert_eq!(row.dst, origin);
+        }
+    }
+}
+
+/// THE DAILY GESTURE: closing a split pane must never stop the window painting.
+///
+/// A canonical leaf that outlives its `ViewStore` entry is unresolvable, so
+/// [`App::active_visible_content_route`] fails closed — and `redraw_window`
+/// returns on that `None` BEFORE it reaches the present, for the rest of the
+/// window's life. Every test here therefore ends at the same seam the frame path
+/// enters: resolve the route, then run the layout preparation `redraw_window`
+/// performs with it.
+///
+/// The freeze itself was a RELEASE-ONLY state — `PaneTree::close_pane` carried
+/// its leaf removal inside a `debug_assert_eq!`, whose argument a shipped build
+/// compiles away — so these run in both profiles on purpose: under
+/// `cargo test --release` they are the direct regression test for that elision,
+/// and under a debug run they hold the surrounding invariant (both trees shrink,
+/// every leaf resolves, the route survives) that let the elision be fatal.
+#[cfg(test)]
+mod pane_close_render_seam_tests {
+    use super::*;
+
+    /// Assert the window can still start a frame: every canonical leaf resolves,
+    /// the route the frame path gates on is `Some`, its layout preparation runs,
+    /// and the structural invariants hold.
+    fn assert_window_keeps_rendering(app: &mut App, wid: WindowId, what: &str) {
+        let unresolved: Vec<_> = app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.root.leaves())
+            .filter(|view| app.view_store.get(*view).is_none())
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "{what}: canonical tree still names dead view(s) {unresolved:?}"
+        );
+        let plan = app
+            .active_visible_leaf_plan(wid)
+            .unwrap_or_else(|| panic!("{what}: the active tab has no layout plan to paint"));
+        assert!(!plan.leaves.is_empty(), "{what}: nothing to paint");
+        assert!(
+            app.active_visible_content_route(wid).is_some(),
+            "{what}: no visible content route — redraw_window returns before any present"
+        );
+        assert!(
+            app.structural_invariants_ok(),
+            "{what}: structural invariants"
+        );
+    }
+
+    fn pane_sessions(app: &App, wid: WindowId) -> Vec<u64> {
+        app.windows[&wid].layouts[app.windows[&wid].tabs.active].sessions()
+    }
+
+    fn canonical_leaves(app: &App, wid: WindowId) -> Vec<crate::tab_model::ViewId> {
+        app.windows[&wid]
+            .tab_set
+            .active()
+            .expect("active tab")
+            .root
+            .leaves()
+    }
+
+    /// THE REPORTED BUG. Split the window, close the focused pane: both trees
+    /// must shrink by exactly the closed leaf, and the window must still render.
+    /// Before the fix the shipped build left the closed leaf in BOTH trees while
+    /// retiring its view, and the window never presented again.
+    #[test]
+    fn closing_the_focused_split_pane_keeps_the_window_rendering() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let closed = app.split_active_stub_tab(wid);
+        assert_eq!(pane_sessions(&app, wid), vec![0, closed]);
+        assert_eq!(canonical_leaves(&app, wid).len(), 2);
+
+        assert_eq!(app.close_active_tab(), None, "a sibling remains");
+
+        assert_eq!(
+            pane_sessions(&app, wid),
+            vec![0],
+            "the compatibility pane tree really lost the closed leaf"
+        );
+        assert_eq!(
+            canonical_leaves(&app, wid).len(),
+            1,
+            "the canonical tree collapsed onto the survivor"
+        );
+        assert_window_keeps_rendering(&mut app, wid, "after closing the focused split pane");
+    }
+
+    /// The UNFOCUSED neighbour: focus back onto the original pane, close it, and
+    /// the pane that kept running is the one still on the glass.
+    #[test]
+    fn closing_the_unfocused_split_pane_keeps_the_window_rendering() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let survivor = app.split_active_stub_tab(wid);
+        app.focus_pane(pane::FocusDir::Left);
+        assert_eq!(
+            app.windows[&wid].layouts[0].focus(),
+            0,
+            "focus moved back to the original pane"
+        );
+
+        assert_eq!(app.close_active_tab(), None);
+
+        assert_eq!(
+            pane_sessions(&app, wid),
+            vec![survivor],
+            "the pane that was NOT focused survives"
+        );
+        assert_window_keeps_rendering(&mut app, wid, "after closing the unfocused split pane");
+    }
+
+    /// A pane whose SIBLING IS ITSELF A SPLIT: closing it promotes the whole
+    /// sub-tree, so two leaves must survive and both must still resolve.
+    #[test]
+    fn closing_a_pane_whose_sibling_is_split_keeps_the_window_rendering() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // root = Split(Leaf(0), Split(Leaf(a), Leaf(b))) — the focused leaf 0's
+        // sibling is a split.
+        let a = app.split_active_stub_tab(wid);
+        let b = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        app.focus_pane(pane::FocusDir::Left);
+        assert_eq!(app.windows[&wid].layouts[0].focus(), 0);
+        assert_eq!(pane_sessions(&app, wid), vec![0, a, b]);
+
+        assert_eq!(app.close_active_tab(), None);
+
+        assert_eq!(
+            pane_sessions(&app, wid),
+            vec![a, b],
+            "the sibling SUB-TREE is promoted whole"
+        );
+        assert_eq!(canonical_leaves(&app, wid).len(), 2);
+        assert_window_keeps_rendering(&mut app, wid, "after closing a pane beside a split");
+    }
+
+    /// The LAST pane of a tab that is not the last tab: the whole tab closes and
+    /// the neighbouring tab renders.
+    #[test]
+    fn closing_the_last_pane_of_a_tab_keeps_the_window_rendering() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        assert_eq!(app.windows[&wid].tab_set.len(), 2);
+
+        assert_eq!(app.close_active_tab(), None, "another tab remains");
+
+        assert_eq!(app.windows[&wid].tab_set.len(), 1, "the whole tab closed");
+        assert_eq!(pane_sessions(&app, wid), vec![0]);
+        assert_window_keeps_rendering(&mut app, wid, "after closing a tab's last pane");
+    }
+
+    /// The LAST pane of the LAST tab is the window-teardown handoff, not a
+    /// freeze: the close reports the window to tear down and leaves the tab
+    /// intact for that teardown to drain.
+    #[test]
+    fn closing_the_last_pane_of_the_last_tab_hands_off_the_window() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_eq!(
+            app.close_active_tab(),
+            Some(wid),
+            "the caller is told to close THIS window"
+        );
+        assert_eq!(
+            canonical_leaves(&app, wid).len(),
+            1,
+            "the last leaf stays for the window teardown to drain"
+        );
+        assert_window_keeps_rendering(&mut app, wid, "after the last-pane handoff");
+    }
+
+    /// The seam guard itself: if a re-projection ever leaves the closed leaf in
+    /// the canonical tree again, `apply_close_outcome` must REFUSE to retire the
+    /// view rather than mint the unresolvable leaf that stops the window
+    /// presenting. Staged by desyncing the compatibility tree (which is exactly
+    /// the shape the release-only elision produced) and driving the real seam.
+    #[test]
+    fn a_close_that_did_not_shrink_the_tree_refuses_to_retire_the_view() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let closed = app.split_active_stub_tab(wid);
+        let before = canonical_leaves(&app, wid);
+        assert_eq!(before.len(), 2);
+
+        // The pane tree keeps BOTH leaves while the outcome claims a collapse —
+        // the exact contradiction a shipped `close_pane` used to report.
+        let refused = app.apply_close_outcome(wid, 0, pane::CloseOutcome::Collapsed { closed });
+
+        assert!(!refused, "a refused close never closes the window");
+        assert_eq!(
+            canonical_leaves(&app, wid),
+            before,
+            "topology is untouched by a close that did not happen"
+        );
+        assert!(
+            app.pool.get(closed).is_some(),
+            "the session keeps its PTY: nothing was torn down"
+        );
+        assert_window_keeps_rendering(&mut app, wid, "after a refused pane close");
+    }
+
+    /// THE ELISION CLASS. The tab/pane tree's mutators must never ride inside a
+    /// `debug_assert*!`: its argument is compiled away in a release build, so the
+    /// mutation silently stops happening in exactly the binary users run — which
+    /// is how a closed pane kept its leaf and froze the window. Source-level
+    /// because no debug-profile test can observe a debug-profile no-op.
+    #[test]
+    fn no_tree_mutation_hides_inside_a_debug_assert() {
+        const MUTATORS: [&str; 5] = [
+            "remove_leaf(",
+            "remove_below_split(",
+            "split_leaf(",
+            "remove_view(",
+            "split_focused(",
+        ];
+        for (file, source) in [
+            ("pane.rs", include_str!("pane.rs")),
+            ("tab_model.rs", include_str!("tab_model.rs")),
+            ("app_tabs.rs", include_str!("app_tabs.rs")),
+        ] {
+            for (n, line) in source.lines().enumerate() {
+                // Comments are not code — the fix's own note quotes the line it
+                // replaced, and a quotation cannot elide a mutation.
+                if line.trim_start().starts_with("//") || !line.contains("debug_assert") {
+                    continue;
+                }
+                for mutator in MUTATORS {
+                    assert!(
+                        !line.contains(mutator),
+                        "{file}:{}: `{mutator}` is a tree MUTATION riding inside a \
+                         debug_assert — a release build compiles the argument away and the \
+                         mutation never happens. Bind the call, then assert the binding.",
+                        n + 1,
+                    );
+                }
+            }
         }
     }
 }

@@ -265,70 +265,31 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
 ///
 /// The changelog alone addresses people who already run aterm; the /releases
 /// page is also the front door for people who have never heard of it and land
-/// on a wall of unexplained assets (a 1.1 GB DMG next to a 26 MB zip next to
-/// TOML nobody should open). The preamble is part of the TEMPLATE, not prose
-/// written per cut, so every future release carries it without anyone
-/// remembering to.
+/// on a wall of unexplained assets (a DMG next to a zip next to TOML nobody
+/// should open). The preamble is part of the TEMPLATE, not prose written per
+/// cut, so every future release carries it without anyone remembering to.
 ///
 /// Only the release body gets the preamble. The manifest's `changelog` and the
 /// in-app Software Update notes stay the rolled section verbatim (spec §3) —
 /// an installed copy already knows what aterm is.
 ///
-/// `intel_dmg` — whether this release carries the per-arch `-x86_64` DMG
-/// variant (the cut knows; docs must not name an asset the release lacks, and
-/// an arm64-only or seedless cut still ships an honest asset guide).
-///
-/// `lite_dmg` — whether this release also carries the lean drag-install DMG
-/// and, with it, the evergreen alias trio on the public mirror (`aterm.dmg` =
-/// the lean bytes, `aterm-offline.dmg` = the seeded ones — the 2026-08
-/// repoint, `mirror::stable_dmg_asset_name`). Keyed on the cut's own lite
-/// digest record for the same honesty rule as `intel_dmg`: a recovered
-/// pre-lite release must not advertise assets it does not carry.
-pub fn release_notes_document(
-    version: &str,
-    changelog_body: &str,
-    intel_dmg: bool,
-    lite_dmg: bool,
-) -> String {
+/// ONE macOS download (RETIRED 2026-08-26: the batteries-included seed, the
+/// Intel `-x86_64` DMG, the `-lite` twin and the `aterm-offline.dmg` alias):
+/// the guide names exactly the lean DMG, the zip, the evergreen aliases and
+/// the sidecars — nothing this release does not carry.
+pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
     // Sizes are ballpark labels for a reader scanning the asset list, not
-    // records (the `.sha256` sidecars are the records): measured on the first
-    // per-arch pair built from the real v0.46.0 app — 1,161.6 MB arm64 /
-    // 959.7 MB Intel, dropping to ~1.11 GB / ~0.96 GB once the stripped+pruned
-    // seed (index 15) is sealed.
-    let intel_line = if intel_dmg {
-        format!(
-            "- `aterm-{version}-x86_64.dmg` — the same install for Intel Macs (~0.96 GB): \
-             identical signed app, the seed carries that architecture's binaries \
-             instead.\n"
-        )
-    } else {
-        String::new()
-    };
-    // The lean lines ride the SAME flag as the assets they describe: the lite
-    // DMG and the alias trio join the mirrored set together (the four names
-    // travel as one — `mirror::required_asset_names`), so a pre-lite release
-    // body names neither.
-    let lite_lines = if lite_dmg {
-        format!(
-            "- `aterm-{version}-lite.dmg` — that same app alone as a drag-install DMG \
-             (~28 MB), if you prefer a DMG to a zip.\n\
-             - `aterm.dmg` / `aterm-mac.zip` / `aterm-offline.dmg` — permanent \
-             `releases/latest/download/` names for the lean DMG, the zip, and the full \
-             batteries-included DMG (the offline pick for a machine with no network).\n"
-        )
-    } else {
-        String::new()
-    };
+    // records (the `.sha256` sidecars are the records).
     format!(
-        "**aterm** is the batteries-included terminal for AI. New here? What each file is:\n\
+        "**aterm** is the terminal for AI. New here? What each file is:\n\
          \n\
-         - `aterm-{version}.dmg` — the full batteries-included install for Apple silicon \
-         (~1.1 GB): the app plus the offline ALab toolchain seed, so first launch needs \
-         no network.\n\
-         {intel_line}\
-         - `aterm-{version}-mac.zip` — the same signed, notarized app alone (~26 MB); the \
-         toolchain installs on demand via `aterm pkg install --default-set`.\n\
-         {lite_lines}\
+         - `aterm-{version}.dmg` — the signed, notarized app as a drag-install DMG \
+         (~28 MB). The ALab toolchain installs itself on first launch (or on demand via \
+         `aterm pkg install --default-set`).\n\
+         - `aterm-{version}-mac.zip` — the same app as a zip (~26 MB); this is the \
+         container the in-app updater and Homebrew stage from.\n\
+         - `aterm.dmg` / `aterm-mac.zip` — permanent `releases/latest/download/` names \
+         for the DMG and the zip above (byte-identical copies).\n\
          - `.sha256` files verify a download: `shasum -a 256 -c <asset>.sha256`.\n\
          - `aterm-appcast.toml` / `aterm-machines.toml` (and their `.sig`) are consumed by \
          the in-app self-updater — not for humans.\n\
@@ -398,34 +359,27 @@ mod tests {
     #[test]
     fn the_release_body_is_preamble_then_the_changelog_verbatim() {
         let body = "### Fixed\n- a thing\n- another";
-        let doc = release_notes_document("0.44.0", body, true, true);
+        let doc = release_notes_document("0.44.0", body);
         // The preamble names THIS release's exact asset names, so a reader can
         // match the guide against the asset list one screen below it.
-        assert!(doc.starts_with("**aterm** is the batteries-included terminal for AI."));
+        assert!(doc.starts_with("**aterm** is the terminal for AI."));
         assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
-        assert!(doc.contains("`aterm-0.44.0-x86_64.dmg`"), "{doc}");
         assert!(doc.contains("`aterm-0.44.0-mac.zip`"), "{doc}");
-        // The lean lane's guide entries: the versioned lite DMG and the
-        // evergreen alias trio it travels with (aterm.dmg = lean bytes,
-        // aterm-offline.dmg = seeded — the 2026-08 repoint).
-        assert!(doc.contains("`aterm-0.44.0-lite.dmg`"), "{doc}");
-        assert!(doc.contains("`aterm-offline.dmg`"), "{doc}");
+        assert!(doc.contains("`aterm.dmg` / `aterm-mac.zip`"), "{doc}");
         assert!(doc.contains("shasum -a 256 -c"), "{doc}");
         assert!(doc.contains("atpkg-index-N"), "{doc}");
+        // ONE macOS download: the guide must never again advertise a
+        // container the release does not carry (RETIRED 2026-08-26).
+        for retired in [
+            "x86_64",
+            "lite.dmg",
+            "aterm-offline",
+            "batteries",
+            "offline",
+        ] {
+            assert!(!doc.contains(retired), "{retired:?} resurfaced: {doc}");
+        }
         // Changelog below the rule, byte-for-byte, newline-terminated.
         assert!(doc.ends_with(&format!("\n---\n\n{body}\n")), "{doc}");
-
-        // A release WITHOUT the Intel variant (arm64-only ack, seedless, or any
-        // pre-pair cut) must not advertise an asset it does not carry.
-        let doc = release_notes_document("0.44.0", body, false, true);
-        assert!(!doc.contains("x86_64.dmg"), "{doc}");
-        assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
-
-        // A PRE-LITE release (recovered old cut) must not advertise the lean
-        // DMG or the alias trio it travels with.
-        let doc = release_notes_document("0.44.0", body, true, false);
-        assert!(!doc.contains("lite.dmg"), "{doc}");
-        assert!(!doc.contains("aterm-offline.dmg"), "{doc}");
-        assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
     }
 }

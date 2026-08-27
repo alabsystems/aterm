@@ -752,22 +752,45 @@ pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
             break;
         }
         keep[j] = false;
-        let item = strip_line_comment(lines[j]);
-        if item.matches('{').count() > item.matches('}').count() {
-            // Block item (mod/fn/impl): blank until the `<indent>}` close.
-            let close = format!("{}}}", " ".repeat(indent));
-            let mut k = j + 1;
-            while k < lines.len() {
-                keep[k] = false;
-                if lines[k] == close {
-                    break;
+        // WHERE THE ITEM'S BODY STARTS may be lines below its first line: a
+        // wrapped signature (`fn f(` … `) -> T {`) opens no brace on the line
+        // the attribute introduces. Reading only that line declared such an
+        // item body-less and left it UNMASKED — so a `#[cfg(not(target_arch =
+        // "wasm32"))]` function with a multi-line signature had its body
+        // scanned as if it shipped, which is exactly how a gated thread spawn
+        // failed the wasm posture check. Walk forward to the first `{`, and
+        // treat a `;` reached first as the genuine body-less case (a `fn`
+        // declaration, a `use`, a const).
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut k = j;
+        while k < lines.len() {
+            let item = strip_line_comment(lines[k]);
+            for ch in item.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    ';' if !opened && depth == 0 => {
+                        // Body-less item: this line is the whole of it.
+                        break;
+                    }
+                    _ => {}
                 }
-                k += 1;
             }
-            i = k + 1;
-        } else {
-            i = j + 1;
+            keep[k] = false;
+            if opened && depth <= 0 {
+                break;
+            }
+            if !opened && strip_line_comment(lines[k]).trim_end().ends_with(';') {
+                break;
+            }
+            k += 1;
         }
+        let _ = indent;
+        i = k + 1;
     }
     let mut out = String::with_capacity(text.len());
     for (idx, line) in lines.iter().enumerate() {
@@ -4685,20 +4708,21 @@ mod tests {
     #[test]
     fn scanned_set_covers_the_full_gui_process_closure() {
         // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface, currently 51 crates (46 until the K-2
+        // aterm-gui process surface, currently 52 crates (46 until the K-2
         // winit→engine key map moved out of aterm-types into its own
         // `aterm-winit-keymap` crate, then +2 when the embedded operator put
         // `aterm-agent` — and through it `aterm-ctl` — on the GUI's own
         // dependency edge, then +1 when `aterm-digest` replaced the `sha2` +
         // `hmac` third-party pair, then +1 when `aterm-time` replaced
-        // `web-time`). The exact member list is pinned by scan_set's
+        // `web-time`, then +1 when `aterm-regex` replaced `regex` and its three
+        // companions). The exact member list is pinned by scan_set's
         // derived_closure_matches_the_pinned_canary; this asserts the census
         // actually WALKS the derived set and reports its provenance +
         // exclusions in the transcript.
         let out = run_lock_order_census(&repo_root());
         assert!(
             out.log
-                .contains("across 51 workspace crate(s) + 5 vendored crate(s)"),
+                .contains("across 52 workspace crate(s) + 5 vendored crate(s)"),
             "the census must report the full derived closure + the scanned vendored \
              crates:\n{}",
             out.log

@@ -495,6 +495,26 @@ impl App {
             })
     }
 
+    /// `true` when the pointer's last WINDOW cell lies INSIDE the focused pane's
+    /// rect — i.e. when `last_mouse_cell` is a translation of where the pointer
+    /// is rather than a clamp of where it is not.
+    ///
+    /// [`Self::focused_pane_rect`] is used to CLAMP the pane-local cell into the
+    /// focused pane, so a gesture that crosses a divider keeps addressing the
+    /// pane it started in. The price of that clamp is that over a SIBLING pane
+    /// the pane-local cell names an edge cell of the focused pane, columns or
+    /// rows from the pointer. Routing a gesture wants the clamp; anything making
+    /// a claim ABOUT WHERE THE POINTER IS has to ask this first. `true` on the
+    /// single-pane path, where the focused rect is the whole grid and the cell
+    /// mapping is already clamped into it.
+    pub(crate) fn pointer_is_inside_focused_pane(&self, wid: WindowId) -> bool {
+        let Some((wr, wc)) = self.windows.get(&wid).map(|ws| ws.last_mouse_window_cell) else {
+            return false;
+        };
+        let (ro, co, prows, pcols) = self.focused_pane_rect(wid);
+        (ro..ro.saturating_add(prows)).contains(&wr) && (co..co.saturating_add(pcols)).contains(&wc)
+    }
+
     /// Click-to-focus in window `wid`: if its last pointer position (window cell)
     /// lands on a pane OTHER than the focused one, move focus there (re-mirroring the
     /// control socket + renderer onto it) and re-derive the pane-local mouse cell.
@@ -939,7 +959,7 @@ impl App {
             ch,
             rows,
             cols,
-            self.tab_strip_rows,
+            self.chrome_rows(),
             geom.pad,
             geom.pad_top,
             geom.head,
@@ -1000,7 +1020,7 @@ impl App {
         };
         let (cw, ch) = geom.cell;
         let (pad, pad_top, head) = (geom.pad, geom.pad_top, geom.head);
-        let composed_rows = usize::from(ws.rows).saturating_add(usize::from(self.tab_strip_rows));
+        let composed_rows = usize::from(ws.rows).saturating_add(usize::from(self.chrome_rows()));
         let frame_w = usize::from(ws.cols)
             .saturating_mul(cw)
             .saturating_add(pad.saturating_mul(2));
@@ -1051,6 +1071,33 @@ impl App {
             return None;
         }
         self.strip_col_at_with(wid, self.pointer_geometry(wid), x, y)
+    }
+
+    /// If pixel position `(x, y)` lands on one of window `wid`'s STATUS BAR rows
+    /// (the chrome rows directly below the tab strip), which bar's lane. `None`
+    /// when no bar is up or the point is elsewhere. The bars are chrome: a press
+    /// on one opens the lane's deliberate surface (Settings ▸ Packages /
+    /// Software Update) and never reaches the terminal underneath — there is no
+    /// terminal underneath, the grid starts below them.
+    pub(crate) fn status_bar_lane_at(
+        &self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+    ) -> Option<crate::status_bars::Lane> {
+        if self.status_bar_rows == 0 {
+            return None;
+        }
+        let geom = self.pointer_geometry(wid);
+        let (_, ch) = geom.cell;
+        let (_, y) = self.window_to_frame_with(wid, geom, x, y);
+        let gy = (y as usize).saturating_sub(geom.pad_top + geom.head);
+        let strip_px = usize::from(self.tab_strip_rows) * ch.max(1);
+        let bars_px = usize::from(self.status_bar_rows) * ch.max(1);
+        if gy < strip_px || gy >= strip_px + bars_px {
+            return None;
+        }
+        self.status_bars.lane_at((gy - strip_px) / ch.max(1))
     }
 
     /// [`Self::strip_col_at`] against geometry the caller already derived.
@@ -1405,6 +1452,10 @@ impl App {
     /// with nothing lit costs nothing, and the redraw is what re-runs
     /// `splice_tab_strip_with` (whose cache key carries both flags).
     pub(crate) fn on_cursor_left(&mut self, wid: WindowId) {
+        // The link caption is the same shape of stale claim: it names what a
+        // click on the cell the pointer WAS over would open, and there is no
+        // pointer over that cell any more.
+        self.retire_link_target(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1605,7 +1656,7 @@ impl App {
         // bottom-anchored bar never risked this; the top bar does.)
         let (ox, oy) = self.frame_origin(wid);
         let (fx, fy) = (x - ox as f64, y - oy as f64);
-        let frame_row = self.tab_strip_rows as usize + band.start;
+        let frame_row = usize::from(self.chrome_rows()) + band.start;
         let top = (pad_top + self.win_head(wid) + frame_row * ch) as f64;
         let bottom = top + (band.len() * ch) as f64;
         if fy < top || fy >= bottom || fx < pad as f64 {
@@ -1933,11 +1984,75 @@ impl App {
         // Zero-argument wrapper for the cold caller (modifier changes); the
         // per-motion path threads its already-derived geometry instead, keeping
         // the one-derivation-per-event rule (`PointerGeometry`'s contract).
+        // Bracketed like the motion path so a modifier tap that lands the
+        // pointer on chrome (the strip arm below) retires a standing caption
+        // AND repaints it away.
+        let parked = self.park_link_target(wid);
         self.update_hover_cursor_with(wid, self.pointer_geometry(wid));
+        self.settle_link_target(wid, parked);
+    }
+
+    /// TAKE the standing link hover without repainting, so the resolution about
+    /// to run decides the whole answer. Every early return in
+    /// [`Self::route_cursor_moved`] leaves it taken, which is the correct answer
+    /// for all of them: chrome, a modal, or a native view owns the pointer, and
+    /// a caption naming a grid link is then a caption about something no click
+    /// can reach. Pairs with [`Self::settle_link_target`], which repaints.
+    fn park_link_target(&mut self, wid: WindowId) -> Option<crate::link_target::LinkHover> {
+        self.windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.link_hover.take())
+    }
+
+    /// Close a [`Self::park_link_target`] bracket: repaint only if the pointer
+    /// routing published something different from what it parked. A pointer
+    /// resting still on one cell re-publishes the identical hover — the common
+    /// case while a caption is up — and must not ask for a frame.
+    fn settle_link_target(&mut self, wid: WindowId, parked: Option<crate::link_target::LinkHover>) {
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if ws.link_hover == parked {
+            return;
+        }
+        if let Some(w) = &ws.os_window {
+            w.request_redraw();
+        }
+    }
+
+    /// Retire any standing caption, repainting it away. For the boundaries that
+    /// end a hover outright rather than re-resolving it — the pointer leaving
+    /// the window, the window losing focus.
+    pub(crate) fn retire_link_target(&mut self, wid: WindowId) {
+        let parked = self.park_link_target(wid);
+        self.settle_link_target(wid, parked);
     }
 
     /// [`Self::update_hover_cursor`] against geometry the caller already derived.
+    ///
+    /// Publishes BOTH halves of one hover resolution: the OS cursor, and the
+    /// cell whose destination the band discloses. They are written from the same
+    /// probe on purpose — a cursor that promises a click and a caption that
+    /// names its destination must never be able to disagree about which link is
+    /// under the pointer.
     fn update_hover_cursor_with(&mut self, wid: WindowId, geom: PointerGeometry) {
+        let resolved = self.resolve_hover_cursor(wid, geom);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            // A plain write: the park/settle bracket at the event boundary owns
+            // the repaint decision, because only it can see what the value was
+            // before the whole routing ran.
+            ws.link_hover = resolved;
+        }
+    }
+
+    /// Resolve the hover state, writing the cursor and RETURNING the cell whose
+    /// hyperlink is to be disclosed (`None` from every arm where the grid is not
+    /// the thing under the pointer).
+    fn resolve_hover_cursor(
+        &mut self,
+        wid: WindowId,
+        geom: PointerGeometry,
+    ) -> Option<crate::link_target::LinkHover> {
         // While a modal overlay is open the pointer is ITS (the About dialog runs
         // its own link/I-beam cursor, the palette its row hand): a Cmd press must
         // not resolve a terminal link hidden UNDER the card and flip the cursor
@@ -1947,14 +2062,14 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.overlay.is_some())
         {
-            return;
+            return None;
         }
         // A native view owns its cursor through the motion path's native branch
         // (I-beam over text bodies, hand over controls): a modifier tap must not
         // stomp what that branch resolved — the old blind swap did exactly that,
         // clearing `native_text_cursor` on a Ctrl tap over an editor body.
         if self.active_native_view(wid).is_some() {
-            return;
+            return None;
         }
         // A held divider drag owns the resize cursor until release
         // (`begin_divider_drag` set it, `finish_divider_drag` restores): mid-drag
@@ -1965,11 +2080,9 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.divider_drag.is_some())
         {
-            return;
+            return None;
         }
-        let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
-            return;
-        };
+        let (px, py) = self.windows.get(&wid).map(|ws| ws.last_cursor_px)?;
         // Chrome: over the tab strip the pointer is a button pointer, never an
         // I-beam (the strip is not selectable text) — the same answer the motion
         // path's own strip branch gives, repeated here for the pointer-eventless
@@ -1977,7 +2090,7 @@ impl App {
         // `CursorMoved`, `last_cursor_px` is the window origin.
         if self.strip_col_at_with(wid, geom, px, py).is_some() {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
-            return;
+            return None;
         }
         // Split dividers (hover half): the 1-cell seam is drawn, but until this
         // probe nothing SAID it was draggable — the resize cursor appeared only
@@ -1985,28 +2098,88 @@ impl App {
         // dragging to learn you could drag.
         if let Some(icon) = self.divider_cursor_under_pointer(wid) {
             self.set_hover_cursor(wid, icon, true, true);
-            return;
+            return None;
         }
+        // The grid. ONE terminal lock answers everything this arm asks: the
+        // hyperlink on the hovered cell, the plain-text URL run under it, and
+        // the mouse mode.
         let mod_held = self
             .windows
             .get(&wid)
             .is_some_and(|ws| link_modifier_held(ws.mods));
-        if mod_held && self.link_under_pointer(wid).is_some() {
-            self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
-            return;
-        }
-        // The grid. The tracking probe takes the terminal lock once per resolved
-        // motion — the same cost shape as the wheel seam's per-event read, and
-        // cheaper than the selection paths this event class already funds.
-        let tracking = self
+        let (row, col) = self
+            .windows
+            .get(&wid)
+            .map_or((0, 0), |ws| ws.last_mouse_cell);
+        let window_row = self
+            .windows
+            .get(&wid)
+            .map_or(0, |ws| ws.last_mouse_window_cell.0);
+        // WHOSE CELL THIS IS — whether the cell about to be probed is the cell
+        // the pointer is actually over. Two ways it is not, and a link read
+        // through either would be a hand promising a click that opens nothing
+        // and a caption naming a destination the pointer is not on, which is
+        // the exact deception the band exists to end:
+        //
+        //   * a SIBLING PANE. The pane-local cell is CLAMPED into the focused
+        //     pane, so over a sibling it names an edge cell of the other pane,
+        //     and a press there focuses that sibling instead of opening
+        //     anything.
+        //   * a CHROME BAND, which COVERS the terminal row it took. A pointer
+        //     resting on the find panel's well, on its toggles or on a banner
+        //     is over chrome, and a press there is hit-tested against that
+        //     chrome — never against the grid cell hidden beneath it. Asked of
+        //     the frame's own register of claimed rows rather than of each band
+        //     in turn, so a band added later needs no clause here.
+        let cell_is_under_pointer = self.pointer_is_inside_focused_pane(wid)
+            && !self.chrome_owns_terminal_row(wid, usize::from(window_row));
+        let Some((term, session)) = self
             .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
-            .is_some_and(|t| term_lock(&t).mouse_tracking_enabled());
-        if tracking {
+            .map(|terminal| (terminal.term.clone(), terminal.session))
+        else {
+            self.set_hover_cursor(wid, CursorIcon::Text, false, true);
+            return None;
+        };
+        let (linked, plain_url, tracking) = {
+            let t = term_lock(&term);
+            // Only WHETHER there is a link: the destination itself is re-read
+            // from the grid at paint (`link_target`'s header), so copying the
+            // string per motion event would buy a value that has to be
+            // discarded anyway.
+            //
+            // VIEWPORT-keyed, like the plain-text probe beside it
+            // (`render_row` resolves through `display_offset`): the pointer
+            // stands on the row the frame DREW, and a screen-keyed probe
+            // answers about a different line the moment the viewport is
+            // scrolled back.
+            let linked = cell_is_under_pointer && t.hyperlink_at_visible(row, col).is_some();
+            // The plain-text probe renders a whole row, so it runs only for the
+            // gesture that needs it. It also earns no caption: a detected URL
+            // IS its own visible text, so there is nothing about its
+            // destination that the screen is not already saying.
+            let plain_url = mod_held
+                && cell_is_under_pointer
+                && !linked
+                && plain_url_at(&t.render_row(row as usize), col as usize).is_some();
+            (linked, plain_url, t.mouse_tracking_enabled())
+        };
+        if mod_held && (linked || plain_url) {
+            self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+        } else if tracking {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
         } else {
             self.set_hover_cursor(wid, CursorIcon::Text, false, true);
         }
+        // DISCLOSE unconditionally, not only while the open modifier is down:
+        // OSC 8 is the one link kind whose visible text and destination can be
+        // unrelated, and the moment a person needs to know that is while they
+        // are deciding whether the underlined word is worth a click — which is
+        // before their hand reaches the modifier, not after.
+        linked.then_some(crate::link_target::LinkHover {
+            cell: (row, col),
+            window_row,
+            session,
+        })
     }
 
     /// Write one resolved hover-cursor state, touching the OS cursor only on a
@@ -2144,6 +2317,21 @@ impl App {
     }
 
     pub(crate) fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
+        // ONE bracket around the WHOLE routing, rather than a retire-the-caption
+        // line in each of the dozen branches below that return before the grid's
+        // hover resolution runs. A branch that never publishes has answered
+        // "nothing is under the pointer that a click could open", and that is
+        // exactly what the parked-and-not-republished caption means — so the two
+        // cannot drift as branches are added.
+        let parked = self.park_link_target(wid);
+        self.route_cursor_moved(wid, x, y);
+        self.settle_link_target(wid, parked);
+    }
+
+    /// The pointer-motion routing itself: chrome, modals, native views, drags,
+    /// then the grid. See [`Self::on_cursor_moved`] for the caption bracket that
+    /// wraps it.
+    fn route_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
         // Pointer motion is not typing. It stays dark, and as a newer user
         // boundary it closes an older swallowed key's licence even when
         // chrome/modal handling returns locally.
@@ -2412,10 +2600,11 @@ impl App {
         // Sub-cell pixel offset of the pointer inside its cell, measured from the
         // real winit cursor (band-, pad- and strip-stripped) so a DEC 1016 (SGR-pixel)
         // report carries a GENUINE sub-cell coordinate, not a cell-origin one. The
-        // strip occupies the top rows, so subtract its pixel height from `y` before
-        // taking the per-cell remainder (matches `pixel_to_term_cell`). Ignored by
-        // every cell-coordinate encoding — see [`crate::input::PixelOffset`].
-        let strip_px = self.tab_strip_rows as usize * ch;
+        // chrome (strip + status bars) occupies the top rows, so subtract its pixel
+        // height from `y` before taking the per-cell remainder (matches
+        // `pixel_to_term_cell`). Ignored by every cell-coordinate encoding — see
+        // [`crate::input::PixelOffset`].
+        let strip_px = usize::from(self.chrome_rows()) * ch;
         // The chrome headroom sits above the pad on the y-axis (x carries none),
         // matching `pixel_to_term_cell`'s `pad_top + head` inset.
         let gy = (fy - (geom.pad_top + geom.head) as f64).max(0.0) as usize;
@@ -2628,7 +2817,7 @@ impl App {
         // top edge is `head + pad_top + strip_px` — fold it into the pad inset the
         // pure edge math subtracts (head == 0 && pad_top == pad is byte-identical).
         let pad = geom.pad_top + geom.head;
-        let strip_px = self.tab_strip_rows as usize * ch;
+        let strip_px = usize::from(self.chrome_rows()) * ch;
         // W1: window→frame first, so the grid's top/bottom edges account for the
         // leading remainder band like every other pointer consumer.
         let (_, y) = self.window_to_frame_with(wid, geom, 0.0, y);
@@ -3034,16 +3223,33 @@ impl App {
         fired
     }
 
-    /// The URL under the pointer, if any: an (authorized) OSC 8 hyperlink on the
-    /// cell wins; else a plain-text `http(s)://` URL detected in the row. Used by
-    /// Cmd-click (open) and Cmd-hover (pointer cursor).
+    /// The URL a PRESS at the pointer would open, if any: an (authorized) OSC 8
+    /// hyperlink on the cell wins; else a plain-text `http(s)://` URL detected
+    /// in the row. `None` wherever a press does not reach the grid at all.
     pub(crate) fn link_under_pointer(&self, wid: WindowId) -> Option<String> {
         let ws = self.windows.get(&wid)?;
         let (row, col) = ws.last_mouse_cell;
+        let window_row = usize::from(ws.last_mouse_window_cell.0);
+        // A CHROME BAND COVERS THE ROW IT TOOK, and a press lands on what is
+        // painted there — never on the grid cell hidden beneath it. The same
+        // register the hover asks, so the hand, the caption and the click give
+        // one answer: without it the find panel's own row opens whatever link
+        // it happens to be covering, and the caption's `ctrl+click opens` is a
+        // promise about a cell the person cannot see.
+        if self.chrome_owns_terminal_row(wid, window_row) {
+            return None;
+        }
         let term = term_lock(&ws.front_terminal()?.term);
-        term.hyperlink_at(row, col).map(str::to_owned).or_else(|| {
-            plain_url_at(&term.render_row(row as usize), col as usize).map(|(u, _, _)| u)
-        })
+        // VIEWPORT rows for BOTH probes. `render_row` resolves through
+        // `display_offset`, so a screen-keyed OSC 8 lookup beside it names a
+        // scrolled-back row's neighbour while the plain-text arm names the row
+        // the person is pointing at — and the press must open what the band and
+        // the pointer hand agree on, whatever the viewport is showing.
+        term.hyperlink_at_visible(row, col)
+            .map(|url| url.to_string())
+            .or_else(|| {
+                plain_url_at(&term.render_row(row as usize), col as usize).map(|(u, _, _)| u)
+            })
     }
 
     /// Cmd-click: if there is a link under the pointer with a safe scheme, open it
@@ -3482,6 +3688,30 @@ impl App {
                 }
             }
             return;
+        }
+        // THE STATUS BARS are chrome rows: a press on one opens the lane's own
+        // deliberate surface (the durable record the bar points at) and is
+        // consumed — like the strip, and unlike the retired floating card, this
+        // is a press on chrome, not on something the chrome is standing on. Only
+        // the PRESS is swallowed; the orphan-release guard below drops the
+        // matching release, so a tracking app sees a balanced stream.
+        if pressed && button == WinitMouseButton::Left {
+            let (px, py) = self
+                .windows
+                .get(&wid)
+                .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
+            if let Some(lane) = self.status_bar_lane_at(wid, px, py) {
+                let route = match lane {
+                    crate::status_bars::Lane::Toolchain => {
+                        crate::native_settings::SettingsRoute::Packages
+                    }
+                    crate::status_bars::Lane::Update => {
+                        crate::native_settings::SettingsRoute::SoftwareUpdate
+                    }
+                };
+                let _ = self.open_settings_tab(route);
+                return;
+            }
         }
         // The update nudge is the version-menu ⬆️ (macOS) / the LEADING `↻` icon in the
         // tab strip (off macOS — handled by the tab-strip click path below via
@@ -4429,7 +4659,7 @@ mod tests {
         (
             ox as f64 + pad as f64 + f64::from(rx + rw * 0.5) * scale,
             oy as f64
-                + (head + usize::from(app.tab_strip_rows) * ch) as f64
+                + (head + usize::from(app.chrome_rows()) * ch) as f64
                 + f64::from(ry + rh * 0.5) * scale,
         )
     }

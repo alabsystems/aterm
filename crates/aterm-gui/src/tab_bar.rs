@@ -2908,18 +2908,29 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// common head when the remainder fits (`…~/aterm`, the cwd as itself),
 /// falling back to a plain tail cut that fills the span with the most context.
 ///
-/// BYTE-IDENTICAL TWINS get their ORDINAL: when several cut tabs carry one
-/// identical title end to end, NO cut can tell them apart — ten shells in one
-/// cwd under pressure rendered ten copies of `…d`, nine meaningless stubs
-/// (measured; the audit's capture). Text cannot distinguish them, so their
-/// POSITION does: each non-active twin is labelled with its 1-based STRIP
-/// POSITION — `2 · …oml` when the window affords a tail, bare `2` when it
-/// doesn't — which for the first nine tabs is also the number the
-/// `switch_tab_<n>` action takes, and past that is a position and nothing more
-/// ([`ordinal_chip_label`] documents exactly what the number does and does not
-/// promise). The ACTIVE twin is exempt: it is the tab being read, its pressure
-/// window is the reserved wide one, and it keeps as much of the real title as
-/// fits.
+/// SUBJECT BEFORE STATE. The pairwise shed alone cannot find the composed state
+/// clause: a strip of twins shares its title WHOLE (nothing to subtract) and a
+/// strip mid-work shares no ending at all (`· Ready in aterm` beside `· Typing
+/// a command`). So every clustered member also sheds its own state clause
+/// ([`state_clause_bytes`]) before the cut — measured on Windows, eight shells
+/// in one directory: the selected chip spent its whole window on `…in aterm`,
+/// and a capture later on `…a command`, while the directory and the program
+/// that would have named it were cut away.
+///
+/// TWINS get their ORDINAL: when several cut tabs carry one identical SUBJECT,
+/// no cut can tell them apart — ten shells in one cwd under pressure rendered
+/// ten copies of `…d`, nine meaningless stubs (measured; the audit's capture).
+/// Text cannot distinguish them, so their POSITION does: each non-active twin
+/// is labelled with its 1-based STRIP POSITION — `2 · …~/aterm` when the window
+/// affords a tail, bare `2` when it doesn't — which for the first nine tabs is
+/// also the number the `switch_tab_<n>` action takes, and past that is a
+/// position and nothing more ([`ordinal_chip_label`] documents exactly what the
+/// number does and does not promise). Twins by SUBJECT rather than by title,
+/// because the state shed makes them: eight shells in one cwd are the same
+/// eight tabs whether or not one is mid-command this frame, and a label that
+/// flips between an ordinal and `…a command` as the user types is not a name.
+/// The ACTIVE twin is exempt: it is the tab being read, its pressure window is
+/// the reserved wide one, and it keeps as much of the real subject as fits.
 ///
 /// ONE DIALECT PER STRIP, extended to the PRESSURE case: the cluster rule
 /// above already flips a shared-head FAMILY together, but a pressure strip
@@ -3009,17 +3020,23 @@ fn distinct_chip_labels(
         relabelled[a] = true;
         let (i, avail) = cut[a];
         // Shed the cluster's common RAW-title suffix — shared tail noise.
-        // Titles that are byte-identical end to end have no distinguishing
-        // text anywhere; such a member keeps its full tail (`suffix = 0`)
-        // rather than truncating to nothing.
+        // Titles that are byte-identical end to end share their WHOLE title;
+        // shedding that would truncate them to nothing, so the pairwise shed
+        // contributes nothing there and the STATE shed below is what answers.
         let mut suffix = usize::MAX;
         for window in members.windows(2) {
             suffix = suffix.min(common_suffix_bytes(&titles[window[0]], &titles[window[1]]));
         }
-        if suffix >= titles[i].len() {
-            suffix = 0;
-        }
-        let core = &titles[i][..titles[i].len() - suffix];
+        // SUBJECT BEFORE STATE. Each member also sheds its OWN composed state
+        // clause ([`state_clause_bytes`]) — the half a chip is not there to
+        // paint. The pairwise shed cannot find it: a strip of twins shares the
+        // whole title (nothing left to subtract) and a strip mid-work shares
+        // NO ending at all (`· Ready in aterm` beside `· Typing a command`),
+        // which is exactly how a cut came to spend a whole chip on
+        // `…in aterm` and `…a command` — measured, eight shells, one cwd.
+        // Whichever is longer wins: a cluster whose shared ending reaches past
+        // the separator into the subject keeps shedding that far.
+        let core = clustered_core(&titles[i], suffix);
         // Prefer the cut at the last word boundary inside the shared head:
         // `…~/aterm` reads as the path it is, where a raw tail-keep pads the
         // width with a `…ower: ` fragment of the shared prompt.
@@ -3043,11 +3060,20 @@ fn distinct_chip_labels(
             .filter(|&&m| m != i)
             .map(|&m| titles[m].as_str())
             .collect();
-        // BYTE-IDENTICAL TWINS: no cut of this title can tell it from the
-        // members it byte-equals, so a non-active twin is labelled by its
-        // ordinal instead — the one thing about it that IS distinct. The
-        // active twin falls through: it keeps as much real title as fits.
-        let twins = members.iter().filter(|&&m| titles[m] == titles[i]).count();
+        // TWINS BY SUBJECT: no cut of this title can tell it from the members
+        // whose SUBJECT it byte-equals — the state shed above just took the one
+        // place they differed, on the ground that the difference names a moment
+        // rather than a tab — so a non-active twin is labelled by its ordinal
+        // instead, the one thing about it that IS distinct. (Subject twins, not
+        // title twins, because the shed makes them: eight shells in one cwd are
+        // twins whether or not one of them happens to be mid-command this
+        // frame, and a label that flips between an ordinal and `…a command` as
+        // the user types is not a name.) The active twin falls through: it
+        // keeps as much of the real subject as fits.
+        let twins = members
+            .iter()
+            .filter(|&&m| clustered_core(&titles[m], suffix) == core)
+            .count();
         if twins >= 2 && i != active {
             labels[i] = Some(ordinal_chip_label(
                 i, &titles[i], core, remainder, avail, &siblings,
@@ -3160,7 +3186,10 @@ fn distinct_chip_labels(
 /// `siblings` are the cluster's other titles. A byte-identical twin shares its
 /// WHOLE title, which distinguishes nothing and would shed everything — such a
 /// sibling is skipped (`n < title.len()`), which is why the twins' answer is
-/// the ordinal rather than another cut.
+/// the ordinal rather than another cut. (Their SHARED text is not lost to this
+/// skip: the caller sheds the composed state clause off every clustered member
+/// before it cuts — [`state_clause_bytes`] — so the label handed here is
+/// already made of subject text.)
 fn furniture_survivor_recut(
     title: &str,
     siblings: &[&str],
@@ -3265,6 +3294,63 @@ fn ordinal_chip_label(
         }
     }
     digits
+}
+
+/// What ONE clustered chip is cut from: its title with the cluster's shared
+/// ending and its own composed STATE clause taken off, whichever reaches
+/// further back ([`state_clause_bytes`], [`distinct_chip_labels`]).
+///
+/// `shared` is the cluster's pairwise common suffix in bytes. A member the
+/// whole of whose title is that suffix (the byte-identical twins) contributes
+/// nothing pairwise — shedding it all would leave no title to cut — so the
+/// state clause is what answers there, and it answers alone.
+fn clustered_core(title: &str, shared: usize) -> &str {
+    let pairwise = if shared >= title.len() { 0 } else { shared };
+    let shed = pairwise.max(state_clause_bytes(title));
+    &title[..title.len() - shed]
+}
+
+/// Byte length of a composed title's trailing STATE clause — the separator
+/// included — or `0` when the title has no clause a cut may shed.
+///
+/// SUBJECT BEFORE STATE. A chip title is composed, not raw: `App::tab_titles`
+/// joins the session's own title with its activity summary through
+/// [`crate::title_summary::TAB_LABEL_SEPARATOR`], and `compose_parts` puts the
+/// half the user's `tab_title_format` ranks SECOND on the far side of that
+/// separator (`title-description` — the default — trails the state;
+/// `description-title` trails the title). So the LAST clause is always the
+/// lower-ranked half, whichever way it is configured, and shedding it keeps the
+/// half the user asked to lead with.
+///
+/// WHY A CUT NEEDS THIS. Every idle tab on a strip carries the same state
+/// (`· Ready in aterm`, `· Typing a command`), so those characters name no tab
+/// — and they sit at the END, exactly where the tail dialect this module cuts
+/// with keeps them. Measured on Windows with eight shells in one directory: the
+/// selected chip painted `…in aterm` and, a capture later, `…a command`, while
+/// the directory that would have named it was cut away. The state is already on
+/// the chip in a form that costs no title cells (the busy/attention marks —
+/// [`TabStripMetadata::has_status`]); the subject is not.
+///
+/// `0` — nothing to shed — for a title with no separator, an empty clause, or a
+/// clause that is the whole title (a shed must leave a subject behind).
+///
+/// `pub(crate)` for ONE reason: `title_summary`'s own test composes a tab label
+/// and splits it back through this function, so the seam the two subsystems
+/// share is pinned from the composing side too, in both title formats.
+pub(crate) fn state_clause_bytes(title: &str) -> usize {
+    let Some(at) = title.rfind(crate::title_summary::TAB_LABEL_SEPARATOR) else {
+        return 0;
+    };
+    // `rfind` with a `&str` pattern lands on a char boundary, and both halves
+    // have to say something for the split to be a shed rather than a deletion.
+    if title[..at].trim().is_empty()
+        || title[at + crate::title_summary::TAB_LABEL_SEPARATOR.len()..]
+            .trim()
+            .is_empty()
+    {
+        return 0;
+    }
+    title.len() - at
 }
 
 /// Byte length of the longest common PREFIX of `a` and `b`, aligned to char
@@ -8337,14 +8423,166 @@ mod tests {
         );
     }
 
+    /// THE EIGHT-SHELLS DEFECT, photographed on Windows: eight tabs open in one
+    /// directory painted `1` `2` `3` `4` `5` `6` `7` beside a selected chip cut
+    /// down to `…in aterm` — and, a capture later, `…a command`. Both of those
+    /// are the composed STATE clause, the half of a chip title that says what
+    /// the tab is DOING: every idle tab on the strip says it identically, it
+    /// changes as the user types, and it is already on the chip as a status
+    /// mark. So it is shed before the cut ([`state_clause_bytes`]) and what
+    /// survives is the SUBJECT — here the program the title names.
+    ///
+    /// Both captures are one case: whether the selected shell is idle like its
+    /// seven siblings (byte-identical titles) or mid-command (its state clause
+    /// alone differs), the strip must name the same eight tabs the same way.
+    /// That is what makes twins a question about SUBJECTS rather than titles —
+    /// a label that flips to `…a command` while the user types is not a name.
+    #[test]
+    fn eight_shells_in_one_cwd_name_their_subject_not_their_state() {
+        let idle: Vec<String> = (0..8)
+            .map(|_| "claude · Ready in aterm".to_string())
+            .collect();
+        // The second capture: the selected tab is mid-command, so its state
+        // clause — and nothing else — differs from the other seven.
+        let mut typing = idle.clone();
+        typing[7] = "claude · Typing a command".to_string();
+        for (capture, titles) in [("idle", idle), ("typing", typing)] {
+            // 160 cols: eight equal 20-cell chips, a 14-cell title window each
+            // — room for a name, never for the whole composed title.
+            let segments = layout_segments(160, titles.len(), 7, false);
+            let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 7, None)
+                .into_iter()
+                .map(Option::unwrap)
+                .collect();
+            assert_eq!(
+                resolved[7], "claude",
+                "{capture}: the selected chip names its tab, where it painted \
+                 the activity phrase: {resolved:?}"
+            );
+            for (i, label) in resolved.iter().enumerate().take(7) {
+                assert_eq!(
+                    label,
+                    &format!("{} · claude", i + 1),
+                    "{capture}: a quiet chip carries its position AND what it \
+                     is, where it painted a bare number: {resolved:?}"
+                );
+            }
+
+            // The PHOTOGRAPHED width: 80 cols, where the pressure layout leaves
+            // a quiet chip four title cells — a window no name fits in, so the
+            // position is all that is left to say (the ordinal's floor, and the
+            // only rung of this that a narrow strip cannot climb off). The
+            // selected chip's reserved width still names it.
+            let segments = layout_segments(80, titles.len(), 7, false);
+            let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 7, None)
+                .into_iter()
+                .map(Option::unwrap)
+                .collect();
+            assert_eq!(resolved[7], "claude", "{capture}: {resolved:?}");
+            for (i, label) in resolved.iter().enumerate().take(7) {
+                assert_eq!(label, &(i + 1).to_string(), "{capture}: {resolved:?}");
+            }
+
+            // AND AT NO WIDTH the strip can still say something does a chip
+            // spend that window on the state. (Wide enough for both is not this
+            // rule's business: a chip with room for `claude · Typing a …` is
+            // painting its subject first, which is the whole point.)
+            for cols in [80u16, 98, 120, 160] {
+                let segments = layout_segments(cols, titles.len(), 7, false);
+                let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 7, None)
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .collect();
+                for (i, label) in resolved.iter().enumerate() {
+                    assert!(
+                        !label.contains("Ready")
+                            && !label.contains("Typing")
+                            && !label.contains("command"),
+                        "{capture} at {cols} cols: tab {i} spends its window on \
+                         the state: {resolved:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE STATE CLAUSE IS NOT A NAME even when it is the only thing that
+    /// differs. Two shells in one directory, one running tests and one
+    /// building, are two tabs with ONE subject: shedding the state collapses
+    /// their labels together, and the pass answers that collapse the way it
+    /// answers any pair it cannot tell apart by text — the non-active one takes
+    /// its POSITION. What must never happen is the strip painting `…s passed`
+    /// and `…e project`, two chips named after two moments.
+    #[test]
+    fn tabs_that_differ_only_in_state_are_told_apart_by_position() {
+        let titles = [
+            "~/work/api · Tests passed".to_string(),
+            "~/work/api · Building the project".to_string(),
+        ];
+        let segments = layout_segments(40, titles.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_ne!(
+            resolved[0], resolved[1],
+            "still tellable apart: {resolved:?}"
+        );
+        for (i, label) in resolved.iter().enumerate() {
+            assert!(
+                label.contains("api"),
+                "tab {i} names the directory both tabs are in: {resolved:?}"
+            );
+            assert!(
+                !label.contains("passed") && !label.contains("Building"),
+                "tab {i} is named after a moment: {resolved:?}"
+            );
+        }
+        assert!(
+            resolved[1].starts_with("2 · "),
+            "the one text cannot name takes its position: {resolved:?}"
+        );
+    }
+
+    /// THE SHED'S OWN RULE: a state clause is shed only when a SUBJECT survives
+    /// it, and only the LAST one — the half `compose_parts` appends, whichever
+    /// way `tab_title_format` orders the two (`title_summary`'s own
+    /// `a_composed_tab_label_splits_back_where_the_strip_looks_for_it` pins that
+    /// seam against the composition itself).
+    #[test]
+    fn a_state_clause_is_shed_only_when_a_subject_survives_it() {
+        let subject = |title: &str| -> String {
+            title[..title.len() - state_clause_bytes(title)].to_string()
+        };
+        assert_eq!(state_clause_bytes("claude"), 0, "no separator, no clause");
+        assert_eq!(
+            state_clause_bytes(" · Ready in aterm"),
+            0,
+            "a shed that would leave no subject is not a shed"
+        );
+        assert_eq!(state_clause_bytes("claude · "), 0, "an empty clause");
+        assert_eq!(subject("claude · Ready in aterm"), "claude");
+        assert_eq!(
+            subject("user@m17-tower: ~/aterm · Typing a command"),
+            "user@m17-tower: ~/aterm"
+        );
+        assert_eq!(
+            subject("mux · pane 2 · Ready"),
+            "mux · pane 2",
+            "only the LAST clause goes: a title that carries the separator \
+             itself keeps everything the composition did not append"
+        );
+    }
+
     /// THE TEN-IDENTICAL-TABS DEFECT, measured at the audit's width: ten
     /// shells in one cwd under the pressure layout rendered `…command` on the
     /// active chip and NINE copies of `…d` beside it — nine tabs, no way to
     /// name any of them. Byte-identical titles have no distinguishing text for
     /// any cut to keep, so a non-active twin is labelled by its 1-based strip
     /// POSITION (`switch_tab_<n>`'s number for the first nine): bare digits in a
-    /// two-cell window, `2 · …nd` where the window affords a tail. The ACTIVE
-    /// twin keeps as much real title as its reserved pressure width fits.
+    /// two-cell window, `2 · …rm` where the window affords a tail. The ACTIVE
+    /// twin keeps as much real SUBJECT as its reserved pressure width fits —
+    /// `…~/aterm`, the cwd, the state clause having been shed before the cut.
     #[test]
     fn byte_identical_tabs_under_pressure_are_addressable_by_ordinal() {
         let titles: Vec<String> = (0..10)
@@ -8358,8 +8596,10 @@ mod tests {
             .map(Option::unwrap)
             .collect();
         assert_eq!(
-            resolved[0], "…command",
-            "the active twin keeps as much title as its reserved width fits"
+            resolved[0], "…~/aterm",
+            "the active twin keeps as much SUBJECT as its reserved width fits \
+             — the cwd its prompt names, not the `…command` its state clause \
+             used to leave there"
         );
         for (i, label) in resolved.iter().enumerate().skip(1) {
             assert_eq!(
@@ -8377,16 +8617,19 @@ mod tests {
             }
         }
 
-        // A wider pressure strip affords each ordinal a tail of the title —
-        // ordinal first (the part that distinguishes), tail as context.
+        // A wider pressure strip affords each ordinal a tail of the SUBJECT —
+        // ordinal first (the part that distinguishes), tail as context. Three
+        // cells is still only a stub of `~/aterm`, but it is a stub of the cwd
+        // rather than of `command`: at every width the ordinal's tail is cut
+        // from the same half of the title the selected chip keeps.
         let segments = layout_segments(120, titles.len(), 0, false);
         let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
             .into_iter()
             .map(Option::unwrap)
             .collect();
-        assert_eq!(resolved[1], "2 · …nd");
+        assert_eq!(resolved[1], "2 · …rm");
         assert_eq!(
-            resolved[9], "10 · …d",
+            resolved[9], "10 · …m",
             "two-digit ordinals spend their extra cell out of the tail's share"
         );
 
@@ -8398,7 +8641,7 @@ mod tests {
             .into_iter()
             .map(Option::unwrap)
             .collect();
-        assert_eq!(resolved[4], "…command");
+        assert_eq!(resolved[4], "…~/aterm");
         assert_eq!(resolved[0], "1");
         assert_eq!(resolved[9], "10");
     }

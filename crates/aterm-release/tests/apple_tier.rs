@@ -76,9 +76,6 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/sign.rs"]
 // The mount exercises the pure decision surface; the real crate's own build is
 // what holds the dead-code line for src/sign.rs, so an unexercised item here is
@@ -278,87 +275,14 @@ impl publish::Packager for FakePackager {
             size_bytes: 1_000,
         })
     }
-    fn zip(
-        &self,
-        app: &Path,
-        _dist: &Path,
-        _version: &str,
-        notarized: bool,
-        _seeded: bool,
-    ) -> ledger::Result<dmg::Packaged> {
+    fn zip(&self, app: &Path, _dist: &Path, _version: &str) -> ledger::Result<dmg::Packaged> {
         // Recorded so the ORDERING contract stays observable: the zip is built from a
-        // bundle that has already been notarized and stapled, and the stripped-bundle
-        // Gatekeeper check is only decisive when that is true.
-        record(
-            &self.log,
-            if notarized {
-                "create_zip(notarized)"
-            } else {
-                "create_zip"
-            },
-            app,
-        );
+        // bundle that has already been notarized and stapled.
+        record(&self.log, "create_zip", app);
         Ok(dmg::Packaged {
             path: PathBuf::from("/tmp/aterm-tier-fixture/aterm-mac.zip"),
             sha256: ZIP_SHA.into(),
             size_bytes: 900,
-        })
-    }
-    fn dmg_arch(
-        &self,
-        app: &Path,
-        _dist: &Path,
-        _version: &str,
-        triple: &str,
-        notarized: bool,
-    ) -> ledger::Result<dmg::Packaged> {
-        // Recorded WITH the triple and the notarization fact: the split lane's
-        // contract is that each per-arch restage is built from the
-        // already-stapled bundle and told so (its spctl gate is only decisive
-        // then), and that the canonical (arm64) image is built before the
-        // Intel variant.
-        record(
-            &self.log,
-            &format!(
-                "create_dmg_arch[{triple}{}]",
-                if notarized { ",notarized" } else { "" }
-            ),
-            app,
-        );
-        Ok(dmg::Packaged {
-            path: if triple == "aarch64-apple-darwin" {
-                dmg()
-            } else {
-                x86_dmg()
-            },
-            sha256: DMG_SHA_BEFORE.into(),
-            size_bytes: 1_000,
-        })
-    }
-    fn dmg_lite(
-        &self,
-        app: &Path,
-        _dist: &Path,
-        _version: &str,
-        notarized: bool,
-        _seeded: bool,
-    ) -> ledger::Result<dmg::Packaged> {
-        // Recorded WITH the notarization fact, exactly like the zip: the lean
-        // DMG's restage Gatekeeper gate is only decisive when the bundle it
-        // strips really was stapled, so the lane must be told so.
-        record(
-            &self.log,
-            if notarized {
-                "create_dmg_lite(notarized)"
-            } else {
-                "create_dmg_lite"
-            },
-            app,
-        );
-        Ok(dmg::Packaged {
-            path: lite_dmg(),
-            sha256: DMG_SHA_BEFORE.into(),
-            size_bytes: 500,
         })
     }
     fn sha256(&self, path: &Path) -> ledger::Result<String> {
@@ -376,12 +300,6 @@ fn app() -> PathBuf {
 }
 fn dmg() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture/aterm.dmg")
-}
-fn x86_dmg() -> PathBuf {
-    PathBuf::from("/tmp/aterm-tier-fixture/aterm-x86_64.dmg")
-}
-fn lite_dmg() -> PathBuf {
-    PathBuf::from("/tmp/aterm-tier-fixture/aterm-lite.dmg")
 }
 fn dist() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture")
@@ -934,8 +852,6 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
         &FakePackager {
             log: Rc::clone(&log),
         },
-        false,
-        false,
     )
     .expect("the active packaging path");
     assert_eq!(
@@ -953,24 +869,8 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
             // 4. re-read afterwards,
             "rehash:aterm.dmg",
             "resize:aterm.dmg",
-            // 5. the LEAN drag-install DMG rides the same per-container
-            //    sequence — built from the stapled bundle (told so, which is
-            //    what makes its restage Gatekeeper gate decisive), hooked,
-            //    re-read — after the fleet-critical seeded image so its
-            //    notarization wait is only ever spent on a cut that already
-            //    cleared the one that matters,
-            "create_dmg_lite(notarized):aterm.app",
-            "sign_dmg:aterm-lite.dmg",
-            "preflight:aterm-lite.dmg",
-            "notarize:aterm-lite.dmg",
-            "rehash:aterm-lite.dmg",
-            "resize:aterm-lite.dmg",
-            // 6. and the zip archived from the ALREADY-STAPLED bundle last.
-            //    `(notarized)` is the point, not noise: it proves the ACTIVE tier
-            //    tells the zip builder the bundle really is signed and stapled,
-            //    which is what makes the stripped-bundle Gatekeeper check FATAL
-            //    rather than advisory (dmg::verify_stripped_bundle).
-            "create_zip(notarized):aterm.app",
+            // 5. and the zip archived from the ALREADY-STAPLED bundle last.
+            "create_zip:aterm.app",
         ],
         "the bundle must be stapled before any container is built"
     );
@@ -980,94 +880,41 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
     assert_eq!(out.dmg_sha256, DMG_SHA_AFTER);
     assert_eq!(out.dmg_size, 2_000, "the size must be re-read too");
     assert_eq!(out.zip.sha256, ZIP_SHA);
-    // The lean DMG's digest goes on record (the journal) under the same rule:
-    // post-hook bytes or nothing.
-    assert_eq!(out.dmg_lite_sha256, DMG_SHA_AFTER);
-    assert_eq!(out.dmg_lite_size, 2_000);
 }
 
+/// ONE DMG (RETIRED 2026-08-26: the Intel `-x86_64` restage and the `-lite`
+/// twin). The packaging seam builds exactly the canonical DMG and the zip —
+/// a second `create_dmg*` call of any spelling is a retired lane coming back.
 #[test]
-fn the_split_cut_builds_the_arm64_canonical_first_then_the_intel_variant() {
-    // The per-arch DMG pair (x86_split = true): the ORDER is the property, as
-    // everywhere in this seam. The bundle is stapled once; the CANONICAL
-    // (arm64-filtered, bare-named) DMG is built from it and hooked/re-hashed;
-    // only then is a second notarization wait spent on the Intel variant; the
-    // zip still comes last, from the already-stapled bundle. Each `dmg_arch`
-    // call is told the bundle is notarized — that is what makes the restage's
-    // Gatekeeper check decisive rather than advisory.
-    let alog = log();
-    let out = publish::notarize_and_package(
+fn the_packaging_lane_builds_exactly_one_dmg_and_one_zip() {
+    let log = log();
+    publish::notarize_and_package(
         &app(),
         &dist(),
         "9.9.9",
         &active_tier(),
-        &FakeTools::healthy(&alog),
+        &FakeTools::healthy(&log),
         &FakePackager {
-            log: Rc::clone(&alog),
+            log: Rc::clone(&log),
         },
-        true,
-        true,
     )
-    .expect("the split packaging path");
+    .expect("the active packaging path");
+    let seen = entries(&log);
     assert_eq!(
-        entries(&alog),
-        vec![
-            "preflight:aterm.app",
-            "notarize:aterm.app",
-            "create_dmg_arch[aarch64-apple-darwin,notarized]:aterm.app",
-            "sign_dmg:aterm.dmg",
-            "preflight:aterm.dmg",
-            "notarize:aterm.dmg",
-            "rehash:aterm.dmg",
-            "resize:aterm.dmg",
-            "create_dmg_arch[x86_64-apple-darwin,notarized]:aterm.app",
-            "sign_dmg:aterm-x86_64.dmg",
-            "preflight:aterm-x86_64.dmg",
-            "notarize:aterm-x86_64.dmg",
-            "rehash:aterm-x86_64.dmg",
-            "resize:aterm-x86_64.dmg",
-            "create_dmg_lite(notarized):aterm.app",
-            "sign_dmg:aterm-lite.dmg",
-            "preflight:aterm-lite.dmg",
-            "notarize:aterm-lite.dmg",
-            "rehash:aterm-lite.dmg",
-            "resize:aterm-lite.dmg",
-            "create_zip(notarized):aterm.app",
-        ],
-        "canonical arm64 first, Intel variant second, lean image third, zip \
-         last — each from the stapled bundle"
+        seen.iter().filter(|c| c.starts_with("create_dmg")).count(),
+        1,
+        "exactly one DMG is imaged: {seen:?}"
     );
-    // Both manifest digests are the POST-hook reads, never the mint-time ones.
-    assert_eq!(out.dmg_sha256, DMG_SHA_AFTER);
-    let (x86, x86_sha, x86_size) = out.dmg_x86_64.expect("the split cut returns the pair");
-    assert_eq!(x86.path, x86_dmg());
-    assert_eq!(x86_sha, DMG_SHA_AFTER);
-    assert_eq!(x86_size, 2_000);
-
-    // And a non-split cut returns None — the single-DMG lane is untouched.
-    let log2 = log();
-    let out = publish::notarize_and_package(
-        &app(),
-        &dist(),
-        "9.9.9",
-        &AppleTier::Inactive,
-        &FakeTools::healthy(&log2),
-        &FakePackager {
-            log: Rc::clone(&log2),
-        },
-        false,
-        false,
-    )
-    .expect("the single-DMG path");
-    assert!(out.dmg_x86_64.is_none());
     assert_eq!(
-        entries(&log2),
-        vec![
-            "create_dmg:aterm.app",
-            "create_dmg_lite:aterm.app",
-            "create_zip:aterm.app"
-        ],
-        "no split, no arch lane: the single-DMG pipeline plus the lean image"
+        seen.iter().filter(|c| c.starts_with("create_zip")).count(),
+        1,
+        "exactly one zip is archived: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|c| c.contains("lite") || c.contains("x86_64") || c.contains("arch")),
+        "a retired container lane ran: {seen:?}"
     );
 }
 
@@ -1087,17 +934,11 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
         &FakePackager {
             log: Rc::clone(&log),
         },
-        false,
-        false,
     )
     .expect("the inactive packaging path");
     assert_eq!(
         entries(&log),
-        vec![
-            "create_dmg:aterm.app",
-            "create_dmg_lite:aterm.app",
-            "create_zip:aterm.app"
-        ],
+        vec!["create_dmg:aterm.app", "create_zip:aterm.app"],
         "the inactive tier packages and does nothing else"
     );
     assert_eq!(
@@ -1105,11 +946,6 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
         "nothing rewrote the DMG, so nothing may re-hash it"
     );
     assert_eq!(out.dmg_size, 1_000);
-    assert_eq!(
-        out.dmg_lite_sha256, DMG_SHA_BEFORE,
-        "same rule for the lean image: no hook, no re-hash"
-    );
-    assert_eq!(out.dmg_lite_size, 500);
 }
 
 #[test]
@@ -1127,8 +963,6 @@ fn a_failed_bundle_notarization_stops_the_cut_before_anything_is_packaged() {
         &FakePackager {
             log: Rc::clone(&log),
         },
-        false,
-        false,
     );
     assert!(
         outcome.is_err(),
@@ -1161,8 +995,6 @@ fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
         &FakePackager {
             log: Rc::clone(&log),
         },
-        false,
-        false,
     );
     assert!(
         outcome.is_err(),
@@ -1172,49 +1004,6 @@ fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
     assert!(
         seen.contains(&"notarize:aterm.app".to_string()),
         "precondition: the bundle's own submission succeeded, {seen:?}"
-    );
-    assert!(
-        !seen.iter().any(|c| c.starts_with("create_zip")),
-        "the zip must never be built, got {seen:?}"
-    );
-    assert!(
-        !seen.iter().any(|c| c.starts_with("create_dmg_lite")),
-        "the lean image must never be built after the fleet-critical DMG's \
-         notarization failed, got {seen:?}"
-    );
-}
-
-#[test]
-fn a_failed_lite_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
-    // The lean image is a browser-download alias, but its failure is NOT
-    // advisory: `aterm.dmg` will serve these bytes, so a cut that cannot
-    // notarize them must stop exactly as it does for the seeded image — before
-    // the zip exists to be uploaded under a team-claiming manifest.
-    let log = log();
-    let tools = FakeTools {
-        fail_on_target: Some("aterm-lite.dmg"),
-        ..FakeTools::failing(&log, "notarize")
-    };
-    let outcome = publish::notarize_and_package(
-        &app(),
-        &dist(),
-        "9.9.9",
-        &active_tier(),
-        &tools,
-        &FakePackager {
-            log: Rc::clone(&log),
-        },
-        false,
-        false,
-    );
-    assert!(
-        outcome.is_err(),
-        "a failed lean-DMG submission must abort the cut"
-    );
-    let seen = entries(&log);
-    assert!(
-        seen.contains(&"notarize:aterm.dmg".to_string()),
-        "precondition: the seeded DMG's own submission succeeded, {seen:?}"
     );
     assert!(
         !seen.iter().any(|c| c.starts_with("create_zip")),
@@ -1373,7 +1162,6 @@ fn journal_with(done: &[&str]) -> Journal {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
-        lite_dmg_sha256: None,
         done: done.iter().map(|s| (*s).to_string()).collect(),
     }
 }

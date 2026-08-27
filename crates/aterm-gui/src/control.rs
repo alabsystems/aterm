@@ -5722,7 +5722,12 @@ fn cross_resize(
             let _ = proxy.send_event(Wake::redraw(session));
         }
     }
-    aterm_pty::resize(master, rows, cols);
+    // WINSIZE PIXELS: the cell metrics come from the ENGINE, which is where
+    // CELL-PX-1 already pushed this session's real font box — `host_cell_pixel_size`
+    // is `None` until a host has actually measured one, so a headless target reports
+    // honest zeros instead of the 8x16 placeholder.
+    let cell_px = term_lock(term).host_cell_pixel_size();
+    aterm_pty::resize_with_cell_px(master, rows, cols, cell_px);
     // Mirror `apply_term_resize`'s per-session asciicast record (main.rs:2459-2463)
     // so the target's own `screen.cast` timeline shows the geometry change.
     {
@@ -15818,5 +15823,96 @@ mod tests {
             id: h.local_id,
             ctx: h.ctx.clone(),
         })))
+    }
+
+    /// THE HELP TEXT IS A CONTRACT, so it is checked against the row itself.
+    ///
+    /// `trail status`'s reply is one line of `key=value` pairs, and the only
+    /// place a driver can learn which keys exist is the `trail` verb's help.
+    /// Those two lived in different crates with nothing holding them together,
+    /// and they drifted: the four `block_fill*` fields shipped in the row for a
+    /// release while the help still ended at `cat_active=`, so every field the
+    /// sensor added was invisible to anyone reading the documented surface.
+    ///
+    /// Set equality, not containment — a key dropped from the row must fail
+    /// just as loudly as one added to it, because a driver that parses a
+    /// documented key which no longer arrives is the same outage either way.
+    #[test]
+    fn trail_status_help_enumerates_exactly_the_keys_the_row_emits() {
+        use aterm_effects::cursor_glow::{
+            AdmissionTally, BlockFill, BlockFillOwner, GlowStyle, TrailStatus,
+        };
+
+        let row = TrailStatus {
+            style_raw: "rainbow kitty pet",
+            style: GlowStyle::RainbowKitty,
+            config_enabled: true,
+            effective: true,
+            focused: true,
+            motion_stage: "full",
+            motion_mode: "auto",
+            shed: 1.0,
+            intensity: 0.7,
+            tally: AdmissionTally {
+                licensed: 8,
+                declined: 1,
+                last_decline_reason: None,
+            },
+            spawns: 8,
+            ribbon_look: "underline",
+            ribbon_segments: 4,
+            ribbon_hue_bands: 4,
+            sparks: 4,
+            momentum: 0.5,
+            momentum_display: 0.44,
+            speed: 12.0,
+            glow_active: true,
+            pet_active: true,
+            cat_active: false,
+            // A body PRESENT, so the fields that only a claimed caret fills are
+            // in the row being compared rather than silently absent.
+            block_fill: Some(BlockFill {
+                owner: BlockFillOwner::Rainbow,
+                fill: 0x0000_F022,
+                base: Some(0x0000_FF00),
+            }),
+        }
+        .line();
+        let emitted = row
+            .split_whitespace()
+            .filter_map(|token| token.split_once('='))
+            .map(|(key, _)| key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            emitted.contains("block_fill") && emitted.len() > 20,
+            "the fixture stopped producing a full row: {row}"
+        );
+
+        // The help spells the row as one backticked run beginning `trail
+        // style=`; take it from the shipped spec so this reads the same bytes
+        // `ctl help` prints.
+        let help = aterm_types::control_verbs::spec("trail")
+            .expect("the trail verb ships")
+            .help;
+        let run = help
+            .split_once("`trail style=")
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(run, _)| run)
+            .expect("help documents the `trail status` row");
+        let documented = std::iter::once("style")
+            .chain(
+                run.split_whitespace()
+                    .filter_map(|token| token.strip_suffix('=')),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            documented,
+            emitted,
+            "`trail status` help and the row it documents disagree:\n  \
+             help-only: {:?}\n  row-only: {:?}",
+            documented.difference(&emitted).collect::<Vec<_>>(),
+            emitted.difference(&documented).collect::<Vec<_>>(),
+        );
     }
 }

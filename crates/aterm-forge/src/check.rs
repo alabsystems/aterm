@@ -992,9 +992,24 @@ reason = \"no arch intrinsics reach the shipped build\"
                 found.extend(sibs.iter().map(|s| s.0.spec()));
             }
             found.sort();
-            let empty: [&str; 0] = [];
+            // ONE NAMED EXCEPTION, carried deliberately and visibly.
+            //
+            // `winnow 1.0.3` re-entered the LINUX graph on 2026-08-26 when the
+            // owner made AccessKit an unconditional Linux dependency: measured
+            // with the feature off, the AT-SPI registry reports ZERO
+            // applications for aterm while a GTK app sits in the same registry,
+            // so a blind Linux user gets no terminal at all. That trade is
+            // settled. Its COST is this: accesskit_unix -> zbus -> winnow 1.0.3
+            // is the registry copy, and aterm forks winnow at 0.7.15 to remove
+            // an `offset_from` underflow that a `^1.0` requirement cannot reach.
+            //
+            // The exception is spelled out per cell rather than deleted, so the
+            // gate still fails on any OTHER unpatched sibling, and this one
+            // stays legible instead of being absorbed. Closing it means carrying
+            // the fix into a 1.x fork and repointing [patch.crates-io].
+            let expected: &[&str] = if cell.name == "linux" { &["winnow@1.0.3"] } else { &[] };
             assert_eq!(
-                found, empty,
+                found, expected,
                 "cell `{}` resolves an unpatched sibling beside a vendored fork — \
                  `cargo forge blame <name>` names the edge that drags it in",
                 cell.name

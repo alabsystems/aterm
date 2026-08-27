@@ -136,7 +136,9 @@ use std::time::Instant as WallInstant;
 
 use aterm_core::render::FreeSprite;
 use aterm_effects::cat_baker::CatColorKey;
-use aterm_effects::kitty_pet::{PetAction, PetBrain, PetFrame, PetMoteKind, PetSense, PetSpecies};
+use aterm_effects::kitty_pet::{
+    PetAction, PetArrival, PetBrain, PetFrame, PetMoteKind, PetSense, PetSpecies,
+};
 use aterm_effects::robi::{CYCLE_MS, MAX_HANDHOLDS, RobiFrame, RobiSense, RobiShow, WANDER_END};
 use aterm_effects::robi_glyphs_gen::RobiGlyphId;
 use aterm_effects::word_decorations::{EffectGeom, PetCursorFrame, WordDecorations};
@@ -275,7 +277,7 @@ impl BrainRig {
     }
 
     /// THE TIMED UNIT: `PetBrain::tick` and nothing else. (Building the
-    /// `PetSense` value is nine scalar stores — it is the call's argument,
+    /// `PetSense` value is ten scalar stores — it is the call's argument,
     /// not host work, so it stays inside.)
     fn tick(&mut self) -> PetFrame {
         self.brain.tick(PetSense {
@@ -288,6 +290,7 @@ impl BrainRig {
             reduced_motion: false,
             output_burst: false,
             pointer: None,
+            wrapped: false,
         })
     }
 }
@@ -889,7 +892,7 @@ fn verify_draw(
 fn capture_zee_and_body() -> (Vec<PetFrame>, Vec<PetFrame>, (u8, u8)) {
     let mut r = BrainRig::new(blank_ink(), None);
     // The look latch, exactly as the host syncs it (immediate at alpha 0).
-    let look = r.brain.sync_look(3, 2);
+    let look = r.brain.sync_look((3, 2), PetArrival::Ceremony).worn;
     let mut zee: Vec<PetFrame> = Vec::new();
     let mut gap = 0usize;
     for _ in 0..3_000 {
@@ -950,7 +953,7 @@ fn capture_zee_and_body() -> (Vec<PetFrame>, Vec<PetFrame>, (u8, u8)) {
 /// dust is alive.
 fn capture_dust() -> (Vec<PetFrame>, (u8, u8)) {
     let mut r = BrainRig::new(blank_ink(), None);
-    let look = r.brain.sync_look(3, 2);
+    let look = r.brain.sync_look((3, 2), PetArrival::Ceremony).worn;
     // Appear (still caret at col 20)…
     r.caret = Some((25, 20));
     for _ in 0..30 {

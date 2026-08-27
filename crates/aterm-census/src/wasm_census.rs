@@ -1158,6 +1158,12 @@ mod tests {
             "crates/aterm-policy/src",
             "crates/aterm-predict/src",
             "crates/aterm-provenance/src",
+            // Entered the closure when the first-party regular-expression
+            // engine replaced `regex` (+ regex-automata, regex-syntax,
+            // aho-corasick): aterm-selection and aterm-search compile patterns
+            // through it, and both are in the web modules' graph. Dependency-
+            // free and lock-free, so it adds no thread or lock vocabulary here.
+            "crates/aterm-regex/src",
             "crates/aterm-render-api/src",
             "crates/aterm-render/src",
             "crates/aterm-rle/src",

@@ -471,3 +471,155 @@ fn text_only_frame_is_unaffected_by_the_image_path() {
     let b = r2.render_input(&term.cell_frame(4, 8)).pixels;
     assert_eq!(a, b, "image-free frame renders identically");
 }
+
+/// ASPECT FIDELITY: the footprint decode FITS the source instead of stretching it.
+///
+/// The measured defect (0.61.0, live pixels): a 120x60 sixel card — aspect exactly
+/// 2.00 — landed in a 14x4-cell footprint of 126x68 px and was drawn 126x68, i.e.
+/// aspect 1.85, a 7.9% error; a 100x40 card (2.50) came out 2.12, an 18% error.
+/// Circles became ellipses on every image whose pixel size was not an exact
+/// multiple of the cell box, which is nearly all of them.
+///
+/// Here the same shape is checked on the ONE decode both renderers share: the
+/// OPAQUE region (what is actually drawn) must carry the SOURCE's aspect to
+/// within a pixel, and the remainder must be fully transparent so the cell
+/// background — not a smeared edge — shows through.
+#[test]
+fn footprint_decode_preserves_the_source_aspect_ratio() {
+    use aterm_core::grid::extra::ImageFormat;
+
+    // Opaque 120x60 raw raster (the sixel path's format), 2.00 aspect.
+    let (sw, sh) = (120usize, 60usize);
+    let src: Vec<u8> = std::iter::repeat_n([200u8, 30, 30, 255], sw * sh)
+        .flatten()
+        .collect();
+    // The footprint the engine rounds that onto: 14 cells x 4 rows at 9x17 px.
+    let (fp_w, fp_h) = (126usize, 68usize);
+    let out = aterm_render::decode_image_to_footprint(
+        &src,
+        ImageFormat::RawRgba8 {
+            width: sw as u16,
+            height: sh as u16,
+        },
+        fp_w,
+        fp_h,
+    )
+    .expect("raw RGBA fits its footprint");
+    assert_eq!(
+        out.len(),
+        fp_w * fp_h * 4,
+        "the buffer is still the footprint"
+    );
+
+    // Bounding box of the OPAQUE pixels: what the eye sees.
+    let opaque = |x: usize, y: usize| out[(y * fp_w + x) * 4 + 3] > 0;
+    let (mut x0, mut x1, mut y0, mut y1) = (fp_w, 0usize, fp_h, 0usize);
+    for y in 0..fp_h {
+        for x in 0..fp_w {
+            if opaque(x, y) {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    let (drawn_w, drawn_h) = (x1 + 1 - x0, y1 + 1 - y0);
+    // Width binds (the source is wider than the box), so the full width is used
+    // and the height is the aspect-exact 63 — letterboxed 2 px above, 3 below.
+    assert_eq!(
+        (drawn_w, drawn_h),
+        (126, 63),
+        "aspect-fitted, not stretched"
+    );
+    let err = ((drawn_w as f64 / drawn_h as f64) - (sw as f64 / sh as f64)).abs()
+        / (sw as f64 / sh as f64);
+    assert!(
+        err < 0.01,
+        "drawn aspect {:.4} must match the source's {:.4} (error {:.2}% — the \
+         pre-fix stretch was 7.9%)",
+        drawn_w as f64 / drawn_h as f64,
+        sw as f64 / sh as f64,
+        err * 100.0
+    );
+    // The bars are FULLY transparent: the cell background shows through them
+    // rather than a stretched edge row.
+    for y in 0..y0 {
+        for x in 0..fp_w {
+            assert_eq!(out[(y * fp_w + x) * 4 + 3], 0, "top bar at ({x},{y})");
+        }
+    }
+    for y in (y1 + 1)..fp_h {
+        for x in 0..fp_w {
+            assert_eq!(out[(y * fp_w + x) * 4 + 3], 0, "bottom bar at ({x},{y})");
+        }
+    }
+}
+
+/// NON-VACUITY + no regression for the paths that already fitted exactly: a
+/// source whose aspect equals the footprint's fills every pixel (no bars), and a
+/// cell-EXACT source is still returned byte-identically — the pixel-perfect sixel
+/// path (measured: 126x68 in, 126x68 out, zero interpolated pixels) must stay
+/// pixel-perfect, and the tab strip's chrome band builds its raster at exactly the
+/// footprint size for the same reason.
+#[test]
+fn an_aspect_matched_source_still_fills_the_whole_footprint() {
+    use aterm_core::grid::extra::ImageFormat;
+    let (fp_w, fp_h) = (126usize, 68usize);
+
+    // Cell-exact: same pixels in and out.
+    let exact: Vec<u8> = std::iter::repeat_n([7u8, 200, 90, 255], fp_w * fp_h)
+        .flatten()
+        .collect();
+    let out = aterm_render::decode_image_to_footprint(
+        &exact,
+        ImageFormat::RawRgba8 {
+            width: fp_w as u16,
+            height: fp_h as u16,
+        },
+        fp_w,
+        fp_h,
+    )
+    .expect("cell-exact raster decodes");
+    assert_eq!(
+        out, exact,
+        "a cell-exact raster must pass through untouched"
+    );
+
+    // Half-size but SAME aspect (63x34 into 126x68): scaled up, still no bars.
+    let (hw, hh) = (63usize, 34usize);
+    let half: Vec<u8> = std::iter::repeat_n([7u8, 200, 90, 255], hw * hh)
+        .flatten()
+        .collect();
+    let out = aterm_render::decode_image_to_footprint(
+        &half,
+        ImageFormat::RawRgba8 {
+            width: hw as u16,
+            height: hh as u16,
+        },
+        fp_w,
+        fp_h,
+    )
+    .expect("aspect-matched raster decodes");
+    assert!(
+        out.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
+        "an aspect-matched source leaves NO transparent margin"
+    );
+}
+
+/// The fit arithmetic itself, including the axis that binds and the exact-aspect
+/// identity the chrome band depends on.
+#[test]
+fn aspect_fit_box_picks_the_binding_axis() {
+    use aterm_render::aspect_fit_box;
+    // Equal aspects ⇒ the whole box, exactly (no rounding drift).
+    assert_eq!(aspect_fit_box(126, 68, 126, 68), (126, 68));
+    assert_eq!(aspect_fit_box(63, 34, 126, 68), (126, 68));
+    // Wider than the box ⇒ width binds.
+    assert_eq!(aspect_fit_box(120, 60, 126, 68), (126, 63));
+    // Taller than the box ⇒ height binds.
+    assert_eq!(aspect_fit_box(60, 120, 126, 68), (34, 68));
+    // Never larger than the box, never zero.
+    let (w, h) = aspect_fit_box(4096, 1, 10, 10);
+    assert!(w <= 10 && h >= 1);
+}

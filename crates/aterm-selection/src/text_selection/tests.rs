@@ -1029,22 +1029,114 @@ fn test_contains_cell_block_wide_char_fully_outside() {
     assert!(!sel.contains_cell(1, 13, false, true));
 }
 
+/// A drag that STARTS on the right half of a wide glyph must still paint the
+/// left half.
+///
+/// The copy path admits the whole glyph whenever either of its cells is in
+/// range — it has no way to emit half a cluster — so a highlight that stopped at
+/// the bare start column would put a character on the clipboard that the user
+/// never saw highlighted. A linear selection snaps a glyph whole for that
+/// reason, exactly as Block does: both ask `glyph_cell_span`, so the selection
+/// kind cannot change where a glyph's boundary lies.
 #[test]
-fn test_contains_cell_simple_selection_ignores_wide() {
-    // Simple (linear) selection should not do wide-char snapping -- it works
-    // at character level, not column-rectangle level.
+fn a_linear_drag_starting_on_a_wide_glyphs_continuation_still_paints_its_lead() {
     let mut sel = TextSelection::new();
+    // The glyph occupies cols 4-5; the drag starts on its continuation (col 5).
     sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, 10, SelectionSide::Right);
     sel.complete_selection();
 
-    // Wide char at col 4: outside selection, should NOT be included.
     assert!(
-        !sel.contains_cell(0, 4, true, false),
-        "simple selection should not snap wide chars at boundary"
+        sel.contains_cell(0, 4, true, false),
+        "the lead of a glyph whose continuation is selected is selected too — \
+         the copy takes that character whether or not it is painted"
     );
-    // Regular cell at col 5: inside selection.
-    assert!(sel.contains_cell(0, 5, false, false));
+    assert!(
+        sel.contains_cell(0, 5, false, true),
+        "and its continuation, which is what the drag actually landed on"
+    );
+    // A whole glyph one column further left is untouched: cols 2 and 3 are both
+    // outside, so nothing snaps it in.
+    assert!(
+        !sel.contains_cell(0, 2, true, false),
+        "snapping reaches exactly one cell, never a glyph that is fully outside"
+    );
+    assert!(sel.contains_cell(0, 6, false, false));
+}
+
+/// The mirror at the far edge: a drag that STOPS on the left half of a wide
+/// glyph must still paint the right half, or the band ends mid-character while
+/// the clipboard receives the whole one.
+#[test]
+fn a_linear_drag_ending_on_a_wide_glyphs_lead_still_paints_its_continuation() {
+    let mut sel = TextSelection::new();
+    // The glyph occupies cols 10-11; the drag stops on its lead (col 10).
+    sel.start_selection(0, 2, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(0, 10, SelectionSide::Right);
+    sel.complete_selection();
+
+    assert!(
+        sel.contains_cell(0, 10, true, false),
+        "the lead is selected"
+    );
+    assert!(
+        sel.contains_cell(0, 11, false, true),
+        "and so is the continuation of the glyph the drag stopped inside"
+    );
+    assert!(
+        !sel.contains_cell(0, 12, true, false),
+        "the glyph after it is fully outside and stays that way"
+    );
+}
+
+/// Anchor order is not selection order: dragging RIGHT-to-LEFT lands the same
+/// mid-glyph edges on the opposite anchors, and `normalized_start`/`_end` order
+/// them before the snap. Both edges must behave exactly as in the forward drag.
+#[test]
+fn a_backwards_drag_snaps_the_same_wide_glyph_edges_as_a_forwards_one() {
+    let mut forwards = TextSelection::new();
+    forwards.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
+    forwards.update_selection(0, 10, SelectionSide::Right);
+    forwards.complete_selection();
+
+    let mut backwards = TextSelection::new();
+    backwards.start_selection(0, 10, SelectionSide::Right, SelectionType::Simple);
+    backwards.update_selection(0, 5, SelectionSide::Left);
+    backwards.complete_selection();
+
+    for (col, wide, cont) in [
+        (4u16, true, false),
+        (5, false, true),
+        (10, true, false),
+        (11, false, true),
+        (2, true, false),
+        (12, true, false),
+    ] {
+        assert_eq!(
+            backwards.contains_cell(0, col, wide, cont),
+            forwards.contains_cell(0, col, wide, cont),
+            "col {col} must paint the same whichever direction the drag ran"
+        );
+    }
+    assert!(backwards.contains_cell(0, 4, true, false));
+    assert!(backwards.contains_cell(0, 11, false, true));
+}
+
+/// A `Lines` selection owns whole rows, so column snapping cannot change its
+/// answer — pinned so the shared span helper never leaks a column condition into
+/// the one selection kind that has none.
+#[test]
+fn a_lines_selection_paints_every_half_of_every_glyph_on_its_rows() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(1, 0, SelectionSide::Left, SelectionType::Lines);
+    sel.update_selection(2, 79, SelectionSide::Right);
+    sel.complete_selection();
+
+    assert!(sel.contains_cell(1, 0, true, false));
+    assert!(sel.contains_cell(1, 1, false, true));
+    assert!(sel.contains_cell(2, 79, true, false));
+    assert!(!sel.contains_cell(3, 0, true, false), "rows below are not");
+    assert!(!sel.contains_cell(0, 79, true, false), "nor rows above");
 }
 
 #[test]
@@ -1056,7 +1148,8 @@ fn test_contains_cell_block_continuation_at_col_zero() {
     sel.update_selection(2, 5, SelectionSide::Right);
     sel.complete_selection();
 
-    // is_wide_continuation at col 0: col > 0 is false, falls through to normal contains.
+    // A continuation at col 0 has no lead to back up to; `glyph_cell_span`
+    // saturates to (0, 0) rather than wrapping to u16::MAX.
     assert!(sel.contains_cell(1, 0, false, true));
 }
 

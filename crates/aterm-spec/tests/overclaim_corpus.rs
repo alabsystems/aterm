@@ -235,6 +235,8 @@ fn anchor(machine: &'static str, action: &'static str, project: &'static str) ->
         rust_method: "fixture::method",
         location: "fixture.rs:1:1",
         project,
+        // Hand-built fixture (no macro expansion), so no injected entry probe.
+        entry_id: "",
     }
 }
 

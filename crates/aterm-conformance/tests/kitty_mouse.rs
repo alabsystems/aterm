@@ -338,35 +338,52 @@ fn mouse_1005_utf8_two_byte_coordinate_beyond_95() {
 /// xterm ctlseqs, Mouse Tracking: in the default (non-extended) encoding a
 /// coordinate byte is `Cx = 32 + x` with x 1-based, so the maximum
 /// representable position is 223 (32+223 = 255); larger positions "cannot
-/// be reported" in a single byte (xterm's MOUSE_LIMIT). The byte encoding
-/// simply has no representation for them, so the engine's DOCUMENTED choice
-/// (aterm_types::mouse::encode_mouse, matching foot) is to fall back to the
-/// SGR form, which is unambiguous and well-formed for any coordinate. This
-/// test locks that fallback: sane bytes, no overflow, no truncated/malformed
-/// single-byte garbage (the historical xterm wraparound bug).
+/// be reported" in a single byte (xterm's MOUSE_LIMIT).
+///
+/// The FRAME, though, is not negotiable. An application that set DECSET 1000
+/// and nothing else reads a fixed six-byte `ESC [ M Cb Cx Cy` record; it has
+/// no parser for any other form. This engine used to answer an out-of-range
+/// coordinate with the SGR (1006) form — a protocol the application never
+/// enabled, whose parameter bytes an X10-only reader most likely passes
+/// through as literal input. On a terminal wider than 223 columns that turned
+/// every far-right click into typed garbage. So: CLAMP the coordinate to the
+/// representable maximum and keep the six-byte frame. Apps that need the far
+/// columns enable 1006 or 1005 themselves, and both are unlimited here.
 #[test]
-fn mouse_x10_coordinate_beyond_223_falls_back_to_sgr() {
+fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
     let t = term_24x80(b"\x1b[?1000h"); // default X10-style encoding
-    // 0-based col 300 -> 1-based 301: unrepresentable in one byte.
+    // 0-based col 300 -> 1-based 301: unrepresentable, so clamped to byte 255.
     assert_eq!(
+        t.encode_mouse_press(0, 300, 5, 0),
+        Some(vec![0x1b, b'[', b'M', 32, 255, 38]),
+        "out-of-range coordinates clamp INSIDE the X10 frame"
+    );
+    assert_ne!(
         t.encode_mouse_press(0, 300, 5, 0).as_deref(),
         Some(b"\x1b[<0;301;6M".as_slice()),
-        "engine-documented fallback: SGR form for out-of-range coordinates"
+        "the pre-fix SGR promotion is exactly the defect: a 1006 report the \
+         application never requested"
     );
-    // Release through the same fallback is a TRUE SGR release: 'm' terminator
-    // AND the button identity preserved (SGR semantics — only legacy single-
-    // byte forms substitute button 3; the encoder decides per actual output
-    // format, #7473).
+    // Release keeps the frame too, which means the LEGACY button-3
+    // substitution the X10 form requires (no button identity in this frame —
+    // that is what enabling 1006 buys, #7473).
     assert_eq!(
-        t.encode_mouse_release(0, 300, 5, 0).as_deref(),
-        Some(b"\x1b[<0;301;6m".as_slice())
+        t.encode_mouse_release(0, 300, 5, 0),
+        Some(vec![0x1b, b'[', b'M', 32 + 3, 255, 38])
     );
     // Boundary: 0-based col 222 -> 1-based 223 is the LAST single-byte
-    // position (32+223 = 255) and must still use the X10 byte form.
+    // position (32+223 = 255) and is byte-identical to the clamped form.
     assert_eq!(
         t.encode_mouse_press(0, 222, 5, 0),
         Some(vec![0x1b, b'[', b'M', 32, 255, 38]),
         "1-based 223 encodes as byte 255 — the X10 maximum"
+    );
+    // Negative control: an app that DOES enable 1006 gets the true coordinate.
+    let sgr = term_24x80(b"\x1b[?1000h\x1b[?1006h");
+    assert_eq!(
+        sgr.encode_mouse_press(0, 300, 5, 0).as_deref(),
+        Some(b"\x1b[<0;301;6M".as_slice()),
+        "SGR is available on request — it is only the silent promotion that is wrong"
     );
 }
 

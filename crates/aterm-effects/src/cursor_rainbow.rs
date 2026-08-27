@@ -2,16 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! The typing-reactive RAINBOW CURSOR — the block cursor glows and evolves colour
-//! with your typing momentum. A single ENERGY value (the caller passes
+//! with your typing momentum. An ENERGY value (the caller passes
 //! [`crate::cursor_trail::TypingCadence::intensity`], `0..1`, already gated by
-//! reduced-motion) drives everything:
+//! reduced-motion) drives the body envelope, while a rainbow-kitty host also
+//! hands it the ribbon's shared spectrum clock:
 //!
-//! * **hue rotation speed** — a slow baseline spin while charged, accelerating
-//!   under sustained fast typing; the final ember freezes when fully settled.
-//!   WHERE that spin lands on the spectrum is not this module's business: the
-//!   caret resolves its colour through the rainbow family's ONE sweep and ONE
-//!   band resolver ([`crate::cursor_glow::rainbow_band_at`]) at its own column,
-//!   so the block and the ribbon leaving it are the same rainbow;
+//! * **hue motion** — hosted beside the ribbon, the caret samples
+//!   [`crate::cursor_glow::CursorGlow::rainbow_phase`] so both marks stream on
+//!   one clock. Standalone, a slow baseline spin accelerates under sustained
+//!   typing and freezes at the final ember. Either path resolves through the
+//!   rainbow family's one reflected sweep and continuously interpolated six
+//!   anchors at the caret's own column, so the block and the ribbon leaving it
+//!   are the same rainbow without hue steps;
 //! * **saturation + brightness** — the block starts from WHITE (dark theme) or
 //!   near-BLACK (light theme) and blooms toward a vivid rainbow as energy climbs;
 //! * **an additive rainbow HALO** hugging the block — the glow, brightest while
@@ -45,10 +47,17 @@ use aterm_render::{GlowQuad, premul_rgb};
 use crate::cursor_glow::OVER_INK_COV_CAP;
 
 use crate::cursor_glow::Geom;
-use crate::cursor_glow::{rainbow_band_of, rainbow_sweep_at, rainbow_sweep_reflect};
+use crate::cursor_glow::{
+    rainbow_phase_from_unit_turn, rainbow_spectrum_of, rainbow_sweep_at, rainbow_sweep_reflect,
+};
 
-/// The block-cursor base the rainbow blooms FROM: white on a dark theme, a soft
-/// near-black on a light theme — so the "start from white or black" reads on either.
+/// The block-cursor base the rainbow blooms FROM when the host names none:
+/// white on a dark theme, a soft near-black on a light theme — so the "start
+/// from white or black" reads on either.
+///
+/// A host that KNOWS the cursor's resolved colour (OSC 12, else the configured
+/// theme cursor) passes it as [`RainbowConfig::base`] instead, and these two
+/// stand only for the raw/embedder callers that have no such value.
 const BASE_DARK_THEME: u32 = 0x00FF_FFFF; // white block on a dark background
 const BASE_LIGHT_THEME: u32 = 0x0016_161C; // near-black block on a light background
 
@@ -199,6 +208,29 @@ pub struct RainbowConfig {
     /// Settled flips remain ordinary terminal blinks. `false` (a steady block)
     /// never twinkles — there is no blink to replace.
     pub blinking: bool,
+    /// The colour the block wears AT REST, `0x00RRGGBB` — the terminal's
+    /// resolved cursor colour (OSC 12 when set, else the configured theme
+    /// cursor, else the live OSC 10 foreground). The spectrum is a TINT over
+    /// this base, so a settled caret is the user's cursor colour and typing
+    /// blooms it toward the rainbow.
+    ///
+    /// This closes the hole the shipped default fell into: the rainbow block
+    /// owns [`aterm_render::RenderInput::cursor_fill_override`], which the
+    /// renderer applies INSTEAD of the frame cursor colour — so a hard-coded
+    /// base meant OSC 12 and the theme cursor reached every cursor shape
+    /// EXCEPT the default one. The aurora and the comet already recolour off
+    /// the same live value (`aterm-gui`'s `glow_cfg.color` / `trail_cfg.color`);
+    /// the block simply never did.
+    ///
+    /// `None` keeps the historical theme-polar base ([`BASE_DARK_THEME`] /
+    /// [`BASE_LIGHT_THEME`]) for callers with no cursor colour to hand — every
+    /// such frame is byte-identical to before.
+    pub base: Option<u32>,
+    /// The actual ribbon-head colour emitted by `CursorGlow` in this frame,
+    /// `0x00RRGGBB`. The hot block blooms toward this exact colour so the caret
+    /// cannot run a plausible-but-different rainbow beside the trail it leads.
+    /// `None` keeps the standalone/embedder family-sweep resolver.
+    pub head_rgb: Option<u32>,
 }
 
 /// What a tick produced: the block FILL colour to hand the renderer (it floors it for
@@ -212,11 +244,13 @@ pub struct RainbowFrame {
     pub fp: u64,
 }
 
-/// Per-window rainbow-cursor animation state — two accumulators (the hue phase and
-/// the idle breath) plus the last clock reading. Tiny + Copy-cheap.
+/// Per-window rainbow-cursor animation state — the standalone hue fallback,
+/// idle breath, and last clock reading. Tiny + Copy-cheap.
 #[derive(Default)]
 pub struct CursorRainbow {
-    /// Rolling hue phase in turns `0..1`.
+    /// Responsive standalone spin in unit turns `0..1`. It is lifted onto one
+    /// complete family sweep by [`rainbow_phase_from_unit_turn`] when a host
+    /// does not provide the ribbon's shared phase.
     phase: f32,
     /// Idle-breath phase in turns `0..1`.
     pulse: f32,
@@ -264,6 +298,66 @@ impl CursorRainbow {
         cfg: &RainbowConfig,
         out: &mut Vec<GlowQuad>,
     ) -> RainbowFrame {
+        self.tick_inner(
+            cur,
+            now,
+            energy,
+            None,
+            blink_phase,
+            dark_theme,
+            geom,
+            cfg,
+            out,
+        )
+    }
+
+    /// [`Self::tick`] phase-locked to the rainbow kitty ribbon's family clock.
+    ///
+    /// Read `family_phase` from [`crate::cursor_glow::CursorGlow::rainbow_phase`]
+    /// immediately after ticking that engine for the same frame. The block,
+    /// halo rings, glitter, fresh-ink rail, and ribbon then all sample the same
+    /// `0..1024` clock and the same reflected spectrum resolver. The private
+    /// energy clock still advances while locked so falling back later is
+    /// continuous in its own domain; it never contributes colour on this path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_with_family_phase(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        now: Instant,
+        energy: f32,
+        family_phase: f32,
+        blink_phase: bool,
+        dark_theme: bool,
+        geom: Geom,
+        cfg: &RainbowConfig,
+        out: &mut Vec<GlowQuad>,
+    ) -> RainbowFrame {
+        self.tick_inner(
+            cur,
+            now,
+            energy,
+            Some(family_phase),
+            blink_phase,
+            dark_theme,
+            geom,
+            cfg,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tick_inner(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        now: Instant,
+        energy: f32,
+        family_phase: Option<f32>,
+        blink_phase: bool,
+        dark_theme: bool,
+        geom: Geom,
+        cfg: &RainbowConfig,
+        out: &mut Vec<GlowQuad>,
+    ) -> RainbowFrame {
         let e = (energy.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Fully inert — byte-identical to the plain themed cursor — when off, when
         // the geometry is degenerate, OR when the amplitude is zero (reduced motion
@@ -303,6 +397,14 @@ impl CursorRainbow {
             self.phase = (self.phase + dt * (IDLE_SPIN + ACTIVE_SPIN * e)).fract();
             self.pulse = (self.pulse + dt * PULSE_HZ).fract();
         }
+        // The ribbon owns the canonical family phase whenever the host can
+        // supply it. The standalone path still gets the cursor's responsive
+        // energy-rate spin, but LIFTS its unit turn onto one complete reflected
+        // sweep. Feeding `self.phase` directly was the regression: the family
+        // resolver interpreted 0..1 as the first 1/1024 of its ring, traversed
+        // only ~0.35 of a spectrum sweep, then jumped backward every wrap.
+        let spectrum_phase =
+            family_phase.unwrap_or_else(|| rainbow_phase_from_unit_turn(self.phase));
 
         // BLINK → TWINKLE: with a blinking block, a CHARGED host blink-phase
         // FLIP stamps a flare (the flip counter varies each flare
@@ -367,17 +469,23 @@ impl CursorRainbow {
         // column the ribbon's rail under this cell resolves. A hidden cursor
         // still reports a fill, so column 0 stands in when there is no cell.
         let col = cur.map_or(0, |(_, cc)| cc);
-        let band = spectrum_at(col, self.phase, 0.0);
-        let rainbow = shade(band, sat, val);
+        let band = spectrum_at(col, spectrum_phase, 0.0);
+        let head_rgb = cfg.head_rgb.unwrap_or(band);
+        let rainbow = shade(head_rgb, sat, val);
 
         // The BLOCK FILL: tint from the theme base toward the rainbow with energy. The
         // renderer floors this against the cell bg (the cut-out glyph colour), so the
         // glyph stays sharp however saturated the block gets.
-        let base = if dark_theme {
+        // …FROM the cursor's own colour when the host resolved one: the block IS
+        // the cursor, so a settled caret must be whatever OSC 12 (or the theme
+        // `cursor_color`) says it is, and the spectrum is the tint typing lays
+        // over it. Only a caller that has no such value falls back to the
+        // theme-polar constants.
+        let base = cfg.base.unwrap_or(if dark_theme {
             BASE_DARK_THEME
         } else {
             BASE_LIGHT_THEME
-        };
+        });
         let (mix_idle, mix_max) = if dark_theme {
             (MIX_IDLE, MIX_MAX)
         } else {
@@ -392,7 +500,7 @@ impl CursorRainbow {
             let glint = if dark_theme {
                 0x00FF_FFFF
             } else {
-                shade(band, 1.0, 0.85)
+                shade(head_rgb, 1.0, 0.85)
             };
             fill = mix_rgb(fill, glint, TWINKLE_MIX * pop * cfg.intensity);
         }
@@ -439,7 +547,18 @@ impl CursorRainbow {
                 // rim IS a rainbow, and the whole spectrum still spins with the
                 // phase. The step is a distance ALONG the sweep now, not an
                 // angle on a private wheel.
-                let ring_hue = shade(spectrum_at(cc, self.phase, t * HALO_HUE_SPREAD), sat, val);
+                let ring_hue = if layer == 0 {
+                    // The innermost rim touches the ribbon nozzle and therefore
+                    // wears its exact emitted hue. Outer rings fan through the
+                    // family spectrum, preserving the authored rainbow halo.
+                    shade(head_rgb, sat, val)
+                } else {
+                    shade(
+                        spectrum_at(cc, spectrum_phase, t * HALO_HUE_SPREAD),
+                        sat,
+                        val,
+                    )
+                };
                 push_ring(
                     out,
                     geom,
@@ -480,7 +599,7 @@ impl CursorRainbow {
                 let arm_rgb = if dark_theme {
                     0x00FF_FFFF
                 } else {
-                    shade(spectrum_at(cc, self.phase, 0.0), 1.0, 0.9)
+                    shade(head_rgb, 1.0, 0.9)
                 };
                 let star = premul_rgb(arm_rgb, arm_cov);
                 let reach_x = ((TWINKLE_REACH * pop * cw as f32) as i32).max(1);
@@ -525,7 +644,7 @@ impl CursorRainbow {
                         _ => (cw + jit, ch + jit),
                     };
                     let hue = shade(
-                        spectrum_at(cc, self.phase, 0.13 + k as f32 * 0.29),
+                        spectrum_at(cc, spectrum_phase, 0.13 + k as f32 * 0.29),
                         0.85,
                         1.0,
                     );
@@ -544,8 +663,14 @@ impl CursorRainbow {
         } else {
             0
         };
-        let fp = ((self.phase * 512.0) as u64)
+        // Key the spectrum by its RESOLVED period-two position, not by either
+        // input clock's raw domain. Equal visible phases (including a complete
+        // family-ring wrap) then have equal keys, while any visible sweep step
+        // still forces a present.
+        let spectrum_fp = rainbow_sweep_at(col, spectrum_phase);
+        let fp = ((spectrum_fp * 1024.0) as u64)
             .wrapping_mul(1_000_003)
+            .wrapping_add(u64::from(head_rgb).rotate_left(7))
             .wrapping_add((halo_energy * 255.0) as u64)
             .wrapping_add(((fill as u64) << 12) ^ ((self.pulse * 64.0) as u64))
             .wrapping_add(twinkle_fp);
@@ -633,32 +758,33 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// THE FAMILY'S SPECTRUM, at the caret's own place on it.
 ///
 /// The block used to run its OWN colour wheel — a private `hsv2rgb_turns`
-/// sampled at `self.phase` turns — while the ribbon leaving that same cell
-/// resolved [`crate::cursor_glow::rainbow_band_at`]'s six anchors. Two
-/// spectrums, two clocks, meeting at one cell: the caret could be a continuous
-/// teal while the underline directly beneath it was flat green, which is the
-/// most literally visible "different rainbows" this family had.
+/// sampled at a private unit-turn clock — while the ribbon leaving that same
+/// cell resolved the family's six anchors. Two spectrums, two clocks, meeting
+/// at one cell: the caret could be teal while the underline directly beneath it
+/// was green, which is the most literally visible "different rainbows" this
+/// family had.
 ///
-/// So the caret now asks the SAME question every other mark of this style asks:
-/// where is this COLUMN on the sweep, and which band is that? `phase` still
-/// comes from the block's own spin law (see [`IDLE_SPIN`] / [`ACTIVE_SPIN`] —
-/// that law is what makes the caret a typing meter and is deliberately kept),
-/// but it is now a position on the family's ping-ponged sweep rather than an
-/// angle on a wheel nothing else reads. `off` steps a further distance ALONG
-/// that sweep — the halo rings walking outward, the glitter dots — folded by
-/// the family's own reflection so an offset can never wrap violet into red.
+/// So the caret now asks the SAME question every other smooth mark of this style
+/// asks: where is this COLUMN on the sweep, and what is the continuous colour
+/// between its two surrounding anchors? `phase` is the ribbon's shared
+/// phase-ring clock on the locked path. A standalone host gets the block's
+/// energy-responsive spin law (see [`IDLE_SPIN`] / [`ACTIVE_SPIN`]), lifted by
+/// [`rainbow_phase_from_unit_turn`] onto one complete family sweep so its unit
+/// wrap is seamless. `off` steps a further distance ALONG that sweep — the halo
+/// rings walking outward, the glitter dots — folded by the family's own
+/// reflection so an offset can never wrap violet into red.
 #[inline]
 fn spectrum_at(col: u16, phase: f32, off: f32) -> u32 {
-    rainbow_band_of(rainbow_sweep_reflect(rainbow_sweep_at(col, phase) + off))
+    rainbow_spectrum_of(rainbow_sweep_reflect(rainbow_sweep_at(col, phase) + off))
 }
 
-/// A family band re-mixed at saturation `s` and value `v`, hue intact — the
+/// A family colour re-mixed at saturation `s` and value `v`, hue intact — the
 /// block's ENERGY LAW applied to a colour it did not choose.
 ///
 /// This is HSV's own S/V re-application written for an RGB input: each channel
 /// is pulled toward the colour's peak by `1 − s` (the achromatic direction) and
 /// then scaled by `v`. At `s = 1, v = 1` it is the IDENTITY, so a caret at full
-/// energy is EXACTLY the band the ribbon under it draws — which is the property
+/// energy is EXACTLY the spectrum colour the ribbon under it draws — which is the property
 /// `caret_ribbon_and_streaks_share_one_spectrum` pins.
 #[inline]
 fn shade(rgb: u32, s: f32, v: f32) -> u32 {
@@ -686,7 +812,7 @@ fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     fn geom() -> Geom {
@@ -709,8 +835,21 @@ mod tests {
             enabled: true,
             intensity: 1.0,
             blinking: false,
+            // No host base: these fixtures pin the historical theme-polar
+            // bloom, so they stay byte-identical to the pre-`base` tick.
+            base: None,
+            head_rgb: None,
         }
     }
+
+    fn rgb_max_delta(a: u32, b: u32) -> u32 {
+        [16, 8, 0]
+            .into_iter()
+            .map(|shift| ((a >> shift) & 0xff).abs_diff((b >> shift) & 0xff))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The blinking-block variant: flips of the passed phase fire twinkles.
     fn blink_cfg() -> RainbowConfig {
         RainbowConfig {
@@ -735,6 +874,8 @@ mod tests {
                 enabled: false,
                 intensity: 1.0,
                 blinking: false,
+                base: None,
+                head_rgb: None,
             },
             &mut out,
         );
@@ -761,6 +902,8 @@ mod tests {
                 enabled: true,
                 intensity: 0.0,
                 blinking: false,
+                base: None,
+                head_rgb: None,
             },
             &mut out,
         );
@@ -814,7 +957,123 @@ mod tests {
         );
     }
 
-    /// A light theme starts the block from near-BLACK (not white).
+    /// THE HOST'S CURSOR COLOUR IS THE BLOCK, on either theme polarity.
+    ///
+    /// The block fill leaves this tick as `RenderInput::cursor_fill_override`,
+    /// which the renderer applies INSTEAD of `frame_cursor(input)` — so
+    /// whatever base this returns is literally the cursor the user sees. With
+    /// the base hard-coded to white/near-black, OSC 12 and the configured
+    /// `cursor_color` reached every cursor shape except the one the shipped
+    /// default paints. A settled caret must therefore BE the host's colour,
+    /// and two colours must never collapse to one block.
+    #[test]
+    fn host_base_is_the_settled_block_on_either_polarity() {
+        let g = geom();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        let settled = |base: u32, dark: bool, out: &mut Vec<GlowQuad>| {
+            let c = RainbowConfig {
+                base: Some(base),
+                ..cfg()
+            };
+            out.clear();
+            CursorRainbow::default()
+                .tick(Some((1, 1)), t, 0.0, true, dark, g, &c, out)
+                .fill
+                .unwrap()
+        };
+        let chans = |c: u32| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+        for dark in [true, false] {
+            let (rr, rg, rb) = chans(settled(0x00FF_0000, dark, &mut out));
+            assert!(
+                rr > 200 && rg < 110 && rb < 110,
+                "a red cursor colour settles red (dark={dark})"
+            );
+            let (br, bg, bb) = chans(settled(0x0000_00FF, dark, &mut out));
+            assert!(
+                bb > 200 && br < 110 && bg < 110,
+                "a blue cursor colour settles blue (dark={dark})"
+            );
+            assert_ne!(
+                settled(0x00FF_0000, dark, &mut out),
+                settled(0x0000_00FF, dark, &mut out),
+                "two cursor colours must not paint one identical block (dark={dark})"
+            );
+        }
+        // …and energy still blooms the spectrum OVER that base rather than
+        // replacing the base's job: the hot fill is markedly more saturated.
+        let c = RainbowConfig {
+            base: Some(0x00FF_0000),
+            ..cfg()
+        };
+        out.clear();
+        let hot = CursorRainbow::default()
+            .tick(Some((1, 1)), t, 1.0, true, true, g, &c, &mut out)
+            .fill
+            .unwrap();
+        assert_ne!(hot, settled(0x00FF_0000, true, &mut out));
+    }
+
+    /// A host with real ribbon pixels is authoritative over a merely plausible
+    /// phase-derived band. The cursor body and the innermost rim must wear the
+    /// emitted head hue, while OSC 12 remains the colour they bloom FROM.
+    #[test]
+    fn emitted_ribbon_head_is_the_hot_caret_authority() {
+        use crate::cursor_glow::RAINBOW_PHASE_RING;
+
+        let g = geom();
+        let now = Instant::now();
+        let render = |head_rgb: u32, family_phase: f32| {
+            let c = RainbowConfig {
+                base: Some(0x0020_2020),
+                head_rgb: Some(head_rgb),
+                ..cfg()
+            };
+            let mut out = Vec::new();
+            let frame = CursorRainbow::default().tick_with_family_phase(
+                Some((1, 7)),
+                now,
+                1.0,
+                family_phase,
+                false,
+                true,
+                g,
+                &c,
+                &mut out,
+            );
+            (frame, out)
+        };
+
+        let (green_a, halo_a) = render(0x0033_FF00, 0.0);
+        let (green_b, _) = render(0x0033_FF00, RAINBOW_PHASE_RING * 0.37);
+        let (violet, _) = render(0x0066_33FF, 0.0);
+        assert_eq!(
+            green_a.fill, green_b.fill,
+            "the actual emitted head, not a different phase helper, owns the block hue"
+        );
+        assert_ne!(
+            green_a.fill, violet.fill,
+            "two emitted head hues must paint two different hot carets"
+        );
+        let fill = green_a.fill.expect("rainbow block fill");
+        let (fr, fg, fb) = ((fill >> 16) & 0xff, (fill >> 8) & 0xff, fill & 0xff);
+        assert!(
+            fg > fr && fg > fb,
+            "green emitted head must produce a green-dominant caret: {fill:#08x}"
+        );
+        assert!(
+            halo_a.iter().any(|q| {
+                let r = (q.color >> 16) & 0xff;
+                let g = (q.color >> 8) & 0xff;
+                let b = q.color & 0xff;
+                g > r && g > b
+            }),
+            "the innermost rim must visibly carry the emitted head hue"
+        );
+    }
+
+    /// A light theme starts the block from near-BLACK (not white) when the host
+    /// names no cursor colour of its own.
     #[test]
     fn light_theme_base_is_dark() {
         let g = geom();
@@ -1550,53 +1809,298 @@ mod tests {
         );
     }
 
-    /// ONE RAINBOW, from the caret outward. The block cursor, the ribbon's rail
-    /// and the rail-riding streaks must resolve THE SAME SPECTRUM POSITION TO
-    /// THE SAME HUE — the property the block's private HSV wheel made
-    /// impossible, since a wheel angle and a six-anchor band index are not the
-    /// same coordinate at all.
+    /// A standalone caret keeps its energy-responsive ~one-turn/second clock,
+    /// but that UNIT turn must traverse one COMPLETE period-two family sweep.
+    ///
+    /// This drives 1.28 seconds of real ticks, crosses the old one-second wrap,
+    /// and checks both sides of that seam. Before the lift through
+    /// `rainbow_phase_from_unit_turn`, the same state covered only ~0.35 of the
+    /// sweep then jumped backward by that whole distance at the wrap. The
+    /// direct-unit negative control proves this is not a vacuous smoothness
+    /// bound, and visiting many interpolated colours proves “seamless” did not
+    /// freeze colour.
+    #[test]
+    fn standalone_stream_crosses_its_one_second_wrap_without_a_spectrum_jump() {
+        let g = geom();
+        let c = cfg();
+        let col = 11u16;
+        let mut cr = CursorRainbow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        cr.tick(Some((2, col)), t0, 1.0, false, true, g, &c, &mut out);
+
+        let mut previous_turn = cr.phase;
+        let mut previous_sweep = rainbow_sweep_at(col, rainbow_phase_from_unit_turn(cr.phase));
+        let mut max_sweep_step = 0.0f32;
+        let mut wraps = 0usize;
+        let mut wrong_domain_disagreements = 0usize;
+        let mut colours = BTreeSet::new();
+        let mut last_at = t0;
+        for frame in 1..=80u64 {
+            last_at = t0 + Duration::from_millis(frame * 16);
+            out.clear();
+            let emitted = cr.tick(Some((2, col)), last_at, 1.0, false, true, g, &c, &mut out);
+            let family_phase = rainbow_phase_from_unit_turn(cr.phase);
+            let sweep = rainbow_sweep_at(col, family_phase);
+            max_sweep_step = max_sweep_step.max((sweep - previous_sweep).abs());
+            wraps += usize::from(cr.phase < previous_turn);
+            previous_turn = cr.phase;
+            previous_sweep = sweep;
+
+            let colour = spectrum_at(col, family_phase, 0.0);
+            colours.insert(colour);
+            assert_eq!(
+                emitted.fill,
+                Some(mix_rgb(BASE_DARK_THEME, colour, MIX_MAX)),
+                "frame {frame}: emitted caret must use the lifted family phase"
+            );
+            wrong_domain_disagreements += usize::from(spectrum_at(col, cr.phase, 0.0) != colour);
+        }
+
+        assert!(
+            last_at.saturating_duration_since(t0) > Duration::from_secs(1),
+            "the run must cross the historical one-second seam"
+        );
+        assert!(
+            wraps >= 1,
+            "the private unit clock must really wrap: {wraps}"
+        );
+        assert!(
+            max_sweep_step < 0.05,
+            "the reflected spectrum jumped by {max_sweep_step} at a 16 ms step"
+        );
+        assert!(
+            colours.len() > 60,
+            "one complete stream must visit a continuous spectrum: {} colours",
+            colours.len()
+        );
+        assert!(
+            wrong_domain_disagreements > 40,
+            "negative control: a raw unit clock must visibly disagree with the family domain"
+        );
+    }
+
+    /// The explicit shared-phase path closes on the ribbon's exact 1024-unit
+    /// ring. This is a COMPLETE emitted frame (fill, halo bytes, fingerprint),
+    /// not a helper equality; the quarter-sweep control proves the clock still
+    /// animates.
+    #[test]
+    fn shared_phase_complete_frame_is_exact_across_the_family_ring() {
+        use crate::cursor_glow::RAINBOW_PHASE_RING;
+
+        let g = geom();
+        let c = cfg();
+        let now = Instant::now();
+        let render = |phase: f32| {
+            let mut cr = CursorRainbow::default();
+            let mut out = Vec::new();
+            let frame = cr.tick_with_family_phase(
+                Some((2, 11)),
+                now,
+                1.0,
+                phase,
+                false,
+                true,
+                g,
+                &c,
+                &mut out,
+            );
+            (frame.fill, frame.fp, out)
+        };
+
+        assert_eq!(render(0.0), render(RAINBOW_PHASE_RING));
+        assert_ne!(
+            render(0.0),
+            render(rainbow_phase_from_unit_turn(0.25)),
+            "a quarter-sweep must change a complete caret frame"
+        );
+    }
+
+    /// The standalone/embedder fallback is visible on the block itself, so its
+    /// phase sweep may not hide six full-colour jumps behind a smooth coordinate
+    /// clock. A dense real-tick sample crosses every anchor and the reflected
+    /// endpoint; the old `rainbow_band_of` lookup jumped by as much as 255 here.
+    #[test]
+    fn fallback_fill_flows_through_the_anchors_without_temporal_hue_steps() {
+        let g = geom();
+        let c = cfg();
+        let now = Instant::now();
+        let mut previous = None;
+        let mut max_step = 0;
+        let mut colours = BTreeSet::new();
+        for sample in 0..=2400 {
+            let phase = sample as f32 * (6.0 / 2400.0);
+            let mut cursor = CursorRainbow::default();
+            let mut out = Vec::new();
+            let fill = cursor
+                .tick_with_family_phase(
+                    Some((2, 17)),
+                    now,
+                    1.0,
+                    phase,
+                    false,
+                    true,
+                    g,
+                    &c,
+                    &mut out,
+                )
+                .fill
+                .expect("enabled block fill");
+            if let Some(prior) = previous {
+                max_step = max_step.max(rgb_max_delta(prior, fill));
+            }
+            previous = Some(fill);
+            colours.insert(fill);
+        }
+        assert!(
+            max_step <= 3,
+            "a 2.5 ms phase step changed one fill channel by {max_step}"
+        );
+        assert!(
+            colours.len() > 256,
+            "continuity must not mean a frozen/six-colour cursor: {} colours",
+            colours.len()
+        );
+    }
+
+    /// Outer halo rings and the two glitter dots take offsets along the same
+    /// spectrum. Every offset must interpolate continuously too; fixing only the
+    /// block/head would leave coloured rings popping around an otherwise smooth
+    /// cursor.
+    #[test]
+    fn halo_and_glitter_offsets_have_no_anchor_colour_steps() {
+        for off in [
+            HALO_HUE_SPREAD / 3.0,
+            2.0 * HALO_HUE_SPREAD / 3.0,
+            0.13,
+            0.42,
+        ] {
+            let mut previous = spectrum_at(17, 0.0, off);
+            let mut max_step = 0;
+            for sample in 1..=2400 {
+                let phase = sample as f32 * (6.0 / 2400.0);
+                let colour = spectrum_at(17, phase, off);
+                max_step = max_step.max(rgb_max_delta(previous, colour));
+                previous = colour;
+            }
+            assert!(
+                max_step <= 3,
+                "offset {off} jumped one spectrum channel by {max_step}"
+            );
+        }
+    }
+
+    /// Real engine-to-engine lock over more than a second of typed advances.
+    /// CursorGlow owns the ribbon clock; CursorRainbow consumes that public
+    /// sample after the same frame's tick. Every hot caret fill must therefore
+    /// be the theme base mixed toward the continuous family colour at that
+    /// cell — throughout motion, not just at the all-zero seed phase.
+    #[test]
+    fn caret_and_ribbon_share_one_live_clock_through_a_streaming_run() {
+        use crate::cursor_glow::{CursorGlow, GlowConfig, GlowStyle};
+
+        let g = geom();
+        let glow_cfg = GlowConfig {
+            enabled: true,
+            style: GlowStyle::RainbowKitty,
+            color: 0x0050_FA7B,
+            accent: 0x007A_A2F7,
+            duration: Duration::from_millis(240),
+            length: 18,
+            intensity: 1.0,
+            radius: 0.6,
+            ring: true,
+            dark_theme: true,
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
+            beam: false,
+            head_dx: 0.5,
+            pack: None,
+            wake_persist_s: 2.4,
+            ribbon_tall: false,
+        };
+        let body_cfg = cfg();
+        let t0 = Instant::now();
+        let row = 2u16;
+        let mut glow = CursorGlow::default();
+        let mut body = CursorRainbow::default();
+        let mut glow_out = Vec::new();
+        let mut body_out = Vec::new();
+        glow.tick(Some((row, 0)), t0, &glow_cfg, g, &mut glow_out);
+
+        let mut phases = Vec::new();
+        let mut colours = BTreeSet::new();
+        for key in 0..18u64 {
+            let press_at = t0 + Duration::from_millis(key * 72 + 1);
+            let frame_at = press_at + Duration::from_millis(8);
+            let col = (key + 1) as u16;
+            glow.note_typed(press_at);
+            glow.tick(Some((row, col)), frame_at, &glow_cfg, g, &mut glow_out);
+            let family_phase = glow.rainbow_phase();
+            phases.push(family_phase);
+
+            body_out.clear();
+            let body_frame = body.tick_with_family_phase(
+                Some((row, col)),
+                frame_at,
+                1.0,
+                family_phase,
+                false,
+                true,
+                g,
+                &body_cfg,
+                &mut body_out,
+            );
+            let ribbon_colour = spectrum_at(col, family_phase, 0.0);
+            colours.insert(ribbon_colour);
+            assert_eq!(
+                body_frame.fill,
+                Some(mix_rgb(BASE_DARK_THEME, ribbon_colour, MIX_MAX)),
+                "key {key}: caret and ribbon diverged at phase {family_phase}, col {col}"
+            );
+        }
+
+        assert!(
+            Duration::from_millis(17 * 72 + 9) > Duration::from_secs(1),
+            "fixture must exercise more than one second of live engine time"
+        );
+        assert!(
+            phases.last().copied().unwrap_or(0.0) > phases[1] + 0.05,
+            "the real ribbon clock must advance non-vacuously: {phases:?}"
+        );
+        assert!(
+            colours.len() >= 12,
+            "the streaming run must traverse many interpolated colours: {colours:#x?}"
+        );
+    }
+
+    /// ONE RAINBOW, from the caret outward. The block cursor and its halo resolve
+    /// one reflected spectrum position through one continuous interpolation —
+    /// the property the block's private HSV wheel made impossible.
     ///
     /// Three claims, and all three are needed:
-    ///   1. the caret's spectrum lookup IS the family's band resolver, at the
-    ///      caret's own column and phase (so the underline under the block is
-    ///      the block's colour);
-    ///   2. the energy law is a pure SHADE of that band — the identity at full
+    ///   1. the caret's spectrum lookup is deterministic at the family's own
+    ///      column and phase;
+    ///   2. the energy law is a pure SHADE of that colour — the identity at full
     ///      energy — so the agreement is exact and not merely close;
     ///   3. the whole tick honours it: a hot block's FILL is the theme base
-    ///      mixed toward exactly that band.
+    ///      mixed toward exactly that interpolated colour.
     #[test]
-    fn caret_ribbon_and_streaks_share_one_spectrum() {
-        use crate::cursor_glow::rainbow_band_at;
+    fn caret_uses_the_continuous_family_spectrum_end_to_end() {
         for &col in &[0u16, 1, 5, 17, 22, 39, 137, 400] {
             for i in 0..9 {
                 let phase = i as f32 * 0.37;
-                let band = rainbow_band_at(col, phase);
-                // (1) the caret asks the family, not a wheel of its own.
-                assert_eq!(
-                    spectrum_at(col, phase, 0.0),
-                    band,
-                    "caret vs ribbon at col {col} phase {phase}"
-                );
+                let colour = spectrum_at(col, phase, 0.0);
                 // (2) full energy ⇒ the shade is the identity.
                 assert_eq!(
-                    shade(band, SAT_MAX, VAL_MAX),
-                    band,
-                    "the energy law recolours nothing at full energy ({band:06X})"
-                );
-                // A shaded band never leaves its own hue: channel ORDER holds.
-                let order = |c: u32| {
-                    let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
-                    (r >= g, g >= b, r >= b)
-                };
-                assert_eq!(
-                    order(band),
-                    order(shade(band, SAT_IDLE, VAL_IDLE)),
-                    "an idle caret keeps the band's hue ({band:06X})"
+                    shade(colour, SAT_MAX, VAL_MAX),
+                    colour,
+                    "the energy law recolours nothing at full energy ({colour:06X})"
                 );
             }
         }
-        // (3) end to end: a hot block's fill is the base mixed toward the band
-        // the ribbon draws at that very cell.
+        // (3) end to end: a hot block's fill is the base mixed toward the
+        // continuous family colour at that very cell.
         let g = geom();
         let c = cfg();
         for &col in &[3u16, 11, 30] {
@@ -1617,8 +2121,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 f,
-                mix_rgb(BASE_DARK_THEME, rainbow_band_at(col, 0.0), MIX_MAX),
-                "the caret at col {col} is the ribbon's band at col {col}"
+                mix_rgb(BASE_DARK_THEME, spectrum_at(col, 0.0, 0.0), MIX_MAX),
+                "the caret at col {col} uses the family spectrum at col {col}"
             );
         }
     }

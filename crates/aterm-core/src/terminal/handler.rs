@@ -248,6 +248,16 @@ pub(super) struct CursorStateHandler<'a> {
 // ---------------------------------------------------------------------------
 
 impl TerminalHandler<'_> {
+    /// Fail-closed marker for the exceptional DEC-2026 close+reopen present
+    /// license. Called once per completed parser action (bulk text runs remain
+    /// one action), never once per DCS/APC payload byte.
+    #[inline]
+    pub(super) fn note_sync_open_action(&mut self) {
+        if self.modes.synchronized_output {
+            self.transient.sync_open_dirty = true;
+        }
+    }
+
     /// Apply any logical-row insertion before a protocol action can create new
     /// absolute-row metadata. This preserves parser order: metadata emitted
     /// after a scroll must not be mistaken for an anchor that existed before it.

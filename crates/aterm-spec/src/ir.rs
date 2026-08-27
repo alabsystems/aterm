@@ -379,6 +379,12 @@ mod tests {
             rust_method: rust,
             location: loc,
             project,
+            // Hand-built fixture: no macro ran, so there is no injected entry probe.
+            // `ir.rs` reasons about the STRING closure only; execution evidence is the
+            // conformance-owning gate's per-step `xref::StepEvidence` window, and it is
+            // NOT lowered into this manifest — the artifact spec-link consumes is
+            // byte-identical before and after the probe landed.
+            entry_id: "",
         }
     }
 

@@ -148,8 +148,8 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture) {
         "fixture must exercise substantial geometry"
     );
     assert!(
-        median.as_micros() < 500,
-        "worst-case {label} cursor frame {median:?} >= 500 us"
+        p90.as_micros() < 500,
+        "worst-case {label} cursor frame p90 {p90:?} >= 500 us (median {median:?})"
     );
 }
 
@@ -175,7 +175,12 @@ fn bench_cursor_rainbow_worstcase() {
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
 fn bench_cursor_rainbow_hot_ribbon_worstcase() {
-    let config = config(GlowStyle::RainbowKitty);
+    // The default RainbowKitty presentation is the restored v0.43 underline
+    // and is covered by `bench_cursor_rainbow_worstcase`. This gate is for the
+    // explicitly selected TALL presentation whose animated per-strip body is
+    // the renderer's real high-geometry rainbow path.
+    let mut config = config(GlowStyle::RainbowKitty);
+    config.ribbon_tall = true;
     // 2× retina cell metrics — the hot path's cost scales with device pixels.
     let geometry = Geom {
         cw: 18,
@@ -241,8 +246,8 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
         "hot retina ribbon saturates its quad budget ({max_under_quads} quads)"
     );
     assert!(
-        median.as_micros() < 500,
-        "worst-case hot nyan cursor frame {median:?} >= 500 us"
+        p90.as_micros() < 500,
+        "worst-case hot nyan cursor frame p90 {p90:?} >= 500 us (median {median:?})"
     );
 }
 
@@ -250,6 +255,15 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
 fn bench_cursor_water_outlier_jump() {
     const JUMP_ITERATIONS: usize = 200;
+    // A 4,095-cell diagonal is tail-capped at MAX_SPARKS=512 resident path
+    // samples; appending the live destination makes 512 adjacent segments.
+    // Water rasterizes both its undertow and crest across every segment, so
+    // even the 1 px hostile geometry must produce at least one clipped quad
+    // per layer per segment. The shared per-stream upload ceiling is
+    // CursorGlow::MAX_QUADS=16,384 (private production constants, repeated
+    // here deliberately so a cap change must be reviewed against this gate).
+    const MIN_OVER_QUADS: usize = 2 * 512;
+    const MAX_OVER_QUADS: usize = 16_384;
     let config = config(GlowStyle::Water);
     let geometry = Geom {
         cw: 1,
@@ -269,6 +283,10 @@ fn bench_cursor_water_outlier_jump() {
     glow.tick(Some(cursor), now, &config, geometry, &mut quads);
 
     let mut samples = Vec::with_capacity(JUMP_ITERATIONS);
+    let mut min_over_quads = usize::MAX;
+    let mut max_over_quads = 0usize;
+    let mut min_under_quads = usize::MAX;
+    let mut max_under_quads = 0usize;
     for iteration in 0..JUMP_ITERATIONS {
         now += Duration::from_secs(1);
         cursor = if iteration.is_multiple_of(2) {
@@ -276,14 +294,50 @@ fn bench_cursor_water_outlier_jump() {
         } else {
             (0, 0)
         };
+        // Raw cursor deltas are deliberately dark under the ownership gate.
+        // Authenticate this benchmark's scripted jump through the same
+        // explicit synthetic seam as the other hostile fixtures above, or the
+        // timing loop measures the rejected/no-output path and passes
+        // vacuously.
+        glow.note_synthetic_move(now);
         let start = Instant::now();
-        glow.tick(Some(cursor), now, &config, geometry, &mut quads);
+        let fingerprint = glow.tick(Some(cursor), now, &config, geometry, &mut quads);
         samples.push(start.elapsed());
+        assert_ne!(
+            fingerprint, 0,
+            "outlier-jump fixture must emit authenticated water geometry"
+        );
+        min_over_quads = min_over_quads.min(quads.len());
+        max_over_quads = max_over_quads.max(quads.len());
+        min_under_quads = min_under_quads.min(glow.under_quads().len());
+        max_under_quads = max_under_quads.max(glow.under_quads().len());
     }
     samples.sort();
     let median = samples[JUMP_ITERATIONS / 2];
     let p90 = samples[JUMP_ITERATIONS * 9 / 10];
-    println!("bench_cursor_water_outlier_jump: median {median:?} (p90 {p90:?})");
+    println!(
+        "bench_cursor_water_outlier_jump: median {median:?} (p90 {p90:?}), \
+         over quads {min_over_quads}..={max_over_quads}, \
+         under quads {min_under_quads}..={max_under_quads}"
+    );
+    assert!(
+        min_over_quads >= MIN_OVER_QUADS,
+        "authenticated 4,095-cell water jump emitted too little wake: \
+         over quads {min_over_quads}..={max_over_quads}, expected every frame >= \
+         {MIN_OVER_QUADS}"
+    );
+    assert!(
+        max_over_quads <= MAX_OVER_QUADS,
+        "authenticated 4,095-cell water jump exceeded the per-stream cap: \
+         over quads {min_over_quads}..={max_over_quads}, expected every frame <= \
+         {MAX_OVER_QUADS}"
+    );
+    assert_eq!(
+        (min_under_quads, max_under_quads),
+        (0, 0),
+        "Water owns only the over-ink stream; unexpected under-ink quads across \
+         the run (min, max)"
+    );
     assert!(
         p90.as_micros() < 2_000,
         "bounded 4095-cell jump p90 {p90:?} >= 2 ms"

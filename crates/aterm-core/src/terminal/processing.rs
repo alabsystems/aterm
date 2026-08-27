@@ -498,10 +498,13 @@ impl Terminal {
         let scroll_delta = self.grid.take_content_scroll_delta();
         // Preserve the grid's precise, per-batch coordinate-motion verdict in
         // a cumulative read-only projection before selection handling consumes
-        // it. A positive finite delta is composable only on the PRIMARY screen:
-        // alt-screen applications own/repaint their buffer and must invalidate
-        // cached host coordinates. Splices, region/down/erase sentinels, and
-        // any future negative delta are likewise non-uniform or ambiguous.
+        // it. A positive finite delta is composable on either active screen:
+        // `Grid` emits it only for an exact full-grid upward translation. Alt
+        // applications own their buffer, but ownership does not make this
+        // coordinate transform ambiguous; treating it as invalidation erased
+        // cursor trails at every bottom-row wrap in fullscreen TUIs. Screen
+        // switches independently invalidate, as do splices, region/down/erase
+        // sentinels, and any future negative delta.
         // SELECTION CUSTODY Phase 4: `scroll_delta == i32::MAX` used to carry this.
         // That sentinel had TWO jobs — invalidate host coordinate caches, and clear
         // the selection — and Phase 4 split them, because they are different
@@ -513,8 +516,7 @@ impl Terminal {
         let invalidates_coordinates = selection_row_update.is_some()
             || self.grid.take_coordinates_invalidated()
             || scroll_delta == i32::MAX
-            || scroll_delta < 0
-            || (self.modes.alternate_screen && scroll_delta > 0);
+            || scroll_delta < 0;
         if invalidates_coordinates {
             self.content_scroll_state.invalidate();
         } else if scroll_delta > 0 {
@@ -706,6 +708,7 @@ impl Terminal {
                 if expired {
                     self.modes.synchronized_output = false;
                     self.transient.sync_start = None;
+                    self.transient.sync_open_dirty = false;
                     // Timeout force-clear closes the window like an ESU would.
                     self.transient.sync_end_seq += 1;
                 }
@@ -1039,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn content_scroll_state_invalidates_alt_screen_scrolls() {
+    fn content_scroll_state_tracks_uniform_alt_screen_scrolls() {
         let mut term = TerminalBuilder::new()
             .size(3, 12)
             .ring_buffer_size(8)
@@ -1057,12 +1060,13 @@ mod tests {
         );
         assert_eq!(
             term.content_scroll_state().uniform_up_rows,
-            before.uniform_up_rows,
-            "an app-owned alt buffer is never translated by the host"
+            before.uniform_up_rows + 1,
+            "an exact full-grid alt scroll has the same uniform transform as primary"
         );
         assert_eq!(
             term.content_scroll_state().invalidation_epoch,
-            before.invalidation_epoch + 1
+            before.invalidation_epoch,
+            "the active screen's ownership does not make an exact translation ambiguous"
         );
     }
 
@@ -1273,6 +1277,102 @@ mod tests {
             term.transient.sync_start.is_none(),
             "sync_start must be cleared with the mode"
         );
+        assert!(
+            !term.sync_open_dirty(),
+            "the timeout close must retire the current episode's dirty bit"
+        );
+    }
+
+    /// The close counter alone cannot authorize a close+immediate-reopen
+    /// present: once the new open episode has accepted output, the mutable grid
+    /// already contains a prefix of the next frame. Pin the exact episode
+    /// boundary and the redundant-DECSET anti-laundering rule in the real
+    /// parser/terminal path.
+    #[test]
+    fn sync_open_dirty_tracks_the_current_episode_only() {
+        let mut term = Terminal::new(24, 80);
+        assert!(!term.sync_open_dirty());
+
+        term.process(b"\x1b[?2026h");
+        assert!(term.modes().synchronized_output());
+        assert!(
+            !term.sync_open_dirty(),
+            "the opening delimiter itself starts a clean episode"
+        );
+
+        term.process(b"old-frame");
+        assert!(term.sync_open_dirty(), "output dirties the open episode");
+        let before_close = term.sync_end_seq();
+
+        term.process(b"\x1b[?2026l\x1b[?2026h");
+        assert!(term.modes().synchronized_output());
+        assert_eq!(term.sync_end_seq(), before_close + 1);
+        assert!(
+            !term.sync_open_dirty(),
+            "close+reopen with no following action leaves the new episode clean"
+        );
+
+        term.process(b"next-frame-prefix");
+        assert!(
+            term.sync_open_dirty(),
+            "a prefix after the reopen forbids presenting the prior close from the current grid"
+        );
+        term.process(b"\x1b[?2026h");
+        assert!(
+            term.sync_open_dirty(),
+            "a redundant DECSET must not launder a dirty episode"
+        );
+
+        term.process(b"\x1b[?2026l");
+        assert!(!term.modes().synchronized_output());
+        assert!(!term.sync_open_dirty(), "an ordinary close clears dirty");
+    }
+
+    /// Every parser action family that can commit presented state feeds the
+    /// conservative dirty bit. Payload-heavy DCS/APC paths mark once at their
+    /// commit edge rather than branching for every byte.
+    #[test]
+    fn sync_open_dirty_covers_parser_action_families() {
+        let mut term = Terminal::new(24, 80);
+        let actions: &[(&str, &[u8])] = &[
+            ("bulk print", b"text"),
+            ("unicode print", "éé".as_bytes()),
+            ("execute", b"\x08"),
+            ("CSI", b"\x1b[2C"),
+            ("CSI subparams", b"\x1b[4:3m"),
+            ("ESC", b"\x1b7"),
+            ("OSC", b"\x1b]0;sync-dirty\x07"),
+            ("DCS commit", b"\x1bP$qm\x1b\\"),
+            ("APC commit", b"\x1b_not-kitty\x1b\\"),
+        ];
+
+        for &(name, action) in actions {
+            term.process(b"\x1b[?2026l\x1b[?2026h");
+            assert!(term.modes().synchronized_output(), "{name}: episode open");
+            assert!(!term.sync_open_dirty(), "{name}: episode starts clean");
+            term.process(action);
+            assert!(term.sync_open_dirty(), "{name}: action must mark dirty");
+        }
+    }
+
+    #[test]
+    fn sync_open_dirty_clears_on_decstr_and_ris() {
+        let mut term = Terminal::new(24, 80);
+
+        term.process(b"\x1b[?2026hdirty");
+        assert!(term.sync_open_dirty());
+        term.process(b"\x1b[!p");
+        assert!(!term.modes().synchronized_output());
+        assert!(
+            !term.sync_open_dirty(),
+            "DECSTR closes and clears the episode"
+        );
+
+        term.process(b"\x1b[?2026hdirty");
+        assert!(term.sync_open_dirty());
+        term.process(b"\x1bc");
+        assert!(!term.modes().synchronized_output());
+        assert!(!term.sync_open_dirty(), "RIS closes and clears the episode");
     }
 
     /// A forward-dated start (timer skew in the other direction, e.g.

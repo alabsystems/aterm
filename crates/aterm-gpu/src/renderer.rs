@@ -2262,6 +2262,25 @@ pub struct WindowGpu {
     // (invalidating it) but keeps the buffer's capacity for the next present's
     // `clone_from`. PER-WINDOW alongside `present_prev`.
     pub(crate) prev_input: RenderInput,
+    // Identity of the model currently held by `prev_input`. Advances on EVERY
+    // present encode attempt, before the frontend learns whether submission
+    // succeeded. A recording commits this epoch only at its later success seam;
+    // if another failed/staged attempt replaces the resident model first, an
+    // on-demand still must reject the older epoch instead of pairing new input
+    // with old success metadata. Zero means no present input has been encoded.
+    resident_input_epoch: u64,
+    // Window-absolute effect planes are translated into the renderer's legacy
+    // padded transport coordinates before an application present. Keep the
+    // exact translation beside the resident input epoch so a later semantic
+    // readback can undo it before running the ordinary visible-frame crop. This
+    // is zero for every caller that presents a canonical RenderInput directly.
+    resident_input_effects_transport_shift_y: i32,
+    // Epoch of the input whose bytes currently occupy `virtual_target`. Unlike
+    // `resident_input_epoch`, this changes only after the virtual destination's
+    // command buffer is submitted; renderer invalidation therefore cannot make
+    // the still-valid last successful destination look stale. Zero means the
+    // target has not received a submitted application present.
+    virtual_presented_input_epoch: u64,
     // M3 phase B: the RAW per-screen EDR maximum for the screen THIS window is
     // on (`NSScreen.maximumExtendedDynamicRangeColorComponentValue`), set by the
     // frontend at attach and re-queried on monitor changes. Read through the
@@ -2348,6 +2367,18 @@ pub struct WindowGpu {
 impl WindowGpu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// TEST/DIAGNOSTIC: whether this window currently holds the half-resolution
+    /// BLOOM texture (`w/2 x h/2 x 4B`). The standing instrument for the demand
+    /// rule in `GpuRenderer::ensure_bloom_target`: a session whose glow never
+    /// lights — the shipped `cursor_trail = false` default — must read `false`
+    /// for its whole life, and did NOT before that rule existed (the target was
+    /// built with the offscreen).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bloom_target_resident(&self) -> bool {
+        self.offscreen.as_ref().is_some_and(|o| o.bloom.is_some())
     }
 
     /// CPU wall time spent encoding commands and calling `queue.submit` for the
@@ -2446,6 +2477,43 @@ impl WindowGpu {
     /// would leave them painted in the OLD theme until cell content changes.
     pub fn invalidate_present(&mut self) {
         self.present_prev = None;
+        self.advance_resident_input_epoch();
+    }
+
+    fn advance_resident_input_epoch(&mut self) {
+        self.resident_input_epoch = self.resident_input_epoch.saturating_add(1);
+    }
+
+    /// Identity of the input model most recently encoded for presentation.
+    /// This is an encode-attempt epoch, not success authority: the frontend
+    /// records it only after its surface/virtual submission succeeds.
+    #[must_use]
+    pub fn resident_input_epoch(&self) -> u64 {
+        self.resident_input_epoch
+    }
+
+    /// Clone the already-resident present model only when it still matches the
+    /// caller's success-committed epoch. Explicit introspection pays this clone;
+    /// the 60fps present path continues to update one allocation-reusing buffer.
+    #[must_use]
+    pub fn clone_resident_input_at(&self, epoch: u64) -> Option<RenderInput> {
+        (epoch != 0 && epoch != u64::MAX && self.resident_input_epoch == epoch)
+            .then(|| self.prev_input.clone())
+    }
+
+    /// Clone the resident semantic model together with the exact frontend
+    /// transport translation that was applied to its window-absolute effects.
+    /// The epoch comparison and tuple read are one immutable operation, so a
+    /// caller cannot accidentally combine one frame's input with another
+    /// frame's translation.
+    #[must_use]
+    pub fn clone_resident_input_with_transport_at(&self, epoch: u64) -> Option<(RenderInput, i32)> {
+        (epoch != 0 && epoch != u64::MAX && self.resident_input_epoch == epoch).then(|| {
+            (
+                self.prev_input.clone(),
+                self.resident_input_effects_transport_shift_y,
+            )
+        })
     }
 
     /// Advance this window's SDR-crown attack envelope. Empty glow resets only
@@ -3036,8 +3104,10 @@ pub(crate) struct Offscreen {
     h: u32,
     /// Half-res bloom target: the comet glow is re-rendered into the bloom target's
     /// `view`, blurred, and additively composited back over the offscreen `view`. Its
-    /// `bind` samples `tex` (group 0 of the bloom pipeline). `None` when bloom is off.
-    /// Rebuilt with the offscreen on a resize. See `encode_frame`.
+    /// `bind` samples `tex` (group 0 of the bloom pipeline). `None` when bloom is off
+    /// AND until the first frame that actually carries a glow — it is DEMAND-BUILT by
+    /// `GpuRenderer::ensure_bloom_target`, not created with the offscreen. Dropped
+    /// with the offscreen on a resize, and rebuilt by the next glow frame.
     bloom: Option<BloomTarget>,
 }
 
@@ -3119,8 +3189,10 @@ struct PresentDest<'a> {
     premult: bool,
 }
 
-/// The half-resolution bloom render target + its composite bind group, resident on
-/// the [`Offscreen`] and rebuilt only on a resize.
+/// The half-resolution bloom render target + its composite bind group, held on the
+/// [`Offscreen`]. DEMAND-BUILT by [`GpuRenderer::ensure_bloom_target`] on the first
+/// frame that carries a live glow (not with the offscreen — the shipped defaults
+/// never draw this pass), and dropped with the offscreen on a resize.
 pub(crate) struct BloomTarget {
     /// The half-res texture. Held to keep it alive for `view`/`bind`; not read.
     #[allow(dead_code)]
@@ -5657,6 +5729,27 @@ impl GpuRenderer {
         self.gate_misses
     }
 
+    /// TEST/DIAGNOSTIC: what the backend's SUBALLOCATOR is holding, as
+    /// `(used_bytes, reserved_bytes, block_sizes)`.
+    ///
+    /// `reserved` is the sum of the driver heaps wgpu-hal's allocator has
+    /// created (`ID3D12Device::CreateHeap` on DX12, `vkAllocateMemory` on
+    /// Vulkan); `used` is the part of them actually sub-allocated to live
+    /// buffers/textures. The gap between them is the memory-hint block size —
+    /// see [`crate::terminal_memory_hints`], which exists because the wgpu
+    /// default reserved a **192 MiB** floor for a terminal that uses single-digit
+    /// megabytes. `None` on a backend with no suballocator report (GLES/WebGL).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn allocator_reserved(&self) -> Option<(u64, u64, Vec<u64>)> {
+        let report = self.ctx.device.generate_allocator_report()?;
+        Some((
+            report.total_allocated_bytes,
+            report.total_reserved_bytes,
+            report.blocks.iter().map(|b| b.size).collect(),
+        ))
+    }
+
     /// TEST/DIAGNOSTIC: number of `present_input` frames that took the SCISSORED
     /// dirty-row repaint (LoadOp::Load + scissor over the dirty band, only dirty
     /// rows re-encoded) instead of a full Clear+all-rows repaint.
@@ -5883,9 +5976,10 @@ impl GpuRenderer {
         self.cpu.set_cursor_blink_phase(on);
     }
 
-    /// Mirror of [`Renderer::set_cursor_style_override`]: when set, the cursor
-    /// is drawn in THIS style instead of the terminal's DECSCUSR style (the
-    /// windowed frontend forces `HollowBlock` while unfocused).
+    /// Mirror of [`Renderer::set_cursor_style_override`]: when set, this
+    /// presentation override wins over both the frame's host/effect override
+    /// and terminal DECSCUSR (the windowed frontend forces `HollowBlock` while
+    /// unfocused).
     pub fn set_cursor_style_override(&mut self, style: Option<CursorStyle>) {
         self.cpu.set_cursor_style_override(style);
     }
@@ -6723,6 +6817,7 @@ impl GpuRenderer {
             opts,
         )?;
         win.virtual_target = Some(self.make_virtual_target(w, h));
+        win.virtual_presented_input_epoch = 0;
         win.video = Some(tap);
         Ok(())
     }
@@ -6815,6 +6910,61 @@ impl GpuRenderer {
             .take()
             .ok_or_else(|| "presented snapshot: no capture is armed".to_string())?
             .take()
+    }
+
+    /// Copy and synchronously read the CURRENT persistent virtual destination.
+    /// No present is armed or forced: queue ordering places this copy after the
+    /// command buffer that produced the extant destination, so the returned
+    /// pixels are the exact post-blit/post-crown/post-chrome bytes of that
+    /// successful headless present. A local one-shot tap keeps video cadence,
+    /// ring occupancy, drop counters, and the independent windowed snapshot tap
+    /// completely untouched.
+    ///
+    /// `expected_input_epoch` is success authority recorded by the frontend.
+    /// It is compared with the epoch stamped only after the virtual submit, not
+    /// with mutable renderer state: knob/card changes after success do not make
+    /// already-presented destination pixels stale.
+    pub fn virtual_presented_snapshot_current(
+        &self,
+        win: &WindowGpu,
+        expected_input_epoch: u64,
+        t_us: u64,
+    ) -> Result<crate::video_tap::CapturedFrame, String> {
+        if expected_input_epoch == 0 || expected_input_epoch == u64::MAX {
+            return Err("presented snapshot: invalid virtual destination epoch".to_string());
+        }
+        if win.virtual_presented_input_epoch != expected_input_epoch {
+            return Err(
+                "presented snapshot: virtual destination advanced before capture".to_string(),
+            );
+        }
+        let target = win.virtual_target.as_ref().ok_or_else(|| {
+            "presented snapshot: current virtual destination is unavailable".to_string()
+        })?;
+        let mut tap = crate::video_tap::PresentedFrameTap::new(
+            &self.ctx.device,
+            target.w,
+            target.h,
+            VIRTUAL_PRESENT_FORMAT,
+            crate::video_tap::CaptureColorSpace::Srgb,
+            1.0,
+        )?;
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aterm current virtual presented-frame snapshot"),
+            });
+        tap.enqueue_copy(
+            &mut encoder,
+            &target.tex,
+            crate::video_tap::CaptureColorSpace::Srgb,
+            1.0,
+        );
+        self.ctx.queue.submit([encoder.finish()]);
+        tap.after_present(&self.ctx.device, t_us)?;
+        tap.finish(&self.ctx.device)?;
+        tap.take()
     }
 
     /// Render a [`RenderInput`] snapshot (built by the engine via
@@ -7892,7 +8042,7 @@ impl GpuRenderer {
         // feature is OFF unless the caller passes a card.
         tray: Option<TrayQuad<'_>>,
     ) -> Result<(), SurfacePresentFailure> {
-        self.present_input_with_crop(win, surf, input, invert, overlay, tray, None)
+        self.present_input_with_crop(win, surf, input, invert, overlay, tray, None, 0)
     }
 
     /// [`Self::present_input`] with an explicit frontend-visible source interval.
@@ -7912,7 +8062,38 @@ impl GpuRenderer {
         tray: Option<TrayQuad<'_>>,
         crop: PresentCrop,
     ) -> Result<(), SurfacePresentFailure> {
-        self.present_input_with_crop(win, surf, input, invert, overlay, tray, Some(crop))
+        self.present_input_with_crop(win, surf, input, invert, overlay, tray, Some(crop), 0)
+    }
+
+    /// Cropped present whose input carries a temporary Y translation on its
+    /// window-absolute effect planes. The translation is transport-only: it
+    /// makes those planes line up with the legacy padded offscreen, and is
+    /// retained beside the input epoch solely so semantic capture can undo it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cropped public twin preserves the present tuple and records one transport translation"
+    )]
+    pub fn present_input_cropped_with_effects_transport(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        crop: PresentCrop,
+        effects_transport_shift_y: i32,
+    ) -> Result<(), SurfacePresentFailure> {
+        self.present_input_with_crop(
+            win,
+            surf,
+            input,
+            invert,
+            overlay,
+            tray,
+            Some(crop),
+            effects_transport_shift_y,
+        )
     }
 
     #[allow(
@@ -7928,6 +8109,7 @@ impl GpuRenderer {
         overlay: Option<DropOverlay>,
         tray: Option<TrayQuad<'_>>,
         source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
         let source_crop = if let Some(crop) = source_crop {
             let (_, logical_raw_height) = self.frame_size(input.rows, input.cols);
@@ -8024,6 +8206,7 @@ impl GpuRenderer {
             overlay,
             tray,
             source_crop,
+            effects_transport_shift_y,
             PresentDest {
                 view: &view,
                 tex: &frame.texture,
@@ -8068,6 +8251,7 @@ impl GpuRenderer {
         overlay: Option<DropOverlay>,
         tray: Option<TrayQuad<'_>>,
         source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
         dest: PresentDest<'_>,
     ) {
         // 1. Offscreen render (submits). SCISSORED DIRTY-ROW REPAINT: when the
@@ -8143,6 +8327,7 @@ impl GpuRenderer {
         let tray_over_copy = tray_resident && !shift_full;
         let tray_in_place = tray.is_some() && !tray_over_copy;
         let (fw, fh) = self.encode_present_frame(win, input);
+        win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
 
         let bloom_glow_present = self.enable_bloom && !input.cursor_glow_add.is_empty();
         // HEAT SHIMMER rides the identical present-time parity class off the
@@ -8667,6 +8852,7 @@ impl GpuRenderer {
             overlay,
             tray,
             None,
+            0,
             (fw as u32, fh as u32),
         )
     }
@@ -8688,7 +8874,46 @@ impl GpuRenderer {
         crop: PresentCrop,
         destination: (u32, u32),
     ) -> bool {
-        self.present_virtual_with_crop(win, input, invert, overlay, tray, Some(crop), destination)
+        self.present_virtual_with_crop(
+            win,
+            input,
+            invert,
+            overlay,
+            tray,
+            Some(crop),
+            0,
+            destination,
+        )
+    }
+
+    /// Cropped virtual present carrying the frontend's temporary Y translation
+    /// of window-absolute effect planes. See
+    /// [`Self::present_input_cropped_with_effects_transport`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the virtual cropped twin preserves the present tuple and records one transport translation"
+    )]
+    pub fn present_virtual_cropped_with_effects_transport(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        crop: PresentCrop,
+        effects_transport_shift_y: i32,
+        destination: (u32, u32),
+    ) -> bool {
+        self.present_virtual_with_crop(
+            win,
+            input,
+            invert,
+            overlay,
+            tray,
+            Some(crop),
+            effects_transport_shift_y,
+            destination,
+        )
     }
 
     #[allow(
@@ -8703,6 +8928,7 @@ impl GpuRenderer {
         overlay: Option<DropOverlay>,
         tray: Option<TrayQuad<'_>>,
         source_crop: Option<PresentCrop>,
+        effects_transport_shift_y: i32,
         destination: (u32, u32),
     ) -> bool {
         let source_crop = if let Some(crop) = source_crop {
@@ -8725,6 +8951,7 @@ impl GpuRenderer {
             .is_none_or(|t| t.w != w || t.h != h)
         {
             win.virtual_target = Some(self.make_virtual_target(w, h));
+            win.virtual_presented_input_epoch = 0;
         }
         let tex = win
             .virtual_target
@@ -8743,6 +8970,7 @@ impl GpuRenderer {
             overlay,
             tray,
             source_crop,
+            effects_transport_shift_y,
             PresentDest {
                 view: &view,
                 tex: &tex,
@@ -8753,6 +8981,7 @@ impl GpuRenderer {
                 premult: false,
             },
         );
+        win.virtual_presented_input_epoch = win.resident_input_epoch;
         win.last_present_work_ns =
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         true
@@ -9124,6 +9353,7 @@ impl GpuRenderer {
         let mut prev_input = prev_input;
         prev_input.clone_from(input);
         win.prev_input = prev_input;
+        win.advance_resident_input_epoch();
         win.present_prev = Some(PresentPrev {
             blink_phase: cur_blink,
             cursor_style_override: cur_override,
@@ -9505,6 +9735,10 @@ impl GpuRenderer {
         if glow_count > 0 {
             self.effects
                 .ensure(&self.ctx.device, EffectPipeline::GlowAdd);
+            // The half-res extract target, on the same demand rule as the
+            // pipeline above (see `ensure_bloom_target`). Must precede the
+            // `win.offscreen` borrow below.
+            self.ensure_bloom_target(win);
         }
         let shimmer_region = if self.shimmer_live(input) {
             self.shimmer_region(input, w, h)
@@ -9619,6 +9853,9 @@ impl GpuRenderer {
         // from its own buffer, outside the encode's demand pass.
         self.effects
             .ensure(&self.ctx.device, EffectPipeline::GlowAdd);
+        // Likewise the half-res extract target (`ensure_bloom_target`); before
+        // the `win.offscreen` borrow below.
+        self.ensure_bloom_target(win);
         let mut enc = self
             .ctx
             .device
@@ -9769,6 +10006,71 @@ impl GpuRenderer {
             band_w,
             heat,
         })
+    }
+
+    /// (Re)create this window's half-resolution [`BloomTarget`] when absent, at
+    /// the offscreen's current dims. THE FIRST FRAME WITH A LIVE GLOW pays it;
+    /// before that the window holds no bloom texture at all.
+    ///
+    /// It used to be built alongside the [`Offscreen`], which meant every window
+    /// carried `w/2 x h/2 x 4B` — 2.05 MB at 1914x1071, 8.4 MB at 4180x2016 —
+    /// for a pass the shipped defaults (`cursor_trail = false`) never run: the
+    /// only thing that draws into it is the comet halo, and both composite sites
+    /// are already gated on a non-empty `cursor_glow_add`. This is the same
+    /// demand rule [`EffectPipelines`] applies to the nine effect-only
+    /// pipelines, applied to the one effect-only TEXTURE.
+    ///
+    /// A no-op when bloom is disabled, when there is no offscreen, or when a
+    /// target at the right size is already resident. A resize recreates the
+    /// offscreen with `bloom: None`, so the next glow frame rebuilds at the new
+    /// dims — the identical lifetime the eager build had.
+    fn ensure_bloom_target(&mut self, win: &mut WindowGpu) {
+        if !self.enable_bloom {
+            return;
+        }
+        let Some((w, h)) = win.offscreen.as_ref().map(|o| (o.w, o.h)) else {
+            return;
+        };
+        let bw = (w / BLOOM_DOWNSCALE).max(1);
+        let bh = (h / BLOOM_DOWNSCALE).max(1);
+        if matches!(win.offscreen.as_ref().and_then(|o| o.bloom.as_ref()),
+            Some(b) if b.bw == bw && b.bh == bh)
+        {
+            return;
+        }
+        let btex = self.ctx.offscreen_texture(bw, bh);
+        let bview = btex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sview = btex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("aterm-gpu bloom bind"),
+                layout: &self.bloom_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&sview),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.bloom_uniform_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        if let Some(off) = win.offscreen.as_mut() {
+            off.bloom = Some(BloomTarget {
+                tex: btex,
+                view: bview,
+                bind,
+                bw,
+                bh,
+            });
+        }
     }
 
     /// Build the lazy [`ShimmerResources`] if absent (first shimmer frame).
@@ -10070,6 +10372,7 @@ impl GpuRenderer {
             overlay,
             tray,
             None,
+            0,
             PresentDest {
                 view: &view,
                 tex: &tex,
@@ -11596,13 +11899,11 @@ impl GpuRenderer {
 
         let (cr, cc) = (input.cursor_row, input.cursor_col);
         let cursor_in = cr < rows && cc < cols;
-        // Cursor shape for THIS frame: DECSCUSR or the frontend's override,
-        // gated by DECTCEM and the blink phase — read from the inner CPU
-        // renderer so the suppression rules are byte-for-byte the CPU's.
-        let style = self
-            .cpu
-            .cursor_style_override()
-            .unwrap_or(input.cursor_style);
+        // Cursor shape for THIS frame: the backend presentation override first
+        // (unfocused HollowBlock), then the composed frame's host/effect
+        // override, then DECSCUSR. Resolve through the shared CPU helper so
+        // precedence, DECTCEM and blink suppression stay byte-for-byte aligned.
+        let style = aterm_render::effective_cursor_style(input, self.cpu.cursor_style_override());
         let cursor_drawn = cursor_in
             && input.cursor_visible
             && aterm_render::cursor_shown(style, self.cpu.cursor_blink_phase());
@@ -14123,44 +14424,6 @@ impl GpuRenderer {
                         },
                     ],
                 });
-            // GPU bloom target: a half-res texture the comet glow is re-rendered
-            // into, blurred, and composited back over `view`. Rebuilt with the
-            // offscreen; absent (a no-op) when bloom is disabled.
-            let bloom = self.enable_bloom.then(|| {
-                let bw = (w / BLOOM_DOWNSCALE).max(1);
-                let bh = (h / BLOOM_DOWNSCALE).max(1);
-                let btex = self.ctx.offscreen_texture(bw, bh);
-                let bview = btex.create_view(&wgpu::TextureViewDescriptor::default());
-                let sview = btex.create_view(&wgpu::TextureViewDescriptor::default());
-                let bind = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("aterm-gpu bloom bind"),
-                        layout: &self.bloom_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&sview),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.bloom_uniform_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-                BloomTarget {
-                    tex: btex,
-                    view: bview,
-                    bind,
-                    bw,
-                    bh,
-                }
-            });
             win.offscreen = Some(Offscreen {
                 tex,
                 view,
@@ -14168,7 +14431,11 @@ impl GpuRenderer {
                 blit_bind,
                 w,
                 h,
-                bloom,
+                // The GPU bloom target is DEMAND-BUILT, not built here: see
+                // `ensure_bloom_target`. A window whose glow never lights (the
+                // shipped `cursor_trail = false` default) never allocates it,
+                // and a resize drops it with the offscreen exactly as before.
+                bloom: None,
             });
         }
 

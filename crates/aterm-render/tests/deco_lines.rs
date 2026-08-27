@@ -30,11 +30,11 @@
 
 use aterm_core::terminal::{Terminal, UnderlineStyle};
 use aterm_render::deco::{
-    DecoMetrics, DecoTables, intersect_rect_spans, keep_spans_after_ink, pattern_spans_into,
-    resolve_deco_metrics,
+    DecoMetrics, DecoTables, ink_skip_applies_to_width, intersect_rect_spans, keep_spans_after_ink,
+    pattern_spans_into, resolve_deco_metrics,
 };
 use aterm_render::{
-    Renderer, Theme, strike_overline_rects, undercurl_coverage, undercurl_supported,
+    ColumnGlyph, Renderer, Theme, strike_overline_rects, undercurl_coverage, undercurl_supported,
     undercurl_tile_col, underline_band, underline_rects,
 };
 
@@ -803,4 +803,224 @@ fn pattern_spans_partition_invariant() {
         g
     };
     assert_eq!(cover(&whole), cover(&parts));
+}
+
+// ---------------------------------------------------------------------------
+// (5) the CJK composition underline — a wide glyph's rule is never carved.
+// ---------------------------------------------------------------------------
+
+/// Render `text` as an IME PREEDIT starting at column 2 of row 0, the way
+/// `RenderInput::overlay_ime_preedit` paints a live composition (every composed
+/// cell gets `UnderlineStyle::Single`).
+///
+/// The `$ ` prefix is not decoration: `overlay_ime_preedit` seeds the composed
+/// cells' colours from the cursor cell, and a pristine `Terminal::new` has
+/// resolved no defaults at all — the overlay then falls back to a
+/// `RenderCell::default()` seed and paints the composition BLACK ON BLACK,
+/// which would make every pixel assertion below vacuously true. Processing a
+/// two-cell prompt first gives the seed real colours, and is what a person
+/// composing at a shell prompt actually has on screen.
+fn preedit_frame(r: &mut Renderer, text: &str) -> aterm_render::Frame {
+    let mut term = Terminal::new(2, 12);
+    term.process(b"$ ");
+    let mut input = term.cell_frame(2, 12);
+    input.overlay_ime_preedit(text, None, false);
+    r.render_input(&input)
+}
+
+/// The composition underline under a DENSE WIDE GLYPH must be a continuous
+/// rule, not a row of dashes.
+///
+/// # The defect
+///
+/// `overlay_ime_preedit` marks every composed cell `UnderlineStyle::Single`, so
+/// the preedit rule goes through descender ink-skip like any other underline.
+/// The skip's subject is a Latin descender TAIL — the narrow stroke of g/y/j/p/q
+/// that pierces the rule — which it finds by probing the rows strictly below the
+/// baseline. A Han ideograph puts ink in exactly those rows for an unrelated
+/// reason: its foot rests on the baseline and AA-overshoots it by a pixel or
+/// two. The probe cannot tell a tail from a foot, so it carved the foot out.
+///
+/// Measured on the embedded face BEFORE the fix, the lead cell of a composed
+/// `日` came back chopped into THREE fragments at every size from 13px up — a
+/// short dash at each margin plus a stub between the character's two vertical
+/// strokes:
+///
+/// ```text
+///   px=14  dw=16  spans=[(0, 1), (6, 5), (15, 1)]
+///   px=18  dw=22  spans=[(0, 2), (7, 7), (19, 3)]
+///   px=32  dw=38  spans=[(0, 5), (11, 15), (32, 6)]
+/// ```
+///
+/// Someone composing Japanese saw that under EVERY character, and the
+/// composition rule is the only thing on screen that says the text is still
+/// uncommitted.
+///
+/// # What is asserted
+///
+/// Two independent statements, at two levels:
+///
+/// * **Policy** — the wide lead takes the no-skip path (`false`), so the whole
+///   two-cell span is drawn.
+/// * **Pixels** — the composed frame is BYTE-IDENTICAL with the feature on and
+///   off (the no-ink identity, now extended to wide cells), and the underline
+///   row carries no background gap across the composed span. The gap check is
+///   the one that failed before: the carved columns went back to background.
+///
+/// Host-portable: `cell.wide` is Unicode East Asian Width, decided by
+/// `aterm-grapheme` and not by which fonts the host has, so the policy half
+/// holds even where no CJK face is installed to draw `日`.
+#[test]
+fn cjk_composition_underline_is_continuous() {
+    let Some(bytes) = embedded_font_bytes() else {
+        eprintln!("SKIP: embedded font unavailable");
+        return;
+    };
+    // 12px is the live desktop size the Latin ink-skip was tuned at; the rest
+    // span the sizes where the fragmentation was measured.
+    for px in [12.0f32, 13.0, 14.0, 16.0, 18.0, 24.0, 32.0] {
+        let Ok(mut r) = Renderer::from_bytes(&bytes, px, Theme::default()) else {
+            continue;
+        };
+        assert!(r.underline_skip_descenders(), "W7 ships DEFAULT ON");
+        let (cw, _) = r.cell_size();
+        let pad = r.pad();
+
+        // --- Policy: the wide LEAD is exempt, so its rule is drawn whole. ---
+        let mut term = Terminal::new(2, 12);
+        term.process(b"$ ");
+        let mut input = term.cell_frame(2, 12);
+        input.overlay_ime_preedit("日本", None, false);
+        let (mut ink, mut spans) = (Vec::new(), Vec::new());
+        let carved = r.underline_keep_spans_into(
+            &input,
+            0,
+            2,
+            ColumnGlyph::PerCell,
+            pad + 2 * cw,
+            2 * cw,
+            &mut ink,
+            &mut spans,
+        );
+        assert!(
+            !carved,
+            "{px}px: the lead cell of a composed 日 must take the UNSKIPPED draw \
+             — an ideograph's foot is not a descender. Got carved spans {spans:?}"
+        );
+
+        // --- Pixels: identical with the feature on and off. ---
+        r.set_underline_skip_descenders(false);
+        let off = preedit_frame(&mut r, "日本");
+        r.set_underline_skip_descenders(true);
+        let on = preedit_frame(&mut r, "日本");
+        assert_eq!(
+            off.pixels, on.pixels,
+            "{px}px: a composed CJK run must render byte-identically with \
+             descender ink-skip on or off"
+        );
+
+        // --- Pixels: no background gap in the rule across the composed span. ---
+        let dm = r.deco_metrics();
+        let w = on.width;
+        let bg = on.pixels[0];
+        let (x0, x1) = (pad + 2 * cw, (pad + 6 * cw).min(w));
+        for y in dm.underline_y..(dm.underline_y + dm.underline_t).min(on.height) {
+            let row = &on.pixels[y * w..y * w + w];
+            let first = (x0..x1).find(|&x| row[x] != bg);
+            let last = (x0..x1).rev().find(|&x| row[x] != bg);
+            let (Some(first), Some(last)) = (first, last) else {
+                continue;
+            };
+            let gaps: Vec<usize> = (first..=last).filter(|&x| row[x] == bg).collect();
+            assert!(
+                gaps.is_empty(),
+                "{px}px: the composition rule is broken at row {y}, columns \
+                 {gaps:?} of the composed span {x0}..{x1} fell back to \
+                 background — that is the dashes-under-每-character defect"
+            );
+        }
+    }
+}
+
+/// The Latin half of the same frame construction is UNCHANGED — the wide-glyph
+/// exemption is inert for narrow cells.
+///
+/// Non-vacuity for the test above: a composed Latin descender in the very same
+/// preedit path must STILL differ between skip-on and skip-off, so
+/// `cjk_composition_underline_is_continuous` cannot be passing merely because
+/// the whole feature stopped firing.
+#[test]
+fn latin_descender_skip_survives_the_wide_glyph_exemption() {
+    let Some(bytes) = embedded_font_bytes() else {
+        eprintln!("SKIP: embedded font unavailable");
+        return;
+    };
+    let mut fired = 0usize;
+    for px in [12.0f32, 14.0, 18.0, 24.0, 32.0] {
+        let Ok(mut r) = Renderer::from_bytes(&bytes, px, Theme::default()) else {
+            continue;
+        };
+        r.set_underline_skip_descenders(false);
+        let off = preedit_frame(&mut r, "gy");
+        r.set_underline_skip_descenders(true);
+        let on = preedit_frame(&mut r, "gy");
+        if off.pixels != on.pixels {
+            fired += 1;
+        }
+        // And the narrow cell still reports a CARVED span set with real ink.
+        let mut term = Terminal::new(2, 12);
+        term.process(b"$ ");
+        let mut input = term.cell_frame(2, 12);
+        input.overlay_ime_preedit("gy", None, false);
+        let (cw, _) = r.cell_size();
+        let (mut ink, mut spans) = (Vec::new(), Vec::new());
+        let carved = r.underline_keep_spans_into(
+            &input,
+            0,
+            2,
+            ColumnGlyph::PerCell,
+            r.pad() + 2 * cw,
+            cw,
+            &mut ink,
+            &mut spans,
+        );
+        assert!(
+            carved,
+            "{px}px: a composed 'g' is a NARROW cell — the wide-glyph exemption \
+             must not reach it, and its descender must still carve the rule"
+        );
+        let kept: usize = spans.iter().map(|s| s.1).sum();
+        assert!(
+            kept < cw,
+            "{px}px: 'g' must lose underline columns to its tail (kept {kept} of {cw})"
+        );
+    }
+    assert!(
+        fired > 0,
+        "descender ink-skip must still change pixels for a composed Latin \
+         descender — otherwise the CJK continuity test is vacuous"
+    );
+}
+
+/// The width predicate itself, as a pure function: narrow cells are carved,
+/// double-width cells never are. Total over the widths a cell can report (a
+/// continuation half is asked with its GLYPH's column count, so `0` cannot
+/// reach it — but the predicate is defined there anyway).
+#[test]
+fn ink_skip_width_predicate_exempts_exactly_the_wide_cells() {
+    assert!(
+        ink_skip_applies_to_width(0),
+        "degenerate width stays on the carving path"
+    );
+    assert!(
+        ink_skip_applies_to_width(1),
+        "a narrow cell is where descenders live"
+    );
+    for cols in 2..=8 {
+        assert!(
+            !ink_skip_applies_to_width(cols),
+            "a {cols}-column glyph is an ideograph / fullwidth form — no descenders, \
+             so its rule is drawn whole"
+        );
+    }
 }

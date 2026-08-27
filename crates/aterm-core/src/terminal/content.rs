@@ -80,21 +80,43 @@ pub(crate) fn visible_row_bounds_to_string(
     // Clamp end_col to actual grid width. `side_adjusted_bounds` uses
     // u16::MAX as a sentinel for "entire row" when the end retreats to the
     // previous row; iterating up to 65535 wastes ~65K no-op cell lookups.
-    let end_col = end_col.min(grid.cols().saturating_sub(1));
+    let last_col = grid.cols().saturating_sub(1);
+    let end_col = end_col.min(last_col);
 
-    // If start_col falls on a wide_continuation cell, back up (#7526).
-    // Context-aware check so DECSCA-protected cells are not mistaken for
-    // continuations (shared bit 10). Screen-row keyed, like push_cell_text.
-    let mut effective_start = start_col;
-    if effective_start > 0 && grid.is_wide_continuation_at_screen(row, effective_start) {
-        effective_start -= 1;
-    }
+    // Both edges widen over a double-width glyph through the SAME authority the
+    // highlight predicate uses — `glyph_cell_span`: a CJK/emoji glyph is one
+    // indivisible unit, selected whole whenever either of its cells is. An edge
+    // that landed mid-glyph would otherwise make the copy and the paint describe
+    // different runs of cells (#7526): a start on the continuation would drop the
+    // lead's text under a painted highlight, and an end on the lead would take a
+    // character whose right half was never highlighted.
+    //
+    // Context-aware continuation checks so DECSCA-protected cells are not
+    // mistaken for continuations (shared bit 10). Screen-row keyed, like
+    // `push_cell_text`. A cell one past `last_col` cannot be a continuation, so
+    // an end already at the row's edge stays there.
+    let is_continuation =
+        |col: u16| col <= last_col && grid.is_wide_continuation_at_screen(row, col);
+    let (effective_start, _) = aterm_types::selection::glyph_cell_span(
+        start_col,
+        is_continuation(start_col.saturating_add(1)),
+        is_continuation(start_col),
+    );
+    // Extending the end onto a continuation adds no TEXT — the cluster lives on
+    // the lead and `push_cell_text` yields nothing for the right half. It earns
+    // its place as a seam, not as output: ONE rule governs both edges instead of
+    // two that agree by coincidence, and the loop's span stays the painted span.
+    let (_, effective_end) = aterm_types::selection::glyph_cell_span(
+        end_col,
+        is_continuation(end_col.saturating_add(1)),
+        is_continuation(end_col),
+    );
+    let end_col = effective_end.min(last_col);
 
     // One byte per column is the exact ASCII size and a tight lower bound
     // otherwise, so a plain row lands in a single allocation instead of growing
     // by doubling from zero (~ceil(log2(bytes)) realloc+memcpy cycles per
-    // extracted row). `end_col` is already clamped to `cols()-1` and
-    // `effective_start` already backed up over a wide continuation, so this can
+    // extracted row). Both bounds are already inside `0..=last_col`, so this can
     // never exceed one row's width. Mirrors `Grid::row_text_screen_into`, which
     // reserves the same way before its identical per-column push loop.
     let mut line = String::with_capacity(

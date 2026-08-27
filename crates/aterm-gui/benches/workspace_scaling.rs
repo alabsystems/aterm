@@ -657,7 +657,7 @@ impl Contenders {
                         // left alone.
                         let _ = cell.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
                         n = n.wrapping_add(1);
-                        if n % CONTENDER_BATCH == 0 {
+                        if n.is_multiple_of(CONTENDER_BATCH) {
                             writes.fetch_add(CONTENDER_BATCH, Ordering::Relaxed);
                         }
                     }

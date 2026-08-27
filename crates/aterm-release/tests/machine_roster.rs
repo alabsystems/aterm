@@ -68,9 +68,6 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -535,7 +532,7 @@ fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
 #[test]
 fn an_unattributed_release_carries_no_roster_assets() {
     assert_eq!(
-        mirror::required_asset_names("0.5.0", true, false, false, false),
+        mirror::required_asset_names("0.5.0", true, false),
         vec![
             "aterm-0.5.0-mac.zip".to_string(),
             "aterm-0.5.0-mac.zip.sha256".to_string(),
@@ -563,39 +560,38 @@ fn an_unattributed_release_carries_no_roster_assets() {
     assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
 }
 
-/// THE PER-ARCH DMG PAIR rides the manifest's say-so through the draft gate, in
-/// both directions: a manifest naming `dmg_x86_64` demands exactly the DMG +
-/// sidecar (a missing pair would publish a head install.sh elects and then
-/// fails to download), and a draft carrying the pair under a manifest that
-/// never named it is refused (an asset no manifest names is one no install can
-/// verify a digest for). The manifest-less shape stays byte-identical to
-/// today's — the fleet-compatibility requirement.
+/// THE INTEL DMG PAIR IS RETIRED (2026-08-26). A manifest that still names
+/// `dmg_x86_64` was staged by a previous cutter under a container contract
+/// this one neither produces nor mirrors, so the draft gate refuses it BY
+/// NAME — before judging the asset set — rather than half-honouring a pair
+/// the exact set no longer carries. And a smuggled `-x86_64.dmg` under a
+/// manifest that (correctly) names none is a foreign object, as it always was.
 #[test]
-fn the_intel_dmg_pair_is_demanded_exactly_when_the_manifest_names_it() {
-    // Without the pair: today's exact set, and a smuggled x86 DMG is refused.
+fn a_manifest_naming_the_retired_intel_dmg_is_refused_and_a_smuggled_one_too() {
     let plain = manifest_out::build(&inputs("0.5.0", 500));
-    assert_eq!(plain.dmg_x86_64, None, "precondition: no Intel DMG named");
+    assert_eq!(plain.dmg_x86_64, None, "this cutter never emits the pair");
+    assert_eq!(plain.dmg_x86_64_sha256, None);
     let smuggled = draft_names(&plain, true, &["aterm-0.5.0-x86_64.dmg"]);
     let err = publish::validate_draft_asset_set(&smuggled, &plain, true, PROVENANCE, None)
         .expect_err("an Intel DMG the manifest never named must be refused");
     assert!(err.to_string().contains("x86_64"), "{err}");
 
-    // With the pair: the exact set grows by exactly DMG + sidecar…
     let mut named = manifest_out::build(&inputs("0.5.0", 500));
     named.dmg_x86_64 = Some("aterm-0.5.0-x86_64.dmg".to_string());
     named.dmg_x86_64_sha256 = Some("ab".repeat(32));
-    let names = draft_names(&named, true, &[]);
-    publish::validate_draft_asset_set(&names, &named, true, PROVENANCE, None)
-        .expect("the named pair is part of the exact set");
-    // …and a draft MISSING the named DMG is refused before it can flip visible.
-    let missing: Vec<String> = names
-        .iter()
-        .filter(|n| n.as_str() != "aterm-0.5.0-x86_64.dmg")
-        .cloned()
-        .collect();
-    let err = publish::validate_draft_asset_set(&missing, &named, true, PROVENANCE, None)
-        .expect_err("a manifest-named Intel DMG must be present");
-    assert!(err.to_string().contains("x86_64"), "{err}");
+    // Even a draft that DOES carry the pair is refused: the contract is gone.
+    let mut names = draft_names(&named, true, &[]);
+    names.push("aterm-0.5.0-x86_64.dmg".to_string());
+    names.push("aterm-0.5.0-x86_64.dmg.sha256".to_string());
+    let err = publish::validate_draft_asset_set(&names, &named, true, PROVENANCE, None)
+        .expect_err("a manifest naming the retired pair is refused by name");
+    assert!(err.to_string().contains("retired"), "{err}");
+    let err = publish::refuse_retired_intel_dmg(&named).expect_err("same rule, directly");
+    assert!(err.to_string().contains("aterm-0.5.0-x86_64.dmg"), "{err}");
+    // A digest without a name is the same retired shape.
+    let mut half = manifest_out::build(&inputs("0.5.0", 500));
+    half.dmg_x86_64_sha256 = Some("ab".repeat(32));
+    assert!(publish::refuse_retired_intel_dmg(&half).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,7 +1137,7 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
     );
 
     // The mirrored set the client elects grows by exactly those two names.
-    let names = mirror::required_asset_names("0.5.0", true, true, false, false);
+    let names = mirror::required_asset_names("0.5.0", true, true);
     assert!(
         names.contains(&"aterm-machines.toml".to_string()),
         "{names:?}"
@@ -1150,12 +1146,11 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         names.contains(&"aterm-machines.toml.sig".to_string()),
         "{names:?}"
     );
-    mirror::validate_mirror_asset_set(&names, "0.5.0", true, true, false, false)
-        .expect("the exact set");
+    mirror::validate_mirror_asset_set(&names, "0.5.0", true, true).expect("the exact set");
     // ...and a mirror that forgets the roster is refused rather than published: the
     // armed client refuses such a head structurally, before any artifact crypto.
-    let forgotten = mirror::required_asset_names("0.5.0", true, false, false, false);
-    let err = mirror::validate_mirror_asset_set(&forgotten, "0.5.0", true, true, false, false)
+    let forgotten = mirror::required_asset_names("0.5.0", true, false);
+    let err = mirror::validate_mirror_asset_set(&forgotten, "0.5.0", true, true)
         .expect_err("a rostered channel head without its roster is unelectable");
     assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
 
@@ -1509,8 +1504,6 @@ fn inputs(version: &'static str, build: u64) -> manifest_out::ManifestInputs<'st
             "aterm-0.99.0-mac.zip"
         },
         zip_sha256: ZIP_SHA,
-        dmg_x86_64_name: None,
-        dmg_x86_64_sha256: None,
         repo_slug: "owner/repo",
         min_os: "11.0",
         // The shipped tier claims no team; this file invents no Apple identity.
@@ -1536,10 +1529,6 @@ fn draft_names(manifest: &Manifest, signed: bool, extra: &[&str]) -> Vec<String>
     if let Some(zip) = manifest.zip.as_deref() {
         names.push(zip.to_string());
         names.push(format!("{zip}.sha256"));
-    }
-    if let Some(x86) = manifest.dmg_x86_64.as_deref() {
-        names.push(x86.to_string());
-        names.push(format!("{x86}.sha256"));
     }
     if signed {
         names.push("aterm-appcast.toml.sig".to_string());

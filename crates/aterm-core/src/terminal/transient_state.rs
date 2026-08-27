@@ -88,6 +88,14 @@ pub(super) struct TransientState {
     /// level true (the ~1 present/timeout freeze). Never reset to 0 — the reset
     /// paths bump it instead, so any change means "at least one close".
     pub(super) sync_end_seq: u64,
+    /// Whether the CURRENT synchronized-output window has accepted any complete
+    /// PTY action since its opening `?2026h`. A host may safely present a
+    /// just-closed frame while the mode level already reads true again only
+    /// while this is false: once the new window is dirty, the mutable grid may
+    /// already contain a prefix of the next frame. Conservative by design —
+    /// parser queries/no-ops count too, so the exceptional close+reopen present
+    /// license fails closed rather than risking a torn frame.
+    pub(super) sync_open_dirty: bool,
     /// Logical "now" for the current `process_at()` batch — the single
     /// timestamp every state-affecting time read in the pipeline observes.
     ///
@@ -203,6 +211,7 @@ impl TransientState {
             vt52_cursor_state: Vt52CursorState::None,
             sync_start: None,
             sync_end_seq: 0,
+            sync_open_dirty: false,
             // Placeholders; overwritten at the top of every process_at() before
             // any reader runs, so this value is never observed as state.
             // aterm_time::Instant::now(): std on native, JS clock on wasm (std panics there).
@@ -251,6 +260,7 @@ impl TransientState {
             self.sync_end_seq += 1;
         }
         self.sync_start = None;
+        self.sync_open_dirty = false;
         self.sgr_stack.clear();
         self.pipeline_timestamps = PipelineTimestamps::default();
         self.last_combining_was_zwj = false;

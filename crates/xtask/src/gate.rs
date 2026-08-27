@@ -91,6 +91,56 @@
 //!   Rust's, which drives a stable rustc that rejects this workspace's
 //!   `-Ztrust-verify=off` and formats to a different style than the tree is in.
 //!
+//!   THE TIPPY LANE LINTS EVERY MEMBER, AND SAYS SO IN NUMBERS (2026-08-26).
+//!   It did not, until now, and the shortfall was invisible from the output.
+//!   Cargo stops scheduling new units at the first one that fails, so under
+//!   `-D warnings` the FIRST red crate ended the run and every crate cargo had
+//!   not started yet went unlinted — while the verdict line still said `gate
+//!   lint: FAILED — findings in: tippy`, which reads like a statement about the
+//!   whole workspace and was a statement about a prefix of it. Fix one crate,
+//!   re-run, meet the next: that is exactly the 2026-08-11 sequence below, and
+//!   it repeated three more times in August. MEASURED on this tree the day this
+//!   was written: the aborting form reported 3 findings, all in `atpkg`; the
+//!   same tree with `--keep-going` reported 9, in `atpkg`, `aterm-conformance`
+//!   and `aterm-gui`.
+//!
+//!   Two things changed. The argv gained `--keep-going`, and it now comes from
+//!   [`aterm_verify::stages::tippy_args`] — the one builder `tools/verify.sh`'s
+//!   Tippy stage already uses — so the gate and the script cannot cover
+//!   different amounts of the tree under the same word. And the lane REPORTS
+//!   ITS OWN COVERAGE: a clean run says how many members it linted and names
+//!   the one thing a green run still does not reach (targets behind
+//!   `required-features`); a failing run names the red members and says out
+//!   loud that its finding list is a floor, since a member downstream of a
+//!   failed LIB has no metadata to be linted against. See
+//!   [`tippy_clean_coverage`] and [`tippy_finding_coverage`].
+//!
+//!   AND NOW IT LINTS THE `required-features` TARGETS TOO (2026-08-27). The
+//!   declaration above was true and useless: `--all-targets` skips every target
+//!   whose `required-features` are off, silently, and this tree has SIX —
+//!   `aterm-gui`'s three `bench-support` benches, its `control-conformance`
+//!   bin, and `aterm-scrollback`'s two `disk-tier` benches. Nothing linted or
+//!   even BUILT them, which is how a broken bench build survived four days in
+//!   August; and because the perf campaign's count gates and reach guards live
+//!   inside those benches, an unbuilt bench is a gate that stopped existing
+//!   without a word. The lane now runs a SECOND tippy invocation with those
+//!   features on ([`aterm_verify::stages::tippy_gated_args`]), folds its
+//!   verdict in with `worst`, and prints its own coverage line.
+//!
+//!   WHAT IT COSTS, measured on this box (m21) with a warm `target-tippy`, and
+//!   stated rather than assumed because a lane nobody will wait for is a lane
+//!   that gets bypassed. No-op re-run: pass one 12.1 s, pass two 11.4 s — the
+//!   tippy lane roughly DOUBLES and still finishes inside half a minute. After
+//!   an edit that invalidates `aterm-gui`: 43.4 s + 22.6 s (+52%). The one
+//!   genuinely expensive run is the FIRST after a fresh `target-tippy`, where
+//!   pass two compiles the wider feature set from scratch: 33.7 s. Everything
+//!   below the two packages is a cache hit from pass one either way. Ten
+//!   seconds a run — half a minute, once — for six targets that had no linter
+//!   at all. The pair
+//!   ([`aterm_verify::stages::GATED_LINT_FEATURES`]) is checked against
+//!   `crates/*/Cargo.toml` by test, so a seventh gated target cannot be added
+//!   without either extending the table or reddening that test.
+//!
 //!   THE FMT LANE IS ARMED (2026-08-26). It was not, for a month: `cargo fmt`
 //!   could not dispatch, the lane reported NOT RUN, and its NOT RUN was
 //!   exempted from blocking. The tree was reformatted (254 files) and the lane
@@ -138,7 +188,12 @@
 //!   `PATH="$HOME/trust/build/<triple>/stage2/bin:$PATH"
 //!   CARGO_TARGET_DIR=<root>/target-tippy TRUST_NO_MIGRATE_WARN=1 targo-tippy
 //!   -p <crate> --all-targets -- -D warnings` (add `--no-deps` to see one
-//!   crate's own findings when a workspace peer is red).
+//!   crate's own findings when a workspace peer is red). For the whole tree by
+//!   hand, use `--workspace --all-targets --keep-going` — without `--keep-going`
+//!   you get the first red crate and nothing after it. To see EVERY finding
+//!   including the ones a red crate would mask, drop `-- -D warnings`
+//!   altogether: warnings then stay warnings, nothing fails, and every member
+//!   is linted in one pass.
 //! - `counts`: COMPUTED-ONLY PROOF INVENTORY. Counts ordinary `#[kani::proof]`
 //!   attributes under workspace crates, fails closed on scan/read errors or an
 //!   empty inventory, and rejects a hand-maintained README total. The semantic
@@ -194,6 +249,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use aterm_verify::scope::Scope;
 
 use crate::{collect_rs_files, workspace_root};
 
@@ -2106,6 +2163,83 @@ struct LiveLintLanes<'a> {
     pin_refusal: Option<String>,
 }
 
+impl LiveLintLanes<'_> {
+    /// ONE tippy invocation, with the identity-abort retry the lane has always
+    /// had — factored out so the workspace pass and the `required-features`
+    /// pass cannot drift into different retry, environment or reporting
+    /// behaviour.
+    ///
+    /// RETRY THE IDENTITY ABORT, AND ONLY THAT. See [`TIPPY_IDENTITY_ABORTS`]:
+    /// the guard can trip on a clean run, so reporting it as red is a lie in
+    /// one direction — and retrying anything else would be a lie in the far
+    /// worse direction, turning a genuine `-D warnings` failure into a pass.
+    /// The match is on the abort signature alone.
+    ///
+    /// The window is wider than the compile: it spans cargo's BUILD-LOCK WAIT,
+    /// so with one shared `target-tippy` a two-second leaf crate can sit
+    /// exposed for minutes queued behind another build. That is why the crates
+    /// observed failing were the FAST ones, and why concurrent invokers should
+    /// each use their own `CARGO_TARGET_DIR`.
+    ///
+    /// The identity abort is the OTHER not-run hiding in this gate: when it
+    /// exhausts the retries NOTHING WAS LINTED, so the honest answer is
+    /// `NotRun` — which still blocks (see [`LintLane`]), but tells the operator
+    /// to wait for the tree to go quiet rather than hunt a lint finding that
+    /// was never reported.
+    fn tippy_pass(
+        &self,
+        bin: &Path,
+        argv_owned: &[String],
+        pass: TippyPass,
+        members: usize,
+    ) -> LaneVerdict {
+        let argv: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        for attempt in 1..=TIPPY_IDENTITY_RETRIES {
+            let (ok, stderr) = run_shell_env_capturing(
+                "tippy",
+                &bin.to_string_lossy(),
+                &argv,
+                &[
+                    (
+                        "CARGO_TARGET_DIR",
+                        self.root.join("target-tippy").to_string_lossy().as_ref(),
+                    ),
+                    ("TRUST_NO_MIGRATE_WARN", "1"),
+                ],
+                Some(self.tools),
+                self.root,
+            );
+            if ok {
+                eprintln!("  tippy: {}", pass.clean_coverage(members));
+                return LaneVerdict::Clean;
+            }
+            let aborted = TIPPY_IDENTITY_ABORTS.iter().any(|sig| stderr.contains(sig));
+            if !aborted {
+                // A real finding (or any other failure): report it — and report
+                // HOW MUCH the finding list covers, because with a red member
+                // that is no longer "all of it".
+                eprintln!("  tippy: {}", pass.finding_coverage(&stderr, members));
+                return LaneVerdict::Finding;
+            }
+            if attempt == TIPPY_IDENTITY_RETRIES {
+                eprintln!(
+                    "  tippy: NOT RUN — toolchain-identity abort on all \
+                     {TIPPY_IDENTITY_RETRIES} attempts, so NOTHING WAS LINTED. This is \
+                     an environment abort, not a clean lint and not a finding: \
+                     something changed an ancestor of the stage2 sysroot mid-run (a \
+                     $HOME/trust rebuild will do it). Re-run once the tree is quiet."
+                );
+                return LaneVerdict::NotRun;
+            }
+            eprintln!(
+                "  tippy: toolchain-identity abort (attempt \
+                 {attempt}/{TIPPY_IDENTITY_RETRIES}) — transient, retrying"
+            );
+        }
+        LaneVerdict::Finding
+    }
+}
+
 impl LintLanes for LiveLintLanes<'_> {
     fn run(&mut self, lane: LintLane) -> LaneVerdict {
         match lane {
@@ -2129,69 +2263,49 @@ impl LintLanes for LiveLintLanes<'_> {
                 );
                 LaneVerdict::NotRun
             }
+            // TWO PASSES, ONE VERDICT. `[LiveLintLanes::tippy_pass]` owns the
+            // invocation, the environment and the identity-abort retry; this
+            // arm owns only WHICH two argvs get run and how their verdicts
+            // fold.
             LintLane::Tippy => match resolve_tippy(self.tools) {
-                // RETRY THE IDENTITY ABORT, AND ONLY THAT. See
-                // [`TIPPY_IDENTITY_ABORTS`]: the guard can trip on a clean run,
-                // so reporting it as red is a lie in one direction — and
-                // retrying anything else would be a lie in the far worse
-                // direction, turning a genuine `-D warnings` failure into a
-                // pass. The match is on the abort signature alone.
-                //
-                // The window is wider than the compile: it spans cargo's
-                // BUILD-LOCK WAIT, so with one shared `target-tippy` a
-                // two-second leaf crate can sit exposed for minutes queued
-                // behind another build. That is why the crates observed failing
-                // were the FAST ones, and why concurrent invokers should each
-                // use their own `CARGO_TARGET_DIR`.
                 Some(bin) => {
-                    // The identity abort is the OTHER not-run hiding in this
-                    // gate: when it exhausts the retries NOTHING WAS LINTED, so
-                    // the honest answer is `NotRun` — which still blocks (see
-                    // [`LintLane`]), but tells the operator to wait for the
-                    // tree to go quiet rather than to hunt a lint finding that
-                    // was never reported.
-                    let mut outcome = LaneVerdict::Finding;
-                    for attempt in 1..=TIPPY_IDENTITY_RETRIES {
-                        let (ok, stderr) = run_shell_env_capturing(
-                            "tippy",
-                            &bin.to_string_lossy(),
-                            &["--workspace", "--all-targets", "--", "-D", "warnings"],
-                            &[
-                                (
-                                    "CARGO_TARGET_DIR",
-                                    self.root.join("target-tippy").to_string_lossy().as_ref(),
-                                ),
-                                ("TRUST_NO_MIGRATE_WARN", "1"),
-                            ],
-                            Some(self.tools),
-                            self.root,
-                        );
-                        if ok {
-                            outcome = LaneVerdict::Clean;
-                            break;
-                        }
-                        let aborted = TIPPY_IDENTITY_ABORTS.iter().any(|sig| stderr.contains(sig));
-                        if !aborted {
-                            // A real finding (or any other failure): report it.
-                            break;
-                        }
-                        if attempt == TIPPY_IDENTITY_RETRIES {
-                            eprintln!(
-                                "  tippy: NOT RUN — toolchain-identity abort on all \
-                                 {TIPPY_IDENTITY_RETRIES} attempts, so NOTHING WAS LINTED. This is \
-                                 an environment abort, not a clean lint and not a finding: \
-                                 something changed an ancestor of the stage2 sysroot mid-run (a \
-                                 $HOME/trust rebuild will do it). Re-run once the tree is quiet."
-                            );
-                            outcome = LaneVerdict::NotRun;
-                            break;
-                        }
-                        eprintln!(
-                            "  tippy: toolchain-identity abort (attempt \
-                             {attempt}/{TIPPY_IDENTITY_RETRIES}) — transient, retrying"
-                        );
+                    // THE ARGV IS `aterm_verify`'s, not a second copy of it.
+                    // This lane's contract is "lint exactly as tools/verify.sh
+                    // does"; two hand-written arrays can honour that on the day
+                    // they are written and not the day after, and `--keep-going`
+                    // landing in one of them alone would mean the two verbs
+                    // covered different amounts of the workspace under the same
+                    // word. One builder, two consumers.
+                    let scope = Scope::workspace();
+                    let members = workspace_member_count(self.root);
+                    let main = self.tippy_pass(
+                        &bin,
+                        &aterm_verify::stages::tippy_args(&scope),
+                        TippyPass::Workspace,
+                        members,
+                    );
+                    // PASS TWO REACHES WHAT `--all-targets` CANNOT. Cargo skips
+                    // every target whose `required-features` are off and says
+                    // nothing about it, so the first pass built none of the six
+                    // in `GATED_LINT_FEATURES` — three `aterm-gui` benches, its
+                    // conformance bin, two `aterm-scrollback` benches. That
+                    // blind spot is not hypothetical: it hid a broken bench
+                    // build for four days, and the campaign's count gates and
+                    // reach guards live IN those benches, so an unbuilt bench
+                    // is a gate that quietly stopped existing.
+                    //
+                    // Skipped when the first pass reached no verdict: with the
+                    // toolchain aborting there is nothing to learn from asking
+                    // it again, and `worst` already blocks.
+                    if main == LaneVerdict::NotRun {
+                        return main;
                     }
-                    outcome
+                    let Some(gated_argv) = aterm_verify::stages::tippy_gated_args(&scope) else {
+                        return main;
+                    };
+                    let gated =
+                        self.tippy_pass(&bin, &gated_argv, TippyPass::RequiredFeatures, members);
+                    main.worst(gated)
                 }
                 None => {
                     eprintln!(
@@ -2322,6 +2436,176 @@ fn resolve_tippy(tools: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// How many members `--workspace` covers. The manifest says
+/// `members = ["crates/*"]`, so one directory under `crates/` holding a
+/// `Cargo.toml` is one member; nothing else in the tree is in the workspace.
+///
+/// This is the DENOMINATOR of the coverage sentence below, and it is computed
+/// rather than written down for the same reason `gate counts` refuses a
+/// hand-maintained total: a number in prose is right on the day it is typed.
+/// `0` (an unreadable or absent `crates/`) is reported as "unknown" instead of
+/// as a confident zero — see [`tippy_clean_coverage`].
+fn workspace_member_count(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join("Cargo.toml").is_file())
+        .count()
+}
+
+/// WHICH of the tippy lane's two passes a report line is about.
+///
+/// They cover different things, and a sentence borrowed from the other one is
+/// a false claim in both directions: "2 of 71 workspace members" said of a
+/// two-package pass overstates what ran, and "targets behind
+/// `required-features` are not in this pass" said of the pass that IS them is
+/// simply wrong. One enum, two report sentences, no chance of crossing them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TippyPass {
+    /// `--workspace --all-targets`: every member, default features.
+    Workspace,
+    /// `-p … --features …`: only the targets `--all-targets` refuses to build.
+    RequiredFeatures,
+}
+
+impl TippyPass {
+    fn clean_coverage(self, members: usize) -> String {
+        match self {
+            Self::Workspace => tippy_clean_coverage(members),
+            Self::RequiredFeatures => tippy_gated_clean_coverage(),
+        }
+    }
+
+    fn finding_coverage(self, stderr: &str, members: usize) -> String {
+        match self {
+            Self::Workspace => tippy_finding_coverage(stderr, members),
+            Self::RequiredFeatures => tippy_gated_finding_coverage(stderr),
+        }
+    }
+}
+
+/// What a ZERO-EXIT tippy run is entitled to claim — pass one, the workspace.
+///
+/// A clean exit from `--workspace --all-targets` means cargo built and linted
+/// every unit it scheduled and none failed, so every member really was reached
+/// — that part is not a guess. What it still does not reach is named in the
+/// same breath, because `--all-targets` does not build a target whose
+/// `required-features` are off. That used to be where the sentence stopped, and
+/// stopping there is what let a broken bench build sit unnoticed for four days;
+/// the second pass now closes it, and this line points at it rather than
+/// shrugging.
+fn tippy_clean_coverage(members: usize) -> String {
+    let scope = if members == 0 {
+        "the workspace".to_string()
+    } else {
+        format!("all {members} workspace members")
+    };
+    format!(
+        "clean — {scope} linted, every target `--all-targets` builds under default \
+         features. Targets gated behind `required-features` are not in this pass; the \
+         `required-features` pass below is what reaches them."
+    )
+}
+
+/// What a ZERO-EXIT `required-features` pass is entitled to claim — pass two.
+///
+/// It names the count and the features so the claim is checkable against
+/// `crates/*/Cargo.toml` by eye, and the table it is derived from is checked
+/// against them by test.
+fn tippy_gated_clean_coverage() -> String {
+    let mut pairs: Vec<String> = aterm_verify::stages::GATED_LINT_FEATURES
+        .iter()
+        .map(|(pkg, feat)| format!("{pkg}/{feat}"))
+        .collect();
+    pairs.sort_unstable();
+    format!(
+        "clean — required-features pass: every target behind {} also linted, so the \
+         `--all-targets` blind spot above is closed rather than merely declared.",
+        pairs.join(", ")
+    )
+}
+
+/// What a FAILING `required-features` pass is entitled to claim.
+///
+/// Deliberately NOT [`tippy_finding_coverage`]: that sentence counts against
+/// the 71-member workspace, and this pass compiles two packages. It names the
+/// red members and says which pass they are red in, so a reader can tell a
+/// finding that only the second pass can see (a bench nothing else builds)
+/// from one the first pass would have caught anyway.
+fn tippy_gated_finding_coverage(stderr: &str) -> String {
+    let failed = tippy_failed_members(stderr);
+    let named = if failed.is_empty() {
+        "no member named itself in the output".to_string()
+    } else {
+        failed.join(", ")
+    };
+    format!(
+        "FINDING in the required-features pass ({named}). This pass builds the targets \
+         `--all-targets` skips, so a finding here may be one NOTHING ELSE LINTS — check \
+         the target name in the error, not just the crate. Same floor caveat as the \
+         workspace pass: a member whose dependency failed to compile was not linted at \
+         all, so this list is a lower bound."
+    )
+}
+
+/// What a FAILING tippy run is entitled to claim — deliberately weaker.
+///
+/// `--keep-going` keeps cargo scheduling after a unit fails, so one red crate
+/// no longer ends the run; but a member whose DEPENDENCY failed to compile
+/// cannot be linted at all, because there is no metadata to lint it against.
+/// So the finding list after a failure is a FLOOR, not a census, and this
+/// sentence says which members were red so the reader can judge the gap
+/// instead of assuming there is none.
+fn tippy_finding_coverage(stderr: &str, members: usize) -> String {
+    let failed = tippy_failed_members(stderr);
+    let of = if members == 0 {
+        String::new()
+    } else {
+        format!(" of {members}")
+    };
+    if failed.is_empty() {
+        return "FINDING — tippy exited non-zero without naming a crate it could not compile, \
+                so this gate cannot say how much of the workspace was linted. Read the output \
+                above."
+            .to_string();
+    }
+    format!(
+        "FINDING in {}{of} workspace member(s): {}. `--keep-going` linted every other member \
+         whose dependencies compiled, so the list above is a FLOOR, not a census — a member \
+         downstream of a failed LIB could not be linted at all. Re-run after fixing these.",
+        failed.len(),
+        failed.join(", ")
+    )
+}
+
+/// The packages cargo reported it could not compile, deduplicated, in the
+/// order they were first seen.
+///
+/// Cargo writes one ``error: could not compile `<pkg>` (<target>) due to …``
+/// line per FAILED TARGET, so a crate with a red lib and a red test appears
+/// twice; the coverage sentence counts MEMBERS, not targets, hence the dedupe.
+/// Parsed from text rather than `--message-format=json` on purpose: this lane
+/// tees tippy's own output to the operator verbatim, and switching the format
+/// would replace the report they are reading with a wall of JSON.
+fn tippy_failed_members(stderr: &str) -> Vec<String> {
+    const HEAD: &str = "error: could not compile `";
+    let mut seen: Vec<String> = Vec::new();
+    for line in stderr.lines() {
+        let Some(rest) = line.trim_start().strip_prefix(HEAD) else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once('`') else {
+            continue;
+        };
+        if !name.is_empty() && !seen.iter().any(|s| s == name) {
+            seen.push(name.to_string());
+        }
+    }
+    seen
+}
+
 /// The verdict lines `gate lint` prints. `.githooks/pre-push` DISCRIMINATES ON
 /// THESE STRINGS — an exit code alone cannot tell a finding from a lane that
 /// never ran, and the hook must say different things about the two, exactly as
@@ -2368,6 +2652,14 @@ fn gate_lint_args(args: &[String]) -> bool {
 /// finding tells you less than one that ran everything, and this repo has
 /// already paid for that once: `aterm-effects` was lint-red for a day because
 /// `atpkg`'s errors aborted the workspace run before tippy reached it.
+///
+/// THAT SAME BUG HAD A SECOND STOREY, one level down, and it outlived the fix
+/// here by a fortnight: running every LANE does nothing about cargo stopping at
+/// the first failing CRATE inside the tippy lane. `aterm-effects` was
+/// unreachable in that incident not because a lane was skipped but because
+/// cargo never scheduled it. Both floors are closed now — this loop runs every
+/// lane, and `--keep-going` makes the tippy lane run every member (see the
+/// module header).
 ///
 /// THREE OUTCOMES, not two. A FINDING is a statement about the tree and blocks.
 /// A NOT-RUN is a statement about the MACHINE and also blocks, under a
@@ -2893,6 +3185,154 @@ mod tippy_identity_retry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // THE TIPPY LANE'S COVERAGE SENTENCE.
+    //
+    // The lane's old failure mode was not that it lied on purpose; it was that
+    // it said nothing about coverage at all, so a reader supplied the missing
+    // half themselves and always supplied "all of it". These pin the two
+    // claims it now makes, in both directions.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_lint_argv_is_the_one_verify_sh_uses_and_it_does_not_stop_at_the_first_crate() {
+        // Not a copy of the array: the SAME builder. If the two ever diverge,
+        // `gate lint` and `tools/verify.sh` cover different amounts of the
+        // workspace while printing the same word, which is the defect this
+        // whole lane was rewritten for.
+        let argv = aterm_verify::stages::tippy_args(&Scope::workspace());
+        assert_eq!(
+            argv,
+            [
+                "--workspace",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings"
+            ],
+            "the gate lints the whole workspace and keeps going past a red crate"
+        );
+    }
+
+    #[test]
+    fn a_clean_run_counts_the_members_and_still_names_what_it_did_not_reach() {
+        let s = tippy_clean_coverage(71);
+        assert!(s.contains("all 71 workspace members"), "{s}");
+        // `--all-targets` skips every target whose `required-features` are off,
+        // and this tree has six of them. Pass one still does not reach them —
+        // what changed is that it now points at the pass that does, instead of
+        // shrugging the gap off onto "whoever turns the feature on".
+        assert!(s.contains("required-features"), "{s}");
+        // An unreadable `crates/` must not be reported as a confident zero.
+        let unknown = tippy_clean_coverage(0);
+        assert!(!unknown.contains("all 0"), "{unknown}");
+        assert!(unknown.contains("the workspace"), "{unknown}");
+    }
+
+    #[test]
+    fn the_second_pass_says_which_features_it_turned_on() {
+        let s = tippy_gated_clean_coverage();
+        for (pkg, feat) in aterm_verify::stages::GATED_LINT_FEATURES {
+            assert!(s.contains(&format!("{pkg}/{feat}")), "{s}");
+        }
+    }
+
+    /// THE REACH GUARD FOR THE REACH GUARDS. A seventh `required-features`
+    /// target added to any manifest is a seventh target nothing lints, and the
+    /// only reason the first six were found at all is that somebody went
+    /// looking. This derives the answer from `crates/*/Cargo.toml` instead, so
+    /// the table cannot fall behind the tree without a red test naming the
+    /// pair that is missing.
+    #[test]
+    fn the_gated_feature_table_matches_every_required_features_target() {
+        let root = crate::workspace_root();
+        let mut found: Vec<(String, String)> = Vec::new();
+        let entries = std::fs::read_dir(root.join("crates")).expect("crates/ is readable");
+        for entry in entries.filter_map(Result::ok) {
+            let manifest = entry.path().join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            // The PACKAGE name, read from the `[package]` table — not the
+            // directory name and not the first `name =` in the file (that
+            // would pick up a `[[bin]]`). `-p` takes the package name, and
+            // nothing makes it equal to either of the other two.
+            let Some(pkg) = text
+                .lines()
+                .map(str::trim)
+                .skip_while(|l| *l != "[package]")
+                .find_map(|l| l.strip_prefix("name = "))
+                .map(|n| n.trim().trim_matches('"').to_string())
+            else {
+                continue;
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                // Only the DECLARATION, never the prose about it: the manifests
+                // discuss `required-features` in comments right beside it.
+                let Some(list) = line.strip_prefix("required-features") else {
+                    continue;
+                };
+                let Some(list) = list.trim_start().strip_prefix('=') else {
+                    continue;
+                };
+                for feat in list.trim().trim_matches(['[', ']']).split(',') {
+                    let feat = feat.trim().trim_matches('"');
+                    if !feat.is_empty() {
+                        found.push((pkg.clone(), feat.to_string()));
+                    }
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        let mut declared: Vec<(String, String)> = aterm_verify::stages::GATED_LINT_FEATURES
+            .iter()
+            .map(|(p, f)| ((*p).to_string(), (*f).to_string()))
+            .collect();
+        declared.sort();
+        assert!(
+            !found.is_empty(),
+            "the manifest scan found nothing — it broke"
+        );
+        assert_eq!(
+            found, declared,
+            "GATED_LINT_FEATURES has drifted from the manifests. Every (package, feature) \
+             pair that gates a target MUST be here, or `--all-targets` builds that target \
+             for nobody and its lints — and any count gate or reach guard living in it — \
+             stop existing silently. That is the four-day bench break, restated."
+        );
+    }
+
+    #[test]
+    fn a_failing_run_names_the_red_members_and_calls_its_list_a_floor() {
+        // Two failing TARGETS of one crate are one failing MEMBER.
+        let stderr = "\
+warning: unused variable: `x`
+error: could not compile `atpkg` (test \"tar_oracle\") due to 3 previous errors
+error: could not compile `atpkg` (lib test) due to 2 previous errors
+error: could not compile `aterm-gui` (lib) due to 1 previous error
+";
+        assert_eq!(tippy_failed_members(stderr), ["atpkg", "aterm-gui"]);
+        let s = tippy_finding_coverage(stderr, 71);
+        assert!(s.contains("FINDING in 2 of 71"), "{s}");
+        assert!(s.contains("atpkg") && s.contains("aterm-gui"), "{s}");
+        // The honesty clause: after a failure the list is a lower bound, because
+        // a member downstream of a failed lib was never linted at all.
+        assert!(s.contains("FLOOR"), "{s}");
+    }
+
+    #[test]
+    fn a_failure_that_names_no_crate_refuses_to_claim_a_coverage_number() {
+        // `targo-tippy` can exit non-zero for reasons that are not a lint
+        // finding in any crate (a broken manifest, a missing driver). Inventing
+        // "0 of 71" there would be the same over-claim in the other direction.
+        let s = tippy_finding_coverage("error: failed to parse manifest\n", 71);
+        assert!(s.contains("cannot say how much"), "{s}");
+        assert!(!s.contains("FINDING in 0"), "{s}");
+    }
 
     // ------------------------------------------------------------------
     // VERB-LEVEL red proofs for `gate lint` and `gate perf`.

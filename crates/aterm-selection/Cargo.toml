@@ -13,7 +13,10 @@ description = "Smart semantic selection and text selection state machines for te
 aterm-ffi-types = { workspace = true }
 aterm-grapheme = { workspace = true }
 aterm-types = { workspace = true }
-regex = { workspace = true }
+# The first-party regular-expression engine (bounded Pike VM). Selection rules
+# are regexes — the eleven built-ins in `builtin_patterns.rs` plus user-defined
+# custom rules — so this crate is the engine's largest syntax consumer.
+aterm-regex = { workspace = true }
 
 [lints]
 workspace = true

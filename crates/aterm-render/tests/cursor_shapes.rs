@@ -193,6 +193,50 @@ fn hollow_block_draws_outline_but_not_center() {
 }
 
 #[test]
+fn composed_effect_shape_preserves_decscusr_and_backend_override_stays_highest() {
+    let Some(mut r) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = r.cell_size();
+    let mut term = term_with(b"\x1b[4 q"); // terminal owns steady underline
+    let mut input = term.cell_frame(2, 4);
+    assert_eq!(input.cursor_style, CursorStyle::SteadyUnderline);
+
+    // A composed laser/rainbow frame may choose Bolt without destroying the
+    // terminal's DECSCUSR style.
+    input.cursor_effect_style_override = Some(CursorStyle::Bolt);
+    let effect = r.render_input(&input);
+    let bolt_area: usize = cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch)
+        .iter()
+        .map(|&[_, _, w, h]| w * h)
+        .sum();
+    assert_eq!(cursor_positions(&effect).len(), bolt_area);
+    assert_eq!(input.cursor_style, CursorStyle::SteadyUnderline);
+
+    // Renderer/backend presentation authority remains highest precedence.
+    r.set_cursor_style_override(Some(CursorStyle::HollowBlock));
+    let unfocused = r.render_input(&input);
+    let t = (ch / 16).max(1);
+    let hollow_area = 2 * cw * t + 2 * t * (ch - 2 * t);
+    assert_eq!(cursor_positions(&unfocused).len(), hollow_area);
+
+    // `image plain` strips the effect field and restores the terminal shape.
+    r.set_cursor_style_override(None);
+    input.clear_overlays();
+    assert_eq!(input.cursor_effect_style_override, None);
+    assert_eq!(input.cursor_style, CursorStyle::SteadyUnderline);
+    let plain = r.render_input(&input);
+    let underline_h = (ch / 8).max(2);
+    assert_eq!(cursor_positions(&plain).len(), cw * underline_h);
+    assert!(
+        cursor_positions(&plain)
+            .iter()
+            .all(|&(x, y)| x < cw && y >= ch - underline_h && y < ch)
+    );
+}
+
+#[test]
 fn blink_phase_off_suppresses_blinking_styles_only() {
     let Some(mut r) = renderer() else {
         eprintln!("SKIP: no system monospace font");

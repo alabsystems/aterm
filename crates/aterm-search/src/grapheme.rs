@@ -112,6 +112,21 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
     column
 }
 
+/// Display columns `text` occupies, in the SAME column frame every
+/// [`SearchMatch`](crate::SearchMatch) column is measured in (a wide glyph
+/// counts 2, a combining mark 0).
+///
+/// Exported because the terminal's search caller JOINS a soft-wrapped run of
+/// grid rows into the one logical line the user sees before indexing it, and
+/// has to pad each continued row back out to the grid's width first. A caller
+/// that counted that padding with its OWN width routine would put every column
+/// past the first wrap boundary on the wrong cell, so the padding is counted by
+/// the engine's counter, not beside it.
+#[must_use]
+pub fn display_columns(text: &str) -> usize {
+    ColumnMap::new(text).total_columns()
+}
+
 /// Map a byte offset in lowercased text back to the corresponding byte offset
 /// in the original text.
 ///

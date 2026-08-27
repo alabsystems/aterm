@@ -133,6 +133,12 @@ impl Grid {
     ///   selection / copy will treat the continuation as a separate line.
     #[inline]
     pub(crate) fn advance_autowrap_line(&mut self) {
+        // THE WRAP FACT (kitty-motion §4.1): this fn is the one funnel every
+        // autowrap line advance resolves through, so the serial bumps HERE and
+        // nowhere else — unconditionally at entry, because even the clamped
+        // bottom-of-screen arm below (cursor pinned, column already reset to
+        // the margin) is a wrap the caret observer must be able to see.
+        self.storage.wrap_serial += 1;
         // Determine whether cursor was within horizontal margins BEFORE moving it.
         // When DECLRMM is active and cursor is within margins, wrap to the left
         // margin; otherwise wrap to column 0.  Bug fix: previously cursor.col was

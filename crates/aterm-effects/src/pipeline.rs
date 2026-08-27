@@ -2009,12 +2009,12 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_real_region_alt_reset_and_restore_invalidate_geometry() {
+    fn pipeline_real_alt_uniform_translates_while_ambiguous_motion_invalidates() {
         fn region_scroll(term: &mut Terminal) {
             term.process(b"\x1b[2;4r\x1b[4;1H\n\x1b[r\x1b[3;3H");
         }
         fn alt_scroll(term: &mut Terminal) {
-            term.process(b"\x1b[5;1H\n\x1b[3;3H");
+            term.process(b"\x1b[5;1H\n\n\x1b[3;3H");
         }
         fn direct_reset(term: &mut Terminal) {
             term.reset();
@@ -2024,15 +2024,45 @@ mod tests {
             term.restore_checkpoint(&checkpoint);
         }
 
-        type ScrollMutationCase = (&'static str, i64, bool, fn(&mut Terminal));
+        type ScrollMutationCase = (
+            &'static str,
+            i64,
+            bool,
+            ContentScrollDecision,
+            fn(&mut Terminal),
+        );
         let cases: [ScrollMutationCase; 4] = [
-            ("RegionInvalidation", 2, false, region_scroll),
-            ("AltInvalidation", 3, true, alt_scroll),
-            ("ResetInvalidation", 4, false, direct_reset),
-            ("RestoreInvalidation", 5, false, checkpoint_restore),
+            (
+                "RegionInvalidation",
+                2,
+                false,
+                ContentScrollDecision::Invalidate,
+                region_scroll,
+            ),
+            (
+                "AltUniform",
+                3,
+                true,
+                ContentScrollDecision::Translate(2),
+                alt_scroll,
+            ),
+            (
+                "ResetInvalidation",
+                4,
+                false,
+                ContentScrollDecision::Invalidate,
+                direct_reset,
+            ),
+            (
+                "RestoreInvalidation",
+                5,
+                false,
+                ContentScrollDecision::Invalidate,
+                checkpoint_restore,
+            ),
         ];
 
-        for (action, event, enter_alt, mutate) in cases {
+        for (action, event, enter_alt, expected, mutate) in cases {
             let mut term = Terminal::new(5, 16);
             if enter_alt {
                 // Mode entry is a coordinate-space transition of its own. The
@@ -2054,30 +2084,47 @@ mod tests {
                     0x0050_FA7B,
                 );
             }
-            let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
+            let (mut input, before_trail) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
             let before = term.content_scroll_state();
             mutate(&mut term);
             let after = term.content_scroll_state();
             let decision = content_scroll_decision(Some(before), after);
-            assert_eq!(decision, ContentScrollDecision::Invalidate, "{action}");
+            assert_eq!(decision, expected, "{action}");
             validate_cursor_scroll_action(action, event, decision);
 
             term.cell_frame_into(&mut input, 5, 16);
             pipeline.apply(&mut term, &mut input, 10, 19);
-            assert!(
-                input.cursor_trail.is_empty(),
-                "{action} retained stale cells"
-            );
-            assert!(!pipeline.trail.is_active(), "{action} retained trail state");
+            if let ContentScrollDecision::Translate(rows) = expected {
+                assert!(
+                    pipeline.trail.is_active(),
+                    "{action} destroyed licensed resident light"
+                );
+                let expected_cells: Vec<TrailCell> = before_trail
+                    .iter()
+                    .filter_map(|cell| {
+                        cell.row
+                            .checked_sub(usize::from(rows))
+                            .map(|row| TrailCell { row, ..*cell })
+                    })
+                    .collect();
+                assert_eq!(
+                    input.cursor_trail, expected_cells,
+                    "{action} must translate the licensed comet exactly with alt content"
+                );
+            } else {
+                assert!(
+                    input.cursor_trail.is_empty(),
+                    "{action} retained stale cells"
+                );
+                assert!(!pipeline.trail.is_active(), "{action} retained trail state");
+            }
 
             if enter_alt {
-                // Behavioral ordering bind: the invalidation above reset both
-                // engines' context to main. `apply` must restore ALT after the
-                // reset and before this typed same-row jump. With ALT + no
-                // repaint blink it is deliberate TUI motion and remains
-                // visible; if context is omitted/re-fed before reset, both
-                // engines misclassify it as a main-screen re-anchor and emit
-                // nothing.
+                // Behavioral ordering bind: the exact alt translation keeps
+                // the engines' ALT context. A following licensed typed jump
+                // therefore retains the TUI classification; losing context
+                // while translating would misclassify it as a main-screen
+                // re-anchor and emit nothing.
                 let scripted = pipeline.now();
                 pipeline.glow.note_synthetic_typed(scripted, 1);
                 pipeline.trail.note_synthetic_typed(scripted);
@@ -2087,11 +2134,11 @@ mod tests {
                 pipeline.apply(&mut term, &mut input, 10, 19);
                 assert!(
                     !input.cursor_trail.is_empty(),
-                    "alt context must survive invalidation for classic classification"
+                    "alt context must survive the translated scroll for classic classification"
                 );
                 assert!(
                     !input.cursor_glow_add.is_empty() || !input.glow_halo.is_empty(),
-                    "alt context must survive invalidation for glow classification"
+                    "alt context must survive the translated scroll for glow classification"
                 );
             }
         }

@@ -1898,6 +1898,231 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
     }
 }
 
+/// Resident cursor-pet coordinates are owned by one front terminal surface.
+/// A pane/tab owner change, a same-terminal main/alternate-screen change, or a
+/// focus loss that leaves cursor effects truly unpresentable retires both the
+/// visible body and its host-owned hit target.
+/// The pet's durable identity survives so the next lawful sighting uses the
+/// same companion. Raw focus loss is not itself a retirement proof: a live
+/// typed-wake or recording pin keeps the same presentation surface admitted.
+///
+/// `Buggy = 1` reproduces the retained-coordinate defect: retiring boundaries
+/// keep the old body and hit target, allowing them to jump into a replacement
+/// pane/tab or remain interactable after presentation has stopped. The pinned
+/// focus-loss actions are independent negative controls and remain visible in
+/// both laws, so the repair cannot be "retire on every raw blur".
+///
+/// This model projects only the resident `PetBrain` body and the GUI's paired
+/// hit target. The ordinary flying cursor cat has a distinct earned/promise
+/// lifecycle; its owner-switch retirement is a separately asserted host rule
+/// in the Tier-1 GUI regression, not one of these variables.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn cursor_companion_owner_lifecycle_model() -> Model {
+    crate::ty_model! {
+        CursorCompanionOwnerLifecycle {
+            const Buggy = 0;
+            var phase = 0;
+            // The model begins with a configured durable identity but no
+            // surface-relative sighting. 1 means that identity is retained.
+            var durable_identity = 1;
+            var pet_visible = 0;
+            var hit_target = 0;
+
+            action Materialize when (phase == 0) {
+                phase = 1;
+                pet_visible = 1;
+                hit_target = 1;
+            }
+            action PaneOwnerSwitch when (phase == 1) {
+                phase = 2;
+                pet_visible = if Buggy == 1 { pet_visible } else { 0 };
+                hit_target = if Buggy == 1 { hit_target } else { 0 };
+            }
+            action TabOwnerSwitch when (phase == 1) {
+                phase = 3;
+                pet_visible = if Buggy == 1 { pet_visible } else { 0 };
+                hit_target = if Buggy == 1 { hit_target } else { 0 };
+            }
+            action UnpresentableFocusLoss when (phase == 1) {
+                phase = 4;
+                pet_visible = if Buggy == 1 { pet_visible } else { 0 };
+                hit_target = if Buggy == 1 { hit_target } else { 0 };
+            }
+            action TypedWakeFocusLoss when (phase == 1) {
+                phase = 5;
+            }
+            action RecordingFocusLoss when (phase == 1) {
+                phase = 6;
+            }
+            action ScreenBufferSwitch when (phase == 1) {
+                phase = 7;
+                pet_visible = if Buggy == 1 { pet_visible } else { 0 };
+                hit_target = if Buggy == 1 { hit_target } else { 0 };
+            }
+
+            invariant RetiringBoundariesAreDark:
+                if phase == 2 || phase == 3 || phase == 4 || phase == 7 {
+                    pet_visible == 0 && hit_target == 0
+                } else {
+                    phase <= 7
+                };
+            invariant PresentationPinsPreserveTheSighting:
+                if phase == 5 || phase == 6 {
+                    pet_visible == 1 && hit_target == 1
+                } else {
+                    phase <= 7
+                };
+            invariant DurableIdentitySurvives: durable_identity == 1;
+            invariant CompanionOwnerValuesBounded:
+                phase <= 7 && pet_visible <= 1 && hit_target <= 1
+                    && durable_identity <= 1;
+        }
+    }
+}
+
+/// A composed frame owns one DEC-2026 hold machine per visible terminal. One
+/// pane completing its bracket cannot release a sibling pane whose bracket is
+/// still incomplete; only a frame where every member releases may present.
+///
+/// `Buggy = 1` is the retired aggregate-counter defect: the first pane close
+/// presents the composite even though the other pane remains held.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn composed_sync_hold_model() -> Model {
+    crate::ty_model! {
+        ComposedSyncHold {
+            const Buggy = 0;
+            var phase = 0;
+            var a_hold = 0;
+            var b_hold = 0;
+            var presented = 0;
+
+            action ArmBoth when (phase == 0) {
+                phase = 1;
+                a_hold = 1;
+                b_hold = 1;
+            }
+            action CloseOnlyA when (phase == 1) {
+                phase = 2;
+                a_hold = 0;
+                presented = if Buggy == 1 { 1 } else { 0 };
+            }
+            action CloseOnlyB when (phase == 1) {
+                phase = 4;
+                b_hold = 0;
+                presented = if Buggy == 1 { 1 } else { 0 };
+            }
+            action CloseRemainingB when (phase == 2) {
+                phase = 3;
+                b_hold = 0;
+                presented = 1;
+            }
+            action CloseRemainingA when (phase == 4) {
+                phase = 3;
+                a_hold = 0;
+                presented = 1;
+            }
+            action CloseBoth when (phase == 1) {
+                phase = 5;
+                a_hold = 0;
+                b_hold = 0;
+                presented = 1;
+            }
+
+            invariant NoPartialCompositePresent:
+                if a_hold == 1 || b_hold == 1 {
+                    presented == 0
+                } else {
+                    presented <= 1
+                };
+            invariant ComposedSyncValuesBounded:
+                phase <= 5 && a_hold <= 1 && b_hold <= 1 && presented <= 1;
+        }
+    }
+}
+
+/// A DEC-2026 close edge licenses the last completed episode for presentation.
+/// If the terminal immediately opens a new episode, that completed boundary may
+/// remain visible while the new episode is still clean. The first completed
+/// parser action in the reopened episode sets `open_dirty`; from that point the
+/// host must hold the partial episode until its matching close.
+///
+/// `Buggy = 1` is the close/reopen race that treats the close sequence alone as
+/// a presentation license. It keeps presenting after the reopened episode has
+/// become dirty, exposing cells that belong to an incomplete synchronized
+/// update.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn sync_reopen_visibility_model() -> Model {
+    crate::ty_model! {
+        SyncReopenVisibility {
+            const Buggy = 0;
+            // Begin inside a dirty first episode. The modeled close/reopen edge
+            // is the exact boundary at which the stale close-sequence-only
+            // license used to lose track of the new episode's writes.
+            var phase = 0;
+            var sync_active = 1;
+            var open_dirty = 1;
+            var hold = 1;
+            var completed_generation = 0;
+            var presented_generation = 0;
+            var partial_visible = 0;
+
+            action CloseFirstEpisode when (phase == 0) {
+                phase = 1;
+                sync_active = 0;
+                open_dirty = 0;
+                hold = 0;
+                completed_generation = 1;
+            }
+            action ReopenClean when (phase == 1) {
+                phase = 2;
+                sync_active = 1;
+                // The new episode has performed no presented mutation, so the
+                // completed close boundary remains a lawful frame.
+                presented_generation = 1;
+            }
+            action DirtyReopenedEpisode when (phase == 2) {
+                phase = 3;
+                open_dirty = 1;
+                hold = if Buggy == 1 { 0 } else { 1 };
+                partial_visible = if Buggy == 1 { 1 } else { 0 };
+            }
+            action CloseReopenedEpisode when (phase == 3) {
+                phase = 4;
+                sync_active = 0;
+                open_dirty = 0;
+                hold = 0;
+                completed_generation = 2;
+                presented_generation = 2;
+                partial_visible = 0;
+            }
+
+            invariant CleanReopenMayPresentCompletedBoundary:
+                if phase == 2 {
+                    sync_active == 1 && open_dirty == 0 && hold == 0
+                        && completed_generation == 1
+                        && presented_generation == 1 && partial_visible == 0
+                } else {
+                    phase <= 4
+                };
+            invariant DirtyReopenHoldsUntilClose:
+                if phase == 3 {
+                    sync_active == 1 && open_dirty == 1 && hold == 1
+                        && completed_generation == 1
+                        && presented_generation == 1 && partial_visible == 0
+                } else {
+                    phase <= 4
+                };
+            invariant SyncReopenValuesBounded:
+                phase <= 4 && sync_active <= 1 && open_dirty <= 1 && hold <= 1
+                    && completed_generation <= 2 && presented_generation <= 2
+                    && partial_visible <= 1;
+        }
+    }
+}
+
 /// Family-wide lifecycle for PTY scroll translation. `survivor_y` abstracts
 /// every position-bearing member whose translated anchor remains visible;
 /// `off_top_alive` abstracts every member that crosses the top boundary. The
@@ -1948,14 +2173,17 @@ pub fn cursor_effect_scroll_model() -> Model {
 
 /// Host-side scroll observation at a retained-history cap. The terminal owns
 /// two cumulative, non-consuming clocks: `uniform_rows` for composable
-/// full-screen upward motion and `epoch` for region/alt/reset/restore mutations whose
+/// full-screen upward motion on either active screen and `epoch` for
+/// region/reset/restore mutations whose
 /// coordinates cannot be transformed as one plane. `retained_history` stays
 /// zero in every state, modeling both a zero-history terminal and a saturated
 /// ring whose public count no longer changes.
 ///
 /// `UniformAtCap` must still reach one exact translation and retire row-bound
-/// proof. Region, alternate-screen, reset and in-place restore events must instead choose the
-/// invalidation decision and drop all geometry/proof. `Buggy=1` is the former
+/// proof. `AltUniform` must make the same exact translation: changing active
+/// screen invalidates independently, but an in-screen full-grid shift is not
+/// ambiguous. Region, reset and in-place restore events must instead choose
+/// invalidation and drop all geometry/proof. `Buggy=1` is the former
 /// GUI policy: infer motion from the unchanged retained count and preserve the
 /// stranded effect state.
 #[must_use]
@@ -1966,7 +2194,7 @@ pub fn cursor_scroll_signal_model() -> Model {
             const StartY = 3;
             const Delta = 2;
             const Buggy = 0;
-            var event = 0;              // 0 initial, 1 uniform, 2 region, 3 alt, 4 reset, 5 restore
+            var event = 0;              // 0 initial, 1 primary uniform, 2 region, 3 alt uniform, 4 reset, 5 restore
             var retained_history = 0;   // capped: deliberately unchanged
             var uniform_rows = 0;       // cumulative composable scroll clock
             var epoch = 0;              // cumulative invalidation clock
@@ -1989,12 +2217,13 @@ pub fn cursor_scroll_signal_model() -> Model {
                 geometry_alive = if Buggy == 1 { 1 } else { 0 };
                 proof_alive = if Buggy == 1 { 1 } else { 0 };
             }
-            action AltInvalidation when (event == 0) {
+            action AltUniform when (event == 0) {
                 event = 3;
-                epoch = 1;
-                decision = if Buggy == 1 { 0 } else { 2 };
-                geometry_alive = if Buggy == 1 { 1 } else { 0 };
-                proof_alive = if Buggy == 1 { 1 } else { 0 };
+                uniform_rows = Delta;
+                decision = if Buggy == 1 { 2 } else { 1 };
+                survivor_y = if Buggy == 1 { StartY } else { StartY - Delta };
+                geometry_alive = if Buggy == 1 { 0 } else { 1 };
+                proof_alive = 0;
             }
             action ResetInvalidation when (event == 0) {
                 event = 4;
@@ -2012,20 +2241,20 @@ pub fn cursor_scroll_signal_model() -> Model {
             }
 
             invariant RetainedCountIsNotAuthority:
-                if event == 1 {
+                if event == 1 || event == 3 {
                     retained_history == 0 && uniform_rows == Delta && decision == 1
                 } else {
                     retained_history == 0
                 };
             invariant UniformTranslationExact:
-                if event == 1 {
+                if event == 1 || event == 3 {
                     survivor_y == StartY - Delta && geometry_alive == 1
                         && proof_alive == 0
                 } else {
                     survivor_y == StartY
                 };
             invariant AmbiguousMotionInvalidates:
-                if event > 1 {
+                if event == 2 || event == 4 || event == 5 {
                     epoch == 1 && decision == 2
                         && geometry_alive == 0 && proof_alive == 0
                 } else {

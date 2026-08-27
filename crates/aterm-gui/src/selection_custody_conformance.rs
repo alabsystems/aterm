@@ -32,19 +32,52 @@
 //! * `Terminal::set_scrollback_line_limit` — the eviction-with-no-delta entry point,
 //!   for `Evict`.
 //!
-//! WHAT AN ANCHOR PROVES, AND WHAT IT DOES NOT. The `#[refines]` attribute emits an
-//! inventory record naming a (machine, action) pair. The gate checks that every action
-//! of an active machine appears in that set — it does NOT check that the attribute sits
-//! on a function which performs the action. `xref.rs` says so itself: obligation 2, that
-//! `project` resolves to a live symbol, "is NOT enforced here". Moving an anchor to an
-//! unrelated stub keeps the gate green, which was verified rather than assumed.
+//! WHAT AN ANCHOR PROVES, AND WHAT IT DOES NOT — the CURRENT state, which is not what
+//! this paragraph used to say. It used to say the gate "does NOT check that the
+//! attribute sits on a function which performs the action", so "the anchors here are
+//! documentation with a coverage gate attached". That was true and is no longer.
 //!
-//! So the anchors here are documentation with a coverage gate attached, and THIS module
-//! is the part that can fail. It drives real gestures and real `Terminal::process`
-//! batches, projects the engine before and after, and asserts the model admits the
-//! transition — plus negative controls asserting the model REFUSES the regression
-//! members. Deleting `force_selection_invalidation()` from ED 3 in the shipping grid
-//! turns it red; that is the standard each case is held to.
+//! Every step below now drives its shipping seam inside a ONE-STEP-WIDE execution
+//! evidence window (`aterm_spec::xref::StepEvidence`): the thread-local anchor-entry
+//! record is cleared, the seam is called, and what was entered is snapshotted before
+//! this module reads anything back. `spec_xref_closure` (crates/aterm-gui/src/lib.rs,
+//! the `SelectionCustody` block) then asks TWO questions of the ledger, and the second
+//! is what makes the first worth anything.
+//!
+//! 1. ENTRY: every window driving action A must have entered A's annotated function.
+//!    An anchor parked on a stub fails; so does one moved onto a function some other
+//!    step calls — `Terminal::process` is entered by seven of this module's sixteen
+//!    steps (four damage batches, ED 3, RIS, the uniform scroll) and still fails
+//!    `Evict`, whose three steps call only `set_scrollback_line_limit`.
+//! 2. THE CONTRAPOSITIVE: an annotated function must NOT be entered by a window driving
+//!    an action it is not anchored for. Question 1 alone is weak inside a batch, because
+//!    a window is only as narrow as its seam: the uniform-scroll step enters
+//!    `Terminal::note_output_custody` as well as `Terminal::post_process`, so entry
+//!    alone would accept the anchor on either. `note_output_custody` also runs in the
+//!    damage and invalidation windows, so question 2 rejects it.
+//!
+//! THE SURVIVING LIMIT, stated in numbers because the adjective would overclaim. The
+//! evidence is FUNCTION-ENTRY, not branch-entry. Ten of the eleven actions here sit on
+//! a function that carries more than one of them — `App::finish_selection` carries four,
+//! `Terminal::post_process` four, `app_input::apply_press_custody` two — so one entry
+//! marks every anchor on that function and NOTHING here can tell those siblings apart:
+//! permuting the four labels on `post_process` changes no observable. `post_process` is
+//! entered on EVERY VT batch regardless of which damage or scroll occurred, which is
+//! precisely why the gate reports the actions its windows cover rather than reporting a
+//! function "entered in every window" — that older figure was an intersection across
+//! step families and could never be non-empty at all. The other survivor is an anchor
+//! moved onto a function whose entry pattern is exactly the action set it claims,
+//! including an unanchored one inside the same window, which carries no probe and so
+//! cannot even be counted. The gate derives all of that from the anchors and the ledger
+//! and prints it rather than claiming more; obligation 2 proper (`project` and
+//! `rust_method` resolving to live symbols) is still unresolved strings, and still
+//! Phase 3's `trust-ir` job.
+//!
+//! So THIS module remains the part that carries real weight. It drives real gestures
+//! and real `Terminal::process` batches, projects the engine before and after, and
+//! asserts the model admits the transition — plus negative controls asserting the model
+//! REFUSES the regression members. Deleting `force_selection_invalidation()` from ED 3
+//! in the shipping grid turns it red; that is the standard each case is held to.
 //!
 //! * `Terminal::post_process`'s `SelectionDamage::All` arm — for
 //!   `WholesaleInvalidate`, driven with real ED 3 (`\x1b[3J`) and RIS (`\x1bc`) bytes.
@@ -110,6 +143,7 @@ use std::collections::BTreeMap;
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_spec::derive::selection_custody_model;
+use aterm_spec::xref::StepEvidence;
 
 use crate::app_input::{PressKind, apply_press_custody};
 use crate::{App, WindowId, term_lock};
@@ -309,11 +343,12 @@ fn band_of(term: &Terminal, base: u64, first: u16, last: u16) -> (i64, i64) {
 /// Drive one damage case: arm `sel_lo..=sel_hi`, damage visible rows `first..=last`
 /// with real EL batches, and validate the step against `action`.
 fn damage_case(
-    action: &str,
+    action: &'static str,
     sel: (i64, i64),
     rows: (u16, u16),
     expect_alive: bool,
     validated: &mut usize,
+    ev: &mut StepEvidence,
 ) {
     let (mut term, base) = engine_fixture(4, 0);
     arm(&mut term, base, sel.0, sel.1);
@@ -332,7 +367,11 @@ fn damage_case(
     for row in rows.0..=rows.1 {
         batch.extend_from_slice(format!("\x1b[{};1H\x1b[K", row + 1).as_bytes());
     }
-    term.process(&batch);
+    // EXECUTION-EVIDENCE WINDOW — the batch and NOTHING ELSE. The fixture build above
+    // also fed `Terminal::process` and called `set_scrollback_line_limit`, and both are
+    // anchored; leaving them inside the window would credit this action with entering
+    // functions its own step never touched.
+    ev.step(action, || term.process(&batch));
 
     c.fired(prev, EV_DAMAGE, Some(band));
     let next = c.state(&term);
@@ -352,7 +391,7 @@ fn damage_case(
 
 /// The GUI half: one real `App`, one real terminal, six validated transitions driven
 /// through the genuine gesture and press seams.
-fn gui_gesture_chain(validated: &mut usize) {
+fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     // Keep the REAL system clipboard untouched: `finish_selection`'s copy-on-select and
@@ -404,7 +443,7 @@ fn gui_gesture_chain(validated: &mut usize) {
 
     // --- SelectLow: a two-row selection on the model's low pair.
     let prev = c.state(&term_lock(&terminal));
-    drag(&mut app, (0, 0), (1, 5));
+    ev.step("SelectLow", || drag(&mut app, (0, 0), (1, 5)));
     c.fired(prev, EV_GESTURE, None);
     let next = c.state(&term_lock(&terminal));
     let (ok, out) = validate_transition("SelectLow", prev, next);
@@ -416,14 +455,14 @@ fn gui_gesture_chain(validated: &mut usize) {
 
     // --- InertPress: a bare modifier may DESTROY NOTHING.
     let prev = next;
-    {
-        let mut t = term_lock(&terminal);
-        assert_eq!(
-            apply_press_custody(&mut t, PressKind::Inert),
-            (false, false),
-            "an inert press must neither snap the viewport nor clear the selection"
-        );
-    }
+    let inert = ev.step("InertPress", || {
+        apply_press_custody(&mut term_lock(&terminal), PressKind::Inert)
+    });
+    assert_eq!(
+        inert,
+        (false, false),
+        "an inert press must neither snap the viewport nor clear the selection"
+    );
     c.fired(prev, EV_INERT, None);
     let next = c.state(&term_lock(&terminal));
     let (ok, out) = validate_transition("InertPress", prev, next);
@@ -435,13 +474,10 @@ fn gui_gesture_chain(validated: &mut usize) {
 
     // --- TypingPress: the ONE handover.
     let prev = next;
-    {
-        let mut t = term_lock(&terminal);
-        assert!(
-            apply_press_custody(&mut t, PressKind::Typing).1,
-            "a disturbing press must clear a live selection"
-        );
-    }
+    let typing = ev.step("TypingPress", || {
+        apply_press_custody(&mut term_lock(&terminal), PressKind::Typing)
+    });
+    assert!(typing.1, "a disturbing press must clear a live selection");
     c.fired(prev, EV_TYPING, None);
     let next = c.state(&term_lock(&terminal));
     let (ok, out) = validate_transition("TypingPress", prev, next);
@@ -453,7 +489,7 @@ fn gui_gesture_chain(validated: &mut usize) {
 
     // --- SelectHigh: the live-screen pair.
     let prev = next;
-    drag(&mut app, (2, 0), (3, 5));
+    ev.step("SelectHigh", || drag(&mut app, (2, 0), (3, 5)));
     c.fired(prev, EV_GESTURE, None);
     let next = c.state(&term_lock(&terminal));
     let (ok, out) = validate_transition("SelectHigh", prev, next);
@@ -468,8 +504,10 @@ fn gui_gesture_chain(validated: &mut usize) {
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_cell = (2, 0);
     }
-    app.begin_selection(wid, SelectionType::Simple);
-    let _ = app.finish_selection(wid, true);
+    ev.step("UserClear", || {
+        app.begin_selection(wid, SelectionType::Simple);
+        let _ = app.finish_selection(wid, true);
+    });
     c.fired(prev, EV_GESTURE, None);
     let next = c.state(&term_lock(&terminal));
     assert_eq!(next[0], 0, "a click without a drag deselects");
@@ -483,7 +521,7 @@ fn gui_gesture_chain(validated: &mut usize) {
     // --- SelectOldest: a ONE-ROW selection on the oldest retained row. Without this
     // shape the both-endpoints-evicted arm of `Evict` is unreachable at all.
     let prev = next;
-    drag(&mut app, (0, 0), (0, 5));
+    ev.step("SelectOldest", || drag(&mut app, (0, 0), (0, 5)));
     c.fired(prev, EV_GESTURE, None);
     let next = c.state(&term_lock(&terminal));
     assert_eq!(
@@ -504,7 +542,7 @@ fn gui_gesture_chain(validated: &mut usize) {
 /// the arm that destroys the selection, so the model's post-state names a row the
 /// dead concrete selection cannot be asked about. What IS checkable is the behaviour
 /// the invariant exists for, and that is checked here.
-fn evict_destroys_a_selection_whose_whole_interval_fell_off() {
+fn evict_destroys_a_selection_whose_whole_interval_fell_off(ev: &mut StepEvidence) {
     let (mut term, base) = engine_fixture(4, 2);
     arm(&mut term, base, 0, 0);
     assert_eq!(
@@ -513,7 +551,9 @@ fn evict_destroys_a_selection_whose_whole_interval_fell_off() {
         "a one-row selection on the oldest retained row, floor 0"
     );
     let retained = term.grid().scrollback_lines();
-    term.set_scrollback_line_limit(Some(retained - 1));
+    ev.step("Evict", || {
+        term.set_scrollback_line_limit(Some(retained - 1))
+    });
     let after = project_selection_custody(&term, base);
     assert_eq!(after[3], 1, "the floor rose by one");
     assert_eq!(
@@ -528,29 +568,66 @@ fn evict_destroys_a_selection_whose_whole_interval_fell_off() {
 
 #[test]
 fn real_selection_custody_conforms() {
-    run_conformance();
+    let _ = run_conformance();
 }
 
 /// The `SelectionCustody` Tier-1 body, factored out so the `spec_xref_gate` can RUN
 /// it: the gate's "SelectionCustody is actively bound" claim then means the real
 /// engine and GUI seams were driven and checked, not merely that anchors exist.
-pub(crate) fn run_conformance() {
+pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
+    // EXECUTION EVIDENCE. Every step below drives its shipping seam inside a
+    // ONE-STEP-WIDE `StepEvidence` window: the record is cleared, the seam is called,
+    // and what was entered is snapshotted BEFORE the harness reads anything back. The
+    // gate then requires each action's own anchored function to have been entered by
+    // EVERY step that drives that action, and by no step that drives a different one —
+    // neither of which an audit around the whole run could ask. There, an anchor moved
+    // onto `Terminal::process`, or onto the `term.text_selection()` this module's own
+    // projection calls, was entered somewhere in the run and passed.
+    let mut ev = StepEvidence::new("SelectionCustody");
 
     // ---- The GUI half: six transitions through the real gesture/press seams. ----
-    gui_gesture_chain(&mut validated);
+    gui_gesture_chain(&mut validated, &mut ev);
 
     // ---- The DAMAGE half: both sides of the lattice, both outcomes. ----
     // Model rows are visible rows here (a zero-history fixture), and the band is read
     // back out of `Grid::visible_to_absolute`.
     //
     // `DisjointDamagePreserves`: rows 0-1 rewritten, the selection sits on 2-3.
-    damage_case("RegionDamageLow", (2, 3), (0, 1), true, &mut validated);
+    damage_case(
+        "RegionDamageLow",
+        (2, 3),
+        (0, 1),
+        true,
+        &mut validated,
+        &mut ev,
+    );
     // `OverlapDamageClears`: the same band, the selection now sits ON it.
-    damage_case("RegionDamageLow", (0, 1), (0, 1), false, &mut validated);
+    damage_case(
+        "RegionDamageLow",
+        (0, 1),
+        (0, 1),
+        false,
+        &mut validated,
+        &mut ev,
+    );
     // The INVERSE half — the hole where a highlight survived over replaced text.
-    damage_case("RegionDamageHigh", (2, 3), (3, 3), false, &mut validated);
-    damage_case("RegionDamageHigh", (0, 1), (3, 3), true, &mut validated);
+    damage_case(
+        "RegionDamageHigh",
+        (2, 3),
+        (3, 3),
+        false,
+        &mut validated,
+        &mut ev,
+    );
+    damage_case(
+        "RegionDamageHigh",
+        (0, 1),
+        (3, 3),
+        true,
+        &mut validated,
+        &mut ev,
+    );
 
     // ---- WholesaleInvalidate: the coordinate space itself is gone. ----
     //
@@ -565,7 +642,7 @@ pub(crate) fn run_conformance() {
         arm(&mut term, base, 0, 1);
         let mut c = Custody::new(base);
         let prev = c.state(&term);
-        term.process(b"\x1b[3J");
+        ev.step("WholesaleInvalidate", || term.process(b"\x1b[3J"));
         c.fired(prev, EV_WHOLESALE, None);
         let next = c.state(&term);
         assert_eq!(
@@ -590,7 +667,7 @@ pub(crate) fn run_conformance() {
         arm(&mut term, base, 0, 1);
         let mut c = Custody::new(base);
         let prev = c.state(&term);
-        term.process(b"\x1bc");
+        ev.step("WholesaleInvalidate", || term.process(b"\x1bc"));
         c.fired(prev, EV_WHOLESALE, None);
         let next = c.state(&term);
         assert_eq!(
@@ -614,7 +691,7 @@ pub(crate) fn run_conformance() {
         // Ordinary output while the user reads history: the anchors ride the content,
         // so the ABSOLUTE interval does not move and the floor does not rise.
         let prev = c.state(&term);
-        term.process(b"more\r\n");
+        ev.step("UniformScroll", || term.process(b"more\r\n"));
         c.fired(prev, EV_SCROLL, None);
         let next = c.state(&term);
         assert_eq!(
@@ -633,7 +710,9 @@ pub(crate) fn run_conformance() {
         // a PARTIAL loss, so the head clamps to the new floor and records it.
         let prev = next;
         let retained = term.grid().scrollback_lines();
-        term.set_scrollback_line_limit(Some(retained - 1));
+        ev.step("Evict", || {
+            term.set_scrollback_line_limit(Some(retained - 1))
+        });
         c.fired(prev, EV_EVICT, None);
         let next = c.state(&term);
         assert_eq!(
@@ -656,7 +735,9 @@ pub(crate) fn run_conformance() {
         let mut c = Custody::new(base);
         let prev = c.state(&term);
         let retained = term.grid().scrollback_lines();
-        term.set_scrollback_line_limit(Some(retained - 1));
+        ev.step("Evict", || {
+            term.set_scrollback_line_limit(Some(retained - 1))
+        });
         c.fired(prev, EV_EVICT, None);
         let next = c.state(&term);
         assert_eq!(
@@ -673,7 +754,7 @@ pub(crate) fn run_conformance() {
     }
 
     // ---- The third `Evict` arm, asserted directly (see the fn doc). ----
-    evict_destroys_a_selection_whose_whole_interval_fell_off();
+    evict_destroys_a_selection_whose_whole_interval_fell_off(&mut ev);
 
     // ---- NEGATIVE CONTROLS (non-vacuity). ----
     // Each is a `Buggy = 1` regression member falsifying a NAMED invariant. If ANY of
@@ -761,4 +842,6 @@ pub(crate) fn run_conformance() {
          floor) all rejected.",
         rejected.len()
     );
+
+    ev
 }

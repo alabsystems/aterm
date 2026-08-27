@@ -3348,9 +3348,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         crate::prefs::EDIT_ALLOW_WINDOW_OPS => {
             if cfg!(target_os = "linux") {
-                " · manipulations (iconify, maximize, fullscreen, resize — move stays denied) apply to the window; reports beyond the window-title and text-grid-size fallbacks remain unanswered"
+                " · manipulations (iconify, maximize, fullscreen, resize — move stays denied) apply to the window; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
             } else {
-                " · the GUI answers only XTWINOPS window-title and text-grid-size fallback reports; host manipulation and most state/geometry requests are ignored"
+                " · the GUI answers the XTWINOPS window-title, text-grid-size, text-area-pixels and cell-size reports; host manipulation and window/screen position and size requests are ignored"
             }
         }
         crate::prefs::EDIT_SEARCH_HISTORY_LINES => {
@@ -5360,11 +5360,15 @@ expect_nonce = "pin"
 
         // The window-ops phrasing is per-platform: Linux wires the manipulation
         // half (frame audit #4), so its honest residue is the unanswered
-        // geometry reports; elsewhere the pre-wiring statement stands.
+        // POSITION/screen reports; elsewhere no callback is installed and only
+        // the engine's own reports answer. Pin the ANSWERED set on both
+        // branches — "remain unanswered" alone kept passing while the sentence
+        // around it still said the pixel pair was part of the gap, which it has
+        // not been since the in-core 14t/16t fallbacks landed.
         let window_ops_phrase = if cfg!(target_os = "linux") {
-            "remain unanswered"
+            "text-area-pixels and cell-size reports are answered"
         } else {
-            "most state/geometry requests"
+            "text-area-pixels and cell-size fallback reports"
         };
         // The OSC 52 caveat states the widest grant per platform: the system
         // clipboard off-Linux (what the Query arm answers with), the
@@ -5415,9 +5419,25 @@ expect_nonce = "pin"
                 "reads the SYSTEM clipboard"
             }
         ));
+        // The window-ops Manual entry names the reports that actually ANSWER.
+        // "window-title and text-grid-size" was the pre-fallback set and this
+        // assertion outlived it: the pixel pair (CSI 14 t text area, CSI 16 t
+        // cell size) answers in-core from the host's reported cell box, so a
+        // Manual that still called them unanswered was a lie this test pinned.
+        let window_ops_help = help_for(crate::prefs::EDIT_ALLOW_WINDOW_OPS);
         assert!(
-            help_for(crate::prefs::EDIT_ALLOW_WINDOW_OPS)
-                .contains("window-title and text-grid-size")
+            window_ops_help.contains("text-grid-size, text-area-pixels and cell-size"),
+            "{window_ops_help}"
+        );
+        // …and it still discloses the residue, which is the POSITION/screen
+        // half — nothing in-core knows a window origin or a display size.
+        assert!(
+            window_ops_help.contains(if cfg!(target_os = "linux") {
+                "window/screen position and screen-size reports remain unanswered"
+            } else {
+                "window/screen position and size requests are ignored"
+            }),
+            "{window_ops_help}"
         );
         assert!(help_for("matrix_rain.hue").contains("matrix / theme / #RRGGBB"));
         assert!(help_for("packages.channel").contains("resolves to stable"));

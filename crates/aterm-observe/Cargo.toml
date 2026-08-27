@@ -16,7 +16,16 @@ workspace = true
 [dependencies]
 # The Observation Kernel (L0) primitive this layer builds semantic predicates on.
 aterm-core = { workspace = true }
-# The semantic vocabulary. This crate is the ONLY place `regex` enters the
-# watcher stack — the core stores an opaque `dyn RowMatch` (RFC R2 purity).
-regex = { workspace = true }
+# The semantic vocabulary. This crate is the ONLY place the regex engine enters
+# the watcher stack — the core stores an opaque `dyn RowMatch` (RFC R2 purity).
+aterm-regex = { workspace = true }
+
+[dev-dependencies]
+# ORACLE, test-only: `row_matcher_bounds_compiled_size` asserts that the
+# `(a{200}){200}` amplifier is accepted by the reference engine's 10 MiB default
+# and REJECTED by this crate's 1 MiB `size_limit` — the assertion only proves the
+# cap is wired if the permissive side is the real `regex`. Pinned directly rather
+# than via [workspace.dependencies], which no longer carries `regex`: no shipped
+# member declares it any more.
+regex = "1"
 

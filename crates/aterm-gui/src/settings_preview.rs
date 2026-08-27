@@ -132,6 +132,20 @@ pub(crate) enum PreviewTrailStyle {
     Custom,
 }
 
+/// The cursor companion selected by a rainbow-family style spelling.
+///
+/// Companion identity deliberately rides beside [`PreviewTrailStyle`]: the
+/// effects engine resolves every one of these choices to
+/// [`GlowStyle::RainbowKitty`], while the runtime uses the original style
+/// token to choose the resident cat, resident dog, or flying kitty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PreviewTrailCompanion {
+    #[default]
+    None,
+    Pet(aterm_effects::kitty_pet::PetSpecies),
+    FlyingKitty,
+}
+
 impl PreviewTrailStyle {
     pub(crate) fn parse(value: &str) -> Self {
         let empty = crate::app_config::TrailPackCatalog::default();
@@ -159,23 +173,6 @@ impl PreviewTrailStyle {
         }
     }
 
-    const fn glow(self) -> Option<GlowStyle> {
-        match self {
-            Self::Invalid => None,
-            Self::Off => None,
-            Self::Lumen => Some(GlowStyle::Lumen),
-            Self::Phaser => Some(GlowStyle::Phaser),
-            Self::RainbowKitty => Some(GlowStyle::RainbowKitty),
-            Self::Sparkle => Some(GlowStyle::Sparkle),
-            Self::Fire => Some(GlowStyle::Fire),
-            Self::Laser => Some(GlowStyle::Laser),
-            Self::Water => Some(GlowStyle::Water),
-            Self::Beam => Some(GlowStyle::Beam),
-            Self::Comet => Some(GlowStyle::Comet),
-            Self::Custom => Some(GlowStyle::Custom),
-        }
-    }
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Invalid => "unavailable",
@@ -200,6 +197,10 @@ pub(crate) struct CursorPreviewSpec {
     pub(crate) blink: bool,
     pub(crate) trail_enabled: bool,
     pub(crate) trail_style: PreviewTrailStyle,
+    /// The selected preference token, retained because rainbow-family
+    /// geometry and companion identity intentionally live in its spelling.
+    /// `trail_style` is only the shared engine's broad dispatch class.
+    pub(crate) trail_style_raw: Arc<str>,
     /// Resolved, validated custom interpreter data. `None` for every built-in
     /// and for an unavailable `pack:<id>`; the latter fails closed without
     /// emitting geometry or scheduling an invisible animation cadence.
@@ -226,6 +227,7 @@ impl Default for CursorPreviewSpec {
             blink: true,
             trail_enabled: true,
             trail_style: PreviewTrailStyle::RainbowKitty,
+            trail_style_raw: Arc::from(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
             trail_pack: None,
             color: None,
             accent: None,
@@ -241,11 +243,18 @@ impl Default for CursorPreviewSpec {
 
 impl CursorPreviewSpec {
     fn normalized(&self) -> Self {
+        let trimmed_style = self.trail_style_raw.trim();
+        let trail_style_raw = if trimmed_style.len() == self.trail_style_raw.len() {
+            Arc::clone(&self.trail_style_raw)
+        } else {
+            Arc::from(trimmed_style)
+        };
         Self {
             style: self.style,
             blink: self.blink,
             trail_enabled: self.trail_enabled,
             trail_style: self.trail_style,
+            trail_style_raw,
             trail_pack: if matches!(self.trail_style, PreviewTrailStyle::Custom) {
                 self.trail_pack.clone()
             } else {
@@ -262,6 +271,84 @@ impl CursorPreviewSpec {
             // must disable the wake, never leak into its length math.
             wake_persist_s: finite_or(self.wake_persist_s, 0.0).clamp(0.0, 1.5),
         }
+    }
+
+    /// The selected token when it still names this broad preview style.
+    ///
+    /// The fallback keeps direct
+    /// `CursorPreviewSpec { trail_style, ..Default::default() }` callers honest:
+    /// changing the broad style without also changing its raw
+    /// token must not accidentally retain the default rainbow-pet semantics.
+    pub(crate) fn effective_trail_style_raw(&self) -> &str {
+        let raw = self.trail_style_raw.trim();
+        let empty = crate::app_config::TrailPackCatalog::default();
+        let resolved = crate::app_config::resolve_trail_style(raw, &empty);
+        if PreviewTrailStyle::from_resolution(raw, resolved) == self.trail_style {
+            raw
+        } else {
+            self.trail_style.label()
+        }
+    }
+
+    fn resolved_trail_style(&self) -> crate::app_config::ResolvedTrailStyle {
+        if self.trail_style == PreviewTrailStyle::Custom {
+            return crate::app_config::ResolvedTrailStyle {
+                canonical: None,
+                style: self.trail_pack.as_ref().map(|_| GlowStyle::Custom),
+                pack: self.trail_pack.as_deref().copied(),
+                issue: self
+                    .trail_pack
+                    .is_none()
+                    .then_some(crate::app_config::TrailStyleIssue::MissingPack),
+            };
+        }
+        let empty = crate::app_config::TrailPackCatalog::default();
+        crate::app_config::resolve_trail_style(self.effective_trail_style_raw(), &empty)
+    }
+
+    /// Match the runtime's broad-style gate plus its raw-token companion
+    /// predicates. A non-pet rainbow spelling owns the flying kitty, including
+    /// the historical `nyan` aliases and the geometry-only underline variant.
+    pub(crate) fn trail_companion(&self) -> PreviewTrailCompanion {
+        if self.resolved_trail_style().style != Some(GlowStyle::RainbowKitty) {
+            return PreviewTrailCompanion::None;
+        }
+        let raw = self.effective_trail_style_raw();
+        if GlowStyle::style_names_any_pet(raw) {
+            let species = if GlowStyle::style_names_dog_pet(raw) {
+                aterm_effects::kitty_pet::PetSpecies::Dog
+            } else {
+                aterm_effects::kitty_pet::PetSpecies::Cat
+            };
+            PreviewTrailCompanion::Pet(species)
+        } else {
+            PreviewTrailCompanion::FlyingKitty
+        }
+    }
+
+    fn glow_config(&self, theme: Theme, head_dx: f32) -> crate::cursor_glow::GlowConfig {
+        crate::app_config::resolve_cursor_glow(
+            crate::app_config::CursorGlowInputs {
+                enabled: self.trail_enabled,
+                style_raw: self.effective_trail_style_raw(),
+                color: self.color,
+                accent: self.accent,
+                duration_ms: self.duration_ms,
+                length: self.length,
+                intensity: self.intensity,
+                radius: self.radius,
+                ring: self.ring,
+                wake_persist_s: self.wake_persist_s,
+            },
+            self.resolved_trail_style(),
+            theme.cursor,
+            aterm_render::theme_is_dark(theme.bg),
+            // The preview HAS a theme in scope and no Terminal, so there is
+            // nothing to fold: no OSC 10/11 and no DECSCNM on this path.
+            theme.fg & 0x00FF_FFFF,
+            theme.bg & 0x00FF_FFFF,
+            head_dx,
+        )
     }
 
     const fn trail_pack_unavailable(&self) -> bool {
@@ -963,7 +1050,7 @@ impl SettingsPreviewSpec {
                 let trail = if spec.cursor.trail_enabled && spec.cursor.has_resolved_trail() {
                     format!(
                         "{} cursor trail",
-                        friendly_preview_value(spec.cursor.trail_style.label())
+                        friendly_preview_value(spec.cursor.effective_trail_style_raw())
                     )
                 } else {
                     "cursor with no trail".to_string()
@@ -1019,8 +1106,17 @@ impl SettingsPreviewSpec {
         } else if trail_emitted {
             if spec.cursor.trail_style == PreviewTrailStyle::Custom {
                 "The shared CursorGlow custom Trail Pack interpreter is live for the selected pack."
-            } else if spec.cursor.trail_style == PreviewTrailStyle::RainbowKitty {
-                "Shared CursorGlow Nyan ribbon geometry and the CatBaker cursor sprite are live."
+            } else if let PreviewTrailCompanion::Pet(species) = spec.cursor.trail_companion() {
+                match species {
+                    aterm_effects::kitty_pet::PetSpecies::Cat => {
+                        "Shared CursorGlow rainbow geometry and the resident cat companion are live."
+                    }
+                    aterm_effects::kitty_pet::PetSpecies::Dog => {
+                        "Shared CursorGlow rainbow geometry and the resident dog companion are live."
+                    }
+                }
+            } else if spec.cursor.trail_companion() == PreviewTrailCompanion::FlyingKitty {
+                "Shared CursorGlow rainbow geometry and the CatBaker flying-kitty sprite are live."
             } else {
                 "Shared CursorGlow trail geometry is live for the selected effect."
             }
@@ -1062,9 +1158,9 @@ impl SettingsPreviewSpec {
             } => format!("custom asset {source_id:?} disabled: {bounded_reason}"),
         };
         let kitty_activation = if spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE
-            && spec.cursor.trail_style != PreviewTrailStyle::RainbowKitty
+            && spec.cursor.trail_companion() != PreviewTrailCompanion::FlyingKitty
         {
-            "The chosen sprite is shown independently in this specimen; it remains dormant in terminal sessions until trail style Rainbow kitty is selected."
+            "The chosen sprite is shown independently in this specimen; it remains dormant in terminal sessions until trail style Rainbow kitty flying is selected."
         } else {
             "The sprite follows the selected terminal trail style."
         };
@@ -1116,7 +1212,7 @@ impl SettingsPreviewSpec {
             spec.typography.variations.len(),
             spec.cursor.style.label(),
             if spec.cursor.blink { "on" } else { "off" },
-            spec.cursor.trail_style.label(),
+            spec.cursor.effective_trail_style_raw(),
             spec.post_fx.motion_raw,
             spec.post_fx.motion_effective,
             spec.post_fx.motion_reason,
@@ -1295,6 +1391,10 @@ impl SettingsPreviewSpec {
         self.cursor.blink.hash(&mut hash);
         self.cursor.trail_enabled.hash(&mut hash);
         (self.cursor.trail_style as u8).hash(&mut hash);
+        self.cursor
+            .effective_trail_style_raw()
+            .trim()
+            .hash(&mut hash);
         // Pack identity counts only where the engine can dispatch to it, so two
         // built-ins carrying a stale pack stay one key, exactly as today.
         let trail_pack_fp = if matches!(self.cursor.trail_style, PreviewTrailStyle::Custom) {
@@ -1616,7 +1716,7 @@ impl SettingsPreviewSpec {
                 PreviewAnimation::BlinkEdge { .. } => "Live blink".to_string(),
                 PreviewAnimation::Continuous => format!(
                     "{} · Live",
-                    friendly_preview_value(self.cursor.trail_style.label())
+                    friendly_preview_value(self.cursor.effective_trail_style_raw())
                 ),
             }
         }
@@ -1627,12 +1727,10 @@ impl SettingsPreviewSpec {
             cursor: grid.start_cursor(),
             ..PreviewEffects::default()
         };
-        let Some(style) = self.cursor.trail_style.glow() else {
-            return frame;
-        };
         if self.cursor.trail_pack_unavailable()
             || self.reduced_motion
             || !self.cursor.trail_enabled
+            || !self.cursor.has_resolved_trail()
             || self.cursor.intensity <= 0.0
             || grid.rows == 0
             || grid.cols == 0
@@ -1640,40 +1738,15 @@ impl SettingsPreviewSpec {
             return frame;
         }
 
-        let pack = self.cursor.trail_pack.as_deref().copied();
-        let resolution = crate::app_config::ResolvedTrailStyle {
-            canonical: (self.cursor.trail_style != PreviewTrailStyle::Custom)
-                .then(|| self.cursor.trail_style.label()),
-            style: Some(style),
-            pack,
-            issue: None,
-        };
-        let glow_config = crate::app_config::resolve_cursor_glow(
-            crate::app_config::CursorGlowInputs {
-                enabled: self.cursor.trail_enabled,
-                style_raw: self.cursor.trail_style.label(),
-                color: self.cursor.color,
-                accent: self.cursor.accent,
-                duration_ms: self.cursor.duration_ms,
-                length: self.cursor.length,
-                intensity: self.cursor.intensity,
-                radius: self.cursor.radius,
-                ring: self.cursor.ring,
-                wake_persist_s: self.cursor.wake_persist_s,
-            },
-            resolution,
-            theme.cursor,
-            aterm_render::theme_is_dark(theme.bg),
-            // The preview HAS a theme in scope and no Terminal, so there is
-            // nothing to fold: no OSC 10/11 and no DECSCNM on this path.
-            theme.fg & 0x00FF_FFFF,
-            theme.bg & 0x00FF_FFFF,
+        let glow_config = self.cursor.glow_config(
+            theme,
             if self.cursor.style == PreviewCursorStyle::Bar {
                 0.08
             } else {
                 0.5
             },
         );
+        let style = glow_config.style;
         let color = glow_config.color;
         frame.trail_color = color;
         let trail_config = TrailConfig {
@@ -2057,6 +2130,7 @@ fn build_terminal_specimen_input(
     // The remaining four gate the kitty sprite layer.
     spec.cursor.trail_enabled.hash(&mut hash);
     (spec.cursor.trail_style as u8).hash(&mut hash);
+    hash_trimmed_lowercase(spec.cursor.effective_trail_style_raw(), &mut hash);
     spec.reduced_motion.hash(&mut hash);
     spec.focused_key.hash(&mut hash);
     spec.post_fx.kitty_sprite.hash(&mut hash);
@@ -2125,15 +2199,33 @@ fn build_terminal_specimen_input(
     selection.complete_selection();
     input.selection = selection;
 
-    if spec.scene == PreviewScene::CursorMotion
-        && spec.cursor.trail_enabled
-        && (spec.cursor.trail_style == PreviewTrailStyle::RainbowKitty
-            || spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE)
-        && !spec.reduced_motion
-        && let Some((sprites, atlas)) = kitty_layer(&spec.post_fx.kitty_asset)
-    {
-        input.free_sprites = sprites;
-        input.free_atlas = Some(atlas);
+    if spec.scene == PreviewScene::CursorMotion && spec.cursor.trail_enabled {
+        let companion = if spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE {
+            // The sprite control previews the asset it edits even when the
+            // selected runtime companion is a resident pet. This focused
+            // specimen is explicitly diagnostic, never a claim that the
+            // flying sprite is active under the pet style.
+            (!spec.reduced_motion)
+                .then(|| kitty_layer(&spec.post_fx.kitty_asset))
+                .flatten()
+        } else {
+            match spec.cursor.trail_companion() {
+                // Runtime keeps the resident pet/dog visible as a settled
+                // still under Reduced Motion; the specimen must show the same
+                // companion identity even though its scripted trail is frozen.
+                PreviewTrailCompanion::Pet(species) => pet_layer(species),
+                // Ordinary flying-kitty episodes are motion and remain
+                // suppressed under Reduced Motion, exactly like runtime.
+                PreviewTrailCompanion::FlyingKitty => (!spec.reduced_motion)
+                    .then(|| kitty_layer(&spec.post_fx.kitty_asset))
+                    .flatten(),
+                PreviewTrailCompanion::None => None,
+            }
+        };
+        if let Some((sprites, atlas)) = companion {
+            input.free_sprites = sprites;
+            input.free_atlas = Some(atlas);
+        }
     }
 
     let input = Arc::new(input);
@@ -2200,6 +2292,70 @@ fn kitty_layer(
             Some(render(&mut decorations))
         }
         crate::app_config::KittySpriteAsset::Invalid { .. } => None,
+    }
+}
+
+fn pet_layer(
+    species: aterm_effects::kitty_pet::PetSpecies,
+) -> Option<(
+    Vec<aterm_core::render::FreeSprite>,
+    Arc<aterm_core::render::SceneAtlas>,
+)> {
+    use std::sync::OnceLock;
+
+    use aterm_effects::kitty_pet::{PET_DEPARTURES_MAX, PET_MOTES_MAX, PetAction, PetFrame};
+    use aterm_effects::word_decorations::{EffectGeom, PetCursorFrame, WordDecorations};
+
+    type Layer = Option<(
+        Vec<aterm_core::render::FreeSprite>,
+        Arc<aterm_core::render::SceneAtlas>,
+    )>;
+    static CAT: OnceLock<Layer> = OnceLock::new();
+    static DOG: OnceLock<Layer> = OnceLock::new();
+
+    let render = || {
+        let mut decorations = WordDecorations::default();
+        let mut sprites = Vec::new();
+        let pose = species.skin(aterm_effects::pet_glyphs_gen::PetGlyphId::PetSit);
+        let _ = decorations.pet_cursor(
+            PetCursorFrame {
+                geom: EffectGeom {
+                    cell_w: 8,
+                    cell_h: 18,
+                    rows: 5,
+                    cols: 32,
+                },
+                colors: aterm_effects::cat_baker::CatColorKey::default(),
+                coat: 0,
+                iris: 0,
+                pet: PetFrame {
+                    alpha: 255,
+                    // A static preview: no arrival ramp is in flight, so the
+                    // lane byte and the body byte are the same presence.
+                    lane_alpha: 255,
+                    action: PetAction::Sit,
+                    pose,
+                    col: 1.0,
+                    row: 1.0,
+                    lift: 0.0,
+                    facing_left: false,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    purr: 0.0,
+                    under_ink: false,
+                    motes: [None; PET_MOTES_MAX],
+                    departures: [None; PET_DEPARTURES_MAX],
+                },
+            },
+            &mut sprites,
+        );
+        let atlas = decorations.free_atlas()?;
+        (!sprites.is_empty()).then_some((sprites, atlas))
+    };
+
+    match species {
+        aterm_effects::kitty_pet::PetSpecies::Cat => CAT.get_or_init(render).clone(),
+        aterm_effects::kitty_pet::PetSpecies::Dog => DOG.get_or_init(render).clone(),
     }
 }
 
@@ -3822,6 +3978,118 @@ mod tests {
         assert!(output.trail.is_empty());
     }
 
+    fn rainbow_cursor(raw: &'static str) -> CursorPreviewSpec {
+        CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::RainbowKitty,
+            trail_style_raw: Arc::from(raw),
+            ..CursorPreviewSpec::default()
+        }
+    }
+
+    #[test]
+    fn rainbow_preview_preserves_underline_and_tall_geometry_identity() {
+        let theme = Theme::default();
+        let underline = rainbow_cursor("rainbow kitty underline");
+        let tall = rainbow_cursor("rainbow kitty tall");
+
+        assert!(!underline.glow_config(theme, 0.5).ribbon_tall);
+        assert!(tall.glow_config(theme, 0.5).ribbon_tall);
+        assert_eq!(
+            underline.effective_trail_style_raw(),
+            "rainbow kitty underline"
+        );
+        assert_eq!(tall.effective_trail_style_raw(), "rainbow kitty tall");
+        assert_ne!(
+            SettingsPreviewSpec::cursor(underline).paint_fingerprint(),
+            SettingsPreviewSpec::cursor(tall).paint_fingerprint(),
+            "geometry variants cannot alias in the retained preview cache"
+        );
+    }
+
+    #[test]
+    fn preview_cache_identity_preserves_case_visible_style_text() {
+        let lower = SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty flying"));
+        let authored = SettingsPreviewSpec::cursor(rainbow_cursor("Rainbow Kitty Flying"));
+        assert_ne!(
+            lower.paint_fingerprint(),
+            authored.paint_fingerprint(),
+            "case-visible badge text cannot alias in the retained preview cache"
+        );
+    }
+
+    #[test]
+    fn rainbow_preview_preserves_pet_dog_and_flying_companion_identity() {
+        use aterm_effects::kitty_pet::PetSpecies;
+        use std::hash::{Hash, Hasher};
+
+        for (raw, expected) in [
+            (
+                "rainbow kitty pet",
+                PreviewTrailCompanion::Pet(PetSpecies::Cat),
+            ),
+            (
+                "rainbow dog pet",
+                PreviewTrailCompanion::Pet(PetSpecies::Dog),
+            ),
+            ("rainbow kitty flying", PreviewTrailCompanion::FlyingKitty),
+        ] {
+            let cursor = rainbow_cursor(raw);
+            assert_eq!(cursor.trail_companion(), expected, "{raw}");
+            assert_eq!(cursor.effective_trail_style_raw(), raw, "{raw}");
+        }
+
+        let (cat_sprites, cat_atlas) = pet_layer(PetSpecies::Cat).expect("cat preview layer");
+        let (dog_sprites, dog_atlas) = pet_layer(PetSpecies::Dog).expect("dog preview layer");
+        assert!(!cat_sprites.is_empty() && !cat_atlas.rgba.is_empty());
+        assert!(!dog_sprites.is_empty() && !dog_atlas.rgba.is_empty());
+        assert_ne!(
+            cat_atlas.rgba.as_slice(),
+            dog_atlas.rgba.as_slice(),
+            "species must change pixels"
+        );
+        let fingerprint = |rgba: &[u8]| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            rgba.hash(&mut hash);
+            hash.finish()
+        };
+        assert_ne!(fingerprint(&cat_atlas.rgba), fingerprint(&dog_atlas.rgba));
+    }
+
+    #[test]
+    fn reduced_motion_preview_keeps_resident_pets_but_suppresses_flight() {
+        let reduced_input = |raw: &'static str| {
+            build_terminal_specimen_input(
+                &SettingsPreviewSpec::cursor(rainbow_cursor(raw)).with_reduced_motion(true),
+                Theme::default(),
+            )
+            .0
+        };
+
+        for raw in ["rainbow kitty pet", "rainbow dog pet"] {
+            let input = reduced_input(raw);
+            assert!(
+                !input.free_sprites.is_empty() && input.free_atlas.is_some(),
+                "{raw} remains a static resident under Reduced Motion"
+            );
+        }
+
+        let flying = reduced_input("rainbow kitty flying");
+        assert!(
+            flying.free_sprites.is_empty() && flying.free_atlas.is_none(),
+            "ordinary flying-kitty motion stays suppressed"
+        );
+
+        let (live_flying, _) = build_terminal_specimen_input(
+            &SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty flying")),
+            Theme::default(),
+        );
+        assert!(
+            !live_flying.free_sprites.is_empty() && live_flying.free_atlas.is_some(),
+            "negative control: the selected flying companion is drawable outside Reduced Motion"
+        );
+    }
+
     #[test]
     fn custom_pack_preview_uses_the_shared_engine_and_pack_identity() {
         let synthwave = compile_pack(include_str!(
@@ -4003,14 +4271,26 @@ mod tests {
         assert!(value.contains("fire shimmer"));
         assert!(value.contains("no panel-headroom claim"));
         assert!(value.contains("SDR boost"));
-        assert!(value.contains("rainbow kitty trail"));
+        // Named from the SHIPPED default rather than spelled again here: the
+        // preview's whole claim is that it describes what the product actually
+        // does, so the token it prints has to be the one an unset
+        // `cursor_trail_style` resolves to. Spelling it twice is how this
+        // assertion came to outlive the default it was written for — the
+        // companion joined the default and the literal stayed behind.
+        assert!(
+            value.contains(&format!(
+                "{} trail",
+                crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE
+            )),
+            "the audit value must name the shipped default trail style: {value}"
+        );
 
         let rainbow_kitty = SettingsPreviewSpec::cursor(CursorPreviewSpec {
             trail_style: PreviewTrailStyle::RainbowKitty,
             ..CursorPreviewSpec::default()
         })
         .audit_value();
-        assert!(rainbow_kitty.contains("Nyan ribbon geometry"));
+        assert!(rainbow_kitty.contains("resident cat companion"));
         assert!(rainbow_kitty.contains("built-in CatBaker asset ready"));
         assert!(!rainbow_kitty.contains("not simulated"));
 

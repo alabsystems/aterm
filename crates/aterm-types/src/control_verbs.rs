@@ -254,7 +254,10 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "search <pat> [case] [regex]: full-history find, one \"<row> <col> <len>\" per match",
+        "search <pat> [case] [regex]: full-history find, one \"<row> <col> <len>\" per match \
+         (a hit straddling a SOFT WRAP is one match whose col+len runs past the grid width \
+         and continues at column 0 of the next row; regex ^ and $ bind to the reader's \
+         LOGICAL line, so a continuation row has no ^ of its own)",
     ),
     v(
         "selection",
@@ -308,7 +311,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "record N seconds (0.5..=60) of the front window's WSI-SUBMITTED destination frames -> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input aimed at the tab ON SCREEN — `key`, `ctrl`, `send`, `feed`, `paste`, flagless OR an explicit `@<sid>` naming the front tab — each stamped on the frame clock. A verb aimed at a BACKGROUND session egresses on the control thread and CANNOT be logged (`@self` expands to that when the driving session is not front); those attempts are COUNTED instead and reported as `unlogged_inputs=` on the reply line, live as `unlogged=` on `video status`, and in index.json meta, so an empty inputs[] is never ambiguous. Drive the FRONT tab when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; retention converges to 8 eligible completed recordings while preserving fresh/live handoffs. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized= keys=, and for a keys take the RUNNING inputs= unlogged= so a driver learns mid-take that it is driving an unloggable path); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms, plus keys_requested/inputs_logged/unlogged_inputs. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us (an inputs[] row is `ch` for a character or `key` for a named key like ArrowUp/Escape); cadence gaps = frames[].t_us deltas vs ~16667",
+        "record N seconds (0.5..=60) of the front window's WSI-SUBMITTED destination frames -> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input aimed at the tab ON SCREEN — `key`, `ctrl`, `send`, `feed`, `paste`, flagless OR an explicit `@<sid>` naming the front tab — each stamped on the frame clock. A verb aimed at a BACKGROUND session egresses on the control thread and CANNOT be logged (`@self` expands to that when the driving session is not front), and input that lands on a WINDOW this take is not capturing (the front window changed mid-take — an `aterm ctl spawn` alone does it) has no frame here that could answer it; those attempts are COUNTED instead and reported as `unlogged_inputs=` on the reply line, live as `unlogged=` on `video status`, and in index.json meta (with the window share broken out as `unlogged_other_window`), so an empty inputs[] is never ambiguous and a logged row is never a key the recorded window never saw. Drive the FRONT tab when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; retention converges to 8 eligible completed recordings while preserving fresh/live handoffs. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized= keys=, and for a keys take the RUNNING inputs= unlogged= so a driver learns mid-take that it is driving an unloggable path); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms, plus keys_requested/inputs_logged/unlogged_inputs. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us (an inputs[] row is `ch` for a character or `key` for a named key like ArrowUp/Escape); cadence gaps = frames[].t_us deltas vs ~16667",
     ),
     v(
         "chrome",
@@ -574,11 +577,21 @@ pub const VERBS: &[VerbSpec] = &[
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= sparks= momentum= momentum_display= speed= \
-         glow_active= pet_active= cat_active=` (every gate from the config knob to the glass, \
-         in the order the frame path walks them, plus the cumulative tally the ring has \
-         forgotten — `licensed=0 declined>0` blames the licence and names why, `licensed>0` \
-         over a dark screen blames everything downstream of it). Read-only; typed text is \
-         never reported",
+         glow_active= pet_active= cat_active= \
+         block_fill= block_fill_rgb= block_fill_base= block_fill_base_from=` (every gate \
+         from the config knob to the glass, in the order the frame path walks them, plus \
+         the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
+         licence and names why, `licensed>0` over a dark screen blames everything \
+         downstream of it). The `block_fill*` four are the BLOCK CURSOR's body, which no \
+         other field covers: a style can take the caret away from the terminal entirely, \
+         and `glow_active=false pet_active=false` over a tinted block is what that looks \
+         like from every other gate. `block_fill=` names the owner the frame actually \
+         painted (`rainbow`/`forge`/`phaser`/`bolt`/`comet`/`droplet`/`beamrod`, or `none` \
+         for the terminal's own cursor colour), `block_fill_rgb=` is the hex it drew, and \
+         `block_fill_base=`/`block_fill_base_from=` are the colour that body was built \
+         FROM and which knob supplied it (`cursor_color`/`trail_color`/`style_identity`) — \
+         so a caret that ignored OSC 12 is separable from one that honoured it. Read-only; \
+         typed text is never reported",
     ),
     // Read-only observability for SELECTION/VIEWPORT CUSTODY: which of the eleven
     // custody-moving events last fired. Several of them leave identical state behind
@@ -1063,6 +1076,25 @@ mod tests {
         assert!(!artifact_reply_requires_ack("text", "text"));
         assert!(valid_artifact_ack_nonce("00112233445566778899aabbccddeeff"));
         assert!(!valid_artifact_ack_nonce("artifact"));
+    }
+
+    /// `search` matches whole soft-wrapped runs, so two things about a match are
+    /// not what a row-at-a-time reader would assume: a hit can run past the grid
+    /// width, and `^`/`$` bind to the reader's logical line rather than to a grid
+    /// row. A client that knows neither reads the wrong cells and calls find
+    /// broken, so the help line has to carry both — this is the seam that keeps
+    /// the catalog honest about the semantics the engine actually implements.
+    #[test]
+    fn search_help_states_where_a_wrapped_match_runs_and_where_anchors_bind() {
+        let help = spec("search").unwrap().help;
+        assert!(
+            help.contains("SOFT WRAP") && help.contains("col+len"),
+            "the help must say a straddling hit's col+len runs past the width"
+        );
+        assert!(
+            help.contains("^") && help.contains("$") && help.contains("LOGICAL"),
+            "the help must say regex anchors bind to the logical line"
+        );
     }
 
     #[test]

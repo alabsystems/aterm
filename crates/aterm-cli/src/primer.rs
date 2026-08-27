@@ -97,6 +97,13 @@ const SKILL_MARK_PREFIX: &str = "<!-- aterm skill";
 /// single source of truth — there is no separate file to forget to update.
 const DRIVE_SKILL_BODY: &str = include_str!("../assets/drive-aterm-skill.md");
 
+/// The `supervise-agent` skill: the SUPERVISION layer over `drive-aterm` — how an
+/// agent runs the persistent sweep/classify/review/wait loop over a WORKER
+/// session, reviewing each turn against ground truth (not the screen) with a
+/// turn budget, a no-progress breaker, and human-escalation. Compiled in from the
+/// repo asset, same single-source-of-truth rule as the drive skill.
+const SUPERVISE_SKILL_BODY: &str = include_str!("../assets/supervise-agent-skill.md");
+
 /// One managed skill file: `dir_rel` is the agent-relative skills subdirectory,
 /// `body` the compiled-in content.
 struct SkillFile {
@@ -111,10 +118,16 @@ struct SkillFile {
 /// in [`AGENT_FILES`] get the primer only. Extend here when they grow one.
 fn skills_for(agent: &str) -> &'static [SkillFile] {
     match agent {
-        "claude" => &[SkillFile {
-            path: ".claude/skills/drive-aterm/SKILL.md",
-            body: DRIVE_SKILL_BODY,
-        }],
+        "claude" => &[
+            SkillFile {
+                path: ".claude/skills/drive-aterm/SKILL.md",
+                body: DRIVE_SKILL_BODY,
+            },
+            SkillFile {
+                path: ".claude/skills/supervise-agent/SKILL.md",
+                body: SUPERVISE_SKILL_BODY,
+            },
+        ],
         _ => &[],
     }
 }
@@ -767,38 +780,48 @@ mod tests {
     /// silently disables the whole feature if the asset is edited carelessly.
     #[test]
     fn bundled_skill_carries_its_managed_marker() {
-        assert!(
-            DRIVE_SKILL_BODY
-                .lines()
-                .any(|l| l.trim_start().starts_with(SKILL_MARK_PREFIX)),
-            "the shipped skill lost its `{SKILL_MARK_PREFIX}` marker line"
-        );
-        assert_eq!(
-            skill_state(DRIVE_SKILL_BODY, DRIVE_SKILL_BODY),
-            SkillState::Current,
-            "the shipped body must classify as Current against itself"
-        );
+        // Every bundled skill (drive-aterm, supervise-agent, …) must carry the
+        // marker, or its install would classify it `Foreign` and refuse to write.
+        for s in skills_for("claude") {
+            assert!(
+                s.body
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(SKILL_MARK_PREFIX)),
+                "{} lost its `{SKILL_MARK_PREFIX}` marker line",
+                s.path
+            );
+            assert_eq!(
+                skill_state(s.body, s.body),
+                SkillState::Current,
+                "{} must classify as Current against itself",
+                s.path
+            );
+        }
     }
 
     /// The skill must be a valid Claude Code skill: YAML frontmatter with a
     /// `name:` and a `description:` (the fields the harness matches on).
     #[test]
     fn bundled_skill_has_usable_frontmatter() {
-        let mut lines = DRIVE_SKILL_BODY.lines();
-        assert_eq!(
-            lines.next().map(str::trim),
-            Some("---"),
-            "must open with frontmatter"
-        );
-        let head: Vec<&str> = DRIVE_SKILL_BODY.lines().take(12).collect();
-        assert!(
-            head.iter().any(|l| l.starts_with("name:")),
-            "frontmatter needs name:"
-        );
-        assert!(
-            head.iter().any(|l| l.starts_with("description:")),
-            "frontmatter needs description: (it is what triggers the skill)"
-        );
+        for s in skills_for("claude") {
+            assert_eq!(
+                s.body.lines().next().map(str::trim),
+                Some("---"),
+                "{} must open with frontmatter",
+                s.path
+            );
+            let head: Vec<&str> = s.body.lines().take(12).collect();
+            assert!(
+                head.iter().any(|l| l.starts_with("name:")),
+                "{} frontmatter needs name:",
+                s.path
+            );
+            assert!(
+                head.iter().any(|l| l.starts_with("description:")),
+                "{} frontmatter needs description: (it is what triggers the skill)",
+                s.path
+            );
+        }
     }
 
     /// The skill states must be distinguishable — especially `Foreign`, which is
@@ -822,7 +845,17 @@ mod tests {
     /// such concept.
     #[test]
     fn skills_are_registered_only_for_agents_that_have_them() {
-        assert_eq!(skills_for("claude").len(), 1);
+        // Claude Code ships two bundled skills today: drive-aterm + supervise-agent.
+        assert_eq!(skills_for("claude").len(), 2);
+        assert!(
+            skills_for("claude")
+                .iter()
+                .any(|s| s.path.ends_with("drive-aterm/SKILL.md"))
+                && skills_for("claude")
+                    .iter()
+                    .any(|s| s.path.ends_with("supervise-agent/SKILL.md")),
+            "both drive-aterm and supervise-agent must be registered"
+        );
         for a in AGENT_FILES.iter().filter(|a| a.name != "claude") {
             assert!(
                 skills_for(a.name).is_empty(),

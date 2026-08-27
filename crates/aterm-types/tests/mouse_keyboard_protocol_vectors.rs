@@ -27,11 +27,21 @@ fn executable_mouse_protocol_vectors_cover_supported_encodings() {
     );
 }
 
+/// An out-of-range X10 coordinate is CLAMPED inside the X10 frame — the
+/// encoder never promotes the report to a format the application did not
+/// enable. (It used to emit `ESC [ < 0 ; 401 ; 301 M`, the SGR 1006 form,
+/// which an app that set only DECSET 1000 cannot parse.)
 #[test]
-fn x10_large_coordinates_fall_back_to_sgr() {
+fn x10_large_coordinates_clamp_inside_the_x10_frame() {
     assert_eq!(
         encode_mouse(0, 400, 300, MouseEncoding::X10, false),
-        b"\x1b[<0;401;301M"
+        vec![0x1b, b'[', b'M', 32, 255, 255]
+    );
+    // The last IN-RANGE position encodes to the same maximum byte — the clamp
+    // saturates at the frame's ceiling rather than wrapping through it.
+    assert_eq!(
+        encode_mouse(0, 222, 222, MouseEncoding::X10, false),
+        vec![0x1b, b'[', b'M', 32, 255, 255]
     );
 }
 

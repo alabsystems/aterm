@@ -394,6 +394,62 @@ fn gpu_dirty_gate_one_cell_change_after_hit() {
     );
 }
 
+/// The frame-carried host/effect cursor shape is part of the GPU gate's cached
+/// input. A stationary None↔Bolt transition must miss (and repaint), while an
+/// identical settled effect frame may hit. `clear_overlays` must miss again and
+/// restore the terminal DECSCUSR pixels rather than returning the stale Bolt.
+#[test]
+fn gpu_dirty_gate_tracks_cursor_effect_style_override_and_plain_clear() {
+    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut win = aterm_gpu::WindowGpu::new();
+    gpu.set_cursor_blink_phase(true);
+    gpu.set_cursor_style_override(None);
+
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"\x1b[4 q"); // terminal owns steady underline
+    let plain = term.cell_frame(ROWS, COLS);
+
+    let _ = gpu.render_input_cached(&mut win, &plain);
+    let hits_before = gpu.gate_hits();
+    let _ = gpu.render_input_cached(&mut win, &plain);
+    assert!(
+        gpu.gate_hits() > hits_before,
+        "settled plain frame must hit"
+    );
+
+    let mut effect = plain.clone();
+    effect.cursor_effect_style_override = Some(CursorStyle::Bolt);
+    let misses_before = gpu.gate_misses();
+    let effect_pixels = gpu.render_input_cached(&mut win, &effect).pixels().to_vec();
+    assert!(
+        gpu.gate_misses() > misses_before,
+        "stationary effect-shape transition must miss"
+    );
+    assert_eq!(effect_pixels, fresh_render(&effect, true, None));
+
+    let hits_before = gpu.gate_hits();
+    let _ = gpu.render_input_cached(&mut win, &effect);
+    assert!(
+        gpu.gate_hits() > hits_before,
+        "settled effect frame must hit"
+    );
+
+    let mut cleared = effect.clone();
+    cleared.clear_overlays();
+    assert_eq!(cleared.cursor_effect_style_override, None);
+    assert_eq!(cleared.cursor_style, CursorStyle::SteadyUnderline);
+    let misses_before = gpu.gate_misses();
+    let cleared_pixels = gpu
+        .render_input_cached(&mut win, &cleared)
+        .pixels()
+        .to_vec();
+    assert!(
+        gpu.gate_misses() > misses_before,
+        "plain clear after a settled effect must miss"
+    );
+    assert_eq!(cleared_pixels, fresh_render(&plain, true, None));
+}
+
 /// PHOSPHOR rain through the dirty gate (design §10): a SETTLED (fp-stable)
 /// rain frame must take the gate, and a DRAINED field must settle back to
 /// gate-hits — both byte-identical to a fresh full render. Sequence on one

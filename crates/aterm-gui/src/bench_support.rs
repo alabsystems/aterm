@@ -325,13 +325,9 @@ impl BenchApp {
             trail_fp: out.trail_fp,
             glow_enabled: out.glow_cfg.enabled,
             trail_color: out.trail_color,
-            any_fill: out.forge_fill.is_some()
-                || out.rainbow_fill.is_some()
-                || out.droplet_fill.is_some()
-                || out.beamrod_fill.is_some()
-                || out.comet_fill.is_some()
-                || out.phaser_fill.is_some()
-                || out.bolt_fill.is_some(),
+            // The benchmark witnesses what a renderer can actually receive,
+            // after precedence and the shared presentation-opacity projection.
+            any_fill: out.block_fill.is_some(),
             bolt_cursor: out.bolt_cursor,
             twinkle_cursor: out.twinkle_cursor,
         }
@@ -347,6 +343,92 @@ impl BenchApp {
         self.app
             .redraw_compose(self.wid, 24, 80, false, false, None, 0, now)
             .is_some()
+    }
+
+    /// [`Self::compose`] at an EXPLICIT window cell grid — the same shipping
+    /// entry, sized. `compose` hard-codes the unit suite's 24x80; a split
+    /// workload that means to price a REAL desktop pane has to say so, and the
+    /// window's own `rows`/`cols` (what `compute_layout` divides into pane
+    /// rectangles) must agree with the arguments or the panes would be laid
+    /// out against one grid and the composed scratch sized to another.
+    pub fn compose_at(&mut self, rows: u16, cols: u16, now: Instant) -> bool {
+        self.set_grid(rows, cols);
+        self.app
+            .redraw_compose(
+                self.wid,
+                usize::from(rows),
+                usize::from(cols),
+                false,
+                false,
+                None,
+                0,
+                now,
+            )
+            .is_some()
+    }
+
+    /// THE COMPOSE A/B's PRE-FIX ARM, in ONE binary: disown the focused pane's
+    /// resident engine buffer so its next extraction cannot chain, exactly as
+    /// the historical `cell_frame_into` + `take_damage` pair could not.
+    ///
+    /// This is the split twin of [`Self::strip_present`]'s `unsplice: false`
+    /// leg. The poke is the ordinary host-mutator disown — one `snapshot_seq`
+    /// bump past `engine_fill_seq`, the same thing the IME overlay and the
+    /// prediction ghosts owe — so the extraction it precedes takes the carrier's
+    /// FULL arm, which IS the historical pair (`cell_frame_fill(None)` +
+    /// `take_damage`). The two arms are otherwise byte-identical work in one
+    /// binary: same fixture, same panes, same blit, same decorations.
+    ///
+    /// Called from the workload's UNTIMED arm, beside the keystroke echo — the
+    /// bump is not work any shipping frame does, so it must not sit inside the
+    /// timed span. It costs the FULL arm the carrier's O(1) continuity check on
+    /// top of the historical pair, which is a handful of scalar compares against
+    /// a whole-grid resolve; the A/B therefore reads a hair GENEROUS to the
+    /// scoped arm, in the only direction that is honest to state.
+    pub fn disown_focus_scratch(&mut self) {
+        let ws = self.ws_mut();
+        ws.composed_focus_scratch.snapshot_seq =
+            ws.composed_focus_scratch.snapshot_seq.wrapping_add(1);
+    }
+
+    /// Feed ONE keystroke echo into the pane the compose path treats as focused
+    /// — the split workloads' untimed arm.
+    ///
+    /// Real damage every tick, exactly ONE damaged row, no wrap and no scroll (a
+    /// wrap would advance `base_y` and honestly force the full arm on BOTH
+    /// sides, which would price two identical full re-extracts against each
+    /// other). The mirror of [`Self::strip_echo`], aimed at the focused session
+    /// instead of session 0.
+    pub fn split_echo(&mut self, tick: &mut u8) {
+        *tick = tick.wrapping_add(1);
+        let bytes: &[u8] = if tick.is_multiple_of(2) {
+            b"\rx"
+        } else {
+            b"\ry"
+        };
+        let sid = self.focus_session();
+        self.feed(sid, bytes);
+    }
+
+    /// The session the active tab's layout tree has FOCUSED — the pane whose
+    /// extraction the compose path runs at LOCK A.
+    #[must_use]
+    pub fn focus_session(&self) -> u64 {
+        let ws = self.ws();
+        ws.layouts[ws.tabs.active].focus()
+    }
+
+    /// THE REACH WITNESS for any compose-path extraction work: `(scoped, full)`
+    /// presented-path frame refills counted process-wide since start. Callers
+    /// take DELTAS across a scripted window. Every pane that extracts through
+    /// the DMG-1
+    /// carrier reports its arm here (`metrics::note_frame_refill`), so a
+    /// workload can assert the share it claims to have moved instead of
+    /// trusting that the carrier armed.
+    #[must_use]
+    pub fn refill_arms(&self) -> (u64, u64) {
+        let m = crate::metrics::snapshot();
+        (m.frame_refills_scoped, m.frame_refills_full)
     }
 
     /// ONE headless single-pane rastered frame, modeled exactly as the scout

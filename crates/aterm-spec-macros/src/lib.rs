@@ -130,6 +130,82 @@ fn sanitize_ident(s: &str) -> String {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// EXECUTION-EVIDENCE PROBE (the runnable half of obligation 2).
+//
+// `#[refines]` used to leave the annotated fn 100% unchanged, which is exactly why
+// a green closure gate was a claim about STRINGS: nothing tied the anchor to a fn
+// that performs the action, and an anchor moved onto `Terminal::is_tmux_mode_active()`
+// (body: `false`, callers: none) kept the gate green.
+//
+// So the emitter now ALSO injects, as the FIRST statement of the annotated fn's
+// body, `::aterm_spec::xref::note_entered("<machine>::<action> @ <fn>")`. The id is
+// the same literal the submitted `RefinementAnchor` carries in `entry_id`, emitted
+// from this one expansion, so the probe and the record cannot drift. A gate resets
+// the thread-local record, runs the machine's Tier-1 conformance, and requires every
+// anchor of that machine to have been entered.
+//
+// COST. Nothing changes for a shipping build: the anchors are applied through
+// `#[cfg_attr(any(test, feature = "spec-anchors"), aterm_spec::refines(…))]`, so when
+// that cfg is off the ATTRIBUTE ITSELF is stripped, this macro never runs, and no probe
+// exists to optimize away.
+//
+// BEHAVIOUR. The injection is a statement prepended inside the existing block, so the
+// fn's signature, generics, receiver (including `self` by value), return type and
+// tail expression are untouched; an early `return`, a `?`, a recursive call and a
+// diverging body all still do exactly what they did. A fn carrying SEVERAL anchors
+// gets several probes: attribute macros expand outside-in, so each expansion prepends
+// its own statement to the body the next one will see.
+//
+// NOT INSTRUMENTABLE. Two shapes get no probe and are reported as such (`entry_id: ""`):
+//   * a `const fn` — its body may not call a non-const fn, and adding one would be a
+//     compile error rather than a check (aterm-gpu's `video_slot_transition` and friends
+//     are const);
+//   * anything that is not a fn with a block (e.g. a bodyless trait method).
+// `entry_id: ""` is NOT a pass — a gate demanding execution evidence must fail on it,
+// or parking an anchor on a `const fn` would be a way to opt out of the check.
+// ---------------------------------------------------------------------------
+
+/// The execution-evidence key for one anchor: `"<machine>::<action> @ <rust_method>"`.
+/// Human-readable because it is what a failing gate prints.
+fn entry_id_for(machine: &str, action: &str, rust_method: &str) -> String {
+    format!("{machine}::{action} @ {rust_method}")
+}
+
+/// Prepend the entry probe to the annotated fn's body.
+///
+/// Returns `None` when the item is not an instrumentable fn (see the module note
+/// above); the caller then emits `entry_id: ""` so the gate can see the gap instead of
+/// mistaking an unprobed anchor for an entered one.
+fn inject_entry_probe(
+    item: &proc_macro2::TokenStream,
+    entry_id: &str,
+) -> Option<proc_macro2::TokenStream> {
+    let probe: syn::Stmt = syn::parse_quote! {
+        ::aterm_spec::xref::note_entered(#entry_id);
+    };
+    // `ImplItemFn` covers both the `impl`-block methods the anchors mostly sit on and
+    // free fns (same shape: attrs, vis, defaultness, sig, block); `ItemFn` is the
+    // belt-and-braces fallback. Inner attributes (`fn f() { #![allow(…)] … }`) are
+    // parsed onto the item by syn and re-printed inside the braces, so prepending at
+    // `stmts[0]` cannot displace them.
+    if let Ok(mut f) = syn::parse2::<syn::ImplItemFn>(item.clone()) {
+        if f.sig.constness.is_some() {
+            return None;
+        }
+        f.block.stmts.insert(0, probe);
+        return Some(quote! { #f });
+    }
+    if let Ok(mut f) = syn::parse2::<syn::ItemFn>(item.clone()) {
+        if f.sig.constness.is_some() {
+            return None;
+        }
+        f.block.stmts.insert(0, probe);
+        return Some(quote! { #f });
+    }
+    None
+}
+
 #[proc_macro_attribute]
 pub fn refines(attr: TokenStream, item: TokenStream) -> TokenStream {
     let meta = syn::parse_macro_input!(attr as RefinesMeta);
@@ -149,8 +225,17 @@ pub fn refines(attr: TokenStream, item: TokenStream) -> TokenStream {
     let machine = meta.machine;
     let action = meta.action;
     let project = meta.project.unwrap_or_default();
+    // Execution evidence: probe the annotated body and record the SAME id on the
+    // anchor, so the gate can ask "did this fn actually run?" and not just "does this
+    // string exist?". An un-probeable item keeps the old behaviour (item verbatim) and
+    // says so with an empty `entry_id`.
+    let candidate_id = entry_id_for(&machine, &action, &rust_method);
+    let (item_out, entry_id) = match inject_entry_probe(&item2, &candidate_id) {
+        Some(probed) => (probed, candidate_id),
+        None => (item2, String::new()),
+    };
     quote! {
-        #item2
+        #item_out
         #[allow(non_upper_case_globals)]
         const #const_name: () = {
             ::aterm_spec::inventory::submit! {
@@ -160,6 +245,7 @@ pub fn refines(attr: TokenStream, item: TokenStream) -> TokenStream {
                     rust_method: #rust_method,
                     location: concat!(file!(), ":", line!()),
                     project: #project,
+                    entry_id: #entry_id,
                 }
             }
         };

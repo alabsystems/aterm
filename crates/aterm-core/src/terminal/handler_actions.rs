@@ -25,6 +25,7 @@ use super::{TerminalHandler, Vt52CursorState};
 
 impl ActionSink for TerminalHandler<'_> {
     fn print(&mut self, c: char) {
+        self.note_sync_open_action();
         // Handle VT52 cursor addressing state
         match self.transient.vt52_cursor_state {
             Vt52CursorState::WaitingRow => {
@@ -55,6 +56,7 @@ impl ActionSink for TerminalHandler<'_> {
     /// 2. Fast: Styled but no RGB/hyperlinks/insert, autowrap → `write_ascii_run_styled`
     /// 3. Fallback: Per-character `write_char` for complex cases
     fn print_ascii_bulk(&mut self, data: &Provenance<[u8], Pty>) {
+        self.note_sync_open_action();
         let data = data.as_ref();
         // Blockers that require per-character processing
         if self.transient.vt52_cursor_state != Vt52CursorState::None {
@@ -107,6 +109,7 @@ impl ActionSink for TerminalHandler<'_> {
     /// Amortizes per-character overhead (charset, clipboard, style checks)
     /// over the entire run. Falls back to per-character for complex cases.
     fn print_unicode_bulk(&mut self, chars: &Provenance<[char], Pty>) {
+        self.note_sync_open_action();
         let chars = chars.as_ref();
         // VT52 cursor addressing consumes characters specially
         if self.transient.vt52_cursor_state != Vt52CursorState::None {
@@ -147,6 +150,7 @@ impl ActionSink for TerminalHandler<'_> {
     ///
     /// See `docs/ESCAPE_SEQUENCE_MATRIX.md` for complete control code coverage.
     fn execute(&mut self, byte: u8) {
+        self.note_sync_open_action();
         // Per VT220 spec: a control character arriving mid-sequence cancels
         // any in-progress ESC Y cursor addressing (VT52 mode).
         if self.transient.vt52_cursor_state != Vt52CursorState::None {
@@ -295,6 +299,10 @@ impl ActionSink for TerminalHandler<'_> {
         intermediates: &Provenance<[u8], Pty>,
         final_byte: u8,
     ) {
+        // Mark BEFORE dispatch. The opening `?2026h` observes the old inactive
+        // level and therefore starts clean; a redundant `?2026h` inside an
+        // already-dirty window cannot launder the dirty bit.
+        self.note_sync_open_action();
         self.sync_absolute_row_metadata();
         let params = params.as_ref();
         let intermediates = intermediates.as_ref();
@@ -344,6 +352,7 @@ impl ActionSink for TerminalHandler<'_> {
         final_byte: u8,
         subparam_mask: u32,
     ) {
+        self.note_sync_open_action();
         if self.modes.vt52_mode {
             return;
         }
@@ -360,12 +369,14 @@ impl ActionSink for TerminalHandler<'_> {
 
     /// Dispatch ESC (Escape) sequences.
     fn esc_dispatch(&mut self, intermediates: &Provenance<[u8], Pty>, final_byte: u8) {
+        self.note_sync_open_action();
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
         self.esc_dispatch_core(&cap, intermediates.as_ref(), final_byte);
     }
 
     /// Dispatch OSC (Operating System Command) escape sequences.
     fn osc_dispatch(&mut self, params: &Provenance<[&[u8]], Pty>) {
+        self.note_sync_open_action();
         self.sync_absolute_row_metadata();
         // VT52 mode has no OSC sequences — silently ignore.
         if self.modes.vt52_mode {
@@ -382,6 +393,7 @@ impl ActionSink for TerminalHandler<'_> {
         params: &Provenance<[&[u8]], Pty>,
         bel_terminated: bool,
     ) {
+        self.note_sync_open_action();
         self.sync_absolute_row_metadata();
         // VT52 mode has no OSC sequences — silently ignore.
         if self.modes.vt52_mode {
@@ -429,6 +441,7 @@ impl ActionSink for TerminalHandler<'_> {
     /// the half-decoded image rather than rendering it (DECRQSS/XTGETTCAP are
     /// unaffected — their finalization is idempotent on an empty buffer).
     fn dcs_unhook(&mut self, canceled: bool) {
+        self.note_sync_open_action();
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
         self.dcs_unhook_inner(&cap, canceled);
     }
@@ -504,6 +517,7 @@ impl ActionSink for TerminalHandler<'_> {
     }
 
     fn apc_end(&mut self) {
+        self.note_sync_open_action();
         // Kitty graphics (APC 'G'): parse the accumulated payload and handle it
         // (transmit/store, transmit-and-display, put, delete). `parse_kitty_command`
         // returns an OWNED command (payload cloned), so the borrow on `dcs.data` is

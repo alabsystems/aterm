@@ -277,6 +277,142 @@ impl KittyLook {
     }
 }
 
+/// THE SUFFICIENT-DIFFERENCE FLOOR for two coats, in [`coat_distance`]
+/// units (resolved-RGB Euclidean, 0–255 channels): below it, two coats are
+/// close enough that a costume swap between them reads as noise, and an
+/// arrival ceremony would announce nothing a viewer can see.
+///
+/// Derivation — measured over the live ramp and dark-background lift, not
+/// taste. 40 is the knee that:
+///   • catches all six dark-collapse pairs among coats {0,1,2,3} (post-lift
+///     they sit within 2.9 of each other, while raw ramp RGB claims up to
+///     105) and the six adjacent warm-ramp pairs (6,7) (7,8) (8,9) (9,10)
+///     (10,11) (11,12) — the similarity-ordered ramp's deliberate
+///     near-twins;
+///   • keeps every genuine family crossing: ginger-vs-cream (12,13) at
+///     59.8 stays sufficient (a floor of 60 would demote it);
+///   • demotes 22 of the 120 coat pairs — 1 856 of the 8 128 unordered
+///     pairs of the 128-cell `(coat, iris)` space, 22.8 %;
+///   • never touches a flagship: the claude/codex/agy trio's minimum
+///     pairwise [`coat_distance`] is 163.5 (claude–agy, on a dark
+///     background), 4× this floor — no flagship pair demotes under any
+///     candidate floor up to ~160.
+pub const SUFFICIENT_DIFFERENCE: f32 = 40.0;
+
+/// The precomputed [`coat_distance`] table. Each cell is
+/// `min(dist(COAT_RAMP[a], COAT_RAMP[b]), dist(lift(COAT_RAMP[a]),
+/// lift(COAT_RAMP[b])))` — the minimum over the two background classes of
+/// the Euclidean RGB distance (0–255 channels) between the RESOLVED coat
+/// stops, where `lift` is `cat_baker`'s dark-background luminance rescue
+/// (bands 0|4, floor `COAT_MIN_LUM_DARK_BG`). Precomputed because the lift
+/// is bake-time float math (HSV + a luminance bisection), not
+/// const-evaluable; `coat_distance_table_is_pinned_to_the_live_lift`
+/// re-derives every cell from the living math, so the table cannot drift
+/// from the baker silently.
+#[rustfmt::skip]
+const COAT_DISTANCE: [[f32; 16]; 16] = [
+    [
+        0.0, 2.8093781, 2.0568104, 1.068686, 35.253334, 84.35241, 38.284103, 60.10213,
+        81.077415, 101.84432, 120.05253, 145.46869, 164.0952, 184.17421, 216.38258,
+        259.0521,
+    ],
+    [
+        2.8093781, 0.0, 0.7539005, 1.8053502, 32.862465, 81.92891, 37.79307, 59.51762,
+        79.92146, 100.79885, 119.089264, 144.68791, 163.30513, 182.58707, 214.32759,
+        256.68756,
+    ],
+    [
+        2.0568104, 0.7539005, 0.0, 1.0595087, 33.476418, 82.55651, 37.868793, 59.626038,
+        80.189896, 101.03843, 119.307304, 144.8573, 163.47739, 182.97853, 214.85063,
+        257.29965,
+    ],
+    [
+        1.068686, 1.8053502, 1.0595087, 0.0, 34.22008, 83.31593, 37.80726, 59.601395,
+        80.39209, 101.19558, 119.431786, 144.91122, 163.53357, 183.35428, 215.43098,
+        258.02838,
+    ],
+    [
+        35.253334, 32.862465, 33.476418, 34.22008, 0.0, 49.101936, 30.724583, 44.955532,
+        56.780277, 77.672386, 96.18732, 123.081276, 141.18782, 153.26122, 182.18672,
+        223.83029,
+    ],
+    [
+        84.35241, 81.92891, 82.55651, 83.31593, 49.101936, 0.0, 66.3551, 63.356136,
+        52.64029, 65.00769, 79.517296, 105.214066, 120.45331, 115.00435, 135.7461,
+        174.84564,
+    ],
+    [
+        38.284103, 37.79307, 37.868793, 37.80726, 30.724583, 66.3551, 0.0, 21.84033,
+        44.63183, 64.567795, 82.38932, 107.35455, 125.97619, 149.74979, 186.91174,
+        234.58047,
+    ],
+    [
+        60.10213, 59.51762, 59.626038, 59.601395, 44.955532, 63.356136, 21.84033, 0.0,
+        25.47548, 43.611923, 60.93439, 85.557, 104.16814, 130.43773, 170.78934, 221.3617,
+    ],
+    [
+        81.077415, 79.92146, 80.189896, 80.39209, 56.780277, 52.64029, 44.63183, 25.47548,
+        0.0, 21.189621, 39.749214, 66.4003, 84.723076, 105.68349, 145.93149, 197.43353,
+    ],
+    [
+        101.84432, 100.79885, 101.03843, 101.19558, 77.672386, 65.00769, 64.567795,
+        43.611923, 21.189621, 0.0, 18.574175, 45.453274, 63.600315, 88.09086, 132.81943,
+        187.58731,
+    ],
+    [
+        120.05253, 119.089264, 119.307304, 119.431786, 96.18732, 79.517296, 82.38932,
+        60.93439, 39.749214, 18.574175, 0.0, 27.147743, 45.055523, 74.89326, 123.98387,
+        181.39459,
+    ],
+    [
+        145.46869, 144.68791, 144.8573, 144.91122, 123.081276, 105.214066, 107.35455,
+        85.557, 66.4003, 45.453274, 27.147743, 0.0, 18.841444, 66.64833, 121.19818,
+        181.39735,
+    ],
+    [
+        164.0952, 163.30513, 163.47739, 163.53357, 141.18782, 120.45331, 125.97619,
+        104.16814, 84.723076, 63.600315, 45.055523, 18.841444, 0.0, 59.841457, 115.628716,
+        176.67484,
+    ],
+    [
+        184.17421, 182.58707, 182.97853, 183.35428, 153.26122, 115.00435, 149.74979,
+        130.43773, 105.68349, 88.09086, 74.89326, 66.64833, 59.841457, 0.0, 55.794266,
+        116.9145,
+    ],
+    [
+        216.38258, 214.32759, 214.85063, 215.43098, 182.18672, 135.7461, 186.91174,
+        170.78934, 145.93149, 132.81943, 123.98387, 121.19818, 115.628716, 55.794266, 0.0,
+        61.220913,
+    ],
+    [
+        259.0521, 256.68756, 257.29965, 258.02838, 223.83029, 174.84564, 234.58047,
+        221.3617, 197.43353, 187.58731, 181.39459, 181.39735, 176.67484, 116.9145,
+        61.220913, 0.0,
+    ],
+];
+
+/// THE SUFFICIENT-DIFFERENCE METRIC: how far apart two coat stops actually
+/// look on glass, as the worst case over the two background classes —
+/// `min` of the raw-ramp RGB distance and the distance after `cat_baker`'s
+/// dark-background luminance rescue. The `min` is the law: the raw ramp
+/// LIES on dark themes (the rescue collapses coats 0–3 to within 2.9 of
+/// each other while their raw distances run 20.9–105.3), and a viewer on a
+/// dark background is the common case, so "visibly different" must hold on
+/// the background where the two coats are CLOSEST.
+///
+/// Deliberately NO iris term: the walking pet culls `GlyphRole::Iris`
+/// entirely below `pet_baker::FACE_DETAIL_MIN_H` (56 px tile height —
+/// every 1× display), so an iris term would certify pixel-identical pets
+/// as "visibly different". The pet's whole legible identity is its coat.
+///
+/// Symmetric, zero on the diagonal; out-of-range indices clamp exactly as
+/// [`KittyLook::normalized`] clamps `coat`. Compare against
+/// [`SUFFICIENT_DIFFERENCE`].
+#[must_use]
+pub fn coat_distance(a: u8, b: u8) -> f32 {
+    COAT_DISTANCE[usize::from(a.min(15))][usize::from(b.min(15))]
+}
+
 /// Stable semantic key for an authored glyph. Persist this rather than the Rust
 /// enum discriminant; contributor-added art may change roster ordinals.
 #[must_use]
@@ -560,6 +696,113 @@ pub struct KittySighting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The raw ramp stop `i` as 0–255 float channels.
+    fn raw_stop(i: u8) -> (f32, f32, f32) {
+        let hex = crate::cat_baker::COAT_RAMP[usize::from(i)];
+        (
+            ((hex >> 16) & 0xff) as f32,
+            ((hex >> 8) & 0xff) as f32,
+            (hex & 0xff) as f32,
+        )
+    }
+
+    /// Euclidean RGB distance over 0–255 channels — the [`coat_distance`]
+    /// unit.
+    fn dist(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
+    }
+
+    /// One cell of the metric, re-derived from the LIVING colour math: the
+    /// min over the raw ramp and `cat_baker`'s dark-background lift.
+    fn live_coat_distance(a: u8, b: u8) -> f32 {
+        let lifted = |i: u8| {
+            let (r, g, b) = crate::cat_baker::dark_bg_coat_stop(i);
+            (r * 255.0, g * 255.0, b * 255.0)
+        };
+        dist(raw_stop(a), raw_stop(b)).min(dist(lifted(a), lifted(b)))
+    }
+
+    /// THE TABLE PIN: every cell of the precomputed [`COAT_DISTANCE`] table
+    /// equals the metric re-derived from the live ramp and the live
+    /// dark-background lift (`cat_baker::dark_bg_coat_stop`). If this
+    /// fails, `COAT_RAMP`, `COAT_MIN_LUM_DARK_BG` or the lift itself moved
+    /// and the table must be regenerated WITH it — the table is a cache of
+    /// the baker's law, never a second law. (Tolerance 0.01: the lift's
+    /// luminance bisection rides `powf`, which libm does not promise
+    /// correctly rounded across platforms; a real drift moves cells by
+    /// whole units.)
+    #[test]
+    fn coat_distance_table_is_pinned_to_the_live_lift() {
+        for a in 0..16u8 {
+            for b in 0..16u8 {
+                let live = live_coat_distance(a, b);
+                assert!(
+                    (coat_distance(a, b) - live).abs() < 1e-2,
+                    "cell ({a},{b}): table {} vs live {live}",
+                    coat_distance(a, b)
+                );
+            }
+        }
+    }
+
+    /// THE DARK-COLLAPSE TRUTH: on dark backgrounds the luminance rescue
+    /// collapses coats {0,1,2,3} onto near-identical pale tones, so every
+    /// pair among them is insufficient — even where the raw ramp claims a
+    /// large distance ((0,3) is 105 raw and ~1 on glass). A raw-only
+    /// metric would certify exactly these swaps as worth a ceremony.
+    #[test]
+    fn dark_collapse_pairs_are_insufficient_where_raw_rgb_would_pass() {
+        for (a, b) in [(0u8, 1u8), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+            assert!(
+                coat_distance(a, b) < SUFFICIENT_DIFFERENCE,
+                "({a},{b}): dark-collapsed pairs are never sufficient (got {})",
+                coat_distance(a, b)
+            );
+        }
+        assert!(
+            dist(raw_stop(0), raw_stop(3)) > SUFFICIENT_DIFFERENCE,
+            "the raw ramp would have passed (0,3) — the min over backgrounds is the point"
+        );
+    }
+
+    /// The flagship trio (claude 12, codex 15, agy 3) never demotes: every
+    /// pair clears [`SUFFICIENT_DIFFERENCE`] with 4× headroom, so the rate
+    /// law's sufficient-difference check changes nothing for the cats
+    /// people live in — by measurement, not by exemption.
+    #[test]
+    fn flagship_trio_is_always_sufficiently_different() {
+        let coats = [
+            ("claude", KittyLook::for_app("claude").coat),
+            ("codex", KittyLook::for_app("codex").coat),
+            ("agy", KittyLook::for_app("agy").coat),
+        ];
+        for i in 0..coats.len() {
+            for j in i + 1..coats.len() {
+                let d = coat_distance(coats[i].1, coats[j].1);
+                assert!(
+                    d >= 4.0 * SUFFICIENT_DIFFERENCE,
+                    "{}–{}: flagship coats keep 4x headroom (got {d})",
+                    coats[i].0,
+                    coats[j].0
+                );
+            }
+        }
+    }
+
+    /// The metric's shape: symmetric, zero on the diagonal, and out-of-range
+    /// indices clamp to the last stop exactly like `normalized()` clamps
+    /// `coat`.
+    #[test]
+    fn coat_distance_is_symmetric_with_a_zero_diagonal() {
+        for a in 0..16u8 {
+            assert_eq!(coat_distance(a, a), 0.0, "d({a},{a})");
+            for b in 0..16u8 {
+                assert_eq!(coat_distance(a, b), coat_distance(b, a), "d({a},{b})");
+            }
+        }
+        assert_eq!(coat_distance(u8::MAX, 15), 0.0, "clamped like normalized()");
+    }
 
     #[test]
     fn look_normalization_never_leaves_an_overlay_as_the_base() {

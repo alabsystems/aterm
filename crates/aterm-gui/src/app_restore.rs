@@ -28,6 +28,27 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
+/// WHICH PROCESS minted the `local_id`s of the descriptor being rebuilt — and so
+/// whether one of them may name a live handle. The two sources look identical on
+/// the wire (`TerminalLeafRestore` is one type) and only the caller knows which
+/// it holds, so the leaf builder is told rather than left to guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LeafIds {
+    /// THIS process's closed-tab ledger. Session ids are never reused within a
+    /// run, so an id still in the pool IS the session that tab was showing —
+    /// a tab closed off a session another view still holds must re-attach to it
+    /// (`closed_terminal_tab_reattaches_a_still_live_shared_session`), not fork
+    /// a stranger that merely wears the same title.
+    Live,
+    /// A manifest written by a process that has since EXITED: session restore,
+    /// and the layout a seamless update carries across the swap. Those ids
+    /// belong to a namespace this launch re-mints from 0, so a pool hit is never
+    /// recognition — only a collision with a shell this same pass just forked.
+    /// The one live thing such a manifest can name is a handed-off fd, matched
+    /// through `seamless_adopt`.
+    Retired,
+}
+
 /// Mint recovery authority only from the already-validated typed descriptor.
 /// Its copyable metadata is deliberately never parsed to recover a path/route.
 fn recovery_capability(
@@ -1059,7 +1080,12 @@ impl App {
         self.frontmost_window = Some(wid);
         let mut built = Vec::with_capacity(restored_tabs.len());
         for record in &restored_tabs {
-            match self.build_recursive_restore_tab(wid, record, &mut reusable_terminal) {
+            match self.build_recursive_restore_tab(
+                wid,
+                record,
+                &mut reusable_terminal,
+                LeafIds::Retired,
+            ) {
                 Ok(tab) => built.push(tab),
                 Err(error) => eprintln!(
                     "aterm-gui: session restore: could not allocate a recovered tab: {error}"
@@ -1121,6 +1147,18 @@ impl App {
         }
 
         self.resync_active_or_window(wid);
+        // NO ALIASED SHELL. Every leaf of a MANIFEST rebuild owns its own session:
+        // the graft consumes the bootstrap exactly once, and each remaining leaf
+        // forks or re-adopts a distinct one. Nothing the manifest says can put two
+        // of them on one PTY, so a repeat here is two tabs pretending to be
+        // separate — the failure this pass exists to make unrepresentable.
+        // (Deliberate sharing does exist — `Open Session in New Window`, and
+        // reopening a tab closed off a still-shared session — but it is minted from
+        // LIVE ids, never rebuilt from a retired manifest.)
+        debug_assert!(
+            self.restored_window_sessions_are_distinct(wid),
+            "session restore aliased two leaves of window {wid:?} onto one shell",
+        );
         if self
             .windows
             .get(&wid)
@@ -1128,6 +1166,29 @@ impl App {
         {
             debug_assert!(self.structural_invariants_ok());
         }
+    }
+
+    /// True iff no live session backs two leaves of `wid` — the post-condition of a
+    /// MANIFEST rebuild, checked where a stale-id graft would once have broken it.
+    /// Not a standing window invariant: a deliberate live share can put one session
+    /// in two leaves, which is why only the retired-id path asserts this.
+    fn restored_window_sessions_are_distinct(&self, wid: WindowId) -> bool {
+        self.windows.get(&wid).is_none_or(|window| {
+            let mut seen = Vec::new();
+            window.tab_set.tabs().iter().all(|tab| {
+                tab.root.leaves().into_iter().all(|view| {
+                    self.view_store
+                        .get(view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        .is_none_or(|session| {
+                            let fresh = !seen.contains(&session);
+                            seen.push(session);
+                            fresh
+                        })
+                })
+            })
+        })
     }
 
     fn window_has_terminal_tab(&self, wid: WindowId) -> bool {
@@ -1216,6 +1277,7 @@ impl App {
         wid: WindowId,
         record: &restore::RestoredTab,
         reusable_terminal: &mut Option<(crate::tab_model::ViewId, u64)>,
+        ids: LeafIds,
     ) -> Result<BuiltRestoreTab, String> {
         let reusable_before = *reusable_terminal;
         let mut leaves = Vec::with_capacity(record.root.leaf_count());
@@ -1223,6 +1285,7 @@ impl App {
             wid,
             &record.root,
             reusable_terminal,
+            ids,
             &mut leaves,
         ) {
             Ok(root) => root,
@@ -1290,12 +1353,13 @@ impl App {
         wid: WindowId,
         tree: &restore::RestoredSplitTree,
         reusable_terminal: &mut Option<(crate::tab_model::ViewId, u64)>,
+        ids: LeafIds,
         leaves: &mut Vec<BuiltRestoreLeaf>,
     ) -> Result<crate::tab_model::SplitTree<crate::tab_model::ViewId>, String> {
         match tree {
             restore::RestoredSplitTree::Leaf { view } => {
                 let (view, presentation, staging_tab) =
-                    self.build_recursive_restore_leaf(wid, view, reusable_terminal)?;
+                    self.build_recursive_restore_leaf(wid, view, reusable_terminal, ids)?;
                 leaves.push((view, presentation, staging_tab));
                 Ok(crate::tab_model::SplitTree::leaf(view))
             }
@@ -1314,12 +1378,14 @@ impl App {
                     wid,
                     first,
                     reusable_terminal,
+                    ids,
                     leaves,
                 )?),
                 second: Box::new(self.build_recursive_restore_tree(
                     wid,
                     second,
                     reusable_terminal,
+                    ids,
                     leaves,
                 )?),
             }),
@@ -1331,10 +1397,11 @@ impl App {
         wid: WindowId,
         descriptor: &restore::RestoredView,
         reusable_terminal: &mut Option<(crate::tab_model::ViewId, u64)>,
+        ids: LeafIds,
     ) -> Result<BuiltRestoreLeaf, String> {
         match descriptor {
             restore::RestoredView::Terminal(terminal) => {
-                match self.restore_terminal_leaf(wid, terminal, reusable_terminal) {
+                match self.restore_terminal_leaf(wid, terminal, reusable_terminal, ids) {
                     Ok(view) => Ok((
                         view,
                         crate::tab_model::TabPresentation {
@@ -1394,13 +1461,32 @@ impl App {
         wid: WindowId,
         terminal: &restore::TerminalLeafRestore,
         reusable_terminal: &mut Option<(crate::tab_model::ViewId, u64)>,
+        ids: LeafIds,
     ) -> Result<crate::tab_model::ViewId, String> {
         if let Some((view, _)) = reusable_terminal.take() {
             return Ok(view);
         }
-        if let Some(session) = terminal
-            .local_id
-            .filter(|session| self.pool.get(*session).is_some())
+        // RE-ATTACH ONLY TO AN ID THIS PROCESS MINTED. A closed-tab record names a
+        // session of OURS, and ids are never reused within a run, so a pool hit is
+        // the very shell that tab was showing — reopening a tab closed off a shared
+        // session must join it again rather than fork a stranger.
+        //
+        // A RETIRED manifest gets no such lookup. Its ids are the previous
+        // process's namespace and this one re-mints from 0, so a hit is never
+        // recognition — it is a COLLISION with a shell this same restore pass just
+        // forked. Attaching to it aliased two tabs onto one PTY (typing in one
+        // appeared in the other) and silently dropped the saved shell the leaf
+        // stood for. No exotic layout is needed to reach it: capture walks tabs in
+        // tree order, so a window of `[0] [1|3] [2]` persists the descending run
+        // `0,1,3,2`, and by the time leaf `2` is rebuilt the pass has already
+        // minted ids 1 and 2. The one live thing such a manifest can name is a
+        // handed-off fd, matched through `seamless_adopt` in the spawn below —
+        // which the collision could also hijack, stranding the real shell in the
+        // adopt list for the orphan net to re-home as a stray tab.
+        if ids == LeafIds::Live
+            && let Some(session) = terminal
+                .local_id
+                .filter(|session| self.pool.get(*session).is_some())
         {
             self.pool.attach(session);
             return match self.view_store.insert_terminal(session) {
@@ -1846,7 +1932,7 @@ impl App {
         descriptor: &restore::RestoredView,
     ) -> Result<(crate::tab_model::ViewId, crate::tab_model::TabPresentation), String> {
         let mut reusable = None;
-        self.build_recursive_restore_leaf(wid, descriptor, &mut reusable)
+        self.build_recursive_restore_leaf(wid, descriptor, &mut reusable, LeafIds::Live)
             .map(|(view, presentation, _)| (view, presentation))
     }
 
@@ -1865,7 +1951,8 @@ impl App {
         }
         self.frontmost_window = Some(wid);
         let mut reusable = None;
-        let (tab, layout) = self.build_recursive_restore_tab(wid, record, &mut reusable)?;
+        let (tab, layout) =
+            self.build_recursive_restore_tab(wid, record, &mut reusable, LeafIds::Live)?;
         debug_assert!(reusable.is_none());
         let id = tab.id;
         let terminal = layout.is_some();
@@ -3010,6 +3097,167 @@ mod tests {
         assert!(
             app.pool.get(0).is_some(),
             "healthy bootstrap shell was grafted"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// One terminal leaf, exactly as `capture_restore_manifest` writes it.
+    fn restored_terminal(local: u64, title: &str) -> restore::RestoredSplitTree {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                cwd: Some("/tmp".to_string()),
+                title: title.to_string(),
+                profile: None,
+                local_id: Some(local),
+                user_title: Some(title.to_string()),
+                description: None,
+                icon: None,
+                role: None,
+                attention: None,
+            },
+        ))
+    }
+
+    /// THE ALIASING REGRESSION. Reproduced from a cold launch on 2026-08-26: open
+    /// three tabs, split the MIDDLE one, quit, relaunch. Capture walks the tabs in
+    /// tree order, so the four shells persist as the DESCENDING run `0, 1, 3, 2`
+    /// — and the old `restore_terminal_leaf` treated "the pool already holds id 2"
+    /// as recognition, even though that id belonged to the fresh shell this same
+    /// pass had just forked for the split. The third tab grafted itself onto the
+    /// split's new pane: three tabs came back over three shells instead of four,
+    /// CHARLIE's saved shell was never started, and typing in the third tab
+    /// appeared in the second. The manifest's ids are a DEAD process's namespace;
+    /// nothing here may consult them for a live handle.
+    #[test]
+    fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.restore_into_window(
+            wid,
+            restore::WindowLayout {
+                rows: 24,
+                cols: 80,
+                active_tab: 0,
+                outer_x: None,
+                outer_y: None,
+                maximized: None,
+                tabs: Vec::new(),
+                native_tabs: Vec::new(),
+                tab_order: Vec::new(),
+                active_item: Some(0),
+                restored_tabs: vec![
+                    restore::RestoredTab {
+                        root: restored_terminal(0, "ALPHA"),
+                        focused_path: Vec::new(),
+                        zoomed: false,
+                    },
+                    restore::RestoredTab {
+                        root: restore::RestoredSplitTree::Split {
+                            axis: restore::SplitKind::Vertical,
+                            ratio: 0.5,
+                            first: Box::new(restored_terminal(1, "BRAVO")),
+                            second: Box::new(restored_terminal(3, "DELTA")),
+                        },
+                        focused_path: vec![restore::RestoreBranch::Second],
+                        zoomed: false,
+                    },
+                    restore::RestoredTab {
+                        root: restored_terminal(2, "CHARLIE"),
+                        focused_path: Vec::new(),
+                        zoomed: false,
+                    },
+                ],
+            },
+        );
+
+        let tabs = app.windows[&wid].tab_set.tabs().to_vec();
+        assert_eq!(tabs.len(), 3, "every saved tab came back");
+        let leaves = tabs
+            .iter()
+            .flat_map(|tab| tab.root.leaves())
+            .collect::<Vec<_>>();
+        assert_eq!(leaves.len(), 4, "the split tab kept both of its panes");
+        let sessions = leaves
+            .iter()
+            .map(|view| {
+                app.view_store
+                    .get(*view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    .expect("every restored leaf is a terminal")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sessions
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            sessions.len(),
+            "two leaves share one shell: {sessions:?}"
+        );
+        for id in &sessions {
+            assert!(app.pool.get(*id).is_some(), "restored session {id} is live");
+            assert_eq!(
+                app.pool.views(*id),
+                Some(1),
+                "restored session {id} backs exactly one leaf"
+            );
+        }
+        assert!(app.restored_window_sessions_are_distinct(wid));
+
+        // WRITE ISOLATION — the symptom a user actually meets. Bytes fed to one
+        // leaf's engine, exactly as its PTY would, must land on that leaf's screen
+        // and on NO other's.
+        for (index, id) in sessions.iter().enumerate() {
+            let session = app.pool.get(*id).expect("restored session");
+            crate::term_lock(&session.term).process(format!("MARKER{index}").as_bytes());
+        }
+        for (index, id) in sessions.iter().enumerate() {
+            let session = app.pool.get(*id).expect("restored session");
+            let terminal = crate::term_lock(&session.term);
+            let screen = (0..i32::from(terminal.rows()))
+                .filter_map(|row| terminal.get_line_text(row, None))
+                .collect::<String>();
+            assert!(
+                screen.contains(&format!("MARKER{index}")),
+                "leaf {index} lost its own typing"
+            );
+            for other in (0..sessions.len()).filter(|other| *other != index) {
+                assert!(
+                    !screen.contains(&format!("MARKER{other}")),
+                    "leaf {index} is showing leaf {other}'s typing — they share a PTY"
+                );
+            }
+        }
+
+        // Each respawned leaf also carries ITS OWN operator title, so the saved
+        // work contexts stayed separate all the way to the tab strip. (Tab 0's
+        // shell is the grafted bootstrap, which keeps the live session it already
+        // had rather than being re-seeded.)
+        let titles = sessions
+            .iter()
+            .skip(1)
+            .map(|id| {
+                app.pool
+                    .get(*id)
+                    .expect("restored session")
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .user_title
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            vec![
+                Some("BRAVO".to_string()),
+                Some("DELTA".to_string()),
+                Some("CHARLIE".to_string()),
+            ],
+            "a respawned leaf must wear the metadata of the shell it stands for"
         );
         assert!(app.structural_invariants_ok());
     }

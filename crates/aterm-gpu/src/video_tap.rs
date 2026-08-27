@@ -488,9 +488,32 @@ struct ConvertWorker {
     handle: std::thread::JoinHandle<()>,
 }
 
+/// The wasm arm of [`spawn_convert_worker`]: there is no worker, and the
+/// harvest converts inline on the present thread — exactly the fallback the
+/// non-wasm arm documents for a platform that cannot spawn.
+///
+/// A separate item rather than a branch inside one, because the wasm census's
+/// OB-12 reads thread vocabulary as a POSTURE claim: the shipped wasm closure
+/// is single-threaded, which is what makes its lock-order obligation vacuous.
+/// A `thread::Builder` token anywhere in that closure — even on a branch wasm
+/// never takes — is an unproven posture, and the census says so rather than
+/// guessing.
+#[cfg(target_arch = "wasm32")]
+fn spawn_convert_worker(
+    _src_w: u32,
+    _src_h: u32,
+    _padded_row: usize,
+    _format: wgpu::TextureFormat,
+    _half_res: bool,
+) -> Option<ConvertWorker> {
+    None
+}
+
 /// Spawn the dedicated conversion worker for one recording. `None` when the
-/// platform cannot spawn a thread (wasm, thread exhaustion) — the harvest then
+/// platform cannot spawn a thread (thread exhaustion) — the harvest then
 /// falls back to converting inline on the present thread, the old behavior.
+/// wasm has no worker at all; see the arm above.
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_convert_worker(
     src_w: u32,
     src_h: u32,
@@ -498,41 +521,49 @@ fn spawn_convert_worker(
     format: wgpu::TextureFormat,
     half_res: bool,
 ) -> Option<ConvertWorker> {
-    let (job_tx, job_rx) = mpsc::channel::<ConvertJob>();
-    let (result_tx, result_rx) = mpsc::channel::<Option<CapturedFrame>>();
-    let handle = std::thread::Builder::new()
-        .name("aterm-video-convert".to_string())
-        .spawn(move || {
-            while let Ok(job) = job_rx.recv() {
-                let frame = mapped_to_rgba8(
-                    &job.raw,
-                    src_w,
-                    src_h,
-                    padded_row,
-                    format,
-                    job.capture_encoding,
-                    half_res,
-                )
-                .ok()
-                .map(|(rgba, w, h)| CapturedFrame {
-                    seq: job.seq,
-                    t_us: job.t_us,
-                    w,
-                    h,
-                    rgba,
-                });
-                if result_tx.send(frame).is_err() {
-                    return; // tap gone: nothing is left to adopt results
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (job_tx, job_rx) = mpsc::channel::<ConvertJob>();
+        let (result_tx, result_rx) = mpsc::channel::<Option<CapturedFrame>>();
+        let handle = std::thread::Builder::new()
+            .name("aterm-video-convert".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let frame = mapped_to_rgba8(
+                        &job.raw,
+                        src_w,
+                        src_h,
+                        padded_row,
+                        format,
+                        job.capture_encoding,
+                        half_res,
+                    )
+                    .ok()
+                    .map(|(rgba, w, h)| CapturedFrame {
+                        seq: job.seq,
+                        t_us: job.t_us,
+                        w,
+                        h,
+                        rgba,
+                    });
+                    if result_tx.send(frame).is_err() {
+                        return; // tap gone: nothing is left to adopt results
+                    }
                 }
-            }
+            })
+            .ok()?;
+        Some(ConvertWorker {
+            job_tx,
+            result_rx,
+            pending: 0,
+            handle,
         })
-        .ok()?;
-    Some(ConvertWorker {
-        job_tx,
-        result_rx,
-        pending: 0,
-        handle,
-    })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (src_w, src_h, padded_row, format, half_res);
+        None
+    }
 }
 
 /// Bytes per source pixel for every destination format the presented-frame taps

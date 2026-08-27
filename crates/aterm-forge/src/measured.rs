@@ -81,10 +81,10 @@ pub struct Baseline {
 
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 194,
-    workspace: 54,
-    third_party: 140,
-    third_party_loc: 2_030_354,
+    resolved: 191,
+    workspace: 55,
+    third_party: 136,
+    third_party_loc: 1_871_883,
     build_scripts: 26,
     proc_macros: 6,
     duplicate_names: 8,
@@ -92,21 +92,21 @@ pub const MAC_ARM: Baseline = Baseline {
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 234,
-    workspace: 54,
-    third_party: 180,
-    third_party_loc: 3_560_712,
-    build_scripts: 38,
-    proc_macros: 7,
-    duplicate_names: 9,
+    resolved: 292,
+    workspace: 55,
+    third_party: 237,
+    third_party_loc: 3_662_288,
+    build_scripts: 40,
+    proc_macros: 17,
+    duplicate_names: 12,
 };
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 199,
-    workspace: 54,
-    third_party: 145,
-    third_party_loc: 4_463_650,
+    resolved: 196,
+    workspace: 55,
+    third_party: 141,
+    third_party_loc: 4_305_179,
     build_scripts: 27,
     proc_macros: 7,
     duplicate_names: 5,
@@ -114,10 +114,10 @@ pub const WIN: Baseline = Baseline {
 
 pub const WASM: Baseline = Baseline {
     cell: "wasm",
-    resolved: 185,
-    workspace: 54,
-    third_party: 131,
-    third_party_loc: 1_870_671,
+    resolved: 182,
+    workspace: 55,
+    third_party: 127,
+    third_party_loc: 1_712_200,
     build_scripts: 26,
     proc_macros: 7,
     duplicate_names: 4,
@@ -182,11 +182,6 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         loc: 212_320,
     },
     Dom {
-        name: "regex",
-        pkgs: 4,
-        loc: 158_471,
-    },
-    Dom {
         name: "libc",
         pkgs: 1,
         loc: 127_772,
@@ -195,6 +190,17 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         name: "tracing",
         pkgs: 3,
         loc: 84_483,
+    },
+    // `regex` stood here at 4 packages / 158,471 lines until crates/aterm-regex
+    // retired it. `rustix` takes the slot rather than shrinking the array: an
+    // anchor list that thins out every time the campaign succeeds stops being a
+    // regression net. The slot goes to whatever now ranks fifth by LOC, which is
+    // `objc2-app-kit` (82,976) — NOT `rustix` (72,832); the list is ordered, so a
+    // wrong pick here fails the ranking test rather than passing quietly.
+    Dom {
+        name: "objc2-app-kit",
+        pkgs: 1,
+        loc: 82_976,
     },
 ];
 

@@ -60,9 +60,6 @@ mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -361,61 +358,5 @@ fn nothing_is_printed_after_the_errand() {
         !head.contains("step("),
         "the errand's trap must be the last line before the wait, and this prints below \
          it:\n{head}"
-    );
-}
-
-/// The x86 warning keeps every fact, and keeps the SPACE that was lost in it.
-///
-/// `It doesNOT fall back to a network install` reached a real operator's terminal — a
-/// space eaten by a `\` line continuation. The sentence it damaged is the one that stops
-/// someone assuming an Intel Mac will simply fetch the toolchain later, so it is worth a
-/// test rather than a memory. The remaining assertions pin the arrangement: headline
-/// first, the ACT second (it used to be word 91), then one fact per line.
-#[test]
-fn the_x86_warning_keeps_its_facts_its_order_and_its_space() {
-    let text =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/seedpack.rs"))
-            .expect("seedpack.rs");
-    // As the compiler sees it: the `\` continuations joined, so a lost space shows up.
-    let joined = text.replace("\\\n", "").replace("\\", "");
-    let mut lines = joined
-        .lines()
-        .skip_while(|l| !l.contains("WARNING — no x86_64-apple-darwin artifacts"));
-    let block: String = lines.by_ref().take(24).collect::<Vec<_>>().join("\n");
-    // The ACT (restage; the ACK is a mute, not a gate) comes second — before any
-    // mechanism — never at word 91 of a paragraph, which is where the original
-    // buried it.
-    assert!(
-        block.find("restage from a current index") < block.find("an Intel Mac installs NOTHING"),
-        "the act comes second, not at word 91: {block}"
-    );
-    assert!(
-        block.contains("a warning-mute, not a gate"),
-        "the ACK must be described as the mute it is — the old text's \"Acknowledge\" \
-         read as a gate the code does not have: {block}"
-    );
-    // The FACTS, as of atpkg index 14 (which superseded the index-12 set: the
-    // registry now publishes EVERY pinned program dual-arch — the rustc
-    // coherence group included, pkg-trust-6808.toml carries the
-    // x86_64-apple-darwin row — so the old "six programs / rustc_private"
-    // story is history, and an x86-less seal now also means no Intel DMG
-    // variant).
-    for fact in [
-        "seed-unusable: no build for this Mac's architecture",
-        "STALE STAGE",
-        "pinned program since index 14",
-        "pkg-trust-6808.toml carries the row",
-        "dmg_x86_64",
-    ] {
-        assert!(
-            block.contains(fact),
-            "the warning dropped {fact:?}: {block}"
-        );
-    }
-    // The class of defect that started all this: a space lost across a `\`
-    // continuation ("doesNOT"). The joined form must never fuse words.
-    assert!(
-        !block.contains("doesNOT") && !block.contains("NOTfall"),
-        "{block}"
     );
 }

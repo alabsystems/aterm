@@ -86,6 +86,33 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
+    /// The hyperlink URL attached to the cell at VIEWPORT row `visible_row` —
+    /// the display-offset-AWARE twin of [`Self::hyperlink_at`], and the one a
+    /// host must ask when it is answering for what a person is LOOKING AT.
+    ///
+    /// [`Self::hyperlink_at`] keys the extras map by the LIVE screen row, so
+    /// scrolled back it answers about a line eight rows further down (or about
+    /// a blank one) while the frame under the pointer was drawn from history.
+    /// This resolves through the same [`Grid::visible_row_view`] the frame
+    /// itself is drawn from ([`Self::render_row`]), so the answer and the
+    /// underline the renderer stamped always describe one cell. The two
+    /// coincide at `display_offset == 0`.
+    ///
+    /// Owned rather than borrowed because a scrolled-off row is MATERIALIZED:
+    /// its extras belong to the view, so no reference can outlive the
+    /// resolution.
+    ///
+    /// [`Grid::visible_row_view`]: aterm_grid::Grid::visible_row_view
+    #[must_use]
+    pub fn hyperlink_at_visible(&self, visible_row: u16, col: u16) -> Option<Arc<str>> {
+        let view = self.grid.visible_row_view(visible_row);
+        let cell = view.cell(col)?;
+        view.cell_data(col, cell)
+            .cell_extra()
+            .and_then(|extra| extra.hyperlink())
+            .cloned()
+    }
+
     /// Get the hyperlink ID (OSC 8 `id=` parameter) attached to a rendered cell, if any.
     ///
     /// The `id=` parameter groups cells into the same hyperlink span. When present,

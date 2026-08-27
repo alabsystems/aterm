@@ -94,8 +94,9 @@ aterm-sixel = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Test-only: trigger evaluation (`#[cfg(test)] mod triggers`, test_support/triggers/*)
-# is the sole `regex` consumer. Kept out of the production closure (§2.7 / A-4).
-regex = { workspace = true }
+# is the sole regex-engine consumer here. Kept out of the production closure
+# (§2.7 / A-4) — aterm-core's vocabulary-free kernel is the point of RFC R2.
+aterm-regex = { workspace = true }
 proptest = { workspace = true }
 aterm-spec = { workspace = true }
 # Test-only: the `spec_xref_closure` gate (terminal/spec_xref_gate.rs) resolves

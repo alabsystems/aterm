@@ -184,10 +184,17 @@ impl TerminalHandler<'_> {
         aterm_spec::refines(machine = "terminal_modes", action = "SetSynchronizedOutput", project = "aterm_core::terminal::project_modes")
     )]
     fn enable_synchronized_output(&mut self) {
+        let opening = !self.modes.synchronized_output;
         self.modes.synchronized_output = true;
         // Clock seam: arm the timeout from the batch's logical instant so the
         // mode-2026 timeout replays deterministically.
         self.transient.sync_start = Some(self.transient.process_now);
+        // Only a REAL false->true edge starts a clean episode. A redundant
+        // DECSET 2026 after writes must not erase evidence that the current
+        // mutable grid already contains a partial synchronized frame.
+        if opening {
+            self.transient.sync_open_dirty = false;
+        }
     }
 
     #[cfg_attr(
@@ -197,6 +204,7 @@ impl TerminalHandler<'_> {
     fn disable_synchronized_output(&mut self) {
         self.modes.synchronized_output = false;
         self.transient.sync_start = None;
+        self.transient.sync_open_dirty = false;
         // ESU: one sync window closed — a complete frame is ready. The host's
         // present-hold releases on this edge (see `Terminal::sync_end_seq`).
         self.transient.sync_end_seq += 1;

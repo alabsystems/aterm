@@ -411,6 +411,22 @@ impl Grid {
         }
     }
 
+    /// Monotonic AUTOWRAP serial — the emulator wrap fact (kitty-motion §4.1).
+    ///
+    /// Advances by exactly one each time an autowrap line advance RESOLVES
+    /// (`advance_autowrap_line`, the one funnel), so `serial changed since my
+    /// last read` is a fact — not a caret-delta heuristic — and a parked
+    /// [`pending_wrap`](Self::pending_wrap) that has not yet resolved is
+    /// correctly not a wrap. Hard newlines (`line_feed`) never advance it.
+    /// Transient observability with a deliberate non-persistence law: see
+    /// `GridStorage::wrap_serial` for why checkpoint/restore and main/alt
+    /// swaps carry no migration.
+    #[must_use]
+    #[inline]
+    pub fn wrap_serial(&self) -> u64 {
+        self.storage.wrap_serial
+    }
+
     // -------------------------------------------------------------------------
     // Subsystem accessors
     // -------------------------------------------------------------------------

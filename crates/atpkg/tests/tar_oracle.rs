@@ -942,7 +942,7 @@ fn magic_and_version_combinations_match_the_oracle() {
 /// then refuses as a disallowed kind.
 #[test]
 fn magicless_extension_headers_match_the_oracle() {
-    for flag in [b'L', b'K', b'x', b'g'] {
+    for flag in *b"LKxg" {
         for (label, magic, version) in [
             ("no magic", &b"\0\0\0\0\0\0"[..], &b"\0\0"[..]),
             ("garbage magic", &b"xxxxx\0"[..], &b"00"[..]),
@@ -973,6 +973,11 @@ fn magicless_extension_headers_match_the_oracle() {
     }
 }
 
+/// One row of [`duplicate_extension_headers_match_the_oracle`]'s table: the
+/// case label, then the extension headers to emit before the member as
+/// `(typeflag, body)` pairs.
+type DuplicateExtensionCase<'a> = (&'a str, Vec<(u8, Vec<u8>)>);
+
 /// A SECOND `L`, `K` or `x` before the same member is two answers to "what is
 /// this file called", and last-wins would make the answer depend on which
 /// parser you asked.
@@ -983,7 +988,7 @@ fn duplicate_extension_headers_match_the_oracle() {
         b.push(0);
         b
     };
-    let cases: Vec<(&str, Vec<(u8, Vec<u8>)>)> = vec![
+    let cases: Vec<DuplicateExtensionCase<'_>> = vec![
         (
             "two long names",
             vec![
@@ -1399,7 +1404,7 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
         2 => 512,
         3 => 600,
         4 => u64::from(rng.below(40) as u32),
-        5 => 0o7777_7777_777,
+        5 => 0o77_777_777_777,
         6 => u64::MAX,
         _ => u64::from(rng.below(1500) as u32),
     };

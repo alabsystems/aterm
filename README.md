@@ -61,50 +61,34 @@ aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel) — and, from v0.44.0, for Linux x86_64 as a tarball on the same
 releases — from the public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
-Every macOS release is the same app in a few containers (the Intel DMG joins
-with the first cut after 2026-08-22, the lean DMG with the first cut after
-2026-08-24; older releases carry fewer):
+Every macOS release is the same app in two containers (from the first cut
+after 2026-08-26; older releases carry more — see below):
 
-- **`aterm-X.Y.0-mac.zip` (~27 MB) — the recommended install.** The signed,
-  notarized app alone; the toolchain streams in on first launch (or on
+- **`aterm-X.Y.0.dmg` (~30 MB) — the download.** The signed, notarized app
+  alone, as a drag-install image: drag `aterm.app` into Applications. On
+  first launch the ALab toolchain installs itself with live progress (or on
   demand: `aterm pkg install --default-set`).
-- **`aterm-X.Y.0.dmg` (~1.1 GB) — batteries included, Apple silicon.** For
-  offline / air-gapped installs: see below.
-- **`aterm-X.Y.0-x86_64.dmg` (~0.96 GB) — batteries included, Intel.** The
-  identical signed, notarized universal app; the seed carries the x86_64
-  builds of every ALab program instead.
-- **`aterm-X.Y.0-lite.dmg` (~28 MB) — the same app alone, as a drag-install
-  DMG** (from the first cut after 2026-08-24). From that same cut each release
-  also carries permanent `releases/latest/download/` names: `aterm.dmg` (the
-  lean DMG), `aterm-mac.zip` (the zip), and `aterm-offline.dmg` (the full
-  batteries-included DMG, for installs with no network). Every container has a
-  `.sha256` sidecar: `shasum -a 256 -c <asset>.sha256`.
+- **`aterm-X.Y.0-mac.zip` (~27 MB) — the same app, zipped.** The container the
+  in-app updater, the Homebrew cask, and `install.sh` consume.
+
+Each release also carries the permanent `releases/latest/download/` names
+`aterm.dmg` and `aterm-mac.zip`, and every container has a `.sha256` sidecar:
+`shasum -a 256 -c <asset>.sha256`.
 
 You can also download a container yourself and drag `aterm.app` into
 Applications.
 
-### Offline / air-gapped install (batteries-included)
+### Offline / air-gapped installs
 
-For machines that cannot (or must not) fetch the toolchain over the network,
-the batteries-included DMG pair remains a first-class install: the app with
-the published ALab toolchain sealed inside it. The installer seeds the
-compilers, solvers, and provers from that payload during the install itself —
-no download; only the follow-up update check touches the network, and it
-fails soft without one. A drag-installed copy of the same DMG seeds itself on
-first launch, entirely offline.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash -s -- --batteries
-```
-
-or download the DMG for your CPU (the bare `aterm-X.Y.0.dmg` seals the
-Apple-silicon toolchain, `aterm-X.Y.0-x86_64.dmg` the Intel one) and drag
-`aterm.app` into Applications. The DMG is big for exactly one reason: about a
-gigabyte of it is that toolchain seed, riding inside the signed app; installed,
-the toolset unpacks to ~4.4 GiB and the app reclaims the sealed copy. From the
-first cut after 2026-08-22 the seed is packed for THIS architecture only
-(~1.1 GB instead of the dual-arch 2.1 GB); a release from before that date is
-the single dual-arch DMG.
+2026-08-26 — owner decision: aterm ships one lean, self-provisioning download.
+The batteries-included images (the ~1.1 GB seeded `aterm-X.Y.0.dmg`, the Intel
+`aterm-X.Y.0-x86_64.dmg`, the evergreen `aterm-offline.dmg`) and the
+`aterm-X.Y.0-lite.dmg` spelling are retired from the next cut on, and so is
+`install.sh --batteries` (it now prints a refusal and the next act). An
+air-gapped machine can still install the app from the DMG, but the toolchain
+comes from the network index: offline provisioning is not offered from this
+cut. Releases published before 2026-08-26 stay on the releases page with their
+seeded images for anyone who needs them.
 
 On Linux x86_64 the same command installs from the release's
 `aterm-<version>-linux-x86_64.tar.gz`, checked against its `.sha256` digest

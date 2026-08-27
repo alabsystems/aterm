@@ -110,7 +110,7 @@ impl App {
             prefill,
             origin,
             anchor_col,
-            usize::from(self.tab_strip_rows),
+            usize::from(self.chrome_rows()),
         );
         let Some(ws) = self.windows.get_mut(&window) else {
             return false;

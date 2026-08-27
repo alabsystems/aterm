@@ -673,14 +673,19 @@ fn test_cwd_tab_title_strips_control_chars() {
         scripts::BASH.contains("\"0;${__aterm_tab_title//[[:cntrl:]]/}\""),
         "bash CWD tab title must strip control characters"
     );
-    // fish strips both the ~-abbreviated and the absolute CWD forms.
+    // fish chooses the title first (~-abbreviated or absolute) and strips ONCE
+    // on the way out, so ONE guard covers both branches instead of two that
+    // could drift apart — and the emission is pinned to the STRIPPED local, so
+    // a future edit cannot route the raw title around the guard.
     assert!(
-        scripts::FISH.contains(r#"string replace -ra '[\x00-\x1f\x7f]' '' -- "~$rel""#),
-        "fish abbreviated CWD tab title must strip control characters"
+        scripts::FISH.contains(
+            r#"set -l safe_title (string replace -ra '[\x00-\x1f\x7f]' '' -- "$title")"#
+        ),
+        "fish CWD tab title must strip control characters"
     );
     assert!(
-        scripts::FISH.contains(r#"string replace -ra '[\x00-\x1f\x7f]' '' -- "$PWD""#),
-        "fish absolute CWD tab title must strip control characters"
+        scripts::FISH.contains(r#"__aterm_osc "0;$safe_title""#),
+        "fish must emit the STRIPPED CWD tab title, never the raw one"
     );
 }
 
@@ -1176,9 +1181,16 @@ fn test_bash_prompt_command_guard_prevents_spurious_capture() {
 #[test]
 fn test_fish_powerline_sep_uses_separator_color() {
     let script = scripts::FISH;
+    // The separator is now built from the ALREADY-RESOLVED `$s` / `$r` locals
+    // rather than two inline `(set_color …)` substitutions: a `set_color` that
+    // rejects its argument prints nothing, and two zero-element substitutions
+    // glued together left `sep` an EMPTY LIST — which then contributed no
+    // `printf` argument at all and slid the whole powerline layout one operand
+    // to the left (see `test_fish_prompt_colors_are_sgr_indices_like_bash`).
     assert!(
-        script.contains(r#"set -l sep (set_color $sc)"""#),
-        "fish powerline must color separator glyphs with sep_color"
+        script.contains(r#"set -l sep "$s$r""#),
+        "fish powerline must build its separator from the resolved sep_color \
+         and reset locals, quoted so it is always exactly one argument"
     );
 }
 
@@ -1719,10 +1731,13 @@ fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
 /// bash and zsh spell all five `${ATERM_PROMPT_*_COLOR:-<default>}`, which
 /// substitutes for empty too.
 ///
-/// `set_color` (and `prompt_pwd`) are stubbed rather than observed through
-/// stderr: fish functions shadow builtins, so the stub captures the exact
-/// argument the script computed, which is the actual subject here and is
-/// independent of which colour spellings a given fish build accepts.
+/// Asserted on the BYTES the prompt emits, not on a `set_color` stub. The
+/// script no longer calls `set_color` for a palette index at all (see
+/// [`test_fish_prompt_colors_are_sgr_indices_like_bash`]) — it formats the SGR
+/// escape itself — so the resolved index is now directly observable, which is
+/// a stronger reading of the same question. Only `prompt_pwd` is stubbed, so
+/// the test does not depend on fish's own `share/functions` (a `dpkg-deb -x`
+/// prefix may not carry them).
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
@@ -1732,9 +1747,7 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
         );
         return;
     };
-    let body = "function set_color; printf '<%s>' $argv; end; \
-                function prompt_pwd; printf '~/x'; end; \
-                __aterm_custom_prompt";
+    let body = "function prompt_pwd; printf '~/x'; end; __aterm_custom_prompt";
     let empty_colors = [
         ("ATERM_PROMPT_STYLE", "minimal"),
         ("ATERM_PROMPT_HOST_COLOR", ""),
@@ -1743,14 +1756,13 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
         ("ATERM_PROMPT_ERROR_COLOR", ""),
         ("ATERM_PROMPT_SEP_COLOR", ""),
     ];
-    // `minimal` renders <path-color> pwd <normal> <prompt-color> $ <normal>;
+    // `minimal` renders <path-color> pwd <reset> <prompt-color> $ <reset>;
     // the defaults are path=4 and (last status 0) separator=8.
     assert_eq!(
         run_fish_integration(fish, &empty_colors, body),
-        "<4>~/x<normal> <8>$<normal> ",
+        "\u{1b}[38;5;4m~/x\u{1b}[0m \u{1b}[38;5;8m$\u{1b}[0m ",
         "empty ATERM_PROMPT_*_COLOR values must fall back to the same defaults \
-         bash and zsh get from `${{ATERM_PROMPT_*_COLOR:-N}}`, not reach \
-         `set_color \"\"`"
+         bash and zsh get from `${{ATERM_PROMPT_*_COLOR:-N}}`"
     );
     // Positive control: an explicitly set colour is still honoured.
     assert_eq!(
@@ -1762,8 +1774,8 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
             ],
             body,
         ),
-        "<5>~/x<normal> <8>$<normal> ",
-        "a non-empty ATERM_PROMPT_PATH_COLOR must still reach set_color"
+        "\u{1b}[38;5;5m~/x\u{1b}[0m \u{1b}[38;5;8m$\u{1b}[0m ",
+        "a non-empty ATERM_PROMPT_PATH_COLOR must still reach the prompt"
     );
 }
 
@@ -2899,4 +2911,869 @@ fn test_wsl_launcher_emits_real_osc_133_marks() {
         "ATERM_WSL_CWD must place the shell in the requested POSIX directory; \
          got {text:?}"
     );
+}
+
+// ─── fish: glued command substitutions, and prompt colours ──────────────────
+//
+// Two defects with one root, both fish-only, both invisible to bash and zsh.
+//
+// THE GLUE RULE. In fish, a string written next to a command substitution is a
+// CARTESIAN PRODUCT over the substitution's output LINES, and a command that
+// prints nothing produces a ZERO-ELEMENT list — so the product is zero
+// arguments and the ENTIRE argument disappears. bash and zsh interpolate a
+// possibly-empty parameter and cannot reproduce any of it.
+//
+// THE PALETTE RULE. Every `ATERM_PROMPT_*_COLOR` is a palette INDEX (bash spells
+// it `\[\033[38;5;${hc}m\]`). fish's `set_color` takes colour NAMES or hex only,
+// answers `set_color: Unknown color "4"` on stderr, and emits nothing — which,
+// via the glue rule, also deleted `printf` arguments and slid the prompt layout
+// sideways.
+
+/// Strip the CONTENTS of every quoted string from a fish source line, keeping
+/// the quote characters themselves, so a glue detector can tell a real command
+/// substitution from a parenthesis that merely sits inside a string literal.
+///
+/// `set git_text " ($branch)"` reduces to `set git_text ""` — no glue. The old
+/// `__aterm_osc "7;file://"(hostname)"$cwd"` reduces to `__aterm_osc ""(hostname)""`,
+/// which still carries both `"(` and `)"`.
+#[cfg(unix)]
+fn fish_strip_string_contents(line: &str) -> String {
+    #[derive(PartialEq)]
+    enum Q {
+        None,
+        Single,
+        Double,
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut state = Q::None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (&state, c) {
+            // A backslash escapes the next byte in fish everywhere except
+            // inside single quotes, where only \' and \\ are special. Consuming
+            // the pair unconditionally is safe for this lint: it can only make
+            // the detector see FEWER characters, never invent a glue site.
+            (_, '\\') => {
+                let _ = chars.next();
+            }
+            (Q::None, '\'') => {
+                state = Q::Single;
+                out.push('\'');
+            }
+            (Q::None, '"') => {
+                state = Q::Double;
+                out.push('"');
+            }
+            (Q::Single, '\'') => {
+                state = Q::None;
+                out.push('\'');
+            }
+            (Q::Double, '"') => {
+                state = Q::None;
+                out.push('"');
+            }
+            (Q::None, _) => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// NO EMITTER IN THE FISH SCRIPT MAY GLUE A STRING TO A COMMAND SUBSTITUTION.
+///
+/// This is the third outage from that one spelling, so it is now pinned as a
+/// total sweep rather than one banned substring per incident:
+///
+/// 1. `__aterm_osc "133;A"(__aterm_id_suffix)` — an empty nonce (this script's
+///    own documented pre-nonce fallback, and the unavoidable state of the
+///    header's manual install) collapsed EVERY OSC 133/633 mark to a bare
+///    `ESC ] BEL`.
+/// 2. `__aterm_osc "7;file://"(hostname)"$cwd"` — the same collapse for OSC 7
+///    on any host whose `hostname` prints nothing (measured on fish 4.2.1: the
+///    wire carried exactly `\e]\a`), and on a host with NO `hostname` command
+///    the substitution instead raised `Unknown command`, which ABORTED the
+///    statement and printed a five-line error block at source time and on every
+///    directory change.
+/// 3. `echo -n (whoami)'@'(hostname)' '(prompt_pwd)' $ '` — four glued
+///    substitutions in the FALLBACK prompt, so one of them printing nothing
+///    made `echo -n` print nothing at all: no user, no host, no path, no `$`.
+///
+/// The rule the script now follows everywhere: capture into a local with
+/// `set -l`, then interpolate it QUOTED. `"$var"` is exactly one argument for
+/// an empty value, an empty list, and an unset variable alike.
+#[cfg(unix)]
+#[test]
+fn test_fish_never_glues_a_command_substitution() {
+    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+        let offenders: Vec<(usize, &str)> = script
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with('#'))
+            .filter(|(_, line)| {
+                let stripped = fish_strip_string_contents(line);
+                ["\"(", "'(", ")\"", ")'"]
+                    .iter()
+                    .any(|glue| stripped.contains(glue))
+            })
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{label} fish script glues a string to a command substitution: {offenders:?}. \
+             That is a CARTESIAN PRODUCT — a substitution printing nothing takes the \
+             whole argument with it. Capture with `set -l` and interpolate \"$var\"."
+        );
+    }
+}
+
+/// OSC 7 carries a resolved host, never a live command substitution.
+///
+/// Pins the payload spelling (one double-quoted argument interpolating two
+/// precomputed globals) and the resolution chain: `$HOST` / `$HOSTNAME` — what
+/// zsh and bash read, and what this suite's harness sets — then fish's own
+/// `$hostname` global, then the `hostname` COMMAND behind `command -sq` so a
+/// host without it gets a default instead of an error storm, then `localhost`,
+/// which is also the canonical RFC 8089 `file://` authority.
+#[test]
+fn test_fish_osc7_resolves_the_host_without_a_substitution() {
+    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+        assert!(
+            script.contains(r#"__aterm_osc "7;file://$__aterm_report_host$cwd""#),
+            "{label} fish OSC 7 must be ONE interpolated argument"
+        );
+        // CODE only: the script quotes the broken spelling in a comment so the
+        // next reader knows why it cannot come back, and that explanation must
+        // not itself trip the guard.
+        let code: String = script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(r#""7;file://"(hostname)"#),
+            "{label} fish re-introduced the glued `(hostname)` OSC 7 payload"
+        );
+        assert!(
+            script.contains("set -g __aterm_report_host localhost"),
+            "{label} fish must seed the OSC 7 authority with a non-empty default, \
+             mirroring zsh's `${{HOST:-${{HOSTNAME:-localhost}}}}`"
+        );
+        assert!(
+            script.contains("command -sq hostname"),
+            "{label} fish must probe for the `hostname` COMMAND before running it — \
+             an unguarded call on a host without it aborts __aterm_report_cwd and \
+             prints an error block on every directory change"
+        );
+    }
+}
+
+/// The fish prompt renders palette indices as SGR escapes, never through
+/// `set_color`.
+///
+/// `set_color` takes colour NAMES and hex triples; handed the index every
+/// `ATERM_PROMPT_*_COLOR` actually carries it prints `set_color: Unknown color`
+/// to stderr and emits NOTHING — which, being a zero-element substitution, also
+/// deleted the corresponding `printf` argument. Measured on fish 4.2.1 for
+/// `ATERM_PROMPT_STYLE=standard` before this fix: four error lines per prompt
+/// render, and `userdev-host@/t/c/…:  $` where bash draws
+/// `user@dev-host:~/…` — the `@` and the `:` had slid onto the wrong
+/// operands.
+#[test]
+fn test_fish_prompt_never_passes_a_palette_index_to_set_color() {
+    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+        assert!(
+            script.contains(r#"printf '\e[38;5;%sm' "$argv[1]""#),
+            "{label} fish must format the SGR 256-colour escape itself — the same \
+             bytes bash writes as `\\[\\033[38;5;${{hc}}m\\]`"
+        );
+        assert!(
+            script.contains(r#"printf '\e[0m'"#),
+            "{label} fish must reset with bash's and zsh's `\\033[0m`, not \
+             `set_color normal` (terminfo sgr0)"
+        );
+        let code: String = script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in [
+            "set_color $hc",
+            "set_color $pc",
+            "set_color $gc",
+            "set_color $sc",
+            "set_color $ec",
+            "set_color $prompt_color",
+            "set_color normal",
+        ] {
+            assert!(
+                !code.contains(banned),
+                "{label} fish prompt re-introduced `{banned}`: fish's set_color \
+                 rejects a palette index, prints an error to the user's terminal, \
+                 and emits nothing"
+            );
+        }
+    }
+}
+
+/// All three POSIX scripts default the five prompt colours to the SAME palette
+/// indices. A divergence here would make the shells disagree on screen even
+/// once every one of them encodes an index correctly.
+#[test]
+fn test_prompt_color_defaults_agree_across_shells() {
+    for (var, index, fish_local) in [
+        ("ATERM_PROMPT_HOST_COLOR", "2", "hc"),
+        ("ATERM_PROMPT_PATH_COLOR", "4", "pc"),
+        ("ATERM_PROMPT_GIT_COLOR", "3", "gc"),
+        ("ATERM_PROMPT_ERROR_COLOR", "1", "ec"),
+        ("ATERM_PROMPT_SEP_COLOR", "8", "sc"),
+    ] {
+        assert!(
+            scripts::BASH.contains(&format!("${{{var}:-{index}}}")),
+            "bash must default {var} to {index}"
+        );
+        assert!(
+            scripts::FISH.contains(&format!(
+                "set -l {fish_local} (test -n \"${var}\"; and echo ${var}; or echo {index})"
+            )),
+            "fish must default {var} to {index}, the same index bash uses"
+        );
+    }
+}
+
+/// OSC 7 is a well-formed `file://` URI for EVERY host value, including the
+/// degenerate one.
+///
+/// The pre-fix failure was not a wrong hostname, it was a wrong NUMBER OF
+/// ARGUMENTS: `__aterm_osc` received none and printed a bare `ESC ] BEL`. So
+/// the assertion is structural — the payload always starts `7;file://` and
+/// always ends with the percent-encoded cwd — and it is checked with the
+/// resolved host forced EMPTY, which is the exact state that used to collapse
+/// the whole argument.
+#[cfg(unix)]
+#[test]
+fn test_fish_osc7_is_well_formed_for_every_host_value() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping test_fish_osc7_is_well_formed_for_every_host_value");
+        return;
+    };
+    let (_dir, cwd) = create_special_cwd();
+    let encoded = osc7_percent_encode(&cwd.to_string_lossy());
+    // A bare `cd`: the report rides fish's `--on-variable PWD` handler, which is
+    // how a real session emits OSC 7, and it fires EXACTLY once (the source-time
+    // report is swallowed with the rest of the load by the harness).
+    let body = format!("cd -- '{}'", cwd.display());
+
+    // Named host: $HOST wins, exactly as it does for zsh.
+    assert_eq!(
+        run_fish_integration(
+            fish,
+            &[("HOST", "aterm.test"), ("HOSTNAME", "aterm.test")],
+            &body,
+        ),
+        format!("\u{1b}]7;file://aterm.test{encoded}\u{7}"),
+        "fish OSC 7 must carry the resolved host and the percent-encoded cwd"
+    );
+
+    // Degenerate host: still a URI, NOT a bare `ESC ] BEL`. `file:///path` is
+    // the empty-authority form RFC 8089 defines, and every consumer of OSC 7
+    // parses it.
+    let degenerate = run_fish_integration(
+        fish,
+        &[("HOST", "aterm.test")],
+        &format!("set -g __aterm_report_host \"\"; {body}"),
+    );
+    assert_eq!(
+        degenerate,
+        format!("\u{1b}]7;file://{encoded}\u{7}"),
+        "an empty resolved host must still yield a well-formed OSC 7"
+    );
+    assert!(
+        !degenerate.contains("\u{1b}]\u{7}"),
+        "OSC 7 collapsed to a bare empty OSC: {degenerate:?}"
+    );
+}
+
+/// The fallback prompt survives a host with no `hostname` command.
+///
+/// `echo -n (whoami)'@'(hostname)' '(prompt_pwd)' $ '` printed NOTHING when any
+/// one of those four substitutions came back empty — the commonest trigger
+/// being a container image with no `hostname` binary. The prompt is now built
+/// from captured locals, so a missing segment costs its own text and nothing
+/// else.
+#[cfg(unix)]
+#[test]
+fn test_fish_fallback_prompt_survives_a_missing_hostname() {
+    let Some(fish) = fish_shell() else {
+        eprintln!(
+            "fish not installed; skipping test_fish_fallback_prompt_survives_a_missing_hostname"
+        );
+        return;
+    };
+    // No ATERM_PROMPT_STYLE and no user prompt to wrap => the fallback arm.
+    //
+    // `$USER` is set INSIDE the body, not through the environment: fish
+    // populates its own `$USER` global from the passwd database at startup, so
+    // an exported one would be overwritten before the prompt ever renders.
+    let body = "functions -e __aterm_original_fish_prompt; \
+                function prompt_pwd; printf '~/x'; end; \
+                set -g __aterm_report_host localhost; \
+                set -g USER tester; \
+                fish_prompt";
+    let out = run_fish_integration(fish, &[("ATERM_DISABLE_PROMPT_TITLES", "1")], body);
+    assert_eq!(
+        out,
+        "\u{1b}]133;A\u{7}tester@localhost ~/x $ \u{1b}]133;B\u{7}",
+        "the fallback prompt must render every segment it can, between the marks"
+    );
+}
+
+/// Extract the ordered list of SGR parameter strings from a rendered prompt —
+/// `\e[38;5;4m` yields `"38;5;4"`. OSC sequences (the 133/633 marks) end in
+/// BEL, not `m`, so they are skipped.
+#[cfg(unix)]
+fn sgr_sequence(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == 0x1b && b[i + 1] == b'[' {
+            let start = i + 2;
+            let mut j = start;
+            while j < b.len() && !b[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'm' {
+                out.push(String::from_utf8_lossy(&b[start..j]).into_owned());
+            }
+            i = j.saturating_add(1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// CROSS-SHELL PARITY: for every prompt style, fish emits the SAME SGR colour
+/// sequence bash does.
+///
+/// This is the assertion the lane is really about. bash's PS1 is a template, so
+/// it is expanded with `${PS1@P}` — which runs the `$(__aterm_err_prompt)` and
+/// `$(__aterm_git_segment)` substitutions too, giving the bytes a terminal
+/// would actually receive. Only the colour sequence is compared: `\w` and
+/// `prompt_pwd` abbreviate paths differently by design, and that is not a
+/// colour.
+///
+/// Before the fix fish emitted NO `38;5;N` at all (every `set_color <index>`
+/// failed), so this compared `[]` against bash's full sequence.
+#[cfg(unix)]
+#[test]
+fn test_fish_prompt_colors_are_sgr_indices_like_bash() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping test_fish_prompt_colors_are_sgr_indices_like_bash");
+        return;
+    };
+    let bash = bash_shell();
+    let bash_script = format!(
+        "{}/src/scripts/aterm_shell_integration.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    for style in ["minimal", "standard", "powerline"] {
+        let out = shell_command(bash)
+            .args(["--noprofile", "--norc", "-i", "-c"])
+            .arg(
+                "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
+                 __aterm_set_prompt; printf '%s' \"${PS1@P}\"",
+            )
+            .env("ATERM_TEST_SCRIPT", &bash_script)
+            .env("ATERM_PROMPT_STYLE", style)
+            .env("ATERM_DISABLE_PROMPT_TITLES", "1")
+            .output()
+            .unwrap_or_else(|error| panic!("spawn bash for prompt parity test: {error}"));
+        let bash_prompt = String::from_utf8_lossy(&out.stdout).into_owned();
+        let bash_sgr = sgr_sequence(&bash_prompt);
+        assert!(
+            !bash_sgr.is_empty(),
+            "bash must colour its {style} prompt (fixture sanity); got {bash_prompt:?}"
+        );
+
+        let fish_out = fish_integration_output(
+            fish,
+            &[
+                ("ATERM_PROMPT_STYLE", style),
+                ("ATERM_DISABLE_PROMPT_TITLES", "1"),
+            ],
+            "function prompt_pwd; printf '~/x'; end; __aterm_custom_prompt",
+        );
+        let fish_prompt = String::from_utf8_lossy(&fish_out.stdout).into_owned();
+        let fish_stderr = String::from_utf8_lossy(&fish_out.stderr).into_owned();
+        assert!(
+            !fish_stderr.contains("Unknown color"),
+            "fish rejected a prompt colour ({style}): {fish_stderr:?}"
+        );
+        assert_eq!(
+            sgr_sequence(&fish_prompt),
+            bash_sgr,
+            "fish and bash must colour the {style} prompt identically.\n  \
+             fish: {fish_prompt:?}\n  bash: {bash_prompt:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE MULTIPLEXER BOUNDARY (screen / tmux)
+//
+// aterm hosts ONE session per PTY. Start `screen` or `tmux` in it and the
+// multiplexer owns that PTY: every pane lives inside the SAME aterm session,
+// and aterm has no name for a pane. Measured on this host against a real
+// headless instance with GNU screen 4.09.01, BEFORE any of this existed:
+//
+//   * the whole screen run collapsed into ONE outer block, still `executing`
+//     (`cmdline=screen%20-S%20muxprobe`), and NOTHING typed inside it produced a
+//     block, an exit code or a cwd update; `meta` reported `title=` EMPTY.
+//   * `$ATERM_PARENT_SESSION_ID` arrived in the pane shell unchanged, so a
+//     flagless `aterm ctl status` typed IN the pane answered `OK … phase=quiet`
+//     from the OUTER session — success, wrong terminal, no signal at all.
+//
+// Neither can be fixed from a pane: a pane is genuinely not an aterm session.
+// What these tests pin is that both are now VISIBLE — the crossing is marked
+// ($ATERM_MUX + the outer sid, which `aterm ctl` refuses flagless self-drive
+// on), and said once out loud.
+//
+// The guard is what makes the detection trustworthy in both directions: aterm's
+// spawn seam forces `$ATERM_SHELL_INTEGRATION_INSTALLED` to the EMPTY string for
+// every session it starts, so a NON-empty value means we did not come straight
+// from aterm. That is what tells a real pane shell apart from an aterm window
+// that was LAUNCHED from a pane and merely inherited `$TMUX`/`$STY`.
+//
+// tmux is not installed on this host. It is covered by construction rather than
+// by claim: `$TMUX` is checked FIRST, before `$STY` and before `TERM`, because
+// tmux's default `TERM` is `screen-256color` and would otherwise misname it.
+// The tmux-shaped environments below exercise that path with the real scripts.
+// ---------------------------------------------------------------------------
+
+/// Static sweep over BOTH copies of every POSIX script: the multiplexer
+/// detection must sit BEFORE the loader guard (a pane shell returns AT the
+/// guard, so anything after it never runs there), the inherited-guard branch
+/// must export the marks, and the past-the-guard path must clear them.
+#[test]
+fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
+    for (label, script, guard) in [
+        ("bash", scripts::BASH, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
+        ("zsh", scripts::ZSH, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
+        ("fish", scripts::FISH, "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\""),
+        ("app-bash", APP_BASH_RESOURCE, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
+        ("app-zsh", APP_ZSH_RESOURCE, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
+        ("app-fish", APP_FISH_RESOURCE, "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\""),
+    ] {
+        let guard_at = script
+            .find(guard)
+            .unwrap_or_else(|| panic!("{label}: the loader guard must still be a `-n` test"));
+        let detect_at = script
+            .find("__aterm_mux")
+            .unwrap_or_else(|| panic!("{label}: no multiplexer detection at all"));
+        assert!(
+            detect_at < guard_at,
+            "{label}: the multiplexer detection must run BEFORE the loader guard — \
+             a pane shell RETURNS at that guard, so detection placed after it never runs"
+        );
+        // $TMUX is consulted before $STY and before TERM: tmux's default TERM is
+        // screen-256color, so TERM names the family, never the program.
+        let tmux_at = script.find("TMUX").expect("{label}: no $TMUX check");
+        let sty_at = script.find("STY").expect("{label}: no $STY check");
+        let term_at = script
+            .find("screen-*")
+            .expect("{label}: no TERM family fallback");
+        assert!(
+            tmux_at < sty_at && sty_at < term_at,
+            "{label}: check $TMUX, then $STY, then TERM"
+        );
+        for marker in ["ATERM_MUX", "ATERM_MUX_OUTER_SESSION_ID", "ATERM_MUX_NOTICE"] {
+            assert!(
+                script.contains(marker),
+                "{label}: the boundary must export/honour {marker}"
+            );
+        }
+        // Past the guard this shell IS an aterm session shell, so a marker
+        // inherited from the pane it was launched out of is a stale lie.
+        let clears = script.contains("unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID")
+            || (script.contains("set -e ATERM_MUX\n") && script.contains("set -e ATERM_MUX_OUTER_SESSION_ID"));
+        assert!(
+            clears,
+            "{label}: a shell that gets PAST the guard must clear an inherited \
+             $ATERM_MUX, or every window opened from a tmux pane inherits a \
+             refusal it does not deserve"
+        );
+        // …and it must carry the base FORWARD. The spawn seam stamps it for
+        // every session (aterm-gui's provision_child_identity_env), so the
+        // script's own write is the embedder fallback: set-if-unset, never an
+        // overwrite. An unconditional write here is the defect — a session
+        // whose shell sources this file INSIDE a pane would stamp the pane's
+        // signature as its own birth and never notice the crossing.
+        // The ASSIGNMENT, not the first mention: the rationale comment names
+        // the variable long before the guard.
+        let stamp_stmt = [": \"${ATERM_MUX_BASE:=", "set -gx ATERM_MUX_BASE"]
+            .into_iter()
+            .find_map(|needle| script.find(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: a shell that gets PAST the guard must carry \
+                     $ATERM_MUX_BASE forward"
+                )
+            });
+        // GUARDED, in each shell's own spelling: posix takes `:=` (assign only
+        // when unset), fish tests emptiness first. An unconditional write would
+        // overwrite the spawn seam's answer with one read after the pane was
+        // entered — the defect that refused a fresh window as if it were a pane.
+        let guarded = if label.ends_with("fish") {
+            script
+                .find("if not test -n \"$ATERM_MUX_BASE\"")
+                .is_some_and(|at| at < stamp_stmt)
+        } else {
+            script.contains(": \"${ATERM_MUX_BASE:=")
+        };
+        assert!(
+            guarded,
+            "{label}: the base must be written only when UNSET — the spawn seam \
+             stamps every session, including shells that never source this file"
+        );
+        assert!(
+            stamp_stmt > guard_at,
+            "{label}: the base is stamped only PAST the guard — a pane shell \
+             that re-stamped it would erase the very comparison that finds it"
+        );
+    }
+}
+
+/// WHY $ATERM_MUX_BASE EXISTS, and the measurement that put it there.
+///
+/// Everything above this line runs only where a pane shell SOURCES the
+/// integration — and under aterm's own injection a bash or zsh pane shell never
+/// does. aterm hands bash `--rcfile <path>` and zsh a `$ZDOTDIR`; both are
+/// one-shot mechanisms chosen by whoever starts the shell, and a pane shell is
+/// started by screen or tmux. Measured live on this host, GNU screen 4.09.01
+/// inside a headless aterm session: the pane had `STY=189301.muxprobe`,
+/// `TERM=screen.xterm-256color`, the inherited guard `1` — every precondition of
+/// the block above TRUE — and `$ATERM_MUX` came back EMPTY with
+/// `type -t __aterm_prompt_command` empty too. The script had not been sourced
+/// at all, so the one-time notice could not be printed and tier 1 was
+/// unreachable from a real pane.
+///
+/// What CAN cross is an exported variable. The session shell — the one place
+/// aterm's injection always lands — stamps the multiplexer environment it was
+/// born into, and the pane inherits it while its OWN `$TMUX`/`$STY` are the
+/// multiplexer's. The mismatch is the crossing; `aterm ctl` reads both sides.
+#[cfg(unix)]
+#[test]
+fn test_bash_session_shell_stamps_the_multiplexer_base_a_pane_can_be_compared_against() {
+    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
+    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+                  __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
+                  printf 'base=[%s]' \"${ATERM_MUX_BASE-UNSET}\"";
+    let probe = |env: &[(&str, &str)]| {
+        run_mux_probe(
+            bash_shell(),
+            &["--noprofile", "--norc", "-i"],
+            "aterm_shell_integration.bash",
+            rt.path(),
+            env,
+            report,
+        )
+        .0
+    };
+
+    // The ordinary aterm session shell: no multiplexer anywhere, so the base is
+    // the empty pair. A pane's `$STY` will differ from this, which is the whole
+    // mechanism — and note it is stamped even though nothing is nested yet.
+    assert_eq!(
+        probe(&[
+            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+            ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+            ("TERM", "xterm-256color"),
+        ]),
+        "base=[|]",
+    );
+    // An aterm window LAUNCHED FROM a tmux pane re-stamps the base as its own,
+    // so the marker it inherited matches and it is not mistaken for a pane.
+    assert_eq!(
+        probe(&[
+            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+            ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+            ("TERM", "xterm-256color"),
+            ("TMUX", "/tmp/tmux-1000/default,9,0"),
+        ]),
+        "base=[/tmp/tmux-1000/default,9,0|]",
+    );
+    assert_eq!(
+        probe(&[
+            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+            ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+            ("TERM", "xterm-256color"),
+            ("STY", "4242.pts-3.host"),
+        ]),
+        "base=[|4242.pts-3.host]",
+    );
+    // A pane shell that DOES source the integration (a hand-installed `source`
+    // line, fish's vendor conf.d) returns at the guard and must leave the
+    // session shell's base untouched — re-stamping it there would erase the
+    // comparison. Nothing in scope, nothing stamped.
+    assert_eq!(
+        probe(&[
+            ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+            ("ATERM_PARENT_SESSION_ID", "s-outer"),
+            ("TERM", "screen.xterm-256color"),
+            ("STY", "4242.pts-3.host"),
+        ]),
+        "base=[UNSET]",
+    );
+}
+
+/// Source a script under `shell` in a synthesized environment and report the
+/// boundary variables it left behind, plus whatever it said on stderr.
+#[cfg(unix)]
+fn run_mux_probe(
+    shell: &str,
+    args: &[&str],
+    script_name: &str,
+    runtime_dir: &std::path::Path,
+    env: &[(&str, &str)],
+    report: &str,
+) -> (String, String) {
+    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+    let mut cmd = shell_command(shell);
+    cmd.args(args)
+        .arg("-c")
+        .arg(report)
+        .env("ATERM_TEST_SCRIPT", &script)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        // A pane's own environment is synthesized per case; start from a clean
+        // slate so the developer's real shell cannot decide the outcome.
+        .env_remove("TMUX")
+        .env_remove("STY")
+        .env_remove("ATERM_MUX")
+        .env_remove("ATERM_MUX_BASE")
+        .env_remove("ATERM_MUX_OUTER_SESSION_ID")
+        .env_remove("ATERM_PARENT_SESSION_ID");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {shell} for the mux probe: {e}"));
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The bash boundary, end to end in a real bash: a pane shell (inherited guard)
+/// is MARKED with the multiplexer and the outer sid; an aterm session shell
+/// (guard forced empty by the spawn seam) is not — and CLEARS a marker it
+/// inherited from the pane it was launched out of.
+#[cfg(unix)]
+#[test]
+fn test_bash_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
+    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
+    // stdout is redirected, stderr is NOT: the one-time notice IS the stderr of
+    // the source, and swallowing it would test the marks while hiding the voice.
+    // The trailing teardown is the suite's usual one: when the guard is EMPTY the
+    // integration really installs, and its DEBUG-trap preexec would otherwise
+    // stamp OSC 633;E/133;C into the stdout this asserts on byte-for-byte.
+    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+                  __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
+                  printf 'mux=%s outer=%s' \"${ATERM_MUX-UNSET}\" \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\"";
+    let probe = |env: &[(&str, &str)]| {
+        run_mux_probe(
+            bash_shell(),
+            &["--noprofile", "--norc", "-i"],
+            "aterm_shell_integration.bash",
+            rt.path(),
+            env,
+            report,
+        )
+    };
+
+    // A GNU screen window inside an aterm session — the measured case.
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen.xterm-256color"),
+        ("STY", "4242.pts-3.host"),
+    ]);
+    assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
+    assert!(
+        err.contains("inside screen") && err.contains("do not cross the multiplexer"),
+        "the first pane of a multiplexer says so once: {err:?}"
+    );
+
+    // The SAME multiplexer, a second pane: the stamp under $XDG_RUNTIME_DIR
+    // keys the notice to the multiplexer, not to the pane, so it stays quiet.
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen.xterm-256color"),
+        ("STY", "4242.pts-3.host"),
+    ]);
+    assert_eq!(out, "mux=screen outer=s-outer");
+    assert!(
+        !err.contains("inside screen"),
+        "the notice is once per MULTIPLEXER, not once per pane: {err:?}"
+    );
+
+    // A tmux pane: $TMUX names the program even though TERM says screen-*.
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,9,0"),
+    ]);
+    assert_eq!(out, "mux=tmux outer=s-outer", "stderr: {err:?}");
+    assert!(err.contains("inside tmux"), "{err:?}");
+
+    // ATERM_MUX_NOTICE=0 silences the line without disturbing the marks.
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-quiet"),
+        ("TERM", "screen"),
+        ("STY", "55.pts-9.h"),
+        ("ATERM_MUX_NOTICE", "0"),
+    ]);
+    assert_eq!(out, "mux=screen outer=s-quiet");
+    assert!(!err.contains("do not cross"), "silenced: {err:?}");
+
+    // A multiplexer with NO aterm session in scope: marked (so `aterm ctl mux`
+    // can say what it sees) but with no outer sid, and nothing announced —
+    // there is no aterm block model to have lost.
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("TERM", "screen"),
+        ("STY", "77.pts-1.h"),
+    ]);
+    assert_eq!(out, "mux=screen outer=UNSET");
+    assert!(!err.contains("do not cross"), "{err:?}");
+
+    // An aterm SESSION shell: the spawn seam forces the guard empty, so the
+    // integration installs — and a marker inherited from the tmux pane this
+    // window was launched out of is cleared rather than believed.
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+        ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+        ("TERM", "xterm-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,9,0"),
+        ("ATERM_MUX", "tmux"),
+        ("ATERM_MUX_OUTER_SESSION_ID", "s-stale"),
+    ]);
+    assert_eq!(
+        out, "mux=UNSET outer=UNSET",
+        "a window launched FROM a pane is not IN it: {err:?}"
+    );
+
+    // A plain nested bash inside an aterm session: guard inherited, but no
+    // multiplexer anywhere — nothing to mark.
+    let (out, _) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "xterm-256color"),
+    ]);
+    assert_eq!(out, "mux=UNSET outer=UNSET");
+}
+
+/// The zsh boundary — the same contract, in a real zsh where one is installed.
+#[cfg(unix)]
+#[test]
+fn test_zsh_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("SKIP: no zsh on this host");
+        return;
+    };
+    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
+    // stdout is redirected, stderr is NOT: the one-time notice IS the stderr of
+    // the source, and swallowing it would test the marks while hiding the voice.
+    // Same teardown reason as bash: an installed zsh integration's preexec hook
+    // would stamp OSC marks into the asserted stdout.
+    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+                  add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; \
+                  add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true; \
+                  printf 'mux=%s outer=%s' \"${ATERM_MUX-UNSET}\" \"${ATERM_MUX_OUTER_SESSION_ID-UNSET}\"";
+    let probe = |env: &[(&str, &str)]| {
+        run_mux_probe(
+            zsh,
+            &["-f", "-i"],
+            "aterm_shell_integration.zsh",
+            rt.path(),
+            env,
+            report,
+        )
+    };
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen.xterm-256color"),
+        ("STY", "4242.pts-3.host"),
+    ]);
+    assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
+    assert!(err.contains("inside screen"), "{err:?}");
+    let (out, _) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,9,0"),
+    ]);
+    assert_eq!(out, "mux=tmux outer=s-outer");
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+        ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+        ("TERM", "xterm-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,9,0"),
+        ("ATERM_MUX", "tmux"),
+    ]);
+    assert_eq!(out, "mux=UNSET outer=UNSET", "stderr: {err:?}");
+}
+
+/// The fish boundary — the same contract, in a real fish where one is installed.
+#[cfg(unix)]
+#[test]
+fn test_fish_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("SKIP: no fish on this host");
+        return;
+    };
+    let rt = aterm_tempfile::tempdir().expect("scratch runtime dir");
+    // stdout redirected, stderr kept — the notice is the stderr of the source.
+    let report = "source \"$ATERM_TEST_SCRIPT\" >/dev/null; \
+                  set -l m UNSET; test -n \"$ATERM_MUX\"; and set m \"$ATERM_MUX\"; \
+                  set -l o UNSET; test -n \"$ATERM_MUX_OUTER_SESSION_ID\"; and set o \"$ATERM_MUX_OUTER_SESSION_ID\"; \
+                  printf 'mux=%s outer=%s' \"$m\" \"$o\"";
+    let probe = |env: &[(&str, &str)]| {
+        run_mux_probe(
+            fish,
+            &["-i"],
+            "aterm_shell_integration.fish",
+            rt.path(),
+            env,
+            report,
+        )
+    };
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen.xterm-256color"),
+        ("STY", "4242.pts-3.host"),
+    ]);
+    assert_eq!(out, "mux=screen outer=s-outer", "stderr: {err:?}");
+    assert!(err.contains("inside screen"), "{err:?}");
+    let (out, _) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", "1"),
+        ("ATERM_PARENT_SESSION_ID", "s-outer"),
+        ("TERM", "screen-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,9,0"),
+    ]);
+    assert_eq!(out, "mux=tmux outer=s-outer");
+    let (out, err) = probe(&[
+        ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+        ("ATERM_PARENT_SESSION_ID", "s-fresh"),
+        ("TERM", "xterm-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,9,0"),
+        ("ATERM_MUX", "tmux"),
+    ]);
+    assert_eq!(out, "mux=UNSET outer=UNSET", "stderr: {err:?}");
 }

@@ -1335,19 +1335,52 @@ fn remove_fault_marker(directory: &Path) -> Result<(), OperatorError> {
 }
 
 struct ProcessLock {
-    _file: File,
+    file: File,
 }
 
 impl ProcessLock {
     fn acquire(path: &Path) -> Result<Self, OperatorError> {
         let file = open_private_regular_file(path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(fs::TryLockError::WouldBlock) => {
                 Err(OperatorError::LockContended(path.to_path_buf()))
             }
             Err(fs::TryLockError::Error(error)) => Err(OperatorError::Io(error)),
         }
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        // Release the lock itself; do not settle for closing a descriptor that
+        // names it. The lock lives on the open file description, and any child
+        // forked anywhere in this process while it was held owns a duplicate of
+        // that description until it reaches `exec` — a window a loaded machine
+        // stretches into milliseconds, and aterm forks for every session it
+        // spawns. Closing alone inside that window leaves the lock standing in a
+        // process that never opened the queue, so the next opener — this process
+        // reopening the directory cold, or the next process to try — is refused
+        // as `LockContended` by a holder no diagnostic can name. Unlocking is the
+        // release no fork window can outlive: it makes "the last handle dropped"
+        // mean "the next opener may have it".
+        //
+        // It reaches exactly the paths that RUN DESTRUCTORS, which is not all of
+        // them. A process that leaves through `libc::_exit` runs none: the
+        // seamless handoff's point of no return (`commit_and_exit` in
+        // crates/aterm-gui/src/seamless.rs) is such an exit, so a successor
+        // taking leadership after handoff still meets whatever the predecessor's
+        // fork window left standing. Closing that gap means unlocking BEFORE the
+        // exit, which no `Drop` can do for it.
+        //
+        // The workspace's other advisory-lock guards do NOT yet release this way:
+        // `atpkg::lock::StoreLock` (crates/atpkg/src/lock.rs),
+        // `aterm_update_core::FileLock` (crates/aterm-update-core/src/sys.rs) and
+        // `atpkg-keys`' roster claim (crates/atpkg-keys/src/provision.rs) each
+        // still rely on the close, and each carries the same fork window. They
+        // are named here so the difference is deliberate and findable rather than
+        // an accident of which one was measured first.
+        let _ = self.file.unlock();
     }
 }
 
@@ -7316,6 +7349,29 @@ mod tests {
         let (next, report) = DurableQueue::open_next_epoch(&directory.0, fast_config()).unwrap();
         assert_eq!(report.durable_epoch, 6);
         assert_eq!(next.durable_epoch().unwrap(), 6);
+    }
+
+    /// A descriptor duplicate is what every `fork` hands out: a child spawned
+    /// anywhere in this process while the queue was open carries a copy of the
+    /// lock's open file description until it reaches `exec`, and the OS lock
+    /// lives on that description rather than on either descriptor. `try_clone`
+    /// is that duplicate exactly. Dropping the last queue handle must therefore
+    /// end the lock, not merely close one name for it — otherwise the next opener
+    /// of the same directory is refused by a holder that never opened it, which is
+    /// how a shell spawn in one thread breaks an unrelated reopen in another.
+    #[test]
+    fn a_dropped_queue_releases_its_lock_against_an_inherited_descriptor() {
+        let directory = TestDir::new("lock-fork-window");
+        let queue = DurableQueue::open(&directory.0, 1, fast_config()).unwrap();
+        let inherited = queue.shared._lock.file.try_clone().unwrap();
+        drop(queue);
+        let reopened = DurableQueue::open(&directory.0, 2, fast_config());
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "an inherited descriptor must not keep a released lock alive: {:?}",
+            reopened.err()
+        );
     }
 
     #[test]

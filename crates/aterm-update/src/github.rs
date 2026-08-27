@@ -2002,6 +2002,18 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
             &format!("update check failed: {error}"),
         );
     }
+    // THE LIVE CHANNEL IS ANSWERED THE SAME WAY. A check that reported a download
+    // (`progress::watch_download`) put something on the host's screen; every exit
+    // after that point must take it down with the truth — the `Staged` and
+    // `Deferred` arms report inline, and this is the one place all eight failure
+    // exits reach. A check that never downloaded reported nothing and owes nothing
+    // (the routine no-op check must not raise a bar to say it failed to find work).
+    let began = crate::progress::take_download_began();
+    if began && let Err(error) = &result {
+        crate::progress::report(crate::progress::Progress::Failed {
+            detail: error.clone(),
+        });
+    }
     result
 }
 
@@ -2519,14 +2531,21 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let part = staging.download.join(format!("{}.part", artifact.name));
     let container_path = staging.download.join(&artifact.name);
     sweep_download_scratch(&staging);
+    // LIVE PROGRESS for a host that shows it (the aterm window's status bar): a
+    // sibling poller stats the growing `.part` against the asset's declared size
+    // — the API's `size`, `0` when it was not reported, which the host renders as
+    // "unknown". Joined on drop, so it cannot outlive the download it watches.
+    let download_watch = crate::progress::watch_download(&part, &manifest.version, asset.size);
     // A failed download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
-    if let Err(e) = aterm_update_core::download_to(
+    let downloaded = aterm_update_core::download_to(
         &asset.url,
         tok.as_deref(),
         &part,
         aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
-    ) {
+    );
+    drop(download_watch);
+    if let Err(e) = downloaded {
         let _ = std::fs::remove_file(&part);
         // The container's own 429/403 is the same weather as the manifest's, one
         // request later in the check: deferred (bounded by the streak), not a
@@ -2535,14 +2554,16 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             && rate_limit_still_deferrable(&CONTAINER_RATE_LIMIT_STREAK)
         {
             RATE_LIMITED.store(true, Ordering::Relaxed);
-            crate::status::record(
-                &staging,
-                current_build,
-                &format!(
-                    "update check deferred: GitHub rate limit hit while downloading the \
-                     {container} — backing off, will retry on the next check"
-                ),
+            let note = format!(
+                "update check deferred: GitHub rate limit hit while downloading the \
+                 {container} — backing off, will retry on the next check"
             );
+            crate::status::record(&staging, current_build, &note);
+            // Answer the live channel too: the bar opened on the first byte and
+            // a deferral is its honest end (the wrapper reports only `Err`s).
+            if crate::progress::take_download_began() {
+                crate::progress::report(crate::progress::Progress::Deferred { detail: note });
+            }
             return Ok(None);
         }
         crate::health::Health::record_failure(
@@ -2555,6 +2576,11 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
 
     // The container arrived: its streak is over.
     CONTAINER_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
+    // …and everything from here to the publish is one "verifying" phase on the
+    // live channel: size, digest, extract, codesign/Gatekeeper, the atomic stage.
+    crate::progress::report(crate::progress::Progress::Verifying {
+        version: manifest.version.clone(),
+    });
     // Size sanity (when the API reported one), then atomically name it final. From
     // here failures are `stage`-class in the health ledger: the bytes ARRIVED; the
     // artifact (or local disk) is the problem, not the download pipeline.
@@ -2685,6 +2711,14 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             manifest.version, manifest.build_number
         ),
     );
+    // The live channel's good end. Only a check that downloaded says so — an
+    // already-covered stage returns `Ok(Some)` far above without touching it.
+    if crate::progress::take_download_began() {
+        crate::progress::report(crate::progress::Progress::Staged {
+            version: manifest.version.clone(),
+            build: manifest.build_number,
+        });
+    }
     Ok(Some(manifest.version))
 }
 

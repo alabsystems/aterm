@@ -1154,6 +1154,89 @@ mod tests {
         }
     }
 
+    /// Exhaustive parity guard for the HANGUL blocks — the other hand-rolled
+    /// width-2 range, and until now the unguarded one. `char_width` hardcodes
+    /// `(0xAC00..0xD7A4) => 2` for the 11,172 Hangul Syllables with nothing
+    /// checking that literal against the authoritative table, the way
+    /// `fast_path_width_matches_table_cjk_block` checks U+3000..U+A000.
+    ///
+    /// WHAT THIS CATCHES, precisely — the honest scope, because a guard that is
+    /// believed to cover more than it does is worse than none:
+    ///
+    ///  * the arm's WIDTH drifting from 2. Every syllable would disagree with
+    ///    the table, so the print path would advance the cursor by one column
+    ///    while the reflow/materialize/fill paths recompute two — every Korean
+    ///    line shifting a column on scroll or resize.
+    ///  * the arm's upper bound WIDENING past U+D7A3. Decoding the generated
+    ///    table directly: U+AC00 and U+D7A3 are WIDE, while the unassigned tail
+    ///    U+D7A4..U+D7AF and the whole of Hangul Jamo Extended-B
+    ///    (U+D7B0..U+D7FF) are NARROW. Widening the literal would force all of
+    ///    them to 2 against a table that says 1. That is why the neighbouring
+    ///    Jamo blocks are swept and not just the syllables.
+    ///
+    /// The Hangul Jamo block (U+1100..U+11FF) is swept for the same reason and
+    /// is the sharpest case in the set, because it is not uniform: U+1100..115F
+    /// (choseong) are WIDE while U+1160..11FF (jungseong/jongseong) are
+    /// ZERO-width, so any blanket rule applied to "Hangul" is wrong for half of
+    /// it. Both halves reach the table through the generic tail today, and this
+    /// pins that they keep doing so.
+    ///
+    /// What it CANNOT catch, by construction: NARROWING the literal. A codepoint
+    /// dropped out of the arm falls through to the generic tail, which asks the
+    /// same table this test compares against, so the two agree by definition.
+    /// Narrowing costs speed, not correctness — which is exactly why the
+    /// absolute-width pins below are here as well as the parity sweep.
+    ///
+    /// Also NOT covered: `write_unicode_bulk` open-codes the same `0xAC00..
+    /// 0xD7A4` literal twice more (the wide-run lead gate and the run-extension
+    /// predicate). Those decide BATCHING, not width — the batched and per-glyph
+    /// writers agree on the grid — so a drift there is a performance bug, not a
+    /// column shift, and this test says nothing about it.
+    #[test]
+    fn fast_path_width_matches_table_hangul_blocks() {
+        // (block, half-open range) — Jamo, Jamo Extended-A, the Syllables plus
+        // the unassigned tail U+D7A4..U+D7AF, and Jamo Extended-B.
+        let blocks: &[(&str, std::ops::Range<u32>)] = &[
+            ("Hangul Jamo", 0x1100..0x1200),
+            ("Hangul Jamo Extended-A", 0xA960..0xA980),
+            ("Hangul Syllables", 0xAC00..0xD7B0),
+            ("Hangul Jamo Extended-B", 0xD7B0..0xD800),
+        ];
+        for (block, range) in blocks {
+            for cp in range.clone() {
+                let c = char::from_u32(cp).expect("all four blocks are BMP scalar values");
+                assert_eq!(
+                    char_width(c, false),
+                    aterm_grapheme::char_width(c),
+                    "{block}: non-CJK (ambiguous=narrow) width mismatch at U+{cp:04X}"
+                );
+                assert_eq!(
+                    char_width(c, true),
+                    aterm_grapheme::char_width_cjk(c),
+                    "{block}: CJK (ambiguous=wide) width mismatch at U+{cp:04X}"
+                );
+            }
+        }
+        // Parity alone could hold vacuously if the TABLE itself went narrow, and
+        // a Korean line one column wide per syllable is the same broken screen.
+        // So pin the absolute width at both ends of the syllable range and at a
+        // syllable from the middle, in both ambiguous-width modes.
+        for c in ['\u{AC00}', '\u{D55C}', '\u{AD6D}', '\u{C5B4}', '\u{D7A3}'] {
+            assert_eq!(
+                char_width(c, false),
+                2,
+                "U+{:04X} must occupy two cells (ambiguous=narrow)",
+                c as u32
+            );
+            assert_eq!(
+                char_width(c, true),
+                2,
+                "U+{:04X} must occupy two cells (ambiguous=wide)",
+                c as u32
+            );
+        }
+    }
+
     /// Pin the specific divergences called out in the bug report so a future
     /// edit to the fast-path can't silently re-break them even if the table
     /// itself were to change.

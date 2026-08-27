@@ -31,10 +31,10 @@ use crate::{
 /// defaults OFF; correct the stale tests") restored that after a test-driven revert
 /// put them back.
 ///
-/// IT OWNS TWO KEYS.
+/// IT OWNS ONE KEY (a second, `pkg_progress_effects` — the retired floating
+/// progress card's party trim — left with the card; the status bars that replaced
+/// it carry no decoration for it to govern).
 ///
-/// * `pkg_progress_effects` — the provisioning card's party trim, the cat that stands
-///   on the progress bar of the first-run "Installing the ALab toolchain" toast.
 /// * `cursor_trail` — the audit's HEADLINE, and the one this family exists for. The
 ///   default STYLE became `rainbow kitty pet` long after `5b11ff2c` made the
 ///   "batteries-on delight" call about a ~260 ms aurora, so the master now seats a
@@ -60,8 +60,9 @@ use crate::{
 ///   output rather than covering it, and its population is capped (`MAX_CATS = 8`)
 ///   rather than accumulating. (It is also a live product gate in native Settings with
 ///   its own disclosure ladder and migration path.) See
-///   [`Config::sparkle_words_enabled_or_default`], which also names the one honest
-///   exception.
+///   `Config::sparkle_words_enabled_or_default`, which also names the one honest
+///   exception. (Named, not linked: that resolver is `#[cfg(test)]`, so an
+///   intra-doc link from this shipping item would not resolve.)
 /// * `hdr_glow`, `cursor_fire_shimmer` — both default ON, and both only do work on
 ///   frames carrying cursor-GLOW quads, which only the trail produces; with the
 ///   Windows trail default off, a fresh Windows config already pays neither.
@@ -139,9 +140,17 @@ pub(crate) struct Config {
     /// Cursor MOTION TRAIL — the "streaming trailer" effect. DEFAULT ON and
     /// exactly idle at rest; set `cursor_trail = false` to opt out.
     pub(crate) cursor_trail: Option<bool>,
-    /// Trail STYLE: `rainbow kitty pet` (DEFAULT — that momentum-driven banded
+    /// Trail STYLE: `rainbow kitty pet` (DEFAULT — the smooth momentum-driven
     /// rainbow ribbon with the full-body cat that walks, runs and pounces along
-    /// the line), `rainbow kitty` (the same ribbon under the flying kitty head),
+    /// the line), `rainbow kitty` (THE SAME THING: since 2026-08-26 every
+    /// kitty-named spelling, bare `kitty` included, draws the full-body
+    /// resident, because a style called *kitty* that drew no kitty was a naming
+    /// trap), `rainbow kitty flying` (the same ribbon under the OLD FLYING KITTY
+    /// HEAD instead — the explicit opt-in for anyone who wants the rare flypast
+    /// back; `flying kitty`/`kitty flying` and the historical
+    /// `nyan rainbow`/`nyan`/`rainbow` also select it), `rainbow kitty
+    /// underline` (the explicit thin/highlighter geometry), and `rainbow kitty
+    /// tall` (an explicit spelling of the default smooth full-height geometry),
     /// `phaser` (a full-spectrum additive hue sweep along the
     /// swept path), `comet` (the cadence-comet: a directional fading comet of
     /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
@@ -150,7 +159,8 @@ pub(crate) struct Config {
     /// (phaser comet + spark particles), `fire` (rising embers), `laser` (white-hot
     /// beam), `water`, `beam` (a bloom-free beam-only crown, no trail body), or `off`.
     /// (`nyan rainbow`, `nyan` and `rainbow` are back-compat aliases for
-    /// `rainbow kitty`; `kitty pet`/`pet kitty` for `rainbow kitty pet`.)
+    /// `rainbow kitty flying` — the animal they have always drawn;
+    /// `kitty`/`kitty pet`/`pet kitty` for the resident pet.)
     pub(crate) cursor_trail_style: Option<String>,
     /// Trail Pack manifests — user-generated cursor trails as data (design
     /// `docs/trail-packs.md`). Each entry is a path to a `*.toml` Trail Pack
@@ -239,16 +249,6 @@ pub(crate) struct Config {
     /// background status, Robi's tips) is unchanged, and reduced motion holds the
     /// hues still so the card is colourful without moving.
     pub(crate) notice_sparkle: Option<bool>,
-    /// PROVISIONING PROGRESS-CARD EFFECTS (`pkg_progress_effects`, default ON —
-    /// user-facing features ship enabled; this is an opt-OUT). The toolchain
-    /// install's progress card wears the house party trim: a rainbow-filled
-    /// bar, sparkles on each completed program, and the cursor kitty riding the
-    /// bar's leading edge. Purely decorative: `false` keeps the card fully
-    /// functional as a plain themed accent bar with text rows — the numbers,
-    /// phases, queue order, dismiss/reopen behaviour and the honest
-    /// not-running/failed states are identical either way. Reduced motion and
-    /// serious mode strip the same trim without touching this preference.
-    pub(crate) pkg_progress_effects: Option<bool>,
     /// SING-ALONG RIFF (`trail_sound_riff`, default ON — user-facing features
     /// ship enabled; this is an opt-OUT).
     ///
@@ -864,6 +864,16 @@ pub(crate) struct Config {
     /// bg-blended tone when focus leaves. ABSENT = `false` (byte-identical:
     /// the band keeps the active colour regardless of focus).
     pub(crate) selection_inactive: Option<bool>,
+    /// Ink a hairline along the edges of the SPLIT pane that takes keystrokes,
+    /// inside the 1-cell divider gaps the compositor already draws between panes
+    /// (`app_render::ActivePaneMark`). ABSENT = `true` (on) — without it the
+    /// caret is the only witness, and a full-screen application is free to hide
+    /// it. `false` composes the plain seam grid, byte-identical to a frame with
+    /// no mark. Inert in a single-pane window (no divider gap exists) and in any
+    /// window that does not have the keyboard. Live on the next composed frame;
+    /// nothing to hot-reload into the renderer, because the mark is cells the
+    /// compositor writes.
+    pub(crate) split_focus_mark: Option<bool>,
     /// Break programming ligatures at the CURSOR cell (W5d): the cell under
     /// the cursor renders per-cell so the block cursor never sits on a
     /// multi-column ligature glyph (`LigatureMode::CursorDisabled`). ABSENT =
@@ -928,11 +938,16 @@ pub(crate) struct Config {
     /// Security opt-in for XTWINOPS (`CSI t`). On Linux the GUI installs a
     /// window callback (`spawn::configure_window_ops` → `App::on_window_op`),
     /// so authorized manipulations (iconify, maximize, fullscreen, resize —
-    /// move stays denied in-core) reach the winit window; position/pixel
-    /// geometry reports beyond the engine's window-title and text-grid-size
-    /// fallbacks remain unanswered. Elsewhere no callback is installed and only
-    /// those fallback reports work. Default OFF because even title/grid
-    /// reports can fingerprint the host.
+    /// move stays denied in-core) reach the winit window. REPORTS are answered
+    /// by the engine on every platform, never by the host callback (an async
+    /// wake cannot carry a synchronous reply): window title / icon label,
+    /// text-grid size (`CSI 18 t`), and — from the cell box the GUI pushes
+    /// through `Terminal::set_cell_pixel_size` — the text area in pixels
+    /// (`CSI 14 t`) and the cell size (`CSI 16 t`). Window/screen POSITION and
+    /// screen size remain unanswered: nothing in-core knows them. Elsewhere no
+    /// callback is installed and only those engine reports work. Default OFF
+    /// because even title/grid reports can fingerprint the host — and the pixel
+    /// pair discloses the host's font metrics, so it rides the same mint.
     pub(crate) allow_window_ops: Option<bool>,
     /// Security opt-in: allow desktop notifications (OSC 9 / 99 / 777). Default
     /// OFF. Maps to `allow_notifications`.
@@ -2904,16 +2919,6 @@ impl Config {
         self.notice_sparkle.unwrap_or(true)
     }
 
-    /// Progress-card party trim — rainbow bar, sparkles, the cat — on the
-    /// toolchain-provisioning card (default [`DEFAULT_DECORATIVE_EFFECTS`]: ON as an
-    /// opt-OUT everywhere except Windows, where the minimal-fast directive makes it
-    /// an opt-IN; see the field doc — the card itself stays fully functional and
-    /// legible either way).
-    pub(crate) fn pkg_progress_effects_or_default(&self) -> bool {
-        self.pkg_progress_effects
-            .unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
-    }
-
     /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is
     /// opt-in; see the field docs: notes/brrrring/bonk/melody unaffected).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
@@ -3140,7 +3145,7 @@ impl Config {
     /// classify it with `eq_ignore_ascii_case` / a case-insensitive `GlowStyle::parse`
     /// instead of paying a `to_ascii_lowercase` heap allocation on every frame.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
-        // Default: the RAINBOW KITTY PET (the banded rainbow ribbon trailed by the
+        // Default: the RAINBOW KITTY PET (the smooth full-height rainbow trailed by the
         // walking cat — the companion the owner runs), read from the single
         // definition in `prefs` rather than re-typed here, so a rename
         // of the style cannot leave this resolver pointing at a dead spelling.
@@ -3669,6 +3674,18 @@ impl Config {
     /// word is already on screen — it is not the resident, unprompted decoration on
     /// ORDINARY output that the minimal-fast directive rules out. If that one path
     /// ever wants a Windows answer, the aim is `supernova_chance`, not this master.
+    ///
+    /// TEST-ONLY, and gated to say so. It landed in `3dc6c33c` as the resolved
+    /// owner of this default and its callers are the `[sparkle_words] enabled`
+    /// assertions below — the shipping resolver reaches the same key through
+    /// `sparkle_deco_config_with_pack_specs`, which reads its own already-cloned
+    /// `sw`. An ungated definition with only `#[cfg(test)]` callers is a
+    /// `dead_code` finding in the LIB target, so the definition is gated to
+    /// match the callers rather than deleted: the sibling below
+    /// (`sparkle_deco_config`) has carried exactly this shape all along. If a
+    /// shipping caller ever wants it, delete the attribute — nothing else here
+    /// has to change.
+    #[cfg(test)]
     pub(crate) fn sparkle_words_enabled_or_default(&self) -> bool {
         self.sparkle_words
             .as_ref()
@@ -4382,6 +4399,13 @@ impl Config {
         self.selection_inactive.unwrap_or(false)
     }
 
+    /// Whether a split marks the pane that takes keystrokes. Default ON: the
+    /// caret is the only other witness, and an application that hides it takes
+    /// even that away.
+    pub(crate) fn split_focus_mark_or_default(&self) -> bool {
+        self.split_focus_mark.unwrap_or(true)
+    }
+
     /// SGR 2 faint opacity (W5e), default `0.5`, clamped 0.0..=1.0.
     pub(crate) fn faint_opacity_or_default(&self) -> f32 {
         match self.faint_opacity {
@@ -4500,9 +4524,11 @@ impl Config {
             }
             Some(TrailStyleIssue::Unknown) => Some(format!(
                 "cursor_trail_style: unknown style {raw:?} — the cursor effect is disabled; \
-                 expected one of phaser|rainbow kitty|comet|lumen|sparkle|fire|laser|water|beam|off \
-                 (or a documented alias like nyan rainbow/nyan/rainbow/ember/ocean), or pack:<id> \
-                 for a loaded Trail Pack"
+                 expected one of phaser|rainbow kitty|rainbow kitty pet|rainbow dog pet|\
+                 rainbow kitty flying|rainbow kitty tall|comet|lumen|sparkle|fire|laser|water|\
+                 beam|off \
+                 (or a documented alias like nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean), \
+                 or pack:<id> for a loaded Trail Pack"
             )),
         }
     }
@@ -6638,10 +6664,10 @@ pub(crate) fn resolve_cursor_glow(
         // The host's taste dial; the engine fails it OFF on a non-finite value,
         // and the resolver has already clamped it into 0..=1.5 s.
         wake_persist_s: inputs.wake_persist_s,
-        // The ribbon's presentation rides the RAW spelling, like the pet
-        // companions do: `cursor_trail_style = "rainbow kitty tall"` (and its
-        // siblings) opts into the banding-era tall body; every other rainbow
-        // spelling gets the default 0.43 flat under-baseline strip.
+        // The ribbon presentation rides the RAW spelling, like the pet
+        // companions do. Every ordinary rainbow spelling uses the smooth
+        // v0.43-shaped full-height body; only an explicit `... underline`
+        // spelling selects the later thin/highlighter alternate.
         ribbon_tall: GlowStyle::style_names_tall_ribbon(inputs.style_raw),
     }
 }
@@ -7309,6 +7335,74 @@ impl App {
         );
     }
 
+    /// THE CHROME ROWS CHANGED — the tab strip took more/fewer rows, or a status
+    /// bar appeared or folded — so every window is re-split between chrome and
+    /// terminal: clear each window's strip cache + force a repaint, and re-grid
+    /// each from its own OS window size (the chrome now takes more/fewer rows,
+    /// and the PTY is told — `on_resize` → `apply_term_resize`, a no-op when the
+    /// count did not actually move). The chrome is GLOBAL, but
+    /// `tab_segments`/`last_present` are per-window, hence the sweep. Shared by
+    /// the `tab_strip_rows` reload and [`Self::sync_status_bar_rows`] so the two
+    /// cannot re-grid by different laws.
+    pub(crate) fn regrid_for_chrome_rows(&mut self) {
+        let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
+            .windows
+            .iter_mut()
+            .filter_map(|(wid, ws)| {
+                ws.tab_segments.clear();
+                ws.last_strip_fp = None; // E3: chrome geometry changed
+                ws.last_present = None;
+                ws.os_window.as_ref().map(|w| (*wid, w.inner_size()))
+            })
+            .collect();
+        for (wid, size) in sized {
+            self.on_resize(wid, size);
+            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                // W1 (Linux): the whole-cell min-size lattice folds the chrome
+                // rows in, so it moves with them — re-push it, or an edge drag
+                // snaps to a lattice one row off and shaves a row.
+                #[cfg(target_os = "linux")]
+                w.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
+                w.request_redraw();
+            }
+        }
+    }
+
+    /// Commit the status bars' row count to the window geometry. `true` when
+    /// the count moved (and every window was re-gridded). The committed count
+    /// (`status_bar_rows`) is what [`Self::chrome_rows`] reads, so a bar's row is
+    /// reserved and released in the SAME step as the PTY resize — the compose
+    /// can never prepend a row the grid still owns, or vice versa.
+    pub(crate) fn sync_status_bar_rows(&mut self) -> bool {
+        let rows = self.status_bars.rows();
+        if rows == self.status_bar_rows {
+            return false;
+        }
+        // NEVER MID-HANDOFF. A seamless self-update parks the readers and hands
+        // the successor an exact window layout; a re-grid here moves `ws.rows`
+        // outside `window_event`, so at Commit the layout no longer matches and
+        // the handoff is refused as a topology change — after the user sat
+        // through the frozen echo. The bar keeps its row count until the handoff
+        // finishes (`Wake::UpdateHandoffFinished` re-syncs); the bars themselves
+        // keep updating, painted within the committed rows.
+        if self.pending_update_handoff.is_some() {
+            return false;
+        }
+        self.status_bar_rows = rows;
+        self.regrid_for_chrome_rows();
+        true
+    }
+
+    /// After any status-bar input: retire what has expired, commit the row
+    /// count, and repaint every window (the bars are chrome in each of them; the
+    /// RepaintKey's quantized `status_bars_fp` keeps a byte-identical tick from
+    /// re-presenting).
+    pub(crate) fn sync_status_bars(&mut self) {
+        let _ = self.status_bars.settle(std::time::Instant::now());
+        let _ = self.sync_status_bar_rows();
+        self.request_redraw_all_windows();
+    }
+
     /// The grid `(rows, cols)` window `wid` gets for raw window `size` — the
     /// PURE half of [`Self::on_resize`] (which also applies it), shared with
     /// [`Self::apply_window_scale`]'s safety-net gate so both derive from the ONE law.
@@ -7321,7 +7415,8 @@ impl App {
     /// the `0..cell-1` remainder is absorbed into per-edge theme-bg bands at present
     /// time, so the swapchain can be the RAW window size and the compositor never
     /// rescales) — the same `cells` as the historical `max(usable/cell, 1)`, now the
-    /// law the ty model + lattice tests pin. The tab strip is reserved out of the
+    /// law the ty model + lattice tests pin. The chrome rows — the tab strip plus
+    /// any live status bar ([`Self::chrome_rows`]) — are reserved out of the
     /// terminal grid while always leaving at least one terminal row.
     /// `pub(crate)` so the LINUX INITIAL-FRAME SETTLE
     /// ([`Self::settle_initial_frame`], in `app_window`) can ask the ONE grid law
@@ -7341,7 +7436,7 @@ impl App {
             pad,
             ch,
         ) as u16;
-        let rows = win_rows.saturating_sub(self.tab_strip_rows).max(1);
+        let rows = win_rows.saturating_sub(self.chrome_rows()).max(1);
         (rows, cols)
     }
 
@@ -7386,7 +7481,7 @@ impl App {
         let base_h = self.win_head(wid)
             + self.win_pad_top(wid)
             + pad
-            + (1 + usize::from(self.tab_strip_rows)) * ch;
+            + (1 + usize::from(self.chrome_rows())) * ch;
         let min_h = base_h + floor_h.saturating_sub(base_h).div_ceil(ch) * ch;
         PhysicalSize::new(
             u32::try_from(min_w).unwrap_or(u32::MAX),
@@ -8815,25 +8910,7 @@ impl App {
         let new_strip = resolve_tab_strip_rows(&config);
         if new_strip != self.tab_strip_rows {
             self.tab_strip_rows = new_strip;
-            // The strip is GLOBAL, but `tab_segments`/`last_present` are per-window:
-            // clear each window's cache + force a repaint, and re-grid each from its
-            // own OS window size (the strip now takes more/fewer rows).
-            let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
-                .windows
-                .iter_mut()
-                .filter_map(|(wid, ws)| {
-                    ws.tab_segments.clear();
-                    ws.last_strip_fp = None; // E3: strip geometry changed
-                    ws.last_present = None;
-                    ws.os_window.as_ref().map(|w| (*wid, w.inner_size()))
-                })
-                .collect();
-            for (wid, size) in sized {
-                self.on_resize(wid, size);
-                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                    w.request_redraw();
-                }
-            }
+            self.regrid_for_chrome_rows();
         }
 
         // Window chrome appearance (titlebar light/dark/auto): re-apply live so a
@@ -12253,32 +12330,20 @@ mod decorative_effect_default_tests {
         toml::from_str(toml).expect("valid toml")
     }
 
-    /// THE MINIMAL-FAST DEFAULT: with a FRESH, EMPTY config a Windows terminal puts
-    /// no party trim on the provisioning card, so the card's own "Installing the
-    /// ALab toolchain" line and its byte counter are the only things in that band.
-    ///
-    /// Asserted against `cfg!` (the `tab_band_height` precedent) so the same test is
-    /// honest on every host: elsewhere the delight stays on.
+    /// THE MINIMAL-FAST DEFAULT: with a FRESH, EMPTY config a Windows terminal
+    /// stands no resident decoration on live output. Asserted against `cfg!` (the
+    /// `tab_band_height` precedent) so the same test is honest on every host:
+    /// elsewhere the delight stays on. The switch is a DEFAULT, never a veto: an
+    /// explicit key wins on every platform, in both directions.
     #[test]
     fn decorative_overlays_default_off_on_windows_and_on_elsewhere() {
         let on = !cfg!(windows);
         assert_eq!(DEFAULT_DECORATIVE_EFFECTS, on);
-        assert_eq!(
-            Config::default().pkg_progress_effects_or_default(),
-            on,
-            "an empty config must not stand a cat on the provisioning toast"
-        );
+        assert_eq!(Config::default().cursor_trail_or_default(), on);
         // A config that merely EXISTS is still a fresh config for this key.
-        assert_eq!(cfg("font_px = 14.0").pkg_progress_effects_or_default(), on);
-    }
-
-    /// …and the switch is a DEFAULT, never a veto: an explicit key wins on every
-    /// platform, in both directions. A Windows user who wants the cat says so and
-    /// gets it.
-    #[test]
-    fn explicit_decorative_keys_win_on_every_platform() {
-        assert!(cfg("pkg_progress_effects = true").pkg_progress_effects_or_default());
-        assert!(!cfg("pkg_progress_effects = false").pkg_progress_effects_or_default());
+        assert_eq!(cfg("font_px = 14.0").cursor_trail_or_default(), on);
+        assert!(cfg("cursor_trail = true").cursor_trail_or_default());
+        assert!(!cfg("cursor_trail = false").cursor_trail_or_default());
     }
 
     /// THE TRAIL MASTER JOINED THE FAMILY, and the two keys beside it did NOT.

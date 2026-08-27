@@ -44,6 +44,8 @@ mod handler_xtgettcap;
 mod handler_xtsmgraphics;
 pub(crate) mod host_traits;
 pub(crate) mod hyperlink_auth;
+/// Inline-image survival across a width-changing reflow (see its module docs).
+mod image_reflow;
 mod keyboard_mode;
 /// Kitty graphics protocol (APC `G`) command parser (KITTY-CORE foundation).
 pub mod kitty_graphics;

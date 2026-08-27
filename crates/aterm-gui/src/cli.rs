@@ -387,6 +387,7 @@ const STARTER_CONFIG: &str = "\
 # selection_color = \"#33415E\"
 # selection_foreground = \"#FFFFFF\" # selected-text ink; unset = auto contrast floor
 # selection_inactive = false       # dim the selection band while the window is unfocused
+# split_focus_mark = true          # in a split, ink the divider edge of the pane taking keystrokes
 # window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (legacy stretched)
 # minimum_contrast = 1.0           # per-cell WCAG contrast floor, 1.0 (off) ..= 21.0
 # background_opacity = 1.0         # macOS GPU window glass, 0.0 (transparent) ..= 1.0 (solid); other renderers stay solid; <1.0 auto-floors contrast to 4.5:1
@@ -435,7 +436,7 @@ const STARTER_CONFIG: &str = "\
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
-# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the banded rainbow ribbon with the full-body cat that walks, runs and pounces along your line; aliases \"kitty pet\"/\"pet kitty\") | rainbow kitty (the same ribbon under the FLYING kitty head; old spellings \"nyan rainbow\"/\"nyan\"/\"rainbow\" still work) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
+# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; a smooth full-height continuous rainbow with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (explicit thin/highlighter alternate) | rainbow kitty tall (explicit spelling of the default full-height geometry; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
@@ -501,7 +502,9 @@ const STARTER_CONFIG: &str = "\
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
 
 # --- security opt-ins (all default OFF) ---------------------------------------
-# allow_window_ops = false         # XTWINOPS title/text-grid-size reports; Linux also applies window manipulations (move stays denied)
+# allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
+#                                  # position and screen size stay unanswered); Linux also applies window
+#                                  # manipulations (move stays denied)
 # allow_notifications = false
 # allow_palette_reconfigure = false
 # allow_kitty_file_transfer = false

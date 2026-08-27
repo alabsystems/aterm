@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
+#[cfg(feature = "regex")]
+use crate::index::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT, REGEX_STEP_LIMIT};
+
 use super::super::content::SearchContent;
 use super::super::error::SearchError;
 use super::super::types::{FilterMode, NavigationDirection, SearchState, StreamingMatch};
@@ -21,19 +24,39 @@ fn kani_retain<T: Clone>(items: &mut Vec<T>, mut keep: impl FnMut(&T) -> bool) {
     *items = retained;
 }
 
+/// Guards the one-time `aterm_log` warning emitted when a regex pattern first
+/// abandons a row on its scan budget. Process-wide and never reset: the point
+/// is to explain *once* why results are short, not to narrate every row.
+#[cfg(feature = "regex")]
+static REGEX_BUDGET_WARNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 impl StreamingSearch {
     /// Compile a regex pattern, prepending `(?i)` when case-insensitive mode
     /// is active. Without this, Regex mode ignores the `case_sensitive` config.
     #[cfg(feature = "regex")]
-    fn compile_regex(&self, pattern: &str) -> Result<regex::Regex, SearchError> {
+    fn compile_regex(&self, pattern: &str) -> Result<aterm_regex::Regex, SearchError> {
         let effective = if self.config.case_sensitive {
             pattern.to_string()
         } else {
             format!("(?i){pattern}")
         };
-        regex::RegexBuilder::new(&effective)
-            .size_limit(1 << 20) // 1 MiB NFA limit
-            .dfa_size_limit(1 << 20) // 1 MiB DFA limit
+        aterm_regex::RegexBuilder::new(&effective)
+            // 128 KiB = 2,048 NFA instructions. The same ceiling the index and
+            // `aterm-observe` pass, and it bounds the *scan* as well as the
+            // compile: a Pike VM is linear in the haystack with the program
+            // size as its constant, and this engine recompiles and rescans on
+            // every keystroke. See `index.rs`'s `REGEX_SIZE_LIMIT`.
+            .size_limit(REGEX_SIZE_LIMIT)
+            // Inert here — a Pike VM has no lazy DFA — but passed for source
+            // compatibility. See `index.rs`'s `REGEX_DFA_SIZE_LIMIT`.
+            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+            // The scan bound the size ceiling cannot give: a program admitted
+            // by 128 KiB can still cost ~19 ms on one 4,096-column row, and
+            // this engine re-scans every row of the terminal on every
+            // keystroke. See `index.rs`'s `REGEX_STEP_LIMIT`; a row that
+            // exhausts it yields no matches and is reported by `scan_row`.
+            .step_limit(REGEX_STEP_LIMIT)
             .build()
             .map_err(|e| SearchError::InvalidRegex(e.to_string()))
     }
@@ -194,6 +217,33 @@ impl StreamingSearch {
         // Find matches in this row
         let matches = self.find_matches_in_row(row, text);
         let match_count = matches.len();
+
+        // The row matcher answers with a `Vec` and has no error channel, so a
+        // row the regex engine abandoned mid-scan arrives here as "no matches"
+        // — indistinguishable from a row that genuinely has none. The compiled
+        // pattern carries the fact instead (sticky, shared with the clone the
+        // engine holds), and this is where it becomes visible.
+        //
+        // Fail closed and keep scanning: the state machine's transitions are
+        // model-checked (`streaming_search`, the `#[refines]` anchor above), so
+        // a row is still a row and the scan still advances. What changes is
+        // that the truncation is on the record rather than silent. Warned once
+        // per process, like the index's first-eviction warning, because a
+        // pattern that exhausts its budget on one row will do it on thousands.
+        #[cfg(feature = "regex")]
+        if self.filter_mode == FilterMode::Regex
+            && self
+                .compiled_regex
+                .as_ref()
+                .is_some_and(aterm_regex::Regex::step_limit_exceeded)
+            && !REGEX_BUDGET_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            aterm_log::warn!(
+                "regex search pattern {:?} exhausted its per-row scan budget; \
+                 matches on the rows it could not finish are missing from the results",
+                self.pattern,
+            );
+        }
 
         // Add matches (respecting memory bound).
         // total_matches increments are saturating: the count can never
@@ -1399,5 +1449,95 @@ mod tests {
         // Re-add same row content
         engine.content_added(0, "needle here");
         assert!(engine.verify_no_duplicates());
+    }
+}
+
+/// The regex **scan** budget in the streaming engine, which re-scans every row
+/// of the terminal on every keystroke.
+///
+/// `REGEX_SIZE_LIMIT` bounds what compiles; `REGEX_STEP_LIMIT` bounds what
+/// running it over a row costs. See `index.rs` for the derivation of both.
+#[cfg(all(test, feature = "regex"))]
+mod regex_scan_budget_tests {
+    use super::*;
+
+    /// Thirteen bytes, 2,042 instructions — inside the 128 KiB program ceiling
+    /// — and ~16.7M work units (~19 ms in release) for one 4,096-column row.
+    const EXPENSIVE: &str = "(?:x?){1020}z";
+
+    /// The engine's default config is case-*insensitive*, which prepends `(?i)`
+    /// and pushes this particular program over the size ceiling; the budget is
+    /// about the scan, so pin case sensitivity and keep the pattern the same
+    /// one the index test uses.
+    fn case_sensitive_engine() -> StreamingSearch {
+        StreamingSearch::with_config(crate::streaming::types::StreamingSearchConfig {
+            case_sensitive: true,
+            ..Default::default()
+        })
+    }
+
+    /// The budget reaches the engine's own compile path, not just the index's.
+    #[test]
+    fn the_streaming_engine_compiles_with_the_scan_budget() {
+        let mut search = case_sensitive_engine();
+        search
+            .start_search("needle", FilterMode::Regex)
+            .expect("compiles");
+        let re = search.compiled_regex.as_ref().expect("regex mode compiled a pattern");
+        assert_eq!(re.step_limit(), REGEX_STEP_LIMIT);
+    }
+
+    /// A row the engine cannot finish scanning yields no matches — fail closed
+    /// — promptly, and leaves the fact readable rather than silently short.
+    ///
+    /// Fail *closed* rather than refuse, unlike the index: `scan_row` is a
+    /// model-checked transition of the `streaming_search` machine with no error
+    /// channel, so the row is completed as a miss and the condition is surfaced
+    /// through the one-time `aterm_log` warning and the compiled pattern's own
+    /// sticky flag.
+    #[test]
+    fn a_row_that_exhausts_the_budget_yields_no_matches_promptly() {
+        let mut search = case_sensitive_engine();
+        search
+            .start_search(EXPENSIVE, FilterMode::Regex)
+            .expect("a pattern the size ceiling admits");
+        let wide = "x".repeat(4096);
+
+        let started = std::time::Instant::now();
+        let found = search.scan_row(0, &wide, 1);
+        let elapsed = started.elapsed();
+
+        assert_eq!(found, 0, "an unfinishable row must not invent matches");
+        assert!(
+            elapsed.as_secs() < 5,
+            "the row took {elapsed:?}; the step budget is not bounding the scan"
+        );
+        assert!(
+            search
+                .compiled_regex
+                .as_ref()
+                .expect("compiled")
+                .step_limit_exceeded(),
+            "the truncation has to be readable, or short results are unexplainable"
+        );
+    }
+
+    /// The same engine, an ordinary pattern, a full-width row of matching
+    /// content: unaffected, and nothing is reported as cut short.
+    #[test]
+    fn ordinary_patterns_scan_rows_normally() {
+        let mut search = case_sensitive_engine();
+        search
+            .start_search(r"\b[0-9a-f]{7,40}\b", FilterMode::Regex)
+            .expect("compiles");
+        let row = "commit 66390b5c8f2a1b3c ".repeat(170);
+        assert!(search.scan_row(0, &row, 1) > 0, "a real pattern still finds its matches");
+        assert!(
+            !search
+                .compiled_regex
+                .as_ref()
+                .expect("compiled")
+                .step_limit_exceeded()
+        );
     }
 }

@@ -1202,6 +1202,11 @@ mod tests {
             // post-cue buffer exactly like every other audible cue.
             SoundGesture::Trail(SoundKind::Glide { dir: 1 }),
             SoundGesture::Trail(SoundKind::Sweep { dir: -1 }),
+            // The comma and the lift are delay-0 voices; the deletion's felt
+            // damp is delay-0 too (its breath trails, but Backspace above
+            // already pins the gesture's first buffer).
+            SoundGesture::Trail(SoundKind::Space),
+            SoundGesture::Trail(SoundKind::Shift),
             SoundGesture::Words(WordGesture::Bonk),
         ];
 

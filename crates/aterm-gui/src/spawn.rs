@@ -349,10 +349,36 @@ impl From<&ChildProvision> for crate::proxy::ProxyEntry {
 /// survives a hop; each direct child receives a fresh value through `env_add`.
 pub(crate) fn provision_child_identity_env(parent_sid: &SessionId) -> Vec<(String, String)> {
     use aterm_types::domain::ENV_PARENT_SESSION_ID;
-    vec![(
-        ENV_PARENT_SESSION_ID.to_string(),
-        parent_sid.as_str().to_string(),
-    )]
+    vec![
+        (
+            ENV_PARENT_SESSION_ID.to_string(),
+            parent_sid.as_str().to_string(),
+        ),
+        // THE MULTIPLEXER BASELINE, stamped HERE rather than by the shell
+        // integration. `aterm ctl` decides whether it is speaking from a
+        // multiplexer PANE by comparing this session's birth signature against
+        // the live one; if the stamp were written by the integration script, a
+        // session whose shell never sources it — `ATERM_NO_SHELL_INTEGRATION=1`,
+        // a `$SHELL` the integration does not cover, a bare `-e` command —
+        // would INHERIT a pane's stamp and be refused as a pane itself
+        // (measured: every flagless verb bricked in a window launched from a
+        // screen pane). This seam runs for every session there is, so the
+        // baseline is always this session's own. Deny-listed with the rest of
+        // the provisioning vars, so an inherited copy never survives a hop.
+        (
+            aterm_types::domain::ENV_MUX_BASE.to_string(),
+            mux_env_signature_now(),
+        ),
+    ]
+}
+
+/// This process's multiplexer signature at the moment a session is born:
+/// `"<$TMUX>|<$STY>"`, empty halves and all. Deliberately the raw pair rather
+/// than a boolean — entering a DIFFERENT multiplexer later must read as a
+/// crossing too, not merely "still inside one".
+fn mux_env_signature_now() -> String {
+    let get = |k: &str| std::env::var(k).unwrap_or_default();
+    format!("{}|{}", get("TMUX"), get("STY"))
 }
 
 /// PURE: the CONTROLLER-spawn observation hint (session connections §2.3/§6):
@@ -701,7 +727,7 @@ pub(crate) fn spawn_session(
             // Capture the child pid (`spawn_shell_with_pid`) so `Session::drop` can HANG
             // UP the session (SIGHUP) before closing the master — the non-blocking
             // teardown that keeps the UI thread off the tty lock (see `Session::drop`).
-            let spawned = aterm_pty::spawn_shell_with_pid(
+            let spawned = aterm_pty::spawn_shell_with_pid_cell_px(
                 rows,
                 cols,
                 &factory.spawn_cap,
@@ -714,6 +740,13 @@ pub(crate) fn spawn_session(
                 cwd_override.or(factory.cwd.as_deref()),
                 factory.sandbox_wrap.as_deref(),
                 limits,
+                // WINSIZE PIXELS (CELL-PX-1, ioctl half): the same window cell box
+                // the newborn engine is seeded with also fills the child's
+                // `ws_xpixel`/`ws_ypixel`, so `aterm -e chafa …` — a tool that reads
+                // TIOCGWINSZ before any resize happens — gets real geometry on its
+                // FIRST look instead of the zeros every construction site used to
+                // hard-code.
+                cell_px,
             );
             match spawned {
                 Ok(aterm_pty::SpawnedShell { master, pid }) => (master, pid, None),
@@ -942,8 +975,8 @@ pub(crate) fn spawn_session(
         .as_ref()
         .is_some_and(|cp| cp.modes.alternate_screen)
     {
-        aterm_pty::resize(master, rows.saturating_sub(1).max(1), cols);
-        aterm_pty::resize(master, rows, cols);
+        aterm_pty::resize_with_cell_px(master, rows.saturating_sub(1).max(1), cols, cell_px);
+        aterm_pty::resize_with_cell_px(master, rows, cols, cell_px);
     }
 
     Ok(session)
@@ -1064,11 +1097,33 @@ mod child_identity_env_tests {
     /// IDENTITY carries the parent id and NOTHING else — it is emitted for every
     /// session, including one-shot `-e <cmd>`, so it must grant no authority.
     #[test]
-    fn identity_env_is_parent_id_only() {
+    fn identity_env_carries_the_parent_id_and_the_multiplexer_baseline() {
         let parent = SessionId::generate();
         let env = provision_child_identity_env(&parent);
-        assert_eq!(keys(&env), vec![ENV_PARENT_SESSION_ID]);
+        assert_eq!(
+            keys(&env),
+            vec![ENV_PARENT_SESSION_ID, aterm_types::domain::ENV_MUX_BASE],
+            "identity is WHO spawned it plus WHAT it was born into — both pure \
+             facts, neither a capability"
+        );
         assert_eq!(env[0].1, parent.as_str());
+        // The baseline is the raw `<$TMUX>|<$STY>` pair, empty halves and all:
+        // a session born outside any multiplexer must still carry a stamp, or
+        // `ctl` cannot tell "never entered one" from "nobody told me".
+        let base = &env[1].1;
+        assert!(
+            base.contains('|'),
+            "the baseline keeps both halves, got {base:?}"
+        );
+        assert_eq!(
+            *base,
+            format!(
+                "{}|{}",
+                std::env::var("TMUX").unwrap_or_default(),
+                std::env::var("STY").unwrap_or_default()
+            ),
+            "the stamp is THIS process's signature at the moment of the spawn"
+        );
     }
 
     /// The two provisioning halves must not overlap: recursion carries ADOPTION
@@ -1805,11 +1860,13 @@ fn configure_bell(
 /// Frame-audit #4 is the reason this exists: with `allow_window_ops = true`,
 /// `CSI 9;1t` (maximize) did NOTHING, because no host callback was ever
 /// installed. Manipulations now apply; REPORT operations still return `None`
-/// here, which keeps the engine's own fallbacks (text-grid size, title/icon
-/// label) byte-identical and leaves the position/pixel-geometry reports
-/// unanswered exactly as before — an async wake cannot carry a synchronous
-/// reply, and inventing stale geometry from this thread would be worse than
-/// silence.
+/// here, and that is permanent: an async wake cannot carry a synchronous reply,
+/// and inventing stale geometry from this thread would be worse than silence.
+/// So the engine's own in-core fallbacks are the only answerer — text-grid
+/// size, title/icon label, and now the pixel pair (text area, cell size), which
+/// answers from the cell metrics `App::sync_cell_pixel_size` pushes rather than
+/// from anything this callback could return. Window/screen POSITION and screen
+/// size stay unanswered: nothing in-core knows them.
 #[cfg(target_os = "linux")]
 fn configure_window_ops(
     term: &Arc<Mutex<Terminal>>,

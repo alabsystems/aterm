@@ -32,6 +32,29 @@
 //!    the walking pet's breed handoff now lets the old cat run off while the
 //!    new one fades UP in place (`kitty_pet::ARRIVE_IN`) instead of
 //!    recolouring in one frame.
+//! 4. **THE HOMECOMING — the rate law** (owner ruling 2026-08-20: *"the
+//!    problem before was that the cat swap animation was every time I
+//!    switched tabs with differing programs"*). The dwell decides WHEN the
+//!    costume moves; the per-window roster on [`KittyTenure`] decides HOW
+//!    LOUDLY. A program cat this window has worn within [`HOMECOMING`]
+//!    (refreshed on every wear) comes home QUIETLY; only a cat this window
+//!    has never worn, or has not worn in ten minutes, is owed the full
+//!    arrival ceremony — and a stranger is never denied one, only spaced,
+//!    by [`HELLO_FLOOR`]. The roster authorises; the render seam performs
+//!    and commits ([`KittyTenure::commit_hello`]), so a hello nobody saw is
+//!    never spent.
+//!
+//! THE PET IS PLEASANT COMPANY, NOT A STATUS INDICATOR — said out loud
+//! because the 2026-08-07 spec could be read either way. The costume is
+//! ALWAYS correct (the roster never rations the verdict, only the theater);
+//! the ANNOUNCEMENT is rationed to strangers. And the rate law deliberately
+//! does NOT solve the 4-bit identity legibility problem: the walking pet's
+//! whole visible identity is a coat index plus a functionally mute iris
+//! (`PetCursorFrame` carries no `variant`, so even the three hand-designed
+//! flagship heads are invisible on it), and making the ceremony rare makes
+//! each surviving one carry MORE meaning through a vocabulary that cannot
+//! carry it. Legible identity is a different design — arguably the one that
+//! should follow this — and it is not attempted here.
 //!
 //! IDENTITY SOURCE: the focused pane's shell block. While a command is
 //! `Executing`, its OSC 633;E commandline names the app; every other state
@@ -64,6 +87,72 @@ pub(crate) const TENURE: Duration = Duration::from_secs(5);
 /// prompt. (A move to ANOTHER program is that program's arrival and takes
 /// [`TENURE`]; the old cat lingers until then.)
 pub(crate) const RELEASE: Duration = Duration::from_secs(15);
+
+/// THE HOMECOMING WINDOW: how long a worn cat stays "yours". A program cat
+/// this window has worn within this window of time comes home QUIETLY; one
+/// absent longer is owed a fresh arrival. Inherited, not invented, from the
+/// tree's only shipped recency TTL — `kitty_log`'s `RING_TTL = 600 s`, one
+/// file away, with the identical refresh-on-hit shape (a second recency
+/// window with a different number would be two laws where the tree has one).
+/// Because the stamp refreshes on EVERY wear, the operative meaning is "a
+/// tool you touch at least once every ten minutes stays yours": a 20 s
+/// alternation is 30× inside it; a lunch break is not. First number to
+/// raise if the ceremony rate still reads high.
+pub(crate) const HOMECOMING: Duration = Duration::from_secs(600);
+
+/// THE HELLO FLOOR: the minimum spacing between two PERFORMED ceremonies.
+/// Not taste: it is [`RELEASE`], quoted — the gate's own longest dwell is
+/// the house's existing statement of "you have genuinely settled", so two
+/// hellos are never closer than the gate's own settling time. It is 3×
+/// [`TENURE`], so the pathological 5 s alternation can never chain hellos.
+/// It SPACES strangers; it never denies one: a floored stranger keeps its
+/// debt (`greeted` stays false) and collects on a later landing.
+pub(crate) const HELLO_FLOOR: Duration = Duration::from_secs(15);
+
+/// The roster's depth: a working set, not a history. Above the realistic
+/// simultaneous-tool count (the owner's case is 2; a busy split is 3–5)
+/// with headroom, and small enough that the landing-time scan is eight
+/// string compares a few times an hour. Deliberately NOT `kitty_log`'s
+/// `RING_SLOTS = 256`: that ring is sized for a screenful of cats across
+/// shared sessions; this is one human's open tools in one window.
+pub(crate) const HOMECOMING_SLOTS: usize = 8;
+
+/// HOW LOUDLY a landed claim arrives — the rate law's verdict, read by the
+/// render seam via [`KittyTenure::arrival`]. The dwell decided WHEN the
+/// costume moved; this decides whether the move is announced. A sticky
+/// latch: it holds the LAST landing's ruling until the next landing, a
+/// performed ceremony ([`KittyTenure::commit_hello`]) or a non-program
+/// verdict ([`KittyTenure::note_non_program_verdict`]) rewrites it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Arrival {
+    /// The full arrival ceremony — owed only to a stranger: a cat this
+    /// window has never worn, or has not worn within [`HOMECOMING`].
+    Ceremony,
+    /// The quiet in-place re-dress. The costume still moves (the roster
+    /// never rations the verdict, only the theater); nothing is announced.
+    #[default]
+    Quiet,
+}
+
+/// One remembered cat: a program whose costume this window has actually put
+/// on the pet. `at` is the LAST time it was worn (refreshed on every wear,
+/// INCLUDING quiet ones — two tools in rotation never grow stale, and
+/// starving the ceremony under sustained alternation is the design);
+/// `greeted` records whether its one full arrival has actually been
+/// PERFORMED, not merely authorised.
+struct Homecoming {
+    /// The canonical app id ([`AppIdentity::id`]), compared as a plain
+    /// `String` across at most [`HOMECOMING_SLOTS`] slots — an in-memory
+    /// roster is not an identity lane, so it takes the exact compare over
+    /// a salt-namespaced hash.
+    id: String,
+    /// Last worn — the recency clock. Refreshed by every landing of this id.
+    at: Instant,
+    /// Whether the one owed hello was PERFORMED (committed by the render
+    /// seam), not merely authorised. An ungreeted slot is an unpaid debt:
+    /// it pins its slot and is never evicted.
+    greeted: bool,
+}
 
 /// The resolved program identity of one pane: canonical id, the raw basename
 /// it came from (diagnostics — `id` may canonicalize it), and the breed. The
@@ -150,6 +239,21 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
 pub struct KittyTenure {
     worn: Option<AppIdentity>,
     candidate: Option<(Option<AppIdentity>, Instant)>,
+    /// THE HOMECOMING roster: the cats this window has worn, LRU by `at`.
+    /// Written only by [`Self::land`] (both landing sites) and
+    /// [`Self::commit_hello`]; arms no timer (expiry is lazy, at landings),
+    /// so `deadline()` and idle-to-zero are untouched by construction.
+    roster: [Option<Homecoming>; HOMECOMING_SLOTS],
+    /// TWO CLOCKS, TWO OPPOSITE RULES, AND THE DIFFERENCE IS DELIBERATE:
+    /// the roster's `at` refreshes on every wear including quiet ones
+    /// (starving the ceremony under alternation is the design); this one is
+    /// stamped ONLY by a PERFORMED ceremony ([`Self::commit_hello`]), never
+    /// by an authorisation. `kitty_summon` rate-limits a RECORD, where
+    /// starvation loses data; this rate-limits a PERFORMANCE, where
+    /// starvation is the goal. Do not "fix" either clock to match the other.
+    last_hello: Option<Instant>,
+    /// The sticky how-loudly latch — see [`Arrival`].
+    arrival: Arrival,
 }
 
 impl KittyTenure {
@@ -164,8 +268,9 @@ impl KittyTenure {
         match &self.candidate {
             Some((cand, since)) if cand.as_ref() == raw => {
                 if now.duration_since(*since) >= dwell_for(raw) {
-                    self.worn = raw.cloned();
+                    let cand = raw.cloned();
                     self.candidate = None;
+                    self.land(cand, now);
                 }
             }
             _ => self.candidate = Some((raw.cloned(), now)),
@@ -205,7 +310,11 @@ impl KittyTenure {
         match self.candidate.take() {
             Some((cand, since)) if now.duration_since(since) >= dwell_for(cand.as_ref()) => {
                 let moved = cand != self.worn;
-                self.worn = cand;
+                // land() runs on EVERY due poll, `moved` or not: a blind
+                // re-land of the worn cat must refresh its roster stamp and
+                // re-rule `arrival` exactly as the observe path would, or a
+                // window off the terminal route silently keeps the old law.
+                self.land(cand, now);
                 moved
             }
             other => {
@@ -213,6 +322,143 @@ impl KittyTenure {
                 false
             }
         }
+    }
+
+    /// THE LANDING — the one place a due candidate becomes `worn`, factored
+    /// from BOTH landing sites ([`Self::observe`]'s dwell branch and
+    /// [`Self::poll`]'s wake-time take) so a window on a non-terminal route
+    /// (a Settings tab, a native tab, a failed-present backoff) cannot
+    /// silently keep the old law. Besides moving the costume it rules HOW
+    /// LOUDLY, writing the [`Arrival`] latch from the roster:
+    ///   * base cat (`None`) — always [`Arrival::Quiet`]: THE BASE CAT IS
+    ///     ALWAYS HOME. The pet is born wearing the launch kitty, so the
+    ///     resident cat is owned from frame one and every fall to the
+    ///     prompt is quiet, forever;
+    ///   * roster hit — a homecoming: refresh `at` (every wear, including
+    ///     quiet ones), quiet if greeted, else the still-owed debt goes to
+    ///     [`Self::floor`];
+    ///   * roster miss — a stranger: insert (LRU among GREETED slots only)
+    ///     and ask [`Self::floor`].
+    ///
+    /// LAZY EXPIRY runs only here, never on a wake — the roster arms no
+    /// timer, so idle-to-zero survives by construction. It evicts only
+    /// GREETED slots older than [`HOMECOMING`], and it SKIPS the currently
+    /// landing id: a continuously-worn cat never re-lands (observe's
+    /// equal-claim arm clears the candidate without landing), so its stamp
+    /// can be arbitrarily stale at its own next landing, and expiring it
+    /// then would hand a 20-minute heads-down session a spurious ceremony.
+    fn land(&mut self, cand: Option<AppIdentity>, now: Instant) {
+        self.worn = cand;
+        let Some(id) = self.worn.as_ref() else {
+            self.arrival = Arrival::Quiet;
+            return;
+        };
+        for s in &mut self.roster {
+            if s.as_ref().is_some_and(|h| {
+                h.greeted && h.id != id.id && now.duration_since(h.at) >= HOMECOMING
+            }) {
+                *s = None;
+            }
+        }
+        match self.roster.iter_mut().flatten().find(|h| h.id == id.id) {
+            Some(h) => {
+                h.at = now;
+                self.arrival = if h.greeted {
+                    Arrival::Quiet
+                } else {
+                    self.floor(now)
+                };
+            }
+            None => {
+                self.arrival = if insert_lru(&mut self.roster, &id.id, now) {
+                    self.floor(now)
+                } else {
+                    // Every slot holds an unpaid debt (eight strangers all
+                    // denied by the floor, none yet performed): refuse the
+                    // insert rather than drop a debt, and arrive as a
+                    // floor-spaced Quiet. This stranger's own hello is the
+                    // one the roster can lose, and only in this state.
+                    Arrival::Quiet
+                };
+            }
+        }
+    }
+
+    /// THE FLOOR — a stranger is never denied its ceremony, only SPACED:
+    /// Ceremony iff no hello was ever performed or the last performed one
+    /// is at least [`HELLO_FLOOR`] ago; Quiet otherwise, with the debt kept
+    /// (`greeted` stays `false`) to be collected on a later landing.
+    fn floor(&self, now: Instant) -> Arrival {
+        if self
+            .last_hello
+            .is_none_or(|t| now.duration_since(t) >= HELLO_FLOOR)
+        {
+            Arrival::Ceremony
+        } else {
+            Arrival::Quiet
+        }
+    }
+
+    /// HOW LOUDLY the current costume arrived — the rate law's ruling for
+    /// the most recent landing, read (never advanced) by the render seam at
+    /// the `sync_look` sites, where the pet's actual pair is in hand.
+    pub fn arrival(&self) -> Arrival {
+        self.arrival
+    }
+
+    /// THE PERFORMANCE COMMIT: called by the render seam ONLY when a
+    /// ceremony was actually PERFORMED on glass — never at authorisation
+    /// (`companion_verdict` runs for unfocused windows, and a hello nobody
+    /// saw must not be spent; the `kitty_summon` precedent, applied
+    /// exactly). Marks the worn id `greeted` (the debt is paid), stamps
+    /// `last_hello` (the ONLY writer of that clock), and consumes the
+    /// latch back to [`Arrival::Quiet`] so a pair the flying-kitty latch
+    /// re-delivers later cannot replay a ceremony already performed.
+    pub fn commit_hello(&mut self, now: Instant) {
+        if let Some(id) = self.worn.as_ref()
+            && let Some(h) = self.roster.iter_mut().flatten().find(|h| h.id == id.id)
+        {
+            h.greeted = true;
+        }
+        self.last_hello = Some(now);
+        self.arrival = Arrival::Quiet;
+    }
+
+    /// THE STALE-LATCH RESET: called by the render seam when a NON-program
+    /// rung wins the precedence (a pinned favourite, the launch kitty). A
+    /// park can be created by a non-landing event — unpinning a favourite
+    /// reveals an already-worn program cat — and without this reset the
+    /// seam would perform a ceremony authorised by a landing minutes old.
+    /// Only the announcement is reset; the roster, its debts and the
+    /// `last_hello` clock are untouched (a debt is owed, not spent).
+    pub fn note_non_program_verdict(&mut self) {
+        self.arrival = Arrival::Quiet;
+    }
+}
+
+/// Insert a stranger into the roster: an empty slot first, else evict the
+/// LRU (oldest `at`) among GREETED slots only — an unpaid debt pins its
+/// slot, so a hello can never be lost to churn. Returns `false` (nothing
+/// inserted) when every slot holds an ungreeted debt.
+fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now: Instant) -> bool {
+    let slot = roster.iter().position(|s| s.is_none()).or_else(|| {
+        roster
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.as_ref().is_some_and(|h| h.greeted))
+            .min_by_key(|(_, s)| s.as_ref().map(|h| h.at))
+            .map(|(i, _)| i)
+    });
+    match slot {
+        Some(i) => {
+            roster[i] = Some(Homecoming {
+                id: id.to_owned(),
+                at: now,
+                greeted: false,
+            });
+            true
+        }
+        None => false,
     }
 }
 
@@ -492,6 +738,221 @@ mod tests {
         assert_eq!(
             gate.observe(Some(&vim), t3 + TENURE).map(|i| i.id.as_str()),
             Some("vim")
+        );
+    }
+
+    /// THE RATE LAW's headline case (the owner's own day): A↔B alternation.
+    /// Each program is a stranger exactly once; every later landing is a
+    /// homecoming, forever — the ceremony count scales with how many tools
+    /// you own, not with how often you tab. Ten landings over 200 s: exactly
+    /// two `Ceremony` (the tree never had an alternation test, which is why
+    /// the every-tab-switch defect shipped).
+    #[test]
+    fn alternating_two_programs_greets_each_once() {
+        let t0 = Instant::now();
+        let mut gate = KittyTenure::default();
+        let (vim, claude) = (ident("vim"), ident("claude"));
+        let mut ceremonies = Vec::new();
+        for n in 0..10u64 {
+            let now = t0 + Duration::from_secs(5 + 20 * n);
+            let cand = if n % 2 == 0 { &vim } else { &claude };
+            gate.land(Some(cand.clone()), now);
+            if gate.arrival() == Arrival::Ceremony {
+                ceremonies.push(n);
+                gate.commit_hello(now);
+            }
+        }
+        assert_eq!(
+            ceremonies,
+            [0, 1],
+            "one hello per cat, both up front; every return is quiet"
+        );
+    }
+
+    /// THE OBSERVE/POLL EQUIVALENCE: the same landing produces identical
+    /// roster effects through both landing sites — or a window off the
+    /// terminal route (Settings tab, native tab, failed-present backoff),
+    /// which lands only via `poll`, would silently keep the old law with no
+    /// failing test anywhere.
+    #[test]
+    fn poll_lands_the_roster_like_observe() {
+        let t0 = Instant::now();
+        let claude = ident("claude");
+        let mut via_observe = KittyTenure::default();
+        let mut via_poll = KittyTenure::default();
+
+        // The stranger's arrival, landed by each path.
+        via_observe.observe(Some(&claude), t0);
+        via_observe.observe(Some(&claude), t0 + TENURE);
+        via_poll.observe(Some(&claude), t0);
+        assert!(via_poll.poll(t0 + TENURE));
+        for (name, gate) in [("observe", &via_observe), ("poll", &via_poll)] {
+            assert_eq!(gate.arrival(), Arrival::Ceremony, "{name}: a stranger");
+        }
+        via_observe.commit_hello(t0 + TENURE);
+        via_poll.commit_hello(t0 + TENURE);
+
+        // The release to the base cat, landed by each path: quiet.
+        let t1 = t0 + Duration::from_secs(60);
+        via_observe.observe(None, t1);
+        via_observe.observe(None, t1 + RELEASE);
+        via_poll.observe(None, t1);
+        assert!(via_poll.poll(t1 + RELEASE));
+        for (name, gate) in [("observe", &via_observe), ("poll", &via_poll)] {
+            assert!(gate.worn().is_none(), "{name}: the base cat is back");
+            assert_eq!(gate.arrival(), Arrival::Quiet, "{name}: home is quiet");
+        }
+
+        // The return within HOMECOMING, landed by each path: a homecoming.
+        let t2 = t1 + RELEASE + Duration::from_secs(10);
+        via_observe.observe(Some(&claude), t2);
+        via_observe.observe(Some(&claude), t2 + TENURE);
+        via_poll.observe(Some(&claude), t2);
+        assert!(via_poll.poll(t2 + TENURE));
+        for (name, gate) in [("observe", &via_observe), ("poll", &via_poll)] {
+            assert_eq!(gate.arrival(), Arrival::Quiet, "{name}: a homecoming");
+            let h = gate
+                .roster
+                .iter()
+                .flatten()
+                .find(|h| h.id == "claude")
+                .expect("the roster remembers claude on both paths");
+            assert!(h.greeted, "{name}: the debt stays paid");
+            assert_eq!(h.at, t2 + TENURE, "{name}: the wear refreshed the stamp");
+        }
+    }
+
+    /// THE FLOOR SPACES, IT NEVER DENIES: a stranger landing inside
+    /// `HELLO_FLOOR` of a performed hello arrives quietly but KEEPS its
+    /// debt (`greeted` stays false), and collects the full ceremony on a
+    /// later landing once the floor is clear.
+    #[test]
+    fn a_stranger_spaced_by_the_floor_keeps_its_debt() {
+        let t0 = Instant::now();
+        let mut gate = KittyTenure::default();
+        gate.land(Some(ident("vim")), t0);
+        assert_eq!(gate.arrival(), Arrival::Ceremony);
+        gate.commit_hello(t0);
+
+        // A second stranger 5 s later: floored, debt held.
+        let t1 = t0 + Duration::from_secs(5);
+        gate.land(Some(ident("claude")), t1);
+        assert_eq!(gate.arrival(), Arrival::Quiet, "spaced by the floor");
+        let debt = gate.roster.iter().flatten().find(|h| h.id == "claude");
+        assert!(
+            debt.is_some_and(|h| !h.greeted),
+            "the debt is owed, not spent"
+        );
+
+        // Back once the floor is clear: the held debt is collected.
+        let t2 = t0 + HELLO_FLOOR + Duration::from_secs(1);
+        gate.land(Some(ident("claude")), t2);
+        assert_eq!(gate.arrival(), Arrival::Ceremony, "the debt is collected");
+    }
+
+    /// AN UNPAID DEBT PINS ITS SLOT: the LRU evicts only greeted slots, so
+    /// a hello can never be lost to churn — and when every slot holds a
+    /// debt, the insert is refused (floor-spaced quiet) rather than any
+    /// debt dropped.
+    #[test]
+    fn an_ungreeted_slot_is_never_evicted() {
+        let t0 = Instant::now();
+        let mut gate = KittyTenure::default();
+        // One greeted cat…
+        gate.land(Some(ident("vim")), t0);
+        gate.commit_hello(t0);
+        // …then seven strangers, authorised but never performed (debts).
+        for n in 0..7u64 {
+            gate.land(
+                Some(ident(&format!("tool{n}"))),
+                t0 + Duration::from_secs(20 + 20 * n),
+            );
+        }
+        // The ninth id must evict the greeted vim, never a debt.
+        let t_full = t0 + Duration::from_secs(200);
+        gate.land(Some(ident("htop")), t_full);
+        assert!(
+            gate.roster.iter().flatten().all(|h| h.id != "vim"),
+            "the one greeted slot was the LRU victim"
+        );
+        for n in 0..7u64 {
+            let id = format!("tool{n}");
+            assert!(
+                gate.roster
+                    .iter()
+                    .flatten()
+                    .any(|h| h.id == id && !h.greeted),
+                "{id}: an unpaid debt pins its slot"
+            );
+        }
+        // All eight slots now hold debts: a tenth id is refused, quietly.
+        let t_refused = t_full + Duration::from_secs(60);
+        gate.land(Some(ident("git")), t_refused);
+        assert_eq!(
+            gate.arrival(),
+            Arrival::Quiet,
+            "a full-of-debts roster refuses the insert as floor-spaced quiet"
+        );
+        assert!(
+            gate.roster.iter().flatten().all(|h| h.id != "git"),
+            "…and records nothing"
+        );
+    }
+
+    /// THE BASE CAT IS ALWAYS HOME: a landing on `None` is quiet on a fresh
+    /// gate, quiet after ceremonies, quiet forever — the pet is born wearing
+    /// the launch kitty, so every fall to the prompt is a homecoming.
+    #[test]
+    fn the_base_cat_is_always_a_homecoming() {
+        let t0 = Instant::now();
+        let mut gate = KittyTenure::default();
+        gate.land(None, t0);
+        assert_eq!(gate.arrival(), Arrival::Quiet, "born home");
+        gate.land(Some(ident("claude")), t0 + Duration::from_secs(5));
+        assert_eq!(gate.arrival(), Arrival::Ceremony);
+        // No commit (the ceremony may still be pending on glass): the fall
+        // to the prompt is quiet regardless.
+        gate.land(None, t0 + Duration::from_secs(40));
+        assert_eq!(gate.arrival(), Arrival::Quiet, "the prompt is always home");
+        // …and an hour later, still quiet: home never expires.
+        gate.land(None, t0 + Duration::from_secs(3600));
+        assert_eq!(gate.arrival(), Arrival::Quiet);
+    }
+
+    /// THE EXPIRY SKIP: a continuously-worn cat never re-lands (observe's
+    /// equal-claim arm clears the candidate without landing), so its roster
+    /// stamp goes stale while it is worn. Its own next landing must SKIP it
+    /// in the lazy-expiry scan, or a 20-minute heads-down session would be
+    /// paid back with a spurious ceremony.
+    #[test]
+    fn a_worn_cat_survives_a_long_heads_down_stretch() {
+        let t0 = Instant::now();
+        let mut gate = KittyTenure::default();
+        gate.land(Some(ident("claude")), t0);
+        gate.commit_hello(t0);
+
+        // Heads-down in claude for 20 min: worn continuously, no landings,
+        // the stamp untouched at t0 — then a settled prompt errand releases
+        // the cat (a quiet landing that runs no expiry: base early-return).
+        let t_errand = t0 + Duration::from_secs(1200);
+        gate.land(None, t_errand);
+        assert_eq!(gate.arrival(), Arrival::Quiet);
+
+        // Relaunch: claude's stamp is 20 min stale, but claude is the
+        // landing id — skipped by the expiry scan, so this is a homecoming.
+        let t_back = t_errand + Duration::from_secs(30);
+        gate.land(Some(ident("claude")), t_back);
+        assert_eq!(
+            gate.arrival(),
+            Arrival::Quiet,
+            "a cat worn heads-down is still yours when you relaunch it"
+        );
+        assert!(
+            gate.roster
+                .iter()
+                .flatten()
+                .any(|h| h.id == "claude" && h.greeted && h.at == t_back),
+            "…and the landing refreshed its stamp"
         );
     }
 }

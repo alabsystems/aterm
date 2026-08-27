@@ -284,11 +284,12 @@ pub struct EffectGeom {
 /// Two facts, because the suppression has two layers that need different
 /// truths:
 ///
-/// * `cell` — the CARET cell. It drives the word-space layers: the per-episode
-///   claim ([`WordDecorations::companion_claim`]) and the caret-on-span gate in
-///   the graphic arm. Both companions ride the caret's pane, so the cell is
-///   the right anchor for "which WORD is being answered" regardless of which
-///   animal is up.
+/// * `cell` — the visible CARET cell, when one exists. It drives the word-space
+///   layers: the per-episode claim ([`WordDecorations::companion_claim`]) and
+///   the caret-on-span gate in the graphic arm. A resident pet deliberately
+///   remains on glass while a one-frame DECTCEM hide fades it; that frame has
+///   no honest caret coordinate, so the cell is `None` while the exact body
+///   rectangle below continues to own pixel custody.
 /// * `body_px` — the companion's LIVE drawn body in grid pixels
 ///   `(x0, x1, y0, y1)`, right/bottom exclusive. The pixel-yield layer
 ///   (`CatTick::companion_px`) collides SPRITES, and the resident PET
@@ -301,8 +302,9 @@ pub struct EffectGeom {
 ///   same feet-anchored dest math the pet emission draws with.
 #[derive(Clone, Copy, Debug)]
 pub struct CompanionOnGlass {
-    /// The caret cell `(row, col)` in pre-splice grid coords.
-    pub cell: (u16, u16),
+    /// The visible caret cell `(row, col)` in pre-splice grid coords. `None`
+    /// only for a still-visible resident body whose caret is currently hidden.
+    pub cell: Option<(u16, u16)>,
     /// The companion's live drawn body `(x0, x1, y0, y1)` in grid pixels, when
     /// the resident pet is the companion; `None` for the flying head.
     pub body_px: Option<(i32, i32, i32, i32)>,
@@ -314,8 +316,18 @@ impl CompanionOnGlass {
     #[must_use]
     pub fn at_cell(cell: (u16, u16)) -> Self {
         Self {
-            cell,
+            cell: Some(cell),
             body_px: None,
+        }
+    }
+
+    /// A resident pet on glass. Its body is authoritative even while DECTCEM
+    /// temporarily withholds the caret; callers must never guess a stale cell.
+    #[must_use]
+    pub fn at_body(cell: Option<(u16, u16)>, body_px: (i32, i32, i32, i32)) -> Self {
+        Self {
+            cell,
+            body_px: Some(body_px),
         }
     }
 }
@@ -502,6 +514,14 @@ struct KittyCursorPlacementState {
     last_target: Option<CatFootprint>,
     last_sprite: Option<(i32, i32)>,
     last_emitted_at: Option<Instant>,
+    /// The settled follower's drawn body origin with the hover bob EXCLUDED
+    /// (bob is re-added at emit, so the 1.4 Hz hover is never attenuated or
+    /// phase-lagged through the follower). `None` between episodes, after
+    /// every continuity reset, and across fold legs — the next settled frame
+    /// then either seeds from `last_sprite` (a fresh landing glides) or
+    /// snaps to the raw placement law (a first emission or retired
+    /// continuity must not swoop in from dead glass).
+    settle: Option<(f32, f32)>,
     seen_fold: Option<(Instant, crate::kitty_cursor::CatFoldDirection)>,
     active: Option<KittyCursorActiveFold>,
 }
@@ -2109,17 +2129,18 @@ pub struct WordDecorations {
     /// longer exists.
     pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId, u8, u8)>,
     /// The breed handoff's DEPARTING bodies each hold their own last-resolved
-    /// tile `(ax, ay)`, one per brain slot — deliberately NOT sharing
+    /// tile `(born, ax, ay)`, one per brain slot — deliberately NOT sharing
     /// [`Self::pet_last_tile`]: two different bake keys ping-ponging one slot
     /// would strobe both bodies exactly while both are animating. Same
-    /// deferred-bake tolerance, same atlas-scoped invalidation. The held pair
-    /// is not keyed to WHICH departure owns the slot; safe today because
-    /// ghost births are spaced by the handoff debounce (2.5 s) while a ghost
-    /// lives at most `kitty_pet::DEPART_MAX` (2.0 s), so a slot is always
-    /// swept `None` (clearing the hold below) before it can be reborn — if
-    /// either constant ever closes that gap, key the hold by the departure's
-    /// `born` stamp.
-    pet_depart_tiles: [Option<(u16, u16)>; crate::kitty_pet::PET_DEPARTURES_MAX],
+    /// deferred-bake tolerance, same atlas-scoped invalidation. The held
+    /// tile IS keyed to which departure owns the slot — its `born` stamp —
+    /// because `kitty_pet::DEPART_MAX` (4.0 s) now exceeds the handoff
+    /// debounce (2.5 s): a ghost can outlive the spacing between births, so
+    /// a slot may be reborn while a stale hold survives, and the old
+    /// unkeyed pair would dress the new ghost in the old ghost's pose. A
+    /// hold whose stamp differs from the slot's live departure is refused
+    /// and dropped (this docstring's own long-standing remedy, now law).
+    pet_depart_tiles: [Option<(f64, u16, u16)>; crate::kitty_pet::PET_DEPARTURES_MAX],
     /// The DOG roster's own exact-size tile cache ([`crate::dog_baker`]) — the
     /// typed-word dog cameo's bake path, reaching the screen through the same
     /// shared-atlas `host_tile` door as the pet.
@@ -3356,6 +3377,10 @@ impl WordDecorations {
             self.kitty_cursor_placement.key = Some(key);
             self.kitty_cursor_placement.last_target = Some(target);
             self.kitty_cursor_placement.last_sprite = None;
+            // The settled follower dies with the continuity it followed: a
+            // retired coordinate space or a stale gap must snap to the live
+            // caret, never swoop across the discontinuity.
+            self.kitty_cursor_placement.settle = None;
             self.kitty_cursor_placement.active = None;
             // A fold already under way belongs to the retired coordinate
             // space / old frame train. Mark it seen so it cannot restart from
@@ -3468,6 +3493,19 @@ impl WordDecorations {
     /// [`Self::kitty_cursor_footprint`] for the placement rationale.
     const KITTY_LEAD_NUM: i32 = 3;
     const KITTY_LEAD_DEN: i32 = 4;
+
+    /// Time constant, in seconds, of the settled placement follower — each
+    /// settled frame the drawn body closes `1 - exp(-dt/PLACE_TAU)` of its
+    /// remaining gap to the bob-excluded rest target (Appendix A of
+    /// DESIGN-kitty-motion-2026-08-19: the per-key x hop and the margin rise
+    /// staircase are the teleports left after the authenticated fold seam).
+    /// Sibling law to `kitty_cursor::DISP_TAU` (0.13 s), the same exponential
+    /// on the POSE spine; placement follows slightly QUICKER than the pose so
+    /// the body reads as escorting the caret, never dragged behind it: at a
+    /// 16 ms frame the staircase's worst `cell_h/2` step lands as ~2 px
+    /// moves, while a one-cell hop still completes within ~4·tau ≈ a third
+    /// of a second.
+    const PLACE_TAU: f32 = 0.08;
 
     pub fn kitty_cursor(
         &mut self,
@@ -3622,13 +3660,75 @@ impl WordDecorations {
                 .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
         };
         let (sprite_x, sprite_y) = match placement.leg {
-            KittyCursorPlacementLeg::Settled => (target_x, target_y),
+            // The remaining Appendix-A teleports (per-key x hop, margin rise
+            // staircase, unauthenticated wraps) die here: one exponential
+            // rest-position follower ([`Self::PLACE_TAU`]) on the SETTLED
+            // resolver path. The rest target excludes the hover bob — bob is
+            // re-added after the follower so the 1.4 Hz hover keeps full
+            // amplitude and phase. The follower SNAPS instead of gliding
+            // when continuity is dead (first emission, or a gap at or past
+            // the resolver's `CURSOR_FOLD_DURATION` staleness law) and when
+            // the rest target jumped more than two rows: a program-owned
+            // relocation is not typing momentum and must not swoop.
+            KittyCursorPlacementLeg::Settled => match placement.sampled_at {
+                // The compat one-shot path (`Self::kitty_cursor`: settings
+                // preview and historical callers) carries no clock and no
+                // continuity; it draws the raw placement law byte-for-byte
+                // and never touches the follower's ledger.
+                None => (target_x, target_y),
+                Some(at) => {
+                    let ch = f32::from(geom.cell_h);
+                    let bob_px = (bob * ch).round() as i32;
+                    let rest = (target_x as f32, (target_y - bob_px) as f32);
+                    let prev_at = self.kitty_cursor_placement.last_emitted_at;
+                    let fresh = prev_at.is_some_and(|prev| {
+                        at.saturating_duration_since(prev)
+                            < crate::kitty_cursor::CURSOR_FOLD_DURATION
+                    });
+                    // Seeding from the last EMITTED body makes a post-fold
+                    // landing glide the rest of the way in, exactly like a
+                    // mid-line keystroke.
+                    let followed = self
+                        .kitty_cursor_placement
+                        .settle
+                        .or_else(|| {
+                            fresh
+                                .then_some(self.kitty_cursor_placement.last_sprite)
+                                .flatten()
+                                .map(|(sx, sy)| (sx as f32, (sy - bob_px) as f32))
+                        })
+                        .filter(|p| fresh && (rest.1 - p.1).abs() <= 2.0 * ch);
+                    match followed {
+                        Some((mut px, mut py)) => {
+                            // dt mirrors `kitty_cursor::advance_spine`: real
+                            // frame pacing, clamped so an occluded gap moves
+                            // one 100 ms step instead of replaying travel.
+                            let dt = prev_at
+                                .map(|prev| at.saturating_duration_since(prev).as_secs_f32())
+                                .unwrap_or(0.0)
+                                .min(0.1);
+                            let alpha = 1.0 - (-dt / Self::PLACE_TAU).exp();
+                            px += (rest.0 - px) * alpha;
+                            py += (rest.1 - py) * alpha;
+                            self.kitty_cursor_placement.settle = Some((px, py));
+                            (px.round() as i32, py.round() as i32 + bob_px)
+                        }
+                        None => {
+                            self.kitty_cursor_placement.settle = Some(rest);
+                            (target_x, target_y)
+                        }
+                    }
+                }
+            },
             KittyCursorPlacementLeg::Exit {
                 direction,
                 eased,
                 from,
                 from_sprite,
             } => {
+                // A fold owns the body for both half-beats; the settled
+                // follower re-seeds from the landing's emitted sprite.
+                self.kitty_cursor_placement.settle = None;
                 let from_cx = from.x + i32::from(nat_w) / 2;
                 let from_x = (from_cx - i32::from(dest_w) / 2 + lead_px)
                     .clamp(0, grid_w - i32::from(dest_w));
@@ -3648,6 +3748,7 @@ impl WordDecorations {
                 )
             }
             KittyCursorPlacementLeg::Enter { direction, eased } => {
+                self.kitty_cursor_placement.settle = None;
                 let start_x = match direction {
                     crate::kitty_cursor::CatFoldDirection::Forward => {
                         -i32::from(dest_w) - clearance
@@ -3815,7 +3916,13 @@ impl WordDecorations {
             iris,
             pet,
         } = frame;
-        if pet.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
+        // Keyed on the PRESENCE byte (`lane_alpha`), not the composed body
+        // alpha: the arrival multiply can truncate a faint body's `alpha`
+        // to 0 while its ghosts are still live on the lane, and an
+        // `alpha`-keyed return here would take them off glass with it.
+        // `lane_alpha == 0` implies `alpha == 0` (the struct's invariant),
+        // so nothing that used to draw is lost.
+        if pet.lane_alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
         self.cat_baker.set_free_tiles(true);
@@ -3941,6 +4048,12 @@ impl WordDecorations {
         // emitter: he climbs a ladder past the top and swings along the tab bar.)
         let grid_h = i32::from(geom.rows).saturating_mul(i32::from(geom.cell_h));
         for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
+            // Deliberately `pet.alpha` (presence × arrival), NOT
+            // `lane_alpha`: motes are the LIVE body's own accents — dust
+            // off its paws, z's over its head — so they ride the body's
+            // full composed ramp and dim with the arriving body they
+            // decorate. Only the departure lane below escapes the arrival
+            // factor; a ghost owns no motes.
             let alpha = (f32::from(m.alpha) * f32::from(pet.alpha) / 255.0) as u8;
             if alpha == 0 {
                 continue;
@@ -4013,11 +4126,24 @@ impl WordDecorations {
                 self.pet_depart_tiles[i] = None;
                 continue;
             };
-            // The ghost rides the live pet's own presence envelope too: if
-            // the pet is fading off the glass, its ghosts fade with it.
-            let alpha = (u16::from(d.alpha) * u16::from(pet.alpha) / 255) as u8;
+            // The ghost rides the live pet's own PRESENCE envelope
+            // (`lane_alpha`): if the pet is fading off the glass, its
+            // ghosts fade with it — but never the ARRIVAL ramp, which
+            // belongs to the incoming body alone. Multiplying the composed
+            // `pet.alpha` in here was §1.1(a)'s shipped bug: on the swap
+            // frame the leaver launched at 6% beside a 6% arriver, and the
+            // owner's "a dim kitty half-leaves" was exactly this line.
+            let alpha = (u16::from(d.alpha) * u16::from(pet.lane_alpha) / 255) as u8;
             if alpha == 0 {
                 continue;
+            }
+            // BORN-KEYED HOLD (the field's own docstring): a held tile from
+            // a PREVIOUS occupant of this slot is dropped, never worn —
+            // with `DEPART_MAX` past the handoff debounce a ghost can
+            // outlive the spacing between births, so slot identity alone
+            // no longer proves the hold belongs to this departure.
+            if self.pet_depart_tiles[i].is_some_and(|(held_born, ..)| held_born != d.born) {
+                self.pet_depart_tiles[i] = None;
             }
             let key = crate::pet_baker::PetBakeKey {
                 pose: d.pose,
@@ -4032,14 +4158,19 @@ impl WordDecorations {
                 .tile(&key)
                 .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), nat_w, nat_h, rgba))
                 .map(|t| (t.ax, t.ay));
-            if let Some(r) = resolved {
-                self.pet_depart_tiles[i] = Some(r);
+            if let Some((ax, ay)) = resolved {
+                self.pet_depart_tiles[i] = Some((d.born, ax, ay));
             }
-            let Some((ax, ay)) = resolved.or(self.pet_depart_tiles[i]) else {
+            let Some((ax, ay)) = resolved.or(self.pet_depart_tiles[i].map(|(_, ax, ay)| (ax, ay)))
+            else {
                 continue; // budget spent, nothing held yet: lands next frame
             };
             let ghost = crate::kitty_pet::PetFrame {
                 alpha,
+                // The ghost's frame IS its composed byte — `body_px` and
+                // the sprite read the same value, and the lane factor is
+                // already folded in above.
+                lane_alpha: alpha,
                 action: pet.action,
                 pose: d.pose,
                 col: d.col,
@@ -6326,7 +6457,7 @@ impl WordDecorations {
         // against. Owner, 2026-08-12: *"there are now two cats that seem to
         // appear when I type 'cat'? I want the cat just like in the main
         // text"* — the second cat WAS the cameo.
-        let companion_at = companion.map(|c| c.cell);
+        let companion_at = companion.and_then(|c| c.cell);
         out.clear();
         ink.clear();
         free.clear();
@@ -6358,9 +6489,14 @@ impl WordDecorations {
         // every later typed word popped its ambient twin out from under the
         // pet. Bounded scan: `self.occ` is capped at MAX_OCCURRENCES and
         // stops at the first hit.
-        match companion_at {
+        match (companion, companion_at) {
             // No animal on glass: the episode is over, the claim releases.
-            None => self.companion_claim = None,
+            (None, _) => self.companion_claim = None,
+            // A resident body is still visibly fading, but DECTCEM supplied no
+            // honest caret cell. Preserve the last word claim and let the exact
+            // `body_px` collision below own this frame; guessing the old caret
+            // would suppress unrelated words after a program-owned relocation.
+            (Some(_), None) => {}
             // Companion on glass: resolve the word it is answering NOW.
             //
             // THE ONE-FRAME LAG (see [`Self::caret_word`]): a companion earned
@@ -6372,7 +6508,7 @@ impl WordDecorations {
             // rescan recorded while it still could. Guarded on the ident still
             // being ON SCREEN so a remembered word that scrolled away cannot
             // hold a veto over a set it no longer belongs to.
-            Some(cell) => {
+            (_, Some(cell)) => {
                 let live = self
                     .occ
                     .iter()
@@ -6512,9 +6648,9 @@ impl WordDecorations {
             // caret-anchored band below would let an ambient cat rise
             // straight under it. The flying head carries no body rect and
             // keeps the classic model.
-            companion_px: companion.map(|c| {
-                c.body_px.unwrap_or_else(|| {
-                    let (row, col) = c.cell;
+            companion_px: companion.and_then(|c| {
+                c.body_px.or_else(|| {
+                    let (row, col) = c.cell?;
                     let cw = i32::from(geom.cell_w);
                     let ch = i32::from(geom.cell_h);
                     let x0 = i32::from(col) * cw;
@@ -6530,7 +6666,7 @@ impl WordDecorations {
                     // the_companion` pins that it must still draw. What must
                     // not happen is a cat landing ON the caret, and a cat that
                     // reaches the caret's own band is doing exactly that.
-                    (x0, x0 + 2 * cw, y0, y0 + ch)
+                    Some((x0, x0 + 2 * cw, y0, y0 + ch))
                 })
             }),
         };
@@ -16020,10 +16156,10 @@ mod tests {
         let nat_w = (nat_h as f32 * crate::kitty_pet::ART_ASPECT).round() as i32;
         let feet = cat.y + i32::from(cat.h);
         let x0 = cat.x + i32::from(cat.w) / 2 - nat_w / 2;
-        let companion = CompanionOnGlass {
-            cell: caret,
-            body_px: Some((x0, x0 + nat_w, feet - nat_h, feet)),
-        };
+        // The body remains visible for a bounded fade when DECTCEM hides the
+        // caret. No stale cell may be invented on that frame: pixel custody by
+        // the exact live body must be sufficient on its own.
+        let companion = CompanionOnGlass::at_body(None, (x0, x0 + nat_w, feet - nat_h, feet));
         let mut wd = scan();
         for k in 0..6u64 {
             let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
@@ -16081,10 +16217,8 @@ mod tests {
         let nat_w = (nat_h as f32 * crate::kitty_pet::ART_ASPECT).round() as i32;
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let feet = 2 * i32::from(g.cell_h);
-        let companion = CompanionOnGlass {
-            cell: caret,
-            body_px: Some((grid_w - nat_w, grid_w, feet - nat_h, feet)),
-        };
+        let companion =
+            CompanionOnGlass::at_body(Some(caret), (grid_w - nat_w, grid_w, feet - nat_h, feet));
         let mut wd = scan();
         let mut ctl = scan();
         let (mut with_pet, mut control) = (Vec::new(), Vec::new());
@@ -22201,24 +22335,44 @@ mod tests {
         );
 
         // The target remains live during entry. Advancing three cells changes
-        // the logical target now, and the settled endpoint is exactly the same
-        // bytes the historical direct emitter would draw there — no end snap.
+        // the logical target now; the landing is no snap in either direction:
+        // the first settled frame continues from the entry body through the
+        // settled follower, and the glide converges onto exactly the same
+        // bytes the historical direct emitter would draw there.
         let advanced = (4, 3);
-        let (entry_place, _) = emit(
+        let (entry_place, entry_body) = emit(
             &mut wd,
             advanced,
             motion(0.85, started + Duration::from_millis(238)),
         );
         assert_eq!(entry_place.sample.x, 4 * i32::from(g.cell_w) + 7);
-        let (_, landed) = emit(
+        let mut at = started + crate::kitty_cursor::CURSOR_FOLD_DURATION;
+        let (_, mut landed) = emit(
             &mut wd,
             advanced,
             CursorCatPlacementFrame {
-                sampled_at: started + crate::kitty_cursor::CURSOR_FOLD_DURATION,
+                sampled_at: at,
                 fold: None,
                 facing_left: false,
             },
         );
+        assert!(
+            (landed.x - entry_body.x).abs() < 2 * i32::from(g.cell_w),
+            "the landing glides from the entry body, no end snap: {entry_body:?} -> {landed:?}"
+        );
+        for _ in 0..40 {
+            at += Duration::from_millis(16);
+            let (_, body) = emit(
+                &mut wd,
+                advanced,
+                CursorCatPlacementFrame {
+                    sampled_at: at,
+                    fold: None,
+                    facing_left: false,
+                },
+            );
+            landed = body;
+        }
         let mut direct = Vec::new();
         wd.kitty_cursor(
             KittyCursorFrame {
@@ -22236,7 +22390,7 @@ mod tests {
         );
         assert_eq!(
             landed, direct[0],
-            "the seam lands on the exact settled frame"
+            "the seam converges on the exact settled frame"
         );
     }
 
@@ -22826,6 +22980,291 @@ mod tests {
         assert_eq!(
             top_edge.y, top_interior.y,
             "a top-row flight is never lifted off-grid by the rise"
+        );
+    }
+
+    /// APPENDIX-A RESIDUE PROOF (the margin staircase): with the fold seam in
+    /// place, authenticated wraps already glide, but per-key motion INSIDE a
+    /// line was still a raw snap — at the right margin the boundary rise
+    /// stepped by up to `cell_h/2` in one frame per keystroke. The settled
+    /// follower (`PLACE_TAU`) must turn that staircase into a glide: typing
+    /// one character per 16 ms frame across the clamp region may never move
+    /// the drawn body more than a few px per frame, and once the keys stop
+    /// the follower must land on the exact bytes of the raw placement law.
+    #[test]
+    fn margin_staircase_glides_instead_of_stepping_per_key() {
+        use crate::kitty_cursor::CursorCatPlacementFrame;
+
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut wd = WordDecorations::default();
+        let emit = |wd: &mut WordDecorations, cursor: (u16, u16), at: Instant| {
+            let layout = KittyCursorLayout {
+                geom: g,
+                cursor,
+                look: KittyLook::default(),
+                bob: 0.0,
+            };
+            let placement = wd
+                .resolve_kitty_cursor_placement(
+                    layout,
+                    CursorCatPlacementFrame {
+                        sampled_at: at,
+                        fold: None,
+                        facing_left: false,
+                    },
+                )
+                .expect("placeable kitty");
+            let mut free = Vec::new();
+            wd.kitty_cursor_at_placement(
+                KittyCursorFrame {
+                    geom: g,
+                    cursor,
+                    look: layout.look,
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                placement,
+                &mut free,
+            )
+            .expect("kitty emitted");
+            *free.last().expect("body emits last")
+        };
+
+        // The first emission snaps by law; it is the baseline, not a step.
+        let mut at = t0;
+        let mut prev = emit(&mut wd, (3, 15), at);
+        let mut max_step = 0i32;
+        for ccol in 16..=19u16 {
+            at += Duration::from_millis(16);
+            let body = emit(&mut wd, (3, ccol), at);
+            max_step = max_step.max((body.y - prev.y).abs());
+            prev = body;
+        }
+        assert!(
+            max_step <= 4,
+            "typing into the margin must glide, not step: max per-frame |dy| = {max_step} px"
+        );
+
+        // Once the keys stop, the follower converges onto the exact raw law.
+        let mut settled = prev;
+        for _ in 0..40 {
+            at += Duration::from_millis(16);
+            settled = emit(&mut wd, (3, 19), at);
+        }
+        let mut direct = Vec::new();
+        wd.kitty_cursor(
+            KittyCursorFrame {
+                geom: g,
+                cursor: (3, 19),
+                look: KittyLook::default(),
+                colors: CatColorKey::default(),
+                bob: 0.0,
+                alpha: 255,
+                pose: crate::kitty_cursor::CatPose::STILL,
+                sing: 0.0,
+                notes: [None; crate::kitty_sing::MAX_NOTES],
+            },
+            &mut direct,
+        )
+        .expect("direct emitter draws");
+        assert_eq!(
+            (settled.x, settled.y),
+            (direct[0].x, direct[0].y),
+            "the glide lands on the same bytes the raw placement law draws"
+        );
+    }
+
+    /// COMPOSITION LAW: the settled follower and the fold seam share one
+    /// continuity ledger (`last_sprite`). A fold that starts while the body
+    /// is still mid-glide must begin its Exit at the body actually drawn
+    /// last frame — the glide position — never at the raw settled law the
+    /// follower had not yet reached.
+    #[test]
+    fn a_fold_started_mid_glide_exits_from_the_glide_position() {
+        use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
+
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut wd = WordDecorations::default();
+        let emit =
+            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
+                let layout = KittyCursorLayout {
+                    geom: g,
+                    cursor,
+                    look: KittyLook::default(),
+                    bob: 0.0,
+                };
+                let placement = wd
+                    .resolve_kitty_cursor_placement(layout, motion)
+                    .expect("placeable kitty");
+                let mut free = Vec::new();
+                wd.kitty_cursor_at_placement(
+                    KittyCursorFrame {
+                        geom: g,
+                        cursor,
+                        look: layout.look,
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::kitty_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    placement,
+                    &mut free,
+                )
+                .expect("kitty emitted");
+                *free.last().expect("body emits last")
+            };
+        let settled = |at: Instant| CursorCatPlacementFrame {
+            sampled_at: at,
+            fold: None,
+            facing_left: false,
+        };
+
+        // Cross the rise onset (ccol 14 -> 16 at this geometry) so the
+        // follower is genuinely lagging when the fold interrupts it.
+        let _ = emit(&mut wd, (3, 14), settled(t0));
+        let _ = emit(&mut wd, (3, 15), settled(t0 + Duration::from_millis(16)));
+        let mid = emit(&mut wd, (3, 16), settled(t0 + Duration::from_millis(32)));
+        let raw = wd
+            .kitty_cursor_footprint(KittyCursorLayout {
+                geom: g,
+                cursor: (3, 16),
+                look: KittyLook::default(),
+                bob: 0.0,
+            })
+            .expect("raw law");
+        assert_ne!(
+            (mid.x, mid.y),
+            (raw.x, raw.y),
+            "negative control: the body is genuinely mid-glide, behind the raw law"
+        );
+
+        let started = t0 + Duration::from_millis(48);
+        let launch = emit(
+            &mut wd,
+            (4, 0),
+            CursorCatPlacementFrame {
+                sampled_at: started,
+                fold: Some(CatFoldFrame {
+                    started,
+                    direction: CatFoldDirection::Forward,
+                    progress: 0.0,
+                }),
+                facing_left: false,
+            },
+        );
+        assert_eq!(
+            (launch.x, launch.y),
+            (mid.x, mid.y),
+            "the Exit leg is C0-continuous with the glide position"
+        );
+    }
+
+    /// COMPAT PATH PROOF: a `sampled_at: None` settled placement (the direct
+    /// [`WordDecorations::kitty_cursor`] wrapper — settings preview and
+    /// historical callers) draws the raw footprint byte-for-byte and never
+    /// reads or writes the follower's ledger, even while a resolver-path
+    /// glide is live on the same engine.
+    #[test]
+    fn compat_settled_emission_is_the_raw_footprint_and_ignores_the_glide() {
+        use crate::kitty_cursor::CursorCatPlacementFrame;
+
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut wd = WordDecorations::default();
+        let resolver_emit = |wd: &mut WordDecorations, cursor: (u16, u16), at: Instant| {
+            let layout = KittyCursorLayout {
+                geom: g,
+                cursor,
+                look: KittyLook::default(),
+                bob: 0.0,
+            };
+            let placement = wd
+                .resolve_kitty_cursor_placement(
+                    layout,
+                    CursorCatPlacementFrame {
+                        sampled_at: at,
+                        fold: None,
+                        facing_left: false,
+                    },
+                )
+                .expect("placeable kitty");
+            let mut free = Vec::new();
+            wd.kitty_cursor_at_placement(
+                KittyCursorFrame {
+                    geom: g,
+                    cursor,
+                    look: layout.look,
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                placement,
+                &mut free,
+            )
+            .expect("kitty emitted");
+            *free.last().expect("body emits last")
+        };
+
+        // Put a live glide on the ledger.
+        let _ = resolver_emit(&mut wd, (3, 16), t0);
+        let _ = resolver_emit(&mut wd, (3, 17), t0 + Duration::from_millis(16));
+        let ledger_settle = wd.kitty_cursor_placement.settle;
+        let ledger_sprite = wd.kitty_cursor_placement.last_sprite;
+        assert!(ledger_settle.is_some(), "a resolver glide is live");
+
+        let raw = wd
+            .kitty_cursor_footprint(KittyCursorLayout {
+                geom: g,
+                cursor: (3, 17),
+                look: KittyLook::default(),
+                bob: 0.0,
+            })
+            .expect("raw law");
+        let compat = |wd: &mut WordDecorations| {
+            let mut free = Vec::new();
+            wd.kitty_cursor(
+                KittyCursorFrame {
+                    geom: g,
+                    cursor: (3, 17),
+                    look: KittyLook::default(),
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                &mut free,
+            )
+            .expect("compat emitter draws");
+            *free.last().expect("one body")
+        };
+        let first = compat(&mut wd);
+        let second = compat(&mut wd);
+        assert_eq!(
+            (first.x, first.y),
+            (raw.x, raw.y),
+            "the compat path draws the raw footprint, not the glide"
+        );
+        assert_eq!(first, second, "the compat path is byte-stable");
+        assert_eq!(
+            wd.kitty_cursor_placement.settle, ledger_settle,
+            "the compat path never writes the follower's ledger"
+        );
+        assert_eq!(
+            wd.kitty_cursor_placement.last_sprite, ledger_sprite,
+            "the compat path never writes the continuity ledger"
         );
     }
 
@@ -23776,6 +24215,7 @@ mod pet_handoff_emission_tests {
     fn pet_frame() -> crate::kitty_pet::PetFrame {
         crate::kitty_pet::PetFrame {
             alpha: 255,
+            lane_alpha: 255,
             action: crate::kitty_pet::PetAction::Sit,
             pose: crate::pet_glyphs_gen::PetGlyphId::PetSit,
             col: 10.0,
@@ -23907,6 +24347,9 @@ mod pet_stays_inside_the_grid_tests {
         });
         crate::kitty_pet::PetFrame {
             alpha: 255,
+            // A settled sleeper: no arrival ramp is in flight, so the lane
+            // byte and the body byte are the same presence.
+            lane_alpha: 255,
             action: crate::kitty_pet::PetAction::Sleep,
             pose: crate::pet_glyphs_gen::PetGlyphId::PetSleep0,
             col: 13.0,

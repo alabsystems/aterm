@@ -11,7 +11,7 @@
 // Gated: if there is no GPU or no system font, the tests no-op (return).
 
 use aterm_core::terminal::{CursorStyle, Terminal};
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_render::{Frame, RenderInput, Renderer, Theme};
 
 mod common;
 use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
@@ -77,8 +77,20 @@ fn parity(
 ) -> Frame {
     // A-3: the engine builds the snapshot; both renderers consume the same value.
     let input = term.cell_frame(2, 4);
-    let cpu_frame = cpu.render_input(&input);
-    let gpu_frame = gpu.render_input(win, &input, None);
+    parity_input(cpu, gpu, win, &input, label)
+}
+
+/// Render an already-composed input on both backends and assert the same parity
+/// contract as [`parity`].
+fn parity_input(
+    cpu: &mut Renderer,
+    gpu: &mut aterm_gpu::GpuRenderer,
+    win: &mut aterm_gpu::WindowGpu,
+    input: &RenderInput,
+    label: &str,
+) -> Frame {
+    let cpu_frame = cpu.render_input(input);
+    let gpu_frame = gpu.render_input(win, input, None);
     assert_eq!(
         (gpu_frame.width, gpu_frame.height),
         (cpu_frame.width, cpu_frame.height),
@@ -237,6 +249,54 @@ fn gpu_hollow_block_matches_cpu() {
     assert!(
         !near_cursor(f.pixels[my * f.width + mx]),
         "hollow: center must stay unfilled"
+    );
+}
+
+#[test]
+fn gpu_effect_shape_precedence_and_clear_overlays_match_cpu() {
+    let Some((mut cpu, mut gpu)) = renderers() else {
+        return;
+    };
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (cw, ch) = cpu.cell_size();
+    let mut term = Terminal::new(2, 4);
+    term.process(b"\x1b[4 q"); // terminal owns steady underline
+    let mut input = term.cell_frame(2, 4);
+    input.cursor_effect_style_override = Some(CursorStyle::Bolt);
+
+    let effect = parity_input(&mut cpu, &mut gpu, &mut win, &input, "effect-bolt");
+    let bolt_area: usize = aterm_render::cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch)
+        .iter()
+        .map(|&[_, _, w, h]| w * h)
+        .sum();
+    assert_eq!(cursor_positions(&effect).len(), bolt_area);
+    assert_eq!(input.cursor_style, CursorStyle::SteadyUnderline);
+
+    // The external/backend override remains highest on both implementations.
+    cpu.set_cursor_style_override(Some(CursorStyle::HollowBlock));
+    gpu.set_cursor_style_override(Some(CursorStyle::HollowBlock));
+    let unfocused = parity_input(
+        &mut cpu,
+        &mut gpu,
+        &mut win,
+        &input,
+        "backend-hollow-over-effect-bolt",
+    );
+    let t = (ch / 16).max(1);
+    let hollow_area = 2 * cw * t + 2 * t * (ch - 2 * t);
+    assert_eq!(cursor_positions(&unfocused).len(), hollow_area);
+
+    // Plain capture strips the host/effect shape, exposing terminal DECSCUSR.
+    cpu.set_cursor_style_override(None);
+    gpu.set_cursor_style_override(None);
+    input.clear_overlays();
+    let plain = parity_input(&mut cpu, &mut gpu, &mut win, &input, "plain-underline");
+    let underline_h = (ch / 8).max(2);
+    let pos = cursor_positions(&plain);
+    assert_eq!(pos.len(), cw * underline_h);
+    assert!(
+        pos.iter()
+            .all(|&(x, y)| x < cw && y >= ch - underline_h && y < ch)
     );
 }
 

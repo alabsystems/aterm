@@ -9,7 +9,7 @@
 pub(crate) use super::builtin_patterns::BuiltinRules;
 use aterm_grapheme::char_width;
 use aterm_grapheme::split_graphemes;
-use regex::Regex;
+use aterm_regex::Regex;
 use std::cmp::Ordering;
 
 /// Priority levels for selection rules.
@@ -118,7 +118,7 @@ impl SelectionRule {
     pub(crate) fn find_all<'a>(
         &'a self,
         text: &'a str,
-    ) -> impl Iterator<Item = regex::Match<'a>> + 'a {
+    ) -> impl Iterator<Item = aterm_regex::Match<'a>> + 'a {
         self.pattern.find_iter(text)
     }
 
@@ -130,7 +130,7 @@ impl SelectionRule {
         &self,
         text: &'a str,
         byte_pos: usize,
-    ) -> Option<regex::Match<'a>> {
+    ) -> Option<aterm_regex::Match<'a>> {
         self.pattern
             .find_iter(text)
             .find(move |m| m.start() <= byte_pos && byte_pos < m.end())

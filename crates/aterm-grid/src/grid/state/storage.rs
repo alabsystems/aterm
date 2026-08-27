@@ -165,6 +165,27 @@ pub struct GridStorage {
     /// sentinel. WRITE-ONLY except for [`Grid::content_gen`]: no render or parse
     /// path reads it, so it cannot alter any rendered output.
     pub content_gen: u64,
+    /// Monotonic AUTOWRAP serial — the emulator wrap fact (kitty-motion §4.1).
+    ///
+    /// Bumped exactly once each time `advance_autowrap_line` runs, which is
+    /// the ONE funnel every autowrap line advance resolves through (deferred
+    /// wraps via `resolve_pending_wrap`, plus the bulk/split write paths that
+    /// advance mid-run). A host that diffs this against a last-seen value
+    /// learns "the terminal wrapped since my last read" as a fact instead of
+    /// a caret-delta heuristic — the only signal that separates a scrolled
+    /// bottom-row wrap from `Home` pressed at the last column.
+    ///
+    /// TRANSIENT OBSERVABILITY, not persisted state — a deliberate law:
+    /// checkpoint/restore does NOT capture it (`GridCursorRepr` round-trips
+    /// `pending_wrap`, never this), and main/alt buffer swaps do NOT migrate
+    /// it (`handler_dec` copies `pending_wrap` onto the incoming grid; each
+    /// grid keeps its own serial). A restored session or a buffer switch may
+    /// therefore hand the host at most one spurious changed/unchanged read,
+    /// and the host diff — a per-window `(session, last-serial)` baseline
+    /// that reports only "changed since MY last read of the SAME session" —
+    /// tolerates exactly that. Like `content_gen`, no render or parse path
+    /// reads it, so it can never alter rendered output or replay parity.
+    pub wrap_serial: u64,
     /// Fast-path flag: set when any row uses DECDWL/DECDHL (double-width/height).
     /// When false, `effective_cols_for_row` skips the ring-buffer lookup
     /// (which checks row line_size) and returns `self.cols` directly.
@@ -231,6 +252,7 @@ impl GridStorage {
             absolute_row_counter: u64::from(visible_rows),
             // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
             content_gen: 1,
+            wrap_serial: 0,
             any_double_width: false,
             has_horizontal_margins: false,
             #[cfg(feature = "disk-tier")]

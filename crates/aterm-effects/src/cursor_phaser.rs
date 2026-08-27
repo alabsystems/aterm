@@ -8,8 +8,9 @@
 //!   the streak is being laid in (injected by the host from
 //!   [`crate::cursor_glow::CursorGlow::beam_hue`]), so the beam reads as light
 //!   LEAVING the cursor, not a ribbon that happens to end near it. At rest the
-//!   fill is a whisper of the current beam hue over the theme base; under the
-//!   keys it saturates to the vivid beam colour.
+//!   fill is a whisper of the current beam hue over THE CURSOR'S OWN COLOUR
+//!   ([`PhaserConfig::base`] — OSC 12 / the configured `cursor_color`); under
+//!   the keys it saturates to the vivid beam colour.
 //! * **beam-axis energy WINGS** — an additive pair of lens-shaped side lobes on
 //!   the horizontal beam axis (the phaser's fat core runs near cell height, so
 //!   the wings span the cell vertically and taper to points sideways). They sit
@@ -36,9 +37,13 @@ use aterm_render::{GlowQuad, premul_rgb};
 use crate::cursor_glow::Geom;
 use crate::effect_util::push_fx_rect as push_rect;
 
-/// The block-cursor base the beam hue tints FROM: white on a dark theme, a soft
-/// near-black on a light theme (the same pair as the rainbow cursor, so the two
-/// treatments feel like one family at rest).
+/// The block-cursor base the beam hue tints FROM when the host names none:
+/// white on a dark theme, a soft near-black on a light theme (the same pair as
+/// the rainbow cursor, so the two treatments feel like one family at rest).
+///
+/// A host that KNOWS the cursor's resolved colour (OSC 12, else the configured
+/// theme cursor) passes it as [`PhaserConfig::base`] instead, and these two
+/// stand only for the raw/embedder callers that have no such value.
 const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
 const BASE_LIGHT_THEME: u32 = 0x0016_161C;
 
@@ -110,6 +115,25 @@ pub struct PhaserConfig {
     /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in
     /// by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
     pub intensity: f32,
+    /// The colour the emitter block wears AT REST, `0x00RRGGBB` — the terminal's
+    /// resolved cursor colour (OSC 12 when set, else the configured theme
+    /// cursor, else the live OSC 10 foreground). The beam hue is a TINT over
+    /// this base, so a settled caret is the user's cursor colour and charging
+    /// blooms it toward the sweep.
+    ///
+    /// The rainbow block's hole, one style over (`d602f8cd`): this fill leaves
+    /// the tick as [`aterm_render::RenderInput::cursor_fill_override`], which
+    /// the renderer applies INSTEAD of the frame cursor colour — so a
+    /// hard-coded base meant OSC 12 and the theme cursor reached every cursor
+    /// shape EXCEPT the block this style paints. The comet and the beam rod
+    /// already build their bodies from a host-resolved colour
+    /// (`CometConfig::color` / `BeamRodConfig::color`); the emitter simply
+    /// never did.
+    ///
+    /// `None` keeps the historical theme-polar base ([`BASE_DARK_THEME`] /
+    /// [`BASE_LIGHT_THEME`]) for callers with no cursor colour to hand — every
+    /// such frame is byte-identical to before.
+    pub base: Option<u32>,
 }
 
 /// What a tick produced: the beam-hued block FILL to hand the renderer (it floors
@@ -195,15 +219,20 @@ impl CursorPhaser {
         }
         let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin(); // 0..1
 
-        // The BLOCK FILL: the theme base tinted toward the BEAM's hue with charge.
-        // The renderer floors this against the cell bg (the cut-out glyph colour),
-        // so the glyph stays sharp however saturated the block gets.
+        // The BLOCK FILL: the cursor's own colour tinted toward the BEAM's hue
+        // with charge. The renderer floors this against the cell bg (the cut-out
+        // glyph colour), so the glyph stays sharp however saturated the block gets.
+        // …FROM the cursor's own colour when the host resolved one: the block IS
+        // the cursor, so a settled caret must be whatever OSC 12 (or the theme
+        // `cursor_color`) says it is, and the beam hue is the tint charging
+        // lays over it. Only a caller that has no such value falls back to the
+        // theme-polar constants.
         let beam = hsv2rgb_turns(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
-        let base = if dark_theme {
+        let base = cfg.base.unwrap_or(if dark_theme {
             BASE_DARK_THEME
         } else {
             BASE_LIGHT_THEME
-        };
+        });
         let fill = mix_rgb(base, beam, lerp(MIX_IDLE, MIX_MAX, e));
 
         // The additive WINGS, drawn only over a visible in-grid cursor cell. A
@@ -364,6 +393,9 @@ mod tests {
         PhaserConfig {
             enabled: true,
             intensity: 1.0,
+            // No host base: these fixtures pin the historical theme-polar
+            // bloom, so they stay byte-identical to the pre-`base` tick.
+            base: None,
         }
     }
 
@@ -382,6 +414,7 @@ mod tests {
             &PhaserConfig {
                 enabled: false,
                 intensity: 1.0,
+                base: None,
             },
             &mut out,
         );
@@ -407,6 +440,7 @@ mod tests {
             &PhaserConfig {
                 enabled: true,
                 intensity: 0.0,
+                base: None,
             },
             &mut out,
         );
@@ -466,8 +500,10 @@ mod tests {
         );
     }
 
-    /// The fill blooms from the theme base (near-white on dark) at rest toward
-    /// the saturated beam hue under charge, and a light theme starts near-black.
+    /// With NO host cursor colour to hand, the fill blooms from the theme base
+    /// (near-white on dark) at rest toward the saturated beam hue under charge,
+    /// and a light theme starts near-black — the raw/embedder fallback, kept
+    /// byte-identical by [`PhaserConfig::base`] being `None` here.
     #[test]
     fn fill_blooms_from_theme_base() {
         let g = geom();
@@ -519,6 +555,67 @@ mod tests {
             maxch < 110,
             "idle block near black on a light theme, got {f_light:#08x}"
         );
+    }
+
+    /// THE HOST'S CURSOR COLOUR IS THE EMITTER BLOCK, on either theme polarity.
+    ///
+    /// The block fill leaves this tick as `RenderInput::cursor_fill_override`,
+    /// which the renderer applies INSTEAD of `frame_cursor(input)` — so
+    /// whatever base this returns is literally the cursor the user sees. With
+    /// the base hard-coded to white/near-black, OSC 12 and the configured
+    /// `cursor_color` reached every cursor shape except the one the `phaser`
+    /// style paints. The rainbow block had the same hole and the same fix
+    /// (`d602f8cd`); this is that test, one style over. A settled caret must
+    /// therefore BE the host's colour, and two colours must never collapse to
+    /// one block.
+    #[test]
+    fn host_base_is_the_settled_block_on_either_polarity() {
+        let g = geom();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        // A SETTLED emitter (energy 0) with a FIXED beam hue: the only thing
+        // that can move this fill between two ticks is the base.
+        let settled = |base: u32, dark: bool, out: &mut Vec<GlowQuad>| {
+            let c = PhaserConfig {
+                base: Some(base),
+                ..cfg()
+            };
+            out.clear();
+            CursorPhaser::default()
+                .tick(Some((1, 1)), t, 0.5, 0.0, dark, g, &c, out)
+                .fill
+                .unwrap()
+        };
+        let chans = |c: u32| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+        for dark in [true, false] {
+            let (rr, rg, rb) = chans(settled(0x00FF_0000, dark, &mut out));
+            assert!(
+                rr > 200 && rg < 130 && rb < 130,
+                "a red cursor colour settles red (dark={dark})"
+            );
+            let (br, bg, bb) = chans(settled(0x0000_00FF, dark, &mut out));
+            assert!(
+                bb > 200 && br < 130 && bg < 130,
+                "a blue cursor colour settles blue (dark={dark})"
+            );
+            assert_ne!(
+                settled(0x00FF_0000, dark, &mut out),
+                settled(0x0000_00FF, dark, &mut out),
+                "two cursor colours must not paint one identical block (dark={dark})"
+            );
+        }
+        // …and charge still blooms the BEAM hue over that base rather than
+        // replacing the base's job: the charged fill differs markedly.
+        let c = PhaserConfig {
+            base: Some(0x00FF_0000),
+            ..cfg()
+        };
+        out.clear();
+        let hot = CursorPhaser::default()
+            .tick(Some((1, 1)), t, 0.5, 1.0, true, g, &c, &mut out)
+            .fill
+            .unwrap();
+        assert_ne!(hot, settled(0x00FF_0000, true, &mut out));
     }
 
     /// Full charge reaches further sideways and burns far brighter than the idle

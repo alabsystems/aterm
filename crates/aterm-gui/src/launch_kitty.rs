@@ -62,6 +62,28 @@ fn fallback_seed() -> u64 {
     nanos ^ pid.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15
 }
 
+/// WHICH RUNG of [`companion_precedence`] won a verdict — the winner report
+/// the rate law reads at the render sync sites (kitty-motion §2.0.4, Rungs:
+/// *"`companion_precedence` reports which arm won; the sync site maps
+/// `Rung::Program => tenure.arrival()`, every other rung to Quiet"*). The
+/// LOOK still travels alone through `App::companion_verdict`'s bare
+/// `KittyLook` return (five production callers and a locked test suite
+/// compare it directly); the rung rides beside it on `WindowState` so the
+/// sync sites can tell a program-rung win from a favourite or launch win —
+/// only a PROGRAM win may ever carry the tenure gate's arrival ceremony.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CompanionRung {
+    /// The pinned favourite won. The user's explicit choice announces
+    /// nothing (the USER-ACT-ONLY precedent): always quiet.
+    Favourite,
+    /// The tenured program cat won — the ONE rung whose arrival may be a
+    /// ceremony, as ruled by `app_kitty::KittyTenure::arrival`.
+    Program,
+    /// The launch kitty floor won — "no stronger claim". The base cat is
+    /// always home: always quiet.
+    Launch,
+}
+
 /// THE COMPANION PRECEDENCE LAW (owner rulings, 2026-08-07 and 2026-08-17),
 /// the ONE place the order is stated — every dressing surface (the
 /// single-pane present, the split/composed present, and both capture
@@ -79,13 +101,23 @@ fn fallback_seed() -> u64 {
 ///   3. THE LAUNCH KITTY: the process's own base cat, minted once at launch —
 ///      the face of "no stronger claim". There is no session rung and no
 ///      discovery rung: neither is a choice, and each made the cat change.
+///
+/// Returns the winning look AND [`CompanionRung`] names the arm that won, so
+/// the rate law's sync sites can ration the theater without a second, drifting
+/// re-derivation of this order.
 #[must_use]
 pub(crate) fn companion_precedence(
     favourite: Option<KittyLook>,
     app: Option<KittyLook>,
     launch: KittyLook,
-) -> KittyLook {
-    favourite.or(app).unwrap_or(launch)
+) -> (KittyLook, CompanionRung) {
+    if let Some(look) = favourite {
+        (look, CompanionRung::Favourite)
+    } else if let Some(look) = app {
+        (look, CompanionRung::Program)
+    } else {
+        (launch, CompanionRung::Launch)
+    }
 }
 
 #[cfg(test)]
@@ -94,7 +126,8 @@ mod tests {
 
     /// (d) The precedence law, rung by rung: a pinned favourite beats the
     /// tenured program cat, the program cat beats the launch kitty, and the
-    /// launch kitty is the floor.
+    /// launch kitty is the floor — and each verdict NAMES its winning rung,
+    /// so the rate law's sync sites can tell a program win from the rest.
     #[test]
     fn precedence_favourite_beats_program_beats_the_launch_kitty_floor() {
         let favourite = KittyLook {
@@ -110,17 +143,17 @@ mod tests {
         );
         assert_eq!(
             companion_precedence(Some(favourite), Some(app), launch),
-            favourite,
+            (favourite, CompanionRung::Favourite),
             "a pinned favourite owns the companion look"
         );
         assert_eq!(
             companion_precedence(None, Some(app), launch),
-            app,
+            (app, CompanionRung::Program),
             "a program that earned the cursor outranks the base cat"
         );
         assert_eq!(
             companion_precedence(None, None, launch),
-            launch,
+            (launch, CompanionRung::Launch),
             "the launch kitty is the floor"
         );
     }

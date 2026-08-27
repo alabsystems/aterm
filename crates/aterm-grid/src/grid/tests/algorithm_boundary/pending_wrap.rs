@@ -342,3 +342,48 @@ fn back_tab_clears_pending_wrap() {
         "CBT (back tab) must clear pending_wrap"
     );
 }
+
+// ========================================================================
+// wrap_serial — the emulator wrap fact (kitty-motion §4.1)
+// ========================================================================
+
+/// `wrap_serial` bumps exactly once per RESOLVED autowrap line and never on
+/// a hard newline.
+///
+/// The serial is the host-facing wrap FACT: a parked `pending_wrap` is not
+/// yet a wrap (xterm defers the advance until the next printable), the
+/// resolving glyph is exactly one wrap, and CR+LF — the same caret shape on
+/// glass — must stay invisible to it, or the pet's fold would eat honest
+/// Enter presses.
+#[test]
+fn wrap_serial_counts_resolved_wraps_and_ignores_hard_newlines() {
+    let mut grid = grid_with_pending_wrap(3, 5);
+    assert_eq!(
+        grid.wrap_serial(),
+        0,
+        "a parked deferred wrap is not yet a wrap"
+    );
+
+    // The next printable resolves the deferred wrap: exactly one bump.
+    grid.write_char_wrap('f');
+    assert_eq!(grid.wrap_serial(), 1, "one wrapped line, one bump");
+    assert_eq!(grid.cursor_row(), 1, "the resolve advanced the line");
+
+    // Ordinary typing inside the line never bumps.
+    grid.write_char_wrap('g');
+    assert_eq!(grid.wrap_serial(), 1, "mid-line typing is not a wrap");
+
+    // A hard newline (CR + LF) moves the caret the same way on glass but
+    // must stay invisible to the wrap fact.
+    grid.carriage_return();
+    grid.line_feed();
+    assert_eq!(grid.wrap_serial(), 1, "a hard newline is not a wrap");
+
+    // A second full line resolves a second wrap: exactly one more bump.
+    for col in 0..5 {
+        grid.write_char_wrap((b'A' + col as u8) as char);
+    }
+    assert_eq!(grid.wrap_serial(), 1, "the second wrap is still parked");
+    grid.write_char_wrap('h');
+    assert_eq!(grid.wrap_serial(), 2, "second wrapped line, second bump");
+}

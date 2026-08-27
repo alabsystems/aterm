@@ -46,7 +46,7 @@ pub(super) fn deterministic_description(snapshot: &Snapshot) -> String {
             } else if !snapshot.title.is_empty() {
                 "Active terminal session".to_string()
             } else {
-                "Ready".to_string()
+                READY.to_string()
             }
         }
     }
@@ -77,9 +77,16 @@ fn generic_completion_description(exit_code: Option<i32>) -> String {
     }
 }
 
+/// The description of a shell that is simply sitting at its prompt.
+///
+/// Named because three places must agree on it: the two that produce it, and
+/// [`super::shed_place_already_in_title`], which drops it when a tab's title has
+/// already said everything it would have said.
+pub(super) const READY: &str = "Ready";
+
 fn ready_description(place: &str) -> String {
     if place.is_empty() {
-        "Ready".to_string()
+        READY.to_string()
     } else {
         normalize_description(&format!("Ready in {place}"))
     }

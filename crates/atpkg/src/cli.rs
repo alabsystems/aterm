@@ -2378,6 +2378,18 @@ fn cmd_install(program: Option<&String>) -> ExitCode {
     if program == "--default-set" {
         return cmd_install_default_set();
     }
+    // A FLAG IS NOT A PROGRAM NAME. A mistyped or unsupported option — the
+    // measured case was `--progress-file`, whose value the arg scanner strips
+    // only in the forms it knows — otherwise lands here as the program to
+    // install, gets RECORDED as a wanted program, and then sits in the local
+    // record as a row `doctor` has to explain away. Refuse it at the door and
+    // name the two spellings that work.
+    if program.starts_with('-') {
+        eprintln!("atpkg: {program:?} is a command-line flag, not a program name");
+        eprintln!("atpkg:   one program:      aterm pkg install <program>");
+        eprintln!("atpkg:   the whole toolset: aterm pkg install --default-set");
+        return ExitCode::from(2);
+    }
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — refusing to install");
         return ExitCode::from(1);
@@ -5403,6 +5415,41 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    /// A FLAG IS NOT A PROGRAM. Measured on a live box: a mistyped
+    /// `atpkg install --progress-file` recorded the flag as a wanted program,
+    /// and `doctor` then carried a standing warning about a row that "cannot be
+    /// a program name". Refusing at the door is the fix; the exit code is the
+    /// usage code, not the failure code, because the user's command was
+    /// malformed rather than their system broken.
+    #[test]
+    fn install_refuses_a_flag_as_a_program_name() {
+        for flag in ["--progress-file", "-v", "--default-sett"] {
+            let code = super::cmd_install(Some(&flag.to_string()));
+            assert_eq!(
+                code,
+                std::process::ExitCode::from(2),
+                "{flag:?} must be refused as a usage error, never recorded"
+            );
+        }
+        // The one flag-shaped argument that IS a verb must reach its branch
+        // rather than the refusal. Asserted structurally — in a test process
+        // with no root key pinned `--default-set` also exits 2, from the
+        // manager gate rather than from this guard, so the exit code cannot
+        // tell the two apart.
+        let src = include_str!("cli.rs");
+        let default_set_at = src
+            .find("if program == \"--default-set\" {")
+            .expect("the --default-set branch");
+        let guard_at = src
+            .find("is a command-line flag, not a program name")
+            .expect("the flag guard");
+        assert!(
+            default_set_at < guard_at,
+            "--default-set must be answered BEFORE the flag guard, or the \
+             documented whole-toolset spelling would refuse itself"
+        );
+    }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

@@ -234,6 +234,88 @@ fn earned_light_survives_a_cold_program_move() {
     }
 }
 
+/// One physical keypress can be presented as more than one cursor delta when
+/// the terminal response is split across parser batches. The key's one-shot
+/// license belongs to the first observed move; a later suffix in the same
+/// freshness window must neither borrow that license nor erase the light the
+/// first batch earned. It still becomes the honest source anchor for whatever
+/// arrives next.
+#[test]
+fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
+    let g = geom();
+    let c = cfg(GlowStyle::RainbowKitty);
+    let tc = trail_cfg();
+    let mut glow = CursorGlow::default();
+    let mut trail = CursorTrail::default();
+    let mut out: Vec<GlowQuad> = Vec::new();
+    let mut trail_out = Vec::new();
+    let t0 = Instant::now();
+
+    glow.tick(Some((2, 3)), t0, &c, g, &mut out);
+    trail.tick(Some((2, 3)), t0, &tc, &mut trail_out);
+
+    // The physical press is stamped once at the input boundary. Its first
+    // parser batch moves the caret and consumes that one-shot license.
+    let first = t0 + Duration::from_millis(8);
+    glow.note_typed_cells(first, 1);
+    trail.note_typed(first);
+    glow.tick(Some((2, 4)), first, &c, g, &mut out);
+    trail.tick(Some((2, 4)), first, &tc, &mut trail_out);
+
+    let earned_spawns = glow.spawns();
+    let earned_sparks = glow.live_sparks();
+    let earned_ribbon = glow.ribbon_segments();
+    let earned_trail: Vec<(usize, usize)> =
+        trail_out.iter().map(|cell| (cell.row, cell.col)).collect();
+    assert_eq!(earned_spawns, 1, "the first batch spends the press once");
+    assert!(earned_sparks > 0, "the first batch must earn rainbow light");
+    assert!(earned_ribbon > 0, "the first batch must lay the ribbon");
+    assert!(
+        !earned_trail.is_empty(),
+        "the first batch must lay the comet"
+    );
+    assert_eq!(glow.cursor_anchor(), Some((2, 4)));
+    assert_eq!(trail.cursor_anchor(), Some((2, 4)));
+    assert!(!glow.move_licensed(first), "the glow license is one-shot");
+    assert!(!trail.move_licensed(first), "the trail license is one-shot");
+
+    // The response's suffix lands in a later parser batch while the original
+    // timestamp would still be fresh. It owns no second license: no births,
+    // no resident wipe, but both engines must track its real destination.
+    let suffix = first + Duration::from_millis(1);
+    glow.tick(Some((2, 5)), suffix, &c, g, &mut out);
+    trail.tick(Some((2, 5)), suffix, &tc, &mut trail_out);
+
+    assert_eq!(glow.spawns(), earned_spawns, "the suffix minted glow");
+    assert_eq!(
+        glow.live_sparks(),
+        earned_sparks,
+        "the suffix erased resident rainbow light"
+    );
+    assert_eq!(
+        glow.ribbon_segments(),
+        earned_ribbon,
+        "the suffix cut the resident ribbon"
+    );
+    assert_eq!(
+        trail_out
+            .iter()
+            .map(|cell| (cell.row, cell.col))
+            .collect::<Vec<_>>(),
+        earned_trail,
+        "the suffix changed the resident comet bed"
+    );
+    assert_eq!(glow.cursor_anchor(), Some((2, 5)));
+    assert_eq!(trail.cursor_anchor(), Some((2, 5)));
+
+    let tally = glow.admission_tally();
+    assert_eq!((tally.licensed, tally.declined), (1, 1));
+    assert_eq!(
+        tally.last_decline_reason,
+        Some(CursorGlow::DECLINE_NO_FRESH_HINT)
+    );
+}
+
 const ALL_STYLES: [GlowStyle; 9] = [
     GlowStyle::Lumen,
     GlowStyle::Phaser,

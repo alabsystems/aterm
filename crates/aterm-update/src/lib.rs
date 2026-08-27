@@ -123,6 +123,7 @@ mod manifest;
 mod no_token;
 #[cfg(target_os = "macos")]
 mod paths;
+mod progress;
 // Not macOS-only: every platform relaunches aterm (see the module's own doc).
 mod relaunch;
 #[cfg(target_os = "macos")]
@@ -174,6 +175,7 @@ fn read_ledger_text(path: &std::path::Path) -> Option<String> {
 /// `ATERM_UPDATE_OWNER`/`_REPO`
 /// env keys) is defined on. A newtype here would break that call site.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
+pub use progress::{Progress, ProgressNotify, set_progress_observer};
 
 /// Re-exported for every OTHER lane that re-launches aterm forwarding its own
 /// argv (the GUI's cold-exec/seamless/Windows successor spawns): strip the
@@ -1732,7 +1734,11 @@ fn reconcile_status_outcome(
 /// ledger to mistake for another checker's, and the first completed check both
 /// stamps the ledger and reveals the lane. An explicitly configured interval is
 /// never second-guessed: an operator who set one owns the consequence.
-#[cfg(any(target_os = "macos", test))]
+// `any(macos, test)` was reaching for the unit tests below, but its BODY reads
+// the macOS-only `github` and `cadence` modules — so on a Linux `cargo test` the
+// fn compiled without them and the crate failed to build. The tests that cover
+// it are macOS-gated for the same reason, so this rides the platform alone.
+#[cfg(target_os = "macos")]
 fn dedup_window_base(
     configured: bool,
     lane: github::Lane,
@@ -2007,7 +2013,10 @@ pub(crate) mod log_capture {
     }
 }
 
-#[cfg(test)]
+// The cadence and github modules are macOS-only (the updater lane ships there);
+// this module reads both, so it compiles only where they exist. Without the
+// gate `cargo check --all-targets` fails on Linux with two unresolved imports.
+#[cfg(all(test, target_os = "macos"))]
 mod checker_gate_tests {
     use std::time::Duration;
 

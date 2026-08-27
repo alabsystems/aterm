@@ -503,12 +503,48 @@ impl Worker {
     }
 }
 
+/// The separator a TAB label's two halves are joined with — the one string that
+/// tells a composed chip title apart into its clauses.
+///
+/// Named because two subsystems have to agree on it and neither can check the
+/// other at compile time: the composition writes it ([`Coordinator::compose`] /
+/// [`Coordinator::compose_label_into`], through `compose_parts`), and the tab
+/// strip's label pass reads it back to find where the SUBJECT half of a chip
+/// title ends and the state half begins ([`crate::tab_bar::state_clause_bytes`]
+/// — a narrow chip that can keep only one of the two must keep the subject).
+/// A literal in either place would let the two drift silently, and the drift
+/// would show up as chips painting `…a command` again.
+///
+/// The WINDOW titlebar composes with `" — "` instead; that flavour is not this
+/// constant, and nothing reads it apart.
+pub(crate) const TAB_LABEL_SEPARATOR: &str = " · ";
+
 /// Strip a `"<state> in <place>"` description down to `"<state>"` when `title`
 /// already names that place. Textual and cheap: the state sentence is built by
 /// [`description::idle_prompt_description`] from the same cwd the title's own
 /// rung uses, so a containment test is the exact question ("does the label say
 /// this twice?"). Anything that is not that shape is returned untouched.
 fn shed_place_already_in_title<'a>(title: &str, description: &'a str) -> &'a str {
+    let shed = shed_place(title, description);
+    // AND SHED A BARE "Ready" WHOLE. It is the state every idle tab is in, so it
+    // tells them apart from nothing while costing each one the width of
+    // " · Ready" — the width the label needed for the directory. Measured: two
+    // tabs deep under /tmp both painted `…Ready`, the tail cut having kept the
+    // one word every tab shared and dropped the one that differed.
+    //
+    // Only the bare word goes. A state that says something a title cannot
+    // ("Running Rust tests", "Command failed (exit 1)") is exactly what this
+    // suffix is for and is untouched, and an empty title keeps its "Ready"
+    // rather than falling through to `compose_parts`'s "aterm".
+    if shed == description::READY && !title.trim().is_empty() {
+        return "";
+    }
+    shed
+}
+
+/// [`shed_place_already_in_title`] without the bare-state rule: `"<state> in
+/// <place>"` down to `"<state>"` when `title` already names that place.
+fn shed_place<'a>(title: &str, description: &'a str) -> &'a str {
     let Some((state, place)) = description.split_once(" in ") else {
         return description;
     };
@@ -1160,6 +1196,9 @@ impl Coordinator {
     /// Compose the presented label as a fresh `String`. Same cache and fast path
     /// as [`Self::compose_label_into`]; per-frame paths that own a reusable slot
     /// should prefer that method to avoid the return-value allocation.
+    ///
+    /// TAB flavour callers pass [`TAB_LABEL_SEPARATOR`], the string the tab strip
+    /// also reads a composed label back APART with.
     #[must_use]
     pub(crate) fn compose(
         &self,
@@ -2280,15 +2319,18 @@ mod tests {
     fn the_label_says_where_once() {
         // A chip's title already carries the place, so the state sentence
         // sheds it — otherwise truncation keeps the redundant half and the
-        // strip paints `…in aterm` (seen on glass).
+        // strip paints `…in aterm` (seen on glass). Nothing is left over: a
+        // bare "Ready" is what EVERY idle tab would say, so it goes too.
+        assert_eq!(
+            shed_place("user@m17-tower: ~/aterm", "Ready in aterm"),
+            "Ready"
+        );
         assert_eq!(
             shed_place_already_in_title("user@m17-tower: ~/aterm", "Ready in aterm"),
-            "Ready"
+            ""
         );
-        assert_eq!(
-            shed_place_already_in_title("~/wave/nn", "Ready in nn"),
-            "Ready"
-        );
+        assert_eq!(shed_place("~/wave/nn", "Ready in nn"), "Ready");
+        assert_eq!(shed_place_already_in_title("~/wave/nn", "Ready in nn"), "");
         // A title that does NOT name the place keeps the full sentence: the
         // "where" would otherwise be lost entirely.
         assert_eq!(
@@ -2300,7 +2342,22 @@ mod tests {
             shed_place_already_in_title("~/aterm", "Typing a command"),
             "Typing a command"
         );
-        assert_eq!(shed_place_already_in_title("~/aterm", "Ready"), "Ready");
+        // A state that says something the title cannot is the whole point of
+        // the suffix, and survives.
+        assert_eq!(
+            shed_place_already_in_title("~/aterm", "Running Rust tests"),
+            "Running Rust tests"
+        );
+        assert_eq!(
+            shed_place_already_in_title("~/aterm", "Command failed (exit 1)"),
+            "Command failed (exit 1)"
+        );
+        // The bare word, reached without the sentence shape.
+        assert_eq!(shed_place_already_in_title("~/aterm", "Ready"), "");
+        // ...but a title-less surface keeps it, or `compose_parts` would have
+        // nothing left and fall back to the bare product name.
+        assert_eq!(shed_place_already_in_title("", "Ready"), "Ready");
+        assert_eq!(shed_place_already_in_title("   ", "Ready"), "Ready");
     }
 
     #[test]
@@ -2397,6 +2454,39 @@ mod tests {
             deterministic_description(&snap("", ActivityState::Prompt, None)),
             "Ready in aterm"
         );
+    }
+
+    /// THE SEAM TWO SUBSYSTEMS SHARE. This module WRITES a tab label's
+    /// separator; the tab strip READS it back, to find where the half that
+    /// names the tab ends and the half that says what it is doing begins — a
+    /// narrow chip keeps the first and sheds the second
+    /// ([`crate::tab_bar::state_clause_bytes`]). Nothing but this test checks
+    /// that the two agree, and a silent drift would put `…a command` back on
+    /// the chips the strip is there to name.
+    ///
+    /// Both composed formats, because the claim is not "the title comes first":
+    /// it is that the LAST clause is whichever half `tab_title_format` ranks
+    /// SECOND, so shedding it always keeps the half the user asked to lead
+    /// with.
+    #[test]
+    fn a_composed_tab_label_splits_back_where_the_strip_looks_for_it() {
+        for (format, leading) in [
+            (TitleFormat::TitleDescription, "claude"),
+            (TitleFormat::DescriptionTitle, "Ready in aterm"),
+        ] {
+            let composed = compose_parts("claude", "Ready in aterm", format, TAB_LABEL_SEPARATOR);
+            let shed = crate::tab_bar::state_clause_bytes(&composed);
+            assert!(
+                shed > 0,
+                "{format:?}: the strip finds no clause in {composed:?}"
+            );
+            assert_eq!(
+                &composed[..composed.len() - shed],
+                leading,
+                "{format:?}: the strip must shed exactly the half this format \
+                 ranks second, out of {composed:?}"
+            );
+        }
     }
 
     #[test]

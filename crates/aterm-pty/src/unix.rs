@@ -108,7 +108,7 @@ pub fn spawn_shell(
     // Thin compatibility wrapper: drop the child pid. Callers that need the pid
     // for a graceful, NON-BLOCKING teardown (SIGHUP the controlling-tty session
     // before closing the master — see `spawn_shell_with_pid`) use that instead.
-    spawn_shell_with_pid(
+    spawn_shell_with_pid_cell_px(
         rows,
         cols,
         cap,
@@ -123,6 +123,10 @@ pub fn spawn_shell(
         // The thin wrapper preserves the historical hardened default; the GUI's
         // real spawn path picks the limits by containment mode.
         aterm_sandbox::Limits::shell_default(),
+        // No cell metrics on this seam (its callers are tests and the protected-spawn
+        // gate, which have no font): the winsize pixel fields stay zero, which is the
+        // honest answer rather than an invented one.
+        None,
     )
     .map(|s| s.master)
 }
@@ -1371,7 +1375,51 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
     read_exec_status_now(rd).unwrap_or(ExecStatus::NoVerdict)
 }
 
-/// Like [`spawn_shell`] but also returns the child pid (see [`SpawnedShell`]).
+/// Like [`spawn_shell`] but also returns the child pid (see [`SpawnedShell`]) —
+/// with NO cell metrics, so the child's winsize pixel fields start zero.
+///
+/// The metric-free shim over [`spawn_shell_with_pid_cell_px`], which is the one
+/// fork/exec body (this adds no behavior of its own). Kept as its own name and
+/// signature because it is the seam every frontend already calls; a caller that
+/// knows the host's cell size should call the `_cell_px` form so a tool reading
+/// `ioctl(TIOCGWINSZ)` gets real pixel geometry instead of zeros.
+///
+/// # Errors
+/// See [`spawn_shell_with_pid_cell_px`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_shell_with_pid(
+    rows: u16,
+    cols: u16,
+    cap: &aterm_cap::Cap<aterm_cap::effects::Spawn>,
+    sandbox_cap: &aterm_cap::Cap<aterm_sandbox::Sandbox>,
+    env_add: &[(String, String)],
+    shell_override: Option<&str>,
+    shell_args: Option<&[String]>,
+    argv_override: Option<&[String]>,
+    exec_command: Option<&[String]>,
+    cwd: Option<&str>,
+    sandbox_wrap: Option<&str>,
+    limits: aterm_sandbox::Limits,
+) -> io::Result<SpawnedShell> {
+    spawn_shell_with_pid_cell_px(
+        rows,
+        cols,
+        cap,
+        sandbox_cap,
+        env_add,
+        shell_override,
+        shell_args,
+        argv_override,
+        exec_command,
+        cwd,
+        sandbox_wrap,
+        limits,
+        None,
+    )
+}
+
+/// Like [`spawn_shell`] but also returns the child pid (see [`SpawnedShell`]),
+/// and fills the winsize PIXEL fields from the host's cell metrics.
 /// Identical spawn/sandbox/exec behavior — `spawn_shell` is this minus the pid.
 ///
 /// SPEC: the parent-prebuild + child branch of this fork/exec seam is the real
@@ -1488,7 +1536,7 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
 // dormant` and the explicit-full lane are what notice.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_shell_with_pid(
+pub fn spawn_shell_with_pid_cell_px(
     rows: u16,
     cols: u16,
     cap: &aterm_cap::Cap<aterm_cap::effects::Spawn>,
@@ -1513,6 +1561,14 @@ pub fn spawn_shell_with_pid(
     // daily-driver User/Master modes so normal programs aren't constrained more than
     // the launching login shell.
     limits: aterm_sandbox::Limits,
+    // The host's REAL cell size in device pixels, `(width, height)`, used to fill
+    // the winsize PIXEL fields the child reads with its very first
+    // `ioctl(TIOCGWINSZ)` — see [`resize_with_cell_px`]. Passed at SPAWN rather
+    // than left to the first resize because an image tool run as the session's
+    // first command (`aterm -e chafa …`) reads the geometry before any resize
+    // exists; `None` (headless, tests, a frontend with no metrics yet) keeps the
+    // fields zero.
+    cell_px: Option<(u16, u16)>,
 ) -> io::Result<SpawnedShell> {
     aterm_cap::require(cap, aterm_cap::Tier::Trusted)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
@@ -1661,11 +1717,15 @@ pub fn spawn_shell_with_pid(
     // the carriers that were tried and rejected.
     let (status_rd, status_wr, status_carrier) = open_exec_status_channel()?;
 
+    // The child's FIRST winsize, pixel fields included: a tool that reads
+    // TIOCGWINSZ before anything resizes the window must still learn the pixel
+    // geometry (`winsize_pixels`).
+    let (ws_xpixel, ws_ypixel) = winsize_pixels(rows, cols, cell_px);
     let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+        ws_xpixel,
+        ws_ypixel,
     };
     // Explicit slave termios (kernel defaults + IUTF8 + B230400 — see
     // `build_spawn_termios`); `None` = the historical NULL path. Built here in
@@ -3226,19 +3286,65 @@ pub fn close_fd(fd: i32) {
 /// `SetPriorityClass` + power-throttling) lives in `src/windows/mod.rs`.
 pub fn set_focus_boost(_master: i32, _on: bool) {}
 
-/// Resize the PTY to `rows`×`cols` (`TIOCSWINSZ`).
+/// Resize the PTY to `rows`×`cols` (`TIOCSWINSZ`), leaving the PIXEL fields
+/// unset. Prefer [`resize_with_cell_px`] anywhere the caller knows the cell
+/// metrics — a zeroed `ws_xpixel`/`ws_ypixel` is what every image tool reads as
+/// "this terminal cannot tell me its pixel geometry".
 pub fn resize(master: i32, rows: u16, cols: u16) {
+    resize_with_cell_px(master, rows, cols, None);
+}
+
+/// Resize the PTY to `rows`×`cols` and fill the winsize PIXEL fields from
+/// `cell_px` (the host's REAL device-pixel cell size, `(width, height)`).
+///
+/// `ws_xpixel`/`ws_ypixel` are the terminal's pixel geometry, and they are the
+/// route an image tool actually takes: `chafa`, `timg`, `viu`, `img2sixel`,
+/// matplotlib's sixel backend and libsixel's own probe all call
+/// `ioctl(TIOCGWINSZ)` and size their output from these two fields, falling back
+/// to a guessed cell size (or refusing to draw) when they are zero. aterm
+/// hard-coded them to 0 at every construction site, so every one of those tools
+/// got nothing — the XTWINOPS answers added later cover the escape-sequence
+/// route only, and are off by default.
+///
+/// `None` leaves the fields zero (the honest answer when the caller has no
+/// metrics — the headless CLI before its first `SIGWINCH`, a test harness).
+pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, cell_px: Option<(u16, u16)>) {
+    let (ws_xpixel, ws_ypixel) = winsize_pixels(rows, cols, cell_px);
     let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+        ws_xpixel,
+        ws_ypixel,
     };
     // SAFETY: `master` is a valid PTY master fd; `&ws` is a valid `winsize` for
     // the `TIOCSWINSZ` ioctl.
     unsafe {
         libc::ioctl(master, libc::TIOCSWINSZ, &ws);
     }
+}
+
+/// The winsize pixel pair for a `rows`×`cols` grid of `cell_px`-sized cells:
+/// `(cols * cell_w, rows * cell_h)`, saturating at `u16::MAX` because that is
+/// the width of the kernel's fields — a window bigger than 65535 px on an axis
+/// reports the cap rather than wrapping to a small number, which is the failure
+/// mode that would have a tool render a thumbnail on a wall display.
+///
+/// A zero axis in `cell_px` is treated as "unknown" and yields 0 for BOTH fields:
+/// half a geometry is not a geometry, and a tool dividing by it would divide by
+/// zero.
+fn winsize_pixels(rows: u16, cols: u16, cell_px: Option<(u16, u16)>) -> (u16, u16) {
+    let Some((cell_w, cell_h)) = cell_px else {
+        return (0, 0);
+    };
+    if cell_w == 0 || cell_h == 0 {
+        return (0, 0);
+    }
+    let x = u32::from(cols) * u32::from(cell_w);
+    let y = u32::from(rows) * u32::from(cell_h);
+    (
+        u16::try_from(x).unwrap_or(u16::MAX),
+        u16::try_from(y).unwrap_or(u16::MAX),
+    )
 }
 
 #[cfg(test)]
@@ -4390,6 +4496,122 @@ mod tests {
         );
     }
 
+    /// The pixel arithmetic itself: `(cols * cell_w, rows * cell_h)`, with
+    /// "unknown" and the `u16` ceiling handled explicitly rather than by wrapping.
+    #[test]
+    fn winsize_pixels_multiplies_the_cell_metrics_and_saturates() {
+        // The measured 0.61.0 window: 24x80 cells of 9x17 px -> 720x408, which is
+        // exactly what `CSI 14t` answers on the same window (`ESC[4;408;720t`).
+        assert_eq!(winsize_pixels(24, 80, Some((9, 17))), (720, 408));
+        // No metrics: zero, the honest "I cannot tell you" — never a guess.
+        assert_eq!(winsize_pixels(24, 80, None), (0, 0));
+        // Half a geometry is not a geometry: a zero axis zeroes BOTH fields, so no
+        // consumer can divide by it.
+        assert_eq!(winsize_pixels(24, 80, Some((0, 17))), (0, 0));
+        assert_eq!(winsize_pixels(24, 80, Some((9, 0))), (0, 0));
+        // The kernel's fields are u16: a monster window reports the cap, never a
+        // wrapped small number (a thumbnail on a wall display).
+        assert_eq!(
+            winsize_pixels(u16::MAX, u16::MAX, Some((9, 17))),
+            (u16::MAX, u16::MAX)
+        );
+    }
+
+    /// The defect: `ws_xpixel`/`ws_ypixel` were hard-coded 0 at EVERY winsize
+    /// construction site, so every tool that sizes its output from
+    /// `ioctl(TIOCGWINSZ)` — chafa, timg, viu, img2sixel, libsixel's own probe —
+    /// got nothing out of aterm, at spawn and after every resize alike.
+    ///
+    /// Read back through the kernel (not from our own struct): a pty pair carries
+    /// ONE winsize, so `TIOCGWINSZ` on the master returns exactly the bytes the
+    /// child's `TIOCGWINSZ` on its stdin returns. The NEGATIVE CONTROL in the same
+    /// run — the identical spawn with no metrics — reproduces the old zeros, so a
+    /// pass cannot be vacuous.
+    #[test]
+    fn a_spawned_child_can_read_real_pixel_geometry_from_the_kernel() {
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+        let spawn = |cell_px: Option<(u16, u16)>| {
+            spawn_shell_with_pid_cell_px(
+                41,
+                137,
+                &spawn_cap,
+                &sandbox_cap,
+                &[],
+                None, // shell_override
+                None, // shell_args
+                None, // argv_override
+                Some(&exec),
+                None, // cwd
+                None, // sandbox_wrap
+                aterm_sandbox::Limits::inherit(),
+                cell_px,
+            )
+            .expect("the parked probe must spawn")
+        };
+        let read_ws = |master: i32| {
+            // SAFETY: `master` is a live pty master fd; `TIOCGWINSZ` fills the
+            // caller's `winsize`.
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut ws) },
+                0,
+                "TIOCGWINSZ on the master must succeed"
+            );
+            ws
+        };
+
+        // 1) AT SPAWN — before anything resizes anything.
+        let sh = spawn(Some((9, 17)));
+        let ws = read_ws(sh.master);
+        assert_eq!(
+            (ws.ws_row, ws.ws_col),
+            (41, 137),
+            "the cell grid still lands"
+        );
+        assert_eq!(
+            (ws.ws_xpixel, ws.ws_ypixel),
+            (137 * 9, 41 * 17),
+            "the child's FIRST winsize must carry the real pixel geometry"
+        );
+
+        // 2) ON RESIZE — the path the GUI drives on every window drag.
+        resize_with_cell_px(sh.master, 24, 80, Some((9, 17)));
+        let ws = read_ws(sh.master);
+        assert_eq!((ws.ws_row, ws.ws_col), (24, 80));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (720, 408));
+
+        // 3) A FONT-SIZE change at an unchanged grid still moves the pixels — the
+        // case a rows/cols-only comparison would have missed entirely.
+        resize_with_cell_px(sh.master, 24, 80, Some((18, 34)));
+        let ws = read_ws(sh.master);
+        assert_eq!((ws.ws_row, ws.ws_col), (24, 80));
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (1440, 816));
+
+        hangup(sh.pid);
+        // SAFETY: `master` is the fd this test was handed.
+        unsafe { libc::close(sh.master) };
+
+        // NEGATIVE CONTROL: no metrics ⇒ the pre-fix zeros, at spawn and on resize.
+        let bare = spawn(None);
+        let ws = read_ws(bare.master);
+        assert_eq!(
+            (ws.ws_xpixel, ws.ws_ypixel),
+            (0, 0),
+            "without metrics the fields must stay zero — the check above is not \
+             reading a kernel default"
+        );
+        resize(bare.master, 24, 80);
+        let ws = read_ws(bare.master);
+        assert_eq!((ws.ws_xpixel, ws.ws_ypixel), (0, 0));
+        hangup(bare.pid);
+        // SAFETY: `master` is the fd this test was handed.
+        unsafe { libc::close(bare.master) };
+    }
+
     /// BOTH ends of the pair this seam hands the spawn are close-on-exec from the
     /// moment they exist, and the pair is a REAL, correctly-configured pty — not
     /// a pair of flags on nothing. The precondition is asserted alongside the
@@ -5144,7 +5366,7 @@ mod tests {
 
         let before = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let spawned = spawn_shell_with_pid(
+        let spawned = spawn_shell_with_pid_cell_px(
             24,
             80,
             &spawn_cap,
@@ -5157,6 +5379,7 @@ mod tests {
             None,
             None,
             aterm_sandbox::Limits::inherit(),
+            None, // cell_px
         )
         .expect("a normal shell must still spawn");
         let elapsed = started.elapsed();
@@ -5537,7 +5760,7 @@ mod tests {
                         \"$s\" \"$c\" \"$(stty size)\" \"$(tty)\"; \
                       exec sleep 30";
         let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
-        let sh = spawn_shell_with_pid(
+        let sh = spawn_shell_with_pid_cell_px(
             41,
             137,
             &spawn_cap,
@@ -5550,6 +5773,7 @@ mod tests {
             None, // cwd
             None, // sandbox_wrap
             aterm_sandbox::Limits::inherit(),
+            None, // cell_px
         )
         .expect("the probe command must spawn");
 
@@ -5658,7 +5882,7 @@ mod tests {
             "-c".into(),
             "printf 'UP\\n'; exec sleep 30".into(),
         ];
-        let sh = spawn_shell_with_pid(
+        let sh = spawn_shell_with_pid_cell_px(
             24,
             80,
             &spawn_cap,
@@ -5671,6 +5895,7 @@ mod tests {
             None,
             None,
             aterm_sandbox::Limits::inherit(),
+            None, // cell_px
         )
         .expect("the parked session must spawn");
 

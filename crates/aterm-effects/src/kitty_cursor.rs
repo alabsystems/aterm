@@ -778,10 +778,13 @@ impl CursorCat {
     }
 
     /// Retire only renderer-coordinate continuity. A LOCK A/B cursor/style/
-    /// scroll divergence may not carry an in-flight edge fold into the next
-    /// coordinate space, but a collection hello or singing appearance remains
-    /// a presentation promise and must continue settled at the live caret.
+    /// scroll divergence may not carry an in-flight edge fold or a palette
+    /// sampled under the old footprint into the next coordinate space, but a
+    /// collection hello or singing appearance remains a presentation promise:
+    /// its identity and lifecycle continue settled at the live caret, and the
+    /// host samples a fresh two-byte palette key for that new footprint.
     pub fn rebase_placement(&mut self) {
+        self.colors = None;
         self.fold = None;
         self.facing_left = false;
     }
@@ -3250,6 +3253,77 @@ mod tests {
             cat.colors_for_episode(light),
             light,
             "a new hello samples a new footprint palette"
+        );
+    }
+
+    /// A placement rebase changes which terminal cells sit under the cursor
+    /// cat, so its tiny contrast key must be sampled again. That cache is not
+    /// the presentation promise: collection and song keep the same identity
+    /// and lifecycle across the retirement/rebase sequence used by the host.
+    #[test]
+    fn coordinate_rebase_invalidates_only_the_promised_cat_palette() {
+        let t = Instant::now();
+        let seeded = CatColorKey {
+            accent: 2,
+            background: 7,
+        };
+
+        let mut hello = CursorCat::default();
+        hello.on_collect(t, KittyLook::default());
+        let hello_look = hello.look;
+        let hello_until = hello.discovery_until;
+        assert_eq!(hello.colors_for_episode(seeded), seeded);
+        hello.retire_unowned_cursor_motion();
+        assert_eq!(
+            hello.episode_colors(),
+            Some(seeded),
+            "the promised hello survives ordinary-flight retirement intact"
+        );
+        hello.rebase_placement();
+        assert_eq!(
+            hello.episode_colors(),
+            None,
+            "the old footprint key is stale"
+        );
+        assert!(hello.is_active() && hello.collection_hello);
+        assert_eq!(
+            hello.look, hello_look,
+            "the collected identity is unchanged"
+        );
+        assert_eq!(
+            hello.discovery_until, hello_until,
+            "the hello's promised lifetime is unchanged"
+        );
+
+        let mut song = CursorCat::default();
+        arm_singing_after_travel(&mut song, t + Duration::from_secs(1));
+        let song_look = song.look;
+        assert_eq!(song.colors_for_episode(seeded), seeded);
+        song.retire_unowned_cursor_motion();
+        assert_eq!(
+            song.episode_colors(),
+            Some(seeded),
+            "the promised song survives ordinary-flight retirement intact"
+        );
+        song.rebase_placement();
+        assert_eq!(
+            song.episode_colors(),
+            None,
+            "the song also resamples its footprint"
+        );
+        assert!(song.is_active(), "the promised song lifecycle remains live");
+        assert_eq!(song.sing, 1.0, "the rebase cannot cancel the song");
+        assert_eq!(song.look, song_look, "the singing identity is unchanged");
+        assert_eq!(
+            song.colors_for_episode(CatColorKey {
+                accent: 9,
+                background: 1,
+            }),
+            CatColorKey {
+                accent: 9,
+                background: 1,
+            },
+            "the first frame in the new coordinate space seeds a fresh key"
         );
     }
 

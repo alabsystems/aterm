@@ -85,13 +85,39 @@
 //!   `OutputAtLive`, `OutputWhileReading`, `OutputDamagesTheSelectedRows` (from BOTH
 //!   ownerships), `OutputInvalidatesTheCoordinateSpace`.
 //!
-//! WHAT AN ANCHOR PROVES, AND WHAT IT DOES NOT. The `#[refines]` attribute emits an
-//! inventory record naming a (machine, action) pair. The gate checks that every action
-//! of an active machine appears in that set — it does NOT check that the attribute sits
-//! on a function which performs the action. `xref.rs` says so itself: obligation 2, that
-//! `project` resolves to a live symbol, "is NOT enforced here". So the anchors here are
-//! documentation with a coverage gate attached, and THIS module is the part that can
-//! fail.
+//! WHAT AN ANCHOR PROVES, AND WHAT IT DOES NOT — the CURRENT state, which is not what
+//! this paragraph used to say. It used to say the gate "does NOT check that the
+//! attribute sits on a function which performs the action", so "the anchors here are
+//! documentation with a coverage gate attached". That was true and is no longer.
+//!
+//! [`step`] now runs each gesture inside a ONE-STEP-WIDE execution-evidence window
+//! (`aterm_spec::xref::StepEvidence`) — the thread-local anchor-entry record is
+//! cleared, the shipping seam is called, and what was entered is snapshotted before
+//! `recorded()` or the post-state projection touch anything. `spec_xref_closure`
+//! (crates/aterm-gui/src/lib.rs, the `PressCustody` block) then requires each action's
+//! annotated function to have been ENTERED BY EVERY WINDOW THAT DRIVES IT, and — the
+//! contrapositive, which is what discriminates inside a `Terminal::process` batch — to
+//! be entered by NO window driving an action it is not anchored for. An anchor parked
+//! on a stub fails the first; an anchor moved onto another function the same batch
+//! enters fails the second, because that function also runs when the batch's siblings
+//! fire.
+//!
+//! THE SURVIVING LIMIT, in numbers rather than adjectives. The evidence is
+//! FUNCTION-ENTRY, not branch-entry. Ten of the eleven actions sit on a function
+//! carrying more than one of them — `Terminal::note_output_custody` carries four,
+//! `app_input::note_press_custody` four, `app_mouse::note_selection_custody` two — so
+//! one entry marks every anchor on that function and NOTHING here separates those
+//! siblings: permuting their labels changes no observable. `note_output_custody` is
+//! called on EVERY non-screen-switching `Terminal::process` batch, so its entry is not
+//! conditional on which output action the batch turned out to be — and that fact is now
+//! REPORTED, as the set of actions whose windows entered it, rather than through a
+//! "entered in every window" intersection that no ledger mixing gesture, batch and
+//! eviction steps could ever satisfy. The gate derives those counts from the anchors and
+//! the ledger and prints them instead of claiming more; obligation 2 proper (`project` and
+//! `rust_method` resolving to live symbols) is still unresolved strings, still Phase
+//! 3's `trust-ir` job. THIS module remains the part that carries the weight — and it is
+//! the discriminator the anchors cannot be: the ENGINE's own custody record names each
+//! step's action, so a seam that mis-classifies fails at claim 2 above.
 //!
 //! THE ABSTRACTION FUNCTION — three real reads, one derivation, one recorded tag:
 //!
@@ -177,6 +203,7 @@ use std::sync::{Arc, Mutex};
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CustodyTransition, Terminal};
 use aterm_spec::derive::press_custody_model;
+use aterm_spec::xref::StepEvidence;
 
 use crate::input::{InputEvent, ScrollIntent, Source};
 use crate::{App, WindowId, term_lock};
@@ -340,6 +367,14 @@ fn recorded(
 /// runs — the pre-state read, the gesture and the post-state read are three separate
 /// acquisitions on purpose, because the SEAMS are what must read their own before and
 /// after inside one guard, and they do.
+///
+/// EXECUTION EVIDENCE. `gesture` — and only `gesture` — runs inside a one-step-wide
+/// `StepEvidence` window, so what the gate later audits is what THIS step called and
+/// not what the run as a whole touched. The pre-state read, the record read-back and
+/// the post-state projection are all outside it deliberately: they call
+/// `Terminal::grid`, `text_selection` and `take_custody_transition`, and a window that
+/// contained those would let an anchor parked on a HARNESS read path discharge a
+/// shipping obligation.
 fn step(
     term: &Arc<Mutex<Terminal>>,
     c: &mut Press,
@@ -347,10 +382,11 @@ fn step(
     what: &str,
     gesture: impl FnOnce(),
     validated: &mut usize,
+    ev: &mut StepEvidence,
 ) -> [i64; 7] {
     let prev = c.state(&term_lock(term));
     arm(term);
-    gesture();
+    ev.step(expect.action(), gesture);
     let got = recorded(term, expect, what);
     c.fired(prev, got);
     let next = c.state(&term_lock(term));
@@ -425,7 +461,7 @@ fn arm_selection(term: &mut Terminal, first: i32, last: i32) {
 /// selection-damage lattice, at the LIVE screen's row 0 — the prologue has forced the
 /// offset to 0 for the duration of the batch, so VT row 1 is the live top, which is
 /// where the fixture's selection starts.
-fn damaged_rows_case(validated: &mut usize) {
+fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
     // EL over the live top (the selection's own rows), then a line feed from the
     // bottom row so a row really enters scrollback.
     const DAMAGE: &[u8] = b"\x1b[1;1H\x1b[Knew text\x1b[6;1H\r\n";
@@ -448,6 +484,7 @@ fn damaged_rows_case(validated: &mut usize) {
             term_lock(&term).process(DAMAGE);
         },
         validated,
+        ev,
     );
     assert_eq!(
         [next[0], next[1], next[2]],
@@ -477,6 +514,7 @@ fn damaged_rows_case(validated: &mut usize) {
             term_lock(&term).process(DAMAGE);
         },
         validated,
+        ev,
     );
     assert_eq!(
         [next[0], next[1], next[2]],
@@ -488,7 +526,7 @@ fn damaged_rows_case(validated: &mut usize) {
 
 /// The GUI half: one real `App`, one real terminal, eleven validated transitions
 /// driven through the genuine scroll, gesture and press seams.
-fn gui_gesture_chain(validated: &mut usize) {
+fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     // Keep the REAL system clipboard untouched: `finish_selection`'s copy-on-select
@@ -541,6 +579,7 @@ fn gui_gesture_chain(validated: &mut usize) {
             );
         },
         validated,
+        ev,
     );
 
     // --- UserSelect: the press that starts a drag brings a selection into existence.
@@ -557,6 +596,7 @@ fn gui_gesture_chain(validated: &mut usize) {
         "left press starting a drag",
         || drag_from(&mut app, (1, 0)),
         validated,
+        ev,
     );
 
     // --- UserSelect again: the RELEASE that completes the drag. Idempotent in the
@@ -572,6 +612,7 @@ fn gui_gesture_chain(validated: &mut usize) {
             let _ = app.finish_selection(wid, true);
         },
         validated,
+        ev,
     );
 
     // --- ALL FOUR PRESS CLASSES, each as a REAL `App::input` delivery.
@@ -651,6 +692,7 @@ fn gui_gesture_chain(validated: &mut usize) {
                 );
             },
             validated,
+            ev,
         );
         if expect == CustodyTransition::TypingPress {
             assert_eq!(
@@ -682,6 +724,7 @@ fn gui_gesture_chain(validated: &mut usize) {
         "left press with no drag",
         || drag_from(&mut app, (2, 0)),
         validated,
+        ev,
     );
     let after_clear = step(
         &term,
@@ -692,6 +735,7 @@ fn gui_gesture_chain(validated: &mut usize) {
             let _ = app.finish_selection(wid, true);
         },
         validated,
+        ev,
     );
     assert_eq!(after_clear[2], 0, "a click without a drag deselects");
 }
@@ -717,7 +761,7 @@ fn gui_gesture_chain(validated: &mut usize) {
 /// seam was "covered by its seam's assertion rather than by a step" — there was no
 /// such assertion, and four recorder call sites in `app_search` were exercised by
 /// nothing at all.
-fn silent_select_seams(validated: &mut usize) {
+fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.copy_on_select = false;
@@ -747,6 +791,7 @@ fn silent_select_seams(validated: &mut usize) {
         "Select All from the menu, with no mouse-down before it",
         || app.select_all(),
         validated,
+        ev,
     );
     assert_eq!(
         after_all[2], 1,
@@ -763,6 +808,7 @@ fn silent_select_seams(validated: &mut usize) {
         "the double-click PRESS that word-selects, before any release",
         || app.select_word_click(wid, 0, 1),
         validated,
+        ev,
     );
     assert_eq!(
         after_word[2], 1,
@@ -798,7 +844,7 @@ fn silent_select_seams(validated: &mut usize) {
 ///
 /// One fixture each, because both start from live and the abstract offset is bounded
 /// at `MaxOffset = 2` — a chain of notches would saturate rather than step.
-fn wheel_seams(validated: &mut usize) {
+fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
     for (focused, what) in [
         (
             false,
@@ -864,6 +910,7 @@ fn wheel_seams(validated: &mut usize) {
                 app.settle_scroll_motion_at_target(wid, std::time::Instant::now());
             },
             validated,
+            ev,
         );
         assert_eq!(
             [next[0], next[1]],
@@ -875,7 +922,7 @@ fn wheel_seams(validated: &mut usize) {
 
 /// The OUTPUT half: real `Terminal::process` batches, each on its own fixture so the
 /// bounded offset never has to saturate.
-fn output_batches(validated: &mut usize) {
+fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
     // ---- OutputAtLive, WITH a live selection the batch does not touch. ----
     //
     // The action is an identity transition on the observable variables — at live the
@@ -909,6 +956,7 @@ fn output_batches(validated: &mut usize) {
                 term_lock(&term).process(b"tail\r\n");
             },
             validated,
+            ev,
         );
         assert!(
             term_lock(&term).text_selection().has_selection(),
@@ -947,6 +995,7 @@ fn output_batches(validated: &mut usize) {
                 term_lock(&term).process(b"more\r\n");
             },
             validated,
+            ev,
         );
         assert_eq!(
             [next[0], next[1], next[2]],
@@ -974,6 +1023,7 @@ fn output_batches(validated: &mut usize) {
                 term_lock(&term).process(b"\x1b[3J");
             },
             validated,
+            ev,
         );
         assert_eq!(
             [next[0], next[1], next[2]],
@@ -1004,6 +1054,7 @@ fn output_batches(validated: &mut usize) {
                 term_lock(&term).process(b"\x1bc");
             },
             validated,
+            ev,
         );
         assert_eq!(
             [next[0], next[1], next[2]],
@@ -1015,24 +1066,28 @@ fn output_batches(validated: &mut usize) {
 
 #[test]
 fn real_press_custody_conforms() {
-    run_conformance();
+    let _ = run_conformance();
 }
 
 /// The `PressCustody` Tier-1 body, factored out so the `spec_xref_gate` can RUN it:
 /// the gate's "PressCustody is actively bound" claim then means the real engine and
 /// GUI seams were driven and checked, not merely that anchors exist.
-pub(crate) fn run_conformance() {
+pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
+    // EXECUTION EVIDENCE. `step` drives each seam inside a one-step-wide window, so
+    // the gate can require this action's anchored function to have been entered by
+    // THIS action's step rather than somewhere in a run that drives eleven of them.
+    let mut ev = StepEvidence::new("PressCustody");
 
-    gui_gesture_chain(&mut validated);
-    wheel_seams(&mut validated);
-    silent_select_seams(&mut validated);
+    gui_gesture_chain(&mut validated, &mut ev);
+    wheel_seams(&mut validated, &mut ev);
+    silent_select_seams(&mut validated, &mut ev);
     // Everything counted so far came through the App's real input seams; the rest is
     // the engine's own output path. Derived rather than hardcoded, so a step added to
     // either half cannot make the summary line lie.
     let gui = validated;
-    output_batches(&mut validated);
-    damaged_rows_case(&mut validated);
+    output_batches(&mut validated, &mut ev);
+    damaged_rows_case(&mut validated, &mut ev);
 
     // ---- NEGATIVE CONTROLS (non-vacuity). ----
     // Each is a regression the model must REFUSE. If ANY were admitted, a real
@@ -1179,4 +1234,6 @@ pub(crate) fn run_conformance() {
         validated - gui,
         rejected.len()
     );
+
+    ev
 }

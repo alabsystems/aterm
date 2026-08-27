@@ -3169,6 +3169,11 @@ fn settings_field_is_visible(key: &str, modified_only: bool, global_search: bool
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdvancedEffectPath {
     RendererPalette,
+    /// The SPLIT COMPOSITOR — the pass that builds one window frame out of
+    /// several panes' snapshots and the divider gaps between them. Distinct from
+    /// `RendererPalette`: nothing here reaches a renderer knob, the value is read
+    /// while composing each frame's cells.
+    Compositor,
     RendererTypography,
     CursorAndMotion,
     WindowRuntime,
@@ -3216,6 +3221,10 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_SELECTION_INACTIVE
         | prefs::EDIT_BOLD_IS_BRIGHT
         | prefs::EDIT_FAINT_OPACITY => Some(Effect::RendererPalette),
+        // Read by `App::redraw_compose`, its capture twin and the mixed
+        // native/terminal compositor while they seed the divider grid — every
+        // composed frame, no renderer knob involved.
+        prefs::EDIT_SPLIT_FOCUS_MARK => Some(Effect::Compositor),
         prefs::EDIT_BACKGROUND_OPACITY => {
             cfg!(target_os = "macos").then_some(Effect::RendererPalette)
         }
@@ -3790,6 +3799,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "cursor_break_ligatures" => config.cursor_break_ligatures,
         "merged_ligatures" => config.merged_ligatures,
         "selection_inactive" => config.selection_inactive,
+        "split_focus_mark" => config.split_focus_mark,
         "bold_is_bright" => config.bold_is_bright,
         "font_thicken" => config.font_thicken,
         "cursor_blink" => config.cursor_blink,
@@ -3957,6 +3967,21 @@ fn setting_choice_label(key: &str, value: &str) -> String {
                 "Follow the trail".to_string()
             };
         }
+    }
+    // The trail picker's UNDERLINE alternate is the one spelling in the family
+    // whose sentence-cased form does not fit the control: "Rainbow kitty
+    // underline" measures 133.6 pt inside a 132.0 pt button at 1.0× text scale
+    // and paints clipped ("Rainbow kitty underl…"). It reads as the shorter
+    // spelling the engine already accepts for exactly this style — honest about
+    // what it selects (the thin under-baseline strip rather than the default
+    // full-height body) and still a valid `cursor_trail_style` value, so a user
+    // who copies the button into `aterm.toml` lands back on this same option.
+    // The config spelling and the picker rows are untouched; this is the
+    // button's paint label, like `EDIT_MOTION`'s above.
+    if key == prefs::EDIT_CURSOR_TRAIL_STYLE
+        && aterm_effects::cursor_glow::GlowStyle::style_names_underline_ribbon(value)
+    {
+        return "Rainbow underline".to_string();
     }
     choice_label(value)
 }
@@ -4862,6 +4887,7 @@ fn renderer_preview_spec_for_key_with_font(
         blink: field_bool(state, prefs::EDIT_CURSOR_BLINK, true),
         trail_enabled: !serious_preview_suppression && preview_cursor_trail_enabled(state),
         trail_style: PreviewTrailStyle::from_resolution(&trail_style_value, resolved_trail),
+        trail_style_raw: Arc::from(trail_style_value),
         trail_pack: resolved_trail.pack.map(Arc::new),
         color: field_color(state, prefs::EDIT_CURSOR_TRAIL_COLOR),
         accent: field_color(state, prefs::EDIT_CURSOR_TRAIL_ACCENT),
@@ -7951,6 +7977,44 @@ fn top_compact_choice_text_width(state: &SettingsViewState, viewport: LogicalRec
     (control_width - 48.0).max(0.0)
 }
 
+/// The authored width of a Top choice button on a REGULAR-width host, where the
+/// row paints its value without eliding it.
+///
+/// One flat measure cannot serve all three Top pickers. `cursor_trail_style`'s
+/// option spellings ARE the `aterm.toml` vocabulary — [`prefs::CURSOR_TRAIL_STYLES`]
+/// is at once the picker domain, the save-time validation domain and the
+/// introspection domain — so the longest of them cannot be trimmed to suit a
+/// control. At 1× "Rainbow kitty underline" needs 142.4pt of text where a flat
+/// 180pt button authors only 132pt, and the painter ellipsized the very value the
+/// row exists to state (2026-08 settings audit, 1200×810 Home). Measuring each
+/// picker's own domain hands every control the slot its widest option occupies;
+/// the historical 180pt stays the floor, so the shorter theme and appearance
+/// pickers keep the shape they already had at every Dynamic Type step.
+///
+/// Only the BUILT-IN domain is measured. A user theme name or a Trail Pack id is
+/// unbounded, and letting one of those size this control would push the row's own
+/// label out of a half-grid card — a worse outcome than the ellipsis such a name
+/// already receives.
+fn top_regular_choice_control_width(field: &EditField) -> f32 {
+    let widest = choices_for_field(field, &[], &crate::app_config::ThemeCatalog::default())
+        .unwrap_or_default()
+        .iter()
+        .map(|option| {
+            crate::native_ui::native_button_label_width(&setting_choice_label(field.key, option))
+        })
+        .fold(0.0_f32, f32::max);
+    // The same 10pt leading plus 38pt trailing-chevron reserve
+    // `top_compact_choice_text_width` subtracts, added back — and then a real
+    // margin past it, the way `choice_navigation_button_width` keeps one. The
+    // painter derives its text box from the control's painted EDGES
+    // (`right - 38` less `x + 10`), so a width authored to EXACTLY the measured
+    // label lands a hair under it once the row's origin has run through that
+    // subtraction, and the label loses its last grapheme to an ellipsis: at
+    // 1200×810 the exact fit audited required=142.4 against available=142.4 and
+    // still painted "Rainbow kitty underli…".
+    (widest + 50.0).max(180.0 * settings_text_scale())
+}
+
 fn top_setting_row(
     state: &SettingsViewState,
     key: &str,
@@ -8028,7 +8092,7 @@ fn top_setting_row(
                     top_compact_choice_text_width(state, viewport),
                 ));
             } else if width != SettingsWidth::Compact {
-                control.layout.width = Length::Fixed(180.0 * settings_text_scale());
+                control.layout.width = Length::Fixed(top_regular_choice_control_width(field));
             }
         }
     }
@@ -17654,6 +17718,44 @@ mod tests {
             Some("phaser"),
             "moving picker focus previews without persisting"
         );
+    }
+
+    #[test]
+    fn renderer_preview_carries_rainbow_variant_identity_from_config() {
+        use crate::settings_preview::PreviewTrailCompanion;
+        use aterm_effects::kitty_pet::PetSpecies;
+
+        let motion = crate::native_app::ViewMotionCx::default();
+        let theme = aterm_render::Theme::default();
+        for (raw, expected) in [
+            (
+                "rainbow kitty underline",
+                PreviewTrailCompanion::FlyingKitty,
+            ),
+            ("rainbow kitty tall", PreviewTrailCompanion::FlyingKitty),
+            (
+                "rainbow kitty pet",
+                PreviewTrailCompanion::Pet(PetSpecies::Cat),
+            ),
+            (
+                "rainbow dog pet",
+                PreviewTrailCompanion::Pet(PetSpecies::Dog),
+            ),
+            ("rainbow kitty flying", PreviewTrailCompanion::FlyingKitty),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "cursor_trail = true\ncursor_trail_style = {raw:?}\n"
+            ))
+            .unwrap();
+            let mut state = SettingsViewState::new(&config);
+            state.navigate(SettingsRoute::CursorMotion);
+            let preview = renderer_preview_spec(&state, 900, motion, 13.0, theme)
+                .unwrap_or_else(|| panic!("preview for {raw}"));
+
+            assert_eq!(preview.cursor.trail_style, PreviewTrailStyle::RainbowKitty);
+            assert_eq!(preview.cursor.effective_trail_style_raw(), raw);
+            assert_eq!(preview.cursor.trail_companion(), expected, "{raw}");
+        }
     }
 
     #[test]
@@ -30604,6 +30706,94 @@ enabled = true
         assert!(picker.options.iter().any(|o| o.label == "Glass bell"));
     }
 
+    /// THE UNDERLINE ROW FITS ITS OWN BUTTON. `rainbow kitty underline` is the
+    /// longest spelling the trail list has ever carried (23 characters, against
+    /// the previous longest `rainbow kitty pet` at 17), and sentence-cased it
+    /// measured 133.6 pt inside the 132.0 pt Top control at 1.0× text scale —
+    /// the renderer clipped it to `Rainbow kitty underl…` and the Top paint
+    /// audit went red
+    /// (`top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow`).
+    ///
+    /// The fix is a PAINT LABEL, like `EDIT_MOTION`'s, not a narrower control
+    /// and not a renamed config value: the button reads the family's shorter
+    /// spelling, which stays honest (it names the thin under-baseline strip
+    /// rather than the default full-height body) and stays a legal
+    /// `cursor_trail_style` — pinned below by canonicalising the label itself.
+    /// The committed value, the semantics and the open picker's rows keep the
+    /// complete spelling.
+    #[test]
+    fn cursor_trail_underline_choice_label_fits_the_control() {
+        // Every spelling the ENGINE routes to the strip gets the one label —
+        // the predicate is asked, not a second copy of the list.
+        for spelling in [
+            "rainbow kitty underline",
+            "rainbow underline",
+            "underline rainbow",
+            "nyan underline",
+            "  Rainbow Kitty Underline  ",
+        ] {
+            assert_eq!(
+                setting_choice_label(prefs::EDIT_CURSOR_TRAIL_STYLE, spelling),
+                "Rainbow underline",
+                "{spelling:?} is an underline spelling and must read as the short label"
+            );
+        }
+        // HONEST: the label is itself a spelling of the style it names, so it
+        // resolves back to the value the control is holding.
+        assert_eq!(
+            prefs::cursor_trail_style_canonical("rainbow underline"),
+            Some("rainbow kitty underline")
+        );
+        // Every other trail entry keeps its plain sentence case…
+        for (value, label) in [
+            ("rainbow kitty", "Rainbow kitty"),
+            ("rainbow kitty pet", "Rainbow kitty pet"),
+            ("rainbow kitty flying", "Rainbow kitty flying"),
+            ("rainbow kitty tall", "Rainbow kitty tall"),
+            ("off", "Off"),
+        ] {
+            assert_eq!(
+                setting_choice_label(prefs::EDIT_CURSOR_TRAIL_STYLE, value),
+                label
+            );
+        }
+        // …and the shortening is scoped to this key.
+        assert_eq!(
+            setting_choice_label(prefs::EDIT_WINDOW_THEME, "rainbow kitty underline"),
+            "Rainbow kitty underline"
+        );
+        // The open list — which has the width for it — still names the config
+        // spelling, so the row a screen reader announces is the value written.
+        let field = prefs::editable_fields(&crate::app_config::Config::default())
+            .into_iter()
+            .find(|f| f.key == prefs::EDIT_CURSOR_TRAIL_STYLE)
+            .expect("the cursor-trail row");
+        let choices = choices_for_field(&field, &[], &crate::app_config::ThemeCatalog::default())
+            .expect("static options");
+        assert!(choices.iter().any(|c| c == "rainbow kitty underline"));
+        let picker = ChoicePicker::new(
+            prefs::EDIT_CURSOR_TRAIL_STYLE,
+            choices,
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            false,
+            false,
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            &crate::app_config::ThemeCatalog::default(),
+        );
+        assert!(
+            picker
+                .options
+                .iter()
+                .any(|option| option.label == "Rainbow kitty underline"),
+            "picker rows: {:?}",
+            picker
+                .options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// EVERY SOUND-MENU KEY IS READ AT ITS CONSUMER — the pin that stops this
     /// panel from shipping a switch that does nothing.
     ///
@@ -30967,11 +31157,11 @@ enabled = true
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                54
+                55
             } else if cfg!(windows) {
-                51
+                52
             } else {
-                49
+                50
             },
             // +1 on every platform (2026-08-21): allow_osc52_query became an
             // ordinary Advanced switch when the GUI's clipboard callback
@@ -30982,6 +31172,11 @@ enabled = true
             // banner (`paste_banner`) — the switch now actuates a real
             // confirmation on every platform, so it joins the audited surface
             // instead of the platform-unavailable shelf.
+            // +1 on every platform (2026-08-27): `split_focus_mark`, the mark
+            // that says which pane of a split takes keystrokes. Its consumer is
+            // the split COMPOSITOR, which reads it while seeding the divider
+            // grid on every composed frame, so it is live everywhere a split is
+            // — not an expert knob for Manual.
             "the audited Advanced surface changed; new expert keys belong in Manual"
         );
         let ordinary_groups = fields

@@ -59,7 +59,10 @@
 //!   `blinking_underline`, `steady_underline`, `blinking_bar`, `steady_bar`,
 //!   `hidden`, `hollow_block`).
 //! * `cell <r> <c>`    — print `OK <codepoint> <fg> <bg>`.
-//! * `search <pat>`    — print one `"<row> <col> <len>"` line per match.
+//! * `search <pat>`    — print one `"<row> <col> <len>"` line per match. A hit
+//!   that straddles a SOFT WRAP is one match, reported at the row and column it
+//!   starts on, with `col + len` running past the grid width — the overflow
+//!   continues at column 0 of the following (wrapped) row.
 //! * `send <text>`     — write `<text>` to the PTY (trailing literal `\n` ⇒ CR).
 //! * `key <name>`      — send a named key (`enter`, `tab`, `up`, …) to the PTY.
 //! * `image [path]`    — render aterm's own client frame to a PNG, including
@@ -305,6 +308,24 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     instance instead of the whole fleet. Use that to keep an automated
     caller's own instance isolated from the user's real terminals. A
     scoped listing that finds nothing reports that distinctly (exit 1).
+
+    mux           whether a MULTIPLEXER (screen/tmux) sits between this shell
+                  and its aterm session, and what that costs:
+                  mux=<kind|none> detected_by= outer_sid= marks= self_target=
+                  detected_by is shell-integration (the integration marked the
+                  pane itself), session-base ($ATERM_MUX_BASE — the multiplexer
+                  environment the SESSION shell recorded, compared against this
+                  one) or environment ($TMUX/$STY corroborated by TERM).
+                  aterm hosts ONE session for a whole multiplexer, so inside a
+                  pane a flagless / @self call would drive the terminal RUNNING
+                  screen or tmux — those calls are REFUSED here, naming the sid
+                  and the explicit form to use. Verbs that address no session
+                  (version/sessions/who/whoami/grant/flows/dial-*/help) are NOT
+                  refused: they have no target to redirect. OSC 133 marks do not
+                  cross the boundary either, so blocks/exit codes/cwd are ABSENT
+                  (not empty) for the duration — said once per multiplexer on
+                  the first call from inside one (ATERM_MUX_NOTICE=0 silences
+                  that sentence; ATERM_MUX=0 disables the whole check).
 ";
 
 /// The verbs a completion script offers as the FIRST argument: every protocol
@@ -320,9 +341,10 @@ fn completion_verb_list() -> String {
         s.push_str(spec.name);
         s.push(' ');
     }
-    // The client-only discovery verbs, answered by `run_discovery` (never framed
-    // on the socket), so the protocol table above does not carry them.
-    s.push_str("ls instances");
+    // The client-only verbs, answered here and never framed on the socket
+    // (`run_discovery`, `run_mux_report`), so the protocol table above does not
+    // carry them.
+    s.push_str("ls instances mux");
     s
 }
 
@@ -889,6 +911,552 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE MULTIPLEXER BOUNDARY (screen / tmux)
+//
+// aterm hosts ONE session per PTY. Run `screen` or `tmux` in that PTY and the
+// multiplexer owns it: every pane it draws lives inside the SAME aterm session,
+// and aterm has no name for a pane. But `$ATERM_PARENT_SESSION_ID` is an
+// ordinary exported variable, so it rides into every pane shell unchanged — and
+// the flagless self-location above then resolves it to the session HOSTING the
+// multiplexer. A `aterm ctl send …` typed in a pane therefore drives the outer
+// terminal, and for an agent driving ITSELF that is silent mis-targeting: the
+// keystrokes land, the reply says OK, and the wrong session moved.
+//
+// The rule this seam implements: inside a multiplexer, a call that names its
+// target only IMPLICITLY (flagless, `@.`, or the `@self` that literally claims
+// "this session") is REFUSED with the outer sid and the explicit form to use.
+// Everything that names a target — `@<sid>`, `--pid`, `--sock`, an explicit
+// `$ATERM_CONTROL_SOCK` — is unchanged, because none of those is silent.
+// ---------------------------------------------------------------------------
+
+/// Environment marker the shell integration exports when the shell it loaded
+/// into is a MULTIPLEXER CHILD of an aterm session shell — `tmux` or `screen`.
+///
+/// Set from INSIDE the pane, so it exists only where the integration is really
+/// sourced there: a hand-installed `source …` line in the user's rc, or fish
+/// (whose vendor `conf.d` rides `$XDG_DATA_DIRS` into every pane). Under aterm's
+/// own managed injection a bash or zsh pane shell never sources the script at
+/// all — `--rcfile` and `ZDOTDIR` are one-shot argv/env mechanisms that only the
+/// shell ATERM ITSELF starts receives — so this marker is usually ABSENT in a
+/// real pane and [`MUX_BASE_ENV`] is what carries the verdict there. Measured on
+/// this host in a real GNU screen 4.09.01 window: `$STY`, the multiplexer
+/// `$TERM` and the inherited loader guard were all set and `$ATERM_MUX` was
+/// still empty.
+///
+/// Its disable spellings (`0`/`off`/`no`/`none`/`false`) are the escape hatch:
+/// a stale `$TMUX`/`$STY` inherited by a nested shell can otherwise make the
+/// heuristics refuse a call that was never in a pane at all.
+const MUX_ENV: &str = "ATERM_MUX";
+
+/// The multiplexer environment the aterm SESSION shell itself was started under,
+/// recorded by the shell integration as `"<$TMUX>|<$STY>"`.
+///
+/// This is the one detection input that comes from a place which ACTUALLY RUNS
+/// for every session aterm starts — the tail of the integration script, past the
+/// loader guard — and it reaches a pane the only way anything can: ordinary
+/// environment inheritance. A pane's own `$TMUX`/`$STY` are the multiplexer's
+/// and no longer match the recorded base, which is the crossing; an aterm window
+/// merely LAUNCHED from a pane re-runs the integration and re-stamps the base as
+/// its own, so it matches and is not refused. That is the same question the
+/// loader guard was invented to answer, asked where the answer is available.
+///
+/// It also closes the hole `TERM` cannot: a tmux configured with
+/// `default-terminal "xterm-256color"` looks exactly like an aterm window to the
+/// `TERM` heuristic, and looks like a pane to this.
+const MUX_BASE_ENV: &str = "ATERM_MUX_BASE";
+
+/// The aterm session HOSTING the detected multiplexer — a copy of
+/// `$ATERM_PARENT_SESSION_ID` taken by the shell integration at the boundary and
+/// exported beside [`MUX_ENV`]. It names the terminal a flagless call WOULD have
+/// driven, which is exactly what the refusal has to hand back to the caller.
+/// Absent whenever [`MUX_ENV`] is (see there); `$ATERM_PARENT_SESSION_ID` itself
+/// is the fallback, and it rides into a pane unchanged.
+const MUX_OUTER_SID_ENV: &str = "ATERM_MUX_OUTER_SESSION_ID";
+
+/// tmux's per-client marker (`<socket>,<pid>,<session>`), set in every pane.
+const TMUX_ENV: &str = "TMUX";
+
+/// GNU screen's per-session marker (`<pid>.<tty>.<host>`), set in every window.
+const SCREEN_ENV: &str = "STY";
+
+/// The terminal type — the corroborating witness `$TMUX`/`$STY` need.
+///
+/// The INNERMOST layer to write `TERM` wins, and both multiplexers always
+/// rewrite it for their pane children (screen forces `screen*`; tmux's
+/// `default-terminal` is `screen-256color` out of the box), while aterm's spawn
+/// seam forces `xterm-256color` for every session shell. `$TMUX`/`$STY` alone
+/// cannot carry the decision because an aterm launched FROM a pane inherits
+/// them verbatim — `TERM` is what tells that window apart from a real pane.
+const TERM_ENV: &str = "TERM";
+
+/// A multiplexer standing between the calling shell and the aterm session a
+/// flagless call would drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MuxNesting {
+    /// `tmux` or `screen` — the multiplexer around this shell.
+    kind: &'static str,
+    /// The aterm session hosting it, when the environment names one. `None`
+    /// means a multiplexer with no aterm session identity in scope (e.g. screen
+    /// inside a non-aterm terminal): there is nothing to mis-target, so the
+    /// refusal below does not apply and only the report mentions it.
+    outer_sid: Option<String>,
+    /// Which tier saw it, verbatim as the `mux` report's `detected_by=` field:
+    /// `shell-integration` ([`MUX_ENV`], set from inside the pane),
+    /// `session-base` ([`MUX_BASE_ENV`], stamped by the session shell and
+    /// compared here), or `environment` (the `$TMUX`/`$STY`/`$TERM` heuristic).
+    detected_by: &'static str,
+}
+
+/// The multiplexer a marker value or a `TERM` names, or `None` for anything
+/// else. Matches the family head (`screen`, `screen-256color`,
+/// `screen.xterm-256color`, `tmux`, `tmux-256color` …), never a substring.
+fn mux_kind(value: &str) -> Option<&'static str> {
+    match value.split(['-', '.']).next().unwrap_or("") {
+        "tmux" => Some("tmux"),
+        "screen" => Some("screen"),
+        _ => None,
+    }
+}
+
+/// The multiplexer markers of the CURRENT environment, in the spelling the shell
+/// integration stamps into [`MUX_BASE_ENV`]: `"<$TMUX>|<$STY>"`, empty for an
+/// unset side. Compared for equality only — it is an identity, not a parse.
+fn mux_env_signature(tmux: Option<&str>, sty: Option<&str>) -> String {
+    let mut sig = String::from(tmux.unwrap_or(""));
+    sig.push('|');
+    sig.push_str(sty.unwrap_or(""));
+    sig
+}
+
+/// The multiplexer the per-pane MARKERS name, or `None` when neither is set.
+/// `$TMUX` is consulted first because tmux's default `TERM` is
+/// `screen-256color`, so only the marker can tell the two programs apart.
+fn marker_kind(tmux: Option<&str>, sty: Option<&str>) -> Option<&'static str> {
+    if tmux.is_some_and(|v| !v.is_empty()) {
+        Some("tmux")
+    } else if sty.is_some_and(|v| !v.is_empty()) {
+        Some("screen")
+    } else {
+        None
+    }
+}
+
+/// Decide whether a multiplexer sits between this shell and its aterm session,
+/// from the environment values alone (passed in, so the decision is a pure
+/// function the tests can drive without touching the process environment).
+///
+/// Three tiers, in order:
+///
+/// 1. [`MUX_ENV`] — a verdict the integration reached INSIDE the pane, including
+///    its explicit disable spellings, which win outright. Present only where the
+///    script is genuinely sourced in a pane (see [`MUX_ENV`]).
+/// 2. [`MUX_BASE_ENV`] — the multiplexer environment the aterm SESSION shell
+///    stamped for itself. Set for every session aterm starts through a shell the
+///    integration supports, and inherited verbatim by every pane, so this is the
+///    tier that answers in a real bash/zsh pane. A signature that MATCHES the
+///    base is an authoritative NO (this shell's multiplexer environment is the
+///    session shell's own, which is exactly the aterm-window-launched-from-a-pane
+///    case); a signature that differs AND names a multiplexer is an
+///    authoritative YES, `TERM` unread.
+/// 3. The `$TMUX`/`$STY` + `TERM` heuristic, for a shell that carries neither
+///    mark — an old session shell started before the base existed, or a shell
+///    aterm did not start. It fires only when BOTH an aterm session identity is
+///    in scope (something to mis-target) and `TERM` names a multiplexer (the
+///    corroboration `$TMUX`/`$STY` need — see [`TERM_ENV`]).
+///
+/// The known gap, stated rather than papered over: a tmux configured with
+/// `default-terminal "xterm-256color"` defeats tier 3's `TERM` corroboration.
+/// Tier 2 catches it — it never reads `TERM` — for every session started by a
+/// shell the integration loads into; a pane of a shell with neither mark is
+/// still invisible, and `aterm ctl mux` says `mux=none` there rather than
+/// pretending.
+fn detect_mux_nesting(
+    mux: Option<&str>,
+    base: Option<&str>,
+    outer_sid: Option<&str>,
+    tmux: Option<&str>,
+    sty: Option<&str>,
+    term: Option<&str>,
+    self_sid: Option<&str>,
+) -> Option<MuxNesting> {
+    fn set(v: Option<&str>) -> Option<&str> {
+        v.filter(|s| !s.is_empty())
+    }
+    let outer = set(outer_sid).or_else(|| set(self_sid)).map(str::to_string);
+    if let Some(marker) = set(mux) {
+        if matches!(marker, "0" | "off" | "no" | "none" | "false") {
+            return None;
+        }
+        return Some(MuxNesting {
+            kind: mux_kind(marker).unwrap_or("multiplexer"),
+            outer_sid: outer,
+            detected_by: "shell-integration",
+        });
+    }
+    if let Some(base) = set(base) {
+        // The session shell recorded what it was born into. Equal means nothing
+        // has been entered since; different-and-marked means a pane. Different
+        // with no marker at all (someone unset $TMUX/$STY by hand) names no
+        // multiplexer to report, so fall through rather than invent one.
+        if base == mux_env_signature(tmux, sty) {
+            return None;
+        }
+        if let Some(kind) = marker_kind(tmux, sty) {
+            return Some(MuxNesting {
+                kind,
+                outer_sid: outer,
+                detected_by: "session-base",
+            });
+        }
+        return None;
+    }
+    // Nothing to mis-target without an aterm identity in scope: a screen inside
+    // a plain xterm legitimately drives the user's aterm windows flaglessly.
+    // `as_ref()?` rather than an `is_none()` early return: the workspace lints
+    // deny `question_mark`, and `outer` is still moved into `outer_sid` below,
+    // so the borrow-and-discard is the equivalent that keeps it owned.
+    outer.as_ref()?;
+    let term_kind = mux_kind(set(term)?)?;
+    Some(MuxNesting {
+        kind: marker_kind(tmux, sty).unwrap_or(term_kind),
+        outer_sid: outer,
+        detected_by: "environment",
+    })
+}
+
+/// [`detect_mux_nesting`] over the real process environment.
+fn mux_nesting_from_env() -> Option<MuxNesting> {
+    detect_mux_nesting(
+        env::var(MUX_ENV).ok().as_deref(),
+        env::var(MUX_BASE_ENV).ok().as_deref(),
+        env::var(MUX_OUTER_SID_ENV).ok().as_deref(),
+        env::var(TMUX_ENV).ok().as_deref(),
+        env::var(SCREEN_ENV).ok().as_deref(),
+        env::var(TERM_ENV).ok().as_deref(),
+        env::var(SELF_SID_ENV).ok().as_deref(),
+    )
+}
+
+/// Verbs answered by this CLIENT, which never reach a server and so are not in
+/// the shared verb table [`addresses_no_session`] consults. They address no
+/// session and cannot be mis-targeted by a multiplexer.
+const MUX_EXEMPT_VERBS: [&str; 3] = ["instances", "ls", "mux"];
+
+/// Whether `verb` addresses NO SESSION, and so has nothing a multiplexer could
+/// silently redirect.
+///
+/// Read from the SHARED verb table rather than a second hand-kept list:
+/// `Target::Meta` is the table's own name for "self-scoped or fleet-wide; a
+/// selector is meaningless here" (`version`, `sessions`, `who`, `whoami`,
+/// `grant`, `flows`, `dial-*`, `help`, `verbs`, …). Refusing those inside a
+/// multiplexer protected nothing — there is no session to point at the wrong
+/// terminal — and the refusal's own advice made it worse: `aterm ctl @<sid>
+/// sessions` is answered `ERR denied` by the server, because a selector on an
+/// owner-only meta verb is exactly what it rejects. Measured against a live
+/// instance: `@<sid>` with `sessions`/`who`/`whoami`/`flows` → `ERR denied`.
+fn addresses_no_session(verb: &str) -> bool {
+    MUX_EXEMPT_VERBS.contains(&verb)
+        || aterm_types::control_verbs::spec(verb)
+            .is_some_and(|s| matches!(s.target, aterm_types::control_verbs::Target::Meta))
+}
+
+/// Whether the request names its target only IMPLICITLY — the shape that
+/// silently follows `$ATERM_PARENT_SESSION_ID` or "whatever tab is in front".
+///
+/// * `@self` / `@env` — always implicit: the token literally claims "the session
+///   I am in", and inside a pane that claim is false however the socket was
+///   chosen, so flags do not rescue it.
+/// * no selector, or `@.` — implicit only while nothing else names a target;
+///   both follow the instance's ACTIVE tab. `--sock`, `--pid` and an explicit
+///   `$ATERM_CONTROL_SOCK` each pin the instance deliberately, and a deliberate
+///   choice is not the silent mis-targeting this guards.
+/// * a concrete `@<sid>` — never implicit.
+fn targets_own_session_implicitly(
+    parts: &[String],
+    sock: Option<&str>,
+    pid: Option<u32>,
+    env_sock: Option<&str>,
+) -> bool {
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    if addresses_no_session(first) {
+        return false;
+    }
+    // `subscribe` carries its selector SECOND; every other verb takes an
+    // optional leading `@<sel>` proxy token.
+    let sel_idx = usize::from(first == "subscribe");
+    let selector = parts.get(sel_idx).filter(|t| t.starts_with('@'));
+    // Only the flagless per-instance case leaves the target to the environment;
+    // Explicit/Disabled both mean the caller (or the environment) already
+    // decided, and `Disabled` has its own clearer error downstream.
+    let unpinned = sock.is_none()
+        && pid.is_none()
+        && matches!(
+            control_socket::socket_directive(env_sock, None),
+            SocketDirective::PerInstance
+        );
+    match selector {
+        Some(sel) if sel.split(',').any(|e| e == "@self" || e == "@env") => true,
+        Some(sel) if sel.split(',').all(|e| e == "@.") => unpinned,
+        Some(_) => false,
+        None => unpinned,
+    }
+}
+
+/// The refusal for an implicitly self-targeting call made inside a multiplexer:
+/// what is wrong, which session it would have driven, and the ways to say what
+/// you meant. Long on purpose — this is the one message standing between an
+/// agent and a keystroke landing in the wrong terminal. Hand-composed (no inline
+/// `format_args!`), like every other client error here.
+///
+/// Every remedy it names is one this refusal's own reachable set accepts, which
+/// is a correctness property and not a wording one. `@<sid>` is offered because
+/// what survives the guard is exactly the SESSION- and APP-targeted verbs, where
+/// a selector is how you name a target; the session-less (`Target::Meta`) verbs
+/// that a selector would earn `ERR denied` for are never refused in the first
+/// place (see [`addresses_no_session`]), so this message never sends anyone
+/// there. `--pid`/`--sock` are pins the guard treats as deliberate, and
+/// `instances` is how you learn either value from inside a pane — so the line
+/// naming them is followed all the way through instead of assuming the reader
+/// already knows the pid.
+fn nested_self_drive_error(n: &MuxNesting) -> io::Error {
+    let sid = n.outer_sid.as_deref().unwrap_or("<unknown>");
+    let mut msg = String::from("ERR this shell is inside ");
+    msg.push_str(n.kind);
+    msg.push_str(", and aterm hosts ONE session for the WHOLE multiplexer — it has no session for a pane.\n  $ATERM_PARENT_SESSION_ID (");
+    msg.push_str(sid);
+    msg.push_str(") therefore names the terminal RUNNING ");
+    msg.push_str(n.kind);
+    msg.push_str(", not the pane you are looking at,\n  so this call was refused rather than driving the wrong session silently. Say what you mean:\n    aterm ctl @");
+    msg.push_str(sid);
+    msg.push_str(" <verb>     drive the outer terminal deliberately\n    aterm ctl --pid <pid> <verb>   or --sock <path>, to pin one instance\n    aterm ctl instances            lists the pid and socket of every live instance\n    aterm ctl mux                  what aterm can and cannot see from in here\n  Verbs that address no session at all (version, sessions, who, whoami, grant, flows, dial-*, help)\n  are answered from in here unrefused — they have no target to redirect, and a selector on them is\n  what the server rejects. OSC 133 marks do not cross ");
+    msg.push_str(n.kind);
+    msg.push_str(" either, so blocks/exit codes/cwd for ");
+    msg.push_str(sid);
+    msg.push_str("\n  describe the multiplexer, not your pane. Set ATERM_MUX=0 if this shell is not really inside ");
+    msg.push_str(n.kind);
+    msg.push('.');
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// `0` silences the one-time boundary notice. Spelled exactly as the shell
+/// integration spells it (a literal `0`, nothing else) so one value silences
+/// both halves; the richer disable family belongs to [`MUX_ENV`], which turns
+/// the whole guard off rather than just the sentence.
+const MUX_NOTICE_ENV: &str = "ATERM_MUX_NOTICE";
+
+/// The one-time boundary notice — signal #1, the sentence that tells a person
+/// their command blocks just stopped existing.
+///
+/// It reads as one sentence with the [`stderr_line`] `aterm-ctl: ` prefix, and
+/// is otherwise word-for-word the shell integration's, because the two are the
+/// same statement said by whichever half gets to run.
+fn mux_boundary_notice(kind: &str) -> String {
+    let mut msg = String::from("inside ");
+    msg.push_str(kind);
+    msg.push_str(" — command blocks, exit codes and cwd tracking do not cross the multiplexer,\n  so aterm records none of them for these panes. `aterm ctl mux` explains; ATERM_MUX_NOTICE=0 silences this.");
+    msg
+}
+
+/// The stamp that makes the notice ONCE-per-multiplexer instead of once per
+/// call, keyed by the multiplexer's OWN id so every pane of one screen or tmux
+/// shares it.
+///
+/// Path, key and sanitising are the shell integration's byte for byte
+/// (`${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/aterm/mux-notice/<kind>-<id>`, id =
+/// `${TMUX:-${STY:-$TERM}}` with every character outside `[A-Za-z0-9._-]`
+/// replaced by `_`). That is the point: where BOTH halves run — a hand-installed
+/// integration in a pane, or fish's vendor `conf.d` — whichever speaks first
+/// claims the stamp and the other stays quiet, so nobody is told twice.
+fn mux_notice_stamp(
+    kind: &str,
+    tmux: Option<&str>,
+    sty: Option<&str>,
+    term: Option<&str>,
+    runtime_dir: Option<&str>,
+    tmp_dir: Option<&str>,
+) -> PathBuf {
+    fn set(v: Option<&str>) -> Option<&str> {
+        v.filter(|s| !s.is_empty())
+    }
+    let root = set(runtime_dir).or_else(|| set(tmp_dir)).unwrap_or("/tmp");
+    let id = set(tmux).or_else(|| set(sty)).or_else(|| set(term));
+    let mut name = String::from(kind);
+    name.push('-');
+    for ch in id.unwrap_or("").chars() {
+        name.push(
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            },
+        );
+    }
+    Path::new(root).join("aterm").join("mux-notice").join(name)
+}
+
+/// Claim the one-time notice for this multiplexer: `true` exactly once, for
+/// whichever process creates the stamp first.
+///
+/// `create_new` is the whole mechanism — an atomic "I am the first", so six
+/// panes racing on one screen produce one sentence rather than six. Every error
+/// is swallowed deliberately: a read-only runtime dir must cost the caller
+/// nothing, and a notice is not worth failing a verb over. Returning `false`
+/// when the stamp cannot be written also means the sentence is skipped rather
+/// than repeated on every call, which is the kinder failure.
+fn claim_mux_notice(n: &MuxNesting) -> bool {
+    if env::var(MUX_NOTICE_ENV).ok().as_deref() == Some("0") {
+        return false;
+    }
+    claim_mux_notice_at(&mux_notice_stamp(
+        n.kind,
+        env::var(TMUX_ENV).ok().as_deref(),
+        env::var(SCREEN_ENV).ok().as_deref(),
+        env::var(TERM_ENV).ok().as_deref(),
+        env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        env::var("TMPDIR").ok().as_deref(),
+    ))
+}
+
+/// [`claim_mux_notice`] with the stamp already resolved — the whole mechanism,
+/// separated from the environment read so a test can drive the real claim
+/// against a real path instead of asserting about a fabricated one.
+fn claim_mux_notice_at(stamp: &Path) -> bool {
+    let Some(dir) = stamp.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stamp)
+        .is_ok()
+}
+
+/// Say the boundary out loud once, unless something better is about to say it.
+///
+/// The refusal, the `mux` report and the `blocks`/`status` degradation note each
+/// already carry the whole fact in a sharper form; those callers pass
+/// `already_said = true`, which CLAIMS the stamp without printing so the short
+/// notice does not turn up afterwards as a duplicate.
+fn announce_mux_boundary(nesting: Option<&MuxNesting>, already_said: bool) {
+    let Some(n) = nesting else {
+        return;
+    };
+    announce_mux_boundary_with(n, already_said, claim_mux_notice);
+}
+
+/// [`announce_mux_boundary`]'s decision, with the CLAIM injected.
+///
+/// The gate below is the whole subject: a boundary that cost nothing must not
+/// even reach the stamp. Testing that against the shipping `claim_mux_notice`
+/// means testing against `$XDG_RUNTIME_DIR`, which a std-only test cannot
+/// safely retarget (mutating the process environment races every other test in
+/// the binary). So the claim is the seam, and the test hands in one that writes
+/// where it can see.
+fn announce_mux_boundary_with(
+    n: &MuxNesting,
+    already_said: bool,
+    claim: impl FnOnce(&MuxNesting) -> bool,
+) {
+    // No aterm identity in scope means no aterm block model to have LOST — a
+    // screen inside somebody else's terminal never had one. The shell half
+    // draws the line in the same place (it announces only under
+    // `$ATERM_PARENT_SESSION_ID`), and this is also what keeps `aterm ctl` from
+    // leaving stamps for multiplexers that have nothing to do with aterm.
+    if n.outer_sid.is_none() {
+        return;
+    }
+    if claim(n) && !already_said {
+        let _ = stderr_line(&mux_boundary_notice(n.kind));
+    }
+}
+
+/// The honest note for a verb whose answer is SHAPED by the boundary: `blocks`
+/// and `status` read the OSC 133 block model, and no mark emitted inside a
+/// multiplexer ever reaches aterm. Returned only when the request actually
+/// addresses the session hosting the multiplexer (explicitly, or implicitly with
+/// a pinned instance) — otherwise the note would be about a session the caller
+/// never asked for.
+fn mux_degradation_note(n: &MuxNesting, parts: &[String]) -> Option<String> {
+    let sid = n.outer_sid.as_deref()?;
+    let (selector, rest) = split_selector(parts);
+    if !matches!(rest.first().map(String::as_str), Some("blocks" | "status")) {
+        return None;
+    }
+    let addressed = match selector {
+        None | Some("@.") => true,
+        Some(sel) => sel.strip_prefix('@') == Some(sid),
+    };
+    if !addressed {
+        return None;
+    }
+    let mut msg = String::from("NOTE: this shell is inside ");
+    msg.push_str(n.kind);
+    msg.push_str(", so no OSC 133 mark from your pane ever reaches aterm — session ");
+    msg.push_str(sid);
+    msg.push_str(
+        "'s\n  blocks, exit codes and cwd are the multiplexer's, and command blocks from inside ",
+    );
+    msg.push_str(n.kind);
+    msg.push_str(" are ABSENT,\n  not empty. `aterm ctl mux` explains; ATERM_MUX=0 silences this.");
+    Some(msg)
+}
+
+/// The `mux` CLIENT verb: what aterm can and cannot see from this shell, as one
+/// machine-readable line on STDOUT plus the human explanation on STDERR (so a
+/// script parses the line and a person still gets told what it means).
+fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
+    let Some(n) = nesting else {
+        print_stdout_line("mux=none")?;
+        stderr_line(
+            "no multiplexer between this shell and its aterm session: \
+             a flagless call drives the session you are looking at",
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    };
+    let sid = n.outer_sid.as_deref().unwrap_or("-");
+    let mut line = String::from("mux=");
+    line.push_str(n.kind);
+    line.push_str(" detected_by=");
+    line.push_str(n.detected_by);
+    line.push_str(" outer_sid=");
+    line.push_str(sid);
+    line.push_str(" marks=absent self_target=");
+    line.push_str(if n.outer_sid.is_some() {
+        "refused"
+    } else {
+        "allowed"
+    });
+    print_stdout_line(&line)?;
+    let mut note = String::from("this shell is inside ");
+    note.push_str(n.kind);
+    note.push_str(". aterm hosts ONE session for the whole multiplexer, so:\n  * aterm has no session for a pane; ");
+    if n.outer_sid.is_some() {
+        note.push_str("flagless / @self calls are REFUSED here (they would drive ");
+        note.push_str(sid);
+        note.push_str(").\n  * ");
+    } else {
+        note.push_str("no aterm session identity is in scope, so nothing is refused.\n  * ");
+    }
+    note.push_str(
+        "OSC 133 marks are ABSENT, not empty: aterm delivers its shell integration through the\n    \
+         argv the SPAWN SEAM controls (bash --rcfile, zsh's ZDOTDIR), and a pane shell is started\n    \
+         by the multiplexer, not by aterm — so the hooks that emit the marks are never defined\n    \
+         here, and neither screen nor tmux forwards an unknown OSC to the outer terminal anyway.\n    \
+         Command blocks, exit codes and cwd tracking are dead for the duration.\n  * \
+         Verbs that address no session (version, sessions, who, whoami, grant, flows, dial-*) are\n    \
+         answered from in here unrefused; name a target explicitly (@<sid>, --pid, --sock) to\n    \
+         drive a real aterm session.",
+    );
+    stderr_line(&note)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Resolve the socket path from the flags and the environment values. Flags
 /// win over the environment; `--pid` targets one instance's
 /// `<dir>/aterm-<pid>.sock` directly. The env interpretation (explicit path
@@ -1062,6 +1630,11 @@ fn live_instances() -> Vec<(u32, String)> {
 /// A socket that does not answer `sessions` (died between readdir and dial, or
 /// a foreign server) is skipped silently: discovery reports what is REACHABLE,
 /// exactly like the shell convention for `ls` on a churning directory.
+///
+/// Inside a MULTIPLEXER those two markers become a half-truth — the session they
+/// point at hosts the whole screen/tmux, not the pane the caller is in — so a
+/// note goes to STDERR saying so. STDERR, not the rows: the marker spelling is
+/// what scripts parse, and the truth about it is what humans need.
 /// Whether two socket path strings name the SAME socket, tolerant of a symlinked
 /// ancestor (macOS `/var` → `/private/var`, an `XDG_RUNTIME_DIR` under `$TMPDIR`).
 /// `self_instance_sock` canonicalizes its side but `live_instances` yields the RAW
@@ -1118,7 +1691,12 @@ fn discovery_targets(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<(u32, S
     Ok(live_instances())
 }
 
-fn run_discovery(verb: &str, sock: Option<&str>, pid: Option<u32>) -> io::Result<ExitCode> {
+fn run_discovery(
+    verb: &str,
+    sock: Option<&str>,
+    pid: Option<u32>,
+    nesting: Option<&MuxNesting>,
+) -> io::Result<ExitCode> {
     let self_sid = env::var(SELF_SID_ENV).ok();
     let self_sock = self_instance_sock(self_sid.as_deref());
     let stdout = io::stdout();
@@ -1169,6 +1747,15 @@ fn run_discovery(verb: &str, sock: Option<&str>, pid: Option<u32>) -> io::Result
             eprintln!("aterm-ctl: no live aterm instances found");
         }
         return Ok(ExitCode::FAILURE);
+    }
+    // The ` self` / ` *` markers mean "hosts the calling terminal", and inside a
+    // multiplexer that terminal is the one RUNNING screen/tmux — an honest note
+    // rather than a marker silently read as "your pane".
+    if let Some(n) = nesting.filter(|n| n.outer_sid.is_some()) {
+        let mut note = String::from("NOTE: this shell is inside ");
+        note.push_str(n.kind);
+        note.push_str(", so the marked session hosts the WHOLE multiplexer, not your pane");
+        stderr_line(&note)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1388,10 +1975,49 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         }
     }
 
+    // THE MULTIPLEXER BOUNDARY, decided BEFORE `@self` is expanded away — after
+    // expansion the selector is a concrete sid and the "implicit target" shape
+    // this guards is no longer visible. `mux` is the client-answered report of
+    // that decision; everything else gets refused only when its target is named
+    // implicitly AND an aterm session identity is in scope to be mis-targeted.
+    let nesting = mux_nesting_from_env();
+    if request_parts.first().map(String::as_str) == Some("mux") {
+        announce_mux_boundary(nesting.as_ref(), true);
+        return run_mux_report(nesting.as_ref());
+    }
+    if let Some(n) = nesting.as_ref()
+        && n.outer_sid.is_some()
+        && targets_own_session_implicitly(
+            &request_parts,
+            sock.as_deref(),
+            pid,
+            env::var(SOCK_ENV).ok().as_deref(),
+        )
+    {
+        announce_mux_boundary(nesting.as_ref(), true);
+        return Err(nested_self_drive_error(n));
+    }
+
     // Expand a leading `@self` / `@env` selector to `@$ATERM_PARENT_SESSION_ID`
     // BEFORE anything reads the selector (framing, discovery, stdin routing), so
     // the rest of the path sees only a concrete `@<sid>`.
     expand_self_selector(&mut request_parts, env::var(SELF_SID_ENV).ok())?;
+
+    // SIGNAL #1 — the sentence that says the command blocks just stopped
+    // existing. It used to be the shell integration's alone, which meant it was
+    // never said at all in a real bash or zsh pane: nothing sources the script
+    // there (see [`MUX_ENV`]). A pane cannot say it, so `aterm ctl` does — once
+    // per multiplexer, on the first call from inside one, sharing the
+    // integration's own stamp so a fish or hand-installed pane that already said
+    // it does not say it twice. Read AFTER `@self` expansion so the
+    // `blocks`/`status` check below sees the same request the trailing
+    // degradation note will.
+    announce_mux_boundary(
+        nesting.as_ref(),
+        nesting
+            .as_ref()
+            .is_some_and(|n| mux_degradation_note(n, &request_parts).is_some()),
+    );
 
     // `dial <name> <verb...>` runs ONE verb on a saved remote over the relay and
     // reads back the REMOTE's framed reply. A BARE `dial <name>` (or `dial` alone)
@@ -1417,7 +2043,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     if request_parts.first().map(String::as_str) == Some("instances")
         || request_parts.first().map(String::as_str) == Some("ls")
     {
-        return run_discovery(&request_parts[0], sock.as_deref(), pid);
+        return run_discovery(&request_parts[0], sock.as_deref(), pid, nesting.as_ref());
     }
 
     let path = resolve_path(
@@ -1507,14 +2133,24 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         request.clone()
     };
 
-    exchange(
+    let outcome = exchange(
         &path,
         &request,
         &verb,
         &frame_request,
         deadline,
         timeout_explicit,
-    )
+    );
+    // AFTER the reply, so the caveat lands under the (necessarily empty) result
+    // it explains rather than ahead of it. A failure to write the note is
+    // ignored — the exchange's own outcome is what this call is for.
+    if let Some(note) = nesting
+        .as_ref()
+        .and_then(|n| mux_degradation_note(n, &request_parts))
+    {
+        let _ = stderr_line(&note);
+    }
+    outcome
 }
 
 /// Split an optional leading `@<selector>` proxy token off the request parts,
@@ -3630,5 +4266,627 @@ mod tests {
         drop(listener);
         let _ = std::fs::remove_file(&instance);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // THE MULTIPLEXER BOUNDARY
+    //
+    // Measured on this host with GNU screen 4.09.01 against a real headless
+    // instance before any of this existed: inside a `screen` window the whole
+    // run collapses into ONE outer block (`cmdline=screen%20-S%20muxprobe`,
+    // still `executing`), `meta` reports `title=` empty, and a flagless
+    // `aterm ctl status` typed in the window answered `OK … phase=quiet` FROM
+    // THE OUTER SESSION — success, wrong terminal, no signal. tmux is not
+    // installed here; it is covered by construction rather than by claim (see
+    // the tmux-shaped cases below): its `$TMUX` marker is checked FIRST, and
+    // its default `TERM` is `screen-256color`, which is exactly why the kind is
+    // taken from the marker and only the family from `TERM`.
+    // -----------------------------------------------------------------------
+
+    /// Tier 1: the shell integration's own `$ATERM_MUX` marker decides, and its
+    /// disable spellings turn the whole guard off (the escape hatch for a stale
+    /// marker inherited by a shell that is not in a pane at all).
+    #[test]
+    fn mux_marker_decides_and_its_disable_spellings_turn_the_guard_off() {
+        let n = detect_mux_nesting(
+            Some("screen"),
+            None,
+            Some("s-outer"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a marked boundary is nested");
+        assert_eq!(n.kind, "screen");
+        assert_eq!(n.outer_sid.as_deref(), Some("s-outer"));
+        assert_eq!(
+            n.detected_by, "shell-integration",
+            "the in-pane marker is the top tier"
+        );
+        // The marker wins even when nothing else in the environment agrees —
+        // including a session base that would otherwise answer "no crossing".
+        let n = detect_mux_nesting(
+            Some("tmux"),
+            Some("|"),
+            None,
+            None,
+            None,
+            Some("xterm-256color"),
+            Some("s-env"),
+        )
+        .expect("marked");
+        assert_eq!(n.kind, "tmux");
+        assert_eq!(
+            n.outer_sid.as_deref(),
+            Some("s-env"),
+            "$ATERM_PARENT_SESSION_ID stands in when the marker carries no outer sid"
+        );
+        for off in ["0", "off", "no", "none", "false"] {
+            assert_eq!(
+                detect_mux_nesting(
+                    Some(off),
+                    Some("|"),
+                    Some("s-outer"),
+                    Some("/tmp/tmux-1000/default,9,0"),
+                    None,
+                    Some("screen-256color"),
+                    Some("s-outer"),
+                ),
+                None,
+                "ATERM_MUX={off} must disable the guard outright"
+            );
+        }
+    }
+
+    /// Tier 2 — the tier that actually answers in a real pane.
+    ///
+    /// THE MEASUREMENT THIS EXISTS FOR: in a real GNU screen 4.09.01 window
+    /// under a headless aterm on this host, the pane shell had `$STY`,
+    /// `TERM=screen.xterm-256color` and the inherited loader guard, and
+    /// `$ATERM_MUX` was EMPTY with no integration hook defined — because aterm
+    /// injects bash through `--rcfile`, which a shell started by screen never
+    /// receives. Tier 1 is therefore unreachable from a bash or zsh pane, and
+    /// the session shell's own `$ATERM_MUX_BASE` is what crosses instead.
+    #[test]
+    fn mux_session_base_decides_a_pane_without_reading_term() {
+        // A session shell born outside any multiplexer stamps "|"; the pane's
+        // own $STY no longer matches, and that mismatch alone is the crossing.
+        let n = detect_mux_nesting(
+            None,
+            Some("|"),
+            None,
+            None,
+            Some("4242.pts-3.host"),
+            Some("screen.xterm-256color"),
+            Some("s-outer"),
+        )
+        .expect("STY differing from the session base is a pane");
+        assert_eq!(n.kind, "screen");
+        assert_eq!(n.outer_sid.as_deref(), Some("s-outer"));
+        assert_eq!(n.detected_by, "session-base");
+        // THE GAP TIER 3 CANNOT SEE: tmux with `default-terminal
+        // "xterm-256color"` looks exactly like an aterm window to TERM. The base
+        // never reads TERM, so it calls this a pane anyway.
+        let n = detect_mux_nesting(
+            None,
+            Some("|"),
+            None,
+            Some("/tmp/tmux-1000/default,9,0"),
+            None,
+            Some("xterm-256color"),
+            Some("s-outer"),
+        )
+        .expect("a tmux pane with aterm's own TERM is still a pane");
+        assert_eq!(n.kind, "tmux", "the marker names the program, not TERM");
+        assert_eq!(n.detected_by, "session-base");
+        // An aterm window LAUNCHED FROM a pane re-runs the integration and
+        // re-stamps the base as its own, so its inherited $TMUX matches and it
+        // is NOT refused — the case the loader guard was invented for, decided
+        // here without TERM.
+        assert_eq!(
+            detect_mux_nesting(
+                None,
+                Some("/tmp/tmux-1000/default,9,0|"),
+                None,
+                Some("/tmp/tmux-1000/default,9,0"),
+                None,
+                Some("xterm-256color"),
+                Some("s-fresh"),
+            ),
+            None,
+            "a base equal to this environment means nothing was entered since"
+        );
+        // A nested multiplexer inside that window is a crossing again.
+        let n = detect_mux_nesting(
+            None,
+            Some("/tmp/tmux-1000/default,9,0|"),
+            None,
+            Some("/tmp/tmux-1000/default,9,7"),
+            None,
+            Some("screen-256color"),
+            Some("s-fresh"),
+        )
+        .expect("a DIFFERENT tmux than the session's own is a pane");
+        assert_eq!(n.kind, "tmux");
+        // Different base, but no marker names a multiplexer here (someone unset
+        // $TMUX by hand): there is nothing to report, and inventing a kind from
+        // TERM would be the papering-over this whole seam refuses.
+        assert_eq!(
+            detect_mux_nesting(
+                None,
+                Some("/tmp/tmux-1000/default,9,0|"),
+                None,
+                None,
+                None,
+                Some("screen-256color"),
+                Some("s-fresh"),
+            ),
+            None,
+            "a base mismatch with no live marker names no multiplexer"
+        );
+    }
+
+    /// Tier 3, for a shell carrying neither mark — a session started before the
+    /// base existed, or one aterm did not start. It needs BOTH an aterm identity
+    /// to mis-target AND a multiplexer-written `TERM`.
+    ///
+    /// The `TERM` corroboration is what keeps an aterm window LAUNCHED FROM a
+    /// pane out of the refusal: it inherits `$TMUX`/`$STY` verbatim, and only
+    /// `TERM` (which aterm's spawn seam forces to `xterm-256color`) tells it
+    /// apart from a real pane.
+    #[test]
+    fn mux_fallback_needs_an_aterm_identity_and_a_multiplexer_term() {
+        let n = detect_mux_nesting(
+            None,
+            None,
+            None,
+            None,
+            Some("4242.pts-3.host"),
+            Some("screen.xterm-256color"),
+            Some("s-outer"),
+        )
+        .expect("STY + a screen TERM inside an aterm session is a pane");
+        assert_eq!(n.kind, "screen");
+        assert_eq!(n.outer_sid.as_deref(), Some("s-outer"));
+        assert_eq!(n.detected_by, "environment", "no mark was present");
+        // tmux's DEFAULT TERM is screen-256color, so the marker — not TERM —
+        // names the program. Reporting "screen" for a tmux pane would send the
+        // reader to the wrong manual.
+        let n = detect_mux_nesting(
+            None,
+            None,
+            None,
+            Some("/tmp/tmux-1000/default,9,0"),
+            None,
+            Some("screen-256color"),
+            Some("s-outer"),
+        )
+        .expect("tmux pane");
+        assert_eq!(n.kind, "tmux");
+        // An aterm window launched FROM a pane: markers inherited, TERM aterm's.
+        assert_eq!(
+            detect_mux_nesting(
+                None,
+                None,
+                None,
+                Some("/tmp/tmux-1000/default,9,0"),
+                Some("4242.pts-3.host"),
+                Some("xterm-256color"),
+                Some("s-fresh"),
+            ),
+            None,
+            "a stale $TMUX/$STY with aterm's own TERM is not a pane"
+        );
+        // A screen inside a NON-aterm terminal has no aterm identity to
+        // mis-target: flagless calls there legitimately drive the user's
+        // windows through the `latest` pointer, and must not be refused.
+        assert_eq!(
+            detect_mux_nesting(
+                None,
+                None,
+                None,
+                None,
+                Some("1.pts-0.h"),
+                Some("screen"),
+                None
+            ),
+            None,
+            "no aterm session identity in scope means nothing to mis-target"
+        );
+        // Empty is unset, everywhere (the spawn seam and the user's environment
+        // both deliver empty values) — including the base, whose real spelling
+        // is never shorter than "|".
+        assert_eq!(
+            detect_mux_nesting(
+                Some(""),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some("")
+            ),
+            None
+        );
+    }
+
+    /// Which invocation shapes name their target only IMPLICITLY — the ones a
+    /// multiplexer silently redirects to the outer terminal.
+    #[test]
+    fn implicit_self_targeting_is_exactly_the_flagless_at_self_and_at_dot_shapes() {
+        let parts = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+        // Flagless with nothing pinned: the case the audit found.
+        assert!(targets_own_session_implicitly(
+            &parts(&["text"]),
+            None,
+            None,
+            None
+        ));
+        // Any explicit instance pin is a deliberate choice, not silence.
+        assert!(!targets_own_session_implicitly(
+            &parts(&["text"]),
+            Some("/tmp/x.sock"),
+            None,
+            None
+        ));
+        assert!(!targets_own_session_implicitly(
+            &parts(&["text"]),
+            None,
+            Some(42),
+            None
+        ));
+        assert!(!targets_own_session_implicitly(
+            &parts(&["text"]),
+            None,
+            None,
+            Some("/tmp/explicit.sock")
+        ));
+        // `@self`/`@env` CLAIM this session by name — false in a pane however
+        // the socket was chosen, so a pin does not rescue them.
+        for sel in ["@self", "@env"] {
+            assert!(targets_own_session_implicitly(
+                &parts(&[sel, "send", "hi"]),
+                Some("/tmp/x.sock"),
+                Some(42),
+                None
+            ));
+        }
+        // …including inside `subscribe`'s selector-SECOND position and a list.
+        assert!(targets_own_session_implicitly(
+            &parts(&["subscribe", "@self,@1", "screen"]),
+            None,
+            None,
+            None
+        ));
+        // `@.` follows the ACTIVE tab — as implicit as flagless, and pinned the
+        // same way.
+        assert!(targets_own_session_implicitly(
+            &parts(&["@.", "text"]),
+            None,
+            None,
+            None
+        ));
+        assert!(!targets_own_session_implicitly(
+            &parts(&["@.", "text"]),
+            None,
+            Some(7),
+            None
+        ));
+        // A concrete sid names its target; nothing implicit is left.
+        assert!(!targets_own_session_implicitly(
+            &parts(&["@s-abc", "text"]),
+            None,
+            None,
+            None
+        ));
+        // The client-answered verbs address no session at all.
+        for verb in MUX_EXEMPT_VERBS {
+            assert!(
+                !targets_own_session_implicitly(&parts(&[verb]), None, None, None),
+                "{verb} addresses no session"
+            );
+        }
+        // Neither does anything the shared table calls Target::Meta. Refusing
+        // these protected nothing and the refusal's own advice was a dead end:
+        // `@<sid> sessions` is `ERR denied` at the server, measured against a
+        // live instance for sessions/who/whoami/flows. Driven from the TABLE, so
+        // a verb added there as Meta is exempt the day it lands.
+        let meta: Vec<&str> = aterm_types::control_verbs::VERBS
+            .iter()
+            .filter(|s| matches!(s.target, aterm_types::control_verbs::Target::Meta))
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            meta.len() > 10,
+            "the table should carry the whole session-less family: {meta:?}"
+        );
+        for verb in [
+            "version", "sessions", "who", "whoami", "grant", "flows", "help",
+        ] {
+            assert!(meta.contains(&verb), "{verb} must be Target::Meta");
+        }
+        for verb in &meta {
+            assert!(
+                !targets_own_session_implicitly(&parts(&[verb]), None, None, None),
+                "{verb} addresses no session and cannot be mis-targeted by a multiplexer"
+            );
+        }
+        // The exemption is exactly the session-less set — a SESSION or APP verb
+        // is still refused, because those really can land in the wrong terminal.
+        for verb in ["text", "send", "key", "blocks", "window", "tab", "spawn"] {
+            assert!(
+                targets_own_session_implicitly(&parts(&[verb]), None, None, None),
+                "{verb} names a real target and stays guarded"
+            );
+        }
+        // Empty argv is the usage error's business, not this guard's.
+        assert!(!targets_own_session_implicitly(&[], None, None, None));
+    }
+
+    /// The refusal has to be ACTIONABLE, not just correct: it names the session
+    /// a flagless call would have driven, the explicit form that drives it on
+    /// purpose, the two instance pins, and the way to switch the guard off.
+    #[test]
+    fn nested_self_drive_error_names_the_outer_session_and_every_way_forward() {
+        let n = MuxNesting {
+            kind: "tmux",
+            outer_sid: Some("s-1a2b".to_string()),
+            detected_by: "session-base",
+        };
+        let e = nested_self_drive_error(&n);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let msg = e.to_string();
+        for needle in [
+            "inside tmux",
+            "s-1a2b",
+            "aterm ctl @s-1a2b <verb>",
+            "--pid",
+            "--sock",
+            "aterm ctl instances",
+            "aterm ctl mux",
+            "ATERM_MUX=0",
+            "OSC 133",
+        ] {
+            assert!(msg.contains(needle), "refusal must name {needle:?}: {msg}");
+        }
+        // EVERY remedy it names must be one the reachable set accepts. `@<sid>`
+        // is offered to the verbs that survive the guard — Session and App — and
+        // never to a session-less one, where the server answers `ERR denied` to
+        // a selector. That is the property, not the wording: if some Meta verb
+        // ever became refusable again, this fails.
+        let parts = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+        for spec in aterm_types::control_verbs::VERBS {
+            if matches!(spec.target, aterm_types::control_verbs::Target::Meta) {
+                assert!(
+                    !targets_own_session_implicitly(&parts(&[spec.name]), None, None, None),
+                    "{} is session-less, so `@<sid> {}` must never be prescribed \
+                     — the server rejects a selector there",
+                    spec.name,
+                    spec.name
+                );
+            }
+        }
+    }
+
+    /// The block-model caveat rides only on the verbs whose ANSWER is shaped by
+    /// the boundary, and only when the request actually addresses the session
+    /// hosting the multiplexer.
+    #[test]
+    fn mux_degradation_note_marks_the_block_reading_verbs_only() {
+        let parts = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+        let n = MuxNesting {
+            kind: "screen",
+            outer_sid: Some("s-1a2b".to_string()),
+            detected_by: "environment",
+        };
+        for verb in ["blocks", "status"] {
+            let note = mux_degradation_note(&n, &parts(&[verb]))
+                .unwrap_or_else(|| panic!("{verb} reads the block model"));
+            assert!(note.contains("inside screen"), "{note}");
+            assert!(note.contains("s-1a2b"), "{note}");
+            assert!(note.contains("ABSENT"), "absent, not empty: {note}");
+            // The same verb aimed at the hosting session explicitly still earns
+            // the note — that IS the session the multiplexer is starving.
+            let sel = mux_degradation_note(&n, &parts(&["@s-1a2b", verb]));
+            assert!(sel.is_some(), "{verb} at the outer sid still applies");
+        }
+        // A different session is not the one the pane is starving.
+        assert_eq!(
+            mux_degradation_note(&n, &parts(&["@s-other", "blocks"])),
+            None
+        );
+        // Verbs whose answer the boundary does not shape stay quiet.
+        for verb in ["text", "cursor", "send", "meta"] {
+            assert_eq!(
+                mux_degradation_note(&n, &parts(&[verb])),
+                None,
+                "{verb} does not read the block model"
+            );
+        }
+        // No aterm identity, no note to give.
+        let anon = MuxNesting {
+            kind: "screen",
+            outer_sid: None,
+            detected_by: "shell-integration",
+        };
+        assert_eq!(mux_degradation_note(&anon, &parts(&["blocks"])), None);
+    }
+
+    /// `mux` is a CLIENT verb, so it must be discoverable exactly where the
+    /// other two are: the `--help` client block and the completion verb list.
+    #[test]
+    fn the_mux_client_verb_is_documented_and_completable() {
+        let help = help_text();
+        assert!(
+            help.contains("    mux "),
+            "the mux verb is in --help: {help}"
+        );
+        assert!(
+            help.contains("ATERM_MUX=0"),
+            "--help names the escape hatch"
+        );
+        let verbs = completion_verb_list();
+        assert!(
+            verbs.split_whitespace().any(|v| v == "mux"),
+            "mux completes like ls/instances"
+        );
+    }
+
+    /// SIGNAL #1's stamp, which is the whole reason the sentence is said once
+    /// and not once per call — and which `aterm ctl` now has to compute
+    /// IDENTICALLY to the shell integration, because the two halves share it.
+    ///
+    /// The shell spells it
+    /// `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/aterm/mux-notice/<kind>-<id>` with
+    /// `id=${TMUX:-${STY:-$TERM}}` and `${id//[!A-Za-z0-9._-]/_}`. Anything else
+    /// here and a fish pane would be told twice.
+    #[test]
+    fn the_mux_notice_stamp_matches_the_shell_integrations_path_exactly() {
+        // tmux's marker wins the id, and every byte outside the shell's class
+        // (`/`, `,`) becomes `_` — one substitution per character, not per run.
+        assert_eq!(
+            mux_notice_stamp(
+                "tmux",
+                Some("/tmp/tmux-1000/default,9,0"),
+                Some("4242.pts-3.h"),
+                Some("screen-256color"),
+                Some("/run/user/1000"),
+                None,
+            ),
+            Path::new("/run/user/1000/aterm/mux-notice/tmux-_tmp_tmux-1000_default_9_0"),
+        );
+        // $STY when there is no $TMUX; dots and dashes survive untouched, which
+        // is what keeps one screen's panes on ONE stamp.
+        assert_eq!(
+            mux_notice_stamp(
+                "screen",
+                None,
+                Some("4242.pts-3.host"),
+                Some("screen.xterm-256color"),
+                Some("/run/user/1000"),
+                Some("/tmp"),
+            ),
+            Path::new("/run/user/1000/aterm/mux-notice/screen-4242.pts-3.host"),
+        );
+        // The root falls through XDG_RUNTIME_DIR -> TMPDIR -> /tmp, and TERM is
+        // the id of last resort, exactly as the shell's `${TMUX:-${STY:-$TERM}}`.
+        assert_eq!(
+            mux_notice_stamp(
+                "screen",
+                Some(""),
+                None,
+                Some("screen"),
+                Some(""),
+                Some("/x")
+            ),
+            Path::new("/x/aterm/mux-notice/screen-screen"),
+        );
+        assert_eq!(
+            mux_notice_stamp("screen", None, None, None, None, None),
+            Path::new("/tmp/aterm/mux-notice/screen-"),
+        );
+    }
+
+    /// The notice is the SAME SENTENCE the shell integration prints, because it
+    /// is the same statement said by whichever half gets to run — and in a real
+    /// bash or zsh pane the shell half never runs at all.
+    #[test]
+    fn the_mux_boundary_notice_says_what_stopped_existing() {
+        let msg = mux_boundary_notice("screen");
+        for needle in [
+            "inside screen",
+            "command blocks, exit codes and cwd tracking do not cross the multiplexer",
+            "aterm ctl mux",
+            "ATERM_MUX_NOTICE=0",
+        ] {
+            assert!(msg.contains(needle), "notice must say {needle:?}: {msg}");
+        }
+        assert!(
+            mux_boundary_notice("tmux").contains("inside tmux"),
+            "the notice names the multiplexer it found"
+        );
+    }
+
+    /// The notice belongs to a boundary that COST something. A screen inside
+    /// somebody else's terminal never had an aterm block model to lose, so
+    /// neither half announces there — the shell integration draws the line at
+    /// `$ATERM_PARENT_SESSION_ID` and this must draw it in the same place, or
+    /// `aterm ctl` starts leaving stamps for multiplexers aterm has no part in.
+    ///
+    /// DRIVEN ON A REAL PATH. This test used to compute a stamp under a root
+    /// (`/nonexistent-runtime-dir-for-this-test`) that the shipping claim never
+    /// resolves — `claim_mux_notice` reads `$XDG_RUNTIME_DIR`/`$TMPDIR` — so
+    /// `!before.exists()` was true no matter what the gate did, and deleting the
+    /// gate outright would not have failed it. Here the root is a real scratch
+    /// dir, the stamp is resolved by the SHIPPING resolver from that root, and
+    /// the POSITIVE control runs on the very same path: the negative claim means
+    /// something only because the positive one demonstrably writes.
+    #[test]
+    fn the_boundary_is_announced_only_where_it_cost_a_session_something() {
+        let root = std::env::temp_dir().join(format!("aterm-ctl-muxnotice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("private scratch root");
+        // The path the SHELL and `aterm ctl` both compute, resolved by the
+        // shipping resolver off this test's root.
+        let stamp = mux_notice_stamp(
+            "screen",
+            None,
+            Some("77.pts-1.h"),
+            None,
+            root.to_str(),
+            None,
+        );
+        assert_eq!(
+            stamp,
+            root.join("aterm")
+                .join("mux-notice")
+                .join("screen-77.pts-1.h"),
+            "fixture: the stamp under test is the shell's own path, resolved from this root"
+        );
+        // The claim the seam is handed: the SHIPPING mechanism (`create_new` on
+        // the resolved stamp), aimed at this test's root instead of the
+        // process-wide `$XDG_RUNTIME_DIR` — which a std-only test must not
+        // mutate out from under its sibling tests.
+        let claim = |_: &MuxNesting| claim_mux_notice_at(&stamp);
+
+        // ANONYMOUS: no aterm session outside, so the gate returns before the
+        // claim runs at all — nothing written, nothing spent.
+        let anon = MuxNesting {
+            kind: "screen",
+            outer_sid: None,
+            detected_by: "shell-integration",
+        };
+        announce_mux_boundary_with(&anon, false, claim);
+        assert!(
+            !stamp.exists(),
+            "an anonymous multiplexer must leave no stamp behind"
+        );
+
+        // OURS: the same call on the same path, with an aterm session outside.
+        // `already_said = true` claims without printing, so the assertion is
+        // about the stamp rather than about this test's stderr.
+        let ours = MuxNesting {
+            kind: "screen",
+            outer_sid: Some("s1".to_string()),
+            detected_by: "shell-integration",
+        };
+        announce_mux_boundary_with(&ours, true, claim);
+        assert!(
+            stamp.exists(),
+            "a boundary that cost an aterm session its block model claims the stamp"
+        );
+
+        // ONCE. `create_new` is the whole once-per-multiplexer mechanism: the
+        // second pane to reach it is refused, which is what keeps six panes of
+        // one screen down to one sentence.
+        assert!(
+            !claim_mux_notice_at(&stamp),
+            "a claimed stamp must refuse the next claimant"
+        );
+
+        // …and the `None` nesting is a no-op, not a panic.
+        announce_mux_boundary(None, false);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

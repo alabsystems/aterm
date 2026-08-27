@@ -37,7 +37,7 @@ pub struct StreamingSearch {
     pattern: String,
     /// Compiled regex (if filter mode is Regex).
     #[cfg(feature = "regex")]
-    compiled_regex: Option<regex::Regex>,
+    compiled_regex: Option<aterm_regex::Regex>,
     /// Search results (bounded by max_results).
     results: Vec<StreamingMatch>,
     /// Current highlighted result index (1-based, 0 = none).

@@ -155,7 +155,7 @@ fn keystroke_tick(c: &mut Criterion) {
             // Reach guard, side 1: the baseline fill is the full arm.
             let first = term.cell_frame_damage_scoped_into(&mut input, rows, cols);
             assert!(
-                matches!(first, FrameRefill::Full),
+                matches!(first, FrameRefill::Full { .. }),
                 "first fill must take the full arm"
             );
             // Reach guard, side 2: the echo tick takes the SCOPED arm — the

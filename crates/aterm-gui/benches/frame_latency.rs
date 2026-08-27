@@ -45,6 +45,26 @@
 //     exactly like the product's windowed present. `verify_echo` asserts the
 //     model's byte-parity against a full repaint on every verify frame.
 //
+// SPEC ANCHORS ARE COMPILED INTO THIS BENCH. `aterm-gui`'s dev-dependency on
+// `aterm-core` turns the `spec-anchors` feature ON (Cargo.toml, and dev-dep
+// features apply to bench targets too), so every `#[refines]`-annotated body
+// inside the timed span carries the execution-evidence probe the spec gate
+// reads — including `Terminal::write_char`, the per-character path for
+// non-ASCII, styled, insert-mode and VT52 output.
+//
+// What that costs here: ONE thread-local `bool` load and a branch per entry.
+// The probe's first act is to test an `ARMED` flag that only
+// `aterm_spec::xref::StepEvidence::step` ever sets, and no bench opens an
+// evidence window — so no `RefCell` borrow, no `BTreeSet` insert and no string
+// comparison happens on any path this file times.
+// `aterm_spec_macros::tests::an_unarmed_probe_records_nothing` asserts that
+// un-armed behaviour rather than leaving it as a claim. It is still a real,
+// if tiny, addition to the annotated bodies, so numbers from BEFORE the probe
+// landed are not exactly comparable with numbers from after; the ENFORCED perf
+// gates are unaffected either way, since `xtask perf` measures release
+// `aterm-bench` examples (crates/xtask/src/perf.rs) and not this criterion
+// target.
+//
 // WHAT IS OUT OF REACH (cut honestly, not stubbed): the OS present itself —
 // softbuffer damage-rect blit / GPU swapchain present, frame pacing, EDR/scale
 // binding, tab-strip + native chrome, and `redraw_window`'s own inline
@@ -273,11 +293,53 @@ fn f_rainbow_on() -> BenchApp {
     b
 }
 
+/// The SPLIT workload's window grid and pane count — a desktop-sized composed
+/// frame, not the 24x80 the rest of this group runs at.
+///
+/// The rest of the group prices ONE terminal's worth of work, where 24x80 is a
+/// fair unit. The split workload prices the compositor's per-pane amplification,
+/// and at 24x80 a four-way split gives each pane ~9 columns: the per-pane fixed
+/// costs would dominate the per-cell resolve the audit is about, and the
+/// workload would report on the wrong half. 90x340 is roughly a 4K display at a
+/// mid-size font — ~30k cells, the shape the audit item is written against.
+const SPLIT_ROWS: u16 = 90;
+/// See [`SPLIT_ROWS`].
+const SPLIT_COLS: u16 = 340;
+/// See [`SPLIT_ROWS`].
+const SPLIT_PANES: usize = 4;
+/// Rows of neutral text every split pane carries — more than a screenful, so
+/// the caret sits at the bottom and the pane is full.
+const SPLIT_FILL_ROWS: usize = 40;
+/// The width those rows are filled to: the WIDEST pane a `SPLIT_PANES` split of
+/// [`SPLIT_COLS`] produces, so the focused pane's rows are fully materialized.
+/// See [`wide_line`] for why this is not scenery.
+const SPLIT_FILL_COLS: usize = SPLIT_COLS as usize / 2;
+
 /// Neutral, non-lexicon text: it must put INK on the rows (the pet map's
 /// input) without summoning sparkle-word decorations, whose multi-second
 /// episodes would keep the fixtures from ever settling.
 fn bland_line(i: usize) -> Vec<u8> {
     format!("row {i:02} 0123456789 abcdef 0123456789 abcdef\r\n").into_bytes()
+}
+
+/// [`bland_line`] padded to `width` columns — the same neutral, non-lexicon
+/// alphabet, filling the row instead of leaving most of it unwritten.
+///
+/// Width is load-bearing for the split workload and for nothing else in this
+/// file. An engine row snapshot is RAGGED: `cell_frame_fill` materializes only
+/// the row's WRITTEN PREFIX, so a 90x170 pane holding 40-column lines resolves
+/// ~3.7k cells per frame, not 15.3k. A fixture built from `bland_line` would
+/// therefore price a QUARTER of the resolve the audit item is about and report
+/// the smaller saving as the whole story. Filling the pane is the honest upper
+/// end of the same one number; both ends are recorded in the item's notes.
+fn wide_line(i: usize, width: usize) -> Vec<u8> {
+    let mut line = format!("row {i:02} ");
+    while line.len() < width {
+        line.push_str("0123456789 abcdef ");
+    }
+    line.truncate(width);
+    line.push_str("\r\n");
+    line.into_bytes()
 }
 
 /// PET-03 fixture: 2-pane split, pet CONFIGURED (`rainbow kitty pet`) but
@@ -330,6 +392,54 @@ fn flood_chunk() -> Vec<u8> {
     }
     out.truncate(FLOOD_CHUNK);
     out
+}
+
+/// SPLIT-COMPOSE fixture: a `SPLIT_PANES`-way split at [`SPLIT_ROWS`]x
+/// [`SPLIT_COLS`], DEFAULT config (the shipped shape), every pane carrying a
+/// screenful of neutral text with a prompt at the caret.
+///
+/// The engines are really resized to their pane rectangles
+/// (`resize_settle` — the eager pass every non-drag caller runs), which is
+/// load-bearing: the carrier's continuity check compares the scratch's
+/// dimensions against the terminal's OWN `rows()`/`cols()`, so a fixture that
+/// set only the window grid would hand every pane a dimension mismatch and both
+/// arms would fall back to the full re-extract while reporting a confident zero.
+fn f_split() -> (BenchApp, Instant) {
+    let mut b = BenchApp::headless();
+    for _ in 1..SPLIT_PANES {
+        b.split_stub();
+    }
+    b.set_grid(SPLIT_ROWS, SPLIT_COLS);
+    b.resize_settle();
+    let t0 = Instant::now();
+    b.mark_deco_birth(t0);
+    for sid in b.session_ids() {
+        for i in 0..SPLIT_FILL_ROWS {
+            b.feed(sid, &wide_line(i, SPLIT_FILL_COLS));
+        }
+        b.feed(sid, b"user@host demo $ ");
+    }
+    b.compose_at(SPLIT_ROWS, SPLIT_COLS, t0);
+    (b, t0)
+}
+
+/// One split frame plus its arm, returning `(presented, scoped, full)` for the
+/// frame alone — the reach witness `verify_split` asserts on.
+///
+/// `unscoped: true` is the PRE-FIX focused extraction verbatim: the focused
+/// pane's resident buffer is disowned before the frame, so its extraction can
+/// only take the carrier's FULL arm, which IS the historical `cell_frame_into` +
+/// `take_damage` pair. Nothing else differs — same panes, same echo, same
+/// blit, same decorations, ONE binary.
+fn split_frame(b: &mut BenchApp, now: Instant, tick: &mut u8, unscoped: bool) -> (bool, u64, u64) {
+    b.split_echo(tick);
+    if unscoped {
+        b.disown_focus_scratch();
+    }
+    let (s0, f0) = b.refill_arms();
+    let presented = b.compose_at(SPLIT_ROWS, SPLIT_COLS, now);
+    let (s1, f1) = b.refill_arms();
+    (presented, s1 - s0, f1 - f0)
 }
 
 /// Keystroke-echo fixture: single pane, default config, a prompt on screen.
@@ -827,6 +937,78 @@ fn verify_strip() -> BenchApp {
 /// by hand (the loop a real PTY closes), a `\r\n` every `ECHO_LINE` strokes so
 /// the line never hits the right margin. Returns the echoed char, `None` on
 /// the wrap strokes (their frame moves the cursor, not a new glyph).
+/// THE SPLIT WORKLOAD'S GUARDS, two-sided, before a nanosecond is timed.
+///
+/// REACH is the whole point here and it is asserted PER PANE, not per frame. A
+/// composed frame extracts once per visible pane, so "some extraction took the
+/// scoped arm" is exactly the claim that reads as proof and is not: the
+/// BACKGROUND panes have taken it since audit-2 item 11, and an A/B whose two
+/// arms differed in nothing would sail past a frame-level check.
+///
+/// So both arms are pinned to an exact census:
+///
+/// * `split_compose_full`   — `SPLIT_PANES - 1` scoped + EXACTLY 1 full. The
+///   one full is the focused pane, forced by the disown; the backgrounds stay
+///   scoped, which is what makes the focused extraction the ONLY difference
+///   between the arms.
+/// * `split_compose_scoped` — `SPLIT_PANES` scoped, ZERO full.
+///
+/// Both arms must also PRESENT every frame: an early-out frame prices a
+/// RepaintKey comparison, not an extraction, and would silently equalize the
+/// two arms.
+fn verify_split() -> (BenchApp, Instant, u8) {
+    let (mut b, mut now) = f_split();
+    assert_eq!(
+        b.pane_count(),
+        SPLIT_PANES,
+        "the split fixture did not build the shape it claims"
+    );
+    let mut tick = 0u8;
+    // The FULL arm never chains, so every one of its frames reads the same.
+    for i in 0..WARM_FRAMES {
+        now += FRAME_DT;
+        let (presented, scoped, full) = split_frame(&mut b, now, &mut tick, true);
+        assert!(
+            presented,
+            "split_compose_full: frame {i} took the early-out"
+        );
+        assert_eq!(
+            (scoped, full),
+            ((SPLIT_PANES - 1) as u64, 1),
+            "split_compose_full frame {i}: expected the focused pane on the FULL \
+             arm and every background pane still scoped — the A/B would otherwise \
+             be pricing something other than the focused extraction"
+        );
+    }
+    // The scoped arm chains from its first un-disowned frame on.
+    now += FRAME_DT;
+    let _ = split_frame(&mut b, now, &mut tick, false);
+    for i in 0..WARM_FRAMES {
+        now += FRAME_DT;
+        let (presented, scoped, full) = split_frame(&mut b, now, &mut tick, false);
+        assert!(
+            presented,
+            "split_compose_scoped: frame {i} took the early-out"
+        );
+        assert_eq!(
+            (scoped, full),
+            (SPLIT_PANES as u64, 0),
+            "split_compose_scoped frame {i}: EVERY pane must take the damage-scoped \
+             arm — the arm does not price what it is named for"
+        );
+    }
+    report(
+        "split_compose",
+        &format!(
+            "{SPLIT_PANES} panes at {SPLIT_ROWS}x{SPLIT_COLS} | \
+             full arm {}+1 scoped+full on {WARM_FRAMES}/{WARM_FRAMES} | \
+             scoped arm {SPLIT_PANES}+0 on {WARM_FRAMES}/{WARM_FRAMES}",
+            SPLIT_PANES - 1
+        ),
+    );
+    (b, now, tick)
+}
+
 fn echo_arm(b: &mut BenchApp, now: &mut Instant, k: &mut u32) -> Option<char> {
     *now += TYPE_DT;
     *k += 1;
@@ -1221,6 +1403,7 @@ fn frame_latency(c: &mut Criterion) {
     let (mut sb_live, mut sb_live_now) = verify_live_bottom();
     let (mut sb_wheel, mut sb_wheel_now, mut sb_wheel_dir) = verify_wheel();
     let mut strip = verify_strip();
+    let (mut split, mut split_now, mut split_tick) = verify_split();
 
     {
         let mut group = c.benchmark_group("frame_latency");
@@ -1360,6 +1543,63 @@ fn frame_latency(c: &mut Criterion) {
                 });
             });
         }
+        // 4c. THE SPLIT COMPOSE FRAME (the compose-pane-amplification audit
+        // item). ONE BINARY, TWO ARMS, differing in EXACTLY ONE THING: whether
+        // the FOCUSED pane's extraction may chain from its own resident buffer.
+        //
+        // `split_compose_full` disowns that buffer before every frame, which is
+        // the pre-fix focused extraction verbatim (the historical
+        // `cell_frame_into` + `take_damage` pair could not chain either), and
+        // leaves the background panes on the scoped arm they have had since
+        // audit-2 item 11. `split_compose_scoped` lets it chain. Same fixture,
+        // same one-row echo, same per-pane blit, same decorations — so what is
+        // left between the two numbers is one full O(rows x cols) engine resolve
+        // of the focused pane per presented frame.
+        //
+        // `verify_split` pins the per-pane arm census on BOTH sides. The disown
+        // itself is untimed (it is not work any shipping frame does), and it
+        // costs the full arm the carrier's O(1) continuity check on top of the
+        // historical pair — a handful of scalar compares against a whole-grid
+        // resolve, in the only direction that is honest to state.
+        group.bench_function("split_compose_full", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    split_now += FRAME_DT;
+                    split.split_echo(&mut split_tick);
+                    split.disown_focus_scratch();
+                    let t0 = Instant::now();
+                    black_box(split.compose_at(SPLIT_ROWS, SPLIT_COLS, split_now));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+        // Re-establish the chain the disowned arm above broke: the first
+        // un-disowned frame is still Full, the next one may be Scoped.
+        split_now += FRAME_DT;
+        let _ = split_frame(&mut split, split_now, &mut split_tick, false);
+        split_now += FRAME_DT;
+        assert_eq!(
+            split_frame(&mut split, split_now, &mut split_tick, false),
+            (true, SPLIT_PANES as u64, 0),
+            "split_compose_scoped must take the SCOPED arm on every pane — the \
+             bench would otherwise price two identical full re-extracts against \
+             each other"
+        );
+        group.bench_function("split_compose_scoped", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    split_now += FRAME_DT;
+                    split.split_echo(&mut split_tick);
+                    let t0 = Instant::now();
+                    black_box(split.compose_at(SPLIT_ROWS, SPLIT_COLS, split_now));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
         // 5. Steady state as resident state scales.
         for (n, b_app, now) in tabs.iter_mut() {
             group.bench_function(BenchmarkId::new("many_tabs_idle", *n), |b| {

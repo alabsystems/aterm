@@ -1165,10 +1165,32 @@ impl crate::App {
             // Foreground-job PRESENCE only: `tcgetpgrp` gives a Boolean, not a
             // process name (the name is not available on the session path at
             // all), so the classifier is deliberately built to need only this.
+            //
+            // Routed through `App::job_probe` rather than calling
+            // `foreground_is_job` directly. On unix that is the same cheap
+            // per-fd `tcgetpgrp` this always was. On WINDOWS there is no
+            // `tcgetpgrp`, so the answer comes from a system-wide process-table
+            // walk (~3 ms measured) — and calling it here, once per due session
+            // per sweep, is what made an idle EIGHT-tab window cost ~4x an idle
+            // one-tab window at the same two frames a second: eight walks every
+            // 250 ms, ~100 ms of CPU per idle second, none of it visible to the
+            // scheduler's deadline counters because it rides the per-turn sweep
+            // rather than any armed wake. `JobProbe` keeps the verdict and its
+            // freshness rule and removes only the duplication: one capture per
+            // sweep for every due session, and one per
+            // `quit_safety::JOB_PROBE_MAX_AGE` while no session's evidence moves.
             let foreground_job = (master >= 0 && pid > 0).then(|| {
-                crate::quit_safety::foreground_is_job(
-                    crate::quit_safety::foreground_pgrp(master),
+                self.job_probe.is_job(
+                    id,
+                    master,
                     pid,
+                    crate::quit_safety::JobEvidenceKey {
+                        content_seq,
+                        alt_screen,
+                        output_ns: latest_output_ns,
+                        input: last_input,
+                    },
+                    now,
                 )
             });
             let evidence = Evidence {
@@ -1385,6 +1407,10 @@ impl crate::App {
 
     pub(crate) fn retire_session_status(&mut self, session: u64) {
         self.session_status.retire(session);
+        // The job oracle's per-session evidence describes a pool entry that no
+        // longer exists; without this the map would grow one entry per closed
+        // tab for the process lifetime.
+        self.job_probe.forget(session);
     }
 
     /// Project one session's SUBJECT + STATUS onto the `status` verb's reply
@@ -1478,6 +1504,126 @@ impl crate::App {
             status.conflict,
             self.session_status.revision(session),
         ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod idle_cost_tests {
+    use std::time::{Duration, Instant};
+
+    /// A pid that certainly owns no child process, so the classifier's verdict
+    /// is stable however the test binary's own process tree happens to look.
+    const CHILDLESS_PID: i32 = 0x7FFF_FFF0;
+
+    /// Stage `extra` additional pooled sessions that LOOK like real ConPTY
+    /// sessions to the status observer: a non-negative master (windows hands
+    /// out opaque registry keys from `0x4000_0000`) and a live-looking pid.
+    /// Both are what arms the `foreground_job` evidence — the headless
+    /// fixture's `master = -1, pid = -1` stubs skip it entirely, which is
+    /// exactly why the cost this test pins had never been priced.
+    fn stage_pty_like_sessions(app: &mut crate::App, count: u64) {
+        for i in 0..count {
+            let mut session = crate::stub_session(1000 + i);
+            session.master = 0x4000_0000 + i32::try_from(i).expect("small fixture");
+            session.pid = CHILDLESS_PID;
+            app.pool.insert(session);
+        }
+    }
+
+    /// Run `secs` of SIMULATED idle event loop: the observer sweep
+    /// `about_to_wait` runs on every turn, at the ~4 turns a second an idle
+    /// blinking cursor produces. Returns how many system process-table
+    /// captures the foreground-job oracle bought.
+    fn idle_captures(pty_sessions: u64, secs: u64) -> u64 {
+        let mut app = crate::App::headless_for_test();
+        stage_pty_like_sessions(&mut app, pty_sessions);
+        let t0 = Instant::now();
+        let turns = secs * 4;
+        for turn in 0..turns {
+            let now = t0 + Duration::from_millis(250 * turn);
+            let _ = app.observe_session_statuses(now);
+        }
+        app.job_probe.capture_count()
+    }
+
+    /// THE IDLE-WAKE REGRESSION GUARD (bundle `idle-wakes`).
+    ///
+    /// The tab-status observer asks "is a foreground job running?" once per due
+    /// session on every event-loop turn. On unix that is a `tcgetpgrp` on the
+    /// session's own fd. On WINDOWS there is no such call, so the answer came
+    /// from a system-wide process-table walk — measured at ~3.1 ms on the
+    /// machine this was found on — bought once per session per sweep. An idle
+    /// window with eight restored tabs was therefore spending roughly a tenth
+    /// of a CPU second per idle second discovering that eight idle prompts
+    /// were still idle, and none of it showed up in the scheduler's deadline
+    /// counters because it rides the per-turn sweep rather than any armed wake.
+    ///
+    /// What must hold now: the number of captures an IDLE window buys does not
+    /// depend on how many tabs it has, and is bounded by the ceiling rather
+    /// than by the sweep rate.
+    #[test]
+    fn an_idle_windows_job_probe_cost_does_not_scale_with_tab_count() {
+        const SECS: u64 = 30;
+        let ceiling_refreshes = SECS / crate::quit_safety::JOB_PROBE_MAX_AGE.as_secs() + 1;
+
+        let one_tab = idle_captures(1, SECS);
+        let eight_tabs = idle_captures(8, SECS);
+        println!(
+            "IDLE JOB PROBES over {SECS}s: 1 tab = {one_tab} captures, \
+             8 tabs = {eight_tabs} captures (ceiling allows {ceiling_refreshes})"
+        );
+
+        assert_eq!(
+            eight_tabs, one_tab,
+            "an idle window's process-table captures must not scale with tab \
+             count (8 tabs bought {eight_tabs}, 1 tab bought {one_tab})"
+        );
+        assert!(
+            eight_tabs <= ceiling_refreshes,
+            "{SECS}s of idle must buy at most one capture per \
+             JOB_PROBE_MAX_AGE ({ceiling_refreshes}), bought {eight_tabs}"
+        );
+        assert!(
+            eight_tabs >= 1,
+            "the fixture must actually reach the probe — a staged session whose \
+             master/pid never arm `foreground_job` would price an early return"
+        );
+    }
+
+    /// The other half: the probe still WORKS. A session whose evidence moves
+    /// gets a capture taken after the movement, so a real job start is never
+    /// answered from a stale process table.
+    #[test]
+    fn a_session_whose_grid_moves_buys_a_fresh_capture() {
+        let mut app = crate::App::headless_for_test();
+        stage_pty_like_sessions(&mut app, 3);
+        let t0 = Instant::now();
+        let _ = app.observe_session_statuses(t0);
+        let settled = app.job_probe.capture_count();
+        assert!(settled >= 1, "the first sweep captures");
+
+        // A later sweep inside the ceiling with nothing moving: no capture.
+        let t1 = t0 + Duration::from_millis(500);
+        let _ = app.observe_session_statuses(t1);
+        assert_eq!(
+            app.job_probe.capture_count(),
+            settled,
+            "a settled sweep must buy nothing"
+        );
+
+        // Now write to one staged session's grid — the `content_seq` movement
+        // a starting job produces — and sweep again inside the ceiling.
+        let term = app.pool.get(1000).expect("staged session").term.clone();
+        term.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .process(b"$ cargo build\r\n");
+        let t2 = t1 + Duration::from_millis(500);
+        let _ = app.observe_session_statuses(t2);
+        assert_eq!(
+            app.job_probe.capture_count(),
+            settled + 1,
+            "moved evidence must force exactly one fresh capture"
+        );
     }
 }
 

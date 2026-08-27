@@ -1469,21 +1469,13 @@ pub struct Journal {
     /// Append-only, exactly like [`Journal::upload_intents`].
     #[serde(default)]
     pub mirror_upload_intents: Vec<String>,
-    /// The LEAN drag-install DMG's digest — post-container-hook, in-process —
-    /// which is the byte AUTHORITY for `aterm-<v>-lite.dmg` and its `aterm.dmg`
-    /// alias, because the signed manifest deliberately names no lite container
-    /// (no client elects one; see `mirror::dmg_lite_asset_name`). The `.sha256`
-    /// sidecars restate this value; they never originate it, exactly as the
-    /// manifest-bound sidecars never originate theirs.
-    ///
-    /// `None` is the PRE-LITE shape — a journal written before the lane
-    /// existed, or a recovery of a release published without one — and every
-    /// consumer must then keep that cut's asset set byte-for-byte what it
-    /// always was (`mirror::required_asset_names` takes it as the `lite_dmg`
-    /// flag). `step_selfcheck` upgrades a pre-lite journal it re-enters by
-    /// building the missing artifact and recording the digest here.
-    #[serde(default)]
-    pub lite_dmg_sha256: Option<String>,
+    // RETIRED 2026-08-26: `lite_dmg_sha256`, the byte authority for the
+    // `aterm-<v>-lite.dmg` twin and its `aterm.dmg` alias. The key is simply
+    // absent from the struct now; a journal written by the previous cutter
+    // that still carries it loads (serde ignores unknown keys), and its
+    // mirrored set is judged by today's exact set — a channel head that
+    // already received the lean twin is refused at the mirror's exact-set
+    // gate ("unexpected aterm-<v>-lite.dmg") for a human to inspect.
     /// Completed steps, in completion order (a subset of [`STEPS`]).
     #[serde(default)]
     pub done: Vec<String>,
@@ -1690,19 +1682,6 @@ impl Journal {
                 &self.mirror_upload_intents,
             )?;
         }
-        // The lite digest is the sole byte authority for two published assets
-        // (the manifest names neither), so a corrupt record here is a corrupt
-        // channel object later — refuse the journal, not the mirror.
-        if let Some(sha) = self.lite_dmg_sha256.as_deref()
-            && (sha.len() != 64
-                || !sha
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
-        {
-            return Err(Error::new(
-                "release journal lite DMG digest is not exactly 64 lowercase hex digits",
-            ));
-        }
         Ok(())
     }
 
@@ -1876,69 +1855,6 @@ pub const fn draft_cleanup_decision(
         (Some(false), true, _) | (None, false, _) | (None, true, false) => {
             DraftCleanupDecision::RefuseUnknownOrInconsistent
         }
-    }
-}
-
-/// What `step_selfcheck` may do about the LEAN drag-install DMG.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiteDmgPlan {
-    /// The journaled digest and the bytes on disk agree — proven, proceed.
-    Proven,
-    /// Build (or rebuild) the artifact through the packaging lane and record
-    /// its digest as the cut's new lite authority. Legal in exactly two
-    /// shapes: a pre-lite journal re-entering selfcheck (no record exists —
-    /// this is how an old cut is upgraded in place), and a recorded artifact
-    /// that has gone missing from mutable dist/ BEFORE its bytes ever crossed
-    /// to the public channel (the record is then this cutter's own private
-    /// note, free to re-mint — a DMG rebuild is never byte-identical, so the
-    /// record must move with it).
-    Rebuild,
-    /// Bytes exist that disagree with the cut's own digest record. This cutter
-    /// only writes what it records, so something else wrote these — refuse,
-    /// never repair, exactly as for a divergent stable twin.
-    RefuseDivergent,
-    /// The recorded artifact is gone AND its bytes were already durably
-    /// uploaded toward the public channel. A rebuild cannot reproduce them
-    /// (DMG imaging + staple are not deterministic), so converging the mirror
-    /// against fresh bytes would be publishing different bytes than the ones
-    /// the intent covered — stop and let a human look.
-    RefuseIrreproducible,
-}
-
-/// Decide the lean-DMG selfcheck action from the three facts that matter:
-/// the cut's own digest record, what dist/ holds now, and whether a mirror
-/// upload intent for the lite asset was ever durably issued.
-///
-/// A pure sibling of [`durable_post_decision`] for the same reason: the rule
-/// is fleet-facing (it governs what `aterm.dmg` will serve) and the effectful
-/// caller needs a real build to run, so the rule would otherwise be exactly as
-/// untested as it is important.
-#[must_use]
-pub fn lite_dmg_selfcheck_plan(
-    journaled_sha256: Option<&str>,
-    observed_sha256: Option<&str>,
-    mirror_upload_issued: bool,
-) -> LiteDmgPlan {
-    match (journaled_sha256, observed_sha256) {
-        (Some(recorded), Some(observed)) => {
-            if recorded.eq_ignore_ascii_case(observed) {
-                LiteDmgPlan::Proven
-            } else {
-                LiteDmgPlan::RefuseDivergent
-            }
-        }
-        (Some(_), None) | (None, _) if mirror_upload_issued => {
-            // An issued intent with no matching record+bytes pair is a state
-            // this cutter never writes (the intent is only minted over a
-            // recorded artifact) — fail closed rather than guess which bytes
-            // the channel holds.
-            LiteDmgPlan::RefuseIrreproducible
-        }
-        (Some(_), None) => LiteDmgPlan::Rebuild,
-        // No record: a pre-lite journal. Bytes without a record (if any) are
-        // unattested leftovers; the rebuild overwrites them exactly as a
-        // re-entered `step_build` would.
-        (None, _) => LiteDmgPlan::Rebuild,
     }
 }
 
@@ -4029,94 +3945,6 @@ pub(crate) const fn release_identity_jq(listing: bool) -> &'static str {
     }
 }
 
-/// The highest `atpkg-index-N` build published in `slug`, or `None` when the
-/// repo publishes no index releases at all.
-///
-/// Deliberately reads TAG NAMES only. The index build is encoded in the tag by
-/// `tools/atpkg-index.sh`, so this needs neither asset downloads nor signature
-/// verification — it is answering "has the index moved past what we sealed?",
-/// not "is this index trustworthy?". Trust is the client's chain's job, and it
-/// runs over the sealed bytes regardless of what this returns.
-fn newest_published_index_build(slug: &str) -> Result<Option<u64>> {
-    const PER_PAGE: usize = 100;
-    let endpoint = format!("repos/{slug}/releases?per_page={PER_PAGE}");
-    let out = gh_retry(&["api", &endpoint, "--jq", ".[].tag_name"])?;
-    Ok(out
-        .stdout_utf8()
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("atpkg-index-"))
-        .filter_map(|rest| rest.parse::<u64>().ok())
-        .max())
-}
-
-/// Refuse a cut whose staged seed is behind the index CLIENTS will read.
-///
-/// The seal is frozen at staging time and then pressed into every DMG, so an
-/// index published between staging and cut ships as day-one staleness that no
-/// amount of client-side care can undo. v0.44.0 is the worked example: sealed
-/// at index build 8, `atpkg-index-9` published 70 minutes before the cut, and
-/// four of ten programs (`ay`, `clean`, `ny`, `ty`) were behind the moment the
-/// DMG existed.
-///
-/// Every other seed gate here is internal-consistency or shelf-life — all of
-/// them pass on a stale-but-well-formed seal, which is exactly what shipped.
-/// This is the only gate that asks the outside world a question.
-///
-/// FATAL on a confirmed lag (with a named override, because rehearsing an older
-/// index is a real if rare thing to want) and LOUD but non-fatal when the index
-/// cannot be reached — an offline rehearsal should not be blocked by a gate
-/// that had no answer either way.
-fn gate_seed_matches_published_index(stat: &crate::seedpack::SeedStat) -> Result<()> {
-    if std::env::var_os("ATERM_ALLOW_STALE_SEED").is_some() {
-        step(
-            "seed-index",
-            &format!(
-                "ATERM_ALLOW_STALE_SEED set — NOT checking index build {} against the published index",
-                stat.index_build
-            ),
-        );
-        return Ok(());
-    }
-    let slug = atpkg::discovery::resolve_account(None).slug();
-    match newest_published_index_build(&slug) {
-        Ok(Some(newest)) if newest > stat.index_build => Err(Error::new(format!(
-            "staged seed is index build {} but {slug} already publishes atpkg-index-{newest} — \
-             every DMG from this cut would install superseded programs on day one. Re-stage with \
-             `tools/atpkg-seed-from-published.sh` (it now takes the newest index by default), or \
-             cut anyway with ATERM_ALLOW_STALE_SEED=1.",
-            stat.index_build
-        ))),
-        Ok(Some(newest)) => {
-            step(
-                "seed-index",
-                &format!(
-                    "seed is index build {} — current with {slug} (newest: {newest})",
-                    stat.index_build
-                ),
-            );
-            Ok(())
-        }
-        Ok(None) => {
-            step(
-                "seed-index",
-                &format!("{slug} publishes no atpkg-index-N release — nothing to compare against"),
-            );
-            Ok(())
-        }
-        Err(e) => {
-            step(
-                "seed-index",
-                &format!(
-                    "WARNING: could not read the published index list from {slug} ({e}) — \
-                     shipping seed index build {} UNCHECKED for staleness",
-                    stat.index_build
-                ),
-            );
-            Ok(())
-        }
-    }
-}
-
 /// Exhaustively resolve a tag to release objects. Unlike
 /// `GET /releases/tags/{tag}`, this sees duplicate drafts instead of letting
 /// REST order silently choose one.
@@ -4816,6 +4644,33 @@ pub fn release_inventory_asset_name_by_id(
     Ok(asset.name.clone())
 }
 
+/// Refuse a manifest that still names the RETIRED Intel DMG pair
+/// (`dmg_x86_64` / `dmg_x86_64_sha256`, retired 2026-08-26 with the
+/// batteries-included seed).
+///
+/// The two wire keys stay in the shared `Manifest` type so every client keeps
+/// parsing the manifests already published under them; this cutter simply
+/// never emits them, and every gate that judges a manifest — the draft
+/// exact-set gate, the self-check, post-publish verify and a killed-machine
+/// recovery — runs this first so a manifest from the retired contract is
+/// refused by name rather than half-honoured by a set that no longer carries
+/// the container it names.
+pub fn refuse_retired_intel_dmg(manifest: &Manifest) -> Result<()> {
+    if manifest.dmg_x86_64.is_some() || manifest.dmg_x86_64_sha256.is_some() {
+        return Err(Error::new(format!(
+            "manifest names the Intel DMG variant ({:?}) — retired 2026-08-26: aterm ships \
+             ONE lean macOS DMG and this cutter neither produces nor mirrors an \
+             `aterm-<v>-x86_64.dmg`. Finish or retire the cut that staged this manifest \
+             with the cutter version that started it",
+            manifest
+                .dmg_x86_64
+                .as_deref()
+                .unwrap_or("<digest without a name>")
+        )));
+    }
+    Ok(())
+}
+
 /// The exact asset set a draft may carry before it is allowed to become visible.
 ///
 /// `roster_attached` is derived from the MANIFEST's own `machine_id`, not from a
@@ -4844,15 +4699,10 @@ pub fn validate_draft_asset_set(
     // to verify the download against.
     let dmg_sidecar = mirror::sha256_sidecar_name(&manifest.dmg);
     let zip_sidecar = manifest.zip.as_deref().map(mirror::sha256_sidecar_name);
-    // The Intel DMG rides on the manifest's say-so, exactly like the zip: a
-    // manifest naming a `dmg_x86_64` the draft does not carry would publish a
-    // head install.sh elects and then fails to download, and a draft carrying
-    // one the manifest never named would ship an asset no install can verify a
-    // digest for.
-    let x86_sidecar = manifest
-        .dmg_x86_64
-        .as_deref()
-        .map(mirror::sha256_sidecar_name);
+    // RETIRED 2026-08-26: the Intel `dmg_x86_64` pair. This cutter emits
+    // neither wire key, so a manifest naming one is not this cutter's — refuse
+    // before judging the draft against a container shape that no longer ships.
+    refuse_retired_intel_dmg(manifest)?;
     let mut exact_counts = vec![
         (manifest_out::MANIFEST_ASSET, 1usize),
         (
@@ -4871,12 +4721,6 @@ pub fn validate_draft_asset_set(
     if let Some(sidecar) = zip_sidecar.as_deref() {
         exact_counts.push((sidecar, 1usize));
     }
-    if let Some(x86) = manifest.dmg_x86_64.as_deref() {
-        exact_counts.push((x86, 1usize));
-    }
-    if let Some(sidecar) = x86_sidecar.as_deref() {
-        exact_counts.push((sidecar, 1usize));
-    }
     for (name, expected) in exact_counts {
         let observed = count(name);
         if observed != expected {
@@ -4891,10 +4735,8 @@ pub fn validate_draft_asset_set(
         .map(String::as_str)
         .collect();
     dmgs.sort_unstable();
-    let mut expected_dmgs: Vec<&str> = std::iter::once(manifest.dmg.as_str())
-        .chain(manifest.dmg_x86_64.as_deref())
-        .collect();
-    expected_dmgs.sort_unstable();
+    // ONE DMG: the manifest-named one, nothing else.
+    let expected_dmgs: Vec<&str> = vec![manifest.dmg.as_str()];
     if dmgs != expected_dmgs {
         return Err(Error::new(format!(
             "draft artifact set has non-canonical DMG names {dmgs:?}; expected exactly \
@@ -4911,12 +4753,6 @@ pub fn validate_draft_asset_set(
         allowed.push(zip);
     }
     if let Some(sidecar) = zip_sidecar.as_deref() {
-        allowed.push(sidecar);
-    }
-    if let Some(x86) = manifest.dmg_x86_64.as_deref() {
-        allowed.push(x86);
-    }
-    if let Some(sidecar) = x86_sidecar.as_deref() {
         allowed.push(sidecar);
     }
     if signature_required {
@@ -5643,17 +5479,9 @@ pub fn validate_live_release_identity(
             "published manifest names zip {zip:?}, expected exact {expected_zip:?}"
         )));
     }
-    // Same contract for the optional Intel DMG: a manifest that names one must
-    // name the canonical spelling — install.sh derives this exact string from
-    // the manifest's own `version` and refuses anything else.
-    let expected_x86 = mirror::dmg_x86_64_asset_name(expected.version);
-    if let Some(x86) = manifest.dmg_x86_64.as_deref()
-        && x86 != expected_x86
-    {
-        return Err(Error::new(format!(
-            "published manifest names Intel DMG {x86:?}, expected exact {expected_x86:?}"
-        )));
-    }
+    // RETIRED 2026-08-26: the optional Intel DMG. A published manifest naming
+    // one was not emitted by this cutter and is not a shape it can verify.
+    refuse_retired_intel_dmg(&manifest)?;
     match (signature_required, live_signature, signature_pubkey) {
         (true, Some(signature), Some(pubkey)) => {
             if local_signature != Some(signature) {
@@ -5823,11 +5651,6 @@ pub struct CutCtx {
     pub mirror_release_id: Option<u64>,
     pub mirror_create_issued: bool,
     pub mirror_upload_intents: Vec<String>,
-    /// The lean DMG's post-hook digest — mirror of [`Journal::lite_dmg_sha256`]
-    /// and carried here too because dry-run/rehearse cuts are deliberately
-    /// unjournaled. `None` = a pre-lite cut whose asset set must stay exactly
-    /// what it was (see the journal field's doc for the full contract).
-    pub lite_dmg_sha256: Option<String>,
     pub kind: CutKind,
     /// `--no-paint-smoke`, carried to `step_selfcheck`. Never journaled: a
     /// resume re-earns the paint proof (and the CLI refuses the flag there,
@@ -5906,64 +5729,6 @@ impl CutCtx {
     fn stable_zip_sha256_path(&self) -> PathBuf {
         self.dist
             .join(mirror::sha256_sidecar_name(&mirror::stable_zip_asset_name()))
-    }
-    /// The LEAN drag-install DMG in dist/ (`aterm-<v>-lite.dmg`) and its
-    /// sidecar. Its byte authority is [`Self::lite_dmg_sha256`], never the
-    /// manifest — see `mirror::dmg_lite_asset_name` for the naming contract.
-    fn dmg_lite_path(&self) -> PathBuf {
-        self.dist.join(mirror::dmg_lite_asset_name(&self.version))
-    }
-    fn dmg_lite_sha256_path(&self) -> PathBuf {
-        self.dist
-            .join(mirror::sha256_sidecar_name(&mirror::dmg_lite_asset_name(
-                &self.version,
-            )))
-    }
-    /// The seeded image's evergreen alias in dist/ (`aterm-offline.dmg`) and
-    /// its sidecar — staged exactly when the cut carries a lite DMG, because
-    /// the two repoints travel together (`mirror::stable_offline_dmg_asset_name`).
-    fn stable_offline_dmg_path(&self) -> PathBuf {
-        self.dist.join(mirror::stable_offline_dmg_asset_name())
-    }
-    fn stable_offline_dmg_sha256_path(&self) -> PathBuf {
-        self.dist.join(mirror::sha256_sidecar_name(
-            &mirror::stable_offline_dmg_asset_name(),
-        ))
-    }
-    /// Whether THIS cut carries the lean DMG lane — keyed on the cut's own
-    /// digest record rather than probing the disk, for the same reason the x86
-    /// pair asks the staged manifest: dist/ is mutable and a set-membership
-    /// decision must come from an authority, never from what happens to exist.
-    fn carries_lite_dmg(&self) -> bool {
-        self.lite_dmg_sha256.is_some()
-    }
-    /// The Intel DMG variant in dist/ (`aterm-<v>-x86_64.dmg`) — exists only
-    /// on a per-arch split cut; every consumer asks the STAGED MANIFEST first
-    /// ([`Self::staged_manifest_dmg_x86_64`]) rather than probing the disk.
-    fn dmg_x86_64_path(&self) -> PathBuf {
-        self.dist.join(mirror::dmg_x86_64_asset_name(&self.version))
-    }
-    fn dmg_x86_64_sha256_path(&self) -> PathBuf {
-        self.dist
-            .join(mirror::sha256_sidecar_name(&mirror::dmg_x86_64_asset_name(
-                &self.version,
-            )))
-    }
-    /// Whether THIS cut carries an Intel DMG, read from the staged appcast in
-    /// dist/ — the manifest is the single authority for the asset set (the
-    /// draft "is judged by what it says about itself"), and reading it back
-    /// keeps resume and recovery consistent without a second journaled copy
-    /// that could drift.
-    ///
-    /// Best-effort by design: `None` when no manifest is staged yet (pre-build,
-    /// or a fixture ctx) or when it does not parse. That cannot ship a wrong
-    /// set silently — the remote exact-set gates (`validate_draft_asset_set`,
-    /// `validate_mirror_asset_set`) re-derive the requirement from the manifest
-    /// BYTES actually published and fail closed on any disagreement; this
-    /// helper only decides what the local lanes stage and demand.
-    fn staged_manifest_dmg_x86_64(&self) -> Option<String> {
-        let text = fs::read_to_string(self.manifest_path()).ok()?;
-        Manifest::parse(&text).ok()?.dmg_x86_64
     }
     fn manifest_path(&self) -> PathBuf {
         self.dist.join(manifest_out::MANIFEST_ASSET)
@@ -6175,8 +5940,6 @@ impl CutCtx {
             &self.version,
             self.signature_required,
             self.attaches_roster(),
-            self.staged_manifest_dmg_x86_64().is_some(),
-            self.carries_lite_dmg(),
         )
         .into_iter()
         .map(|name| self.dist.join(name))
@@ -6221,13 +5984,6 @@ impl CutCtx {
             self.manifest_path(),
             self.provenance_path(),
         ];
-        // The Intel DMG pair travels exactly when the staged manifest names it
-        // — same authority the draft gate judges the upload against, so the two
-        // cannot disagree about membership.
-        if self.staged_manifest_dmg_x86_64().is_some() {
-            files.push(self.dmg_x86_64_path());
-            files.push(self.dmg_x86_64_sha256_path());
-        }
         files.extend(self.roster_asset_paths());
         files
     }
@@ -6247,10 +6003,6 @@ impl CutCtx {
             self.zip_sha256_path(),
             self.provenance_path(),
         ];
-        if self.staged_manifest_dmg_x86_64().is_some() {
-            files.push(self.dmg_x86_64_path());
-            files.push(self.dmg_x86_64_sha256_path());
-        }
         if self.signature_required {
             files.push(self.manifest_path().with_extension("toml.sig"));
         }
@@ -7506,9 +7258,8 @@ fn recover_published_cut(
     // Regenerate the stable download twins from the digest-verified canonical
     // containers: recovery must leave dist/ able to satisfy
     // required_asset_names(), and each twin is by definition a byte copy of
-    // its canonical asset. `aterm.dmg` gets the SEEDED image here on purpose:
-    // a recovered cut is pre-lite (see the journal below), and pre-lite is
-    // exactly the world where that alias serves the seeded bytes.
+    // its canonical asset: `aterm.dmg` is a byte copy of manifest.dmg, the ONE
+    // DMG (RETIRED 2026-08-26: the lean/seeded split the alias once tracked).
     fs::copy(
         dist.join(&manifest.dmg),
         dist.join(mirror::stable_dmg_asset_name()),
@@ -7527,41 +7278,12 @@ fn recover_published_cut(
         dist.join(mirror::stable_zip_asset_name()),
     )
     .map_err(|error| Error::new(format!("reconstruct stable zip twin: {error}")))?;
-    // The Intel DMG, whenever the manifest names one — same digest-verified
-    // lane as the canonical DMG, so a recovered dist/ can satisfy
-    // required_asset_names() on a per-arch release. A name without a digest is
-    // a malformed release this cutter never produces: refuse rather than
-    // reconstruct an asset nothing can verify.
-    let recovered_x86 = match (
-        manifest.dmg_x86_64.as_deref(),
-        manifest.dmg_x86_64_sha256.as_deref(),
-    ) {
-        (Some(name), Some(sha)) => {
-            if !exact_asset_present(&names, name)? {
-                return Err(Error::new(format!(
-                    "published recovery release has no exact Intel DMG {name} its own \
-                     manifest names"
-                )));
-            }
-            verify_release_asset_digest_for_release_id_to(
-                slug,
-                release_object.id,
-                &tag,
-                name,
-                sha,
-                &dist.join(name),
-            )?;
-            Some((name.to_string(), sha.to_string()))
-        }
-        (None, None) => None,
-        _ => {
-            return Err(Error::new(
-                "published recovery release names an Intel DMG without its digest (or the \
-                 digest without the name); this cutter never produces that pair — finish \
-                 or retire it by hand",
-            ));
-        }
-    };
+    // RETIRED 2026-08-26: the Intel DMG pair. A published release whose
+    // manifest still names one was cut by a previous cutter under a container
+    // contract this one no longer produces or mirrors — refuse the takeover
+    // rather than reconstruct a dist/ the mirror's exact-set gate would then
+    // refuse anyway.
+    refuse_retired_intel_dmg(&manifest)?;
     // The `.sha256` sidecars are pure functions of the manifest digests just
     // proved against the downloaded bytes, so a recovery REGENERATES them
     // rather than downloading — the mirror step demands them from dist/ and a
@@ -7571,15 +7293,12 @@ fn recover_published_cut(
     // `releases/latest/download` URLs actually save.
     let stable_dmg_name = mirror::stable_dmg_asset_name();
     let stable_zip_name = mirror::stable_zip_asset_name();
-    let mut sidecar_records = vec![
+    let sidecar_records = [
         (manifest.dmg.as_str(), manifest.sha256.as_str()),
         (recovered_zip.as_str(), recovered_zip_sha256.as_str()),
         (stable_dmg_name.as_str(), manifest.sha256.as_str()),
         (stable_zip_name.as_str(), recovered_zip_sha256.as_str()),
     ];
-    if let Some((name, sha)) = &recovered_x86 {
-        sidecar_records.push((name.as_str(), sha.as_str()));
-    }
     for (name, sha) in sidecar_records {
         let sidecar = mirror::sha256_sidecar_name(name);
         fs::write(
@@ -7638,18 +7357,6 @@ fn recover_published_cut(
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
-        // DELIBERATELY PRE-LITE. Recovery reconstructs only remotely validated
-        // bytes, and the lean DMG's digest lives in the dead publisher's
-        // journal, not in anything the private release carries (the signed
-        // manifest names no lite container) — so there is nothing truthful to
-        // recover it FROM. The recovered cut therefore mirrors the pre-lite
-        // asset set, which is exactly right for every release published before
-        // the lane existed. Recovering a cut whose mirror ALREADY carries the
-        // lean assets then refuses loudly at the mirror's exact-set gate
-        // ("unexpected aterm-<v>-lite.dmg") rather than converging `aterm.dmg`
-        // onto different bytes — a human inspects, which is the only honest
-        // move when the one byte authority died with the publisher.
-        lite_dmg_sha256: None,
         done: [
             "lock",
             "build",
@@ -7713,8 +7420,6 @@ fn recover_published_cut(
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
-        // Pre-lite, matching the journal above (its comment holds the why).
-        lite_dmg_sha256: None,
         kind: CutKind::Real,
         // Recovery re-runs no build/selfcheck step (all are journaled done),
         // so there is no smoke left to skip.
@@ -7735,18 +7440,6 @@ fn recover_published_cut(
 /// ledger, which supplies only the build number. Cutting twice without
 /// bumping Cargo.toml therefore lands on the already-published guard in
 /// [`verify::derive_cut_mode`], which names the bump.
-/// Whether this cut deliberately ships WITHOUT the batteries-included toolchain
-/// seed (§9.1). The one spelling of the escape hatch, read by both the
-/// pre-claim gate and the journaled `step_build`, so the two can never disagree
-/// about what this cut is.
-///
-/// Exactly `1` — not "any value set". A `ATERM_SEEDLESS=0` that silently meant
-/// "seedless" would be the worst possible reading of an operator's intent, and
-/// the same strict-`1` rule already governs the other env switches here.
-fn seedless_cut() -> bool {
-    std::env::var("ATERM_SEEDLESS").is_ok_and(|v| v.trim() == "1")
-}
-
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // Resolved ONCE, here — the explicit flag when given, else this machine's
     // provisioned identity (`~/.aterm/machine.key`, the same file every atpkg
@@ -7932,55 +7625,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         ),
     );
 
-    // Batteries-included seed, PRE-CLAIM (§9.1 + the ordering rule above):
-    // everything that can fail must fail before the ledger claim burns a build
-    // number, and a missing or drifted seed certainly fails step_build. Cheap —
-    // signature checks over a few MB of manifests plus stat calls; artifact
-    // bytes are never read. step_build revalidates the same dir (the authority
-    // for what actually seals); this gate only makes the refusal free.
-    // `ATERM_SEEDLESS=1` is checked BEFORE `resolve`, never as a `None` arm: it
-    // means "this cut ships no seed", which must hold whatever is lying in
-    // `dist/`. Testing it only when no dir exists made the documented escape
-    // hatch unreachable in the one case an operator actually needs it — a stale
-    // or half-staged `dist/toolchain-seed` would fail validation and there was
-    // no way to proceed except deleting the directory.
-    if seedless_cut() {
-        step("seed", "NONE — deliberately seedless (ATERM_SEEDLESS=1)");
-    } else {
-        let dist = repo.join("dist");
-        match crate::seedpack::resolve(&dist) {
-            Some(dir) => {
-                let stat = crate::seedpack::validate(&dir)
-                    .map_err(|e| Error::new(format!("toolchain seed gate (pre-claim): {e}")))?;
-                step(
-                    "seed",
-                    &format!(
-                        "{} program(s) staged, index_build {}, valid_until {}",
-                        stat.programs.len(),
-                        stat.index_build,
-                        stat.valid_until
-                    ),
-                );
-                // Emitted HERE and only here. The second call site (`step_build`) runs
-                // the same `validate` ninety seconds later and stays silent, because
-                // printing the identical paragraph twice in one cut is how a real warning
-                // teaches an operator to skip warnings.
-                for w in &stat.warnings {
-                    step("", w);
-                }
-            }
-            None => {
-                return Err(Error::new(
-                    "no toolchain seed staged — a batteries-included cut seals every \
-                     published binary into the app, and there is nothing to seal. No ledger \
-                     claim was made.\n\
-                     stage it:  tools/atpkg-seed-from-published.sh\n\
-                     or cut deliberately seedless:  ATERM_SEEDLESS=1\n\
-                     looked at:  dist/toolchain-seed, and ATERM_SEED_DIR (unset)",
-                ));
-            }
-        }
-    }
+    // RETIRED 2026-08-26: the pre-claim toolchain-seed gate (`dist/toolchain-seed`
+    // validation, `ATERM_SEEDLESS=1`). aterm ships ONE lean self-provisioning
+    // download; there is nothing to seal and nothing to gate.
     step(
         "",
         &format!(
@@ -8298,8 +7945,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
-        // Recorded by `step_build` once the lean DMG's post-hook digest exists.
-        lite_dmg_sha256: None,
         kind,
         no_paint_smoke: opts.no_paint_smoke,
         lease: None,
@@ -8325,7 +7970,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             mirror_release_id: None,
             mirror_create_issued: false,
             mirror_upload_intents: Vec::new(),
-            lite_dmg_sha256: ctx.lite_dmg_sha256.clone(),
             done: vec![],
         };
         j.save(&journal_path)?;
@@ -8483,10 +8127,6 @@ fn resume_cut(
         mirror_release_id: journal.mirror_release_id,
         mirror_create_issued: journal.mirror_create_issued,
         mirror_upload_intents: journal.mirror_upload_intents.clone(),
-        // The lean DMG's digest record rides the journal like every other cut
-        // authority; `None` here is a pre-lite journal, and `step_selfcheck`
-        // upgrades it in place iff selfcheck still has to run.
-        lite_dmg_sha256: journal.lite_dmg_sha256.clone(),
         kind: CutKind::Real,
         // Never journaled: a resumed self-check re-earns the paint proof.
         no_paint_smoke: false,
@@ -8836,52 +8476,14 @@ fn run_gate_script(repo: &Path) -> Result<()> {
 ///
 /// It wraps `dmg.rs` rather than changing it: the real implementation is four
 /// one-line delegations, so nothing about how a DMG is actually built moved.
+///
+/// RETIRED 2026-08-26: the `dmg_arch` (Intel `-x86_64` restage) and `dmg_lite`
+/// (seed-stripped `-lite` twin) lanes, and the `notarized`/`seeded` facts the
+/// zip lane took to judge its restage — there is no seed and no restage; the
+/// zip archives the bundle exactly as the DMG images it.
 pub trait Packager {
     fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
-    /// `notarized` says whether the bundle really carries a Developer-ID signature and
-    /// a stapled ticket. It decides whether the stripped-bundle Gatekeeper check is
-    /// advisory (ad-hoc tier: spctl rejects everything, so a failure proves nothing) or
-    /// FATAL (notarized tier: a rejection means the lean updater zip would fail on every
-    /// client).
-    /// `seeded` is the CUT'S OWN claim about whether it sealed a toolchain — the
-    /// packager cannot infer it, and the difference between "no seal" and "the seal
-    /// was removed under us" is a shipped release either way.
-    fn zip(
-        &self,
-        app: &Path,
-        dist: &Path,
-        version: &str,
-        notarized: bool,
-        seeded: bool,
-    ) -> Result<dmg::Packaged>;
-    /// The per-arch DMG lane (`dmg::create_arch_filtered`): restage the ONE
-    /// signed+notarized universal app with its sealed seed filtered to
-    /// `triple`'s artifacts, re-prove the filtered seed through the client
-    /// chain (`seedpack::ArchScope::Only`) and the codesign/Gatekeeper seal,
-    /// then image it. `notarized` decides whether the restage's spctl gate is
-    /// FATAL (notarized tier) or advisory (ad-hoc), exactly as for `zip`.
-    fn dmg_arch(
-        &self,
-        app: &Path,
-        dist: &Path,
-        version: &str,
-        triple: &str,
-        notarized: bool,
-    ) -> Result<dmg::Packaged>;
-    /// The LEAN drag-install DMG lane (`dmg::create_lite`): restage the ONE
-    /// signed+notarized app with its sealed seed STRIPPED (the same restage
-    /// proof chain the zip runs — `optional = true` `.lproj` seal, codesign +
-    /// Gatekeeper re-proof), then image it through the same hdiutil lane as the
-    /// seeded DMG. `notarized`/`seeded` carry exactly the meanings they carry
-    /// for [`Packager::zip`], guarding the same two failures.
-    fn dmg_lite(
-        &self,
-        app: &Path,
-        dist: &Path,
-        version: &str,
-        notarized: bool,
-        seeded: bool,
-    ) -> Result<dmg::Packaged>;
+    fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
     fn sha256(&self, path: &Path) -> Result<String>;
     fn size(&self, path: &Path) -> Result<u64>;
 }
@@ -8893,35 +8495,8 @@ impl Packager for RealPackager {
     fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged> {
         dmg::create(app, dist, version).map_err(Error::new)
     }
-    fn zip(
-        &self,
-        app: &Path,
-        dist: &Path,
-        version: &str,
-        notarized: bool,
-        seeded: bool,
-    ) -> Result<dmg::Packaged> {
-        dmg::create_zip(app, dist, version, notarized, seeded).map_err(Error::new)
-    }
-    fn dmg_arch(
-        &self,
-        app: &Path,
-        dist: &Path,
-        version: &str,
-        triple: &str,
-        notarized: bool,
-    ) -> Result<dmg::Packaged> {
-        dmg::create_arch_filtered(app, dist, version, triple, notarized).map_err(Error::new)
-    }
-    fn dmg_lite(
-        &self,
-        app: &Path,
-        dist: &Path,
-        version: &str,
-        notarized: bool,
-        seeded: bool,
-    ) -> Result<dmg::Packaged> {
-        dmg::create_lite(app, dist, version, notarized, seeded).map_err(Error::new)
+    fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged> {
+        dmg::create_zip(app, dist, version).map_err(Error::new)
     }
     fn sha256(&self, path: &Path) -> Result<String> {
         dmg::sha256_file(path).map_err(Error::new)
@@ -8941,27 +8516,11 @@ pub struct PackagedCut {
     /// The DMG size AFTER the hook, for the same reason.
     pub dmg_size: u64,
     pub zip: dmg::Packaged,
-    /// The INTEL DMG variant (`aterm-<v>-x86_64.dmg`) with its post-hook
-    /// digest and size — `Some` exactly when the cut's seed covers
-    /// `x86_64-apple-darwin` (the per-arch split lane). `None` reproduces
-    /// today's single-DMG behaviour byte-for-byte: a seedless or acknowledged
-    /// arm64-only cut emits one DMG and no `dmg_x86_64` manifest keys.
-    pub dmg_x86_64: Option<(dmg::Packaged, String, u64)>,
-    /// The LEAN drag-install DMG (`aterm-<v>-lite.dmg`) — unconditional, every
-    /// cut ships one. Its post-hook digest is NOT a manifest field (no client
-    /// elects this container); it becomes `Journal::lite_dmg_sha256`, the byte
-    /// authority for the artifact and its `aterm.dmg` download alias.
-    pub dmg_lite: dmg::Packaged,
-    /// The lite DMG digest AFTER its own container hook, exactly like
-    /// [`Self::dmg_sha256`].
-    pub dmg_lite_sha256: String,
-    /// The lite DMG size AFTER the hook, for the same reason.
-    pub dmg_lite_size: u64,
 }
 
-/// Notarize the bundle, build every container around it (the DMG family, then
-/// the zip), notarize each DMG, and return the digests that go on record —
-/// the manifest's for the containers it names, the journal's for the lite DMG.
+/// Notarize the bundle, build both containers around it (the DMG, then the
+/// zip), notarize the DMG, and return the digests that go on record in the
+/// manifest.
 ///
 /// # The order is the property
 ///
@@ -8984,11 +8543,6 @@ pub struct PackagedCut {
 /// On the inactive tier (the shipped one) both hooks do nothing, no re-hash
 /// happens, and this is `dmg::create` + `dmg::create_zip` with the digests they
 /// minted — byte-for-byte the pipeline as it has always run.
-// One extracted unit by design (the doc above: every line is sequenced against
-// a failure that produces a green cut and a broken artifact) — the two seed
-// facts pushed it to 8 parameters, and splitting it to satisfy the arity lint
-// would scatter exactly the ordering this function exists to hold together.
-#[allow(clippy::too_many_arguments)]
 pub fn notarize_and_package(
     app: &Path,
     dist: &Path,
@@ -8996,8 +8550,6 @@ pub fn notarize_and_package(
     tier: &sign::AppleTier,
     tools: &dyn sign::AppleTools,
     pack: &dyn Packager,
-    seeded: bool,
-    x86_split: bool,
 ) -> Result<PackagedCut> {
     // Said BEFORE the two notarization waits, and said HERE rather than in `sign.rs`,
     // which deliberately references nothing else in the crate so `tests/signconf.rs` can
@@ -9035,18 +8587,10 @@ pub fn notarize_and_package(
         );
     }
 
-    // THE CANONICAL DMG. On a per-arch split cut (`x86_split`, decided by the
-    // seed's own signed [[artifact]] coverage) the bare-named DMG is the
-    // ARM64-seeded restage — same signed app, seed filtered to the majority
-    // arch — because the deployed fleet binds the bare `aterm-<v>.dmg`
-    // spelling and the arm64 slice is what essentially every downloader runs.
-    // Otherwise it is `dmg::create`'s image of the app exactly as sealed:
-    // byte-for-byte today's pipeline.
-    let dmg_out = if x86_split {
-        pack.dmg_arch(app, dist, version, "aarch64-apple-darwin", notarized_app)?
-    } else {
-        pack.dmg(app, dist, version)?
-    };
+    // THE ONE DMG: `dmg::create`'s image of the app exactly as signed (and, on
+    // the active tier, stapled), under the fleet-pinned bare `aterm-<v>.dmg`
+    // name.
+    let dmg_out = pack.dmg(app, dist, version)?;
     // THE hook. Inactive: returns false having done nothing. Active: Dev-ID
     // signs, preflights, notarizes and staples the DMG — and any failure in that
     // sequence propagates here and aborts the cut, because the manifest stamps
@@ -9067,57 +8611,17 @@ pub fn notarize_and_package(
     } else {
         (dmg_out.sha256.clone(), dmg_out.size_bytes)
     };
-    // THE INTEL DMG VARIANT — additive, same one-notarized-app restage lane,
-    // same hook, same re-hash rule. Built after the canonical DMG's hook so a
-    // failure there stops the cut before a second notarization wait is spent.
-    let dmg_x86_64 = if x86_split {
-        let x86_out = pack.dmg_arch(app, dist, version, "x86_64-apple-darwin", notarized_app)?;
-        let x86_notarized =
-            sign::sign_and_notarize_dmg(&x86_out.path, tier, tools).map_err(Error::new)?;
-        let (sha, size) = if x86_notarized {
-            (pack.sha256(&x86_out.path)?, pack.size(&x86_out.path)?)
-        } else {
-            (x86_out.sha256.clone(), x86_out.size_bytes)
-        };
-        Some((x86_out, sha, size))
-    } else {
-        None
-    };
-    // THE LEAN DRAG-INSTALL DMG — the seed-stripped restage in the seeded
-    // DMG's image lane, then the SAME container hook and the SAME re-hash rule
-    // as every other DMG: the digest that goes on record (the journal, here —
-    // this container is deliberately not a manifest field) must cover the
-    // stapled bytes clients actually download. Last of the DMG family so a
-    // notarization failure on a fleet-critical image stops the cut before the
-    // browser-alias image spends a wait, and before the zip so `ditto` still
-    // runs at the very end.
-    let lite_out = pack.dmg_lite(app, dist, version, notarized_app, seeded)?;
-    let lite_notarized =
-        sign::sign_and_notarize_dmg(&lite_out.path, tier, tools).map_err(Error::new)?;
-    let (dmg_lite_sha256, dmg_lite_size) = if lite_notarized {
-        (pack.sha256(&lite_out.path)?, pack.size(&lite_out.path)?)
-    } else {
-        (lite_out.sha256.clone(), lite_out.size_bytes)
-    };
     // The updater container, from the SAME signed — and, on the active tier,
     // already stapled — .app. It is built from the bundle rather than from the
     // DMG because `ditto` must archive the bundle directly to preserve its seal,
     // and `create_zip` hashes what it writes, so its digest already covers the
     // ticket without a second pass.
-    // `notarize_app` reported whether this bundle actually got a Developer-ID
-    // signature and a stapled ticket; pass it through so the stripped-bundle
-    // Gatekeeper check knows whether an spctl rejection is meaningless (ad-hoc) or
-    // fleet-fatal (notarized).
-    let zip = pack.zip(app, dist, version, notarized_app, seeded)?;
+    let zip = pack.zip(app, dist, version)?;
     Ok(PackagedCut {
         dmg: dmg_out,
         dmg_sha256,
         dmg_size,
         zip,
-        dmg_x86_64,
-        dmg_lite: lite_out,
-        dmg_lite_sha256,
-        dmg_lite_size,
     })
 }
 
@@ -9178,50 +8682,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
-    // Batteries-included seed (§9.1, reinstated 2026-08-17): validate BEFORE
-    // assemble so a cut never seals a seed its own client would refuse — the
-    // gate IS the client's chain (`seedpack::validate` runs atpkg's DirFetcher
-    // + roster + index selection under the compiled paper master). A cut with
-    // NO seed dir is refused too: "installs with all the binaries" is the
-    // product default, so shipping seedless takes the explicit
-    // `ATERM_SEEDLESS=1` (stamped `seed=no` in the provenance record).
-    //
-    // The pre-claim gate in `run_cut` already made this exact decision, but it
-    // is re-derived rather than threaded: `step_build` is a JOURNALED step and a
-    // `--resume` can enter here in a fresh shell that never ran the pre-claim
-    // gate. Re-reading the env keeps the two answers identical on a normal cut,
-    // and the refusal below names the variable so a resumed seedless cut is told
-    // exactly what to re-export instead of failing with a puzzle.
-    let seed = if seedless_cut() {
-        None
-    } else {
-        match crate::seedpack::resolve(&ctx.dist) {
-            Some(dir) => {
-                let stat = crate::seedpack::validate(&dir).map_err(Error::new)?;
-                // Internal consistency and shelf life are proven above; this is
-                // the only gate that asks whether the world moved past the seal.
-                gate_seed_matches_published_index(&stat)?;
-                Some(stat)
-            }
-            None => {
-                // The caveat LEADS here, because it is the only thing that distinguishes
-                // this refusal from the pre-claim one forty-five words earlier — and
-                // recognising the opening of a message you have already read is exactly
-                // what suppresses the tail where the distinguishing fact used to sit.
-                return Err(Error::new(
-                    "no toolchain seed staged — and if this is a --resume of a cut that was \
-                     already running seedless, that is why: ATERM_SEEDLESS=1 is read from \
-                     the environment, not from the journal, so it must be re-exported in \
-                     THIS shell.\n\
-                     resume seedless:  ATERM_SEEDLESS=1\n\
-                     or stage it:  tools/atpkg-seed-from-published.sh\n\
-                     a batteries-included cut seals every published binary into the app, \
-                     and there is nothing to seal.",
-                ));
-            }
-        }
-    };
-
     let spec = bundle::BundleSpec {
         repo_root: ctx.repo.clone(),
         out_dir: ctx.dist.clone(),
@@ -9230,23 +8690,14 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         bundle_id: "com.aterm.aterm".to_string(),
         git_commit: stamp.clone(),
         aterm_bin: bout.aterm,
-        seed,
     };
     let app = bundle::assemble(&spec)?;
     step(
         "bundle",
         &format!(
-            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}  seed={}",
-            ctx.version,
-            ctx.build,
-            match &spec.seed {
-                Some(s) => format!(
-                    "{} program(s), index_build {}",
-                    s.programs.len(),
-                    s.index_build
-                ),
-                None => "none (ATERM_SEEDLESS=1)".to_string(),
-            }
+            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}  lean (the \
+             toolchain self-provisions on first launch)",
+            ctx.version, ctx.build,
         ),
     );
 
@@ -9273,25 +8724,11 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // load-bearing and none of it is observable from a green cut. See
     // `notarize_and_package`; its ordering and its fail-closed propagation are
     // proved offline in tests/apple_tier.rs.
-    // Per-arch DMG split iff the SEALED seed's signed [[artifact]] rows cover
-    // x86_64-apple-darwin (SeedStat.targets — derived from PRESENT artifacts,
-    // never from rows alone). A seedless cut or an acknowledged arm64-only
-    // seal (`ATERM_SEED_ARCH_ACK=1`, which implies no x86 coverage) takes the
-    // single-DMG lane, byte-for-byte today's behaviour, and emits no
-    // `dmg_x86_64` manifest keys.
-    let x86_split = spec
-        .seed
-        .as_ref()
-        .is_some_and(|s| s.targets.contains("x86_64-apple-darwin"));
     let PackagedCut {
         dmg: dout,
         dmg_sha256: dmg_sha,
         dmg_size,
         zip: zout,
-        dmg_x86_64,
-        dmg_lite: lout,
-        dmg_lite_sha256: lite_sha,
-        dmg_lite_size: lite_size,
     } = notarize_and_package(
         &app,
         &ctx.dist,
@@ -9299,19 +8736,13 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         &ctx.apple,
         &sign::RealAppleTools,
         &RealPackager,
-        spec.seed.is_some(),
-        x86_split,
     )?;
-    // BOTH DMGs must clear the client's own download bound before anything is
-    // hashed into a manifest: the fat dual-arch DMG reached 97.3% of the 2 GiB
-    // `RELEASE_ASSET_DOWNLOAD_BOUND` on v0.46.0, and a cut that seals past it
-    // publishes a release no client can download. (The split itself is the
-    // durable headroom — the arm64 DMG measured 54.1% of the bound.)
+    // The DMG must clear the client's own download bound before anything is
+    // hashed into a manifest: a cut that packages past it publishes a release
+    // no client can download. (The seeded dual-arch image once reached 97.3%
+    // of the 2 GiB `RELEASE_ASSET_DOWNLOAD_BOUND`; the lean image is ~28 MB,
+    // and the check stays because the bound is the client's, not ours.)
     validate_release_asset_download_size(dmg_size)?;
-    if let Some((_, _, x86_size)) = &dmg_x86_64 {
-        validate_release_asset_download_size(*x86_size)?;
-    }
-    validate_release_asset_download_size(lite_size)?;
     // The stable download twins are copied only HERE, after
     // `notarize_and_package` has produced the FINAL container bytes
     // (codesign/staple rewrites included), so each twin is byte-identical to
@@ -9319,19 +8750,13 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // every one of them, so the mirror uploads them and refuses a channel head
     // without them. The zip twin is the PRIMARY download: the alab.systems
     // homepage is a single evergreen button pointed at
-    // `releases/latest/download/aterm-mac.zip`, the lightweight app-only
-    // container (its seed is stripped by `dmg::create_zip`; the app installs
-    // its toolchain itself on first launch). The DMG twin `aterm.dmg` aliases
-    // the LEAN drag-install DMG for the same person-with-a-browser reason
-    // (approved repoint, 2026-08 — see `mirror::stable_dmg_asset_name`), and
-    // the seeded image's evergreen spelling moves to `aterm-offline.dmg`, a
-    // byte copy of manifest.dmg — the CANONICAL (arm64-seeded, on a per-arch
-    // cut majority-arch) DMG. An Intel visitor is routed by install.sh (or the
-    // release notes), never by these URLs.
+    // `releases/latest/download/aterm-mac.zip`. The DMG twin `aterm.dmg` is a
+    // byte copy of manifest.dmg — the ONE lean DMG (RETIRED 2026-08-26: the
+    // `-lite` twin it used to alias, and the `aterm-offline.dmg` alias of the
+    // seeded image).
     for (source, twin) in [
-        (&lout.path, ctx.stable_dmg_path()),
+        (&dout.path, ctx.stable_dmg_path()),
         (&zout.path, ctx.stable_zip_path()),
-        (&dout.path, ctx.stable_offline_dmg_path()),
     ] {
         fs::copy(source, &twin).map_err(|e| {
             Error::new(format!(
@@ -9378,28 +8803,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             &dmg_sha[..12.min(dmg_sha.len())]
         ),
     );
-    if let Some((x86_out, x86_sha, x86_size)) = &dmg_x86_64 {
-        step(
-            "",
-            &format!(
-                "{} ({:.1} MB)  sha256 {}… — Intel batteries-included variant \
-                 (x86_64-filtered seed, same notarized app)",
-                x86_out.path.display(),
-                *x86_size as f64 / 1_000_000.0,
-                &x86_sha[..12.min(x86_sha.len())]
-            ),
-        );
-    }
-    step(
-        "",
-        &format!(
-            "{} ({:.1} MB)  sha256 {}… — lean drag-install variant (seed \
-             stripped, same notarized app; served as `aterm.dmg`)",
-            lout.path.display(),
-            lite_size as f64 / 1_000_000.0,
-            &lite_sha[..12.min(lite_sha.len())]
-        ),
-    );
     step(
         "zip",
         &format!(
@@ -9420,7 +8823,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // `shasum -c` record names the file it checks, and the versioned sidecar
     // can never verify the file a `releases/latest/download/...` click
     // actually saves.
-    let mut sidecars = vec![
+    let sidecars = [
         (
             ctx.dmg_sha256_path(),
             dmg_sha.as_str(),
@@ -9431,18 +8834,12 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             zout.sha256.as_str(),
             mirror::zip_asset_name(&ctx.version),
         ),
-        (
-            ctx.dmg_lite_sha256_path(),
-            lite_sha.as_str(),
-            mirror::dmg_lite_asset_name(&ctx.version),
-        ),
         // The alias sidecars restate their SOURCE artifact's digest under the
-        // alias filename: `aterm.dmg` now carries the lite digest and the
-        // seeded digest rides under `aterm-offline.dmg` — each twin above is a
-        // byte copy of exactly the artifact whose digest it restates.
+        // alias filename — each twin above is a byte copy of exactly the
+        // artifact whose digest it restates.
         (
             ctx.stable_dmg_sha256_path(),
-            lite_sha.as_str(),
+            dmg_sha.as_str(),
             mirror::stable_dmg_asset_name(),
         ),
         (
@@ -9450,19 +8847,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             zout.sha256.as_str(),
             mirror::stable_zip_asset_name(),
         ),
-        (
-            ctx.stable_offline_dmg_sha256_path(),
-            dmg_sha.as_str(),
-            mirror::stable_offline_dmg_asset_name(),
-        ),
     ];
-    if let Some((_, x86_sha, _)) = &dmg_x86_64 {
-        sidecars.push((
-            ctx.dmg_x86_64_sha256_path(),
-            x86_sha.as_str(),
-            mirror::dmg_x86_64_asset_name(&ctx.version),
-        ));
-    }
     for (path, sha, name) in sidecars {
         fs::write(&path, mirror::sha256_sidecar_contents(sha, &name))
             .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
@@ -9472,13 +8857,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         "`.sha256` sidecars staged for every container and every stable twin \
          (shasum -a 256 -c)",
     );
-    // The lite digest goes on RECORD here, beside the packaging that minted
-    // it: it is the byte authority for two published assets the manifest
-    // deliberately does not name (`aterm-<v>-lite.dmg` and its `aterm.dmg`
-    // alias — no client elects either), and `step_selfcheck`, the mirror set,
-    // and every resume read it back from exactly this field.
-    ctx.lite_dmg_sha256 = Some(lite_sha.clone());
-
     // ---- manifest + notes (the rolled body, verbatim, once — spec §3) -----
     let cl_text = fs::read_to_string(ctx.repo.join(changelog::CHANGELOG_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
@@ -9488,15 +8866,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // address a machine that already runs aterm.
     fs::write(
         ctx.notes_path(),
-        // `carries_lite_dmg` is always true HERE (the digest went on record a
-        // few lines up) — passed through the accessor anyway so the guide is
-        // keyed on the same authority as the mirror set, not on code distance.
-        changelog::release_notes_document(
-            &ctx.version,
-            &body,
-            dmg_x86_64.is_some(),
-            ctx.carries_lite_dmg(),
-        ),
+        changelog::release_notes_document(&ctx.version, &body),
     )
     .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
 
@@ -9504,7 +8874,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
     let min_os = manifest_out::plist_string(&plist_text, "LSMinimumSystemVersion")
         .unwrap_or_else(|| "11.0".to_string());
-    let x86_name = mirror::dmg_x86_64_asset_name(&ctx.version);
     let inputs = manifest_out::ManifestInputs {
         version: &ctx.version,
         build_number: ctx.build,
@@ -9517,12 +8886,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         // `create_zip` runs AFTER the staple and hashes the bytes it writes, so
         // this digest already covers them.
         zip_sha256: &zout.sha256,
-        // Present exactly when the seed's signed rows cover x86_64-apple-darwin
-        // (the split above): the manifest is the single authority every later
-        // gate (draft asset set, mirror set, recovery, install.sh's election)
-        // derives the pair from. Absent keys = the pre-pair wire bytes.
-        dmg_x86_64_name: dmg_x86_64.as_ref().map(|_| x86_name.as_str()),
-        dmg_x86_64_sha256: dmg_x86_64.as_ref().map(|(_, sha, _)| sha.as_str()),
         // The manifest's `url` must name the repository a reader can actually
         // fetch from. These same bytes ride BOTH the private release and the
         // mirrored public one, and only the public channel is readable without
@@ -9574,8 +8937,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     }
     if let Some(journal) = &mut ctx.journal {
         // `run_pipeline` marks `build` immediately after this returns; that
-        // same atomic save persists the signature fact — and the lite DMG's
-        // digest record — before later steps.
+        // same atomic save persists the signature fact before later steps.
         journal.manifest_signed = ctx.manifest_signed;
         journal.signature_required = ctx.signature_required;
         journal.signature_pubkey.clone_from(&ctx.signature_pubkey);
@@ -9583,7 +8945,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         journal
             .signature_machine_id
             .clone_from(&ctx.signature_machine_id);
-        journal.lite_dmg_sha256.clone_from(&ctx.lite_dmg_sha256);
     }
     Ok(())
 }
@@ -10024,212 +9385,40 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         }
     };
 
-    // The Intel DMG, when this cut's manifest names one: same in-process
-    // re-hash proof as the canonical DMG — a per-arch release must never ship a
-    // variant whose digest record and bytes disagree. The name is bound to the
-    // canonical spelling here (install.sh re-derives it from `version` and
-    // refuses anything else), and a named-but-missing file is a hard stop: the
-    // manifest is a promise about this draft's asset set.
-    let x86_pair = match (
-        manifest.dmg_x86_64.as_deref(),
-        manifest.dmg_x86_64_sha256.as_deref(),
-    ) {
-        (Some(name), Some(expected)) => {
-            let canonical = mirror::dmg_x86_64_asset_name(&ctx.version);
-            if name != canonical {
-                return Err(Error::new(format!(
-                    "self-check failed: manifest names Intel DMG {name:?}, expected \
-                     {canonical:?}"
-                )));
-            }
-            let sha = dmg::sha256_file(&ctx.dmg_x86_64_path())?;
-            if !sha.eq_ignore_ascii_case(expected) {
-                return Err(Error::new(format!(
-                    "self-check failed: Intel DMG sha256 {sha} != manifest {expected}"
-                )));
-            }
-            Some((canonical, expected.to_string()))
-        }
-        (None, None) => None,
-        _ => {
-            return Err(Error::new(
-                "self-check failed: manifest carries an Intel DMG name without its digest \
-                 (or the digest without the name) — the pair ships together or not at all",
-            ));
-        }
-    };
-
-    // THE LEAN DRAG-INSTALL DMG. Its byte authority is the CUT'S OWN digest
-    // record (`lite_dmg_sha256` — the signed manifest deliberately names no
-    // lite container, since no client elects one), and dist/ is mutable while
-    // a resume skips `step_build`, so record and bytes are re-proved against
-    // each other here, under the pure rule `lite_dmg_selfcheck_plan` states.
-    // A cut with NO record at all is a PRE-LITE journal re-entering selfcheck:
-    // the artifact is built NOW, through the same packaging + container-hook
-    // lane `step_build` runs, and its digest recorded — upgrading the old
-    // journal in place instead of stranding it. (A pre-lite journal already
-    // PAST selfcheck deliberately stays pre-lite: its mirrored set must not
-    // grow names its published head never carried.)
-    let lite_name = mirror::dmg_lite_asset_name(&ctx.version);
-    let lite_path = ctx.dmg_lite_path();
-    let observed_lite = if lite_path.is_file() {
-        Some(dmg::sha256_file(&lite_path)?)
-    } else {
-        None
-    };
-    let lite_sha = match lite_dmg_selfcheck_plan(
-        ctx.lite_dmg_sha256.as_deref(),
-        observed_lite.as_deref(),
-        ctx.mirror_upload_intent_issued(&lite_name),
-    ) {
-        LiteDmgPlan::Proven => ctx
-            .lite_dmg_sha256
-            .clone()
-            .expect("Proven implies a recorded digest"),
-        LiteDmgPlan::RefuseDivergent => {
-            return Err(Error::new(format!(
-                "self-check failed: lean DMG {} sha256 {} != this cut's recorded {} — \
-                 this cutter only writes what it records, so something else wrote these \
-                 bytes; refusing to alias them as `aterm.dmg` for every browser download",
-                lite_path.display(),
-                observed_lite.as_deref().unwrap_or("<unhashable>"),
-                ctx.lite_dmg_sha256.as_deref().unwrap_or("<none>"),
-            )));
-        }
-        LiteDmgPlan::RefuseIrreproducible => {
-            return Err(Error::new(format!(
-                "self-check failed: lean DMG {} is missing from dist/ but its upload \
-                 toward the public channel was already durably issued — a rebuild cannot \
-                 reproduce those exact bytes (imaging and stapling are not deterministic), \
-                 so converging would publish different bytes than the issued intent \
-                 covers. Inspect the mirror release by hand",
-                lite_path.display(),
-            )));
-        }
-        LiteDmgPlan::Rebuild => {
-            // Quality must survive the rebuild: on a cut whose manifest claims
-            // a team, every DMG ships Dev-ID signed, notarized and stapled —
-            // and a resume past `build` deliberately resolves no signing tier
-            // (`resume_apple_tier`), so say what is missing rather than alias
-            // an unsigned image on a notarized release.
-            let team = manifest.team_id.clone().unwrap_or_default();
-            let notarized = !team.is_empty();
-            if notarized && ctx.apple.identity().is_none() {
-                return Err(Error::new(format!(
-                    "self-check must build the lean DMG {lite_name} (this cut predates \
-                     the lite lane or lost the artifact), but the manifest claims team \
-                     {team} and this session resolved no signing identity — finish this \
-                     cut with the cutter version that started it, or re-cut with the \
-                     Developer ID configuration available",
-                )));
-            }
-            // The cut's own claim about the seal, from the attested provenance
-            // record beside the artifacts (validated against this claim above)
-            // — the exact `seeded` fact `step_build` hands the packagers, so
-            // the strip's silent-no-op tripwire keeps firing on a rebuild.
-            let seeded = String::from_utf8_lossy(&provenance)
-                .lines()
-                .any(|line| line == "seed=yes");
-            let out = dmg::create_lite(&app, &ctx.dist, &ctx.version, notarized, seeded)
-                .map_err(Error::new)?;
-            let hooked = sign::sign_and_notarize_dmg(&out.path, &ctx.apple, &sign::RealAppleTools)
-                .map_err(Error::new)?;
-            let (sha, size) = if hooked {
-                (
-                    dmg::sha256_file(&out.path)?,
-                    fs::metadata(&out.path)
-                        .map_err(|e| Error::new(format!("stat {}: {e}", out.path.display())))?
-                        .len(),
-                )
-            } else {
-                (out.sha256.clone(), out.size_bytes)
-            };
-            validate_release_asset_download_size(size)?;
-            // Record FIRST, then refresh the derivatives, so a crash between
-            // the two leaves a recorded digest and stale copies the next
-            // selfcheck pass regenerates — never fresh bytes with no record.
-            ctx.lite_dmg_sha256 = Some(sha.clone());
-            if let Some(journal) = &mut ctx.journal {
-                journal.lite_dmg_sha256 = Some(sha.clone());
-                journal.save(&ctx.journal_path)?;
-            }
-            // The lite sidecar and the `aterm.dmg` alias + alias sidecar are
-            // pure derivatives of the bytes just built — refresh them outright
-            // (a pre-lite resume's `aterm.dmg` still aliases the SEEDED image
-            // here, and judging that stale copy would strand the very resume
-            // this arm exists to finish).
-            fs::write(
-                ctx.dmg_lite_sha256_path(),
-                mirror::sha256_sidecar_contents(&sha, &lite_name),
-            )
-            .map_err(|e| {
-                Error::new(format!(
-                    "self-check: write {}: {e}",
-                    ctx.dmg_lite_sha256_path().display()
-                ))
-            })?;
-            fs::copy(&out.path, ctx.stable_dmg_path()).map_err(|e| {
-                Error::new(format!(
-                    "self-check: copy {} -> {}: {e}",
-                    out.path.display(),
-                    ctx.stable_dmg_path().display()
-                ))
-            })?;
-            fs::write(
-                ctx.stable_dmg_sha256_path(),
-                mirror::sha256_sidecar_contents(&sha, &mirror::stable_dmg_asset_name()),
-            )
-            .map_err(|e| {
-                Error::new(format!(
-                    "self-check: write {}: {e}",
-                    ctx.stable_dmg_sha256_path().display()
-                ))
-            })?;
-            step(
-                "",
-                &format!(
-                    "lean DMG {lite_name} built at self-check ({:.1} MB)  sha256 {}… — \
-                     digest recorded; `aterm.dmg` alias refreshed",
-                    size as f64 / 1_000_000.0,
-                    &sha[..12.min(sha.len())]
-                ),
-            );
-            sha
-        }
-    };
+    // RETIRED 2026-08-26: the Intel DMG pair and the `-lite` twin with its
+    // journaled digest record. The manifest names ONE DMG, proved above; a
+    // manifest that still names an Intel variant was not staged by this
+    // cutter.
+    refuse_retired_intel_dmg(&manifest)?;
 
     // The stable download twins are byte copies of containers already proved
-    // against their digest records — the manifest's for the zip and the
-    // seeded image, the cut's own for the lean image — and dist/ is mutable
-    // while a resume skips `step_build`, so the copies are re-proved too: the
+    // against the manifest's digest records, and dist/ is mutable while a
+    // resume skips `step_build`, so the copies are re-proved too: the
     // mirror later verifies the public channel's alias objects against dist/'s
     // twins, never against the canonical containers, so a stale twin here
     // would cross byte-verified against itself. The digest is the record's
     // own — the twin is only ever a byte copy, so hashing it and comparing IS
     // the identity proof, never an independent record. A twin MISSING outright
-    // is a pre-twin (or, for `aterm-offline.dmg`, pre-lite) journal's resume
-    // shape and is regenerated from the proven canonical bytes (same reasoning
-    // as the sidecars below); a twin PRESENT with different bytes is refused,
-    // not repaired — this cutter only writes byte copies, so something else
-    // wrote it.
+    // is a pre-twin journal's resume shape and is regenerated from the proven
+    // canonical bytes (same reasoning as the sidecars below); a twin PRESENT
+    // with different bytes is refused, not repaired — this cutter only writes
+    // byte copies, so something else wrote it. (A journal from the retired
+    // lite lane, resumed here, has an `aterm.dmg` that aliases the OLD lean
+    // twin's bytes, not manifest.dmg's — that is exactly the divergent case
+    // this refuses; a human re-cuts rather than the mirror serving two
+    // contracts under one evergreen name.)
     for (twin, source, expected_sha, what) in [
         (
             ctx.stable_dmg_path(),
-            ctx.dmg_lite_path(),
-            lite_sha.as_str(),
-            "stable DMG twin (lean alias)",
+            ctx.dmg_path(),
+            manifest.sha256.as_str(),
+            "stable DMG twin",
         ),
         (
             ctx.stable_zip_path(),
             ctx.zip_path(),
             zip_sha256.as_str(),
             "stable zip twin",
-        ),
-        (
-            ctx.stable_offline_dmg_path(),
-            ctx.dmg_path(),
-            manifest.sha256.as_str(),
-            "stable offline DMG twin (seeded alias)",
         ),
     ] {
         if !twin.exists() {
@@ -10264,12 +9453,10 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     // same way `recover_published_cut` reconstructs them for old releases —
     // refusing would strand every journal written before sidecars existed. The
     // twins' ALIAS sidecars ride the same rule: same digests, alias filenames
-    // (`aterm.dmg.sha256` restates the LEAN digest, `aterm-offline.dmg.sha256`
-    // the seeded one — each names the exact bytes its evergreen URL saves).
+    // (each names the exact bytes its evergreen URL saves).
     let stable_dmg_name = mirror::stable_dmg_asset_name();
     let stable_zip_name = mirror::stable_zip_asset_name();
-    let stable_offline_name = mirror::stable_offline_dmg_asset_name();
-    let mut sidecar_checks = vec![
+    let sidecar_checks = [
         (
             ctx.dmg_sha256_path(),
             manifest.sha256.as_str(),
@@ -10281,13 +9468,8 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             zip_name.as_str(),
         ),
         (
-            ctx.dmg_lite_sha256_path(),
-            lite_sha.as_str(),
-            lite_name.as_str(),
-        ),
-        (
             ctx.stable_dmg_sha256_path(),
-            lite_sha.as_str(),
+            manifest.sha256.as_str(),
             stable_dmg_name.as_str(),
         ),
         (
@@ -10295,15 +9477,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             zip_sha256.as_str(),
             stable_zip_name.as_str(),
         ),
-        (
-            ctx.stable_offline_dmg_sha256_path(),
-            manifest.sha256.as_str(),
-            stable_offline_name.as_str(),
-        ),
     ];
-    if let Some((name, sha)) = &x86_pair {
-        sidecar_checks.push((ctx.dmg_x86_64_sha256_path(), sha.as_str(), name.as_str()));
-    }
     for (path, sha, name) in sidecar_checks {
         let expected = mirror::sha256_sidecar_contents(sha, name);
         if !path.exists() {
@@ -11759,13 +10933,9 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    for name in mirror::required_asset_names(
-        &ctx.version,
-        ctx.signature_required,
-        ctx.attaches_roster(),
-        ctx.staged_manifest_dmg_x86_64().is_some(),
-        ctx.carries_lite_dmg(),
-    ) {
+    for name in
+        mirror::required_asset_names(&ctx.version, ctx.signature_required, ctx.attaches_roster())
+    {
         if !body.contains(&format!("\"name\":\"{name}\"")) {
             return Err(Error::new(format!(
                 "the anonymous view of {slug} {} does not list the required asset \
@@ -11943,8 +11113,6 @@ fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         &ctx.version,
         ctx.signature_required,
         ctx.attaches_roster(),
-        ctx.staged_manifest_dmg_x86_64().is_some(),
-        ctx.carries_lite_dmg(),
     )?;
     for file in ctx.mirror_asset_paths() {
         let name = file
@@ -11983,8 +11151,6 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         &ctx.version,
         ctx.signature_required,
         ctx.attaches_roster(),
-        ctx.staged_manifest_dmg_x86_64().is_some(),
-        ctx.carries_lite_dmg(),
     )?;
 
     // `stop_early: true` IS the client's replay: canonical tags only, exact
@@ -12276,7 +11442,6 @@ mod roster_wiring_tests {
             mirror_release_id: None,
             mirror_create_issued: false,
             mirror_upload_intents: Vec::new(),
-            lite_dmg_sha256: None,
             kind: CutKind::Real,
             no_paint_smoke: false,
             lease: None,
@@ -12345,53 +11510,6 @@ mod roster_wiring_tests {
                 "an unattributed cut must publish no roster: {set:?}"
             );
         }
-    }
-
-    /// THE LEAN LANE'S SET MEMBERSHIP, from the cut's own record. A cut that
-    /// recorded a lite digest serves the lean DMG, its sidecar, and the
-    /// `aterm-offline.dmg` alias pair to the MIRROR — and to the mirror only:
-    /// the PRIVATE draft's exact-set gate binds DMG names to what the manifest
-    /// says about itself, and the manifest deliberately names no lite
-    /// container, so the upload and byte-proof sets must never grow these
-    /// names. A pre-lite cut (no record — a recovery, or an old journal past
-    /// selfcheck) keeps every set byte-for-byte what it always was.
-    #[test]
-    fn a_recorded_lite_digest_routes_the_lean_assets_to_the_mirror_set_only() {
-        let mut lite = ctx(None);
-        lite.lite_dmg_sha256 = Some("c6".repeat(32));
-        assert!(lite.carries_lite_dmg());
-        let mirror_set = names(&lite.mirror_asset_paths());
-        for name in [
-            "aterm-0.5.0-lite.dmg",
-            "aterm-0.5.0-lite.dmg.sha256",
-            "aterm-offline.dmg",
-            "aterm-offline.dmg.sha256",
-        ] {
-            assert!(
-                mirror_set.contains(&name.to_string()),
-                "{name} missing from the mirror set: {mirror_set:?}"
-            );
-        }
-        for (label, set) in [
-            ("upload", lite.upload_asset_paths()),
-            ("draft byte-proof", lite.proof_asset_paths()),
-        ] {
-            let set = names(&set);
-            assert!(
-                !set.iter()
-                    .any(|n| n.contains("lite") || n.contains("offline")),
-                "the {label} set must never carry the mirror-only lean assets: {set:?}"
-            );
-        }
-
-        let pre_lite = ctx(None);
-        assert!(!pre_lite.carries_lite_dmg());
-        let set = names(&pre_lite.mirror_asset_paths());
-        assert!(
-            !set.iter()
-                .any(|n| n.contains("lite") || n.contains("offline")),
-            "a pre-lite cut's mirror set must not grow one name: {set:?}"
-        );
     }
 
     /// The verdict's three attribution fields reach the cut TOGETHER, or the release
@@ -12506,8 +11624,6 @@ mod roster_wiring_tests {
             dmg_sha256: &"ab".repeat(32),
             zip_name: "aterm-0.5.0-mac.zip",
             zip_sha256: &"cd".repeat(32),
-            dmg_x86_64_name: None,
-            dmg_x86_64_sha256: None,
             repo_slug: "owner/repo",
             min_os: "11.0",
             team_id: "",
@@ -12604,8 +11720,6 @@ mod roster_wiring_tests {
             dmg_sha256: &"ab".repeat(32),
             zip_name: "aterm-0.5.0-mac.zip",
             zip_sha256: &"cd".repeat(32),
-            dmg_x86_64_name: None,
-            dmg_x86_64_sha256: None,
             repo_slug: "owner/repo",
             min_os: "11.0",
             team_id: "",

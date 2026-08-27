@@ -3653,6 +3653,22 @@ pub(crate) fn fit_native_button_label(value: &str, max_width: f32) -> String {
     elide_ui_label(value, max_width, native_type_px(TypeStep::Secondary).get())
 }
 
+/// The width the painter needs to draw a native button label WHOLE, in the
+/// exact face and rung [`fit_native_button_label`] elides against.
+///
+/// A picker whose option spellings are owned elsewhere — a config vocabulary,
+/// a catalog of built-in names — cannot shorten its longest label to suit a
+/// button authored from a flat constant. Sizing that button from this measure
+/// is how such a control gets a slot its own widest option occupies, instead
+/// of ellipsizing the value the control exists to state.
+pub(crate) fn native_button_label_width(value: &str) -> f32 {
+    visual_text_width(
+        value,
+        native_type_px(TypeStep::Secondary).get(),
+        crate::widget::TextFace::Ui,
+    )
+}
+
 /// Bounded visual projection for a one-line native body label. The caller's
 /// semantic wrapper remains responsible for the complete authored copy.
 pub(crate) fn fit_native_text_label(value: &str, max_width: f32) -> String {

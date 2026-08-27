@@ -517,6 +517,18 @@ pub(super) struct Iterm2State {
     /// default ([`DEFAULT_CELL_PX`]) keeps the engine self-contained for headless
     /// tests. Cell-unit dimensions (`width=10`) never consult this.
     pub(super) cell_px: (u16, u16),
+    /// Whether `cell_px` is a MEASUREMENT (a host called
+    /// [`Terminal::set_cell_pixel_size`]) rather than [`DEFAULT_CELL_PX`].
+    ///
+    /// The placeholder is a fine convenience for footprint arithmetic, which
+    /// has to produce *some* cell count either way. It is NOT an acceptable
+    /// answer to a question — an XTWINOPS pixel report (CSI 14 t / 16 t) that
+    /// hands back 8x16 tells a sixel or image-capable TUI to lay its output out
+    /// on a font that does not exist. Those reports consult
+    /// [`Terminal::host_cell_pixel_size`] instead and stay SILENT while this is
+    /// false, which is the honest answer for a headless engine or a session
+    /// whose renderer has not finished building.
+    pub(super) cell_px_from_host: bool,
 }
 
 /// Default cell pixel size used for inline-image footprint math before the
@@ -542,7 +554,19 @@ impl Iterm2State {
             remote_host_callback: None,
             kvp_callback: None,
             cell_px: DEFAULT_CELL_PX,
+            cell_px_from_host: false,
         }
+    }
+
+    /// The cell box a HOST measured, or `None` for the placeholder.
+    ///
+    /// The single predicate behind [`Terminal::host_cell_pixel_size`] and the
+    /// XTWINOPS pixel reports, so "is this a measurement?" is answered in one
+    /// place. A zero axis counts as unreported: no font has a zero-wide cell,
+    /// and reporting one tells the application to divide by zero.
+    pub(super) fn host_cell_px(&self) -> Option<(u16, u16)> {
+        let (w, h) = self.cell_px;
+        (self.cell_px_from_host && w > 0 && h > 0).then_some((w, h))
     }
 
     /// Reset data fields while preserving callbacks.

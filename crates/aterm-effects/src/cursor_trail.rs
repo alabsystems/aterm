@@ -135,6 +135,50 @@ fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
     (a as f32 + (b as f32 - a as f32) * q).round() as u32
 }
 
+/// Fingerprint the exact trail presentation handed to the renderer.
+///
+/// Colour is folded only while at least one cell is visible, preserving the
+/// trail's `0 == idle` contract. The sentinel keeps a black trail colour from
+/// becoming an empty multiply-add.
+fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
+    let mut fp: u64 = 0;
+    for cell in cells {
+        fp = fp
+            .wrapping_mul(1_000_003)
+            .wrapping_add(((cell.row as u64) << 24) ^ ((cell.col as u64) << 8) ^ cell.alpha as u64);
+    }
+    if !cells.is_empty() {
+        fp = fp
+            .wrapping_mul(1_000_003)
+            .wrapping_add(u64::from(color) | (1 << 32));
+    }
+    fp
+}
+
+/// Apply a host presentation-opacity envelope to emitted trail cells and
+/// return the fingerprint of the exact attenuated output.
+///
+/// This is deliberately downstream of [`CursorTrail::tick`]. Ignition is a
+/// birth property baked into spark heat/lifetime, so scaling
+/// [`TrailConfig::intensity`] would affect only newly spawned sparks and leave
+/// the resident comet fully opaque. Presentation opacity instead attenuates
+/// every live cell uniformly without mutating engine state; a later recovery
+/// can therefore reveal the still-decaying bed continuously. Non-finite input
+/// fails closed, and zero produces the canonical empty/zero presentation.
+#[must_use]
+pub fn project_trail_presentation(cells: &mut Vec<TrailCell>, color: u32, opacity: f32) -> u64 {
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    cells.retain_mut(|cell| {
+        cell.alpha = (f32::from(cell.alpha) * opacity).round() as u8;
+        cell.alpha > 0
+    });
+    trail_presentation_fingerprint(cells, color)
+}
+
 /// Resolved tunables for the trail effect. `Copy` so the host can read it out of
 /// `self` before borrowing per-window state.
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +286,12 @@ pub struct CursorTrail {
     /// host each frame beside the glow's). `false` (main screen / unwired
     /// host) keeps the re-anchor classifier byte-identical.
     ctx_alt: bool,
+    /// Focused pane columns in this engine's composed/window coordinate space:
+    /// `(first_col, width)`. Native hosts stamp it beside [`Self::note_context`]
+    /// before every tick. `None` keeps direct/legacy embedders conservative:
+    /// without physical-margin authority, a large one-row move remains a dark
+    /// repaint re-anchor rather than guessing a fold.
+    pane_columns: Option<(u16, u16)>,
     /// The resident cell→`out`-slot probe table behind [`Self::tick`]'s
     /// overlap merge (see the emit loop there for the WHY): allocated lazily
     /// on the first lit tick — an idle or disabled window never pays the
@@ -340,6 +390,16 @@ impl CursorTrail {
     /// re-anchor classifier byte-identical to the pre-context behavior.
     pub fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
+    }
+
+    /// Stamp the focused pane's exact columns in the coordinate space handed
+    /// to [`Self::tick`]. This changes morphology only; the normal fresh key
+    /// license remains mandatory at [`Self::spawn`].
+    pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
+        self.pane_columns = u16::try_from(cols)
+            .ok()
+            .filter(|cols| *cols > 0)
+            .map(|cols| (first_col, cols));
     }
 
     /// DISARM dangling movement state (see `CursorGlow::clear_typed`): a newer
@@ -451,6 +511,7 @@ impl CursorTrail {
         self.move_hint = None;
         self.blink_hint = None;
         self.ctx_alt = false;
+        self.pane_columns = None;
     }
 
     /// Advance the trail one frame: observe the cursor at `cur` (`Some(row,col)`
@@ -623,26 +684,12 @@ impl CursorTrail {
             }
         }
 
-        // Fingerprint the produced cells (order is deterministic given sparks).
-        let mut fp: u64 = 0;
-        for t in out.iter() {
-            fp = fp
-                .wrapping_mul(1_000_003)
-                .wrapping_add(((t.row as u64) << 24) ^ ((t.col as u64) << 8) ^ t.alpha as u64);
-        }
-        // Fold the resolved trail colour: `ignite` re-heats it from the LIVE
-        // typing cadence each frame, so the colour can change while every cell's
-        // row/col/alpha quantizes identically — an fp that omitted it let the
-        // host's repaint gate hold stale heated pixels (the frozen-glass bug
-        // class). Folded only over a NON-EMPTY trail so an idle trail keeps the
-        // `fp == 0` idle contract; the `| 1 << 32` bit keeps a black (0x000000)
-        // colour from folding as a no-op multiply-add of zero.
-        if !out.is_empty() {
-            fp = fp
-                .wrapping_mul(1_000_003)
-                .wrapping_add(u64::from(cfg.color) | (1 << 32));
-        }
-        fp
+        // Include the resolved trail colour: `ignite` re-heats it from the LIVE
+        // typing cadence each frame, so colour can change while row/col/alpha
+        // quantize identically. The shared helper is also the host's final
+        // presentation-opacity seam, keeping its RepaintKey fingerprint tied to
+        // the exact attenuated cells rather than this unprojected engine output.
+        trail_presentation_fingerprint(out, cfg.color)
     }
 
     /// THE LICENSE — the `CursorGlow::move_licensed` twin. *Did a human touch
@@ -709,6 +756,9 @@ impl CursorTrail {
         // any paired move (bounded state, one hint = one echo).
         let dr_abs = (cr as i32 - pr as i32).abs();
         let raw_dist = dr_abs.max((cc as i32 - pc as i32).abs());
+        let physical_fold = self.pane_columns.is_some_and(|(col0, cols)| {
+            crate::trail_sweep::physical_margin_fold((pr, pc), (cr, cc), col0, cols)
+        });
         let paired = self
             .type_hint
             .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::TYPE_HINT_FRESH)
@@ -738,19 +788,28 @@ impl CursorTrail {
         if nav_paired {
             return false;
         }
-        if paired && dr_abs <= 1 && raw_dist > 2 && (!self.ctx_alt || blink_fresh) {
+        if paired && !physical_fold && dr_abs <= 1 && raw_dist > 2 && (!self.ctx_alt || blink_fresh)
+        {
             return false;
         }
         // Keep at most `max_len` cells NEAREST the destination (the path's tail).
         let max_len = cfg.max_len.max(1);
         self.spawn_path.clear();
-        crate::trail_sweep::line_cells_tail(
-            &mut self.spawn_path,
-            (i32::from(pr), i32::from(pc)),
-            (i32::from(cr), i32::from(cc)),
-            max_len,
-            false,
-        );
+        if physical_fold {
+            // The glyph materialized at the departure margin cell; the shell's
+            // blank/backspace projection exposed the pending fold at the next
+            // row. Light only that material cell—never a Bresenham diagonal
+            // through columns the caret did not visit.
+            self.spawn_path.push((i32::from(pr), i32::from(pc)));
+        } else {
+            crate::trail_sweep::line_cells_tail(
+                &mut self.spawn_path,
+                (i32::from(pr), i32::from(pc)),
+                (i32::from(cr), i32::from(cc)),
+                max_len,
+                false,
+            );
+        }
         if self.spawn_path.is_empty() {
             return false;
         }
@@ -1063,6 +1122,83 @@ mod tests {
         assert!(!t.is_active());
     }
 
+    #[test]
+    fn presentation_opacity_attenuates_resident_cells_and_fingerprints_exact_output() {
+        let now = Instant::now();
+        let mut trail = CursorTrail::default();
+        trail.sparks.push(Spark {
+            row: 3,
+            col: 7,
+            born_alpha: 200,
+            born: now,
+            life_ms: 1_000,
+        });
+        let config = cfg(true);
+        let mut full = Vec::new();
+        let full_fp = trail.tick(None, now, &config, &mut full);
+        assert_eq!(
+            full.as_slice(),
+            &[TrailCell {
+                row: 3,
+                col: 7,
+                alpha: 200
+            }]
+        );
+        assert_ne!(full_fp, 0, "negative control: a resident cell is emitted");
+
+        for (opacity, expected_alpha) in [(1.0, 200), (0.75, 150), (0.5, 100), (0.25, 50)] {
+            let mut presented = full.clone();
+            let fp = project_trail_presentation(&mut presented, config.color, opacity);
+            assert_eq!(
+                presented.as_slice(),
+                &[TrailCell {
+                    row: 3,
+                    col: 7,
+                    alpha: expected_alpha,
+                }],
+                "the envelope must scale already-resident output at {opacity}"
+            );
+            assert_ne!(fp, 0);
+            assert_eq!(
+                fp,
+                trail_presentation_fingerprint(&presented, config.color),
+                "the RepaintKey witness describes the attenuated bytes"
+            );
+            assert_eq!(
+                fp == full_fp,
+                opacity == 1.0,
+                "only the identity projection keeps the original fingerprint"
+            );
+        }
+
+        let mut hidden = full.clone();
+        assert_eq!(
+            project_trail_presentation(&mut hidden, config.color, 0.0),
+            0
+        );
+        assert!(hidden.is_empty());
+        assert!(
+            trail.is_active(),
+            "presentation shedding must not rewrite resident engine state"
+        );
+
+        let mut non_finite = full;
+        assert_eq!(
+            project_trail_presentation(&mut non_finite, config.color, f32::NAN),
+            0
+        );
+        assert!(non_finite.is_empty(), "non-finite opacity fails closed");
+
+        let mut disabled = cfg(false);
+        disabled.intensity = 1.0;
+        let mut off = Vec::new();
+        assert_eq!(trail.tick(None, now, &disabled, &mut off), 0);
+        assert!(
+            off.is_empty() && !trail.is_active(),
+            "the accessibility/master hard-zero path still retires the comet"
+        );
+    }
+
     /// PTY scrolls carry the classic terminal-cell trail just like the glow
     /// engine's pixel/cell pools. A survivor moves by the exact row delta,
     /// while visible light and classifier anchors that cross the top retire;
@@ -1246,6 +1382,48 @@ mod tests {
             assert_eq!(stale.tick(Some((3, 3)), moved, &c, &mut out), 0);
             assert!(out.is_empty(), "negative control must suppress the move");
         }
+    }
+
+    #[test]
+    fn composed_physical_margin_fold_lights_only_departure_material() {
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_millis(8);
+        let origin = (4, 51);
+        let target = (5, 12);
+        let c = cfg(true);
+        let mut out = Vec::new();
+
+        let mut physical = CursorTrail::default();
+        physical.note_pane_columns(12, 40);
+        physical.tick(Some(origin), t0, &c, &mut out);
+        physical.note_typed(at);
+        assert_ne!(physical.tick(Some(target), at, &c, &mut out), 0);
+        assert_eq!(
+            out.iter()
+                .map(|cell| (cell.row, cell.col))
+                .collect::<Vec<_>>(),
+            vec![(usize::from(origin.0), usize::from(origin.1))],
+            "the fold lights its typed margin cell, never an interpolated diagonal"
+        );
+
+        let mut unwired = CursorTrail::default();
+        unwired.tick(Some(origin), t0, &c, &mut out);
+        unwired.note_typed(at);
+        assert_eq!(unwired.tick(Some(target), at, &c, &mut out), 0);
+        assert!(
+            out.is_empty(),
+            "without pane-bound authority the same large one-row move stays a dark re-anchor"
+        );
+
+        let mut wrong_pane = CursorTrail::default();
+        wrong_pane.note_pane_columns(11, 40);
+        wrong_pane.tick(Some(origin), t0, &c, &mut out);
+        wrong_pane.note_typed(at);
+        assert_eq!(wrong_pane.tick(Some(target), at, &c, &mut out), 0);
+        assert!(
+            out.is_empty(),
+            "an adjacent pane origin cannot borrow the fold"
+        );
     }
 
     /// Tier-1 provenance bind for the classic opaque comet. Program/TUI cursor

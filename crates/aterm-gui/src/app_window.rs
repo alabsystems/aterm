@@ -832,6 +832,16 @@ impl App {
         // font, not the placeholder. `apply_window_scale` re-pushes if this window's
         // display resolves a different scale a moment later (the memo keys on the
         // resolved cell size, so that second push is not suppressed).
+        //
+        // A THIRD contract now reads this push, and it is the one with teeth: the
+        // XTWINOPS pixel reports (`CSI 14 t` text area, `CSI 16 t` cell size —
+        // what a sixel or image-capable TUI asks before it decides how big to
+        // draw). Those answer ONLY from a host-reported cell box and stay silent
+        // until one arrives, because a placeholder handed back as a measurement
+        // would send the application off to render at a font size that exists
+        // nowhere. So this push is not merely an accuracy improvement for them —
+        // it is the difference between a truthful answer and no answer at all.
+        // See `Terminal::host_cell_pixel_size` and `handler_window`.
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
         for wid in windows {
             self.sync_cell_pixel_size(wid);
@@ -1115,7 +1125,7 @@ impl App {
             let (cw, ch) = seed_cell_px(self.font_px);
             let pad = self.cfg_pad_for_scale(1.0);
             let vertical_pad = pad.saturating_add(self.cfg_pad_top_for_scale(1.0));
-            let total_rows = rows.saturating_add(self.tab_strip_rows);
+            let total_rows = rows.saturating_add(self.chrome_rows());
             PhysicalSize::new(
                 (cols as usize * cw + pad.saturating_mul(2)) as u32,
                 (total_rows as usize * ch + vertical_pad) as u32,
@@ -1460,7 +1470,7 @@ impl App {
                     .round()
                     .max(0.0) as usize
                     + self.synthetic_strip_head_px(scale, cell_h);
-                let total_rows = rows.saturating_add(self.tab_strip_rows) as usize;
+                let total_rows = rows.saturating_add(self.chrome_rows()) as usize;
                 // THE SHARED LAW, not a second copy of it. `frame_size_px` is what
                 // `Renderer::frame_size` itself is, and `visible_frame_height` is the
                 // same top-pad crop `Backend::frame_size` applies over it — so this

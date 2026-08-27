@@ -667,10 +667,10 @@ pub fn chrome_face_gate_model() -> Model {
 /// The model abstracts the amplitude as ONE scalar over the whole governed set
 /// (the per-effect arm is a constant 0 under Reduced), so a NEW governed effect
 /// joins the proof through aterm-gui's `MotionEffect::ALL` + the exhaustive
-/// `amplitude` match, not through an edit here — most recently
-/// `MotionEffect::PkgProgressCard` (the toolchain-provisioning progress card's
-/// rainbow/sparkle/cat trim, 2026-08: Reduced amplitude 0, the bar still snaps
-/// to new values as information).
+/// `amplitude` match, not through an edit here — and a RETIRED one leaves the
+/// same way (`MotionEffect::PkgProgressCard`, the floating progress card's
+/// rainbow/sparkle/cat trim, went with the card on 2026-08-26; the status bars
+/// that replaced it carry no time-driven decoration to govern).
 ///
 /// Scalar projection `<<mode, sys, focused, resolved, policy, amp>>`: `Observe`
 /// nondeterministically picks the three motion facts (`mode ∈ 0..2` =

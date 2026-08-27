@@ -1440,6 +1440,14 @@ pub struct Renderer {
     fallback_pick: FxHashMap<char, usize>,
     /// Candidate fallback font paths, tried on first miss; emptied once consumed.
     fallback_paths: Vec<String>,
+    /// How many leading [`Self::fallback_paths`] entries are USER-supplied
+    /// (config `fallback_fonts`, then `$ATERM_FALLBACK_FONT`) rather than
+    /// built-in discovery — the boundary [`build_fallback_chain`] needs to know
+    /// which entries are additive. Always written together with
+    /// `fallback_paths` from [`fallback_candidate_paths`]; `0` (the default, and
+    /// what a directly-seeded discovery list gets) means "all discovery", which
+    /// is the conservative reading.
+    fallback_user_prefix: usize,
     /// The last-applied config `fallback_fonts` chain (W6, resolved paths) — the
     /// hot-reload no-op guard for [`Self::set_config_fallback_fonts`]: an
     /// unchanged reload never churns the loaded chain / caches.
@@ -2844,11 +2852,20 @@ fn fallback_discovery_paths() -> Vec<String> {
 /// config `fallback_fonts` > `$ATERM_FALLBACK_FONT` (compat alias) > the
 /// built-in candidates — the proven [`fallback_chain_order`] law. Loaded
 /// lazily on the first primary-face miss.
-fn fallback_candidate_paths(config: &[String]) -> Vec<String> {
-    fallback_chain_order(
-        config,
-        std::env::var("ATERM_FALLBACK_FONT").ok(),
-        &fallback_discovery_paths(),
+///
+/// Returns the paths together with the length of their USER-supplied prefix
+/// (the config entries plus the env alias) — everything past it is built-in
+/// discovery. `build_fallback_chain` needs that boundary: a user entry is
+/// ADDITIVE (an ordered chain of the user's own faces, then the built-ins
+/// behind them), while only a built-in BROAD BACKSTOP ends the scan. Reading
+/// the env var ONCE and returning the count keeps the two in lockstep — a
+/// recount at the point of use could disagree with the list it describes.
+fn fallback_candidate_paths(config: &[String]) -> (Vec<String>, usize) {
+    let env = std::env::var("ATERM_FALLBACK_FONT").ok();
+    let user_prefix = config.len() + usize::from(env.is_some());
+    (
+        fallback_chain_order(config, env, &fallback_discovery_paths()),
+        user_prefix,
     )
 }
 
@@ -3436,10 +3453,18 @@ fn fontdue_admissible(bytes: &[u8], index: u32) -> bool {
 /// tier the same escape.
 ///
 /// EXACTLY FONTDUE'S ANSWER, NOT A BETTER ONE. fontdue 0.9.3 builds its
-/// `char_to_glyph` map by walking EVERY cmap subtable and inserting only
-/// NON-ZERO mappings; a later subtable overwrites an earlier one, but since zero
-/// is never stored, the map holds `ch` iff SOME subtable maps it non-zero. That
-/// is the predicate here. It is deliberately NOT ttf-parser's
+/// `char_to_glyph` map by ENUMERATING every cmap subtable, querying the emitted
+/// code points, and inserting only NON-ZERO mappings; a later subtable overwrites
+/// an earlier one. For ordinary cmap formats, a direct non-zero query is
+/// enumeration-equivalent. Legacy format 2 is the exception: its direct query
+/// can feed the low byte of a two-byte value through single-byte subheader 0 even
+/// though enumeration emits that subheader only as one-byte values. For example,
+/// Hiragino Sans GB's Macintosh-Chinese cmap answers glyph 1 to a raw U+2318
+/// query by aliasing its `0x18` low byte, while fontdue never enumerates U+2318.
+/// [`fontdue_format2_enumerates`] reads the ONE relevant subheader key to reject
+/// that alias in O(1), without scanning a legacy cmap on the render thread.
+///
+/// The resulting predicate is deliberately NOT ttf-parser's
 /// `Face::glyph_index` (best UNICODE subtable only): on an Apple `.ttc` the two
 /// disagree — that is the Mac-Roman mis-map [`StyledFace::unicode_gid`] exists
 /// for — and changing which face a styled cell ROUTES to is not something
@@ -3448,13 +3473,13 @@ fn fontdue_admissible(bytes: &[u8], index: u32) -> bool {
 ///
 /// CAVEATS, in the same spirit as [`fontdue_admissible`]'s. The workspace links
 /// ttf-parser 0.25 and fontdue links 0.21, so the cmap is read by a different
-/// parser version. And fontdue ENUMERATES each subtable (`codepoints`) where
-/// this QUERIES it, which differs for a format-4 subtable at `U+FFFF` (the
-/// segment sentinel `codepoints` stops at, a noncharacter no cell ever holds)
-/// and after a malformed mid-table sentinel. Both can only make this too
-/// PERMISSIVE — an extra route to the real styled face, which then draws the
-/// same `.notdef` the primary would. `styled_coverage_probe_agrees_with_fontdue`
-/// holds it against fontdue itself over every real face on the machine.
+/// parser version. Outside the format-2 domain check above, enumeration and
+/// querying can still differ for a format-4 subtable at `U+FFFF` (the segment
+/// sentinel `codepoints` stops at, a noncharacter no cell ever holds) and after
+/// a malformed mid-table sentinel. Both can only make this too PERMISSIVE — an
+/// extra route to the real styled face, which then draws the same `.notdef` the
+/// primary would. `styled_coverage_probe_agrees_with_fontdue` holds it against
+/// fontdue itself over every real face on the machine.
 fn fontdue_cmap_covers(bytes: &[u8], index: u32, ch: char) -> bool {
     let Ok(face) = ttf_parser::Face::parse(bytes, index) else {
         return false;
@@ -3462,9 +3487,81 @@ fn fontdue_cmap_covers(bytes: &[u8], index: u32, ch: char) -> bool {
     let Some(cmap) = face.tables().cmap else {
         return false;
     };
-    cmap.subtables
-        .into_iter()
-        .any(|subtable| subtable.glyph_index(ch as u32).is_some_and(|g| g.0 != 0))
+    // Use indexed access deliberately. ttf-parser's iterator stops at the first
+    // malformed/unsupported encoding record, just as this loop does, while the
+    // record index lets the format-2 guard find the matching raw subtable.
+    for record_index in 0..cmap.subtables.len() {
+        let Some(subtable) = cmap.subtables.get(record_index) else {
+            break;
+        };
+        if subtable
+            .glyph_index(ch as u32)
+            .is_none_or(|glyph| glyph.0 == 0)
+        {
+            continue;
+        }
+        if matches!(
+            subtable.format,
+            ttf_parser::cmap::Format::HighByteMappingThroughTable(_)
+        ) {
+            let Some(cmap_bytes) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"cmap"))
+            else {
+                continue;
+            };
+            if !fontdue_format2_enumerates(cmap_bytes, record_index, ch) {
+                continue;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Does fontdue's `Subtable2::codepoints` enumerate `ch` for this raw cmap
+/// encoding record?
+///
+/// Format 2 assigns each first byte a `subHeaderKey`. Key zero denotes the
+/// single-byte subheader; non-zero denotes a two-byte subheader. ttf-parser's
+/// direct `glyph_index` does not enforce that distinction: for a two-byte input
+/// whose high-byte key is zero it still queries subheader 0 with the low byte.
+/// Reading the one key selected by `ch` restores the enumeration domain in
+/// constant time. Range and non-zero-glyph membership remain the caller's direct
+/// `glyph_index` duty.
+fn fontdue_format2_enumerates(cmap: &[u8], record_index: u16, ch: char) -> bool {
+    fn be_u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+        let end = offset.checked_add(2)?;
+        Some(u16::from_be_bytes(bytes.get(offset..end)?.try_into().ok()?))
+    }
+    fn be_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+        let end = offset.checked_add(4)?;
+        Some(u32::from_be_bytes(bytes.get(offset..end)?.try_into().ok()?))
+    }
+    fn checked(cmap: &[u8], record_index: u16, ch: char) -> Option<bool> {
+        const CMAP_HEADER_LEN: usize = 4;
+        const ENCODING_RECORD_LEN: usize = 8;
+        const ENCODING_RECORD_OFFSET_FIELD: usize = 4;
+        const FORMAT2_KEYS_OFFSET: usize = 6;
+
+        let record = CMAP_HEADER_LEN + usize::from(record_index) * ENCODING_RECORD_LEN;
+        let subtable_offset =
+            usize::try_from(be_u32_at(cmap, record + ENCODING_RECORD_OFFSET_FIELD)?).ok()?;
+        let subtable = cmap.get(subtable_offset..)?;
+        if be_u16_at(subtable, 0)? != 2 {
+            return Some(false);
+        }
+
+        let codepoint = u16::try_from(ch as u32).ok()?;
+        let single_byte = codepoint <= 0xFF;
+        let key_index = if single_byte {
+            usize::from(codepoint)
+        } else {
+            usize::from(codepoint >> 8)
+        };
+        let key = be_u16_at(subtable, FORMAT2_KEYS_OFFSET + key_index * 2)?;
+        Some((key == 0) == single_byte)
+    }
+
+    checked(cmap, record_index, ch).unwrap_or(false)
 }
 
 /// Runtime per-codepoint font-fallback resolver (M3 FONT-DISCOVERY).
@@ -3978,10 +4075,18 @@ impl FontCoverage {
 /// Extract a font's covered codepoints from its `cmap` as sorted, coalesced inclusive
 /// ranges (compact: a CJK face's ~tens-of-thousands of codepoints collapse to a few
 /// hundred ranges). `None` when the face has no usable Unicode cmap.
-fn font_cmap_ranges(bytes: &[u8]) -> Option<Vec<(u32, u32)>> {
+///
+/// `cps` is the caller's REUSED enumeration scratch, cleared on entry and left
+/// holding this face's codepoints. It is a parameter for the reason
+/// [`font_file::read_bounded_font_file_into`]'s buffer is: this runs once per
+/// system font, and a broad face enumerates tens of thousands of codepoints, so
+/// a private `Vec` per call is one more grow-and-drop cycle per font for the
+/// allocator to leave behind (MEASURED at 0.5 MB of the index build's residue on
+/// this host — small beside the 25.8 MB the file buffer accounts for, and free).
+fn font_cmap_ranges(bytes: &[u8], cps: &mut Vec<u32>) -> Option<Vec<(u32, u32)>> {
     let face = ttf_parser::Face::parse(bytes, 0).ok()?;
     let cmap = face.tables().cmap?;
-    let mut cps: Vec<u32> = Vec::new();
+    cps.clear();
     for sub in cmap.subtables {
         if sub.is_unicode() {
             sub.codepoints(|cp| cps.push(cp));
@@ -3993,7 +4098,7 @@ fn font_cmap_ranges(bytes: &[u8]) -> Option<Vec<(u32, u32)>> {
     cps.sort_unstable();
     cps.dedup();
     let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(64);
-    for cp in cps {
+    for &cp in cps.iter() {
         match ranges.last_mut() {
             Some(last) if cp == last.1 + 1 => last.1 = cp,
             _ => ranges.push((cp, cp)),
@@ -4025,20 +4130,45 @@ fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
     })
 }
 
-/// Build the LAZY broad-fallback CHAIN for `paths` (W8): entries of the NATIVE-SCRIPT
-/// tier ([`NATIVE_SCRIPT_FALLBACK_CANDIDATES`]) are ADDITIVE — the scan keeps going
-/// after loading one — while the first non-tier (broad) face that loads ends the
-/// scan. On macOS this yields `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
-/// broad backstop second); on Windows the per-script faces that exist (YaHei, Malgun
-/// Gothic, Nirmala UI, Leelawadee UI, Sylfaen, Ebrima, Gadugi, MV Boli) followed by
-/// Arial; on Linux a single broad face; a configured/env path still wins outright
-/// (it loads first
-/// and, not being a tier entry, ends the scan). Because every path that fails to read
-/// is SKIPPED rather than fatal, a host missing any of these degrades to the rest of
-/// the chain. A face's bytes are interned and its fontdue parse DEFERRED, so this is
-/// safe to run on a BACKGROUND thread and cheap enough to run anywhere. An EMPTY
-/// result means no candidate loaded.
-fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
+/// Build the LAZY broad-fallback CHAIN for `paths` (W8). A face is ADDITIVE when
+/// the scan keeps going past it; the first NON-additive face that LOADS ends the
+/// scan. Two classes are additive:
+///
+///  * the first `user_prefix` entries — the config `fallback_fonts` chain and
+///    the `$ATERM_FALLBACK_FONT` alias, in that order (see
+///    [`fallback_candidate_paths`]);
+///  * built-in [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] entries.
+///
+/// So exactly one thing ends the scan: the platform's built-in BROAD BACKSTOP,
+/// listed last in its arm of [`FALLBACK_CANDIDATES`].
+///
+/// On macOS this yields `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
+/// broad backstop second); on Windows the per-script faces that exist (YaHei,
+/// Malgun Gothic, Nirmala UI, Leelawadee UI, Sylfaen, Ebrima, Gadugi, MV Boli)
+/// followed by Arial; on Linux a single broad face — each with any configured
+/// faces AHEAD of it.
+///
+/// WHY THE USER PREFIX IS ADDITIVE. `fallback_fonts` is documented as an ordered
+/// chain, "most-preferred first" — the shipped example is a text face followed
+/// by a symbol face that covers what it misses. When user entries ended the scan
+/// only the FIRST of them could ever load, and the entire built-in chain behind
+/// them was orphaned too. On Windows there is no broad backstop, so that turned
+/// one `fallback_fonts` line into Hangul/Thai/Devanagari tofu — the same defect
+/// the Windows arm above exists to close. Pinned by
+/// `a_config_fallback_font_does_not_orphan_the_rest_of_the_chain` and
+/// `a_two_entry_config_fallback_chain_loads_both_entries`.
+///
+/// Because every path that fails to read is SKIPPED rather than fatal, a host
+/// missing any of these degrades to the rest of the chain. A face's bytes are
+/// interned and its fontdue parse DEFERRED, so this is safe to run on a
+/// BACKGROUND thread and cheap enough to run anywhere. An EMPTY result means no
+/// candidate loaded.
+fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFace> {
+    // The additive predicate, by INDEX (the user prefix is positional — a user
+    // may legitimately configure a path that is also a built-in backstop, and in
+    // that position it must not truncate the chain behind it).
+    let additive =
+        |i: usize, p: &str| i < user_prefix || NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p);
     // WHAT THIS COSTS NOW, and why the threads remain.
     //
     // The chain is normally TWO faces on macOS — Hiragino Sans GB (23.5 MB) then
@@ -4059,18 +4189,24 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
     // argument below unchanged.
     //
     // THE SCAN RULE IS PRESERVED EXACTLY, because it decides which faces exist:
-    // native-tier entries are ADDITIVE (keep scanning), the first non-tier face that
-    // LOADS ends the scan, and a path that fails to read or parse is skipped WITHOUT
-    // ending it. So only a bounded prefix can ever be needed — every native-tier path
-    // up to and including the first non-tier one — and that prefix is what is parsed
-    // speculatively. The results are then consumed IN ORDER under the original rule,
+    // additive entries keep the scan going, the first NON-additive face that LOADS
+    // ends it, and a path that fails to read or parse is skipped WITHOUT ending it.
+    // So only a bounded prefix can ever be needed — every additive path up to and
+    // including the first non-additive one — and that prefix is what is parsed
+    // speculatively. The results are then consumed IN ORDER under the same rule,
     // so chain order and membership are identical to the serial form; speculation can
     // only do redundant work (parsing a face a failure upstream would have skipped),
-    // never change the outcome. If every non-tier candidate in the prefix fails to
+    // never change the outcome. If every non-additive candidate in the prefix fails to
     // load, the scan continues serially from there, exactly as before.
+    //
+    // `additive` now covers the user prefix as well, so the speculative window
+    // grows by however many faces the user configured. That is the point: those
+    // faces are going to be loaded anyway, and loading them concurrently is how
+    // a configured chain stays as cheap as the built-in one.
     let speculative = paths
         .iter()
-        .position(|p| !NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p.as_str()))
+        .enumerate()
+        .position(|(i, p)| !additive(i, p.as_str()))
         .map_or(paths.len(), |first_broad| first_broad + 1);
 
     let parsed: Vec<Option<FallbackFace>> = std::thread::scope(|scope| {
@@ -4090,28 +4226,28 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
     });
 
     let mut chain = Vec::new();
-    for (p, face) in paths.iter().zip(parsed) {
+    for (i, (p, face)) in paths.iter().zip(parsed).enumerate() {
         let Some(face) = face else {
             continue; // unreadable or unparsable: skipped, does NOT end the scan
         };
-        let is_native_tier = NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p.as_str());
+        let keep_scanning = additive(i, p.as_str());
         chain.push(face);
-        if !is_native_tier {
+        if !keep_scanning {
             return chain;
         }
     }
-    // Every speculatively-parsed candidate was native-tier or failed, so no broad
+    // Every speculatively-parsed candidate was additive or failed, so no broad
     // face has ended the scan yet. Continue serially through the remainder.
-    for p in &paths[speculative..] {
+    for (i, p) in paths.iter().enumerate().skip(speculative) {
         let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
             continue;
         };
-        let is_native_tier = NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p.as_str());
+        let keep_scanning = additive(i, p.as_str());
         let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
             continue;
         };
         chain.push(face);
-        if !is_native_tier {
+        if !keep_scanning {
             break;
         }
     }
@@ -4130,10 +4266,28 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
 /// LastResort tofu font is excluded (it "covers" everything). Only the small range
 /// tables are retained; the font bytes are dropped after extraction. Prefer
 /// [`warm_font_coverage_index`] at startup so this never stalls a live frame.
+///
+/// "The font bytes are dropped after extraction" was true and still cost 27.5 MB
+/// of resident memory, permanently, in every aterm process. The scan reads EVERY
+/// system font in full — 358 files, 174 MB, the largest 26 MB, on this Linux host
+/// — and keeps ~214 kB of range tables. Dropping each blob returns it to the
+/// ALLOCATOR, not to the kernel: glibc `munmap`s the first large one and then
+/// raises its dynamic `mmap` threshold to that size, so every later read is
+/// served from the arena, and the arena's high-water mark is what survives the
+/// build. That is why both scratch buffers below are hoisted out of the loop —
+/// one block that only grows, returned when it drops. MEASURED on this host, on
+/// the main thread and on the spawned warm thread alike: **27.5 MB → 1.4 MB**,
+/// same files, same bytes, same index
+/// (`docs/measured/memory-footprint-2026-08-24.md` §14).
 fn font_coverage_index() -> &'static [FontCoverage] {
     static INDEX: std::sync::OnceLock<Vec<FontCoverage>> = std::sync::OnceLock::new();
     INDEX.get_or_init(|| {
         let mut idx: Vec<FontCoverage> = Vec::new();
+        // Hoisted, not per-iteration: see the note above. `bytes` grows to the
+        // largest font seen so far and is reused for every read after it; `cps`
+        // likewise for the cmap enumeration.
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut cps: Vec<u32> = Vec::new();
         for path in font_files() {
             let Some(p) = path.to_str().map(str::to_string) else {
                 continue;
@@ -4141,13 +4295,13 @@ fn font_coverage_index() -> &'static [FontCoverage] {
             if path_is_last_resort(&p) {
                 continue;
             }
-            let Ok(bytes) = font_file::read_font_file(&path) else {
+            if font_file::read_font_file_into(&path, &mut bytes).is_err() {
                 continue;
-            };
+            }
             let (weight, italic) = ttf_parser::Face::parse(&bytes, 0)
                 .map(|f| (f.weight().to_number(), f.is_italic()))
                 .unwrap_or((400, false));
-            if let Some(ranges) = font_cmap_ranges(&bytes) {
+            if let Some(ranges) = font_cmap_ranges(&bytes, &mut cps) {
                 idx.push(FontCoverage {
                     path: p,
                     ranges,
@@ -6201,6 +6355,7 @@ impl Renderer {
             display_mix: Vec::new(),
             fallback_pick: FxHashMap::default(),
             fallback_paths: Vec::new(),
+            fallback_user_prefix: 0,
             cfg_fallback_fonts: Vec::new(),
             cfg_symbol_font: None,
             cfg_emoji_font: None,
@@ -6398,7 +6553,7 @@ impl Renderer {
         // re-resolves a CJK char to the SAME key and `glyph_image` returns the OLD
         // face's bitmap (the new face never appears). Drop the bitmaps too.
         self.glyphs.clear();
-        self.fallback_paths.clear();
+        self.clear_fallback_candidates();
         Ok(())
     }
 
@@ -6415,7 +6570,7 @@ impl Renderer {
         // might now be covered by the new entry; re-probe on the next miss.
         self.fallback_pick.clear();
         self.keys.clear();
-        self.fallback_paths.clear();
+        self.clear_fallback_candidates();
         Ok(())
     }
 
@@ -6576,10 +6731,25 @@ impl Renderer {
         true
     }
 
+    /// Drop the pending fallback CANDIDATE list — the lazy first-miss load has
+    /// nothing left to do (the chain was injected, or the generation is sealed).
+    ///
+    /// The list and its user-prefix boundary are ONE fact and must move as one:
+    /// a cleared list beside a stale prefix would misclassify a later, unrelated
+    /// list as user-supplied. Two pieces of state that must agree, updated in two
+    /// places, is precisely the shape of the bug this prefix exists to fix.
+    fn clear_fallback_candidates(&mut self) {
+        self.fallback_paths.clear();
+        self.fallback_user_prefix = 0;
+    }
+
     /// Install the CONFIG fallback-font chain (TOML `fallback_fonts`, W6):
     /// resolved paths that OUTRANK the `$ATERM_FALLBACK_FONT` compat alias,
     /// which outranks the built-in discovery candidates — the proven
-    /// [`fallback_chain_order`] precedence law. Hot-reloadable: a CHANGED list
+    /// [`fallback_chain_order`] precedence law. Every entry is loaded, in order,
+    /// AHEAD of the built-in chain rather than instead of it — see
+    /// [`build_fallback_chain`] on why the user prefix is additive.
+    /// Hot-reloadable: a CHANGED list
     /// resets the loaded chain + per-char picks so the next miss re-probes
     /// (returns `true`); an unchanged list is a free no-op (`false`), so config
     /// reloads never churn caches. NOTE: a change also drops faces injected via
@@ -6590,7 +6760,7 @@ impl Renderer {
             return false;
         }
         self.cfg_fallback_fonts = paths.to_vec();
-        self.fallback_paths = fallback_candidate_paths(paths);
+        (self.fallback_paths, self.fallback_user_prefix) = fallback_candidate_paths(paths);
         self.admitted_sources_sealed = false;
         self.fallback_chain.clear();
         self.fallback_pick.clear();
@@ -6835,7 +7005,7 @@ impl Renderer {
     ) -> Result<Self, String> {
         let mut renderer = Self::from_bytes(bytes, px, theme)?;
         renderer.primary_path = Some(path.into());
-        renderer.fallback_paths = fallback_candidate_paths(&[]);
+        (renderer.fallback_paths, renderer.fallback_user_prefix) = fallback_candidate_paths(&[]);
         renderer.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
         renderer.color_font_paths = color_emoji_candidate_paths(&[]);
         Ok(renderer)
@@ -6901,7 +7071,7 @@ impl Renderer {
         // default `embedded-font` feature.
         #[cfg(feature = "embedded-font")]
         if let Ok(mut r) = Self::from_bytes(embedded_font(), px, theme) {
-            r.fallback_paths = fallback_candidate_paths(&[]);
+            (r.fallback_paths, r.fallback_user_prefix) = fallback_candidate_paths(&[]);
             r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
             r.color_font_paths = color_emoji_candidate_paths(&[]);
             return Some(r);
@@ -6914,13 +7084,14 @@ impl Renderer {
     /// we never re-try. Only seeds the lazy SYSTEM faces; explicit
     /// `add_fallback_bytes` entries are already in the chain and untouched.
     ///
-    /// W8: entries of the NATIVE-SCRIPT tier ([`NATIVE_SCRIPT_FALLBACK_CANDIDATES`])
-    /// are ADDITIVE — the scan keeps going after loading one — while the first
-    /// non-tier (broad) face that loads ends the scan exactly as before. So on
-    /// macOS the chain is `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
-    /// broad backstop second) and everywhere else it stays a single broad face;
-    /// a configured/env path still wins outright (it loads first and, not being
-    /// a tier entry, ends the scan). See [`build_fallback_chain`].
+    /// W8: the configured/env faces and the built-in
+    /// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] tier are ADDITIVE — the scan keeps
+    /// going after loading one — and only the platform's built-in BROAD BACKSTOP
+    /// ends it. So on macOS the chain is `[Hiragino Sans GB, Arial Unicode]`
+    /// (native CJK first, broad backstop second), on Windows the per-script
+    /// faces that exist followed by Arial, and on Linux a single broad face —
+    /// each with any configured faces ahead of it, in config order. See
+    /// [`build_fallback_chain`].
     ///
     /// The read + fontdue parse (~370MB resident for a broad Unicode face,
     /// hundreds of ms) runs on a BACKGROUND thread on native: the first miss
@@ -6938,6 +7109,8 @@ impl Renderer {
             return;
         }
         let paths = std::mem::take(&mut self.fallback_paths);
+        // Taken WITH the paths: the boundary describes that list and nothing else.
+        let user_prefix = std::mem::take(&mut self.fallback_user_prefix);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -6946,8 +7119,8 @@ impl Renderer {
                 .name("aterm-fallback-parse".into())
                 .spawn(move || {
                     // A send error only means the renderer was dropped first.
-                    // W8: build the WHOLE native-CJK-additive tier chain off-thread.
-                    let _ = tx.send(build_fallback_chain(&thread_paths));
+                    // W8: build the WHOLE additive tier chain off-thread.
+                    let _ = tx.send(build_fallback_chain(&thread_paths, user_prefix));
                 })
                 .is_ok()
             {
@@ -6956,7 +7129,7 @@ impl Renderer {
             }
         }
         // wasm (no threads) — or a failed native spawn: the synchronous parse.
-        self.fallback_chain = build_fallback_chain(&paths);
+        self.fallback_chain = build_fallback_chain(&paths, user_prefix);
     }
 
     fn install_fallback_chain(&mut self, chain: Vec<FallbackFace>) {
@@ -7560,7 +7733,7 @@ impl Renderer {
 
         // `ensure_*` consumes these already, but clear explicitly so this method
         // remains a hard boundary if their implementation later changes.
-        self.fallback_paths.clear();
+        self.clear_fallback_candidates();
         self.symbol_fallback_paths.clear();
         self.color_font_paths.clear();
         self.fallback_parse_rx = None;
@@ -7629,7 +7802,7 @@ impl Renderer {
         rebuilt.primary_path = self.primary_path.clone(); // diagnostics only
         rebuilt.fallback_chain = self.fallback_chain.clone();
         rebuilt.display_mix = self.display_mix.clone();
-        rebuilt.fallback_paths.clear();
+        rebuilt.clear_fallback_candidates();
         rebuilt
             .cfg_fallback_fonts
             .clone_from(&self.cfg_fallback_fonts);
@@ -7745,10 +7918,10 @@ impl Renderer {
         fork.fallback_chain = self.fallback_chain.clone();
         fork.display_mix = self.display_mix.clone();
         fork.cfg_fallback_fonts = self.cfg_fallback_fonts.clone();
-        fork.fallback_paths = if fork.fallback_chain.is_empty() {
+        (fork.fallback_paths, fork.fallback_user_prefix) = if fork.fallback_chain.is_empty() {
             fallback_candidate_paths(&fork.cfg_fallback_fonts)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
         fork.symbol_fallback = self.symbol_fallback.clone();
         fork.cfg_symbol_font = self.cfg_symbol_font.clone();
@@ -9829,9 +10002,10 @@ impl Renderer {
         self.cursor_blink_phase
     }
 
-    /// Force the cursor to be drawn as `style` regardless of the terminal's
-    /// DECSCUSR style (`None` restores it). The windowed frontend sets
-    /// `Some(HollowBlock)` while unfocused, the standard terminal behavior.
+    /// Force the cursor to be drawn as `style` regardless of both the frame's
+    /// host/effect override and the terminal's DECSCUSR style (`None` restores
+    /// their normal precedence). The windowed frontend sets `Some(HollowBlock)`
+    /// while unfocused, the standard terminal behavior.
     pub fn set_cursor_style_override(&mut self, style: Option<CursorStyle>) {
         self.cursor_style_override = style;
     }
@@ -14159,7 +14333,34 @@ impl Renderer {
         };
         // Mirror the Pass-2 glyph predicate: cells that draw no glyph have no
         // ink to skip around.
-        if cell.wide || cell.ch == ' ' || cell.ch.is_control() || input.image_hides_glyph_at(r, c) {
+        if cell.ch == ' ' || cell.ch.is_control() || input.image_hides_glyph_at(r, c) {
+            return false;
+        }
+        // WIDE GLYPHS DRAW AN UNBROKEN RULE (see
+        // [`deco::ink_skip_applies_to_width`] for the measurement and the
+        // typography).
+        //
+        // Both halves are tested, and they are two different states, not one:
+        //
+        // * `cell.wide` is the CONTINUATION half. Pass 3 already `continue`s
+        //   past it (the lead draws the rule across both cells with
+        //   `dw = 2 * cw`), so this arm is the GPU caller's and any future
+        //   caller's backstop.
+        // * `cells[c + 1].wide` marks THIS cell as the LEAD half — the one that
+        //   actually owns the two-cell underline, and the one that was carving
+        //   an ideograph's foot out of it. Spelled exactly as the two callers
+        //   spell `is_wide_lead`, so all three sites agree by inspection.
+        //
+        // Before this, the lead was carved and the continuation was not, so a
+        // wide glyph's rule was even inconsistent across its own two halves.
+        let is_wide_lead = input
+            .cells
+            .get(r)
+            .and_then(|row| row.get(c + 1))
+            .is_some_and(|next| next.wide);
+        // Either half of a double-width glyph reports the GLYPH's column count.
+        let cell_cols = if cell.wide || is_wide_lead { 2 } else { 1 };
+        if !deco::ink_skip_applies_to_width(cell_cols) {
             return false;
         }
         let key = match plan_entry {
@@ -15075,9 +15276,10 @@ impl Renderer {
     /// `render_input` ran after the row loop, factored out so the full and
     /// damaged paths share it verbatim.
     ///
-    /// The cursor is shaped by DECSCUSR (`input.cursor_style`) or the frontend's
-    /// override (unfocused windows force HollowBlock). The block styles fill the
-    /// cell with the cursor colour and re-draw the glyph in the cell's own
+    /// The cursor is shaped by the frontend/backend override (unfocused windows
+    /// force HollowBlock), then the composed frame's effect override, then
+    /// DECSCUSR (`input.cursor_style`). The block styles fill the cell with the
+    /// cursor colour and re-draw the glyph in the cell's own
     /// background ("cut out"); underline/bar/hollow paint only their strip /
     /// outline OVER the normally drawn glyph. Nothing is drawn when DECTCEM hides
     /// the cursor, the style is Hidden, or a Blinking* style is in its off phase.
@@ -15090,7 +15292,7 @@ impl Renderer {
     fn draw_cursor(&mut self, pixels: &mut [u32], w: usize, h: usize, input: &RenderInput) {
         let (rows, cols) = (input.rows, input.cols);
         let (cr, cc) = (input.cursor_row, input.cursor_col);
-        let style = self.cursor_style_override.unwrap_or(input.cursor_style);
+        let style = effective_cursor_style(input, self.cursor_style_override);
         if cr < rows
             && cc < cols
             && input.cursor_visible
@@ -15144,6 +15346,17 @@ impl Renderer {
             // (the owner's "green flash" opening Claude, back when a block-only
             // gate held the theme colour until the shape returned). Per-style
             // hosts gate which fill is Some, and the GPU mirrors this exactly.
+            //
+            // THE OVERRIDE REPLACES `frame_cursor`, IT DOES NOT BLEND WITH IT —
+            // which makes `cursor_fill_override` the one channel through which a
+            // host can lose OSC 12 / the configured `cursor_color` entirely. The
+            // renderer cannot recover it (only the effect knows how its colour is
+            // built), so the contract is the HOST's: an effect that owns the
+            // cursor BODY must derive its fill from the resolved cursor colour.
+            // aterm-gui's rainbow block broke exactly that and painted a constant
+            // near-white caret under the shipped default style while
+            // `RenderInput::cursor_color` carried the live OSC 12 value
+            // faithfully all the way to this line (2026-08-26).
             let base_fill = match input.cursor_fill_override {
                 Some(fill) => fill,
                 None => self.frame_cursor(input),
@@ -17157,16 +17370,32 @@ impl DirtyRows {
     }
 }
 
+/// Resolve the shape painted for this frame.
+///
+/// The renderer/backend override is presentation authority (most notably an
+/// unfocused window's HollowBlock), so it remains highest precedence. The
+/// frame-carried host/effect override comes next without mutating terminal
+/// DECSCUSR, and the terminal style is the fallback.
+#[must_use]
+pub fn effective_cursor_style(
+    input: &RenderInput,
+    renderer_cursor_style_override: Option<CursorStyle>,
+) -> CursorStyle {
+    renderer_cursor_style_override
+        .or(input.cursor_effect_style_override)
+        .unwrap_or(input.cursor_style)
+}
+
 /// Whether the cursor is actually painted for `input` at the given blink phase /
-/// style override — the SAME shown-test [`compute_dirty_rows`] and `draw_cursor`
-/// use (effective style = override ?? DECSCUSR, gated by DECTCEM + blink phase +
-/// in-range position).
+/// renderer override — the SAME shown-test [`compute_dirty_rows`] and
+/// `draw_cursor` use (effective style = renderer override ?? effect override ??
+/// DECSCUSR, gated by DECTCEM + blink phase + in-range position).
 fn cursor_shown_in(
     input: &RenderInput,
     blink_phase: bool,
     cursor_style_override: Option<CursorStyle>,
 ) -> bool {
-    let style = cursor_style_override.unwrap_or(input.cursor_style);
+    let style = effective_cursor_style(input, cursor_style_override);
     input.cursor_row < input.rows
         && input.cursor_col < input.cols
         && input.cursor_visible
@@ -17302,14 +17531,15 @@ pub fn scroll_blit_plan(
     if prev_shown != cur_shown {
         return None;
     }
+    let prev_style = effective_cursor_style(prev, prev_cursor_style_override);
+    let cur_style = effective_cursor_style(input, cur_cursor_style_override);
     if cur_shown
         && !(prev.cursor_row == input.cursor_row
             && prev.cursor_col == input.cursor_col
-            && prev.cursor_style == input.cursor_style
+            && prev_style == cur_style
             && prev.cursor_color == input.cursor_color
             && prev.cursor_fill_override == input.cursor_fill_override
-            && prev_blink_phase == cur_blink_phase
-            && prev_cursor_style_override == cur_cursor_style_override)
+            && prev_blink_phase == cur_blink_phase)
     {
         return None;
     }
@@ -17610,14 +17840,14 @@ pub fn compute_dirty_rows(
         }
     }
     // Cursor: where it was last frame and where it is this frame. Use the SAME
-    // shown-test the overlay uses (effective style = override ?? DECSCUSR, gated
-    // by DECTCEM + blink phase).
-    let prev_style = prev_cursor_style_override.unwrap_or(prev_input.cursor_style);
+    // shown-test the overlay uses (effective style = renderer override ?? effect
+    // override ?? DECSCUSR, gated by DECTCEM + blink phase).
+    let prev_style = effective_cursor_style(prev_input, prev_cursor_style_override);
     let prev_shown = prev_input.cursor_row < rows
         && prev_input.cursor_col < cols
         && prev_input.cursor_visible
         && cursor_shown(prev_style, prev_blink_phase);
-    let cur_style = cur_cursor_style_override.unwrap_or(input.cursor_style);
+    let cur_style = effective_cursor_style(input, cur_cursor_style_override);
     let cur_shown = input.cursor_row < rows
         && input.cursor_col < cols
         && input.cursor_visible
@@ -17643,7 +17873,8 @@ pub fn compute_dirty_rows(
     }
 
     let blink_or_override_changed = prev_blink_phase != cur_blink_phase
-        || prev_cursor_style_override != cur_cursor_style_override;
+        || prev_cursor_style_override != cur_cursor_style_override
+        || prev_input.cursor_effect_style_override != input.cursor_effect_style_override;
 
     // Cadence-comet MOTION TRAIL: an OPAQUE per-cell overlay (each `TrailCell` fills
     // its cell with the trail colour blended over that cell's own bg) that
@@ -20749,10 +20980,39 @@ fn to_rgba8(buf: &[u8], color_type: png::ColorType, w: usize, h: usize) -> Optio
     }
 }
 
-/// Decode an inline-image payload (iTerm2 OSC 1337) to RGBA8 resampled to fill
-/// the footprint pixel box `fp_w × fp_h`. The engine already chose the footprint
-/// cell count (honoring aspect ratio), so here we simply scale the decoded image
-/// to fill that box; each covered cell then paints a 1:1 tile of the result.
+/// Decode an inline-image payload (iTerm2 OSC 1337 / sixel) to RGBA8 filling the
+/// footprint pixel box `fp_w × fp_h`, with the SOURCE ASPECT RATIO PRESERVED:
+/// the image is scaled to the largest box that fits, centered, and the remainder
+/// left fully transparent (the cell background shows through). Each covered cell
+/// then paints a 1:1 tile of the result.
+///
+/// ## Why not simply fill the box
+///
+/// This used to scale straight to `fp_w × fp_h` on the reasoning that "the engine
+/// already chose the footprint cell count (honoring aspect ratio)". The engine
+/// does honor it — but only to the nearest WHOLE CELL, which is where the error
+/// comes from: a 120x60 sixel (2.00) lands in a 14x4-cell box of 126x68 px
+/// (1.85), and filling that box stretched the raster by 5% horizontally and 13%
+/// vertically. Measured on the shipping 0.61.0 build: 7.9% aspect error on that
+/// card, 18% on a 100x40 one, for sixel and OSC 1337 alike. Circles came out as
+/// ellipses on every image whose pixel size was not an exact multiple of the cell
+/// box. Fitting instead of filling makes the drawn raster's aspect EXACT to the
+/// rounding of one destination pixel, at the cost of a few transparent px along
+/// one axis.
+///
+/// A source whose aspect already matches the box (the tab strip's chrome band,
+/// which builds its raster at exactly `cols*cell_w × rows*cell_h + lift`, and any
+/// cell-exact image) fits the full box, so those paths are byte-identical.
+///
+/// ## Not yet honored
+///
+/// iTerm2's `preserveAspectRatio=0` — "stretch to fill, ignore the inherent
+/// ratio" — has no carrier: [`ImageData`](aterm_core::grid::extra::ImageData)
+/// stores no such flag, so the renderer cannot tell a default placement from an
+/// explicit stretch request and treats both as fit. That option was ALREADY
+/// ignored before this change (it stretched both ways round); making the default
+/// correct is strictly closer to the spec, and the remaining gap is one bool on
+/// `ImageData` away.
 ///
 /// Returns `None` only for a format the renderer cannot decode (non-PNG) or a
 /// corrupt/oversized PNG; the caller caches that as "draw nothing" so a bad image
@@ -20761,7 +21021,8 @@ fn to_rgba8(buf: &[u8], color_type: png::ColorType, w: usize, h: usize) -> Optio
 /// Public so the GPU renderer's image pass decodes byte-identically: it uploads
 /// this exact footprint RGBA into a texture and samples it NEAREST per cell, so a
 /// covered cell's pixels match the CPU `blit_image_cell` 1:1 tile (the CPU/GPU
-/// inline-image parity gate).
+/// inline-image parity gate). The fit happens HERE, in the one shared decode, so
+/// neither renderer can drift from the other on it.
 pub fn decode_image_to_footprint(
     bytes: &[u8],
     format: aterm_core::grid::extra::ImageFormat,
@@ -20771,7 +21032,7 @@ pub fn decode_image_to_footprint(
     if fp_w == 0 || fp_h == 0 {
         return None;
     }
-    // Already-decoded RGBA8 (the sixel path): resample the stored raster to the
+    // Already-decoded RGBA8 (the sixel path): fit the stored raster into the
     // footprint directly — no container to decode. The engine guarantees the
     // byte layout (`[r, g, b, a]` per pixel, row-major over `width`), matching
     // `resample_rgba`'s input contract.
@@ -20780,7 +21041,13 @@ pub fn decode_image_to_footprint(
         if w == 0 || h == 0 || bytes.len() < w.checked_mul(h)?.checked_mul(4)? {
             return None;
         }
-        return Some(resample_rgba(&bytes[..w * h * 4], w, h, fp_w, fp_h));
+        return Some(fit_rgba_into_footprint(
+            &bytes[..w * h * 4],
+            w,
+            h,
+            fp_w,
+            fp_h,
+        ));
     }
     // Only PNG is decodable today; anything else degrades to nothing.
     if !matches!(format, aterm_core::grid::extra::ImageFormat::Png) {
@@ -20788,13 +21055,73 @@ pub fn decode_image_to_footprint(
     }
     let (src, src_w, src_h) = decode_png_rgba8(bytes)?;
     // Identity fast path (perf): a source already at footprint size needs no
-    // resample — with the area/bilinear ratio at 1:1 the filter is the identity,
-    // so returning the decode directly is byte-identical AND skips a full
-    // multi-megapixel float pass on the event-loop thread.
+    // resample — its aspect IS the box's, so the fit is the whole box and the
+    // area/bilinear ratio is 1:1 (the identity filter). Returning the decode
+    // directly is byte-identical AND skips a full multi-megapixel float pass on
+    // the event-loop thread.
     if (src_w, src_h) == (fp_w, fp_h) {
         return Some(src);
     }
-    Some(resample_rgba(&src, src_w, src_h, fp_w, fp_h))
+    Some(fit_rgba_into_footprint(&src, src_w, src_h, fp_w, fp_h))
+}
+
+/// The largest `w × h` with `src`'s aspect ratio that fits inside `fp_w × fp_h`.
+///
+/// Exact integer cross-multiplication decides which axis binds, so a source whose
+/// aspect already equals the box's fits it EXACTLY (no rounding drift, and the
+/// identity/no-op paths stay byte-identical). Each side is at least 1: a footprint
+/// too small to hold a scaled row still draws one.
+#[doc(hidden)]
+#[must_use]
+pub fn aspect_fit_box(src_w: usize, src_h: usize, fp_w: usize, fp_h: usize) -> (usize, usize) {
+    let (sw, sh) = (src_w as u64, src_h as u64);
+    let (bw, bh) = (fp_w as u64, fp_h as u64);
+    if sw == 0 || sh == 0 {
+        return (fp_w, fp_h);
+    }
+    // `sw/sh` vs `bw/bh` without division: wider-than-the-box ⇒ width binds.
+    let (w, h) = match (sw * bh).cmp(&(sh * bw)) {
+        std::cmp::Ordering::Equal => (bw, bh),
+        // Source is WIDER than the box: pin the width, derive the height.
+        std::cmp::Ordering::Greater => (bw, ((sh * bw) + sw / 2) / sw),
+        // Source is TALLER than the box: pin the height, derive the width.
+        std::cmp::Ordering::Less => (((sw * bh) + sh / 2) / sh, bh),
+    };
+    ((w.max(1) as usize).min(fp_w), (h.max(1) as usize).min(fp_h))
+}
+
+/// Resample `src` into the aspect-preserving box that fits `fp_w × fp_h` and
+/// center it there, leaving the margin fully transparent (RGBA 0,0,0,0 — the
+/// blit's straight-alpha OVER then leaves the cell background untouched, and the
+/// GPU pass samples the same zeros).
+///
+/// When the fit box IS the footprint (equal aspects, including every cell-exact
+/// image and the chrome band) this is exactly the old `resample_rgba` call,
+/// identity fast path included.
+fn fit_rgba_into_footprint(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    fp_w: usize,
+    fp_h: usize,
+) -> Vec<u8> {
+    let (dst_w, dst_h) = aspect_fit_box(src_w, src_h, fp_w, fp_h);
+    if (dst_w, dst_h) == (fp_w, fp_h) {
+        return resample_rgba(src, src_w, src_h, fp_w, fp_h);
+    }
+    let scaled = resample_rgba(src, src_w, src_h, dst_w, dst_h);
+    let mut out = vec![0u8; fp_w * fp_h * 4];
+    // Centered: the letterbox bars split evenly (the odd pixel goes to the
+    // bottom/right, so a 1-px band never lands on top of the image).
+    let off_x = (fp_w - dst_w) / 2;
+    let off_y = (fp_h - dst_h) / 2;
+    let row_bytes = dst_w * 4;
+    for y in 0..dst_h {
+        let s = y * row_bytes;
+        let d = ((off_y + y) * fp_w + off_x) * 4;
+        out[d..d + row_bytes].copy_from_slice(&scaled[s..s + row_bytes]);
+    }
+    out
 }
 
 /// W10 STRIKE-SELECTION LAW — the pure policy choosing which bitmap strike
@@ -22721,6 +23048,41 @@ mod tests {
         );
     }
 
+    /// A host/effect shape transition on a stationary cursor is global snapshot
+    /// content, not a row-cell diff. It must dirty the cursor row and un-gate the
+    /// shared CPU/GPU caches; otherwise a composed Bolt can be stranded as the
+    /// terminal's underline (or vice versa) until the cursor moves.
+    #[test]
+    fn cursor_effect_style_override_change_ungates_stationary_cursor() {
+        let mut term = Terminal::new(4, 8);
+        term.process(b"\x1b[4 q"); // terminal DECSCUSR stays steady underline
+        let prev = term.cell_frame(4, 8);
+        let mut cur = prev.clone();
+        cur.cursor_effect_style_override = Some(CursorStyle::Bolt);
+
+        let mut dirty = Vec::new();
+        let cursor_row = cur.cursor_row;
+        let DirtyDecision::Rows(d) =
+            compute_dirty_rows(&prev, &cur, true, None, true, None, 16, &mut dirty)
+        else {
+            panic!("identical geometry must take the row-damage path");
+        };
+        assert!(d.cursor_changed, "the effective cursor shape changed");
+        assert!(
+            d.blink_or_override_changed,
+            "the frame-carried override participates in the cache fingerprint"
+        );
+        assert!(!d.is_gate_hit(), "an effect-shape transition must miss");
+        assert!(dirty[cursor_row], "the stationary cursor row must repaint");
+
+        // The external/backend override remains highest: both frames resolve to
+        // HollowBlock even though the underlying effect field differs.
+        assert_eq!(
+            effective_cursor_style(&cur, Some(CursorStyle::HollowBlock)),
+            CursorStyle::HollowBlock
+        );
+    }
+
     /// Typography: a BOLD/ITALIC primary cell rasterizes from the REAL hinted
     /// sibling typeface (`DejaVuSansMono-Bold.ttf` …), not by dilating/shearing the
     /// regular glyph's coverage (which reads fuzzy). Proven by loading DejaVu Sans
@@ -23916,7 +24278,7 @@ mod tests {
     fn windows_fallback_chain_covers_hangul() {
         let paths = present_fallback_paths();
         let started = std::time::Instant::now();
-        let chain = build_fallback_chain(&paths);
+        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
         let elapsed = started.elapsed();
         let resident: usize = chain.iter().map(|f| f.bytes.len()).sum();
         eprintln!(
@@ -23971,7 +24333,7 @@ mod tests {
     #[cfg(windows)]
     fn windows_fallback_chain_covers_the_scripts_it_claims() {
         let paths = present_fallback_paths();
-        let chain = build_fallback_chain(&paths);
+        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
         // FILESYSTEM, not the candidate list — see the note in
         // `windows_fallback_chain_covers_hangul`. If this asked the list, then
         // deleting a face FROM the list would silently turn its assertion into a
@@ -24089,6 +24451,84 @@ mod tests {
         }
     }
 
+    /// THE SAME DEFECT, REACHED THROUGH CONFIG. `fallback_fonts` is documented
+    /// as an ORDERED CHAIN ("most-preferred first",
+    /// `fallback_fonts = ["Sarasa Mono J", "Apple Symbols"]`), and
+    /// [`fallback_chain_order`] duly puts every config entry ahead of every
+    /// built-in one. But `build_fallback_chain` ended its scan at the first face
+    /// that was not an additive tier entry, and a CONFIG path is never in
+    /// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] — so the FIRST config entry ended
+    /// the scan and everything behind it was orphaned: the user's own second
+    /// entry, and the whole built-in per-script chain with it.
+    ///
+    /// On Windows that is the Hangul tofu again, resurrected by one config line,
+    /// because Windows has no broad backstop to catch what the config face
+    /// misses. Here Arial is the config face: it covers Latin/Greek/Cyrillic/
+    /// Hebrew/Arabic but not one Hangul syllable.
+    #[test]
+    #[cfg(windows)]
+    fn a_config_fallback_font_does_not_orphan_the_rest_of_the_chain() {
+        let arial = "C:\\Windows\\Fonts\\arial.ttf";
+        let malgun = "C:\\Windows\\Fonts\\malgun.ttf";
+        if !std::path::Path::new(arial).is_file() || !std::path::Path::new(malgun).is_file() {
+            eprintln!("SKIP: needs both arial.ttf and malgun.ttf");
+            return;
+        }
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        assert!(r.set_config_fallback_fonts(&[arial.to_string()]));
+        r.debug_block_on_lazy_fallbacks();
+        // Control: the config entry really is installed and really is consulted.
+        assert_eq!(
+            r.debug_fallback_pick_path('\u{05D0}').as_deref(),
+            Some(arial),
+            "the config face must head the chain and serve what it covers"
+        );
+        // The defect: 한 must still reach the built-in Hangul face BEHIND it.
+        assert_eq!(
+            r.debug_fallback_pick_path('\u{D55C}').as_deref(),
+            Some(malgun),
+            "한 no longer reaches the built-in Hangul face — one `fallback_fonts` \
+             line orphaned the whole built-in chain, and Windows has no broad \
+             backstop to catch it, so this is the tofu again"
+        );
+    }
+
+    /// The other half of the same law, as a PURE function test: a `fallback_fonts`
+    /// list with TWO entries must load BOTH. The documented example is exactly
+    /// this shape — a text face followed by a symbol face that covers what it
+    /// misses — and it was silently truncated to the first entry.
+    #[test]
+    #[cfg(windows)]
+    fn a_two_entry_config_fallback_chain_loads_both_entries() {
+        let arial = "C:\\Windows\\Fonts\\arial.ttf".to_string();
+        let malgun = "C:\\Windows\\Fonts\\malgun.ttf".to_string();
+        if !std::path::Path::new(&arial).is_file() || !std::path::Path::new(&malgun).is_file() {
+            eprintln!("SKIP: needs both arial.ttf and malgun.ttf");
+            return;
+        }
+        let config = [arial.clone(), malgun.clone()];
+        let (paths, user_prefix) = fallback_candidate_paths(&config);
+        assert!(
+            user_prefix >= config.len(),
+            "both config entries must be inside the additive user prefix"
+        );
+        let chain = build_fallback_chain(&paths, user_prefix);
+        let loaded: Vec<&str> = chain
+            .iter()
+            .filter_map(|f| f.path.as_deref())
+            .take(2)
+            .collect();
+        assert_eq!(
+            loaded,
+            vec![arial.as_str(), malgun.as_str()],
+            "both config entries must load, in config order — the chain stopped \
+             at the first one, so the user's second face never existed"
+        );
+    }
+
     /// LAZY-FONT-PARSE, the whole point: building the broad-fallback chain must
     /// NOT fontdue-parse the faces, and neither must probing their coverage.
     ///
@@ -24105,7 +24545,7 @@ mod tests {
             eprintln!("SKIP: no built-in fallback candidate exists on this machine");
             return;
         }
-        let chain = build_fallback_chain(&paths);
+        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
         assert!(!chain.is_empty(), "a present candidate must load");
         for face in &chain {
             assert!(
@@ -24838,6 +25278,113 @@ mod tests {
         );
     }
 
+    /// A format-2 table's direct query must not turn a two-byte Unicode scalar
+    /// into a single-byte glyph by discarding its high byte. This fixture is a
+    /// complete raw cmap table, not a host font: key 0 makes U+2318's high byte
+    /// select single-byte subheader 0, whose genuine U+0018 mapping is the exact
+    /// low-byte alias Hiragino Sans GB exposed. Key 8 is the negative control —
+    /// a real two-byte subheader whose U+2318 mapping must remain visible.
+    #[test]
+    fn format2_coverage_rejects_low_byte_alias_and_keeps_real_two_byte_mapping() {
+        fn synthetic_format2_cmap(two_byte_key: bool) -> Vec<u8> {
+            fn push_u16(out: &mut Vec<u8>, value: u16) {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            fn push_u32(out: &mut Vec<u8>, value: u32) {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+
+            let mut subtable = Vec::new();
+            push_u16(&mut subtable, 2); // format
+            push_u16(&mut subtable, 0); // length, filled after construction
+            push_u16(&mut subtable, 0); // language
+            for high_byte in 0..256 {
+                push_u16(
+                    &mut subtable,
+                    if two_byte_key && high_byte == 0x23 {
+                        8 // subheader 1
+                    } else {
+                        0 // single-byte subheader 0
+                    },
+                );
+            }
+
+            if two_byte_key {
+                // Subheader 0 maps the genuine single byte U+0018 to glyph 1.
+                push_u16(&mut subtable, 0x18); // firstCode
+                push_u16(&mut subtable, 1); // entryCount
+                push_u16(&mut subtable, 0); // idDelta
+                push_u16(&mut subtable, 10); // idRangeOffset -> first glyph below
+                // Subheader 1 maps the genuine two-byte value 0x23,0x18 to gid 2.
+                push_u16(&mut subtable, 0x18);
+                push_u16(&mut subtable, 1);
+                push_u16(&mut subtable, 0);
+                push_u16(&mut subtable, 4); // -> second glyph below
+                push_u16(&mut subtable, 1);
+                push_u16(&mut subtable, 2);
+            } else {
+                push_u16(&mut subtable, 0x18);
+                push_u16(&mut subtable, 1);
+                push_u16(&mut subtable, 0);
+                push_u16(&mut subtable, 2); // -> sole glyph below
+                push_u16(&mut subtable, 1);
+            }
+            let length = u16::try_from(subtable.len()).expect("fixture fits format-2 length");
+            subtable[2..4].copy_from_slice(&length.to_be_bytes());
+
+            let mut cmap = Vec::new();
+            push_u16(&mut cmap, 0); // cmap version
+            push_u16(&mut cmap, 1); // one encoding record
+            push_u16(&mut cmap, 1); // Macintosh
+            push_u16(&mut cmap, 25); // Chinese legacy encoding
+            push_u32(&mut cmap, 12); // subtable follows header + record
+            cmap.extend_from_slice(&subtable);
+            cmap
+        }
+
+        fn enumerated_nonzero(cmap: &[u8], ch: char) -> bool {
+            let table = ttf_parser::cmap::Table::parse(cmap).expect("fixture cmap parses");
+            let subtable = table.subtables.get(0).expect("fixture subtable parses");
+            let mut found = false;
+            subtable.codepoints(|codepoint| {
+                if codepoint == ch as u32
+                    && subtable
+                        .glyph_index(codepoint)
+                        .is_some_and(|glyph| glyph.0 != 0)
+                {
+                    found = true;
+                }
+            });
+            found
+        }
+
+        let aliased = synthetic_format2_cmap(false);
+        let alias_table = ttf_parser::cmap::Table::parse(&aliased).expect("alias cmap parses");
+        let alias_subtable = alias_table.subtables.get(0).expect("alias subtable parses");
+        assert_eq!(
+            alias_subtable.glyph_index('⌘' as u32),
+            Some(ttf_parser::GlyphId(1)),
+            "raw format-2 query reproduces the low-byte false positive"
+        );
+        assert!(!enumerated_nonzero(&aliased, '⌘'));
+        assert!(!fontdue_format2_enumerates(&aliased, 0, '⌘'));
+        assert!(enumerated_nonzero(&aliased, '\u{18}'));
+        assert!(fontdue_format2_enumerates(&aliased, 0, '\u{18}'));
+
+        let genuine = synthetic_format2_cmap(true);
+        let genuine_table = ttf_parser::cmap::Table::parse(&genuine).expect("genuine cmap parses");
+        let genuine_subtable = genuine_table
+            .subtables
+            .get(0)
+            .expect("genuine subtable parses");
+        assert_eq!(
+            genuine_subtable.glyph_index('⌘' as u32),
+            Some(ttf_parser::GlyphId(2))
+        );
+        assert!(enumerated_nonzero(&genuine, '⌘'));
+        assert!(fontdue_format2_enumerates(&genuine, 0, '⌘'));
+    }
+
     /// DEFECT 5 — THE PROBE MUST NOT PARSE, AND MUST NOT LIE. Styled routing asks
     /// coverage on the RENDER THREAD, so it reads the cmap
     /// ([`fontdue_cmap_covers`]) instead of materialising 6.5–8.7 MB of outlines
@@ -25017,6 +25564,61 @@ mod tests {
         }
         assert!(checked > 0, "no font file was readable to check against");
         eprintln!("fontdue_admissible agreed with fontdue on {checked} face(s)");
+    }
+
+    /// The coverage index now walks every system font through TWO shared scratch
+    /// buffers (`font_coverage_index`), so the answer for font N must not depend
+    /// on font N-1. This replays the real scan over the real fonts on this
+    /// machine — a private buffer per face against the shared pair, in the same
+    /// order — and demands identical `(weight, italic, ranges)` for every one.
+    ///
+    /// Non-vacuous both ways: dropping `cps.clear()` in `font_cmap_ranges` makes
+    /// every face after the first report its predecessors' coverage too, and
+    /// dropping `buf.clear()` in `read_bounded_font_file_into` appends a larger
+    /// predecessor's tail to a smaller face's bytes.
+    #[test]
+    fn the_coverage_scan_gives_each_font_the_same_answer_a_private_buffer_would() {
+        let paths: Vec<std::path::PathBuf> = font_files()
+            .into_iter()
+            .filter(|p| !p.to_str().is_some_and(path_is_last_resort))
+            .collect();
+
+        let mut shared_bytes: Vec<u8> = Vec::new();
+        let mut shared_cps: Vec<u32> = Vec::new();
+        let mut checked = 0usize;
+        let mut with_ranges = 0usize;
+        for path in &paths {
+            // The private-buffer form: exactly what the loop did before.
+            let Ok(private) = font_file::read_font_file(path) else {
+                continue;
+            };
+            let want_wi = ttf_parser::Face::parse(&private, 0)
+                .map(|f| (f.weight().to_number(), f.is_italic()))
+                .unwrap_or((400, false));
+            let want = font_cmap_ranges(&private, &mut Vec::new());
+            drop(private);
+
+            // The shipping form: both buffers carry the previous face's state in.
+            assert!(
+                font_file::read_font_file_into(path, &mut shared_bytes).is_ok(),
+                "the reused-buffer read failed where a fresh one succeeded for {path:?}"
+            );
+            let got_wi = ttf_parser::Face::parse(&shared_bytes, 0)
+                .map(|f| (f.weight().to_number(), f.is_italic()))
+                .unwrap_or((400, false));
+            let got = font_cmap_ranges(&shared_bytes, &mut shared_cps);
+
+            assert_eq!(want_wi, got_wi, "weight/italic drifted for {path:?}");
+            assert_eq!(want, got, "cmap coverage drifted for {path:?}");
+            checked += 1;
+            with_ranges += usize::from(got.is_some());
+        }
+        assert!(
+            checked > 1,
+            "need at least two readable fonts to share state"
+        );
+        assert!(with_ranges > 0, "no font yielded coverage ranges");
+        eprintln!("coverage scan agreed on {checked} face(s), {with_ranges} with ranges");
     }
 
     /// Rewrite `maxp.numGlyphs` in a copy of `bytes`. Used only to manufacture

@@ -58,7 +58,7 @@ enum RowMatcher {
     /// Regex (either case mode): compiled ONCE with the batch path's pattern
     /// length / NFA / DFA caps, reused across every resumed slice.
     #[cfg(feature = "regex")]
-    Regex(regex::Regex),
+    Regex(aterm_regex::Regex),
 }
 
 /// A budgeted, resumable search over a fixed window of absolute rows.

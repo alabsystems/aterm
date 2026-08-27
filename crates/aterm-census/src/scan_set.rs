@@ -1460,6 +1460,15 @@ mod tests {
             "crates/aterm-predict/src",
             "crates/aterm-provenance/src",
             "crates/aterm-pty/src",
+            // Entered the closure when the first-party regular-expression
+            // engine (a bounded Pike VM) replaced `regex` — and with it
+            // regex-automata, regex-syntax and aho-corasick, 4 packages /
+            // 158,471 lines. aterm-selection, aterm-observe and aterm-search
+            // compile patterns through it now. A normal [dependencies] edge, so
+            // it is GUI process code — it holds no locks (no interior mutability
+            // at all: the compiled program is immutable and the VM's state lives
+            // on the stack), but the census walks it for exactly that reason.
+            "crates/aterm-regex/src",
             "crates/aterm-render/src",
             "crates/aterm-render-api/src",
             "crates/aterm-rle/src",

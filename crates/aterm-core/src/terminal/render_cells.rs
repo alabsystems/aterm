@@ -413,6 +413,30 @@ impl Terminal {
                     })
                 })
             };
+            // A HYPERLINK NOBODY CAN SEE IS A PHISHING VECTOR, not a quiet
+            // convenience. OSC 8 lets the visible text and the destination be
+            // unrelated — `google.com` addressed to evil.example is one escape
+            // sequence — and a linked cell carried no mark whatsoever: same ink,
+            // same weight, same everything as the prose around it, while
+            // ctrl-click opened it through the desktop launcher with no preview
+            // and no prompt. Measured on 0.61.0: `ctl cell` reported
+            // `link=https://evil.example/steal` on cells rendering "google.com"
+            // with attrs `none`.
+            //
+            // Underline is the mark every terminal and every browser already
+            // shares for "this is a link", and it is what makes the text ask to
+            // be inspected before it is trusted. A decoration the PROGRAM chose
+            // outranks it — this fills only the undecorated case, so an author
+            // who styled their own link keeps their styling — and the colour is
+            // deliberately left `None` so the line takes the text's own ink
+            // rather than inventing a link colour the theme never picked.
+            let underline = if underline == UnderlineStyle::None
+                && extra.is_some_and(|extra| extra.hyperlink().is_some())
+            {
+                UnderlineStyle::Single
+            } else {
+                underline
+            };
 
             out.push(RenderCell {
                 ch,
@@ -839,6 +863,19 @@ impl Terminal {
     /// historical `cell_frame_into(..); take_damage();` pair) and restamps the
     /// scratch's continuity tokens, so the next frame can chain.
     ///
+    /// The `Full` arm names the clause that refused
+    /// ([`FullRefillCause`](crate::render::FullRefillCause)). A caller that can
+    /// only see THAT the chain broke cannot act on it: a forgotten host seq
+    /// bump, a scratch shared across panes, and a workload that simply scrolls
+    /// all read as the same number and have three different answers (fix the
+    /// mutator, give the pane its own scratch, do nothing — scrolling is
+    /// honestly Full). The cause is a fieldless `#[repr(usize)]` enum returned
+    /// in a register, so this is free on the per-presented-frame path: nothing
+    /// is formatted or allocated, and the Scoped arm is untouched. The
+    /// discriminant width is measured, not stylistic — see
+    /// [`FullRefillCause`](crate::render::FullRefillCause), where a `u8` is
+    /// shown to cost the SCOPED arm an ABI cliff.
+    ///
     /// The continuity proof, clause by clause (each one closes a documented
     /// unsoundness from the raster audit's RE-3 skip):
     /// - `terminal_id` match (nonzero): the scratch was last engine-filled by
@@ -891,7 +928,7 @@ impl Terminal {
         rows: usize,
         cols: usize,
     ) -> crate::render::FrameRefill {
-        if self.damage_scoped_refill_valid(scratch, rows, cols) {
+        let Some(cause) = self.damage_scoped_refill_refusal(scratch, rows, cols) else {
             // Copy the tracker's row bits into an owned mask BEFORE the fill:
             // the tracker read borrows `&self`, the fill needs `&mut self`.
             // O(rows/64) words; `damaged_rows` skips clear words via
@@ -911,27 +948,58 @@ impl Terminal {
             // bumped it. Restamp: THIS scratch is the consumer that closed the
             // session, so it remains the valid baseline for the next frame.
             scratch.extract_gen = self.extract_gen;
-            crate::render::FrameRefill::Scoped { rows_refilled }
-        } else {
-            // Any continuity break lands here: always sound, costs exactly the
-            // pre-carrier status quo, and re-establishes a valid baseline.
-            self.cell_frame_fill(scratch, rows, cols, None);
-            self.take_damage();
-            scratch.extract_gen = self.extract_gen;
-            crate::render::FrameRefill::Full
-        }
+            return crate::render::FrameRefill::Scoped { rows_refilled };
+        };
+        // Any continuity break lands here: always sound, costs exactly the
+        // pre-carrier status quo, and re-establishes a valid baseline. The
+        // refusing clause rides out with the arm so the caller can tally WHICH
+        // one it was without re-deriving anything.
+        //
+        // NOT outlined into a cold `#[inline(never)]` callee. That was tried,
+        // to keep `cause` (live across the two calls below) out of the hot
+        // function's callee-saved set: it made no measurable difference —
+        // `keystroke_tick/scoped_extract/24x80` read +0.49% outlined against
+        // +0.40% inline, both inside that arm's own identical-binary control
+        // envelope of +/-0.6% — so the simpler shape stays.
+        self.cell_frame_fill(scratch, rows, cols, None);
+        self.take_damage();
+        scratch.extract_gen = self.extract_gen;
+        crate::render::FrameRefill::Full { cause }
     }
 
     /// The damage-scoped continuity check — every clause is justified on
     /// [`cell_frame_damage_scoped_into`](Self::cell_frame_damage_scoped_into).
-    /// Pure read; conservative by construction (any `false` merely buys the
+    /// Pure read; conservative by construction (any refusal merely buys the
     /// full refill).
-    fn damage_scoped_refill_valid(
+    ///
+    /// `None` means every clause held and the scoped arm is legal.
+    /// `Some(cause)` names the FIRST clause that refused.
+    ///
+    /// SHAPE NOTE (this reports the proof, it does not edit it). This was a
+    /// `-> bool` whose clauses were one `&&` chain. `&&` is left-to-right and
+    /// short-circuiting, and every operand here is a pure `&self` read with no
+    /// interior mutability, so rewriting the chain as the same clauses in the
+    /// same order, each returning its own cause, is a semantics-preserving
+    /// transcription: the set of `(scratch, rows, cols)` that pass is
+    /// unchanged, clause for clause and order for order. Two conjuncts were
+    /// SPLIT (`terminal_id != 0 && terminal_id == identity`, and the four
+    /// dimension comparisons) — splitting a conjunction into consecutive
+    /// refusals cannot change the verdict, only the label it refuses under, and
+    /// the labels are the point: "this scratch was never filled" and "this
+    /// scratch belongs to another terminal" are different bugs.
+    ///
+    /// Nothing here may be reordered for a nicer attribution. A clause's
+    /// position IS part of what its cause means (a scrolled frame that also
+    /// took full damage reports the scroll), and the corpus below pins those
+    /// labels, so a reorder that looked cosmetic would show up as a test
+    /// failure rather than as silently relabelled telemetry.
+    fn damage_scoped_refill_refusal(
         &self,
         scratch: &crate::render::RenderInput,
         rows: usize,
         cols: usize,
-    ) -> bool {
+    ) -> Option<crate::render::FullRefillCause> {
+        use crate::render::FullRefillCause as Cause;
         // BiDi reorder is an in-place, non-idempotent row permutation applied
         // at fill time, so retained rows may only be kept while they are still
         // in LOGICAL order. That is precisely what the carrier's
@@ -949,38 +1017,66 @@ impl Terminal {
         // token either — every setter calls `invalidate_bidi_all`, which marks
         // FULL damage and is caught by the `!is_full()` clause below.
         if scratch.engine_row_order != crate::render::RowOrder::Logical {
-            return false;
+            return Some(Cause::BidiVisual);
         }
         let grid = self.grid();
         // Same conversion the fill stamps, so the comparison can never differ
         // by conversion policy alone.
         let base_y = i64::try_from(grid.base_y()).unwrap_or(i64::MAX);
-        scratch.terminal_id != 0
-            && scratch.terminal_id == self.extract_identity
-            && scratch.extract_gen == self.extract_gen
-            && scratch.snapshot_seq == scratch.engine_fill_seq
-            // No host row PREPEND is still in force. A spliced scratch holds
-            // engine row `r` at index `r + row_shift`, so retaining "row r"
-            // would serve a DIFFERENT row's content — the exact stale-row
-            // defect this whole carrier exists to make impossible. The
-            // frontend inverts its tab-strip prepend
-            // (`RenderInput::undo_host_row_prepend`) before handing the scratch
-            // back; anything it could not invert arrives here still shifted and
-            // takes the full arm. The `rows`/`cells.len()` clauses below
-            // already reject the common shape, but they reject it by arithmetic
-            // coincidence — this clause rejects it by name.
-            && scratch.row_shift == 0
-            && scratch.engine_alt == self.is_alternate_screen()
-            && scratch.rows == rows
-            && scratch.cols == cols
-            && scratch.cells.len() == rows
-            && rows == usize::from(self.rows())
-            && cols == usize::from(self.cols())
-            && grid.display_offset() == 0
-            && scratch.display_offset == 0
-            && scratch.base_y == base_y
-            && scratch.absolute_row_revision == self.absolute_row_revision()
-            && !grid.damage().is_full()
+        if scratch.terminal_id == 0 {
+            return Some(Cause::ScratchUnstamped);
+        }
+        if scratch.terminal_id != self.extract_identity {
+            return Some(Cause::TerminalMismatch);
+        }
+        if scratch.extract_gen != self.extract_gen {
+            return Some(Cause::DamageTaken);
+        }
+        if scratch.snapshot_seq != scratch.engine_fill_seq {
+            return Some(Cause::HostMutation);
+        }
+        // No host row PREPEND is still in force. A spliced scratch holds
+        // engine row `r` at index `r + row_shift`, so retaining "row r"
+        // would serve a DIFFERENT row's content — the exact stale-row
+        // defect this whole carrier exists to make impossible. The
+        // frontend inverts its tab-strip prepend
+        // (`RenderInput::undo_host_row_prepend`) before handing the scratch
+        // back; anything it could not invert arrives here still shifted and
+        // takes the full arm. The `rows`/`cells.len()` clauses below
+        // already reject the common shape, but they reject it by arithmetic
+        // coincidence — this clause rejects it by name, and now reports it
+        // by name too.
+        if scratch.row_shift != 0 {
+            return Some(Cause::RowShift);
+        }
+        if scratch.engine_alt != self.is_alternate_screen() {
+            return Some(Cause::AltScreen);
+        }
+        if scratch.rows != rows || scratch.cols != cols {
+            return Some(Cause::ScratchRows);
+        }
+        if scratch.cells.len() != rows {
+            return Some(Cause::ScratchRowCount);
+        }
+        if rows != usize::from(self.rows()) || cols != usize::from(self.cols()) {
+            return Some(Cause::EngineDims);
+        }
+        if grid.display_offset() != 0 {
+            return Some(Cause::EngineScrolled);
+        }
+        if scratch.display_offset != 0 {
+            return Some(Cause::ScratchScrolled);
+        }
+        if scratch.base_y != base_y {
+            return Some(Cause::BaseY);
+        }
+        if scratch.absolute_row_revision != self.absolute_row_revision() {
+            return Some(Cause::RowRevision);
+        }
+        if grid.damage().is_full() {
+            return Some(Cause::FullDamage);
+        }
+        None
     }
 
     /// The one shared fill body behind [`cell_frame_into`](Self::cell_frame_into)
@@ -1106,9 +1202,14 @@ impl Terminal {
         // `display_offset == 0` hide). Host copy/vi modes still override this
         // snapshot after extraction with their own history-space cursor; the
         // effects-layer history blackout is independent of this projection.
-        let projected_cursor_row = (cur.row as usize).saturating_add(display_offset);
-        scratch.cursor_row = projected_cursor_row;
-        scratch.cursor_visible = self.cursor_visible() && projected_cursor_row < rows;
+        //
+        // Both halves come from the accessor pair that IS this projection
+        // ([`Terminal::projected_cursor_row`] / [`Terminal::cursor_row_on_screen`]),
+        // so a host that has to know where a pane's caret is in the frame it is
+        // painting asks the extraction's own rule rather than a second copy of
+        // the arithmetic that can drift away from it.
+        scratch.cursor_row = self.projected_cursor_row();
+        scratch.cursor_visible = self.cursor_row_on_screen(rows).is_some();
         scratch.cursor_style = self.cursor_style();
         scratch.display_offset = display_offset as i32;
         // Capture base_y (absolute row of the top visible line) under the SAME lock as
@@ -1283,6 +1384,58 @@ fn is_emoji_sequence_marker(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LINK HAS TO LOOK LIKE ONE. OSC 8 addresses arbitrary text to an
+    /// arbitrary URI, ctrl-click opens it with no preview, and before this the
+    /// linked cells rendered byte-identically to the prose around them.
+    #[test]
+    fn a_hyperlink_is_underlined_and_a_program_decoration_still_wins() {
+        let mut term = Terminal::new(2, 32);
+        // The phishing shape: the text says one host, the link addresses another.
+        term.process(b"go\x1b]8;;https://evil.example/steal\x1b\\ogle\x1b]8;;\x1b\\.com");
+        let row = term.render_row(0);
+        let underlines = row
+            .iter()
+            .take(10)
+            .map(|cell| (cell.ch, cell.underline))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            underlines,
+            vec![
+                ('g', UnderlineStyle::None),
+                ('o', UnderlineStyle::None),
+                ('o', UnderlineStyle::Single),
+                ('g', UnderlineStyle::Single),
+                ('l', UnderlineStyle::Single),
+                ('e', UnderlineStyle::Single),
+                ('.', UnderlineStyle::None),
+                ('c', UnderlineStyle::None),
+                ('o', UnderlineStyle::None),
+                ('m', UnderlineStyle::None),
+            ],
+            "exactly the linked cells carry the mark"
+        );
+        // The line takes the text's own ink: no link colour the theme never chose.
+        assert!(
+            row.iter()
+                .take(10)
+                .all(|cell| cell.underline_color.is_none()),
+            "a link underline must not invent a colour"
+        );
+
+        // A decoration the program CHOSE outranks the link's: an author who
+        // styled their own link keeps their styling, curl and all.
+        let mut styled = Terminal::new(2, 32);
+        styled.process(b"\x1b[4:3m\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\x1b[m");
+        assert!(
+            styled
+                .render_row(0)
+                .iter()
+                .take(4)
+                .all(|cell| cell.underline == UnderlineStyle::Curly),
+            "the program's curly underline must survive the link mark"
+        );
+    }
 
     #[test]
     fn render_row_out_of_range_is_empty() {
@@ -2203,7 +2356,7 @@ mod tests {
     /// its correctness.
     #[test]
     fn damage_scoped_extraction_matches_full_extract_over_mutation_corpus() {
-        use crate::render::FrameRefill;
+        use crate::render::{FrameRefill, FullRefillCause};
         let (rows, cols) = (8usize, 40usize);
         let mut term = Terminal::new(8, 40);
         let mut scoped = crate::render::RenderInput::empty();
@@ -2222,7 +2375,7 @@ mod tests {
             let reference = term.cell_frame(rows, cols);
             let refill = term.cell_frame_damage_scoped_into(scoped, rows, cols);
             match refill {
-                FrameRefill::Full => *n_full += 1,
+                FrameRefill::Full { .. } => *n_full += 1,
                 FrameRefill::Scoped { .. } => *n_scoped += 1,
             }
             assert!(
@@ -2242,8 +2395,10 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "a never-filled scratch must take the full arm"
+            FrameRefill::Full {
+                cause: FullRefillCause::ScratchUnstamped
+            },
+            "a never-filled scratch must take the full arm, under its own cause"
         );
 
         // 2) Keystroke echo: one damaged row -> the scoped arm, refilling only it.
@@ -2310,8 +2465,10 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "a base_y advance must force the full arm"
+            FrameRefill::Full {
+                cause: FullRefillCause::BaseY
+            },
+            "a base_y advance must force the full arm, and say so"
         );
 
         // 7) Viewport scroll: display_offset != 0 -> Full on entry AND while held.
@@ -2325,8 +2482,11 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "a scrolled-back viewport must force the full arm"
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
+            "a scrolled-back viewport must force the full arm, attributed to the ENGINE's \
+             offset (the clause that precedes the scratch's own)"
         );
         term.process(b"x"); // live-grid write while scrolled: bits are live rows, not viewport rows
         let r = step(
@@ -2338,16 +2498,31 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
+            FrameRefill::Full {
+                cause: FullRefillCause::EngineScrolled
+            },
             "offset != 0 must keep forcing the full arm"
         );
         term.scroll_to_bottom();
-        step(
+        let r = step(
             &mut term,
             &mut scoped,
             &mut n_scoped,
             &mut n_full,
             "back to bottom",
+        );
+        // The frame that RETURNS to the bottom: the engine is at offset 0 again,
+        // but the scratch was filled while scrolled, so its retained rows are
+        // viewport rows from the other mapping. Previously unasserted — the pair
+        // of offset clauses is the sharpest case of an attribution that a single
+        // `full` counter cannot express, because the two frames look identical
+        // in it and have opposite explanations.
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::ScratchScrolled
+            },
+            "returning to the bottom must refuse on the SCRATCH's stale offset"
         );
 
         // 8) Continuity recovers after the offset round-trip.
@@ -2375,8 +2550,10 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "DECSCNM marks full damage; scoped must yield"
+            FrameRefill::Full {
+                cause: FullRefillCause::FullDamage
+            },
+            "DECSCNM marks full damage; scoped must yield, naming the damage"
         );
         term.process(b"\x1b[?5l");
         step(
@@ -2421,7 +2598,13 @@ mod tests {
             &mut n_full,
             "OSC 4 recolor",
         );
-        assert_eq!(r, FrameRefill::Full, "a palette recolor marks full damage");
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::FullDamage
+            },
+            "a palette recolor marks full damage"
+        );
 
         // 11) Alt screen: swap -> Full; write inside -> Scoped; swap back -> Full.
         term.process(b"\x1b[?1049h");
@@ -2434,8 +2617,10 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "an alt-screen swap must force the full arm"
+            FrameRefill::Full {
+                cause: FullRefillCause::AltScreen
+            },
+            "an alt-screen swap must force the full arm, on the alt clause"
         );
         term.process(b"alt!");
         step(
@@ -2455,8 +2640,10 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "leaving the alt screen must force the full arm"
+            FrameRefill::Full {
+                cause: FullRefillCause::AltScreen
+            },
+            "leaving the alt screen must force the full arm, on the alt clause"
         );
 
         // 12) HOST SPLICE: mutate a content channel + bump snapshot_seq (the
@@ -2474,8 +2661,12 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
-            "a seq-bumped host mutation must force the full arm (RE-3 hazard #1)"
+            FrameRefill::Full {
+                cause: FullRefillCause::HostMutation
+            },
+            "a seq-bumped host mutation must force the full arm (RE-3 hazard #1) and be \
+             ATTRIBUTED to the host, not to the engine — the whole point of the tally is \
+             that a frontend can tell its own mutators from the terminal's scrolling"
         );
 
         // 13) FOREIGN CONSUMER: another take_damage resets the tracker under us;
@@ -2492,7 +2683,9 @@ mod tests {
         );
         assert_eq!(
             r,
-            FrameRefill::Full,
+            FrameRefill::Full {
+                cause: FullRefillCause::DamageTaken
+            },
             "a foreign take_damage must break continuity (undercounting bits)"
         );
 
@@ -2529,7 +2722,9 @@ mod tests {
         #[cfg(feature = "bidi")]
         assert_eq!(
             r,
-            FrameRefill::Full,
+            FrameRefill::Full {
+                cause: FullRefillCause::BidiVisual
+            },
             "a fill that permuted a row into visual order must cost the NEXT fill \
              its scoped arm (retained rows would be double-permuted)"
         );
@@ -2568,7 +2763,13 @@ mod tests {
         term.resize(10, 40);
         let reference = term.cell_frame(10, 40);
         let r = term.cell_frame_damage_scoped_into(&mut scoped, 10, 40);
-        assert_eq!(r, FrameRefill::Full, "a resize must force the full arm");
+        assert_eq!(
+            r,
+            FrameRefill::Full {
+                cause: FullRefillCause::ScratchRows
+            },
+            "a resize must force the full arm on the scratch's stale dims"
+        );
         assert!(
             scoped == reference,
             "post-resize full refill must match the oracle"
@@ -2692,7 +2893,7 @@ mod tests {
                 let reference = term.cell_frame(rows, cols);
                 let refill = term.cell_frame_damage_scoped_into(&mut scoped, rows, cols);
                 match refill {
-                    FrameRefill::Full => total_full += 1,
+                    FrameRefill::Full { .. } => total_full += 1,
                     FrameRefill::Scoped { .. } => total_scoped += 1,
                 }
                 assert!(
@@ -2724,7 +2925,7 @@ mod tests {
     /// pane A's text appearing in pane B's frame.
     #[test]
     fn dmg1_shared_scratch_across_two_terminals_never_leaks_rows() {
-        use crate::render::FrameRefill;
+        use crate::render::{FrameRefill, FullRefillCause};
         let (rows, cols) = (6usize, 24usize);
         let mut a = Terminal::new(rows as u16, cols as u16);
         let mut b = Terminal::new(rows as u16, cols as u16);
@@ -2750,9 +2951,38 @@ mod tests {
                 shared == ref_b,
                 "round {round}: pane B frame diverged (leak from A?) refill={rb:?}"
             );
-            if matches!(ra, FrameRefill::Full) && matches!(rb, FrameRefill::Full) {
-                leaked_full += 1;
-            }
+            // ATTRIBUTED, not merely counted: after the very first fill the
+            // identity nonce is the ONLY clause that may refuse here — every
+            // other token matches across the two panes by construction — so a
+            // run that fell back for some other reason would be proving
+            // something else entirely, and would leave this probe passing while
+            // no longer testing the nonce at all.
+            //
+            // Round 0's pane A is the exception, and the attribution is what
+            // makes it visible: the shared scratch is EMPTY on the first fill,
+            // so it refuses as `scratch_unstamped` (never engine-filled) rather
+            // than on the nonce, which cannot discriminate what was never
+            // stamped. Pinned rather than papered over, because it is exactly
+            // the distinction the tally exists to draw: a window's first frame
+            // is unavoidably Full, a hand-off's is a pane sharing a buffer.
+            let want_a = if round == 0 {
+                FullRefillCause::ScratchUnstamped
+            } else {
+                FullRefillCause::TerminalMismatch
+            };
+            assert_eq!(
+                ra,
+                FrameRefill::Full { cause: want_a },
+                "round {round}: pane A's refusal"
+            );
+            assert_eq!(
+                rb,
+                FrameRefill::Full {
+                    cause: FullRefillCause::TerminalMismatch
+                },
+                "round {round}: pane B must refuse on the identity nonce"
+            );
+            leaked_full += 1;
         }
         // Reach: an ALTERNATING shared scratch must take the FULL arm every
         // time (the identity nonce flips on every handoff). If this ever reads
@@ -2760,7 +2990,202 @@ mod tests {
         // are the only thing left — fail loudly here instead.
         assert_eq!(
             leaked_full, 12,
-            "a scratch alternating between two terminals must full-refill every frame"
+            "a scratch alternating between two terminals must full-refill every frame, \
+             and on the IDENTITY clause specifically"
         );
+    }
+
+    /// PER-CAUSE ATTRIBUTION, ONE CLAUSE AT A TIME (the follow-up a78dd8a1
+    /// deferred: "per-cause Full-arm attribution needs the engine's validity
+    /// check to report its failing clause").
+    ///
+    /// WHY IT IS SHAPED LIKE THIS. The corpus oracle above already drives most
+    /// of these causes, but it drives them through REALISTIC events, and a
+    /// realistic event usually breaks several clauses at once (a scroll moves
+    /// `base_y` AND the row revision AND marks damage). That makes it a fine
+    /// test of the arm and a poor test of the LABEL: an attribution that
+    /// returned one stuck constant would pass most of it. So this test starts
+    /// from a settled scratch that provably takes the SCOPED arm, applies
+    /// EXACTLY ONE mutation, and requires that clause's own cause back. Every
+    /// case is therefore a controlled experiment with a verified control, which
+    /// is the only way a per-clause claim can mean anything.
+    ///
+    /// It is also the completeness gate: the table must name every variant of
+    /// `FullRefillCause`, so a clause added to the predicate without a cause —
+    /// or a cause added without a clause that can produce it — fails here
+    /// instead of quietly reporting as somebody else's.
+    #[test]
+    fn dmg1_every_continuity_clause_reports_its_own_cause() {
+        use crate::render::{FrameRefill, FullRefillCause, RenderInput, RowOrder};
+
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+
+        /// A terminal with scrollback and a scratch whose continuity chain is
+        /// LIVE: the very next damage-scoped refill takes the scoped arm. Every
+        /// case below starts from a fresh one of these, so the single mutation
+        /// it applies is the only difference from a frame that would have been
+        /// scoped.
+        fn settled() -> (Terminal, RenderInput) {
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            // Enough lines to build scrollback (so a viewport scroll is
+            // possible) and to leave `base_y` somewhere other than 0.
+            for i in 0..20 {
+                term.process(format!("line {i}\r\n").as_bytes());
+            }
+            let mut scratch = RenderInput::empty();
+            // Fill 1 is Full by construction (unstamped scratch); fill 2 lands
+            // on a settled chain.
+            let _ = term.cell_frame_damage_scoped_into(&mut scratch, ROWS, COLS);
+            term.process(b"\x1b[1;1Hz");
+            let r = term.cell_frame_damage_scoped_into(&mut scratch, ROWS, COLS);
+            assert!(
+                matches!(r, FrameRefill::Scoped { .. }),
+                "the fixture must start settled on the scoped arm, got {r:?}"
+            );
+            (term, scratch)
+        }
+
+        // THE CONTROL. Without this the whole table is worthless: if the
+        // fixture had drifted off the scoped arm, every case below would report
+        // its cause for a reason that has nothing to do with its mutation.
+        {
+            let (mut term, mut scratch) = settled();
+            term.process(b"\x1b[2;1Hq");
+            let r = term.cell_frame_damage_scoped_into(&mut scratch, ROWS, COLS);
+            assert!(
+                matches!(r, FrameRefill::Scoped { .. }),
+                "control: an unmutated settled fixture must stay scoped, got {r:?}"
+            );
+        }
+
+        type Mutate = fn(&mut Terminal, &mut RenderInput);
+        let cases: &[(&str, Mutate, FullRefillCause)] = &[
+            (
+                "the last engine fill left a row in visual order",
+                |_t, s| s.engine_row_order = RowOrder::BidiVisual,
+                FullRefillCause::BidiVisual,
+            ),
+            (
+                "the scratch carries no terminal identity",
+                |_t, s| s.terminal_id = 0,
+                FullRefillCause::ScratchUnstamped,
+            ),
+            (
+                "the scratch belongs to another terminal",
+                // Any nonzero value that is not this terminal's nonce; the
+                // `max(1)` only fires on the u64::MAX wrap, which is still a
+                // change.
+                |_t, s| s.terminal_id = s.terminal_id.wrapping_add(1).max(1),
+                FullRefillCause::TerminalMismatch,
+            ),
+            (
+                "another consumer closed the damage session",
+                |t, _s| t.take_damage(),
+                FullRefillCause::DamageTaken,
+            ),
+            (
+                "a host mutator wrote cells and bumped the seq",
+                |_t, s| s.snapshot_seq = s.snapshot_seq.wrapping_add(1),
+                FullRefillCause::HostMutation,
+            ),
+            (
+                "a host row prepend is still in force",
+                |_t, s| s.row_shift = 1,
+                FullRefillCause::RowShift,
+            ),
+            (
+                "the alternate-screen bit disagrees",
+                |_t, s| s.engine_alt = !s.engine_alt,
+                FullRefillCause::AltScreen,
+            ),
+            (
+                "the scratch's own dims are stale",
+                |_t, s| s.cols += 1,
+                FullRefillCause::ScratchRows,
+            ),
+            (
+                "the scratch grew a row without stamping a shift",
+                |_t, s| s.cells.push(Vec::new()),
+                FullRefillCause::ScratchRowCount,
+            ),
+            (
+                "the window and its engine are out of step",
+                // The requested size still matches the SCRATCH (so the clause
+                // before this one holds) but no longer matches the grid.
+                |t, _s| t.resize((ROWS + 2) as u16, COLS as u16),
+                FullRefillCause::EngineDims,
+            ),
+            (
+                "the engine's viewport is scrolled back",
+                |t, _s| t.scroll_display(1),
+                FullRefillCause::EngineScrolled,
+            ),
+            (
+                "the scratch was filled while scrolled back",
+                |_t, s| s.display_offset = 1,
+                FullRefillCause::ScratchScrolled,
+            ),
+            (
+                "the live grid scrolled under the retained rows",
+                |_t, s| s.base_y = s.base_y.wrapping_add(1),
+                FullRefillCause::BaseY,
+            ),
+            (
+                "row identity changed without base_y moving",
+                |_t, s| s.absolute_row_revision = s.absolute_row_revision.wrapping_add(1),
+                FullRefillCause::RowRevision,
+            ),
+            (
+                "the tracker holds whole-grid damage",
+                // DECSCNM: a real event that marks Damage::Full and touches no
+                // earlier clause.
+                |t, _s| t.process(b"\x1b[?5h"),
+                FullRefillCause::FullDamage,
+            ),
+        ];
+
+        for (what, mutate, want) in cases {
+            let (mut term, mut scratch) = settled();
+            mutate(&mut term, &mut scratch);
+            let r = term.cell_frame_damage_scoped_into(&mut scratch, ROWS, COLS);
+            assert_eq!(
+                r,
+                FrameRefill::Full { cause: *want },
+                "{what}: the full arm must be attributed to `{}`",
+                want.as_str()
+            );
+        }
+
+        // COMPLETENESS. A clause added to the predicate with a new cause and no
+        // case here would otherwise ship as an unproven label.
+        let mut covered: Vec<FullRefillCause> = cases.iter().map(|(_, _, c)| *c).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            covered,
+            FullRefillCause::ALL.to_vec(),
+            "every FullRefillCause must be produced by exactly one clause here"
+        );
+
+        // The wire labels are a metrics contract: distinct, and snake_case so a
+        // text field of `cause:count` pairs stays one whitespace-free token.
+        let mut labels: Vec<&str> = FullRefillCause::ALL.iter().map(|c| c.as_str()).collect();
+        let n = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "cause labels must be distinct");
+        assert!(
+            labels.iter().all(|l| {
+                !l.is_empty()
+                    && l.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
+            }),
+            "cause labels must be snake_case ASCII: {labels:?}"
+        );
+        // The dense index must really be dense — the tally arrays index by it.
+        for (i, c) in FullRefillCause::ALL.iter().enumerate() {
+            assert_eq!(c.index(), i, "FullRefillCause::ALL must be in index order");
+        }
     }
 }

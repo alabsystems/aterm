@@ -69,6 +69,7 @@ mod types;
 
 pub use bloom::BloomFilter;
 pub use budgeted::BudgetedSearch;
+pub use grapheme::display_columns;
 pub use index::{
     DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, NarrowedSearch, SearchIndex, SearchOptionsError,
     max_cached_for_retained,

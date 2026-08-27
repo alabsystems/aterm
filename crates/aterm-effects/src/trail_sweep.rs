@@ -109,11 +109,40 @@ pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_co
 /// (the wrap SHAPE the caller already classified); `cols` is the grid width.
 /// Ordered tail→head, origin excluded, destination included.
 pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i32), cols: i32) {
+    wrap_fold_cells_in_pane(out, prev, cur, 0, cols);
+}
+
+/// The [`wrap_fold_cells`] law in a pane whose first column is `col0` in the
+/// composed window grid. The old row finishes at `col0 + cols`; the new row
+/// begins at `col0`. Keeping the offset explicit prevents a right-hand split's
+/// physical margin from being mistaken for the whole window's margin.
+pub fn wrap_fold_cells_in_pane(
+    out: &mut Vec<(i32, i32)>,
+    prev: (i32, i32),
+    cur: (i32, i32),
+    col0: i32,
+    cols: i32,
+) {
     out.clear();
     let (pr, pc) = prev;
     let (cr, cc) = cur;
-    out.extend((pc + 1..cols).map(|c| (pr, c)));
-    out.extend((0..=cc).map(|c| (cr, c)));
+    let col1 = col0.saturating_add(cols.max(0));
+    out.extend((pc + 1..col1).map(|c| (pr, c)));
+    out.extend((col0..=cc).map(|c| (cr, c)));
+}
+
+/// Whether one observed move is the exact physical-margin fold shape for a
+/// pane: final pane column -> first pane column on the next row. This is only
+/// morphology; callers must independently require their normal fresh input
+/// license before minting any light.
+#[must_use]
+pub fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: u16) -> bool {
+    if cols == 0 {
+        return false;
+    }
+    let col1 = u32::from(col0) + u32::from(cols);
+    let last = col1.saturating_sub(1);
+    prev.0.checked_add(1) == Some(cur.0) && u32::from(prev.1) == last && cur.1 == col0
 }
 
 #[cfg(test)]
@@ -259,5 +288,13 @@ mod tests {
         // Wrap from the very last column: no old-row cells remain.
         wrap_fold_cells(&mut out, (5, 39), (6, 0), 40);
         assert_eq!(out, vec![(6, 0)]);
+
+        wrap_fold_cells_in_pane(&mut out, (5, 51), (6, 12), 12, 40);
+        assert_eq!(out, vec![(6, 12)]);
+        assert!(physical_margin_fold((5, 51), (6, 12), 12, 40));
+        assert!(
+            !physical_margin_fold((5, 51), (6, 11), 12, 40),
+            "a neighboring pane cannot borrow the fold shape"
+        );
     }
 }

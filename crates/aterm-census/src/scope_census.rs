@@ -215,10 +215,23 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                     scan_row, no tick), so it holds no flash budget and cannot put a \
                     luminance transition on the glass.",
             },
+            Replica {
+                file: "crates/aterm-gui/src/settings_preview.rs",
+                owner: "pet_layer",
+                decl: "WordDecorations::default()",
+                kind: ReplicaKind::SeparateScope,
+                justification: "`kitty_layer`'s twin for the settings PET preview (landed \
+                    2026-08-26 with the pet species picker). Same shape, same argument: one \
+                    sitting pose per species is baked into a `OnceLock` sprite atlas and the \
+                    engine is dropped. `pet_cursor` only drives the tile bakers — it reaches \
+                    neither `super_prepass` nor `nova_prepass`, the only writers of the \
+                    `ignitions` reservation vec — so this instance holds no flash budget and \
+                    cannot put a luminance transition on the glass.",
+            },
         ],
-        // Both replicas are separate SCOPES, not shards, so there is nothing
-        // to re-aggregate: OB-15 requires an aggregator only for shards, and
-        // forbids a dead one.
+        // All three replicas are separate SCOPES, not shards, so there is
+        // nothing to re-aggregate: OB-15 requires an aggregator only for
+        // shards, and forbids a dead one.
         aggregator: None,
         covers_prose_in: &[
             "crates/aterm-effects/src/word_decorations.rs",
@@ -324,7 +337,10 @@ const RESERVED_SCOPE_PHRASES: &[&str] = &[
     "one per app",
 ];
 
-/// The explicit OB-17 escape hatch, written inside the same doc block.
+/// The explicit OB-17 escape hatch. It is a DIRECTIVE, so it must OPEN a line
+/// of the same doc block (`/// scope-waiver: <reason>`) — see
+/// [`has_waiver_directive`] for why merely naming it in a sentence must not
+/// count.
 const SCOPE_WAIVER_MARKER: &str = "scope-waiver:";
 
 /// Sources this census never reads: its own registry names every token and
@@ -1135,7 +1151,7 @@ fn check_vocabulary(
         let Some(phrase) = RESERVED_SCOPE_PHRASES.iter().find(|p| lower.contains(**p)) else {
             continue;
         };
-        if lower.contains(SCOPE_WAIVER_MARKER) {
+        if has_waiver_directive(&block) {
             waivers += 1;
             continue;
         }
@@ -1154,12 +1170,34 @@ fn check_vocabulary(
                      crates/aterm-census/src/scope_census.rs pinning the ownership chain, and \
                      add this file to its `covers_prose_in`; or (b) if the phrase describes \
                      something no instance count can falsify (a config value, a derived \
-                     scalar, a namespace tag), write `{SCOPE_WAIVER_MARKER} <reason>` inside \
-                     the SAME doc block — the gate counts and reports every waiver."
+                     scalar, a namespace tag), OPEN a line of the SAME doc block with \
+                     `{SCOPE_WAIVER_MARKER} <reason>` — a directive, not a mention; the \
+                     gate counts and reports every waiver."
             ),
         });
     }
     waivers
+}
+
+/// Does this doc block TAKE the OB-17 waiver, as opposed to merely talking
+/// about it?
+///
+/// The marker must OPEN a doc line (`/// scope-waiver: <reason>`). A
+/// `contains` test over the whole block exempts any block that names the
+/// marker in passing — and one in this tree did exactly that: `kitty_pet.rs`'s
+/// flight-scalar doc explained that it was deliberately NOT taking the waiver,
+/// spelled the marker to say so, and was silently waived for it. A waiver
+/// channel that can be opened by accident is the "registry rots into a silent
+/// exemption" failure this census exists to refuse. Every real waiver in the
+/// tree is already written as its own directive line, so the tightening costs
+/// them nothing.
+fn has_waiver_directive(block: &str) -> bool {
+    block.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("///")
+            .map(str::trim_start)
+            .is_some_and(|text| text.to_lowercase().starts_with(SCOPE_WAIVER_MARKER))
+    })
 }
 
 /// Every maximal run of `///` lines in a source, as `(1-based start line,
@@ -1467,6 +1505,27 @@ mod tests {
                     .log
                     .contains("1 reserved-vocabulary doc block(s) waived"),
             "an explicit waiver must pass AND be counted in the verdict:\n{}",
+            out.log
+        );
+
+        // A MENTION is not a directive. This is the shape that was silently
+        // waived in kitty_pet.rs: a block that names the marker to explain why
+        // it is NOT taking the waiver. `contains` over the block let it
+        // through; the line-leading rule does not.
+        write_file(
+            &root,
+            "crates/aterm-thing/src/lib.rs",
+            "/// The blink budget: at most two per second, window-wide.\n\
+             ///\n\
+             /// Stated plainly rather than asserting the scope and excusing it\n\
+             /// with a `scope-waiver:` note.\n\
+             pub const BLINK_BUDGET: u32 = 2;\n",
+        );
+        let out = run_scope_census_over(&root, &[], &[]);
+        assert!(
+            !out.ok && out.log.contains("[OB-17]"),
+            "naming `scope-waiver:` mid-sentence must NOT open the escape hatch — a \
+             waiver channel that can be taken by accident is a silent exemption:\n{}",
             out.log
         );
         let _ = std::fs::remove_dir_all(&root);

@@ -470,6 +470,51 @@ pub fn spawn_shell_with_pid(
     sandbox_wrap: Option<&str>,
     limits: aterm_sandbox::Limits,
 ) -> io::Result<SpawnedShell> {
+    spawn_shell_with_pid_cell_px(
+        rows,
+        cols,
+        cap,
+        sandbox_cap,
+        env_add,
+        shell_override,
+        shell_args,
+        argv_override,
+        exec_command,
+        cwd,
+        sandbox_wrap,
+        limits,
+        None,
+    )
+}
+
+/// Unix-seam parity for
+/// [`spawn_shell_with_pid_cell_px`](crate::spawn_shell_with_pid_cell_px): ConPTY
+/// sizes in CHARACTER cells only, so the metrics have nowhere to land and are
+/// ignored. Same errors as [`spawn_shell_with_pid`].
+///
+/// # Errors
+/// See [`spawn_shell_with_pid`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_shell_with_pid_cell_px(
+    rows: u16,
+    cols: u16,
+    cap: &aterm_cap::Cap<aterm_cap::effects::Spawn>,
+    sandbox_cap: &aterm_cap::Cap<aterm_sandbox::Sandbox>,
+    env_add: &[(String, String)],
+    shell_override: Option<&str>,
+    shell_args: Option<&[String]>,
+    argv_override: Option<&[String]>,
+    exec_command: Option<&[String]>,
+    cwd: Option<&str>,
+    sandbox_wrap: Option<&str>,
+    limits: aterm_sandbox::Limits,
+    // Unix-seam parity (the crate's public signatures are identical on both
+    // platforms). ConPTY's resize wire is a `COORD` of CHARACTER cells with no
+    // pixel fields at all, so the host's cell metrics have nowhere to go here
+    // and the argument is accepted and ignored rather than absent — a Windows
+    // build of the frontend keeps compiling against one call shape.
+    _cell_px: Option<(u16, u16)>,
+) -> io::Result<SpawnedShell> {
     // (1) Spawn cap gate — identical PermissionDenied mapping to the Unix seam.
     aterm_cap::require(cap, aterm_cap::Tier::Trusted)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
@@ -1349,6 +1394,14 @@ fn encode_resize_signal(rows: u16, cols: u16) -> [u8; 6] {
 /// see [`WinSession::signal`] for why the adopted branch cannot borrow the
 /// `hpc` guard's protection.
 pub fn resize(master: i32, rows: u16, cols: u16) {
+    resize_with_cell_px(master, rows, cols, None);
+}
+
+/// Unix-seam parity for [`resize_with_cell_px`](crate::resize_with_cell_px):
+/// ConPTY resizes in CHARACTER cells (`COORD`) and has no winsize pixel fields,
+/// so `cell_px` has nowhere to land and is ignored. Kept so the frontend's one
+/// call shape compiles on both platforms.
+pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(u16, u16)>) {
     let Some(s) = session(master) else {
         return;
     };

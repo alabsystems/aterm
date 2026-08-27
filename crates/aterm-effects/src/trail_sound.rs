@@ -53,7 +53,10 @@
 //!   table-driven implementor can spawn them without touching this seam. The
 //!   nine shipped palettes are pinned to their pre-framework (v0.56) rendering
 //!   by the `v056_reference` proofs below — as of the transcendental rewrite,
-//!   to within `V056_TOLERANCE` rather than bit-for-bit. See that constant:
+//!   to within `V056_TOLERANCE` rather than bit-for-bit, and with ONE stated
+//!   design change mirrored into the oracle rather than pinned away: the
+//!   deletion's felt lift-off layer (2026-08-26 owner ask — see the
+//!   `BACKSPACE_FELT_*` constants). See the tolerance constant:
 //!   the per-sample envelopes and oscillators no longer call `exp`/`sin` per
 //!   sample, so the last bits move, and the proofs assert an audibly-inaudible
 //!   bound (measured peak 0.38 of a 16-bit quantization step) instead of
@@ -153,6 +156,33 @@ pub enum SoundKind {
     /// silence) and does NOT step the phrase melody — it punctuates the tune,
     /// it does not compose it.
     Land,
+    /// The SPACEBAR — the COMMA of the typing music (owner ask, 2026-08-26:
+    /// "space and shift ... unique sounds that flow with the typing music").
+    /// The host cues it where it cues the typing click, when the pressed key
+    /// was the bare Space; a space inside a committed IME run stays [`Typed`]
+    /// (the run is one gesture, not a word boundary).
+    ///
+    /// Style-agnostic and designed once before palette dispatch
+    /// ([`TrailSynth::design_space`]): a round, breathy rest-tone on the
+    /// REGISTER'S TONIC an octave below the melody — a walking-bass root on
+    /// every word boundary, so the letters carry the tune and the spaces
+    /// ground it. Does NOT step the phrase melody (a comma is not a note of
+    /// the sentence) and does not cadence it either — the cadence stays owned
+    /// by Enter and real pauses. Gap-thinned exactly like a keystroke.
+    Space,
+    /// A bare SHIFT keydown — the LIFT before a capital: the anticipation of
+    /// the letter that has not landed yet, cued by the host once per physical
+    /// press (never on auto-repeat, never on release, never mid-chord).
+    ///
+    /// The family's fourth member ([`gesture_shape`]): where a deletion is
+    /// one step BELOW entered from above, the lift is one step ABOVE entered
+    /// from below — a pickup note leaning toward where the capital will land.
+    /// Quieter than every per-character gesture (a modifier is INTENT, not
+    /// authorship), it does not step the melody, and — alone in the trail
+    /// vocabulary — its admission does not claim the min-gap beat
+    /// ([`TrailSynth::push`]): a grace note must never thin the keystroke it
+    /// announces.
+    Shift,
 }
 
 /// The sparkle-words gesture vocabulary (word-decoration events).
@@ -649,8 +679,13 @@ const CURSOR_SWEEP_STEP_S: f32 = 0.055;
 //                  dir   notes   stride   lands at (from the melody degree)
 //     Typed        +1      1       0      the degree itself
 //     Backspace    −1      1       0      −1 step, entered from ABOVE
+//     Shift        +1      1       0      +1 step, entered from BELOW
 //     Glide{dir}   dir     1       0      dir × 1 step
 //     Sweep{dir}   dir     4     dir×1    dir × 3 steps
+//
+// (Space is deliberately NOT a family degree: the comma grounds the REGISTER —
+// its tonic an octave down, computed in `design_space` — rather than moving on
+// the melody's lattice, so it takes the neutral shape below.)
 //
 // Encoded ONCE, in [`gesture_shape`] + [`gesture_bend`], and READ from the
 // three places a family degree is built: the shared `deg` in
@@ -713,6 +748,14 @@ fn gesture_shape(kind: SoundKind) -> GestureShape {
             step: 0,
             offset: -GESTURE_CHAR_STEP,
         },
+        // The lift before a capital: one step above the note it announces,
+        // entered from below — the deletion's exact mirror.
+        SoundKind::Shift => GestureShape {
+            dir: 1,
+            notes: 1,
+            step: 0,
+            offset: GESTURE_CHAR_STEP,
+        },
         // A character of travel, in the travel direction.
         SoundKind::Glide { dir } => GestureShape {
             dir,
@@ -768,11 +811,15 @@ const BONK_TRITONE: f32 = 45.0 / 32.0;
 // translates the WHOLE ladder rigidly (one scalar on `g` for every Trail kind
 // and the bonk), so the intervals hold at any typing speed.
 //
-//   TIER 1  -21.0 dBFS  Typed, Backspace, Glide     per CHARACTER (10+/s)
+//   TIER 1  -21.0 dBFS  Typed, Space, Backspace, Glide   per CHARACTER (10+/s)
 //   TIER 2  -19.5 dBFS  Sweep, Navigation           per GESTURE
 //   TIER 3  -18.0 dBFS  Jump, Kill                  per LINE / COMMAND
 //   TIER 4  -16.0 dBFS  Land                        rare spectacle
 //   TIER 5  -14.0 dBFS  Bonk, the riff's peak bar   rarest punctuation
+//
+// (Shift sits UNDER tier 1 with the movement family — a modifier is intent,
+// not authorship — and under Glide too: the lift is the quietest voice in the
+// engine, pinned relatively by `the_ladder_holds_for_the_key_family`.)
 //
 // Kind gains are the TIER knob; `palette_trim` anchors each style's Typed on the
 // floor. Where a gain looks surprising it is compensating a VOICE design, and
@@ -787,7 +834,55 @@ const TYPED_KIND_GAIN: f32 = 1.0;
 ///
 /// `e8d1a1d9` moved this to 1.0 as part of flattening the ladder; the owner's
 /// 2026-08-04 mix pass puts deletions back under typing.
+///
+/// 2026-08-26 ("backspace needs a unique sound"): the deletion now also wears
+/// the felt LIFT-OFF layer ([`TrailSynth::design_backspace_felt`], the
+/// `BACKSPACE_FELT_*` constants). The layer is noise-only and its peaks are
+/// budgeted INSIDE this tier — `the_ladder_holds_for_the_key_family` pins
+/// every voice's deletion strictly under its keystroke, so the extra voices
+/// cannot promote a correction above the character it removes.
 const BACKSPACE_KIND_GAIN: f32 = 0.85;
+/// TIER 1, between the floor and the deletion. The COMMA: a word boundary is
+/// authorship (it repeats at typing speed, so it lives on the per-character
+/// tier), but it punctuates rather than states — a shade under the letters,
+/// a shade over the correction.
+const SPACE_KIND_GAIN: f32 = 0.9;
+/// UNDER the movement family's sub-floor. A bare modifier is INTENT — the
+/// hand shaping the next letter, not a letter — so the lift sits below even
+/// a Glide's whisper (0.78): present in the music, never a note you count.
+const SHIFT_KIND_GAIN: f32 = 0.5;
+
+// THE FELT LIFT-OFF — the deletion's kind-level identity layer (owner ask,
+// 2026-08-26). Two NOISE-ONLY voices under every palette's own inverted note:
+// a felted DAMP at the instant of the press (the damper catching the string
+// whose note is being removed) and a small downward BREATH just behind it
+// (the letter lifting off the page). Noise-only on purpose: every pitch-law
+// proof in the family (`a_deletion_is_the_keystroke_inverted`,
+// `every_pitched_voice_mirrors_a_deletion`) reads the TONAL voices, so the
+// layer adds identity without touching the lattice claims — the −1 step from
+// above stays the palette note's job. Designed once, before palette dispatch,
+// like Kill's swoosh; both voices are duplicated VERBATIM in the
+// `v056_reference` oracle (the phrase-generator discipline: deliberate
+// redesigns are mirrored in lock-step so the pin keeps catching drift in
+// everything else).
+/// The damp's noise band (Hz): a dark felt knock, resonant enough to read as
+/// a contact, far under any palette's melodic register.
+const BACKSPACE_FELT_DAMP_F: (f32, f32) = (260.0, 190.0);
+/// The breath's band (Hz): starts as quiet air, falls away — the down-glide
+/// is the "leaving" the ear keys on.
+const BACKSPACE_FELT_BREATH_F: (f32, f32) = (1500.0, 430.0);
+/// The breath trails the damp by this much (s): contact first, lift-off
+/// after — inside the first synth buffer the damp already speaks, so the
+/// first-buffer latency law holds through the layer.
+const BACKSPACE_FELT_BREATH_DELAY_S: f32 = 0.012;
+/// Spawn gains for damp / breath, applied to the tier-carrying `g`. Noise
+/// voices peak well under tonal ones at equal gain (see the Kill arm's 2.6),
+/// and the layer is an UNDER-layer besides: sized so it colours the deletion
+/// without raising its tier peak over the keystroke's even on the coldest
+/// palette (Sparkle's floor is the binding case) — pinned relatively by
+/// `the_ladder_holds_for_the_key_family` rather than in absolute dBFS.
+const BACKSPACE_FELT_DAMP_LEVEL: f32 = 0.5;
+const BACKSPACE_FELT_BREATH_LEVEL: f32 = 0.4;
 /// TIER 0 — the SUB-FLOOR. Cursor motion is not authorship: it accompanies what
 /// you are doing rather than being the thing you did, so the three movement
 /// gestures sit AUDIBLY under the typing floor.
@@ -1923,12 +2018,15 @@ impl TrailSynth {
             if ev.bed {
                 let kick = match kind {
                     SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
-                    SoundKind::Typed | SoundKind::Backspace => 0.3,
+                    // A space is typing cadence exactly like a letter.
+                    SoundKind::Typed | SoundKind::Backspace | SoundKind::Space => 0.3,
                     // Cursor scrubbing feeds the bed at a whisper — presence,
-                    // not a swell.
-                    SoundKind::Navigation | SoundKind::Glide { .. } | SoundKind::Sweep { .. } => {
-                        0.12
-                    }
+                    // not a swell. The shift lift joins it: a modifier is
+                    // presence too, never a swell of its own.
+                    SoundKind::Navigation
+                    | SoundKind::Glide { .. }
+                    | SoundKind::Sweep { .. }
+                    | SoundKind::Shift => 0.12,
                 };
                 self.bed.energy = (self.bed.energy + kick).min(1.0);
                 self.bed.gain += (ev.gain - self.bed.gain) * 0.3;
@@ -1963,18 +2061,31 @@ impl TrailSynth {
         if !admit {
             return;
         }
-        self.since_voice = 0.0;
+        // The SHIFT lift is admitted through the gap like everything else,
+        // but it does not CLAIM the beat: shift-then-capital lands inside
+        // one MIN_GAP at speed, and a grace note that owned the gap would
+        // thin the very keystroke it announces. Every other admission resets
+        // the clock exactly as before.
+        if ev.kind != SoundGesture::Trail(SoundKind::Shift) {
+            self.since_voice = 0.0;
+        }
         match ev.kind {
             SoundGesture::Trail(kind) => {
                 // A KEYSTROKE / edit / jump advances the phrase-aware melody
                 // (the tune). A cursor GESTURE (Glide/Sweep) plays IN the
                 // melody without stepping it — the cursor sings the current
-                // degree, it does not compose. Draw counts differ per phrase
-                // (rng only at phrase boundaries), which is fine: determinism
-                // is per (events, seed, tone) script.
+                // degree, it does not compose; the SPACE grounds it and the
+                // SHIFT anticipates it, and neither composes either. Draw
+                // counts differ per phrase (rng only at phrase boundaries),
+                // which is fine: determinism is per (events, seed, tone)
+                // script.
                 if !matches!(
                     kind,
-                    SoundKind::Glide { .. } | SoundKind::Sweep { .. } | SoundKind::Land
+                    SoundKind::Glide { .. }
+                        | SoundKind::Sweep { .. }
+                        | SoundKind::Land
+                        | SoundKind::Space
+                        | SoundKind::Shift
                 ) {
                     self.advance_melody(kind, pause);
                 }
@@ -2121,6 +2232,21 @@ impl TrailSynth {
     /// law, resets runtime state, randomizes oscillator phases.
     #[allow(clippy::too_many_arguments)]
     fn spawn(&mut self, proto: Voice, gain: f32, pan: f32) {
+        // The historical draw order — tremolo phase, then the three partials —
+        // hoisted here so the pinned streams are byte-unmoved.
+        let tw_ph = self.rnd();
+        let ph = [self.rnd(), self.rnd(), self.rnd()];
+        self.spawn_seeded(proto, gain, pan, tw_ph, ph);
+    }
+
+    /// [`Self::spawn`] with the oscillator phases HANDED IN rather than
+    /// drawn — the seam a NOISE-ONLY kind-level layer rides (fixed zero
+    /// phases: a silent partial has no phase to hear) so it consumes NO rng
+    /// and the palette design behind it draws exactly the stream it always
+    /// did. That is what keeps the felt lift-off from moving Sparkle's
+    /// scatter, the tinks, or any other seed-replayed voice by a single
+    /// draw.
+    fn spawn_seeded(&mut self, proto: Voice, gain: f32, pan: f32, tw_ph: f32, ph: [f32; 3]) {
         let idx = self.claim();
         let p = (pan * 0.35).clamp(-0.6, 0.6); // never fully one-eared
         let a = (p + 1.0) * core::f32::consts::FRAC_PI_4;
@@ -2141,7 +2267,7 @@ impl TrailSynth {
         v.t = -v.delay; // delay is modelled as negative onset time
         v.gl = gain * a.cos();
         v.gr = gain * a.sin();
-        v.tw_ph = self.rnd();
+        v.tw_ph = tw_ph;
         // GEOMETRIC STEPS. Every exponential in the sample loop is evaluated
         // from `v.t`, which advances by a constant `dt`, so each one is
         // `E_{n+1} = E_n · e^(-dt/τ)`: one multiply per sample instead of a
@@ -2160,8 +2286,8 @@ impl TrailSynth {
         };
         v.env_run = false;
         v.env_n = 0;
-        for part in &mut v.p {
-            part.ph = self.rnd();
+        for (part, ph) in v.p.iter_mut().zip(ph) {
+            part.ph = ph;
             part.k_g = if part.glide > 0.0 {
                 (-dt / part.glide).exp()
             } else {
@@ -2209,7 +2335,10 @@ impl TrailSynth {
             // TIER 1 — per CHARACTER: the floor.
             SoundKind::Typed => TYPED_KIND_GAIN,
             SoundKind::Backspace => BACKSPACE_KIND_GAIN,
+            SoundKind::Space => SPACE_KIND_GAIN,
             SoundKind::Glide { .. } => GLIDE_KIND_GAIN,
+            // UNDER the floor — intent, not authorship.
+            SoundKind::Shift => SHIFT_KIND_GAIN,
             // TIER 2 — per GESTURE.
             SoundKind::Navigation => NAVIGATION_KIND_GAIN,
             SoundKind::Sweep { .. } => SWEEP_KIND_GAIN,
@@ -2256,6 +2385,19 @@ impl TrailSynth {
             return;
         }
 
+        // THE COMMA and THE LIFT — style-agnostic like Kill/Land, designed
+        // here so a word boundary and a shift lift sound like themselves in
+        // every palette, each borrowing the speaking palette's register
+        // through `anchor_hz` exactly as the movement family does.
+        if kind == SoundKind::Space {
+            self.design_space(&ev, g);
+            return;
+        }
+        if kind == SoundKind::Shift {
+            self.design_shift(&ev, deg, g);
+            return;
+        }
+
         // A kill is a style-tinted downward swoosh for every palette: soft
         // noise falling through the style's register. Designed once here.
         if kind == SoundKind::Kill {
@@ -2279,6 +2421,16 @@ impl TrailSynth {
             // and must stay under `BONK_KIND_GAIN`.
             self.spawn(v, g * 2.6, ev.pan);
             return;
+        }
+
+        // THE FELT LIFT-OFF rides UNDER the palette's own inverted note —
+        // the deletion's kind-level identity, added 2026-08-26 (see the
+        // `BACKSPACE_FELT_*` constants). Spawned BEFORE the palette voice so
+        // slot order (and thus the oracle mirror) is deterministic; the
+        // palette dispatch below still runs, so every style keeps its own
+        // dim/reversal on top.
+        if kind == SoundKind::Backspace {
+            self.design_backspace_felt(&ev, g);
         }
 
         // The palette's own level trim lands THIS style's keystroke on the
@@ -2443,6 +2595,137 @@ impl TrailSynth {
             ..Voice::default()
         };
         self.spawn(body, g * 0.3, ev.pan);
+    }
+
+    /// The SPACEBAR'S COMMA — a round, breathy rest-tone on the register's
+    /// TONIC one octave below the melody, in the speaking palette's own
+    /// register ([`Palette::anchor_hz`]): a walking-bass root under every
+    /// word boundary. The tonic choice is the same nearest-root rule the
+    /// cadence uses (degree 0 or its octave 5), dropped a full octave (−5 is
+    /// exactly ×0.5 on the pentatonic lattice), so the comma is consonant
+    /// with the tune under every [`crate::tone::Tone`] and never collides
+    /// with the melody's own register.
+    ///
+    /// The voice is deliberately UN-articulated: no [`gesture_bend`] scoop
+    /// (a rest arrives, it does not lean), a soft attack, a dark low-pass,
+    /// and a low breath of air — punctuation you feel more than hear.
+    fn design_space(&mut self, ev: &SoundEvent, g: f32) {
+        let anchor = palette_for(ev.voice, ev.style).anchor_hz();
+        let tonic = if self.walk * 2 <= 5 { 0 } else { 5 };
+        let f = self.melody_hz(anchor, tonic - 5);
+        let v = Voice {
+            dur: 0.20,
+            attack: 0.012,
+            decay: 0.09,
+            p: [
+                Partial {
+                    lvl: 0.55,
+                    f0: f,
+                    f1: f,
+                    ..Partial::default()
+                },
+                // A whisper of the octave above for roundness — body, not
+                // brightness.
+                Partial {
+                    lvl: 0.12,
+                    f0: f * 2.0,
+                    f1: f * 2.0,
+                    ..Partial::default()
+                },
+                Partial::default(),
+            ],
+            // The breath: low, falling air — the exhale between words.
+            n_lvl: 0.05,
+            n_f0: 900.0,
+            n_f1: 380.0,
+            n_glide: 0.08,
+            n_q: 0.7,
+            lp_cut: 1400.0,
+            ..Voice::default()
+        };
+        self.spawn(v, g * 0.5, ev.pan);
+    }
+
+    /// The SHIFT LIFT — the family's anticipation gesture: one whisper-level
+    /// tone a lattice step ABOVE the melody's degree (`deg` already carries
+    /// the shape's +1), entered from below through the family's own
+    /// [`gesture_bend`], so the lift leans exactly the way the capital's
+    /// keystroke will land. A breath of high air keys "lift" without adding
+    /// a pitch; everything else about the voice is the movement family's
+    /// soft sine, shorter and quieter still.
+    fn design_shift(&mut self, ev: &SoundEvent, deg: i32, g: f32) {
+        let anchor = palette_for(ev.voice, ev.style).anchor_hz();
+        let f = self.melody_hz(anchor, deg);
+        let (f0, f1) = gesture_bend(f, 1);
+        let v = Voice {
+            dur: 0.10,
+            attack: 0.004,
+            decay: 0.05,
+            p: [
+                Partial {
+                    lvl: 0.45,
+                    f0,
+                    f1,
+                    glide: GESTURE_BEND_TAU,
+                    ..Partial::default()
+                },
+                Partial::default(),
+                Partial::default(),
+            ],
+            // The air of a hand lifting — high, tiny, static.
+            n_lvl: 0.02,
+            n_f0: 4800.0,
+            n_f1: 4800.0,
+            n_glide: 0.0,
+            n_q: 0.5,
+            lp_cut: 2600.0,
+            ..Voice::default()
+        };
+        self.spawn(v, g * 0.5, ev.pan);
+    }
+
+    /// THE FELT LIFT-OFF — the deletion's kind-level identity layer (see the
+    /// `BACKSPACE_FELT_*` constants for the design brief): a felted DAMP at
+    /// the press and a small downward BREATH just behind it, both NOISE-ONLY
+    /// so every pitch-law proof in the family keeps reading the palette's
+    /// tonal voice untouched. Spawned through [`Self::spawn_seeded`] with
+    /// fixed phases — NO `rnd()` draws — so the palette design that follows
+    /// draws exactly the stream it always did, which is what lets the
+    /// `v056_reference` oracle mirror this layer verbatim.
+    fn design_backspace_felt(&mut self, ev: &SoundEvent, g: f32) {
+        let damp = Voice {
+            dur: 0.07,
+            attack: 0.002,
+            decay: 0.03,
+            n_lvl: 0.5,
+            n_f0: BACKSPACE_FELT_DAMP_F.0,
+            n_f1: BACKSPACE_FELT_DAMP_F.1,
+            n_glide: 0.05,
+            n_q: 2.2,
+            lp_cut: 700.0,
+            ..Voice::default()
+        };
+        self.spawn_seeded(damp, g * BACKSPACE_FELT_DAMP_LEVEL, ev.pan, 0.0, [0.0; 3]);
+        let breath = Voice {
+            delay: BACKSPACE_FELT_BREATH_DELAY_S,
+            dur: 0.16,
+            attack: 0.004,
+            decay: 0.07,
+            n_lvl: 0.5,
+            n_f0: BACKSPACE_FELT_BREATH_F.0,
+            n_f1: BACKSPACE_FELT_BREATH_F.1,
+            n_glide: 0.10,
+            n_q: 1.1,
+            lp_cut: 2000.0,
+            ..Voice::default()
+        };
+        self.spawn_seeded(
+            breath,
+            g * BACKSPACE_FELT_BREATH_LEVEL,
+            ev.pan,
+            0.0,
+            [0.0; 3],
+        );
     }
 
     /// The curse-word BONK — designed once at kind level exactly like Kill,
@@ -3280,8 +3563,10 @@ impl TrailSynth {
 /// (procedural palettes; byte-identity of the shipped nine), and how a
 /// data-driven Trail-Pack palette would still fit behind this exact seam.
 trait Palette {
-    /// Design and spawn the voice(s) for one admitted trail gesture (Kill is
-    /// designed kind-level before dispatch and never arrives here).
+    /// Design and spawn the voice(s) for one admitted trail gesture (the
+    /// style-agnostic kinds — Kill, Land, the movement family, the space
+    /// comma and the shift lift — are designed kind-level before dispatch
+    /// and never arrive here).
     fn design(
         &self,
         s: &mut TrailSynth,
@@ -4991,13 +5276,15 @@ impl Palette for MechPalette {
                     s.spawn(tick, g * 0.22, -ev.pan * 0.4);
                 }
             }
-            // Kill / Glide / Sweep are designed kind-level before palette
-            // dispatch and never arrive here (trait doc); Bonk and the riff
-            // route through their own designers.
+            // Kill / Glide / Sweep / Space / Shift are designed kind-level
+            // before palette dispatch and never arrive here (trait doc);
+            // Bonk and the riff route through their own designers.
             SoundKind::Kill
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
-            | SoundKind::Land => {}
+            | SoundKind::Land
+            | SoundKind::Space
+            | SoundKind::Shift => {}
         }
     }
 
@@ -5242,12 +5529,15 @@ impl Palette for TypewriterPalette {
                 };
                 s.spawn(clunk, g * 0.61, -0.5);
             }
-            // Kill / Glide / Sweep / Land are designed kind-level before
-            // palette dispatch and never arrive here (trait doc).
+            // Kill / Glide / Sweep / Land / Space / Shift are designed
+            // kind-level before palette dispatch and never arrive here
+            // (trait doc).
             SoundKind::Kill
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
-            | SoundKind::Land => {}
+            | SoundKind::Land
+            | SoundKind::Space
+            | SoundKind::Shift => {}
         }
     }
 
@@ -5391,12 +5681,15 @@ impl Palette for MarimbaPalette {
                 Self::bar(s, deg + 3, 1, 0.07, 0.13, false, g * 0.4, -ev.pan);
                 Self::bar(s, deg + 5, 1, 0.07, 0.13, true, g * 0.45, ev.pan * 0.5);
             }
-            // Kill / Glide / Sweep / Land are designed kind-level before
-            // palette dispatch and never arrive here (trait doc).
+            // Kill / Glide / Sweep / Land / Space / Shift are designed
+            // kind-level before palette dispatch and never arrive here
+            // (trait doc).
             SoundKind::Kill
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
-            | SoundKind::Land => {}
+            | SoundKind::Land
+            | SoundKind::Space
+            | SoundKind::Shift => {}
         }
     }
 
@@ -5531,12 +5824,15 @@ impl Palette for FeltPalette {
                 Self::note(s, deg - 5, 1, 0.0, 0.22, 1.0, g * 0.7, ev.pan * 0.5);
                 Self::note(s, deg + 3, 1, 0.06, 0.19, 0.5, g * 0.5, -ev.pan * 0.5);
             }
-            // Kill / Glide / Sweep / Land are designed kind-level before
-            // palette dispatch and never arrive here (trait doc).
+            // Kill / Glide / Sweep / Land / Space / Shift are designed
+            // kind-level before palette dispatch and never arrive here
+            // (trait doc).
             SoundKind::Kill
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
-            | SoundKind::Land => {}
+            | SoundKind::Land
+            | SoundKind::Space
+            | SoundKind::Shift => {}
         }
     }
 
@@ -6468,7 +6764,12 @@ mod tests {
         let typed = spawned(SoundKind::Typed);
         let back = spawned(SoundKind::Backspace);
         assert_eq!(typed.len(), 3, "a slug strike is clack + ring + platen");
-        assert_eq!(back.len(), 2, "the lever is clack + platen — no ring");
+        assert_eq!(
+            back.len(),
+            4,
+            "the lever is clack + platen — no ring — under the felt \
+             damp + breath every deletion wears"
+        );
         let ring = |vs: &[Voice]| {
             vs.iter()
                 .filter(|v| v.p[0].lvl > 0.0 && v.p[1].lvl > 0.0)
@@ -8683,6 +8984,161 @@ mod tests {
         );
     }
 
+    /// THE COMMA GROUNDS, IT DOES NOT COMPOSE: a Space plays the register's
+    /// tonic one octave below the melody in the palette's own register, steps
+    /// no phrase state, and leaves the melody degree exactly where the
+    /// letters put it.
+    #[test]
+    fn space_grounds_the_phrase_on_the_low_tonic() {
+        let (s, spaces) = family_voices(GlowStyle::RainbowKitty, SoundKind::Space);
+        assert_eq!(spaces.len(), 1, "the comma is one voice");
+        let (land, enter) = spaces[0];
+        assert!(
+            (enter - land).abs() < 0.5,
+            "a rest arrives, it does not lean: {enter} -> {land}"
+        );
+        let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
+        let tonic = if s.walk * 2 <= 5 { 0 } else { 5 };
+        let expect = s.melody_hz(anchor, tonic - 5);
+        assert!(
+            (land - expect).abs() < 0.5,
+            "the comma lands on the register's tonic an octave down: got {land}, \
+             expected {expect}"
+        );
+        // The comma composes nothing: phrase position and degree are exactly
+        // what one Typed probe leaves behind (family_voices pushes Typed
+        // first, then the probed kind).
+        let (t, _) = family_voices(GlowStyle::RainbowKitty, SoundKind::Typed);
+        assert_eq!(
+            s.phrase_pos,
+            t.phrase_pos.saturating_sub(1),
+            "a space must not step the phrase (the Typed probe stepped once more)"
+        );
+    }
+
+    /// THE LIFT LEANS INTO THE NEXT KEYSTROKE — one whisper a lattice step
+    /// ABOVE the melody, entered from below (the deletion's exact mirror) —
+    /// and its admission never claims the min-gap beat: a capital typed at
+    /// speed (shift, then the letter inside one MIN_GAP) still clicks.
+    #[test]
+    fn shift_is_the_lift_and_never_claims_the_beat() {
+        let (s, lifts) = family_voices(GlowStyle::RainbowKitty, SoundKind::Shift);
+        assert_eq!(lifts.len(), 1, "the lift is one voice");
+        let (land, enter) = lifts[0];
+        assert!(
+            enter < land,
+            "the lift enters from below like the keystroke it announces: \
+             {enter} -> {land}"
+        );
+        let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
+        let expect = s.melody_hz(anchor, s.walk + GESTURE_CHAR_STEP);
+        assert!(
+            (land - expect).abs() < 0.5,
+            "the lift sits one step above the melody: got {land}, expected {expect}"
+        );
+        // The beat stays unclaimed: shift, then a letter INSIDE the min-gap —
+        // the letter must still speak.
+        let mut s = TrailSynth::new(48_000.0, 0xC0FF_EE01);
+        s.push(ev(GlowStyle::Lumen, SoundKind::Shift));
+        let before = s.voices.iter().filter(|v| v.on).count();
+        // No render between the two pushes: since_voice is 0 s if shift had
+        // claimed it, MIN_GAP-satisfying only because it did not.
+        s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+        let after = s.voices.iter().filter(|v| v.on).count();
+        assert!(
+            after > before,
+            "the capital right behind a shift must not be thinned by its own \
+             grace note ({before} -> {after} voices)"
+        );
+    }
+
+    /// THE LADDER HOLDS THROUGH THE NEW FAMILY, relatively and for EVERY
+    /// voice in the roster: a correction (felt layer included) stays under
+    /// the keystroke it undoes, the comma stays at or under the letters it
+    /// separates, and the lift whispers under all of them. Relative pins on
+    /// purpose — the law is the ORDER, not a dBFS figure per palette.
+    #[test]
+    fn the_ladder_holds_for_the_key_family() {
+        fn peak(voice: SoundVoice, kind: SoundKind) -> f32 {
+            let mut s = TrailSynth::new(48_000.0, 0x5EED_1234);
+            let mut e = voiced(voice, GlowStyle::RainbowKitty, kind);
+            e.hue = 0.0;
+            e.bed = false;
+            s.push(e);
+            let mut buf = vec![0.0f32; (48_000.0f32 * 2.4) as usize * CHANNELS];
+            s.render(&mut buf);
+            buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        }
+        for &voice in SoundVoice::ALL {
+            let typed = peak(voice, SoundKind::Typed);
+            let back = peak(voice, SoundKind::Backspace);
+            let space = peak(voice, SoundKind::Space);
+            let shift = peak(voice, SoundKind::Shift);
+            assert!(
+                back < typed,
+                "{voice:?}: the correction may not out-shout the keystroke \
+                 (backspace {back} vs typed {typed})"
+            );
+            // One isolated-seed grace: the ORDER is the law, with a small
+            // per-voice tolerance for the comma (its low register can meter
+            // hot against a bright palette's mid).
+            assert!(
+                space <= typed * 1.05,
+                "{voice:?}: the comma must not rise over the letters \
+                 (space {space} vs typed {typed})"
+            );
+            assert!(
+                shift < back && shift < space,
+                "{voice:?}: the lift is the quietest of the family \
+                 (shift {shift} vs backspace {back} / space {space})"
+            );
+        }
+    }
+
+    /// THE FELT LIFT-OFF is two NOISE-ONLY voices — a delay-0 damp (the
+    /// first-buffer latency law holds through the layer) and a delayed
+    /// breath — under the palette's own inverted note, in every palette.
+    #[test]
+    fn backspace_wears_the_felt_liftoff() {
+        for style in STYLES {
+            let mut s = TrailSynth::new(48_000.0, 0xFE17_0FF5);
+            let mut e = ev(style, SoundKind::Backspace);
+            e.bed = false;
+            s.push(e);
+            // The layer's exact bands, so a palette's OWN noise voice (Fire's
+            // crack, Mech's tick) can never be miscounted as the felt.
+            let felt: Vec<&Voice> = s
+                .voices
+                .iter()
+                .filter(|v| {
+                    v.on && v.p.iter().all(|p| p.lvl <= 0.0)
+                        && v.n_lvl > 0.0
+                        && ((v.n_f0, v.n_f1) == BACKSPACE_FELT_DAMP_F
+                            || (v.n_f0, v.n_f1) == BACKSPACE_FELT_BREATH_F)
+                })
+                .collect();
+            assert_eq!(
+                felt.len(),
+                2,
+                "{style:?}: a deletion wears the damp and the breath"
+            );
+            let delays: Vec<f32> = felt.iter().map(|v| v.delay).collect();
+            assert!(
+                delays.contains(&0.0),
+                "{style:?}: the damp speaks in the first buffer"
+            );
+            assert!(
+                delays.contains(&BACKSPACE_FELT_BREATH_DELAY_S),
+                "{style:?}: the breath trails the damp"
+            );
+            let falling = felt.iter().all(|v| v.n_f1 < v.n_f0);
+            assert!(
+                falling,
+                "{style:?}: both layers fall — removal, not arrival"
+            );
+        }
+    }
+
     /// EVERY PALETTE MIRRORS. The deletion interval used to be spelled per
     /// palette — −2 in three of them, −3 in one, absent in six — so "a
     /// deletion" meant something different in every style, and six styles said
@@ -8900,6 +9356,12 @@ mod tests {
     /// `false` and this oracle never sets it) — so any drift the refactor
     /// introduced in push/design/bed/render arithmetic, rng ordering, or
     /// accumulation order shows up as a bit mismatch.
+    ///
+    /// "Frozen" admits DELIBERATE redesigns, mirrored in lock-step exactly
+    /// like the phrase-generator state below: the deletion's felt lift-off
+    /// layer (2026-08-26 owner ask) is duplicated verbatim in this oracle's
+    /// `design`, so the pin accepts the intended sound and still catches
+    /// accidental drift in everything around it.
     mod v056_reference {
         use super::super::*;
 
@@ -8996,10 +9458,13 @@ mod tests {
                 self.bed_style = style;
                 let kick = match kind {
                     SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
-                    SoundKind::Typed | SoundKind::Backspace => 0.3,
-                    SoundKind::Navigation | SoundKind::Glide { .. } | SoundKind::Sweep { .. } => {
-                        0.12
-                    }
+                    // Space/Shift are never pushed by the pins; the arms keep
+                    // the match total, mirroring production's grouping.
+                    SoundKind::Typed | SoundKind::Backspace | SoundKind::Space => 0.3,
+                    SoundKind::Navigation
+                    | SoundKind::Glide { .. }
+                    | SoundKind::Sweep { .. }
+                    | SoundKind::Shift => 0.12,
                 };
                 self.bed.energy = (self.bed.energy + kick).min(1.0);
                 self.bed.gain += (gain - self.bed.gain) * 0.3;
@@ -9073,6 +9538,21 @@ mod tests {
             }
 
             fn spawn(&mut self, proto: Voice, gain: f32, pan: f32) {
+                let tw_ph = self.rnd();
+                let ph = [self.rnd(), self.rnd(), self.rnd()];
+                self.spawn_seeded(proto, gain, pan, tw_ph, ph);
+            }
+
+            // The production `spawn_seeded` twin: the felt lift-off mirror
+            // below must consume NO rng, exactly as production's does.
+            fn spawn_seeded(
+                &mut self,
+                proto: Voice,
+                gain: f32,
+                pan: f32,
+                tw_ph: f32,
+                ph: [f32; 3],
+            ) {
                 let idx = self.claim();
                 let p = (pan * 0.35).clamp(-0.6, 0.6);
                 let a = (p + 1.0) * core::f32::consts::FRAC_PI_4;
@@ -9081,9 +9561,9 @@ mod tests {
                 v.t = -v.delay;
                 v.gl = gain * a.cos();
                 v.gr = gain * a.sin();
-                v.tw_ph = self.rnd();
-                for part in &mut v.p {
-                    part.ph = self.rnd();
+                v.tw_ph = tw_ph;
+                for (part, ph) in v.p.iter_mut().zip(ph) {
+                    part.ph = ph;
                 }
                 v.lp = 0.0;
                 v.n_lp = 0.0;
@@ -9108,6 +9588,10 @@ mod tests {
                     SoundKind::Typed => TYPED_KIND_GAIN,
                     SoundKind::Backspace => BACKSPACE_KIND_GAIN,
                     SoundKind::Glide { .. } => GLIDE_KIND_GAIN,
+                    // Never reached (the pins emit neither the comma nor the
+                    // lift); present so the match stays total.
+                    SoundKind::Space => SPACE_KIND_GAIN,
+                    SoundKind::Shift => SHIFT_KIND_GAIN,
                     // TIER 2 — per GESTURE. Never reached (the pins emit no
                     // cursor gestures); present so the match stays total.
                     SoundKind::Navigation => NAVIGATION_KIND_GAIN,
@@ -9149,6 +9633,42 @@ mod tests {
                     };
                     self.spawn(v, g * 2.6, pan);
                     return;
+                }
+
+                // THE FELT LIFT-OFF, mirrored VERBATIM from
+                // `TrailSynth::design_backspace_felt` (the phrase-generator
+                // discipline: a deliberate redesign — the 2026-08-26 owner
+                // ask — is duplicated in lock-step so the pin keeps catching
+                // accidental drift in everything else). Same constants, same
+                // spawn order, no rng draws.
+                if kind == SoundKind::Backspace {
+                    let damp = Voice {
+                        dur: 0.07,
+                        attack: 0.002,
+                        decay: 0.03,
+                        n_lvl: 0.5,
+                        n_f0: BACKSPACE_FELT_DAMP_F.0,
+                        n_f1: BACKSPACE_FELT_DAMP_F.1,
+                        n_glide: 0.05,
+                        n_q: 2.2,
+                        lp_cut: 700.0,
+                        ..Voice::default()
+                    };
+                    self.spawn_seeded(damp, g * BACKSPACE_FELT_DAMP_LEVEL, pan, 0.0, [0.0; 3]);
+                    let breath = Voice {
+                        delay: BACKSPACE_FELT_BREATH_DELAY_S,
+                        dur: 0.16,
+                        attack: 0.004,
+                        decay: 0.07,
+                        n_lvl: 0.5,
+                        n_f0: BACKSPACE_FELT_BREATH_F.0,
+                        n_f1: BACKSPACE_FELT_BREATH_F.1,
+                        n_glide: 0.10,
+                        n_q: 1.1,
+                        lp_cut: 2000.0,
+                        ..Voice::default()
+                    };
+                    self.spawn_seeded(breath, g * BACKSPACE_FELT_BREATH_LEVEL, pan, 0.0, [0.0; 3]);
                 }
 
                 // Mirrors the production trim at the palette dispatch: the

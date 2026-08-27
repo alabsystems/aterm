@@ -341,6 +341,13 @@ pub(crate) struct FindOrigin {
 /// `(row, start_col, end_col)` in SELECTION coordinates (0..rows = live screen,
 /// negative = scrollback); the current one is highlighted by setting the text
 /// selection (the existing overlay — no renderer change) and scrolled into view.
+///
+/// `end_col` is INCLUSIVE and measured from `row`'s column 0 — it is NOT clamped
+/// to the grid width. A long line is one line to the reader and several rows on
+/// the grid, so a hit can start before a soft wrap and finish after it; such a
+/// hit is one match, and its `end_col` runs past the width by exactly the part
+/// that continues on the rows below. Both consumers — the selection the current
+/// match arms and the highlight-all tint — divide by the width to get there.
 #[derive(Default)]
 pub(crate) struct SearchState {
     pub(crate) query: String,
@@ -348,11 +355,17 @@ pub(crate) struct SearchState {
     /// mutation goes through [`Self::edit`]/[`Self::set_query`], which maintain that
     /// invariant, and the find bar paints the caret here (not merely after the text).
     pub(crate) cursor: usize,
-    pub(crate) matches: Vec<(i32, u16, u16)>,
+    pub(crate) matches: Vec<(i32, u16, u32)>,
     /// Exact point-relative hit when it lies outside the capped batch. Keeping
     /// it separate avoids inserting/removing/shifting 100k elements on every
     /// truncated Cmd-S/Cmd-R repeat.
-    point_match: Option<(i32, u16, u16)>,
+    point_match: Option<(i32, u16, u32)>,
+    /// The most rows any match in [`Self::matches`] spans past its own — 0 while
+    /// nothing straddles a soft wrap. The compositor binary-slices the sorted
+    /// matches to the visible band by their START row, so without this allowance
+    /// a hit that begins just above the viewport would lose the tint on the part
+    /// of it that IS on screen.
+    pub(crate) max_match_rows: i32,
     /// The grid `base_y()` the selection rows in [`Self::matches`] were computed against
     /// (see [`App::search_recompute`]). Selection rows are FRAME-relative but are consumed
     /// a frame or more later (apply + splice), so if concurrent PTY output scrolls the grid
@@ -381,6 +394,11 @@ pub(crate) struct SearchState {
     pub(crate) case_sensitive: bool,
     /// Treat the query as a regular expression (default off = literal). Toggled with
     /// `⌥⌘R`; a malformed pattern sets [`Self::regex_error`] instead of matching.
+    ///
+    /// `^` and `$` anchor the LOGICAL line — the line the reader sees — not the
+    /// grid row a soft wrap split it onto, because find matches whole wrapped
+    /// runs. So `^` does not match at the start of a continuation row, and `$`
+    /// does not match the character a wrap merely pushed to a row's end.
     pub(crate) is_regex: bool,
     /// The last recompute's query was an INVALID regex (only reachable in regex mode).
     /// Distinguishes "your pattern is broken" from "zero hits" in the find bar.
@@ -464,14 +482,14 @@ impl SearchState {
     }
 
     /// The currently-highlighted match, or `None` when the find has no matches.
-    pub(crate) fn current_match(&self) -> Option<(i32, u16, u16)> {
+    pub(crate) fn current_match(&self) -> Option<(i32, u16, u32)> {
         self.point_match
             .or_else(|| self.matches.get(self.current).copied())
     }
 
     /// Select the first/last match at the Emacs search origin, wrapping at the
     /// buffer edge. Matches and anchors use absolute rows for stream-safe order.
-    fn anchored_index(&self, matches: &[(i32, u16, u16)], base_y: i64) -> usize {
+    fn anchored_index(&self, matches: &[(i32, u16, u32)], base_y: i64) -> usize {
         if matches.is_empty() {
             return 0;
         }
@@ -496,7 +514,7 @@ impl SearchState {
 
     /// Install one exact match without changing the capped batch allocation.
     /// Returns true when the exact hit was already represented by the batch.
-    fn install_point_match(&mut self, point: (i32, u16, u16)) -> bool {
+    fn install_point_match(&mut self, point: (i32, u16, u32)) -> bool {
         match match_position(&self.matches, point) {
             Ok(position) => {
                 self.matches[position] = point;
@@ -513,6 +531,26 @@ impl SearchState {
                 false
             }
         }
+    }
+
+    /// Record how far the deepest hit in the installed batch reaches BELOW the
+    /// row it starts on, for a grid `cols` wide — [`Self::max_match_rows`].
+    ///
+    /// Derived from the batch rather than carried from the engine so it can
+    /// never disagree with the matches it describes: it is exactly the row
+    /// allowance the compositor's start-row slice needs to keep a straddling
+    /// hit's visible tail.
+    fn note_match_rows(&mut self, cols: usize) {
+        let cols = cols.max(1);
+        let depth = |&(_, _, end): &(i32, u16, u32)| end as usize / cols;
+        let deepest = self
+            .matches
+            .iter()
+            .map(depth)
+            .chain(self.point_match.iter().map(depth))
+            .max()
+            .unwrap_or(0);
+        self.max_match_rows = i32::try_from(deepest).unwrap_or(i32::MAX);
     }
 
     fn anchor_to_current(&mut self) {
@@ -573,7 +611,7 @@ thread_local! {
     static POINT_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn match_position(matches: &[(i32, u16, u16)], point: (i32, u16, u16)) -> Result<usize, usize> {
+fn match_position(matches: &[(i32, u16, u32)], point: (i32, u16, u32)) -> Result<usize, usize> {
     matches.binary_search_by(|&(row, col, _)| {
         #[cfg(test)]
         POINT_LOOKUP_COMPARISONS.with(|count| count.set(count.get().saturating_add(1)));
@@ -603,15 +641,21 @@ fn take_point_lookup_comparisons() -> usize {
 /// The engine's columns are DISPLAY/cell columns (its `ColumnMap` counts a wide CJK
 /// glyph as two), so they pass straight through — the mapped `(start, end)` index the
 /// render grid and the selection directly, with no per-cell width adjustment here.
-pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16, u16)> {
-    let mut out: Vec<(i32, u16, u16)> = matches
+///
+/// `end` is the one column that can exceed the grid width: a hit that straddles a
+/// soft wrap continues on the row below, and carrying the overflow (rather than
+/// clamping it at the width) is what lets the consumers paint the second half at
+/// all. It is `u32` for that reason — a match on a deeply wrapped line can run
+/// past `u16`, and DROPPING such a match would put the silent-miss back.
+pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16, u32)> {
+    let mut out: Vec<(i32, u16, u32)> = matches
         .iter()
         .filter_map(|m| {
             let row = i32::try_from(i64::try_from(m.line).ok()? - base_y).ok()?;
             let start = u16::try_from(m.start_col).ok()?;
             // end_col is EXCLUSIVE; the selection wants an INCLUSIVE end. A non-empty
             // match always has end_col > start_col.
-            let end = u16::try_from(m.end_col.saturating_sub(1)).ok()?;
+            let end = u32::try_from(m.end_col.saturating_sub(1)).ok()?;
             Some((row, start, end))
         })
         .collect();
@@ -970,6 +1014,7 @@ impl App {
             base_y,
             absolute_row_revision,
             content_seq,
+            cols,
             consistent,
         ) = if query.is_empty() {
             // The guard lives in its own fn DELIBERATELY (OB-7): the lock
@@ -978,8 +1023,18 @@ impl App {
             // — which takes the same lock class. The arms are exclusive, but a
             // tripwire that cannot see exclusivity is satisfied by a guard
             // whose scope is a function — which is also simply clearer.
-            let (base_y, row_rev, seq) = empty_query_term_snapshot(&term);
-            (Vec::new(), None, false, false, base_y, row_rev, seq, true)
+            let (base_y, row_rev, seq, cols) = empty_query_term_snapshot(&term);
+            (
+                Vec::new(),
+                None,
+                false,
+                false,
+                base_y,
+                row_rev,
+                seq,
+                cols,
+                true,
+            )
         } else {
             // No viewport snap before searching. `search_full_history_direction` never
             // reads `display_offset`, and the `base_y()` the result is tagged with is
@@ -1013,6 +1068,7 @@ impl App {
                     search.base_y,
                     search.absolute_row_revision,
                     search.content_seq,
+                    search.cols,
                     search.consistent,
                 ),
                 // The only error is an invalid regex (literal search never errors) → no
@@ -1027,6 +1083,7 @@ impl App {
                         i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
                         terminal.absolute_row_revision(),
                         terminal.content_seq(),
+                        usize::from(terminal.grid().cols()),
                         true,
                     )
                 }
@@ -1053,6 +1110,7 @@ impl App {
             } else {
                 s.current = s.anchored_index(&s.matches, base_y);
             }
+            s.note_match_rows(cols);
             s.anchor_to_current();
         }
         self.search_apply_current_in(wid);
@@ -1154,13 +1212,28 @@ impl App {
             let base_y = i64::try_from(term.grid().base_y()).unwrap_or(0);
             let delta = base_y - match_base_y;
             let row = mat.and_then(|(r, _, _)| i32::try_from(i64::from(r) - delta).ok());
+            // A hit that straddles a soft wrap ends on a LATER row, and its stored
+            // end column counts straight through the boundary. Divide by the grid
+            // width to land the selection's far anchor on the row and column the
+            // text actually finishes on: a Simple selection already spans rows, so
+            // the tail gets highlighted by the same overlay, on the right cells —
+            // ending it at `(row, end)` would paint a whole row of unrelated text.
+            let cols = usize::from(term.grid().cols()).max(1);
+            let end = mat.and_then(|(_, _, c1)| {
+                let row = row?;
+                let c1 = c1 as usize;
+                let end_row = i32::try_from(c1 / cols).ok()?.checked_add(row)?;
+                Some((end_row, u16::try_from(c1 % cols).ok()?))
+            });
             {
                 let sel = term.text_selection_mut();
                 let had = sel.has_selection();
                 sel.clear();
-                let armed = if let (Some(row), Some((_, c0, c1))) = (row, mat) {
+                let armed = if let (Some(row), Some((_, c0, _)), Some((end_row, end_col))) =
+                    (row, mat, end)
+                {
                     sel.start_selection(row, c0, SelectionSide::Left, SelectionType::Simple);
-                    sel.update_selection(row, c1, SelectionSide::Right);
+                    sel.update_selection(end_row, end_col, SelectionSide::Right);
                     true
                 } else {
                     false
@@ -1278,11 +1351,13 @@ impl App {
             search.results_dirty = false;
             if let Some(mapped) = mapped {
                 search.install_point_match(mapped);
+                search.note_match_rows(point.cols);
                 search.anchor_to_current();
             } else {
                 search.matches.clear();
                 search.point_match = None;
                 search.current = 0;
+                search.max_match_rows = 0;
             }
         }
         self.search_apply_current_in(wid);
@@ -1682,15 +1757,16 @@ impl App {
 }
 
 /// The empty-query snapshot of `search_recompute_from_anchor_in`: base row,
-/// row revision, content sequence — taken and released under one short guard.
-/// A FREE fn so the OB-7 lock census sees the guard end here (see the call
-/// site's comment).
-fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64) {
+/// row revision, content sequence, grid width — taken and released under one
+/// short guard. A FREE fn so the OB-7 lock census sees the guard end here (see
+/// the call site's comment).
+fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64, usize) {
     let terminal = term_lock(term);
     (
         i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
         terminal.absolute_row_revision(),
         terminal.content_seq(),
+        usize::from(terminal.grid().cols()),
     )
 }
 

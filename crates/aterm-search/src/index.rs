@@ -387,7 +387,7 @@ impl SearchIndex {
     pub(crate) fn compile_regex(
         query: &str,
         case_sensitive: bool,
-    ) -> Result<regex::Regex, SearchOptionsError> {
+    ) -> Result<aterm_regex::Regex, SearchOptionsError> {
         if query.len() > MAX_REGEX_PATTERN_LEN {
             return Err(SearchOptionsError::PatternTooLong);
         }
@@ -396,11 +396,28 @@ impl SearchIndex {
         } else {
             format!("(?i){query}")
         };
-        regex::RegexBuilder::new(&pattern)
+        aterm_regex::RegexBuilder::new(&pattern)
             .size_limit(REGEX_SIZE_LIMIT)
             .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+            .step_limit(REGEX_STEP_LIMIT)
             .build()
             .map_err(|e| SearchOptionsError::InvalidRegex(e.to_string()))
+    }
+
+    /// The error a scan that ran out of budget reports.
+    ///
+    /// It is deliberately the same variant a malformed pattern gets: from the
+    /// caller's side both mean "this pattern cannot be used", both are shown to
+    /// whoever typed it, and every call site already handles it. What it must
+    /// never be is `Ok` with a short list — the matches such a scan found are a
+    /// prefix of the truth, and a prefix presented as the whole is the wrong
+    /// answer this budget exists to prevent.
+    #[cfg(feature = "regex")]
+    fn regex_scan_budget_exhausted() -> SearchOptionsError {
+        SearchOptionsError::InvalidRegex(format!(
+            "pattern is too expensive to scan: it exhausted the {REGEX_STEP_LIMIT}-unit \
+             per-line budget before finishing a line, so the results would be incomplete"
+        ))
     }
 
     /// Take (read and reset) `search_from_line` candidate count.
@@ -1544,18 +1561,53 @@ const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`.
 ///
-/// Caps NFA/DFA memory to 1 MiB, well below the `regex` crate's 10 MiB
-/// default. This bounds compilation time for deeply nested alternations and
-/// large repetition counts that could otherwise cause ReDoS via compilation.
+/// Caps the NFA at 128 KiB — 2,048 instructions at `aterm-regex`'s
+/// 64-byte-per-instruction charge — well below the engine's 10 MiB default.
+/// Mirrors `aterm-observe`'s constant of the same name, which carries the full
+/// derivation.
+///
+/// It bounds **both** compile time and scan time. Deeply nested alternations
+/// and large repetition counts are the ReDoS-via-compilation shape, and a Pike
+/// VM's scan is linear in the haystack with the program size as its constant —
+/// so the same ceiling is what stops a thirteen-byte pattern such as
+/// `(?:x?){2000}z` (4,002 instructions, 37 ms per 4,096-column row under the
+/// old 1 MiB ceiling) from being recompiled and re-scanned on every keystroke.
+/// 128 KiB is the smallest value that still admits a 1,024-byte literal
+/// pattern, which [`MAX_REGEX_PATTERN_LEN`] permits.
 #[cfg(feature = "regex")]
-const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+pub(crate) const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
 
 /// Maximum DFA size (bytes) passed to `RegexBuilder::dfa_size_limit`.
 ///
-/// Caps DFA cache to 1 MiB. The DFA is built lazily during matching, so this
-/// bounds per-query memory even for patterns that pass the NFA size gate.
+/// Retained for source compatibility and still passed: `aterm-regex` is a pure
+/// Pike VM, so there is no lazy DFA for it to bound today, and the builder
+/// documents the setting as inert rather than repurposing it silently.
+/// Per-query memory is already bounded by [`REGEX_SIZE_LIMIT`] — the VM's
+/// thread set is capped by the program size. Mirrors `aterm-observe`.
 #[cfg(feature = "regex")]
-const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+
+/// Scan budget (work units) for one search, passed to
+/// `aterm_regex::RegexBuilder::step_limit`. About 4.8 ms of matching per line
+/// on the m21 box in release.
+///
+/// [`REGEX_SIZE_LIMIT`] bounds the compiled program; this bounds what running
+/// that program over a line costs, and only the two together bound a query. A
+/// Pike VM's scan is linear in the haystack with the program size as its
+/// constant, so the cost of a pattern is the *product* — and both factors come
+/// from the search box. Measured: the heaviest program the 128 KiB ceiling
+/// still admits needs ~16.7M units (19 ms) to cross one 4,096-column line,
+/// which over a 20,000-line scrollback is minutes per keystroke; this ceiling
+/// refuses it after ~4.2M.
+///
+/// Nothing real comes near it — the most expensive pattern aterm itself ships
+/// (the IPv6 selection rule) needs ~3,100 units for one search over a full-width
+/// line, three orders of magnitude below. Exhaustion is reported as
+/// [`SearchOptionsError::InvalidRegex`] rather than as a short result list:
+/// a truncated result set that looks exhaustive is a wrong answer, and a
+/// refusal naming the cause is not. Mirrors `aterm-observe`.
+#[cfg(feature = "regex")]
+pub(crate) const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
 /// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward
 /// batch results plus the occurrence-line frame that seeds the next
@@ -1789,6 +1841,13 @@ impl SearchIndex {
                         }
                     }
                 }
+            }
+            // One check for the whole walk: `re` is compiled here and used
+            // nowhere else, so its sticky flag can only have been set by the
+            // lines just scanned. If any line was abandoned mid-scan, the list
+            // below is missing matches — say so instead of returning it.
+            if re.step_limit_exceeded() {
+                return Err(Self::regex_scan_budget_exhausted());
             }
             // Backward collection is globally newest/rightmost first. One
             // linear reversal restores the ascending order expected by GUI
@@ -2139,7 +2198,12 @@ impl SearchIndex {
         #[cfg(feature = "regex")]
         {
             let re = Self::compile_regex(query, case_sensitive)?;
-            Ok(self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive))
+            let found =
+                self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
+            if re.step_limit_exceeded() {
+                return Err(Self::regex_scan_budget_exhausted());
+            }
+            Ok(found)
         }
         #[cfg(not(feature = "regex"))]
         {
@@ -2178,10 +2242,17 @@ impl SearchIndex {
             let re = Self::compile_regex(query, case_sensitive)?;
             let found =
                 self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
+            // Checked after each pass, before the answer is used: a `None` from
+            // a walk that abandoned a line is not "there is no next match", and
+            // navigating past a match the scan never finished reading would
+            // move the cursor to the wrong place.
+            if re.step_limit_exceeded() {
+                return Err(Self::regex_scan_budget_exhausted());
+            }
             if found.is_some() || !wrap {
                 return Ok(found);
             }
-            Ok(match direction {
+            let wrapped = match direction {
                 SearchDirection::Forward => self.find_compiled_regex_from(
                     &re,
                     self.first_cached_line.min(self.line_count),
@@ -2196,7 +2267,11 @@ impl SearchIndex {
                     direction,
                     true,
                 ),
-            })
+            };
+            if re.step_limit_exceeded() {
+                return Err(Self::regex_scan_budget_exhausted());
+            }
+            Ok(wrapped)
         }
         #[cfg(not(feature = "regex"))]
         {
@@ -2216,7 +2291,7 @@ impl SearchIndex {
     #[cfg(feature = "regex")]
     fn find_compiled_regex_from(
         &self,
-        re: &regex::Regex,
+        re: &aterm_regex::Regex,
         anchor_line: usize,
         anchor_col: usize,
         direction: SearchDirection,
@@ -2431,5 +2506,100 @@ impl SearchIndex {
 impl Default for SearchIndex {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The regex **scan** budget, at the two entry points that take a pattern from
+/// the search box and run it over untrusted terminal content.
+///
+/// `REGEX_SIZE_LIMIT` bounds what compiles; these tests are about what a
+/// compiled pattern then costs to run, which is a separate axis and used to be
+/// unbounded. See `REGEX_STEP_LIMIT`.
+#[cfg(all(test, feature = "regex"))]
+mod regex_scan_budget_tests {
+    use super::*;
+
+    /// A thirteen-byte pattern that compiles happily under the 128 KiB program
+    /// ceiling (2,042 instructions) and then costs ~16.7M work units — ~19 ms
+    /// in release — to cross a single 4,096-column line.
+    const EXPENSIVE: &str = "(?:x?){1020}z";
+
+    fn index_with_a_wide_line() -> SearchIndex {
+        let mut index = SearchIndex::new();
+        index.index_line(0, "an ordinary line of terminal output");
+        index.index_line(1, &"x".repeat(4096));
+        index.index_line(2, "another ordinary line");
+        index
+    }
+
+    /// The budget is actually passed. Without this the two constants below are
+    /// documentation rather than configuration.
+    #[test]
+    fn the_compiled_pattern_carries_the_scan_budget() {
+        let re = SearchIndex::compile_regex("needle", true).expect("compiles");
+        assert_eq!(re.step_limit(), REGEX_STEP_LIMIT);
+        assert!(!re.step_limit_exceeded());
+    }
+
+    /// A pattern too expensive to finish a line is **refused**, not answered
+    /// with a short list. The distinction is the whole point: a truncated
+    /// result set presented as exhaustive is a wrong answer, and search results
+    /// are read by `cmd_search` and by a human deciding what is in their
+    /// scrollback.
+    #[test]
+    fn a_pattern_that_cannot_finish_a_line_is_refused_not_truncated() {
+        let index = index_with_a_wide_line();
+        let started = std::time::Instant::now();
+        let err = index
+            .search_with_positions_opts(EXPENSIVE, true, true)
+            .expect_err("a scan that could not finish must not return matches");
+        assert!(
+            matches!(err, SearchOptionsError::InvalidRegex(ref m) if m.contains("too expensive")),
+            "the refusal must name the cause: {err:?}"
+        );
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "the scan took {:?}; the budget is not bounding it",
+            started.elapsed()
+        );
+
+        // Point navigation refuses the same way, rather than reporting "no next
+        // match" and moving the cursor somewhere wrong.
+        let err = index
+            .find_regex_direction(
+                EXPENSIVE,
+                true,
+                DirectedFind {
+                    anchor: (0, 0),
+                    direction: SearchDirection::Forward,
+                    inclusive: true,
+                    wrap: true,
+                },
+            )
+            .expect_err("navigation must refuse too");
+        assert!(matches!(err, SearchOptionsError::InvalidRegex(_)), "{err:?}");
+    }
+
+    /// Ordinary patterns over the same content are untouched: the budget is
+    /// three orders of magnitude above what a real query costs.
+    #[test]
+    fn ordinary_regex_queries_are_unaffected() {
+        let mut index = SearchIndex::new();
+        index.index_line(0, "commit 66390b5c8f2a1b3c landed at 192.168.0.1");
+        index.index_line(1, &"user@example.com ".repeat(240));
+        index.index_line(2, "nothing here");
+
+        for (pattern, want_lines) in [
+            (r"\b[0-9a-f]{7,40}\b", vec![0usize]),
+            (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", vec![1]),
+            (r"\d+\.\d+\.\d+\.\d+", vec![0]),
+        ] {
+            let matches = index
+                .search_with_positions_opts(pattern, true, true)
+                .unwrap_or_else(|e| panic!("{pattern:?} must not be refused: {e}"));
+            let mut lines: Vec<usize> = matches.iter().map(|m| m.line).collect();
+            lines.dedup();
+            assert_eq!(lines, want_lines, "{pattern:?}");
+        }
     }
 }

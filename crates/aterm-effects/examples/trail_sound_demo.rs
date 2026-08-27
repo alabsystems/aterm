@@ -43,17 +43,25 @@ type Cue = (f32, SoundKind, f32, f32);
 /// Enter jump — then 3.5 s of tail so the bed's exhale is captured.
 fn scenario() -> Vec<Cue> {
     let mut cues = Vec::new();
-    // Steady typing, 6 cps, heat warming up.
+    // A capital opens the line: the shift LIFT leaning into the first key.
+    cues.push((0.0, SoundKind::Shift, -0.8, 0.0));
+    // Steady typing, 6 cps, heat warming up — with the spacebar's COMMA
+    // grounding a word boundary mid-phrase.
     for i in 0..12 {
-        let t = i as f32 / 6.0;
-        cues.push((t, SoundKind::Typed, -0.8 + t * 0.55, (t / 2.0) * 0.7));
+        let t = 0.08 + i as f32 / 6.0;
+        let kind = if i == 5 || i == 9 {
+            SoundKind::Space
+        } else {
+            SoundKind::Typed
+        };
+        cues.push((t, kind, -0.8 + t * 0.55, (t / 2.0) * 0.7));
     }
     // Hot burst, 20 cps.
     for i in 0..24 {
         let t = 2.0 + i as f32 / 20.0;
         cues.push((t, SoundKind::Typed, -0.6 + (i as f32 / 24.0) * 1.2, 0.9));
     }
-    // Thinking pause… then four backspaces.
+    // Thinking pause… then four backspaces (the felt lift-off run).
     for i in 0..4 {
         cues.push((
             3.9 + i as f32 / 8.0,

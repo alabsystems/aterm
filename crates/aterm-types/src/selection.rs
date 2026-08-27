@@ -116,6 +116,46 @@ pub fn selection_contains_block(
     row >= min_row && row <= max_row && col >= min_col && col <= max_col
 }
 
+/// The inclusive column span of the ONE glyph that occupies `col`.
+///
+/// A double-width glyph — a CJK ideograph, an emoji, a ZWJ sequence — owns TWO
+/// cells: a lead cell carrying the whole cluster's text and a blank continuation
+/// cell carrying none. Nothing downstream of the selection can represent half of
+/// one. The text extractors emit the entire cluster from the lead and nothing
+/// from the continuation, so an edge that divides the pair paints one half a
+/// column wide while the clipboard receives the whole character — what you see
+/// stops being what you get, at both edges and in both drag directions.
+///
+/// So a glyph is INDIVISIBLE to a selection: it is selected iff either of its
+/// cells is. Both sides of that promise widen their edges through here — the
+/// highlight predicate (`TextSelection::contains_cell`) tests the pair, and the
+/// copy's column walk (`visible_row_bounds_to_string`) starts at the lead and
+/// stops at the continuation — so the painted run and the copied run are the
+/// same run by construction rather than by two rules that happen to agree today.
+///
+/// `is_wide_lead` means the cell at `col` is the LEFT half; `is_wide_continuation`
+/// means it is the RIGHT half. A cell can be neither (single width, `(col, col)`)
+/// but never both; a continuation wins if a caller passes both, matching the
+/// order the renderer resolves its own flags in.
+#[inline]
+#[must_use]
+pub const fn glyph_cell_span(
+    col: u16,
+    is_wide_lead: bool,
+    is_wide_continuation: bool,
+) -> (u16, u16) {
+    if is_wide_continuation {
+        // Saturating, not `col - 1`: a continuation at column 0 has no lead to
+        // back up to (a wide glyph cannot start left of the row), so it stands
+        // alone rather than wrapping to u16::MAX and selecting the far edge.
+        (col.saturating_sub(1), col)
+    } else if is_wide_lead {
+        (col, col.saturating_add(1))
+    } else {
+        (col, col)
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     use super::{selection_contains_block, selection_contains_linear};
@@ -202,6 +242,29 @@ mod tests {
     #[test]
     fn selection_side_default_is_left() {
         assert_eq!(SelectionSide::default(), SelectionSide::Left);
+    }
+
+    #[test]
+    fn a_single_width_cell_is_its_own_whole_glyph() {
+        assert_eq!(glyph_cell_span(7, false, false), (7, 7));
+    }
+
+    #[test]
+    fn both_halves_of_a_wide_glyph_name_the_same_pair_of_columns() {
+        // Whichever half a selection edge lands on, the widened span is the same
+        // — that identity is what makes the highlight and the copy agree.
+        assert_eq!(glyph_cell_span(4, true, false), (4, 5));
+        assert_eq!(glyph_cell_span(5, false, true), (4, 5));
+    }
+
+    #[test]
+    fn a_glyph_span_never_wraps_past_the_ends_of_the_column_axis() {
+        // A continuation at column 0 has no lead behind it, and a lead at the
+        // last representable column has no continuation ahead: both stand alone
+        // rather than wrapping to the opposite edge and selecting the far end of
+        // the row.
+        assert_eq!(glyph_cell_span(0, false, true), (0, 0));
+        assert_eq!(glyph_cell_span(u16::MAX, true, false), (u16::MAX, u16::MAX));
     }
 
     #[test]

@@ -729,35 +729,9 @@ pub(crate) struct PackagesProjection {
     pub(crate) command_feedback: Option<String>,
 }
 
-/// THE PROGRESS-CARD REOPEN AFFORDANCE (design §6): visiting Settings ▸
-/// Packages brings back a dismissed provisioning progress card — this page is
-/// the durable `status.toml` record, so it is also the natural "where did that
-/// card go" place to look. The law is the EDGE, not the level: reopen fires
-/// exactly when the page BECOMES front (`was_front == false && front == true`),
-/// never while the user stays on it — otherwise dismissing the card while
-/// reading this page would be impossible (the next frame would re-show it).
-/// Pure so the affordance is test-pinned here; the per-window memory and the
-/// `PkgProgressUi::reopen` call live in `App::splice_pkg_progress`
-/// (`app_render::pkg_progress_card::note_packages_front`).
-#[must_use]
-pub(crate) fn reopen_on_packages_visit(was_front: bool, front: bool) -> bool {
-    front && !was_front
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The reopen affordance is an EDGE: only the moment the Packages page
-    /// becomes front re-shows a dismissed progress card — staying on the page
-    /// must leave a fresh dismissal alone, or dismissing there is impossible.
-    #[test]
-    fn reopen_fires_on_the_visit_edge_only() {
-        assert!(reopen_on_packages_visit(false, true), "arriving reopens");
-        assert!(!reopen_on_packages_visit(true, true), "staying does not");
-        assert!(!reopen_on_packages_visit(true, false), "leaving does not");
-        assert!(!reopen_on_packages_visit(false, false), "absence does not");
-    }
 
     fn refresh(report: PackagesStatusReport) -> PackagesWorkerCompletion {
         PackagesWorkerCompletion::refresh(report)

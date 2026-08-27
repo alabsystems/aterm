@@ -1090,16 +1090,25 @@ mod tests {
             "blame's whole job is naming the first-party edge:\n{}",
             out.log
         );
-        // One resolved version means no dedup prize and no liveness defect —
-        // the clean state, asserted as such rather than assumed.
+        // TWO versions resolve again: the vendored fork at 0.7.15 and the
+        // registry 1.0.3 that accesskit_unix -> zbus drags into the linux graph.
+        // That returned on 2026-08-26 with the unconditional-AccessKit decision,
+        // and blame's job is precisely to SHOW it — so the assertion is that the
+        // report names both, not that the tree is clean.
         assert!(
-            !out.log.contains("Collapsing these"),
-            "one version cannot carry a dedup prize:\n{}",
+            out.log.contains("0.7.15") && out.log.contains("1.0.3"),
+            "blame must name both resolved winnow versions:\n{}",
             out.log
         );
+        // The defect is REAL and blame must say so. `winnow 1.0.3` comes from the
+        // registry via accesskit_unix -> zbus on linux, and the fork is 0.7.15 —
+        // a `^1.0` requirement cannot reach it, so the `offset_from` underflow
+        // the fork exists to remove is absent from the copy that compiles there.
+        // This assertion used to demand SILENCE, which would have hidden a live
+        // defect the moment it returned; it now demands the report.
         assert!(
-            !out.log.contains("PATCH LIVENESS DEFECT"),
-            "the fork covers every resolved version; a defect here is real news:\n{}",
+            out.log.contains("PATCH LIVENESS DEFECT"),
+            "blame must surface the unpatched winnow 1.0.3 sibling on linux:\n{}",
             out.log
         );
         for line in out.log.lines() {

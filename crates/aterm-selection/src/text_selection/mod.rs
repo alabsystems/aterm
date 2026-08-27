@@ -726,18 +726,21 @@ impl TextSelection {
         self.clamp_head_to_min_row(min_row)
     }
 
-    /// Check if a cell is within the selection, accounting for wide characters.
+    /// THE highlight predicate: is this cell painted as selected, with a
+    /// double-width glyph counted whole?
     ///
-    /// For block (rectangular) selection, wide characters that straddle the
-    /// selection boundary must be snapped to whole-character boundaries:
-    /// - If `is_wide` is true (cell at `col` is a double-width character start),
-    ///   the cell is selected if either column `col` or `col + 1` (the
-    ///   continuation cell) falls within the block bounds.
-    /// - If `is_wide_continuation` is true (cell at `col` is the right half of
-    ///   a double-width character), the cell is selected when either its own
-    ///   column or the preceding lead (`col - 1`) falls within the block bounds.
+    /// A CJK ideograph, an emoji, or a ZWJ sequence occupies a lead cell and a
+    /// blank continuation cell, and
+    /// [`glyph_cell_span`](aterm_types::selection::glyph_cell_span) names them as
+    /// one indivisible unit. A cell is selected when EITHER of its glyph's
+    /// columns is — which is exactly the rule the copy path's column walk
+    /// obeys, so a drag that stops mid-glyph paints and copies the same run.
+    /// Testing the bare `col` instead splits the glyph: the highlight covers one
+    /// half a column wide while the clipboard receives the whole character.
     ///
-    /// For non-block selections, this behaves identically to [`Self::contains`].
+    /// `is_wide` means the cell at `col` is the LEFT half; `is_wide_continuation`
+    /// means it is the RIGHT half. Both renderers reach this through one seam
+    /// (`RenderInput::selection_hit`), so CPU and GPU cannot diverge either.
     pub fn contains_cell(
         &self,
         row: i32,
@@ -745,16 +748,12 @@ impl TextSelection {
         is_wide: bool,
         is_wide_continuation: bool,
     ) -> bool {
-        if self.selection_type == SelectionType::Block {
-            if is_wide_continuation {
-                return self.contains(row, col)
-                    || (col > 0 && self.contains(row, col.saturating_sub(1)));
-            }
-            if is_wide {
-                return self.contains(row, col) || self.contains(row, col.saturating_add(1));
-            }
-        }
-        self.contains(row, col)
+        let (lead, continuation) =
+            aterm_types::selection::glyph_cell_span(col, is_wide, is_wide_continuation);
+        // `lead == continuation` is the single-width case — the overwhelming
+        // majority of cells on a frame with a selection, each of which pays this
+        // predicate. Short-circuit rather than testing the same column twice.
+        self.contains(row, lead) || (continuation != lead && self.contains(row, continuation))
     }
 
     /// Check if a cell is within the selection.
@@ -763,8 +762,9 @@ impl TextSelection {
     /// Applies the same side adjustment as [`project_range`] so that both
     /// methods agree on the selected region.
     ///
-    /// Note: this method does not account for wide (CJK) character boundaries.
-    /// For block selection with wide characters, use [`Self::contains_cell`].
+    /// Note: this method knows nothing about wide (CJK/emoji) glyphs, so on its
+    /// own it will divide one. Anything painting cells wants
+    /// [`Self::contains_cell`], which counts a glyph whole.
     pub fn contains(&self, row: i32, col: u16) -> bool {
         if self.state == SelectionState::None {
             return false;
