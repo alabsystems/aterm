@@ -236,12 +236,28 @@ KEY USAGE (spelled as you type them — daily verbs first)
   aterm pkg update [program] upgrade all (or one) to the channel pin; coherence
                              groups apply all-or-nothing (the rustc-locked tuple
                              moves together)
-  aterm pkg install <program>
+  aterm pkg install <program> [--elevate=sudo|osascript|never]
                              one program: verify the signed index, then install the
-                             pinned build
+                             pinned build. THE EXPLICIT DOOR for a member the OS
+                             installs with an administrator (Homebrew's pkg, Apple's
+                             Command Line Tools, an apt/dnf package): in a terminal
+                             sudo asks there; --elevate=osascript uses the system
+                             dialog; without a terminal it records `needs admin` and
+                             says so. The unattended pass never elevates. A member
+                             the platform's own manager installs without elevation
+                             (brew, winget, scoop, cargo, pipx) installs through
+                             that manager; a machine without the manager reads it
+                             as `unavailable on <target>` — atpkg never installs a
+                             package manager
   aterm pkg verify [program] re-attest installed bytes against the signed root (no
                              network) — doctor reads health, verify re-proves bytes
-  aterm pkg which <tool>     print the store path a tool resolves to (never $PATH)
+  aterm pkg which <tool>     ONE line: which copy of a tool runs and why — managed
+                             (shim → store path, pinned by index N), system copy
+                             (not managed by aterm), SHADOWED by a copy ahead on
+                             PATH, installed via another protocol (pkg,
+                             softwareupdate, or a platform manager: apt, brew,
+                             winget, …) at its proof path, or an extra awaiting
+                             opt-in
   aterm pkg run <tool> [-- args]
                              exec the store binary — what `aterm <tool>` dispatches to
   aterm pkg seed             the first-launch bootstrap, runnable by hand: fill an

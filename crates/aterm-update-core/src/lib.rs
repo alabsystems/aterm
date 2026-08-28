@@ -51,7 +51,7 @@ pub use hash::sha256_file;
 pub use http::{
     ApiResponse, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get, api_get_classified,
     api_get_conditional, download_bytes, download_error_is_rate_limit, download_to,
-    download_to_resumable, validator_safe,
+    download_to_resumable, download_to_resumable_https_only, validator_safe,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

@@ -12,6 +12,17 @@
 //! file swapped after extraction (or an interrupted/partial extraction) changes the root
 //! and the apply aborts.
 //!
+//! **Symlinks** (the `https` payload lanes: a `links` entry at `bin/<tool>`, or an in-root
+//! link inside a vendor archive / `.app` bundle) contribute one line each in the SAME
+//! framing, with the literal tag `symlink` in the mode slot and the SHA-256 of the link's
+//! raw target bytes in the digest slot ([`symlink_line`]). The tag can never be an octal
+//! digit string, so a link and a file can never collide; the target is digested rather
+//! than embedded so a target containing `\0` or `\n` cannot break the line framing; and
+//! the link's own permission bits are deliberately NOT part of the line — `lstat` reports
+//! them differently per platform (0777 on Linux, 0755 on macOS) and they mean nothing.
+//! Trees signed before this existed contain no symlinks (the extractor refused them), so
+//! every root already in the wild is unchanged.
+//!
 //! The hash is **content-integrity, not the signature root** (that stays `ring`, §8). It
 //! streams each file, so a multi-GB sysroot is never buffered whole. The exact byte
 //! format below is the contract the publish-side producer (Phase 6) must reproduce.
@@ -30,10 +41,10 @@ use aterm_digest::Sha256;
 /// independent of directory-walk order) and concatenated, and the SHA-256 of that stream
 /// is returned as lowercase hex.
 ///
-/// **Fail-closed on unexpected entry types.** The extracted tree is supposed to contain
-/// only regular files and directories ([`crate::extract::vet_entry`] refused every
-/// symlink/hardlink/exotic entry at stage time); encountering one here means tampering or
-/// a bug, so this returns an error rather than silently skipping it.
+/// A **symlink** contributes a [`symlink_line`] (never followed, never descended). Any
+/// other entry type — device, fifo, socket — is **fail-closed**: the extractor never lays
+/// one down, so meeting one here means tampering or a bug, and this returns an error
+/// rather than silently skipping it.
 pub fn tree_root(root: &Path) -> io::Result<String> {
     let mut entries: Vec<Vec<u8>> = Vec::new();
     // ONE read buffer for the whole walk, threaded down the recursion. A per-file
@@ -83,6 +94,32 @@ pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
 /// and both are `0` on Windows (no POSIX bits), but reading the mode back is what keeps
 /// the extraction-time twin honest on any filesystem that would answer differently.
 pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> Vec<u8> {
+    framed_line(rel_bytes, oct_mode(mode).as_bytes(), content_sha_hex)
+}
+
+/// The mode-slot tag of a symlink's entry line. Never a run of octal digits, so it cannot
+/// collide with any regular file's permission bits (see the module docs).
+pub(crate) const SYMLINK_TAG: &str = "symlink";
+
+/// Lowercase-hex SHA-256 of a symlink's raw target bytes — the digest slot of its line.
+pub(crate) fn symlink_target_sha(target_bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(target_bytes);
+    hex(&h.finalize())
+}
+
+/// Build ONE canonical entry line for a symlink: `<relpath-bytes> 0x00 symlink 0x00
+/// <lowercase-hex sha256 of the raw target bytes> 0x0A`. `target_sha_hex` comes from
+/// [`symlink_target_sha`]; both producers of the digest (the on-disk walk and the
+/// extraction-time fold in [`crate::extract`]) go through this one function.
+pub(crate) fn symlink_line(rel_bytes: &[u8], target_sha_hex: &str) -> Vec<u8> {
+    framed_line(rel_bytes, SYMLINK_TAG.as_bytes(), target_sha_hex)
+}
+
+/// The one line framer: `<rel> 0x00 <mode-slot> 0x00 <digest> 0x0A`. Byte-identical to
+/// the framing `entry_line` always produced; the mode slot is the only thing a symlink
+/// line fills differently.
+fn framed_line(rel_bytes: &[u8], mode_slot: &[u8], digest_hex: &str) -> Vec<u8> {
     // Saturating spelling of the capacity hint (a no-op on every real
     // input: entry lines are a path + 64 hex chars + separators, nowhere
     // near `usize::MAX`), branch-dominated for the allocation-budget
@@ -90,7 +127,7 @@ pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> 
     // grows as needed.
     let cap = rel_bytes
         .len()
-        .saturating_add(content_sha_hex.len())
+        .saturating_add(digest_hex.len())
         .saturating_add(16);
     let mut line = if cap <= 4096 {
         Vec::with_capacity(cap)
@@ -99,9 +136,9 @@ pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> 
     };
     line.extend_from_slice(rel_bytes);
     line.push(0);
-    line.extend_from_slice(oct_mode(mode).as_bytes());
+    line.extend_from_slice(mode_slot);
     line.push(0);
-    line.extend_from_slice(content_sha_hex.as_bytes());
+    line.extend_from_slice(digest_hex.as_bytes());
     line.push(b'\n');
     line
 }
@@ -115,10 +152,20 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>, buf: &mut [u8]) -> io::
     children.sort_by_key(std::fs::DirEntry::file_name);
     for child in children {
         let path = child.path();
-        // symlink_metadata: never follow a link (and a link is itself unexpected here).
+        // symlink_metadata: never follow a link. A link is digested by its TARGET BYTES
+        // (checked first: `is_dir`/`is_file` are both false for it on Unix, but the order
+        // spells out that a link to a directory is a line, never a descent).
         let meta = std::fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            let rel = path.strip_prefix(root).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
+            })?;
+            let target = std::fs::read_link(&path)?;
+            let rel_bytes = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
+            let target_bytes = crate::call1(crate::platform::os_str_bytes, target.as_os_str());
+            out.push(symlink_line(rel_bytes, &symlink_target_sha(target_bytes)));
+        } else if ft.is_dir() {
             walk(root, &path, out, buf)?;
         } else if ft.is_file() {
             let rel = path.strip_prefix(root).map_err(|_| {
@@ -134,7 +181,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>, buf: &mut [u8]) -> io::
             let rel_bytes = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
             out.push(entry_line(rel_bytes, mode, &fsha));
         } else {
-            // symlink / device / fifo / socket — must not be in an extracted bundle.
+            // device / fifo / socket — must not be in an extracted bundle.
             // Manual concat of the previous
             // `format!("unexpected non-file/dir entry in tree: {}", path.display())`
             // — byte-identical (`Path::display` renders exactly the lossy UTF-8
@@ -380,16 +427,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    // A symlink in the tree (which vet_entry never extracts) is fail-closed, not skipped.
+    /// A symlink is digested by its raw TARGET BYTES — never followed, never skipped —
+    /// and the digest moves exactly when the target string moves. A dangling link is a
+    /// perfectly good line (the `links` a vendor row declares are created before the
+    /// stage's re-verify, and nothing about the line depends on what it points at).
     #[cfg(unix)] // symlink fixture — Unix-only
     #[test]
-    fn symlink_in_tree_is_an_error() {
+    fn a_symlink_is_digested_by_its_target_bytes_and_never_followed() {
         let d = tmp("link");
         write(&d.join("real"), b"x");
         std::os::unix::fs::symlink("real", d.join("link")).unwrap();
-        assert!(
-            tree_root(&d).is_err(),
-            "an unexpected symlink in the tree must fail closed, not be silently skipped"
+        let base = tree_root(&d).unwrap();
+        assert_eq!(base, tree_root(&d).unwrap(), "deterministic");
+        // Not followed: the link's own line is a function of the TARGET STRING, so a
+        // second link with the same target string is the same line at another path.
+        std::os::unix::fs::symlink("real", d.join("link2")).unwrap();
+        let with_twin = tree_root(&d).unwrap();
+        assert_ne!(base, with_twin, "an added link must move the root");
+        std::fs::remove_file(d.join("link2")).unwrap();
+        assert_eq!(tree_root(&d).unwrap(), base);
+        // The target STRING moves the root, even when both strings resolve to nothing.
+        std::fs::remove_file(d.join("link")).unwrap();
+        std::os::unix::fs::symlink("nowhere", d.join("link")).unwrap();
+        let dangling = tree_root(&d).unwrap();
+        assert_ne!(base, dangling, "a changed target must move the root");
+        std::fs::remove_file(d.join("link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", d.join("link")).unwrap();
+        assert_ne!(dangling, tree_root(&d).unwrap());
+        // A link to a DIRECTORY is a line, not a descent: the files behind it are hashed
+        // once, under their own paths.
+        write(&d.join("sub/inner"), b"inner");
+        std::fs::remove_file(d.join("link")).unwrap();
+        std::os::unix::fs::symlink("sub", d.join("link")).unwrap();
+        let via_dir = tree_root(&d).unwrap();
+        std::fs::remove_file(d.join("link")).unwrap();
+        std::os::unix::fs::symlink("sub", d.join("link")).unwrap();
+        assert_eq!(via_dir, tree_root(&d).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The symlink line is a cross-version byte contract from the day it ships, so it is
+    /// pinned to a literal computed independently of this code from the documented
+    /// format: `sort(<relpath> 0x00 symlink 0x00 <hex sha256(target bytes)> 0x0A ...)`,
+    /// concatenated, SHA-256 — over `real` (content `x`, mode 0644) and `link -> real`.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_tree_root_matches_the_pinned_cross_version_vector() {
+        let d = tmp("golden-link");
+        write(&d.join("real"), b"x");
+        std::fs::set_permissions(d.join("real"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("real", d.join("link")).unwrap();
+        assert_eq!(
+            tree_root(&d).unwrap(),
+            "9b629b43d3775c6c84f676fd875ce601e5d9c3473b8e71b6470b12d48ee2d952",
+            "the symlink line moved: every vendor manifest signed against it disagrees"
+        );
+        // The line itself, spelled out, so the framing is pinned and not only the fold.
+        assert_eq!(
+            symlink_line(b"link", &symlink_target_sha(b"real")),
+            b"link\0symlink\0aa33996d60e89311b4d1a920dae03c6d7fa3ae1956c52662e273aad4683e577f\n"
+                .to_vec()
         );
         let _ = std::fs::remove_dir_all(&d);
     }

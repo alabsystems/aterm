@@ -135,6 +135,44 @@ pub struct Program {
     /// `aterm` itself per §16).
     #[serde(default)]
     pub coherence_group: Option<String>,
+    /// `extra = true` ⇒ listed and pinned (installable by name: `atpkg install <name>`,
+    /// Settings, or the typed-name consent stub) but NOT a default-set member:
+    /// [`Index::installable`] omits it unless `include` names it or an opt-in marker
+    /// (`<prefix>/optin/<name>`, [`crate::store::Layout::optin_exists`]) records that this
+    /// machine asked for it. Absent ⇒ `false` (today's behaviour). A client older than this
+    /// key ignores it and treats the row as default-set — the rollout accepts that.
+    #[serde(default)]
+    pub extra: bool,
+    /// `system = "gh"` ⇒ a binary of this name already on the user's `PATH` — OUTSIDE the
+    /// managed `bin/` and the atpkg store — SATISFIES the program: no download, no shim,
+    /// status `satisfied by system: <path>`, reconciled on every pass
+    /// ([`crate::vendor::system_satisfied`]). If it disappears the program installs through
+    /// its artifact like any other member. Absent ⇒ the program is always managed here.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// The one-line reason a target this program carries NO `[[artifact]]` row for cannot
+    /// have it (`"Emacs is a macOS-only member"`), surfaced verbatim in the canonical
+    /// `unavailable on <target>: <hint>` state ([`crate::state::unavailable`]). Absent ⇒
+    /// the generic hint. A missing row is a STATE, never an error, with or without one.
+    #[serde(default)]
+    pub unavailable_hint: Option<String>,
+    /// `requires = ["clt"]` — index programs that must be installed (managed, system-
+    /// satisfied, or `installed via <protocol>`) BEFORE this one. Homebrew requires `clt`:
+    /// its `.pkg` refuses to install without the Command Line Tools' git. Validated at
+    /// index parse ([`validate_requires`]: every name an index program, no self-
+    /// dependency, no cycle — over programs or over coherence groups); ordered by the
+    /// plan ([`crate::apply::plan_groups`] is dependency-first); gated by the pass (a
+    /// member whose requirement is unmet records `blocked by <dep>: <dep state>` and
+    /// downloads nothing — [`crate::state::blocked`]); resolved by
+    /// [`crate::flow::install`] exactly like a pkg manifest's own `requires`, unioned with
+    /// it — the explicit door installs the dependency first, in the same session. For a
+    /// member applied through an OS installer (`pkg`, `softwareupdate`) a requirement
+    /// that is DEFERRED (`needs admin`) defers the member too, and one that failed stops
+    /// it — the installer would only fail later, less legibly. A requirement on an EXTRA
+    /// is allowed: the consent surfaces name it and it is never opted in on the
+    /// dependent's behalf. Absent ⇒ none.
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 /// One `[[channels]]` entry: a named, pinned set of program builds plus the gating
@@ -181,17 +219,40 @@ impl Index {
     /// The installable program set after applying the **narrowing-only**
     /// `[packages].include`/`exclude` config (R4/§5). The signed index is the sole gate:
     ///
-    /// * empty `include` ⇒ start from *every* program the index names;
+    /// * empty `include` ⇒ start from *every* DEFAULT-SET program the index names — every
+    ///   program without `extra = true` ([`Program::extra`]);
     /// * non-empty `include` ⇒ start from only those of its names that the index **also**
     ///   names (an `include` entry absent from the index adds **nothing** — it can never
-    ///   widen the set or introduce an unlisted repo);
+    ///   widen the set or introduce an unlisted repo). `include` MAY name an extra: it is
+    ///   index-named, so this never widens past the signed set;
     /// * `exclude` then subtracts.
     ///
-    /// So no config can make a private-config / unlisted repo installable.
+    /// So no config can make a private-config / unlisted repo installable. The opt-in
+    /// markers a machine records for extras are a THIRD input, carried by
+    /// [`Index::installable_with_optins`]; this form is that one with no markers.
     #[must_use]
     pub fn installable(&self, include: &[String], exclude: &[String]) -> BTreeSet<String> {
+        self.installable_with_optins(include, exclude, &BTreeSet::new())
+    }
+
+    /// [`Index::installable`] plus the machine's recorded opt-ins: an extra whose name is
+    /// in `optins` joins the set exactly as if `include` had named it. `optins` is still
+    /// narrowing-only over the signed index — an opt-in for a name the index does not
+    /// carry adds nothing — and `exclude` subtracts after it, so a config exclusion still
+    /// beats a marker.
+    #[must_use]
+    pub fn installable_with_optins(
+        &self,
+        include: &[String],
+        exclude: &[String],
+        optins: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
         let mut set: BTreeSet<String> = if include.is_empty() {
-            self.programs.keys().cloned().collect()
+            self.programs
+                .iter()
+                .filter(|(_, p)| !p.extra)
+                .map(|(n, _)| n.clone())
+                .collect()
         } else {
             include
                 .iter()
@@ -199,10 +260,23 @@ impl Index {
                 .cloned()
                 .collect()
         };
+        for name in optins {
+            if self.programs.get(name.as_str()).is_some_and(|p| p.extra) {
+                set.insert(name.clone());
+            }
+        }
         for e in exclude {
             set.remove(e);
         }
         set
+    }
+
+    /// Whether `name` is an index-named EXTRA ([`Program::extra`]): available on request,
+    /// never a default-set member. `false` for a default-set program AND for a name the
+    /// index does not carry (nothing outside the signed set is an extra either).
+    #[must_use]
+    pub fn is_extra(&self, name: &str) -> bool {
+        self.programs.get(name).is_some_and(|p| p.extra)
     }
 }
 
@@ -241,17 +315,56 @@ pub struct PkgManifest {
     pub artifacts: Vec<Artifact>,
 }
 
-/// One `[[artifact]]` row: the prebuilt asset for a single target triple.
+/// The six target triples a program may carry rows for (§17.1) — the spelling a row's
+/// `target` uses and the one the client reports for itself (`cli::current_triple`, pinned
+/// to this list by a test). A program with NO row for the running triple is the
+/// canonical `unavailable on <target>: <hint>` state, never an error.
+pub const TARGETS: &[&str] = &[
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+];
+
+/// One `[[artifact]]` row: how ONE target triple obtains and applies this build. Two
+/// axes (§17): `kind` is the payload / apply shape, `protocol` is where the bytes come
+/// from; [`crate::dispatch::strategy_for`] maps the pair to an apply strategy and refuses
+/// every pair it does not know. A program carries one row per target it serves
+/// ([`TARGETS`]); a target with NO row is the canonical `unavailable on <target>` state,
+/// never an error.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artifact {
-    /// Target triple (`aarch64-apple-darwin`, …).
+    /// Target triple (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
+    /// `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+    /// `aarch64-pc-windows-msvc`).
     pub target: String,
-    /// `binary` | `sysroot-bundle` | `cargo-src` | `app-bundle` (§4.2).
+    /// The payload / apply shape: `binary` | `cargo-src` | `sysroot-bundle` | `app-bundle`
+    /// | `installer-pkg` (the `pkg` protocol only) | `system-package` (the `system-pm` and
+    /// `softwareupdate` protocols) (§4.2/§17). The former `vendor-fetch` spelling — never published —
+    /// is RETIRED and refused at parse ([`crate::sig::Reject::RetiredKind`]): it was a
+    /// protocol wearing a kind's name; write `kind = "binary"` (or `"app-bundle"` +
+    /// `payload = "dmg"`) with `protocol = "https"` instead.
     #[serde(default)]
     pub kind: String,
-    /// The release asset file name to download.
+    /// How the bytes are obtained: `github-release` (default — a release asset under the
+    /// account slug) | `https` (a vendor's own download, pinned by this signed row) |
+    /// `pkg` (a Developer-ID-signed macOS installer package, applied with elevation) |
+    /// `system-pm` (the platform's own package manager) | `softwareupdate` (Apple's
+    /// `softwareupdate`, macOS only — the Command Line Tools). Absent ⇒ `github-release`,
+    /// so every manifest published before this key reads exactly as it did.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    /// `github-release`: the release asset file name to download. `https`/`pkg`: the
+    /// LOCAL staging file name the download lands under (one bare component, never a
+    /// path). `system-pm`: unused. Validated non-empty for the two release-shaped
+    /// protocols at parse ([`parse_pkg`]).
+    #[serde(default)]
     pub asset: String,
-    /// SHA-256 of the COMPRESSED asset — the download-integrity gate.
+    /// SHA-256 of the DOWNLOADED bytes — the download-integrity gate. Required (validated
+    /// at parse) for every protocol that moves bytes; `system-pm` carries none.
+    #[serde(default)]
     pub sha256: String,
     /// SHA-256 over the sorted extracted-file list — the apply-time re-verify root (§8
     /// TOCTOU). Empty until producers emit it.
@@ -273,6 +386,76 @@ pub struct Artifact {
     /// `[artifact.cost]` — honest accounting surfaced before any byte moves (R7).
     #[serde(default)]
     pub cost: Cost,
+    /// `https` / `pkg`: the vendor's per-version HTTPS URL the client downloads from.
+    /// SIGNED (inside the manifest bytes) and further narrowed by the compiled host
+    /// allow-list ([`crate::vendor::VENDOR_HOSTS`]); the host is a transport, never an
+    /// authenticity input — `sha256`/`tree_root` gate the bytes exactly as for a release
+    /// asset. Ignored for every other protocol.
+    #[serde(default)]
+    pub url: String,
+    /// `https` only: how the download is staged — `raw-binary` | `tar-gz` | `tar-zst` |
+    /// `zip` (each with `kind = "binary"`) | `dmg` (with `kind = "app-bundle"`)
+    /// ([`crate::vendor::PAYLOADS`]).
+    #[serde(default)]
+    pub payload: String,
+    /// `raw-binary` only: the LOGICAL tool name the download becomes under `bin/` (mode
+    /// `0755`) — laid down under the platform's executable spelling
+    /// ([`crate::store::ToolName::exe_file`]: `bin/claude` on Unix, `bin/claude.exe` on
+    /// Windows, which is what the shim forwards to). Must be one of the manifest's
+    /// `exposes`.
+    #[serde(default)]
+    pub entry: String,
+    /// Archive payloads only (`tar-gz`/`tar-zst`/`zip`): leading path components to drop
+    /// on extraction (`gh_<ver>_macOS_arm64/bin/gh` → `bin/gh`). Default `0`.
+    #[serde(default)]
+    pub strip_components: u32,
+    /// `dmg` (and, if declared, archive) payloads: RELATIVE symlinks created at
+    /// `bin/<name>` → `../<target>` after staging, so the shims resolve `bin/<tool>`
+    /// (`emacs = "Emacs.app/Contents/MacOS/Emacs"`). Every key must be in `exposes`;
+    /// targets are relative, `..`-free paths inside the staged tree.
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
+    /// Display-only vendor name for the consent copy (`"Anthropic PBC"`). NEVER a trust
+    /// input.
+    #[serde(default)]
+    pub vendor: String,
+    /// `pkg` only: the Apple Developer ID TEAM of the `.pkg`'s signer (`"927JGANW46"`),
+    /// which the installer lane checks against `pkgutil --check-signature` before the
+    /// package is applied. Required for the protocol ([`crate::vendor::check_row`]).
+    #[serde(default)]
+    pub signer_team: String,
+    /// Whether applying this row needs elevation (an administrator prompt). Required
+    /// `true` for `pkg`; required `true` for `system-pm` over `apt`/`dnf`. The unattended
+    /// pass never elevates — such a member records the canonical `needs admin — run:
+    /// aterm pkg install <name>` state and waits for the explicit door.
+    #[serde(default)]
+    pub elevated: bool,
+    /// `pkg` / `system-pm` / `softwareupdate`: what proves the install happened, since
+    /// nothing lands in the store. `pkg` and `softwareupdate`: absolute paths
+    /// (`"/opt/homebrew/bin/brew"`, `"/Library/Developer/CommandLineTools/usr/bin/git"`).
+    /// `system-pm`: bare tool names resolved on `PATH` (through `PATHEXT` on Windows),
+    /// or absolute paths. The first that exists is the `installed via <protocol>: <path>`
+    /// state's path — for `system-pm` the MANAGER's name stands in the protocol slot
+    /// (`installed via apt: /usr/bin/emacs`).
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// `system-pm` only: which manager resolves `package` — one row of the extensible
+    /// manager table ([`crate::vendor::MANAGER_TABLE`]: `apt` | `dnf` | `brew` | `winget`
+    /// | `scoop` | `cargo` | `pipx`). A machine without that manager on `PATH` reads the
+    /// member as `unavailable on <target>` — atpkg never installs a manager
+    /// ([`crate::system_pm`]).
+    #[serde(default)]
+    pub manager: String,
+    /// `system-pm` only: the package id in that manager's own naming (`emacs`,
+    /// `GNU.Emacs`, `GitHub.cli`). Passed to the manager as ONE argument, never a shell
+    /// word; never begins with `-`.
+    #[serde(default)]
+    pub package: String,
+    /// `softwareupdate` only: the head of the `softwareupdate -l` label to install
+    /// (`"Command Line Tools for Xcode"`); the NEWEST label starting with it is picked
+    /// ([`crate::softwareupdate::pick_label`]). Required for the protocol.
+    #[serde(default)]
+    pub label_prefix: String,
 }
 
 /// A `sysroot-bundle` with no explicit policy is treated as `self-contained` —
@@ -280,6 +463,19 @@ pub struct Artifact {
 fn default_reloc() -> String {
     "self-contained".to_string()
 }
+
+/// A row with no `protocol` is a release asset under the account slug — every manifest
+/// published before the key existed.
+fn default_protocol() -> String {
+    "github-release".to_string()
+}
+
+/// The retired `kind` spelling, and the split that replaced it — the message
+/// [`Reject::RetiredKind`] carries.
+const VENDOR_FETCH_RETIRED: &str = "kind = \"vendor-fetch\" is retired (it was never \
+    published): a row now declares its payload SHAPE as kind = \"binary\" (or \
+    \"app-bundle\" with payload = \"dmg\") and where the bytes come from as \
+    protocol = \"https\"";
 
 /// `[artifact.cost]` — the honest, structural accounting block (§4.2/R7).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -331,7 +527,139 @@ pub(crate) fn parse_index(verified: &VerifiedBytes) -> Result<Index, Reject> {
     if idx.schema > SUPPORTED_SCHEMA {
         return Err(Reject::Schema);
     }
+    validate_requires(&idx)?;
     Ok(idx)
+}
+
+/// The `[programs.<name>].requires` relation must be one a client can honour, checked
+/// ONCE at index parse so no plan is ever asked to order what cannot be ordered
+/// ([`Reject::Requires`], naming the offending edge):
+///
+/// * every name is an index program — a `requires` edge can pull a program IN, never
+///   reach outside the signed set (§5 stays by construction);
+/// * no program requires itself;
+/// * no cycle over programs (`a → b → a`), and none THROUGH a coherence group: the plan
+///   installs a group as one atomic unit ([`crate::apply::plan_groups`]), so a path that
+///   leaves a group and comes back to another of its members (`trust → ny → ay`, with
+///   trust and ay both in `rustc`) would wait on itself forever. A dependency BETWEEN two
+///   members of one group is fine (the tuple's own transaction satisfies it).
+///
+/// A dependency on an EXTRA is allowed: the consent surfaces name it, no pass opts in to
+/// it on the dependent's behalf, and the dependent reads `blocked by <extra>: extra — not
+/// installed (…)` until the user does ([`crate::state::blocked`]).
+pub(crate) fn validate_requires(idx: &Index) -> Result<(), Reject> {
+    for (name, p) in &idx.programs {
+        for dep in &p.requires {
+            if dep == name {
+                let mut m = name.clone();
+                m.push_str(" requires itself");
+                return Err(Reject::Requires(m));
+            }
+            if !idx.programs.contains_key(dep) {
+                let mut m = name.clone();
+                m.push_str(" requires ");
+                m.push_str(dep);
+                m.push_str(", which the index does not name");
+                return Err(Reject::Requires(m));
+            }
+        }
+    }
+    let mut colour: BTreeMap<&str, u8> = BTreeMap::new();
+    for name in idx.programs.keys() {
+        if let Some(cycle) = program_cycle(idx, name, &mut colour, &mut Vec::new()) {
+            let mut m = String::from("requires cycle: ");
+            m.push_str(&cycle.join(" → "));
+            return Err(Reject::Requires(m));
+        }
+    }
+    let mut groups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (name, p) in &idx.programs {
+        if let Some(g) = &p.coherence_group {
+            groups.entry(g.as_str()).or_default().insert(name.as_str());
+        }
+    }
+    for (g, members) in &groups {
+        for m in members {
+            let mut seen = BTreeSet::new();
+            if let Some(path) = group_cycle(idx, members, m, &mut Vec::new(), &mut seen, false) {
+                let mut msg = String::from("requires cycle through coherence group '");
+                msg.push_str(g);
+                msg.push_str("': ");
+                msg.push_str(&path.join(" → "));
+                msg.push_str(" (the group installs as one unit, so it would wait on itself)");
+                return Err(Reject::Requires(msg));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Depth-first over `requires` edges from `name`; `Some(cycle)` names the first cycle met
+/// (`a → b → a`), else `None`. `colour`: absent = unvisited, 1 = on the stack, 2 = done.
+fn program_cycle<'a>(
+    idx: &'a Index,
+    name: &'a str,
+    colour: &mut BTreeMap<&'a str, u8>,
+    stack: &mut Vec<&'a str>,
+) -> Option<Vec<String>> {
+    match colour.get(name) {
+        Some(2) => return None,
+        Some(_) => {
+            let start = stack.iter().position(|s| *s == name).unwrap_or(0);
+            let mut cycle: Vec<String> = stack[start..].iter().map(|s| (*s).to_string()).collect();
+            cycle.push(name.to_string());
+            return Some(cycle);
+        }
+        None => {}
+    }
+    colour.insert(name, 1);
+    stack.push(name);
+    if let Some(p) = idx.programs.get(name) {
+        for dep in &p.requires {
+            if let Some(cycle) = program_cycle(idx, dep.as_str(), colour, stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    stack.pop();
+    colour.insert(name, 2);
+    None
+}
+
+/// Depth-first from `node` (a member of the group `members`), over every `requires`
+/// edge; `left` records whether the path has stepped OUTSIDE the group. Arriving back at
+/// a member after having left is a cycle through the group: `Some(path)` names it.
+/// `seen` holds `(node, left)` pairs so the walk terminates on any graph.
+fn group_cycle<'a>(
+    idx: &'a Index,
+    members: &BTreeSet<&str>,
+    node: &'a str,
+    path: &mut Vec<&'a str>,
+    seen: &mut BTreeSet<(&'a str, bool)>,
+    left: bool,
+) -> Option<Vec<String>> {
+    if !seen.insert((node, left)) {
+        return None;
+    }
+    path.push(node);
+    let mut found = None;
+    if let Some(p) = idx.programs.get(node) {
+        for dep in &p.requires {
+            let inside = members.contains(dep.as_str());
+            if inside && left {
+                let mut cycle: Vec<String> = path.iter().map(|s| (*s).to_string()).collect();
+                cycle.push(dep.clone());
+                found = Some(cycle);
+                break;
+            }
+            found = group_cycle(idx, members, dep.as_str(), path, seen, left || !inside);
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    path.pop();
+    found
 }
 
 /// Parse a release-verified `pkg-*.toml` from its [`VerifiedBytes`] (same strict UTF-8 +
@@ -341,7 +669,39 @@ pub fn parse_pkg(verified: &VerifiedBytes) -> Result<PkgManifest, Reject> {
     if m.schema > SUPPORTED_SCHEMA {
         return Err(Reject::Schema);
     }
+    validate_rows(&m)?;
     Ok(m)
+}
+
+/// The post-parse shape rules `serde` alone cannot express now that `asset`/`sha256` are
+/// optional for the protocols that carry no bytes:
+///
+/// * the retired `kind = "vendor-fetch"` is refused with the split's spelling
+///   ([`Reject::RetiredKind`]) — a whole-manifest refusal, since a publisher that emits
+///   it is running tooling this schema left behind;
+/// * a `github-release` or `https` row still REQUIRES `asset` and `sha256` (they were
+///   `serde`-required fields before the split, and a release-shaped row without them
+///   used to fail closed as [`Reject::Malformed`] — it still does);
+/// * a `pkg` row requires `url` and `sha256` (bytes move; they must be pinned);
+/// * `system-pm` and `softwareupdate` rows move no bytes and need nothing here.
+///
+/// Everything finer — hosts, payload lanes, `signer_team`, `manager`, `provides`,
+/// `label_prefix` — is [`crate::vendor::check_row`]'s per-program refusal, so one
+/// mis-authored row for one target never takes the other targets' rows down with it.
+fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
+    for a in &m.artifacts {
+        if a.kind == "vendor-fetch" {
+            return Err(Reject::RetiredKind(VENDOR_FETCH_RETIRED));
+        }
+        let release_shaped = matches!(a.protocol.as_str(), "github-release" | "https");
+        if release_shaped && (a.asset.is_empty() || a.sha256.is_empty()) {
+            return Err(Reject::Malformed);
+        }
+        if a.protocol == "pkg" && (a.url.is_empty() || a.sha256.is_empty()) {
+            return Err(Reject::Malformed);
+        }
+    }
+    Ok(())
 }
 
 /// Shared strict-UTF-8 + `toml` deserialize over already-verified bytes. Invalid UTF-8
@@ -400,12 +760,22 @@ coherence_group = "rustc"
 repo = "aterm"
 policy = "prebuilt-only"
 
+[programs.codex]
+repo = "codex"
+policy = "prebuilt-only"
+extra = true
+
+[programs.gh]
+repo = "gh"
+policy = "prebuilt-only"
+system = "gh"
+
 [[channels]]
 name = "stable"
 channel_build = 137
 min_build = 120
 yanked = ["trust@4790"]
-pin = {{ aterm = 1234, trust = 4821, ay = 18 }}
+pin = {{ aterm = 1234, trust = 4821, ay = 18, codex = 2026082601, gh = 2026082601 }}
 
 [channels.meta]
 nightly = "nightly-2025-12-03"
@@ -477,10 +847,11 @@ trust_mc_rev = "0.67.0"
     #[test]
     fn include_exclude_are_narrowing_only() {
         let idx = parse_index(&verified(&full_index())).unwrap();
-        // Default (empty include): every named program.
+        // Default (empty include): every named DEFAULT-SET program (`codex` is an extra
+        // and stays out; `gh` is default-set — `system` is a satisfaction rule, not a tier).
         assert_eq!(
             idx.installable(&[], &[]),
-            ["aterm", "ay", "trust"]
+            ["aterm", "ay", "gh", "trust"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
@@ -500,9 +871,397 @@ trust_mc_rev = "0.67.0"
         );
         // exclude subtracts.
         assert_eq!(
-            idx.installable(&[], &["trust".into()]),
+            idx.installable(&[], &["trust".into(), "gh".into()]),
             ["aterm", "ay"].iter().map(|s| s.to_string()).collect()
         );
+    }
+
+    /// The EXTRAS tier: an `extra = true` program is index-named and pinned (reachable by
+    /// name) but NOT in the default set. It joins the set when `include` names it or when
+    /// this machine recorded an opt-in — and only then.
+    #[test]
+    fn extras_are_excluded_by_default_and_join_by_include_or_optin() {
+        let idx = parse_index(&verified(&full_index())).unwrap();
+        // Parsed as declared; absent ⇒ false; `system` parsed beside it.
+        assert!(idx.program("codex").unwrap().extra);
+        assert!(!idx.program("ay").unwrap().extra);
+        assert!(idx.is_extra("codex"));
+        assert!(!idx.is_extra("ay"), "a default-set program is not an extra");
+        assert!(
+            !idx.is_extra("dotfiles"),
+            "an unlisted name is not an extra"
+        );
+        assert_eq!(idx.program("gh").unwrap().system.as_deref(), Some("gh"));
+        assert_eq!(idx.program("ay").unwrap().system, None);
+        // Reachable by name (the channel pins it) — but not in the default set.
+        assert!(idx.is_program("codex"));
+        assert!(!idx.installable(&[], &[]).contains("codex"));
+        // `include` may name it: index-named, so this never widens past the signed set.
+        assert_eq!(
+            idx.installable(&["codex".into()], &[]),
+            ["codex"].iter().map(|s| s.to_string()).collect()
+        );
+        // An opt-in marker unions it into the default set...
+        let optins: BTreeSet<String> = ["codex".to_string()].into_iter().collect();
+        assert_eq!(
+            idx.installable_with_optins(&[], &[], &optins),
+            ["aterm", "ay", "codex", "gh", "trust"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        // ...an opt-in for a NON-extra or an unlisted name adds nothing (narrowing-only)...
+        let stray: BTreeSet<String> = ["ay".to_string(), "dotfiles".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            idx.installable_with_optins(&[], &[], &stray),
+            idx.installable(&[], &[])
+        );
+        // ...and `exclude` still beats a marker.
+        assert!(
+            !idx.installable_with_optins(&[], &["codex".into()], &optins)
+                .contains("codex")
+        );
+        // The no-marker form is the marker form with no markers.
+        assert_eq!(
+            idx.installable(&[], &[]),
+            idx.installable_with_optins(&[], &[], &BTreeSet::new())
+        );
+    }
+
+    /// The `https` row keys parse as signed data (all `serde(default)`, so a row without
+    /// them — every existing manifest — is unchanged), `links` is a map, and a row with no
+    /// `protocol` is `github-release`.
+    #[test]
+    fn parses_https_protocol_artifact_keys() {
+        let body = r#"
+schema = 2
+program = "claude"
+version = "2.1.231"
+build_number = 2026082601
+exposes = ["claude"]
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "binary"
+protocol = "https"
+url = "https://downloads.claude.ai/claude-code-releases/2.1.231/darwin-arm64/claude"
+payload = "raw-binary"
+entry = "claude"
+asset = "claude-2.1.231-darwin-arm64"
+sha256 = "7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c"
+tree_root = "abc"
+size = 230824016
+vendor = "Anthropic PBC"
+strip_components = 1
+links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
+"#;
+        let m = parse_pkg(&verified(body)).expect("valid https manifest");
+        let a = m.artifact_for("aarch64-apple-darwin").unwrap();
+        assert_eq!(a.kind, "binary");
+        assert_eq!(a.protocol, "https");
+        assert!(a.url.starts_with("https://downloads.claude.ai/"));
+        assert_eq!(a.payload, "raw-binary");
+        assert_eq!(a.entry, "claude");
+        assert_eq!(a.vendor, "Anthropic PBC");
+        assert_eq!(a.strip_components, 1);
+        assert_eq!(
+            a.links.get("emacs").map(String::as_str),
+            Some("Emacs.app/Contents/MacOS/Emacs")
+        );
+        // Absent keys default: an ordinary binary row reads back empty/zero, and the
+        // protocol it never declared is the release lane every older manifest meant.
+        let plain = parse_pkg(&verified(
+            "schema = 2\nprogram = \"ay\"\nbuild_number = 18\n[[artifact]]\n\
+             target = \"aarch64-apple-darwin\"\nasset = \"ay-18.tar.zst\"\nsha256 = \"d\"\n",
+        ))
+        .unwrap();
+        let a = plain.artifact_for("aarch64-apple-darwin").unwrap();
+        assert_eq!(a.protocol, "github-release");
+        assert!(a.url.is_empty() && a.payload.is_empty() && a.entry.is_empty());
+        assert_eq!(a.strip_components, 0);
+        assert!(a.links.is_empty() && a.vendor.is_empty());
+        assert!(a.signer_team.is_empty() && !a.elevated && a.provides.is_empty());
+        assert!(a.manager.is_empty() && a.package.is_empty() && a.label_prefix.is_empty());
+    }
+
+    /// A `softwareupdate` row (Apple's Command Line Tools) parses with its own keys and
+    /// no bytes at all; the index-level `requires` parses beside `system`/`extra`.
+    #[test]
+    fn parses_a_softwareupdate_row_and_the_index_requires() {
+        let body = r#"
+schema = 2
+program = "clt"
+version = "16.4"
+build_number = 2026082701
+exposes = []
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "system-package"
+protocol = "softwareupdate"
+label_prefix = "Command Line Tools for Xcode"
+elevated = true
+provides = ["/Library/Developer/CommandLineTools/usr/bin/git"]
+vendor = "Apple"
+"#;
+        let m = parse_pkg(&verified(body)).expect("a softwareupdate row parses");
+        let a = m.artifact_for("aarch64-apple-darwin").unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.protocol.as_str()),
+            ("system-package", "softwareupdate")
+        );
+        assert_eq!(a.label_prefix, "Command Line Tools for Xcode");
+        assert!(a.elevated);
+        assert_eq!(
+            a.provides,
+            vec!["/Library/Developer/CommandLineTools/usr/bin/git".to_string()]
+        );
+        assert!(a.url.is_empty() && a.sha256.is_empty() && a.size == 0);
+        let idx_body = full_index().replace(
+            "[programs.gh]\nrepo = \"gh\"",
+            "[programs.gh]\nrequires = [\"trust\", \"ay\"]\nrepo = \"gh\"",
+        );
+        let idx = parse_index(&verified(&idx_body)).unwrap();
+        assert_eq!(
+            idx.program("gh").unwrap().requires,
+            vec!["trust".to_string(), "ay".to_string()]
+        );
+        assert!(idx.program("ay").unwrap().requires.is_empty());
+    }
+
+    /// The index-level `requires` relation is validated at parse (§17.10): a name the
+    /// index does not carry, a self-dependency, a cycle over programs, and a cycle THROUGH
+    /// a coherence group are each refused with the edge named — while a dependency on an
+    /// extra, and one between two members of the same group, parse fine.
+    #[test]
+    fn the_requires_relation_is_validated_at_index_parse() {
+        let with = |gh: &str, ay: &str, trust: &str| {
+            full_index()
+                .replace(
+                    "[programs.gh]\nrepo = \"gh\"",
+                    &format!("[programs.gh]\n{gh}repo = \"gh\""),
+                )
+                .replace(
+                    "[programs.ay]\nrepo = \"ay\"",
+                    &format!("[programs.ay]\n{ay}repo = \"ay\""),
+                )
+                .replace(
+                    "[programs.trust]\nrepo = \"trust\"",
+                    &format!("[programs.trust]\n{trust}repo = \"trust\""),
+                )
+        };
+        let refused = |body: String| match parse_index(&verified(&body)) {
+            Err(Reject::Requires(why)) => why,
+            other => panic!("expected Reject::Requires, got {other:?}"),
+        };
+        // Unknown name.
+        assert_eq!(
+            refused(with("requires = [\"dotfiles\"]\n", "", "")),
+            "gh requires dotfiles, which the index does not name"
+        );
+        // Self-dependency.
+        assert_eq!(
+            refused(with("requires = [\"gh\"]\n", "", "")),
+            "gh requires itself"
+        );
+        // A cycle over programs, spelled out.
+        let why = refused(with("requires = [\"ay\"]\n", "requires = [\"gh\"]\n", ""));
+        assert!(
+            why == "requires cycle: ay → gh → ay" || why == "requires cycle: gh → ay → gh",
+            "{why}"
+        );
+        // A cycle THROUGH a coherence group: `ay` joins trust's `rustc` tuple; trust
+        // requires gh, gh requires ay — the tuple would wait on itself.
+        let body = with(
+            "requires = [\"ay\"]\n",
+            "coherence_group = \"rustc\"\n",
+            "requires = [\"gh\"]\n",
+        );
+        let why = refused(body);
+        assert!(
+            why.starts_with("requires cycle through coherence group 'rustc': "),
+            "{why}"
+        );
+        assert!(
+            why.contains("gh → ay") || why.contains("trust → gh"),
+            "{why}"
+        );
+        // Allowed: a dependency on an EXTRA (the consent surfaces name it), and one
+        // between two members of ONE group (the tuple's transaction satisfies it).
+        let ok = with(
+            "requires = [\"codex\"]\n",
+            "coherence_group = \"rustc\"\nrequires = [\"trust\"]\n",
+            "",
+        );
+        let idx = parse_index(&verified(&ok)).expect("an extra dep and an intra-group dep parse");
+        assert_eq!(
+            idx.program("gh").unwrap().requires,
+            vec!["codex".to_string()]
+        );
+        assert!(idx.is_extra("codex"));
+        assert!(
+            !idx.installable(&[], &[]).contains("codex"),
+            "a dependency on an extra never opts it in"
+        );
+    }
+
+    /// The retired `kind = "vendor-fetch"` is refused at parse with the split spelled out
+    /// — never read as a binary, never as an https row, never silently Unknown.
+    #[test]
+    fn the_retired_vendor_fetch_kind_is_refused_naming_the_split() {
+        let body = "schema = 2\nprogram = \"claude\"\nbuild_number = 1\n[[artifact]]\n\
+                    target = \"aarch64-apple-darwin\"\nkind = \"vendor-fetch\"\n\
+                    asset = \"claude\"\nsha256 = \"d\"\nurl = \"https://downloads.claude.ai/c\"\n";
+        match parse_pkg(&verified(body)) {
+            Err(Reject::RetiredKind(why)) => {
+                assert!(why.contains("vendor-fetch"), "{why}");
+                assert!(why.contains("kind = \"binary\""), "{why}");
+                assert!(why.contains("protocol = \"https\""), "{why}");
+            }
+            other => panic!("expected RetiredKind, got {other:?}"),
+        }
+        // Even a SECOND row spelled that way refuses the manifest: a publisher emitting it
+        // is on retired tooling.
+        let mixed = "schema = 2\nprogram = \"claude\"\nbuild_number = 1\n[[artifact]]\n\
+                     target = \"aarch64-apple-darwin\"\nasset = \"a\"\nsha256 = \"d\"\n\
+                     [[artifact]]\ntarget = \"x86_64-apple-darwin\"\nkind = \"vendor-fetch\"\n\
+                     asset = \"a\"\nsha256 = \"d\"\n";
+        assert!(matches!(
+            parse_pkg(&verified(mixed)),
+            Err(Reject::RetiredKind(_))
+        ));
+    }
+
+    /// `pkg` and `system-pm` rows parse with their own keys and WITHOUT the release-shaped
+    /// ones (`asset`, and for `system-pm` `sha256`) — while a release-shaped row still
+    /// fails closed without `asset`/`sha256`, exactly as when serde required them.
+    #[test]
+    fn pkg_and_system_pm_rows_parse_and_release_rows_still_need_their_digests() {
+        let body = r#"
+schema = 2
+program = "homebrew"
+version = "4.5.0"
+build_number = 2026082701
+exposes = []
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "installer-pkg"
+protocol = "pkg"
+url = "https://github.com/Homebrew/brew/releases/download/4.5.0/Homebrew-4.5.0.pkg"
+sha256 = "7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c7b09f01c"
+size = 144434507
+signer_team = "927JGANW46"
+elevated = true
+provides = ["/opt/homebrew/bin/brew"]
+vendor = "Homebrew"
+
+[[artifact]]
+target = "x86_64-unknown-linux-gnu"
+kind = "system-package"
+protocol = "system-pm"
+manager = "apt"
+package = "emacs"
+provides = ["emacs", "/usr/bin/emacs"]
+elevated = true
+
+[[artifact]]
+target = "x86_64-pc-windows-msvc"
+kind = "system-package"
+protocol = "system-pm"
+manager = "winget"
+package = "GNU.Emacs"
+provides = ["emacs"]
+"#;
+        let m = parse_pkg(&verified(body)).expect("pkg + system-pm rows parse");
+        let p = m.artifact_for("aarch64-apple-darwin").unwrap();
+        assert_eq!(
+            (p.kind.as_str(), p.protocol.as_str()),
+            ("installer-pkg", "pkg")
+        );
+        assert_eq!(p.signer_team, "927JGANW46");
+        assert!(p.elevated);
+        assert_eq!(p.provides, vec!["/opt/homebrew/bin/brew".to_string()]);
+        assert!(p.asset.is_empty(), "a pkg row names no release asset");
+        let apt = m.artifact_for("x86_64-unknown-linux-gnu").unwrap();
+        assert_eq!(
+            (
+                apt.kind.as_str(),
+                apt.protocol.as_str(),
+                apt.manager.as_str()
+            ),
+            ("system-package", "system-pm", "apt")
+        );
+        assert_eq!(apt.package, "emacs");
+        assert!(apt.elevated);
+        assert!(
+            apt.sha256.is_empty() && apt.url.is_empty() && apt.size == 0,
+            "no bytes, no digest"
+        );
+        let win = m.artifact_for("x86_64-pc-windows-msvc").unwrap();
+        assert_eq!(
+            (win.manager.as_str(), win.package.as_str()),
+            ("winget", "GNU.Emacs")
+        );
+        assert!(!win.elevated);
+        // A target with no row is the clean skip, never an error.
+        assert!(m.artifact_for("aarch64-pc-windows-msvc").is_none());
+        // Release-shaped rows keep their required digests (the pre-split serde contract).
+        for missing in [
+            "target = \"aarch64-apple-darwin\"\nsha256 = \"d\"\n",
+            "target = \"aarch64-apple-darwin\"\nasset = \"a\"\n",
+            "target = \"aarch64-apple-darwin\"\nprotocol = \"https\"\nkind = \"binary\"\n\
+             sha256 = \"d\"\nurl = \"https://github.com/x\"\n",
+            "target = \"aarch64-apple-darwin\"\nprotocol = \"pkg\"\nkind = \"installer-pkg\"\n\
+             sha256 = \"d\"\n",
+        ] {
+            let body =
+                format!("schema = 2\nprogram = \"ay\"\nbuild_number = 18\n[[artifact]]\n{missing}");
+            assert_eq!(
+                parse_pkg(&verified(&body)).unwrap_err(),
+                Reject::Malformed,
+                "{missing}"
+            );
+        }
+    }
+
+    /// The six targets, in the schema's spelling — every one a `<arch>-<vendor>-<os>[-abi]`
+    /// triple over the two architectures and three operating systems the client ships on.
+    #[test]
+    fn the_target_list_is_the_six_triples() {
+        assert_eq!(TARGETS.len(), 6);
+        for t in TARGETS {
+            let arch = t.split('-').next().unwrap();
+            assert!(matches!(arch, "aarch64" | "x86_64"), "{t}");
+            assert!(
+                t.ends_with("-apple-darwin")
+                    || t.ends_with("-unknown-linux-gnu")
+                    || t.ends_with("-pc-windows-msvc"),
+                "{t}"
+            );
+        }
+        let mut sorted = TARGETS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 6, "no duplicates");
+    }
+
+    /// `[programs.<name>].unavailable_hint` parses beside `extra`/`system`; absent ⇒ None.
+    #[test]
+    fn parses_the_unavailable_hint() {
+        let mut body = full_index();
+        body = body.replace(
+            "[programs.gh]\nrepo = \"gh\"",
+            "[programs.gh]\nunavailable_hint = \"gh is a macOS/Linux member\"\nrepo = \"gh\"",
+        );
+        let idx = parse_index(&verified(&body)).unwrap();
+        assert_eq!(
+            idx.program("gh").unwrap().unavailable_hint.as_deref(),
+            Some("gh is a macOS/Linux member")
+        );
+        assert_eq!(idx.program("ay").unwrap().unavailable_hint, None);
     }
 
     // reject-newer: a schema beyond this build is refused (the client stays put).

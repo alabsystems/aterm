@@ -669,8 +669,13 @@ fn current_program_line(f: &atpkg::progress::ProgressFile) -> (String, Option<f3
         },
         Phase::Skipped => format!("{name} — already current"),
     };
+    // "you asked" outranks "you wait"; a row pulled forward because a program the user
+    // asked for REQUIRES it (§17.10) says so instead — it was not asked for, it was needed.
     let line = if row.bumped {
-        format!("{line} (you asked for this)")
+        match row.bumped_with.as_deref() {
+            Some(with) => format!("{line} (bumped with {with})"),
+            None => format!("{line} (you asked for this)"),
+        }
     } else {
         line
     };
@@ -957,6 +962,7 @@ mod tests {
                         bytes_total: 900_000_000,
                         build: Some(5520),
                         bumped: false,
+                        bumped_with: None,
                         error: None,
                     },
                 ),
@@ -968,6 +974,7 @@ mod tests {
                         bytes_total: 0,
                         build: None,
                         bumped: false,
+                        bumped_with: None,
                         error: None,
                     },
                 ),
@@ -1323,6 +1330,7 @@ mod tests {
                 bytes_total: 2,
                 build: None,
                 bumped: false,
+                bumped_with: None,
                 error: None,
             },
         );

@@ -5223,17 +5223,53 @@ impl App {
             // at all. The bound existed but was unreachable, which defeats the
             // very escape hatch `AutomaticPastGrace` was introduced to provide.
             let past_grace = now >= intent.apply_by;
+            // A TYPING-GAP REFUSAL IS NOT AN ATTEMPT, and must not be paced like
+            // one. It returned above `begin_apply_preflight`, so it cost no park,
+            // no spawn and no ticket — pacing it by the two-minute grace window
+            // would turn "wait for a gap between keystrokes" into "wait up to two
+            // minutes after one", and the gap it is waiting for is measured in
+            // seconds. Re-poll on the ordinary quiet cadence instead.
+            let typing_gap = reason.contains("typing gap");
             // The anti-spin concern that motivated the rearm is real, so it is
             // answered by PACING instead: past the deadline every poll costs a
             // genuine park/spawn round trip, so space those by the grace window
             // rather than the 500 ms quiet cadence. Before the deadline the
             // quiet cadence is what makes a prompt idle landing possible.
             intent.retry_at = now
-                + if past_grace {
+                + if past_grace && !typing_gap {
                     crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE
                 } else {
                     crate::AUTOMATIC_UPDATE_QUIET_EPOCH
                 };
+            // …AND IT MAY NOT HOLD FOREVER. A refusal that can repeat without
+            // bound is a feature that silently stops working, so a lane held by
+            // typing for this long past its grace stands down to manual-only:
+            // the ordinary latch, which lapses and re-arms on its own, and the
+            // staged build still applies for free at the next launch — where
+            // there is no live session to freeze at all. Better than proving a
+            // point by freezing the terminal of someone who is plainly using it.
+            if typing_gap
+                && past_grace
+                && now.saturating_duration_since(intent.apply_by)
+                    >= crate::AUTOMATIC_UPDATE_TYPING_HOLD
+            {
+                aterm_log::info!(
+                    "update auto-apply for build {} stood down to manual-only: the keyboard \
+                     has not been idle for {:?} since its grace expired; the staged build \
+                     applies at the next launch",
+                    intent.build,
+                    crate::AUTOMATIC_UPDATE_TYPING_HOLD
+                );
+                self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                    build: intent.build,
+                    dmg_sha256: intent.dmg_sha256,
+                    // Activity-shaped, so it LAPSES — this says the keyboard was
+                    // busy, never anything about the artifact.
+                    retry_at: Some(now + crate::ACTIVITY_RETRY_BUDGET_REPLENISH),
+                });
+                self.auto_apply_intent = None;
+                return;
+            }
             self.auto_apply_intent = Some(intent);
             if past_grace {
                 // Paced by the grace window, so this is one line per two minutes at
@@ -5862,6 +5898,25 @@ impl App {
     }
 
     pub(crate) fn apply_native_update(&mut self, mode: ApplyMode) -> UpdateOutcome {
+        // HANDS OFF THE KEYS — the one refusal that outranks the past-grace force.
+        //
+        // Everything below this line eventually parks every PTY reader and hands
+        // the shells to a successor that must swap the bundle, re-exec and boot a
+        // GUI before anything echoes again. The owner's complaint is not that the
+        // window is long, it is that it lands MID-WORD. So both automatic lanes —
+        // including `AutomaticPastGrace`, which by design ignores the quiet epoch
+        // below — wait for a plain gap between keystrokes. An explicit
+        // "Install & Relaunch" is the user asking for the pause and is never held.
+        //
+        // This refuses; it never admits. It returns above `begin_apply_preflight`,
+        // so it mints no ticket, spends no retry budget, and cannot make an apply
+        // happen that today's code would refuse — the property that keeps it clear
+        // of this lane's adoption proof entirely.
+        if mode.is_automatic() && !self.update_apply_hands_off_keys(std::time::Instant::now()) {
+            return UpdateOutcome::Deferred {
+                reason: "a keystroke landed in an aterm window inside the typing gap".to_string(),
+            };
+        }
         // Only the still-inside-the-window automatic lane defers here.
         // `AutomaticPastGrace` already spent that window waiting for an idle
         // moment that never came (see `AUTOMATIC_UPDATE_ACTIVITY_GRACE`).

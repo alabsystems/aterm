@@ -159,6 +159,13 @@ pub struct ProgramProgress {
     /// renders it as "bumped — you asked for this".
     #[serde(default)]
     pub bumped: bool,
+    /// When the bump pulled this program forward NOT because a user asked for it but
+    /// because a program they DID ask for `requires` it (§17.10): that program's name.
+    /// The GUI renders it as "bumped with <name>". `None` for a plain bump and for every
+    /// other row; absent from the file when `None`, so an older reader sees the row it
+    /// always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bumped_with: Option<String>,
     /// Why `phase` is `failed`, when it is. UNTRUSTED for display: control-strip and
     /// length-cap before any TTY (see the module docs).
     #[serde(default)]
@@ -338,6 +345,7 @@ impl ProgressSink {
                         bytes_total: *size,
                         build: None,
                         bumped: false,
+                        bumped_with: None,
                         error: None,
                     },
                 );
@@ -362,6 +370,7 @@ impl ProgressSink {
                     bytes_total: 0,
                     build: None,
                     bumped: false,
+                    bumped_with: None,
                     error: None,
                 });
             if row.phase != phase {
@@ -466,6 +475,21 @@ impl ProgressSink {
                 && !row.bumped
             {
                 row.bumped = true;
+                s.dirty = true;
+            }
+        });
+    }
+
+    /// Mark `program` bumped ALONG WITH `with` — the bumped program that requires it — so
+    /// the row can say why it moved ("bumped with brew"). A row already bumped in its
+    /// own right keeps that: the user's own ask outranks the pull.
+    pub fn bumped_with(&self, program: &str, with: &str) {
+        self.with(|s| {
+            if let Some(row) = s.file.programs.get_mut(program)
+                && !row.bumped
+            {
+                row.bumped = true;
+                row.bumped_with = Some(with.to_string());
                 s.dirty = true;
             }
         });

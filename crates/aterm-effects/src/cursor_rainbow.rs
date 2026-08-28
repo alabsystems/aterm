@@ -2170,4 +2170,79 @@ mod tests {
             );
         }
     }
+
+    /// THE BLOCK CARET'S OWN CYAN CENSUS — measured, not argued (2026-08-26).
+    ///
+    /// The owner's standing complaint is that a ROYGBIV trail shows cyan.
+    /// ROYGBIV is red, orange, yellow, green, blue, indigo, violet; cyan is
+    /// none of them. The ribbon's cyan is countable in the raster
+    /// (`cyan_px=` in the PAINT line, tools/paint-conformance/scan.py), but
+    /// the caret is ONE CELL and the ribbon behind it is hundreds of pixels,
+    /// so a focused/unfocused raster differential moved the take's total by
+    /// 5 pixels out of ~310 and proved nothing either way. The caret's colour
+    /// law is therefore measured HERE, at the source, where it cannot be
+    /// swamped.
+    ///
+    /// [`spectrum_at`] is the caret's entire hue authority, and it resolves
+    /// through the family's [`rainbow_spectrum_of`] — the SAME six anchors and
+    /// the SAME RGB interpolation the ribbon reads. So this census is also the
+    /// ribbon's, for the cold (un-rotated) half of the spectrum.
+    ///
+    /// The bar is stated in hue degrees, matching the scanner exactly: hue in
+    /// [165, 195] at S >= 0.35 and V >= 110/255. What this pins is that the
+    /// caret's sweep DOES enter that band, and where — so the eventual fix has
+    /// a number to drive to zero rather than an opinion to argue with.
+    #[test]
+    fn caret_spectrum_cyan_census() {
+        let mut cyan = 0usize;
+        let mut total = 0usize;
+        let mut worst: Option<(f32, u32)> = None;
+        // Sweep the caret's real argument domain: many columns across a row,
+        // the phase around its whole ring, and the halo's outward offset.
+        for col in 0..80u16 {
+            for p in 0..200 {
+                let phase = p as f32 / 200.0 * crate::cursor_glow::RAINBOW_PHASE_RING;
+                for o in 0..5 {
+                    let off = o as f32 * 0.05;
+                    let rgb = spectrum_at(col, phase, off);
+                    let (h, s, v) = crate::color_math::rgb2hsv(rgb);
+                    total += 1;
+                    if (165.0..=195.0).contains(&h) && s >= 0.35 && v * 255.0 >= 110.0 {
+                        cyan += 1;
+                        if worst.is_none_or(|(wh, _)| (h - 180.0).abs() < (wh - 180.0).abs()) {
+                            worst = Some((h, rgb));
+                        }
+                    }
+                }
+            }
+        }
+        // THE FIX, pinned where the defect was measured. When this census was
+        // written it counted ~4% of the caret's whole argument domain inside
+        // the cyan band, centred on essentially pure 180° at full saturation
+        // (worst sample #0CB9BF-class pixels from the green→blue RGB lerp).
+        // TWO independent fixes were built for it in parallel and this
+        // census adjudicated between them: a pastel-bridge crossing from this
+        // session, and the neutral-control Bézier bend + true-blue/violet
+        // anchors from the codex lane (`rainbow_gradient_pair`, which
+        // collapses the forbidden hue below visible chroma instead of
+        // presenting it). The Bézier form passed every bar this census and
+        // its hot twin (`hot_momentum_spectrum_carries_no_cyan`) impose,
+        // alongside the family's smoothness and wake-visibility pins, so it
+        // is the one that ships. This assertion is what makes the choice
+        // permanent: any future anchor, interpolation, or iridescence edit
+        // that lets a saturated cyan pixel back into the caret's sweep fails
+        // here, with the offending hue and colour printed.
+        if let Some((wh, wrgb)) = worst {
+            println!(
+                "CARET-CYAN-CENSUS samples={total} cyan={cyan} ({:.2}%) \
+                 worst_hue={wh:.2}deg worst=#{wrgb:06X}",
+                cyan as f32 * 100.0 / total as f32
+            );
+        }
+        assert_eq!(
+            cyan, 0,
+            "ROYGBIV has no cyan: {cyan} of {total} caret samples landed in \
+             hue [165, 195] at S >= 0.35, V >= 110/255 (worst: {worst:?})"
+        );
+    }
 }

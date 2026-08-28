@@ -77,6 +77,10 @@ pub mod cost;
 pub mod discovery;
 pub mod dispatch;
 pub mod doctor;
+/// The elevation seam the OS-installer lanes share: the injectable [`elevate::Runner`],
+/// the calling verb's [`elevate::Elevation`] policy (Deferred by default — a background
+/// pass never elevates), the `sudo`/`osascript` wrappers and the `provides` probe.
+pub mod elevate;
 pub mod extract;
 pub mod flow;
 pub mod freespace;
@@ -84,6 +88,9 @@ pub mod gate;
 pub mod gc;
 pub mod hooks;
 pub mod install;
+/// The `pkg` protocol's lane: a Developer-ID-signed macOS installer package, its
+/// signer team checked with `pkgutil`, applied by `installer` with elevation.
+pub mod installer_pkg;
 pub mod linkmode;
 pub mod lock;
 pub mod manifest;
@@ -97,14 +104,30 @@ pub mod provisional;
 pub mod relocate;
 pub mod select;
 pub mod sig;
+/// The `softwareupdate` protocol's lane: Apple's Command Line Tools, installed
+/// headlessly by `softwareupdate` with elevation (never `xcode-select --install`).
+pub mod softwareupdate;
+/// The CANONICAL per-program state spellings (`managed <build> — pinned by index <N>`,
+/// `system: <path> — not managed by aterm`, …) shared by status.toml, the pass log,
+/// `doctor` and `which`.
+pub mod state;
 pub mod status;
 pub mod store;
 pub mod stub;
 pub mod sysroot;
+/// The `system-pm` protocol's lane: a package the platform's own manager (one row of
+/// [`vendor::MANAGER_TABLE`]) installs — `sudo` for the system-wide ones, as the user
+/// for the rest, never installing a manager, proven by the row's `provides`.
+pub mod system_pm;
 /// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
 /// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
 pub mod tarread;
 pub mod tree;
+/// Per-protocol row admission (`https`: host allow-list + payload shape; `pkg`,
+/// `system-pm` and `softwareupdate`: their own field rules), the extensible manager
+/// table, the `system = "<bin>"` satisfaction probe and the PATH-shadow probe — both
+/// cross-platform (`PATHEXT` on Windows).
+pub mod vendor;
 pub mod verify;
 
 pub use activate::{activate_channel, atomic_symlink, install_shims};
@@ -116,12 +139,13 @@ pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};
 pub use discovery::{IndexRepo, resolve_account, resolve_account_with};
 pub use dispatch::{ApplyStrategy, strategy_for};
+pub use elevate::{Elevation, Runner};
 pub use extract::{
     EntryKind, ExtractError, ExtractReject, extract_tar_zst, vet_entry, vet_hardlink,
 };
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
-    InstallRequest, apply_channel, install, resolve_verified_index,
+    InstallRequest, ProtocolOutcome, apply_channel, install, resolve_verified_index,
 };
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};
@@ -135,7 +159,7 @@ pub use lock::{StoreLock, StoreLockError, try_lock_store};
 // crate, the only way to a parsed `Index` is `TrustedRoster::authorize_index`, which runs
 // the machine-id bind the raw parse would let a caller skip. See its doc in `manifest`.
 pub use manifest::{
-    Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, parse_pkg,
+    Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, TARGETS, parse_pkg,
 };
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
 pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
@@ -148,6 +172,9 @@ pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
 pub use sysroot::{relocate_sysroot, write_toolchain_version};
 pub use tree::{sha256_file, tree_root};
+pub use vendor::{
+    MANAGER_TABLE, MANAGERS, Manager, VENDOR_HOSTS, shadowing_binary_on_path, system_satisfied,
+};
 pub use verify::{VerifyOutcome, verify_all, verify_program};
 
 /// The base64 Ed25519 public key(s) of the **paper master** this binary trusts — atpkg's

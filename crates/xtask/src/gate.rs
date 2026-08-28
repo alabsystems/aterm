@@ -2041,8 +2041,9 @@ impl LaneVerdict {
 }
 
 /// Run the repo guard scripts (`tools/grep_guard.sh`, `tools/license_check.sh`,
-/// `tools/paint_guard.sh`, `tools/spin_guard.sh`), FAILING CLOSED when one is
-/// missing.
+/// `tools/proof_cache_selftest.sh`, `tools/paint_guard.sh`,
+/// `tools/spin_guard.sh`, `publish/version-sites.sh`),
+/// FAILING CLOSED when one is missing.
 ///
 /// Each takes the repo root as its argument, and each is executed directly so
 /// its `#!/usr/bin/env bash` shebang is honored — they use bash-only process
@@ -2061,6 +2062,20 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
     for (label, rel) in [
         ("grep_guard", "tools/grep_guard.sh"),
         ("license_check", "tools/license_check.sh"),
+        // The gate on the two expensive guards' CACHE (2026-08-26 cached-green
+        // audit). Both teeth below skip when a previous verdict may honestly
+        // stand in for this run, and `tools/proof_cache.sh` is the code that
+        // decides "honestly" — so it is the piece that, if it quietly loosens,
+        // turns both proofs back into decorations. It already did once: a green
+        // that had been RE-ROLLED over a flaky red was stamped under the same
+        // content hash, and every push after it inherited that green without
+        // re-running, for six releases. This selftest drives the real decision
+        // function over a scratch directory in milliseconds and asserts that
+        // re-rolled, unprovenanced, expired, future-dated and unreadable greens
+        // are all refused — while a genuine first-try green still skips, since
+        // a cache that never skips is a broken gate too. It runs FIRST, before
+        // anything consults a cache.
+        ("proof_cache", "tools/proof_cache_selftest.sh"),
         // The paint-conformance tooth (2026-08-24 blackout audit,
         // docs/RELEASE-PROOF-DISCIPLINE.md): when the paint-relevant trees
         // (effects/render/gui + the gate's own machinery) differ from the last
@@ -2069,6 +2084,8 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
         // asserted. Unchanged trees cost one content hash, so the ordinary
         // push keeps the hook's affordability rule; the script itself owns the
         // macOS-only honesty and the loud ATERM_SKIP_PAINT_GUARD escape.
+        // Its skip now prints INHERITED, never GREEN: GREEN out of that script
+        // means the matrix ran in that process (see proof_cache above).
         ("paint_guard", "tools/paint_guard.sh"),
         // The spin-conformance tooth (2026-08 responsiveness audit, item A3).
         // The freeze-safety gate watches for loops that BLOCK; a loop spinning
@@ -2083,6 +2100,16 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
         // owns its own POSIX-only honesty and the loud ATERM_SKIP_SPIN_GUARD
         // escape.
         ("spin_guard", "tools/spin_guard.sh"),
+        // The release-version tooth. The release version lives in THREE places
+        // — `[workspace.package] version`, `VERSION_DEFAULT`, and the
+        // `aterm X.Y.0` assertion inside `CHECK_CMD_DEFAULT` — and `pub bump`
+        // moves only the first, so the other two have been hand-edited seven
+        // times and rotted repeatedly. They were also read at DIFFERENT stages
+        // of a release, the second only after the slow anonymous public-clone
+        // build, so a stale pair cost two failed release attempts. This is a
+        // text read costing milliseconds; catching the drift at lint time means
+        // it never reaches a release cut at all. `--fix` repairs every site.
+        ("version_sites", "publish/version-sites.sh"),
     ] {
         let script = root.join(rel);
         let lane = if script.exists() {
@@ -2674,8 +2701,8 @@ fn gate_lint_args(args: &[String]) -> bool {
 /// every lane was clean.
 fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
     eprintln!(
-        "=== gate lint (tippy -D warnings + trustfmt + \
-         guards[grep_guard,license_check,paint_guard,spin_guard]) ==="
+        "=== gate lint (tippy -D warnings + trustfmt + guards[grep_guard,license_check,\
+         proof_cache,paint_guard,spin_guard,version_sites]) ==="
     );
     let mut findings: Vec<&str> = Vec::new();
     let mut blocked_not_run: Vec<&str> = Vec::new();

@@ -494,6 +494,62 @@ fn alt_screen_cold_spinner_paints_zero_ink() {
 /// landing away from the caret several times a second) leaves trail ink.
 /// Verified live 2026-08-24 against HEAD 7cbf4651 ("an unowned batch retires
 /// what it invalidates"): the no-row-probe fence fix holds under this shape.
+///
+/// CONTINUITY IS JUDGED IN TIME, NOT FRAMES (2026-08-26). This row used to
+/// assert `rainbow_gap <= 1` — the longest run of non-rainbow FRAMES anywhere
+/// in the whole five-second recording. That term was flaky and blind at the
+/// same time, and both halves are measured, one binary, one shape, capture the
+/// only variable:
+///
+///   arm                     rainbow_gap (old)     driven_dark_us (new)
+///   six HEALTHY takes       0, 0, 4, 25, 26, 26   0 every time
+///   effect OFF, two takes   0, 0                  1_632_392 / 1_771_652
+///
+/// FLAKY: four of six healthy takes went red. The gap was never a blackout —
+/// it was the exhale `RAINBOW_DISP_RELEASE_TAU` deliberately authors ("the
+/// rainbow EXHALES after the last key ... melts over ~2 s of visible
+/// dimming"). After the last keystroke the ribbon dims below the scanner's
+/// hue-separation bar for a few hundred ms until the streamer's next unowned
+/// batch re-lights it. Frames 130 and 145 of a red take were pulled and
+/// looked at: 130 carries a faint multi-hue underline under `hello world`,
+/// 145 the same underline decayed to fewer hues. Nothing blacked out.
+///
+/// BLIND: with the effect switched OFF entirely (an unknown
+/// `cursor_trail_style`, which resolves Unknown and disables the effect), the
+/// same term reads ZERO — a take with no sustained two-frame rainbow anywhere
+/// gives `sustained_rainbow_bounds` nothing to bound, so the gap is vacuously
+/// zero. The term read 0 on a dead effect and 26 on a live one. Raising the
+/// threshold could only have traded one blindness for more, which is why the
+/// unit changed instead.
+///
+/// NOT a capture artefact, checked before anything was rewritten: the video
+/// tap records every SUBMITTED frame, and the index proves it — `seq` strictly
+/// contiguous, `ring_skipped=0`, `evicted_frames=0`, and inside every dark run
+/// the inter-frame delta sat at the nominal 17.8 ms. The darkness was really
+/// on glass; it simply was not a defect.
+///
+/// WHAT THE ROW MEASURES NOW: `ctl video ... keys` stamps every keystroke into
+/// `index.json`'s `inputs[]` on the SAME clock as `frames[].t_us`, so the take
+/// carries the interval in which the trail is actually being DRIVEN. Inside
+/// that window (plus a 150 ms grace for the stroke in flight) the scan reports
+/// `driven_dark_us`, the longest blackout in wall-clock time, charging only
+/// frames actually SAMPLED dark — first-dark to last-dark plus one nominal
+/// interval, never from the preceding lit frame. So a render stall cannot
+/// manufacture a blackout: the healthy takes measured 0 with sampling holes up
+/// to 86 ms, and `sampling_hole_us` is reported beside the verdict so a coarse
+/// capture is visible rather than silently deciding the row.
+///
+/// THE BOUND IS PROVEN IN BOTH DIRECTIONS. Blackouts injected into a healthy
+/// take (frames inside the window overwritten with the baseline) score exactly
+/// N x the nominal interval: 1 frame 17_683 us, 2 frames 35_087, 3 frames
+/// 52_608. The bound is 1.5 nominal intervals (26_524 us here) — ONE dark
+/// sampled frame is tolerated as capture jitter, TWO is a regression. That is
+/// strictly tighter than the `rainbow_gap <= 1` it replaces, while being
+/// immune to the exhale and to cadence drift.
+///
+/// Image-burst rows carry no recording and no `inputs[]`, so they report
+/// `driven_dark_us=-1` and keep the old whole-take frame gap, which is all
+/// such a take can support.
 #[cfg(target_os = "macos")]
 #[test]
 fn alt_screen_esc7_esc8_streamer_typing_paints_trail_ink() {
@@ -781,6 +837,45 @@ fn the_owners_rainbow_kitty_spelling_carries_the_resident_pet() {
     probe_with_companion(
         "prompt",
         "r,a,i,n,b,o,w,k,i,t,t,y",
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        Some(Companion::PetOwnerSpelling),
+    );
+}
+
+/// Matrix row 11 — ONE COMPANION BODY PER FRAME, on the owner's own line.
+///
+/// Owner, 2026-08-21, on v0.60.0 with `cursor_trail_style = "rainbow kitty"`:
+/// *"when there is a kitty head pet instead of the running kitty pet on the
+/// cursor, FIX THE BUG where there are two overlapping kitties drawn sometimes
+/// on effects!"* Two animals were on the glass at once.
+///
+/// WHY THE KEYS ARE ROW 8'S SUSTAINED RUN AND NOT ROW 10'S SINGLE WORD. Both
+/// companions only have a claim on the same frame once the typing run is long
+/// enough to earn the flypast — that is the exact window in which the resident
+/// steps aside for the singing head, and the only window in which a second body
+/// could ever be drawn. Row 10 types one word and never reaches it.
+///
+/// WHAT GOES RED. `companion_stack` counts isolating frames (the launch still
+/// and the three final cleared-plane stills) carrying two or more
+/// companion-shaped components, and this row — like rows 7, 8 and 10 — demands
+/// zero. It is deliberately a PIXEL obligation: `cursor_cat.is_active() &&
+/// cursor_pet.is_active()` is legal engine state that several unit tests pin on
+/// purpose, so a `pet_claimed`/`cat_claimed` conjunction would be asking the
+/// wrong question. Active is not drawn. The rest of the pet obligations ride
+/// along unchanged, so the row cannot go green by losing the resident either.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_owners_spelling_never_draws_two_companions_in_one_frame() {
+    const RUN: &str = concat!(
+        "r,a,i,n,b,o,w,k,i,t,t,y,",
+        "r,a,i,n,b,o,w,k,i,t,t,y,",
+        "r,a,i,n,b,o,w,k,i,t,t,y,",
+        "r,a,i,n,b,o,w,k,i,t,t,y",
+    );
+    probe_with_companion(
+        "prompt",
+        RUN,
         Expect::Ink,
         Capture::UnpinnedFocused,
         Some(Companion::PetOwnerSpelling),

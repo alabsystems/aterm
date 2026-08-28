@@ -5582,23 +5582,74 @@ mod tests {
         // DERIVED, not hardcoded: the premise is a relationship between the
         // slot and the two faces' advances, and the UI face ladder moves under
         // this test (a Noto/DejaVu swap shifted the old fixture from 159.7pt to
-        // 172.0pt regular and falsified it outright). Grow a real heading to the
-        // LONGEST prefix that still fits at rest — one character more would
-        // overflow, so the semibold cut of that same text necessarily does too,
-        // which is exactly the row this test is about.
+        // 172.0pt regular and falsified it outright).
+        //
+        // Search for a heading that satisfies BOTH halves rather than assuming
+        // one does. The previous shape grew to the longest prefix that fits at
+        // REGULAR and asserted "one character more would overflow, so the
+        // semibold cut necessarily does too" — which is not true, and Windows
+        // proved it: Segoe's longest fitting prefix measured 159.8pt regular /
+        // 165.8pt semibold against a 166.0pt slot, i.e. semibold FIT, by 0.2pt,
+        // and the premise assertion failed. (The `trim_end` below is part of
+        // why: dropping a trailing space shrinks the very measurement the
+        // premise is about, so it must happen BEFORE the two faces are compared,
+        // not after.) The window is only about one character wide, so whether
+        // any single prefix lands in it is down to the host font — test every
+        // prefix and keep the longest that genuinely qualifies.
+        // Whole characters of a sentence step the measure by ~6pt, but the window
+        // in which the premise holds — regular fits AND semibold does not — is
+        // only about one character wide, so a prefix search alone lands in it only
+        // by luck of the host face. Segoe misses it: no prefix of the sentence
+        // below qualifies. So widen the candidate set with NARROW characters,
+        // which step ~3pt and can therefore land inside the window on any face.
         let source = "Getting started with aterm on a Linux desktop today";
+        let qualifies = |text: &str| {
+            let reg = crate::tray_raster::ui_text_width_for(TextFace::Ui, text, outline_px);
+            let semi = crate::tray_raster::ui_text_width_for(TextFace::UiBold, text, outline_px);
+            (reg <= outline_slot, semi > outline_slot)
+        };
         let mut heading_owned = String::new();
+        let mut base = String::new();
+        let mut candidate = String::new();
         for ch in source.chars() {
-            let mut candidate = heading_owned.clone();
             candidate.push(ch);
-            if crate::tray_raster::ui_text_width_for(TextFace::Ui, &candidate, outline_px)
-                > outline_slot
-            {
+            let trimmed = candidate.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (reg_fits, semi_over) = qualifies(trimmed);
+            if !reg_fits {
                 break;
             }
-            heading_owned = candidate;
+            // The longest prefix that still fits at regular — the base the narrow
+            // run below extends when no whole-character prefix qualifies.
+            base = trimmed.to_string();
+            if semi_over {
+                heading_owned = trimmed.to_string();
+            }
         }
-        let heading: &str = heading_owned.trim_end();
+        if heading_owned.is_empty() {
+            let mut grown = base.clone();
+            for _ in 0..16 {
+                grown.push('i');
+                let (reg_fits, semi_over) = qualifies(&grown);
+                if !reg_fits {
+                    break;
+                }
+                if semi_over {
+                    heading_owned = grown.clone();
+                    break;
+                }
+            }
+        }
+        assert!(
+            !heading_owned.is_empty(),
+            "no heading built from {source:?} fits at regular while overflowing in semibold \
+             in a {outline_slot}pt slot at {outline_px}px on this host's UI face — the premise \
+             this test pins cannot be built here, so widen the search rather than deleting \
+             the assertion"
+        );
+        let heading: &str = heading_owned.as_str();
         // MEASURE AT THE SIZE THE PAINTER USES. The premise below used the ambient
         // `px`, which the chip section above had shadowed to
         // `native_type_px(TypeStep::Secondary)` — 13.0 — while every

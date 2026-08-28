@@ -12521,7 +12521,7 @@ mod tests {
         fn hold(&mut self, caret: Option<(u16, u16)>, secs: f32) {
             // Frames, not seconds: 60 fps is the host's cadence.
             let n = (secs * 60.0).round();
-            assert!(n >= 0.0 && n < 1e6, "probe: bad hold {secs}");
+            assert!((0.0..1e6).contains(&n), "probe: bad hold {secs}");
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             self.hold_frames(caret, n as u32);
         }

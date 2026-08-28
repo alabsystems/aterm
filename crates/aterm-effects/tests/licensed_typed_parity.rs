@@ -353,22 +353,49 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     const GOLDEN: [u64; 9] = [
         6_526_463_453_780_881_225,
         6_256_934_022_851_981_454,
-        // RE-BASELINED AGAIN 2026-08-26, entry 2 (rainbow) ONLY, for the
-        // deliberate owner-driven restoration of the ADVANCING rainbow and the
-        // HIGHLIGHTER: *"it still doesn't look like an advancing rainbow like
-        // before it did, and you also removed the 'highlighter' cursor trail
-        // behind the text"*. Three things moved, all inside the rainbow
-        // emitter and its hue bookkeeping: the dark mark now colours each cell
-        // from that cell's OWN LAID hue (`rainbow_laid_sweep`) instead of from
-        // its head-to-tail ordinal, a coalesced rainbow sweep lays each swept
-        // cell its own successive hue instead of one hue for the whole batch,
-        // and the default look composes the v0.43 highlighter behind the
-        // glyphs with the strip in the leading. Every other style folded
-        // BYTE-IDENTICAL across the change (`3_323_371_464_999_701_743` was
-        // the previous rainbow value), which is the evidence that only the
-        // rainbow path moved — the license seam itself still lays the pixel it
-        // always laid.
-        3_947_126_183_161_842_362,
+        // RE-BASELINED A THIRD TIME 2026-08-27, entry 2 (rainbow) ONLY:
+        // `3_947_126_183_161_842_362` → the value below. The cause is NOT one
+        // repaint but four deliberate rainbow-emitter commits that landed on
+        // the codex lane and were never re-captured here — d0d0b863 (smooth
+        // rainbow, coherent kitty frames), 7d712dc0 (continuous presentation),
+        // 8c85c952 (unified fade + palette) and e2bc14c4 (gaps and colour
+        // seams). They reached main through the merge da2832f0, which kept
+        // origin/main's NUMBER while taking both sides' CODE, so this golden
+        // has been stale — and main red — ever since. (da2832f0 itself does
+        // not compile: it kept a use of `Self::RAINBOW_WAVE_RAD` whose const
+        // the codex side had deleted. A bisect therefore stops at the merge;
+        // the first commit that both builds and disagrees is d0d0b863.)
+        //
+        // The mechanisms are the emitter's clocks and raster: the hue and wave
+        // clocks moved onto the exact phase ring (`rainbow_momentum_bands`
+        // `phase * 2.2` → `rainbow_ring_turns(phase, 359.0/1024.0) * TAU`,
+        // `RAINBOW_LIGHT_RAIL_FLOW` 0.35 → 179/512), `rainbow_glint_profile`
+        // arrived, and a per-pixel sub-cell raster replaced the slab raster.
+        //
+        // WHY THIS IS A REPAINT AND NOT THE SEAM — measured, not argued. The
+        // fold was decomposed per channel at the golden's own tree and at
+        // HEAD. For all NINE styles, and for rainbow in particular, these are
+        // BYTE-IDENTICAL: `spawns`, `live_sparks`, `ribbon_segments`,
+        // `typing_momentum`, the comet-trail cells, the drained sound cues,
+        // the admission tally (licensed=10, declined=0) and the whole
+        // per-step trajectory including both engines' anchors. The other
+        // eight styles do not move on ANY channel. Only rainbow's frame
+        // fingerprint and its over-ink quad fold moved (1593 → 3047 quads).
+        // A seam regression cannot produce that signature: disabling the
+        // `type_hint` disjunct in `move_licensed` moves all NINE entries and
+        // flips the tally to licensed=1/declined=9, while reverting a single
+        // line of `emit_rainbow_mark_dark` moves index 2 alone with the tally
+        // frozen — which is exactly the shape observed here.
+        //
+        // Read the sentence above about "admission … untouched" as a claim
+        // about these MEASURED channels, not about the source: the machinery
+        // did change (e2bc14c4 added `refresh_rainbow_cell_owner` and altered
+        // the `hue_advances` seed), and both are provably counter-neutral on
+        // this script. Note also that the mark emitter's ink reaches this
+        // number only through the frame fingerprint — the ribbon is written
+        // to `under_out`, which the script never folds as quads — so both
+        // `fp` and the quad fold moved, and neither alone explains it.
+        14_083_045_704_876_203_537,
         10_295_259_453_273_105_322,
         3_062_372_403_814_732_219,
         11_710_665_231_074_982_027,

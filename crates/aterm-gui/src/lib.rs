@@ -9776,6 +9776,35 @@ const AUTOMATIC_UPDATE_QUIET_EPOCH: Duration =
 /// here spends jank, never work.
 const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = Duration::from_secs(120);
 
+/// HANDS OFF THE KEYS. How long after the user's last keystroke an automatic
+/// apply refuses to start.
+///
+/// The apply lane is LOSSLESS but not INSTANT: it parks every PTY reader, hands
+/// the shells to a successor process that must swap the bundle, re-exec and boot
+/// a GUI, and only then attaches readers again. For that window the terminal
+/// echoes nothing and the user's own programs stall against a full kernel PTY
+/// buffer (`crate::spawn`'s "like Ctrl-S flow control" note). Landing that on a
+/// person MID-WORD is the complaint this constant exists to answer: it is not
+/// that the freeze is long, it is that it arrives while their fingers are moving.
+///
+/// 2.5 s is a natural inter-keystroke pause — longer than any gap inside a typed
+/// word or a held repeat, short enough that an ordinary think-pause opens the
+/// gate and the update lands invisibly, exactly as it does today for a user who
+/// is reading rather than typing. It gates the AUTOMATIC lanes only; an explicit
+/// "Install & Relaunch" is the user asking for the freeze and is never held.
+const AUTOMATIC_UPDATE_KEYSTROKE_GAP: Duration = Duration::from_millis(2_500);
+
+/// How long the keystroke gate may hold a PAST-GRACE automatic apply before the
+/// lane stands down to manual-only.
+///
+/// [`AUTOMATIC_UPDATE_KEYSTROKE_GAP`] is a refusal, and a refusal that can repeat
+/// forever is a feature that silently stops working. A user who literally never
+/// pauses for 2.5 s over this long is not going to be given a frozen terminal to
+/// prove a point: the intent stands down (the ordinary manual-only latch, which
+/// lapses and re-arms on its own), and the staged build still applies for free at
+/// the next launch, where there is no session to freeze at all.
+const AUTOMATIC_UPDATE_TYPING_HOLD: Duration = Duration::from_secs(10 * 60);
+
 /// True once the most recently consumed PTY burst is old enough for automatic
 /// update admission. A zero stamp means that session has produced no output.
 ///
@@ -10041,6 +10070,23 @@ fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventC
 /// dropped `Ime::Commit` cannot be reconstructed from anything else in the queue:
 /// the character is simply gone. That is every CJK writer and every `⌥e e` accent,
 /// in the one window an update creates (2026-08-19 round-6 audit).
+/// How many pre-Commit input events the successor queues before it starts
+/// dropping (round-5 audit; the VALUE is unchanged). A held key cannot grow this
+/// without limit, and the queue dies with the process either way, so the bound
+/// is the safe direction — but a drop is a LOST KEYSTROKE and must be counted
+/// and said, which is what [`App::handoff_deferred_input_dropped`] is for.
+const MAX_DEFERRED_HANDOFF_INPUT: usize = 512;
+
+/// How long the handoff's "installing / finishing update" cards live.
+///
+/// Longer than the ordinary notice TTL (5.4 s) because it must not expire inside
+/// the window it explains: a cold apply is measured at ~4.5 s, and the readiness
+/// deadline that bounds the whole attempt is env-clamped to 120 s. Five seconds
+/// past that ceiling is the smallest value that cannot leave a user staring at a
+/// frozen terminal whose explanation already faded. Every path that ends the
+/// freeze retires the card explicitly rather than waiting for this.
+const HANDOFF_PENDING_NOTICE_TTL: Duration = Duration::from_secs(125);
+
 fn handoff_deferrable_input(event: &WindowEvent) -> bool {
     matches!(
         event,
@@ -10335,6 +10381,17 @@ struct PendingUpdateHandoff {
     /// bounded nothing, which is why a continuously-used terminal exhausted the
     /// budget instantly and reported `ActivityRevoked` forever.
     commit_drain_started: Option<std::time::Instant>,
+    /// When the readers PARKED — the instant the user's terminal stopped
+    /// echoing. Stamped where this attempt is armed, and reported (with the
+    /// stamps below) on every exit, because the two halves of the freeze have
+    /// very different costs and nobody has ever measured them separately: the
+    /// park→proof half carries a bundle swap, a second `execve` and a cold GUI
+    /// boot, while proof→commit is the dispatch fence plus egress. Optimizing
+    /// the second without a number for the first is how this file's own metrics
+    /// notes record three refusals in a row for a phase that did not exist.
+    park_at: std::time::Instant,
+    /// When the successor's adoption proof arrived (its first present).
+    proof_ready_at: Option<std::time::Instant>,
     /// Set by the main-thread final-admission gate when it REJECTED this
     /// attempt for an activity-shaped reason (session/layout/epoch drift,
     /// deferred teardown, a session death, or an undrainable OS input queue).
@@ -10723,6 +10780,17 @@ struct App {
     /// between first paint and Commit. Replayed in order once the handoff commits;
     /// see the deferral in `window_event`.
     handoff_deferred_input: Vec<(WinitWindowId, WindowEvent)>,
+    /// Input events the pre-Commit queue REFUSED (past
+    /// [`MAX_DEFERRED_HANDOFF_INPUT`]). Never silently zero: the replay arm says
+    /// so, because "the update ate 40 characters" and "the user typed 40" are
+    /// indistinguishable in a post-mortem without this number.
+    handoff_deferred_input_dropped: u32,
+    /// The deferred queue can no longer be replayed as a coherent key stream —
+    /// a drop past the cap broke a press/release pair, or a live `Focused(false)`
+    /// (exempt from the deferral, so it runs OUT OF ORDER against the queue)
+    /// cleared the modifier snapshot the queued events were typed under.
+    /// Replay then repairs the ambient modifier state rather than trusting it.
+    handoff_deferred_input_incoherent: bool,
     /// How many times in a row a control apply's facts came back stale and were
     /// re-requested; bounded so a wedged facts worker (sequences restarted below
     /// the last reduced one) cannot turn one `update apply` into a hot loop.
@@ -11433,6 +11501,11 @@ struct App {
     /// ONCE, when the first window attaches, if [`JUST_UPDATED`] is set) — guards against
     /// `resumed` running more than once.
     level_up_done: bool,
+    /// The post-update celebration the overlap lane HELD BACK: on that lane the
+    /// first frame is a revealed-but-uncommitted successor whose window is still
+    /// deferring keystrokes, and a "LEVEL UP" burst is the wrong sentence there.
+    /// `Some(build)` until the Commit arm fires it against a live terminal.
+    level_up_deferred: Option<u64>,
     /// Set true after the FIRST real content present ([`crate::metrics::record_present`]).
     /// Gates the DEFERRED session restore: `apply_pending_restore` is no longer run
     /// synchronously in `resumed()` (where it blocks first paint on N shell forks) —
@@ -11471,12 +11544,6 @@ struct App {
     /// the PTY was told about and the rows the compose reserves can never differ
     /// mid-frame.
     status_bar_rows: u16,
-    /// The toolchain-provisioning PROGRESS CARD state ([`PkgProgressUi`]): the latest
-    /// `Wake::PkgProgress` snapshot from the child-scoped progress tailer plus the
-    /// card's visibility/animation bookkeeping. GLOBAL like `notice` (the pass is
-    /// machine-wide); hidden = every FL-1 term is byte-identical to the no-card path.
-    /// WP4 renders the card from this; WP3 owns the plumbing.
-    pkg_progress: PkgProgressUi,
     /// The tab-status observer's FOREGROUND-JOB oracle
     /// ([`crate::quit_safety::JobProbe`]). On unix it is a per-fd `tcgetpgrp`
     /// and holds nothing; on WINDOWS the same question costs a system-wide
@@ -11538,6 +11605,12 @@ struct App {
     /// Monotonic time of the latest input/output/structural terminal activity.
     /// Automatic apply waits one quiet epoch after this instant before parking.
     last_update_activity_at: Instant,
+    /// When a KEY was last pressed into any of this process's windows — the
+    /// input to [`Self::update_apply_hands_off_keys`], and deliberately NOT
+    /// [`Self::last_update_activity_at`], which every tolerated pointer move,
+    /// PTY burst and bell also bumps and so can never answer "are the user's
+    /// fingers on the keys". `None` until the first keystroke of the process.
+    last_keystroke_at: Option<Instant>,
     next_update_handoff_id: u64,
     /// Event-loop-owned retry deadline used when a deadline-missed reader,
     /// temporal writer, or fallible reader attach is not yet live during handoff
@@ -11789,6 +11862,88 @@ impl App {
                         .load(std::sync::atomic::Ordering::Acquire),
                 )
             })
+    }
+
+    /// Queue ONE input event typed into a revealed-but-uncommitted successor,
+    /// or account for its loss. Extracted from `window_event` so the policy is
+    /// reachable from a headless test: this path had none, which is how the
+    /// silent drop and the stranded-modifier misfire below survived.
+    fn queue_pre_commit_input(&mut self, id: WinitWindowId, event: WindowEvent) {
+        if !handoff_deferrable_input(&event) {
+            return;
+        }
+        if self.handoff_deferred_input.len() < MAX_DEFERRED_HANDOFF_INPUT {
+            self.handoff_deferred_input.push((id, event));
+        } else {
+            // AT THE CAP. The drop policy is unchanged — the NEWEST event goes,
+            // so the prefix that replays is still exactly what the user typed,
+            // in order — but it is no longer silent, and it marks the stream
+            // incoherent: the release half of a chord may be what we threw away.
+            self.handoff_deferred_input_dropped =
+                self.handoff_deferred_input_dropped.saturating_add(1);
+            self.handoff_deferred_input_incoherent = true;
+        }
+    }
+
+    /// After the pre-Commit queue has replayed: say what could not be carried,
+    /// and repair the ambient modifier state if the stream was incoherent.
+    /// Extracted from the Commit arm for the same reason as
+    /// [`Self::queue_pre_commit_input`] — so it can be tested without an event
+    /// loop. Returns the number of dropped events it reported (tests read it;
+    /// production ignores it).
+    fn settle_replayed_handoff_input(&mut self) -> u32 {
+        let dropped = std::mem::take(&mut self.handoff_deferred_input_dropped);
+        if dropped > 0 {
+            aterm_log::warn!(
+                "overlap handoff: {dropped} input event(s) typed before Commit exceeded \
+                 the {MAX_DEFERRED_HANDOFF_INPUT}-event queue and were dropped"
+            );
+            self.surface_gesture_failure(&format!(
+                "The update dropped {dropped} keystroke(s) typed while it finished"
+            ));
+        }
+        // A CHORD THAT LOST ITS RELEASE MUST NOT ARM THE NEXT KEY. If the queue
+        // went incoherent — a drop broke a press/release pair, or a live
+        // `Focused(false)` cleared the snapshot out of order — the ambient
+        // per-window modifiers are no longer evidence of what is physically
+        // held. Clear ONLY that snapshot: `physical_press_owners` is
+        // process-wide and deliberately survives, so a real release still pairs
+        // with its press-time key, modifiers and session.
+        //
+        // The failure direction is chosen: at worst a genuinely-held modifier is
+        // ignored until its next physical edge. The alternative is what this
+        // replaces — a stranded SUPER satisfying `on_key_super_chord`, so the
+        // first replayed `w` takes the Cmd-W arm and CLOSES A TAB, PTYs and all,
+        // in whatever window came back frontmost.
+        if std::mem::take(&mut self.handoff_deferred_input_incoherent) {
+            aterm_log::info!(
+                "overlap handoff: pre-Commit input was incoherent (drop or out-of-order \
+                 focus change); clearing the ambient modifier snapshot so no chord is \
+                 fabricated from it"
+            );
+            for ws in self.windows.values_mut() {
+                ws.mods = ModifiersState::empty();
+            }
+        }
+        dropped
+    }
+
+    /// HANDS OFF THE KEYS: whether an automatic apply may start its freeze now.
+    ///
+    /// True when no aterm window holds focus (the user is somewhere else, so a
+    /// keystroke of theirs cannot be interrupted by this), or when the last key
+    /// they pressed is at least [`AUTOMATIC_UPDATE_KEYSTROKE_GAP`] old.
+    ///
+    /// The focus aggregate is the window state the process already maintains for
+    /// Secure Keyboard Entry; asking the OS instead would be a WindowServer call
+    /// from the main thread, which this process does not make (see the 2026-08-17
+    /// watchdog incident). Pure and total, so the policy is unit-testable.
+    fn update_apply_hands_off_keys(&self, now: Instant) -> bool {
+        if !self.windows.values().any(|ws| ws.focused) {
+            return true;
+        }
+        self.last_keystroke_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= AUTOMATIC_UPDATE_KEYSTROKE_GAP)
     }
 
     /// Sole gate into bulk scrollback maintenance. Passing an ordinary-output
@@ -13255,6 +13410,8 @@ impl App {
             native_stage_imported_at: None,
             auto_apply_was_on: true,
             handoff_deferred_input: Vec::new(),
+            handoff_deferred_input_dropped: 0,
+            handoff_deferred_input_incoherent: false,
             control_apply_stale_retries: 0,
             deferred_native_update_reconcile: None,
             pending_native_update_reconcile_purpose: None,
@@ -13402,6 +13559,7 @@ impl App {
             notice: None,
             robi_dismissal: None,
             level_up_done: false,
+            level_up_deferred: None,
             first_present_done: false,
             boot_health_confirmation_dispatched: false,
             boot_health_confirmation_retry_at: None,
@@ -13409,7 +13567,6 @@ impl App {
             level_up: None,
             status_bars: status_bars::StatusBars::default(),
             status_bar_rows: 0,
-            pkg_progress: PkgProgressUi::default(),
             job_probe: crate::quit_safety::JobProbe::default(),
             relaunch: None,
             auto_apply_intent: None,
@@ -13421,6 +13578,7 @@ impl App {
             operator_control: None,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
+            last_keystroke_at: None,
             next_update_handoff_id: 1,
             deferred_reader_resume_at: None,
             upgrade_realized: None,
@@ -14007,6 +14165,14 @@ impl App {
                 // a release delivered to another window still pairs with the exact
                 // press-time key, modifiers, and session.
                 ws.mods = ModifiersState::empty();
+                // …AND IF A HANDOFF QUEUE IS WAITING, IT NO LONGER MATCHES.
+                // `Focused(_)` is exempt from the pre-Commit deferral, so this
+                // clear runs LIVE while queued `ModifiersChanged` events sit
+                // waiting to be replayed seconds later — ⌘-Tab away mid-handoff
+                // is a three-event reproduction of exactly the stranded modifier
+                // the clear above exists to prevent, arriving by the one door it
+                // does not cover.
+                self.handoff_deferred_input_incoherent |= self.incoming_handoff_pending;
                 if !cursor_fx_presentable {
                     // Pause a one-shot collectible hello at the presentability
                     // edge itself. An unfocused compositor may withhold the
@@ -16589,16 +16755,6 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::StatusBars,
             );
         }
-        // Preserve the newest upstream progress-card cadence alongside the
-        // status-bar fold clock. Hidden or settled cards contribute no deadline.
-        if let Some(d) = self.pkg_progress.deadline(Instant::now()) {
-            fold_owned_deadline(
-                &mut deadline,
-                &mut deadline_owner,
-                d,
-                metrics::DeadlineOwner::StatusBars,
-            );
-        }
         if let Some(d) = fold_auto_apply_deadline(self.auto_apply_intent, None) {
             fold_owned_deadline(
                 &mut deadline,
@@ -16994,7 +17150,28 @@ impl ApplicationHandler<Wake> for App {
                 // ...and the full "LEVEL UP" celebration (border glow + rising arrow) to
                 // mark the swap into the newer build — a bigger burst than the available
                 // nudge, right as the fresh window comes up. See [`crate::level_up`].
-                if self
+                // NOT WHILE THE WINDOW IS STILL EATING KEYSTROKES. On the overlap
+                // lane this frame is the successor's FIRST — revealed carrying the
+                // user's own pre-update screen, already the key window, and
+                // deferring every key it receives until Commit. Celebrating over
+                // that is the wrong sentence in the one moment the user is most
+                // likely to be typing into it: what they need is why nothing is
+                // happening. The celebration is not cancelled, only DEFERRED — the
+                // Commit arm fires it once the terminal is genuinely live — and
+                // `level_up_done` above stays set unconditionally, so a second
+                // `resumed` (suspend/resume) still cannot re-raise it.
+                //
+                // The explanation is an `UpdateStatus` card, which carries no
+                // serious-mode gate: the celebration keeps its policy, but a user
+                // in serious mode still gets told why their terminal is frozen
+                // instead of being handed a mute dead window.
+                if self.incoming_handoff_pending {
+                    self.level_up_deferred = Some(build);
+                    self.surface_update_status_for(
+                        "\u{2191} Finishing update — keys you type now are queued and will arrive.",
+                        crate::HANDOFF_PENDING_NOTICE_TTL,
+                    );
+                } else if self
                     .serious_mode_policy()
                     .allows(crate::motion::SeriousEffect::LevelUp)
                 {
@@ -17930,6 +18107,24 @@ impl ApplicationHandler<Wake> for App {
                         self.window_event(el, winit_id, deferred);
                     }
                 }
+                // THE CELEBRATION THIS LANE HELD BACK. The terminal is live now:
+                // readers are attached, the queue has replayed, and a burst over it
+                // is a flourish rather than a distraction from a frozen screen.
+                if let Some(build) = self.level_up_deferred.take()
+                    && self
+                        .serious_mode_policy()
+                        .allows(crate::motion::SeriousEffect::LevelUp)
+                {
+                    self.notice = Some(crate::notice::TransientNotice::level_up(
+                        build,
+                        Instant::now(),
+                    ));
+                    self.level_up = Some(crate::level_up::LevelUp::new(build, Instant::now()));
+                    self.request_redraw_all_windows();
+                }
+                // What the queue could not carry, said out loud; and a chord
+                // whose release it dropped disarmed rather than replayed.
+                self.settle_replayed_handoff_input();
             }
             Wake::NativeDocumentSaved {
                 document,
@@ -18189,19 +18384,6 @@ impl ApplicationHandler<Wake> for App {
                 self.status_bars
                     .toolchain_snapshot(snapshot.as_deref(), now);
                 self.sync_status_bars();
-                let paint_changed = self.pkg_progress.on_snapshot(snapshot, now);
-                if paint_changed {
-                    // The upstream progress card is a passive overlay on focused
-                    // windows; retain that narrower fan-out even though a status
-                    // bar row transition may already have repainted every window.
-                    for ws in self.windows.values_mut() {
-                        if ws.focused
-                            && let Some(w) = ws.os_window.as_ref()
-                        {
-                            w.request_redraw();
-                        }
-                    }
-                }
             }
             // aterm's own updater reporting from inside its check: the update bar.
             Wake::UpdateProgress(progress) => {
@@ -18482,6 +18664,20 @@ impl ApplicationHandler<Wake> for App {
             UpdateHandoffEventClass::Tolerated => self.note_update_handoff_tolerated_activity(),
             UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
         }
+        // THE KEYSTROKE CLOCK — read by the automatic apply lane's hands-off-keys
+        // gate. Above the pre-Commit deferral below on purpose: a key typed into a
+        // revealed-but-uncommitted successor is the user typing, whatever this
+        // process is able to do with it. A plain stamp — it must never touch
+        // `update_handoff_activity_epoch` or a pending attempt's cancel, or the
+        // mandatory `exact_activity` fact would start refusing Commit on the
+        // user's own typing. `ModifiersChanged` is excluded: a chord's shift is
+        // not a keystroke, and holding one down must not hold the gate shut.
+        if matches!(
+            &event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+        ) {
+            self.last_keystroke_at = Some(Instant::now());
+        }
         if self.incoming_handoff_pending
             && !matches!(
                 &event,
@@ -18497,16 +18693,13 @@ impl ApplicationHandler<Wake> for App {
             // which the adoption proof requires, and the outgoing process was
             // deactivated by our own launch, so it receives no keyboard events either.
             // Bytes typed into what looks like a live terminal reached NEITHER process
-            // and were simply lost, and the act of typing lengthens the window that
-            // loses it (the parent's pre-Commit drain waits for input to go quiet).
-            // Queue them and replay after Commit, bounded so a held key cannot grow
-            // this without limit (2026-08-19 round-5 audit).
-            const MAX_DEFERRED_HANDOFF_INPUT: usize = 512;
-            if handoff_deferrable_input(&event)
-                && self.handoff_deferred_input.len() < MAX_DEFERRED_HANDOFF_INPUT
-            {
-                self.handoff_deferred_input.push((id, event));
-            }
+            // and were simply lost. Queue them and replay after Commit, bounded so a
+            // held key cannot grow this without limit (2026-08-19 round-5 audit).
+            // (This used to add "and the act of typing lengthens the window that loses
+            // it" — true when the parent's pre-Commit drain waited for a quiet HID
+            // clock, and false since that wait was deleted: the drain's elapsed clock
+            // is stamped ONCE on the first spin, so no keystroke moves it.)
+            self.queue_pre_commit_input(id, event);
             return;
         }
         // Resolve the winit id to our logical WindowId. An event for an unknown
@@ -19302,140 +19495,6 @@ fn sleep_interval_watching_bump(
     }
 }
 
-const PKG_PROGRESS_ACTIVE_WINDOW: Duration = Duration::from_secs(1);
-
-#[derive(Default)]
-pub(crate) struct PkgProgressUi {
-    snapshot: Option<Box<PkgProgressSnapshot>>,
-    dismissed: bool,
-    origin: Option<Instant>,
-    last_bytes_move: Option<Instant>,
-    last_metric: Option<(u64, u64)>,
-    fx_until: Option<Instant>,
-}
-
-impl PkgProgressUi {
-    fn on_snapshot(&mut self, snap: Option<Box<PkgProgressSnapshot>>, now: Instant) -> bool {
-        let was_visible = self.visible();
-        match snap {
-            None => {
-                self.snapshot = None;
-                self.last_bytes_move = None;
-                self.last_metric = None;
-            }
-            Some(s) => {
-                if self.origin.is_none() {
-                    self.origin = Some(now);
-                }
-                let new_pass = self.snapshot.as_ref().is_none_or(|old| {
-                    old.file.pass != s.file.pass || old.file.started_unix != s.file.started_unix
-                });
-                if new_pass {
-                    self.dismissed = false;
-                }
-                let metric = (
-                    s.file.overall.bytes_done,
-                    s.file.programs.values().map(|row| row.bytes_done).sum(),
-                );
-                if s.running && self.last_metric.is_some_and(|old| old != metric) {
-                    self.last_bytes_move = Some(now);
-                }
-                self.last_metric = Some(metric);
-                self.snapshot = Some(s);
-            }
-        }
-        was_visible || self.visible()
-    }
-
-    pub(crate) fn visible(&self) -> bool {
-        !self.dismissed && self.snapshot.is_some()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "the upstream progress-card renderer consumes this seam"
-    )]
-    pub(crate) fn snapshot(&self) -> Option<&PkgProgressSnapshot> {
-        self.snapshot.as_deref()
-    }
-
-    pub(crate) fn dismiss(&mut self) {
-        self.dismissed = true;
-    }
-
-    #[allow(
-        dead_code,
-        reason = "the upstream progress-card affordance consumes this seam"
-    )]
-    pub(crate) fn reopen(&mut self) {
-        self.dismissed = false;
-    }
-
-    pub(crate) fn note_fx(&mut self, until: Instant) {
-        if self.fx_until.is_none_or(|held| held < until) {
-            self.fx_until = Some(until);
-        }
-    }
-
-    fn animating(&self, now: Instant) -> bool {
-        self.visible()
-            && (self
-                .last_bytes_move
-                .is_some_and(|at| now.duration_since(at) <= PKG_PROGRESS_ACTIVE_WINDOW)
-                || self.fx_until.is_some_and(|until| until > now))
-    }
-
-    fn deadline(&self, now: Instant) -> Option<Instant> {
-        self.animating(now).then(|| now + Duration::from_millis(16))
-    }
-
-    pub(crate) fn fingerprint(&self, now: Instant) -> u64 {
-        if !self.visible() {
-            return 0;
-        }
-        let Some(snap) = self.snapshot.as_deref() else {
-            return 0;
-        };
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut fold = |bytes: &[u8]| {
-            for &b in bytes {
-                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
-        fold(&[u8::from(snap.running)]);
-        fold(&snap.file.v.to_le_bytes());
-        fold(snap.file.pass.as_bytes());
-        let overall = snap.file.overall;
-        fold(&overall.programs_done.to_le_bytes());
-        fold(&overall.programs_total.to_le_bytes());
-        fold(&overall.bytes_done.to_le_bytes());
-        fold(&overall.bytes_total.to_le_bytes());
-        fold(&[u8::from(snap.file.ended_unix.is_some())]);
-        for name in &snap.file.queue {
-            fold(name.as_bytes());
-            fold(&[0]);
-        }
-        for (name, row) in &snap.file.programs {
-            fold(name.as_bytes());
-            fold(&[0, row.phase as u8, u8::from(row.bumped)]);
-            fold(&row.bytes_done.to_le_bytes());
-            fold(&row.bytes_total.to_le_bytes());
-            fold(&row.build.unwrap_or(0).to_le_bytes());
-            fold(row.error.as_deref().unwrap_or("").as_bytes());
-        }
-        let mut fp = h;
-        if self.animating(now)
-            && let Some(origin) = self.origin
-        {
-            let bucket = now.duration_since(origin).as_millis() / 16;
-            fp ^= u64::try_from(bucket)
-                .unwrap_or(u64::MAX)
-                .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        }
-        fp | 1
-    }
-}
-
 #[cfg(test)]
 mod pkg_progress_tests {
     use super::*;
@@ -19451,6 +19510,7 @@ mod pkg_progress_tests {
                 bytes_total: 100,
                 build: Some(210),
                 bumped: false,
+                bumped_with: None,
                 error: None,
             },
         );
@@ -19470,101 +19530,6 @@ mod pkg_progress_tests {
             programs,
             ended_unix: None,
         }
-    }
-
-    fn snap(running: bool) -> Box<PkgProgressSnapshot> {
-        Box::new(PkgProgressSnapshot {
-            file: file_with(Some(1), pkg_unix_now()),
-            running,
-        })
-    }
-
-    /// FL-1's load-bearing term: the fingerprint is EXACTLY 0 whenever the card
-    /// is hidden — before any data, and after a dismissal — so the RepaintKey is
-    /// byte-identical to the no-card path; visible it is never 0.
-    #[test]
-    fn fingerprint_zero_when_hidden_nonzero_when_visible() {
-        let now = Instant::now();
-        let mut ui = PkgProgressUi::default();
-        assert_eq!(ui.fingerprint(now), 0, "no data ⇒ the hidden sentinel");
-        assert!(ui.on_snapshot(Some(snap(true)), now), "appearing repaints");
-        let fp = ui.fingerprint(now);
-        assert_ne!(fp, 0, "a visible card must move the key");
-        ui.dismiss();
-        assert_eq!(ui.fingerprint(now), 0, "dismissed ⇒ back to the sentinel");
-        assert!(ui.deadline(now).is_none(), "dismissed folds no deadline");
-    }
-
-    /// Dismissal answers ONE announcement: the same pass stays dismissed through
-    /// further data ticks, and a NEW pass identity re-shows the card.
-    #[test]
-    fn dismissal_is_per_pass() {
-        let now = Instant::now();
-        let mut ui = PkgProgressUi::default();
-        ui.on_snapshot(Some(snap(true)), now);
-        ui.dismiss();
-        let mut same_pass = snap(true);
-        same_pass.file.overall.bytes_done = 50;
-        ui.on_snapshot(Some(same_pass), now);
-        assert!(!ui.visible(), "same pass stays dismissed");
-        let mut next_pass = snap(true);
-        next_pass.file.started_unix = 2;
-        ui.on_snapshot(Some(next_pass), now);
-        assert!(ui.visible(), "a new pass re-arms the card");
-    }
-
-    /// The deadline exists ONLY while visible AND active: byte movement opens the
-    /// 1s animating window, its lapse closes it, and a hidden card never folds one
-    /// (idle = no deadline, no repaint).
-    #[test]
-    fn deadline_only_while_visible_and_animating() {
-        let t0 = Instant::now();
-        let mut ui = PkgProgressUi::default();
-        ui.on_snapshot(Some(snap(true)), t0);
-        assert!(
-            ui.deadline(t0).is_none(),
-            "first snapshot proves no movement yet"
-        );
-        let mut moved = snap(true);
-        moved.file.overall.bytes_done = 42;
-        ui.on_snapshot(Some(moved), t0 + Duration::from_millis(100));
-        let mid = t0 + Duration::from_millis(200);
-        assert!(ui.deadline(mid).is_some(), "bytes just moved ⇒ frame wakes");
-        let late = t0 + Duration::from_secs(3);
-        assert!(
-            ui.deadline(late).is_none(),
-            "movement lapsed ⇒ the card settles and folds nothing"
-        );
-        // The flourish latch re-opens the window without byte movement.
-        ui.note_fx(late + Duration::from_millis(500));
-        assert!(ui.deadline(late).is_some(), "flourish in flight ⇒ frames");
-        // ...and it CLOSES again on its own. `note_fx` only ever raises
-        // `fx_until` and nothing clears it, so this is the assertion that says
-        // a spent flourish cannot leave the card arming 16 ms wakes forever —
-        // the shape an idle-wake audit would otherwise have to guess at from a
-        // cumulative `deadline_arms_by_owner=pkg_progress` reading.
-        assert!(
-            ui.deadline(late + Duration::from_secs(1)).is_none(),
-            "a spent flourish settles: an idle card folds NOTHING"
-        );
-    }
-
-    /// While animating the fingerprint steps with the ~16ms frame bucket (live
-    /// motion is never swallowed); settled, it holds still (no churn).
-    #[test]
-    fn fingerprint_steps_only_while_animating() {
-        let t0 = Instant::now();
-        let mut ui = PkgProgressUi::default();
-        ui.on_snapshot(Some(snap(true)), t0);
-        let mut moved = snap(true);
-        moved.file.overall.bytes_done = 42;
-        ui.on_snapshot(Some(moved), t0 + Duration::from_millis(50));
-        let a = ui.fingerprint(t0 + Duration::from_millis(100));
-        let b = ui.fingerprint(t0 + Duration::from_millis(150));
-        assert_ne!(a, b, "animating frames must not early-out");
-        let s1 = ui.fingerprint(t0 + Duration::from_secs(10));
-        let s2 = ui.fingerprint(t0 + Duration::from_secs(11));
-        assert_eq!(s1, s2, "a settled card holds one fingerprint");
     }
 
     /// The staleness laws (design §3): a dead installer's file can never claim
@@ -21662,6 +21627,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 bytes_total: 900_000_000,
                 build: Some(5520),
                 bumped: false,
+                bumped_with: None,
                 error: None,
             },
         );
@@ -22257,6 +22223,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         native_stage_imported_at: None,
         auto_apply_was_on: true,
         handoff_deferred_input: Vec::new(),
+        handoff_deferred_input_dropped: 0,
+        handoff_deferred_input_incoherent: false,
         control_apply_stale_retries: 0,
         deferred_native_update_reconcile: None,
         pending_native_update_reconcile_purpose: None,
@@ -22442,13 +22410,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         notice: None,
         robi_dismissal: None,
         level_up_done: false,
+        level_up_deferred: None,
         first_present_done: false,
         boot_health_confirmation_dispatched: false,
         boot_health_confirmation_retry_at: None,
         level_up: None,
         status_bars: status_bars::StatusBars::default(),
         status_bar_rows: 0,
-        pkg_progress: PkgProgressUi::default(),
         job_probe: crate::quit_safety::JobProbe::default(),
         relaunch: None,
         auto_apply_intent: None,
@@ -22460,6 +22428,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         operator_control: operator_control.clone(),
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
+        last_keystroke_at: None,
         next_update_handoff_id: 1,
         deferred_reader_resume_at: None,
         upgrade_realized: None,
@@ -23223,6 +23192,8 @@ mod overlap_handoff_tests {
         let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
         let arbiter = crate::HandoffAttemptArbiter::new();
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            park_at: std::time::Instant::now(),
+            proof_ready_at: None,
             attempt_id: 7,
             nonce: None,
             live: live.clone(),
@@ -23635,6 +23606,143 @@ mod overlap_handoff_tests {
     /// overlap; typing and pointer/modifier noise buffer through; structural
     /// and mode-changing events — including every UNKNOWN future event via
     /// the fail-closed default arm — revoke.
+    /// THE PRE-COMMIT INPUT QUEUE, which had no test at all until this one — the
+    /// reason a silent drop and a chord that fires itself both survived in it.
+    ///
+    /// Three properties, in the order they bite:
+    ///  * the queue is BOUNDED and the overflow is COUNTED (a lost keystroke is
+    ///    never silent — "the update ate 40 characters" and "the user typed 40"
+    ///    must be distinguishable afterwards);
+    ///  * the kept prefix is exactly what was typed, in arrival order (the drop
+    ///    policy takes the NEWEST, so replay is never reordered);
+    ///  * an incoherent queue DISARMS the ambient modifiers instead of replaying
+    ///    them. This is the destructive-misfire guard: a ⌘ press queued while its
+    ///    release was dropped past the cap used to leave SUPER set, so the first
+    ///    replayed `w` took the Cmd-W arm and closed a tab, PTYs and all.
+    #[test]
+    fn pre_commit_input_is_bounded_counted_and_cannot_strand_a_chord() {
+        use super::{MAX_DEFERRED_HANDOFF_INPUT, ModifiersState};
+        use winit::event::WindowEvent;
+
+        let mut app = App::headless_for_test();
+        let winit_id = winit::window::WindowId::from(0u64);
+        app.incoming_handoff_pending = true;
+
+        let typed = |n: usize| WindowEvent::Ime(winit::event::Ime::Commit(format!("k{n}")));
+        for n in 0..(MAX_DEFERRED_HANDOFF_INPUT + 88) {
+            app.queue_pre_commit_input(winit_id, typed(n));
+        }
+        assert_eq!(
+            app.handoff_deferred_input.len(),
+            MAX_DEFERRED_HANDOFF_INPUT,
+            "the queue is bounded"
+        );
+        assert_eq!(
+            app.handoff_deferred_input_dropped, 88,
+            "and every refusal past the bound is counted"
+        );
+        assert!(
+            app.handoff_deferred_input_incoherent,
+            "a drop breaks press/release pairing, so the stream is incoherent"
+        );
+        // The kept prefix is the FIRST 512 in arrival order — the newest went.
+        match (&app.handoff_deferred_input[0].1, &app.handoff_deferred_input[511].1) {
+            (
+                WindowEvent::Ime(winit::event::Ime::Commit(first)),
+                WindowEvent::Ime(winit::event::Ime::Commit(last)),
+            ) => {
+                assert_eq!(first, "k0");
+                assert_eq!(last, "k511");
+            }
+            other => panic!("queue holds the typed prefix in order, got {other:?}"),
+        }
+        // A non-deferrable event is not queued and costs no slot.
+        let before = app.handoff_deferred_input.len();
+        app.queue_pre_commit_input(winit_id, WindowEvent::RedrawRequested);
+        assert_eq!(app.handoff_deferred_input.len(), before);
+
+        // THE MISFIRE GUARD. A window carrying SUPER when the replay settles must
+        // not keep it: the release may be one of the 88 events we refused.
+        app.windows
+            .get_mut(&WindowId(0))
+            .expect("headless window")
+            .mods = ModifiersState::SUPER;
+        let reported = app.settle_replayed_handoff_input();
+        assert_eq!(reported, 88, "the drop count is reported once, then cleared");
+        assert!(
+            app.windows.values().all(|ws| ws.mods.is_empty()),
+            "an incoherent queue disarms the ambient modifiers; a stranded SUPER \
+             would turn the next replayed `w` into Cmd-W against a live shell"
+        );
+        assert_eq!(app.handoff_deferred_input_dropped, 0, "counter is consumed");
+        assert!(!app.handoff_deferred_input_incoherent, "flag is consumed");
+
+        // …and a COHERENT queue leaves a genuinely-held modifier alone.
+        app.windows
+            .get_mut(&WindowId(0))
+            .expect("headless window")
+            .mods = ModifiersState::SUPER;
+        assert_eq!(app.settle_replayed_handoff_input(), 0);
+        assert_eq!(
+            app.windows[&WindowId(0)].mods,
+            ModifiersState::SUPER,
+            "nothing was dropped or reordered, so the snapshot is still evidence"
+        );
+    }
+
+    /// HANDS OFF THE KEYS: the automatic apply lane refuses to start its freeze
+    /// inside a keystroke gap, and opens again once the user pauses.
+    ///
+    /// The precondition assert is load-bearing. A headless window seeds
+    /// `focused: true` (only a real `WindowEvent::Focused` corrects it), so what
+    /// keeps every existing update test transparent to this gate is the ABSENT
+    /// keystroke stamp, not the focus state. If that default ever changes, this
+    /// test says so here rather than as a puzzling failure three files away.
+    #[test]
+    fn the_keystroke_gate_holds_an_automatic_apply_until_the_typing_pauses() {
+        use super::AUTOMATIC_UPDATE_KEYSTROKE_GAP;
+        use std::time::Instant;
+
+        let mut app = App::headless_for_test();
+        let now = Instant::now();
+
+        assert!(
+            app.windows.values().any(|ws| ws.focused),
+            "precondition: a headless window seeds focused = true"
+        );
+        assert!(
+            app.last_keystroke_at.is_none(),
+            "precondition: no keystroke has been observed"
+        );
+        assert!(
+            app.update_apply_hands_off_keys(now),
+            "a process that has never seen a keystroke never holds the lane"
+        );
+
+        // Mid-word: the freeze must not start here.
+        app.last_keystroke_at = Some(now);
+        assert!(!app.update_apply_hands_off_keys(now));
+        assert!(
+            !app.update_apply_hands_off_keys(now + AUTOMATIC_UPDATE_KEYSTROKE_GAP / 2),
+            "an inter-keystroke pause shorter than the gap is still typing"
+        );
+
+        // A pause opens it, and the update lands invisibly as it always did.
+        assert!(app.update_apply_hands_off_keys(now + AUTOMATIC_UPDATE_KEYSTROKE_GAP));
+
+        // THE INVERSION LEG: the user is typing somewhere ELSE. Their keystrokes
+        // are not ours to interrupt, so the lane proceeds — this is the leg that
+        // would silently rot into "aterm never updates while any app is in use".
+        app.last_keystroke_at = Some(now);
+        for ws in app.windows.values_mut() {
+            ws.focused = false;
+        }
+        assert!(
+            app.update_apply_hands_off_keys(now),
+            "no aterm window has focus, so no keystroke of ours is being interrupted"
+        );
+    }
+
     #[test]
     fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         use super::{

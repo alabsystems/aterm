@@ -14746,16 +14746,39 @@ fn bound_outcome_lines(lines: &mut Vec<String>, max_width: f32) {
     }
 }
 
+/// The outcome card's own padding: the ONE place the value is written, read
+/// both by the card's layout and by the measure its prose wraps to.
+///
+/// Splitting those two readings is exactly how the wrapper came to pack a line
+/// wider than the box the painter hands it: the card was authored with a fixed
+/// 16pt inset but wrapped to the RELEASE-NOTES card's measure, and
+/// [`update_release_notes_padding`] narrows to 14pt above 1.25× text. Identical
+/// at 1×, four points apart at 2× — a greedy line could then land in the gap
+/// and paint past its own edge (2× short-landscape Update page, 2026-08).
+const COMPACT_UPDATE_OUTCOME_PADDING: f32 = 16.0;
+
+/// The text measure this card's own box leaves, derived from the card width the
+/// caller lays it out at. Measure and paint agree because they are the same
+/// subtraction.
+fn compact_update_outcome_text_width(card_width: f32) -> f32 {
+    (card_width - COMPACT_UPDATE_OUTCOME_PADDING * 2.0).max(0.0)
+}
+
 /// The last updater outcome as its own reachable slice.
 ///
 /// Only the short-landscape host needs this: there the status card collapses to
 /// [`compact_update_summary`], which has no room for a result line, and losing
 /// the one message that explains a stalled update would be the worst possible
 /// thing to drop.
-fn compact_update_outcome(update: &UpdateProjection, text_width: f32) -> Option<(UiNode, f32)> {
+///
+/// Takes the CARD width, not a pre-subtracted text measure: the padding it
+/// wraps to has to be the padding it paints with, and only this function knows
+/// that inset.
+fn compact_update_outcome(update: &UpdateProjection, card_width: f32) -> Option<(UiNode, f32)> {
     let display = update_outcome_line(update)?;
     let scale = settings_text_scale();
     let line_height = 24.0_f32.max(20.0 * scale);
+    let text_width = compact_update_outcome_text_width(card_width);
     let mut lines = wrap_native_lines(
         std::slice::from_ref(&display),
         text_width,
@@ -14776,7 +14799,7 @@ fn compact_update_outcome(update: &UpdateProjection, text_width: f32) -> Option<
             Layout::column()
                 .width(Length::Fill)
                 .height(Length::Fixed(height))
-                .padding(Insets::all(16.0))
+                .padding(Insets::all(COMPACT_UPDATE_OUTCOME_PADDING))
                 .clipped(),
         )
         .children(
@@ -15429,7 +15452,9 @@ fn update_page(
         action.layout.height = Length::Fixed(action_height);
         items.push((action, action_height));
         items.extend(automatic.clone());
-        items.extend(compact_update_outcome(update, notes_text_width));
+        // The CARD width, not the notes card's text measure: the outcome card
+        // subtracts its own inset so the wrap and the paint share one box.
+        items.extend(compact_update_outcome(update, notes_width));
         items.extend(
             notes
                 .iter()
@@ -23176,6 +23201,103 @@ mod tests {
         }
     }
 
+    /// Widest UI-face text in an authored subtree, measured EXACTLY as
+    /// `native_ui`'s paint audit measures a `Text` node whose role/style resolve
+    /// to the Body step in the UI face — every `updates/outcome/line-*` does.
+    ///
+    /// Returns `(worst required width, the box it was given, its key)`, walking
+    /// the same padding arithmetic the compiler performs so the answer is the
+    /// PAINTED measure, not the authoring intent.
+    fn widest_authored_text(node: &UiNode, width: f32) -> Option<(f32, f32, String)> {
+        let inner = (width - node.layout.padding.left - node.layout.padding.right).max(0.0);
+        let px = 13.0 * crate::native_appearance::text_scale();
+        let face = crate::widget::TextFace::Ui;
+        let mut worst = match &node.content {
+            UiContent::Text(spec) => {
+                let required = crate::tray_raster::ui_text_width_for(face, &spec.text, px);
+                Some((required, width, node.key.as_str().to_string()))
+            }
+            _ => None,
+        };
+        for child in &node.children {
+            let Some(found) = widest_authored_text(child, inner) else {
+                continue;
+            };
+            let worse = match &worst {
+                Some((required, available, _)) => found.0 - found.1 > required - available,
+                None => true,
+            };
+            if worse {
+                worst = Some(found);
+            }
+        }
+        worst
+    }
+
+    /// MEASURE == PAINT for the compact updater-outcome card, at every text
+    /// scale the appearance store can hand it.
+    ///
+    /// The card wraps prose greedily to a measure it is told, and paints those
+    /// lines inside a box it authors itself. When those two numbers came from
+    /// different subtractions the wrapper packed lines the painter could not
+    /// fit: the card was handed the RELEASE-NOTES card's text measure, which
+    /// [`update_release_notes_padding`] narrows to 14pt above 1.25× text, while
+    /// the card itself insets 16pt. Identical at 1×, four points apart at 2× —
+    /// so a greedy line landed in the gap and painted past its own edge
+    /// (`updates/outcome/line-2`, required 263.3 in a 262.0 box, Windows 2×).
+    ///
+    /// This pins the property at the seam rather than through one page: the box
+    /// is read back off the node's OWN authored padding, so re-padding the card
+    /// without re-measuring its prose fails here, on every platform, at 1× too.
+    #[test]
+    fn compact_update_outcome_wraps_to_the_box_it_paints_in() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let restore = crate::native_appearance::current_preferences();
+        let mut status = update_status(true);
+        // Long enough to wrap past the bound at every scale, so no width under
+        // test can pass by having nothing to break.
+        status.outcome =
+            "The protected live terminal remains attached until the verified handoff retries."
+                .to_string();
+        let projection = UpdateState::from_status(1, "0.1.0", Some(&status), false).projection();
+
+        for scale in [0.85_f32, 1.0, 1.25, 1.5, 1.75, 2.0] {
+            crate::native_appearance::install_preferences(
+                crate::native_appearance::AppearancePreferences {
+                    text_scale: scale,
+                    ..restore
+                },
+            );
+            // 294.0 is the real short-landscape section width (568×320 at 2×).
+            for card_width in [180.0_f32, 240.0, 294.0, 360.0, 480.0, 620.0] {
+                let (card, _) = compact_update_outcome(&projection, card_width)
+                    .expect("a non-routine outcome authors the card");
+                // Font-independent half of the property, true on every
+                // platform: the measure the prose wrapped to IS the box the
+                // authored insets leave. Only the second half — whether a
+                // greedy break happens to land in a gap — depends on the host
+                // UI face, which is why this defect could hide off-Windows.
+                let insets = card.layout.padding.left + card.layout.padding.right;
+                assert_eq!(
+                    compact_update_outcome_text_width(card_width),
+                    card_width - insets,
+                    "{scale}x card {card_width}: wrap measure vs authored box",
+                );
+                let (required, available, key) = widest_authored_text(&card, card_width)
+                    .expect("the card paints its wrapped lines");
+                // The paint audit's own overflow predicate
+                // (`native_ui::finish_text_fit`): whatever it would flag, this
+                // flags first.
+                assert!(
+                    required <= available + 0.5,
+                    "{scale}x card {card_width}: {key} wraps to \
+                     {required:.1} in a {available:.1} box",
+                );
+            }
+        }
+        crate::native_appearance::install_preferences(restore);
+    }
+
     /// Every section of the simplified Update page stays reachable, complete and
     /// overflow-free at the platform maximum Dynamic Type in short landscape —
     /// the shape that used to clip whatever followed the status card.
@@ -27982,7 +28104,19 @@ mod tests {
         }
         let motion_compiled = motion_compiled.expect("Motion control is reachable");
         let motion_semantic = motion_compiled.semantic(&motion_key).unwrap();
-        assert!(motion_semantic.label.contains("Reduce Motion"));
+        // The OS's own accessibility setting has a DIFFERENT NAME per platform:
+        // macOS calls it "Reduce Motion", Windows calls it "Show animations in
+        // Windows". This assertion hardcoded the macOS wording, so it went red on
+        // Windows the moment the per-platform copy landed. Assert against the
+        // SHIPPED copy so the test tracks `prefs::motion_auto_copy` rather than
+        // drifting from it.
+        let (auto_value, auto_note) = prefs::motion_auto_copy(std::env::consts::OS);
+        assert!(
+            motion_semantic.label.contains(auto_value)
+                || motion_semantic.label.contains(auto_note),
+            "the Motion label must carry this platform's own motion copy, got {:?}",
+            motion_semantic.label
+        );
         let motion_audit = motion_compiled
             .paint_audit_lines()
             .into_iter()

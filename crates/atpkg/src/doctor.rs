@@ -86,7 +86,7 @@ fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> 
 ///
 /// Stray rows (keys beginning with `-`) are excluded — see the caller: they cannot be
 /// programs at all, and counting them condemned healthy toolsets.
-fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
+pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
     status
         .map(|s| {
             s.programs
@@ -562,6 +562,108 @@ pub fn run_with(
              No program is missing because of it; the next successful `aterm pkg update` \
              clears it"
         );
+    }
+    // (10a) SYSTEM-SATISFIED MEMBERS. A member the signed index marks `system = "<bin>"`
+    // that the pass found on PATH outside the prefix is deliberately NOT managed here —
+    // its row says so in the canonical words (`system: <path> — not managed by aterm`),
+    // and it is neither missing nor a fault. Re-check the recorded path: a binary that
+    // has since gone away is the one state worth a line, because the next pass will
+    // install the member through its artifact and a user may wonder why.
+    if let Some(s) = status.as_ref() {
+        for (program, row) in &s.programs {
+            let Some(path) = crate::state::system_path(&row.state) else {
+                continue;
+            };
+            if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — {program}: {} (remove that copy to have atpkg manage {program})",
+                    row.state
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — {program}: recorded as `{}`, but that copy is gone — system \
+                     copy gone: the next `aterm pkg update` reinstalls the managed copy",
+                    row.state
+                );
+            }
+        }
+        // (10b) MEMBERS WAITING ON ELEVATION (`needs admin — run: aterm pkg install
+        // <name>`): not a fault — the unattended pass cannot elevate — but the one line
+        // that tells the user which act is theirs.
+        for (program, row) in &s.programs {
+            if row.state.starts_with(crate::state::NEEDS_ADMIN_PREFIX) {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — {program}: {} (in a terminal; sudo asks there)",
+                    row.state
+                );
+            }
+        }
+        // (10c) MEMBERS OBTAINED THROUGH ANOTHER PROTOCOL (`installed via <protocol>:
+        // <path>` — Homebrew's pkg, Apple's Command Line Tools): proven by the recorded
+        // `provides` path, re-checked here the way a system copy is. Gone ⇒ the next
+        // pass records `needs admin` and the explicit door reinstalls it.
+        for (program, row) in &s.programs {
+            let Some((protocol, path)) = crate::state::installed_via_path(&row.state) else {
+                continue;
+            };
+            if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — {program}: {} (kept current by {protocol}, not by aterm)",
+                    row.state
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — {program}: recorded as `{}`, but that path is gone — the \
+                     next pass records it as needing admin; reinstall: aterm pkg install \
+                     {program}",
+                    row.state
+                );
+            }
+        }
+    }
+    // (10e) MEMBERS BLOCKED BY A REQUIREMENT (`blocked by <dep>: <dep state>`, §17.10):
+    // a DEFERRED state, never a fault — the pass retries every six hours, and the
+    // dependency's own row (quoted in the state) says whose act unblocks it. The
+    // explicit door resolves both, in order.
+    if let Some(s) = status.as_ref() {
+        for (program, row) in &s.programs {
+            if let Some((dep, _)) = crate::state::blocked_by(&row.state) {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — {program}: {} (installs once {dep} is; `aterm pkg install \
+                     {program}` does both, in order)",
+                    row.state
+                );
+            }
+        }
+    }
+    // (10d) SHADOWED MANAGED MEMBERS (design S5). For every managed member and every tool
+    // it exposes, a foreign executable of that name EARLIER on PATH than the managed
+    // bin/ is what actually runs — silently ahead of the build the index pins. Probed
+    // LIVE against this process's PATH, never trusted from the record: a warning, never a
+    // fault, and never "fixed" here — the user owns PATH.
+    for (program, build) in &installed {
+        if crate::linkmode::is_linked(layout, program) {
+            continue;
+        }
+        let shadow = crate::ops::active_tools(layout, program, *build)
+            .into_iter()
+            .find_map(|tool| {
+                crate::vendor::shadowing_binary_on_path(&layout.prefix, tool.as_str(), path_var)
+            });
+        if let Some(path) = shadow {
+            let _ = writeln!(
+                out,
+                "{p}: warn — {program}: {} (not the pinned build; atpkg never edits PATH — \
+                 remove or reorder that copy if you want the managed one)",
+                crate::state::shadowed(*build, &path)
+            );
+        }
     }
     // EVERY problem, not the first one. This scan used to `.find()`, so a second failing
     // program was invisible until the first was fixed — a diagnostic that reveals its
@@ -1344,6 +1446,299 @@ mod tests {
             ),
             "a PATH warning stays exit-0"
         );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `satisfied by system` row is an OK line while the system binary is there, a WARN
+    /// (never a PROBLEM) once it is gone — and it is never counted as a recorded fault.
+    #[test]
+    fn a_system_satisfied_member_is_reported_and_never_a_fault() {
+        let l = layout("system-satisfied");
+        install(&l, "ay", 19);
+        let exe = l.prefix.join("fake-system-gh");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        let existing = crate::status::read(&l).unwrap_or_default();
+        let mut programs = existing.programs.clone();
+        programs.insert(
+            "gh".into(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::system(&exe, Some("2026-08-27")),
+                tree_root: String::new(),
+            },
+        );
+        crate::status::write(
+            &l,
+            &crate::Status {
+                schema: 1,
+                updated_at: "2026-08-27T00:00:00Z".into(),
+                enabled: true,
+                index_source: "alabsystems/aterm".into(),
+                outcome: "up to date".into(),
+                programs,
+            },
+        )
+        .unwrap();
+        let home = synthetic_home("system-satisfied");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let run = |l: &Layout| {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let (ok, out) = run(&l);
+        assert!(ok, "a satisfied member is not a problem:\n{out}");
+        // The SAME words the pass wrote — the canonical state, retirement note included.
+        assert!(
+            out.contains(&format!(
+                "doctor: ok — gh: system: {} — not managed by aterm (managed copy retired \
+                 2026-08-27)",
+                exe.display()
+            )),
+            "{out}"
+        );
+        assert!(recorded_problems(crate::status::read(&l).as_ref()).is_empty());
+        // The system binary goes away: a warning naming the remedy, still not a problem.
+        std::fs::remove_file(&exe).unwrap();
+        let (ok, out) = run(&l);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("doctor: warn — gh: recorded as `system: ")
+                && out.contains("system copy gone: the next `aterm pkg update` reinstalls"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An `installed via <protocol>: <path>` row (Homebrew's pkg, the Command Line
+    /// Tools) is an OK line while its `provides` path is there — the words the pass
+    /// wrote — and a WARN naming the door once it is gone; `needs admin` is a WARN with
+    /// the door's spelling. Neither is ever a recorded fault.
+    #[test]
+    fn an_os_installed_member_is_reported_by_its_provides_path_and_never_a_fault() {
+        let l = layout("installed-via");
+        install(&l, "ay", 19);
+        let brew = l.prefix.join("fake-opt-homebrew-bin-brew");
+        std::fs::write(&brew, b"#!/bin/sh\nexit 0\n").unwrap();
+        let existing = crate::status::read(&l).unwrap_or_default();
+        let mut programs = existing.programs.clone();
+        programs.insert(
+            "brew".into(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::installed_via("pkg", &brew),
+                tree_root: String::new(),
+            },
+        );
+        programs.insert(
+            "clt".into(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::needs_admin("clt"),
+                tree_root: String::new(),
+            },
+        );
+        crate::status::write(
+            &l,
+            &crate::Status {
+                schema: 1,
+                updated_at: "2026-08-27T00:00:00Z".into(),
+                enabled: true,
+                index_source: "alabsystems/aterm".into(),
+                outcome: "up to date".into(),
+                programs,
+            },
+        )
+        .unwrap();
+        let home = synthetic_home("installed-via");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let run = |l: &Layout| {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let (ok, out) = run(&l);
+        assert!(ok, "an OS-installed member is not a problem:\n{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: ok — brew: installed via pkg: {} (kept current by pkg, not by aterm)",
+                brew.display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "doctor: warn — clt: needs admin — run: aterm pkg install clt (in a terminal; \
+                 sudo asks there)"
+            ),
+            "{out}"
+        );
+        assert!(recorded_problems(crate::status::read(&l).as_ref()).is_empty());
+        // The provides path goes away: a warning naming the door, still not a problem.
+        std::fs::remove_file(&brew).unwrap();
+        let (ok, out) = run(&l);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("doctor: warn — brew: recorded as `installed via pkg: ")
+                && out.contains("reinstall: aterm pkg install brew"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// SHADOWED (design S5): a foreign copy of a managed tool AHEAD of the managed bin/ on
+    /// PATH is a WARN line in the canonical words — never a fault, never touched — and a
+    /// copy BEHIND the managed bin/ is not mentioned at all.
+    #[cfg(unix)]
+    /// A member BLOCKED by a requirement (§17.10) is reported in its own words as a
+    /// `warn` naming the dependency and the door that installs both — and never counted
+    /// as a fault: `doctor` stays healthy over it.
+    #[test]
+    fn a_blocked_member_is_a_warning_naming_its_dependency_never_a_fault() {
+        let layout = layout("doctor-blocked");
+        install(&layout, "ay", 18);
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "ay".to_string(),
+            crate::ProgramStatus {
+                installed_build: Some(18),
+                state: crate::state::managed(18, 41),
+                tree_root: String::new(),
+            },
+        );
+        let blocked = crate::state::blocked("clt", &crate::state::needs_admin("clt"));
+        programs.insert(
+            "brew".to_string(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: blocked.clone(),
+                tree_root: String::new(),
+            },
+        );
+        let status = crate::Status {
+            schema: 1,
+            updated_at: "2026-08-27T00:00:00Z".into(),
+            enabled: true,
+            index_source: "x/y".into(),
+            outcome: "up to date".into(),
+            programs,
+        };
+        crate::status::write(&layout, &status).unwrap();
+        assert!(
+            recorded_problems(Some(&status)).is_empty(),
+            "a blocked row is deferred, not a fault"
+        );
+        let home = synthetic_home("doctor-blocked");
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let ok = run_with(
+            &layout,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            None,
+            "doctor",
+            &mut out,
+            &mut err,
+        );
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            ok,
+            "a blocked row is a warning, not a structural fault:
+{text}"
+        );
+        assert!(
+            text.contains(&format!("warn — brew: {blocked} (installs once clt is;")),
+            "{text}"
+        );
+        assert!(text.contains("aterm pkg install brew"), "{text}");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shadowed_managed_member_is_a_warning_never_a_fault() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let l = layout("shadowed");
+        install(&l, "ay", 19);
+        let foreign = l
+            .prefix
+            .parent()
+            .unwrap()
+            .join(format!("atpkg-doctor-shadow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).unwrap();
+        let exe = foreign.join("ay");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = synthetic_home("shadowed");
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let run = |path: &std::ffi::OsStr| {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(path),
+                now,
+                None,
+                None,
+                "doctor",
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let ahead = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
+        let (ok, out) = run(&ahead);
+        assert!(ok, "a shadow is a warning, not a structural fault:\n{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — ay: {}",
+                crate::state::shadowed(19, &exe)
+            )),
+            "{out}"
+        );
+        assert!(
+            exe.exists() && crate::which(&l, "ay").is_some(),
+            "never fixed"
+        );
+        let behind = std::env::join_paths([l.bin_dir(), foreign.clone()]).unwrap();
+        let (ok, out) = run(&behind);
+        assert!(ok, "{out}");
+        assert!(!out.contains("SHADOWED"), "{out}");
+        let _ = std::fs::remove_dir_all(&foreign);
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }

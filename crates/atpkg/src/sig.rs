@@ -116,7 +116,7 @@ impl VerifiedBytes {
 /// The single opaque rejection set. Deliberately coarse: a verifier that reported a
 /// *different* reason per failure mode would be a verification oracle. Callers map any
 /// variant to "refuse, fail closed".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
     /// No master anchor is pinned (an unarmed build). Fail-closed default, returned
     /// *before* any crypto — and it authorizes NOTHING, ever.
@@ -163,6 +163,22 @@ pub enum Reject {
     /// ([`crate::manifest::SUPPORTED_SCHEMA`]); refused rather than misread. Also
     /// post-verify, not a crypto oracle.
     Schema,
+    /// A `pkg-*.toml` row spelled with a RETIRED `kind` — today only `vendor-fetch`, which
+    /// was never published and was split into `kind` (the payload/apply shape) and
+    /// `protocol` (how the bytes are obtained) before any client saw it. Post-verify, like
+    /// [`Reject::Malformed`], but it carries the split's spelling so the authoring machine's
+    /// own `atpkg install` names the fix instead of a bare "malformed".
+    RetiredKind(&'static str),
+    /// An `index.toml` whose `[programs.<name>].requires` relation is not one a client can
+    /// honour: a name the index does not carry, a program requiring itself, or a cycle —
+    /// over programs, or over the coherence groups the plan installs atomically
+    /// ([`crate::manifest::validate_requires`]). Post-verify, like [`Reject::Malformed`];
+    /// it carries the offending edge (a cycle is spelled out, `a → b → a`) so the
+    /// publisher's own `atpkg verify-index` names the row to fix. The dependency relation
+    /// is SIGNED metadata, so this can only ever be an authoring mistake, never an
+    /// adversary's — and a client refuses the whole index rather than plan an order it
+    /// could not satisfy. (`String`, so the enum is no longer `Copy`; nothing copied it.)
+    Requires(String),
 }
 
 /// Translate the roster tier's verdict into atpkg's. One-to-one and total, deliberately:
@@ -1577,6 +1593,7 @@ mod tests {
     ///
     /// MUTATION: restore the discarded `let _ = self.write(..)` (report nothing) and the
     /// `Some` assertion fails.
+    #[cfg(unix)]
     #[test]
     fn a_failed_floor_persist_keeps_the_accept_and_reports_the_lost_advance() {
         use std::os::unix::fs::PermissionsExt as _;

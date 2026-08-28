@@ -90,6 +90,17 @@ aterm-digest = { workspace = true }
 # a writer. Per-entry extraction is still driven manually so EVERY entry is vetted before
 # a byte is written, modes are sanitized, and a single escape aborts the whole stage.
 zstd = { workspace = true }
+# The `https` protocol lane's OTHER compressors: gzip for `tar-gz` payloads (Codex ships
+# `codex-package-<triple>.tar.gz`, gh ships `.tar.gz` too) and raw deflate inside `.zip`
+# members (the first-party zip reader in `src/extract/zipread.rs`). flate2 was ALREADY in
+# the pinned tree transitively (via `png`, the GUI's image decoder) at exactly this
+# version, so this promotes an existing edge rather than admitting a new package; the
+# `deny.toml` floor pins it the way `ring`/`tar` are pinned. `default-features = false` +
+# `rust_backend` = the pure-Rust `miniz_oxide` inflate (also already in the tree) and
+# NOTHING else — no zlib-sys, no C. The container parsing on both sides of it stays
+# first-party (`src/tarread.rs`, `src/extract/zipread.rs`): flate2 only turns bytes into
+# bytes; every path/mode/link decision is ours, made before a byte is written.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 # ORACLE ONLY — never in the shipped graph. The retired reader, kept so

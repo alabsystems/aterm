@@ -2492,7 +2492,16 @@ impl App {
         // never leaks into the user's shell children (`App::take_just_updated`).
         #[cfg(unix)]
         {
-            return self.start_unix_update_handoff(
+            // THE CARD IS RETIRED BY WHOEVER BROKE THE PROMISE. `start_unix_update_
+            // handoff` raises "Installing update…" just before it parks, and several
+            // of its later `Err` exits (a missed 20 ms park deadline, masters closed
+            // under it, a reservation failure) return WITHOUT producing a completion
+            // — so the completion path cannot be the only place that clears it, or a
+            // refused attempt leaves a card claiming an install that never started
+            // standing for its whole (deliberately long) lifetime. Binding the result
+            // at the ONE call site covers every such exit and cannot rot as new ones
+            // are added.
+            let started = self.start_unix_update_handoff(
                 exe,
                 build,
                 safety_token,
@@ -2500,6 +2509,11 @@ impl App {
                 apply_attempt,
                 debug_seamless,
             );
+            if started.is_err() {
+                self.notice = None;
+                self.request_redraw_all_windows();
+            }
+            return started;
         }
         // Windows has no exec(2); the analog is spawn-the-new-then-exit. Dead in
         // practice today (the updater is macOS-only, so `staged` is always None
@@ -2912,8 +2926,30 @@ impl App {
         // visible-only rather than risking the deadline for a bonus. This is what
         // makes carrying history safe to enable by default — the failure mode is
         // "less scrollback", never "the update did not apply".
+        // SAY IT BEFORE THE SCREEN STOPS. Everything below parks the readers, and
+        // from here until the successor attaches its own the terminal echoes
+        // nothing — and, once the kernel PTY buffer fills, the user's own programs
+        // stall against it. That is a defensible few seconds; being given it with
+        // no explanation is not. Raised HERE on purpose: above this line every
+        // early return is a refusal that never froze anything (the card would be a
+        // lie), and below it the allocation would land inside the 20 ms budget this
+        // function hoists work out of.
+        //
+        // A CARD, NEVER A STATUS-BAR ROW. A row re-grids, which moves `ws.rows` —
+        // the exact value `exact_layout` compares un-normalized at Commit — so the
+        // bar explaining the freeze would REFUSE the update after the user sat
+        // through it; and the re-grid's SIGWINCH is itself activity the plain
+        // automatic lane's own re-check reads as a revocation.
+        self.surface_update_status_for(
+            "\u{2191} Installing update — your shells are safe; the screen pauses for a moment.",
+            crate::HANDOFF_PENDING_NOTICE_TTL,
+        );
         const HANDOFF_HISTORY_COMFORT: std::time::Duration = std::time::Duration::from_millis(10);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
+        // user experiences, and the zero point of the two numbers reported at
+        // Commit. The 20 ms capture deadline hangs off the same stamp.
+        let park_at = std::time::Instant::now();
+        let deadline = park_at + std::time::Duration::from_millis(20);
         if !self.park_all_readers(deadline) {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::failed(
@@ -3363,6 +3399,8 @@ impl App {
         let arbiter = crate::HandoffAttemptArbiter::new();
         self.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             attempt_id,
+            park_at,
+            proof_ready_at: None,
             nonce: None,
             live: live.clone(),
             // The PROOF identities, in whichever term this attempt's lane can
@@ -3443,16 +3481,17 @@ impl App {
     /// DRAIN, DON'T DIE (seamless: OS-accepted input): hardware events
     /// accepted immediately before this callback may not yet have been
     /// dispatched through winit and would die with `_exit`. Defer Commit
-    /// through a short input-quiet epoch, read from the kernel's HID idle
-    /// clock through the injected `App::user_input_recent` (never through
-    /// WindowServer, never pumping AppKit). Re-posting this
+    /// across a mandatory dispatch FENCE — measured in loop iterations that
+    /// really dispatched events, not in wall clock alone. Re-posting this
     /// exact completion gives the run loop time to dispatch those events —
     /// their bytes flow through the tolerated input path into the
     /// still-open PTY masters — and the re-post re-runs this admission
-    /// against a drained queue. Bounded by the spin cap below (sustained
-    /// typing exhausts it and is then treated as activity revocation,
-    /// retaining the automatic retry budget) and absolutely by the
-    /// worker's 15 s decision deadline. A failed re-post means the event
+    /// against a drained queue. Bounded by the drain DEADLINE below (3 s,
+    /// which at the 2 ms yield is reached around spin ~1500 — the 4000
+    /// spin cap is the backstop behind it, not the operative bound; this
+    /// comment used to name the cap and claim sustained typing exhausts
+    /// it into an activity revocation, which was unreachable arithmetic)
+    /// and absolutely by the worker's 15 s decision deadline. A failed re-post means the event
     /// loop is closing; dropping the completion drops the reject sender,
     /// which the worker observes as Disconnected and rejects/reaps.
     ///
@@ -3470,21 +3509,27 @@ impl App {
     ///
     /// The hard admission facts are the dispatch fence and settled
     /// egress (see `HandoffCommitFacts::input_dispatch_fenced` /
-    /// `egress_settled`). A quiet window is still PREFERRED — it is
-    /// simply no longer required, and we stop paying for it after a
-    /// bounded budget.
+    /// `egress_settled`). A quiet window used to be PREFERRED on top of
+    /// them — waited for up to 400 ms, then abandoned.
+    ///
+    /// THAT WAIT IS GONE (2026-08-27), and deleting it weakened no
+    /// admission fact: `quiet_window_settled` was read in the respin
+    /// condition and nowhere else, and `handoff_commit_admitted`'s
+    /// eleven-way conjunction never mentioned it. What it cost was real.
+    /// `user_input_recent` reads the MACHINE-WIDE kernel HID idle clock,
+    /// so any mouse twitch anywhere on the desktop held the gate to its
+    /// full 400 ms ceiling; and after the reveal the successor is the key
+    /// window, so the keystrokes it was DEFERRING held the PARENT's gate
+    /// open on a queue the parent could no longer receive from — typing
+    /// lengthened the very freeze that was swallowing the typing. The
+    /// gate now settles at its ~30-45 ms floor: the mandatory dispatch
+    /// fence, and egress that has actually reached the kernel.
     #[cfg(unix)]
     fn handoff_drain_gate(
         &mut self,
         completion: crate::UpdateHandoffCompletion,
     ) -> Option<(crate::UpdateHandoffCompletion, bool, bool)> {
         const HANDOFF_INPUT_DRAIN_SPIN_CAP: u32 = 4_000;
-        /// Opportunistic gap we would LIKE to commit inside.
-        const HANDOFF_INPUT_QUIET_EPOCH: std::time::Duration = std::time::Duration::from_millis(15);
-        /// How long we are willing to wait for that gap before committing
-        /// anyway. Under a continuously-driven terminal it never comes.
-        const HANDOFF_INPUT_QUIET_BUDGET: std::time::Duration =
-            std::time::Duration::from_millis(400);
         /// MANDATORY minimum event-loop time between ProofReady and Commit.
         const HANDOFF_INPUT_DISPATCH_FENCE: std::time::Duration =
             std::time::Duration::from_millis(30);
@@ -3501,6 +3546,10 @@ impl App {
         let drained_for = {
             let now = std::time::Instant::now();
             self.pending_update_handoff.as_mut().map(|pending| {
+                // Same edge, so the same stamp: the first ProofReady observation
+                // is when the successor's proof landed, which closes the park→proof
+                // half of the freeze and opens proof→commit.
+                pending.proof_ready_at.get_or_insert(now);
                 now.saturating_duration_since(*pending.commit_drain_started.get_or_insert(now))
             })
         };
@@ -3509,14 +3558,12 @@ impl App {
         // iterated) and the elapsed floor.
         let input_dispatch_fenced =
             completion.input_drain_spins >= 1 && drained_for >= HANDOFF_INPUT_DISPATCH_FENCE;
-        let input_quiet = !(self.user_input_recent)(HANDOFF_INPUT_QUIET_EPOCH);
-        let quiet_window_settled = input_quiet || drained_for >= HANDOFF_INPUT_QUIET_BUDGET;
         let egress_settled = self
             .pending_update_handoff
             .as_ref()
             .map(|pending| pending.live.clone())
             .is_none_or(|live| handoff_egress_settled(&self.pool, &live));
-        if (!input_dispatch_fenced || !quiet_window_settled || !egress_settled)
+        if (!input_dispatch_fenced || !egress_settled)
             && completion.input_drain_spins < HANDOFF_INPUT_DRAIN_SPIN_CAP
             && drained_for < HANDOFF_INPUT_DRAIN_DEADLINE
             && let Some(proxy) = self.proxy.clone()
@@ -3710,8 +3757,29 @@ impl App {
             let mut commit_write_failed = false;
             if commit_admitted && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof) {
                 if arbiter.try_begin_commit() {
+                    // THE FREEZE, IN TWO NUMBERS. Everything from the park to here
+                    // is a terminal that echoed nothing; the split says which half
+                    // to attack. park→proof is the successor's bundle swap, second
+                    // `execve` and cold GUI boot; proof→commit is this process's
+                    // dispatch fence plus egress settle. Emitted once per apply, on
+                    // the path that ends in `_exit`, so it is the last thing this
+                    // process says about a freeze the user just sat through.
+                    let (park_to_proof_ms, proof_to_commit_ms) = self
+                        .pending_update_handoff
+                        .as_ref()
+                        .map(|pending| {
+                            let now = std::time::Instant::now();
+                            let proof = pending.proof_ready_at.unwrap_or(now);
+                            (
+                                proof.saturating_duration_since(pending.park_at).as_millis(),
+                                now.saturating_duration_since(proof).as_millis(),
+                            )
+                        })
+                        .unwrap_or((0, 0));
                     aterm_log::info!(
-                        "update apply: committing exact readerless handoff to child {:?}",
+                        "update apply: committing exact readerless handoff to child {:?} \
+                         (screen was frozen {park_to_proof_ms}ms park->proof + \
+                         {proof_to_commit_ms}ms proof->commit)",
                         child_pid
                     );
                     // Success cannot return: `commit_and_exit` performs the one
@@ -5569,6 +5637,8 @@ mod returned_handoff_completion_lane_tests {
         ticket.make_current_apply_for_test(&mut app.native_updater_service);
         let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            park_at: std::time::Instant::now(),
+            proof_ready_at: None,
             attempt_id: 1,
             nonce: None,
             live: Vec::new(),
@@ -5700,6 +5770,8 @@ mod returned_handoff_completion_lane_tests {
         ticket.make_current_apply_for_test(&mut app.native_updater_service);
         let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            park_at: std::time::Instant::now(),
+            proof_ready_at: None,
             attempt_id: 2,
             nonce: None,
             live: Vec::new(),

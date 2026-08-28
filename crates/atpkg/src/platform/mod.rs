@@ -199,6 +199,7 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
 ///
 /// `exec "<target>" "$@"` sets argv[0] to the target, which targo's brand detection
 /// reads: the stub is invisible to the tool it launches.
+#[cfg(any(unix, test))]
 pub(crate) fn sh_shim_content(target: &Path) -> String {
     let mut s = String::from(
         "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec ",
@@ -211,6 +212,7 @@ pub(crate) fn sh_shim_content(target: &Path) -> String {
 /// Single-quote a path for the `sh` stub, escaping embedded quotes POSIX-style. A
 /// managed-store path never contains one; this is fail-closed defence in depth, the
 /// same posture the `.cmd` side takes.
+#[cfg(any(unix, test))]
 pub(crate) fn sh_shim_quote(target: &Path) -> String {
     let mut out = String::from("'");
     for c in target.to_string_lossy().chars() {
@@ -231,6 +233,7 @@ pub(crate) fn sh_shim_quote(target: &Path) -> String {
 /// shim point at". Parsing the stub keeps every one of those answers identical.
 /// A TOMBSTONE (a failing notice script with no `exec`) must parse as `None`, exactly
 /// as `read_link` returned `Err` for it.
+#[cfg(any(unix, test))]
 pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
         let line = line.trim();

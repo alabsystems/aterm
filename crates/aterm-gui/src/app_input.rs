@@ -8726,6 +8726,8 @@ mod forwarded_release_handoff_activity_tests {
     fn arm_pending_overlap(app: &mut App) -> std::sync::mpsc::Receiver<()> {
         let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            park_at: std::time::Instant::now(),
+            proof_ready_at: None,
             attempt_id: 1,
             nonce: None,
             live: Vec::new(),

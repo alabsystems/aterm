@@ -32,8 +32,14 @@ pub const MAX_STATUS_PROGRAMS: usize = 2048;
 pub struct ProgramStatus {
     /// The currently-active build, if any.
     pub installed_build: Option<u64>,
-    /// Free-text state: `"active"`, `"tombstoned: yanked@N"`, `"deferred: …"`,
-    /// `"rejected: unsigned index at build N"`, … (mirrors the updater's outcome strings).
+    /// The program's state line. For a program the index names it is one of the CANONICAL
+    /// spellings of [`crate::state`] — `managed <build> — pinned by index <N>`, `system:
+    /// <path> — not managed by aterm`, `managed <build> — SHADOWED by <path>`, `extra — not
+    /// installed (opt in: …)`, `installed via <protocol>: <path>`, `needs admin — …`,
+    /// `unavailable on <target>: <hint>` — the same words the pass log, `doctor` and
+    /// `which` print. Faults keep their prefixed free text (`"error: …"`, `"tombstoned:
+    /// yanked@N"`, `"deferred: …"`, `"rejected: unsigned index at build N"`, …), which
+    /// `doctor` matches by prefix.
     pub state: String,
     /// The SIGNED `tree_root` (§8) of the active build, captured from the release-key-
     /// verified manifest at install/update time. `atpkg verify` recomputes the store tree's

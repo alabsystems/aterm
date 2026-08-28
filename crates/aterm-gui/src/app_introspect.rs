@@ -2934,9 +2934,25 @@ impl App {
         // same single cat the glass does, not the pre-fix pair. The pet counts
         // as the companion too (the windowed present's rule), and hands in its
         // live drawn body as the pixel-yield box.
+        let companion_duty =
+            crate::app_render::cursor_companion_duty(pet_on_glass, kitty_alpha, cur);
         let companion_at = crate::app_render::cursor_companion_on_glass(
+            companion_duty,
             cur,
-            kitty_alpha,
+            // The flying head's live rect — a capture must yield to the same
+            // pixels the glass does, and the head is nowhere near the caret.
+            match companion_duty {
+                crate::app_render::CompanionDuty::FlyingHead { cell } => {
+                    crate::app_render::flying_head_footprint_px(
+                        &ws.word_decos,
+                        effect_geom,
+                        cell,
+                        cat_frame.render_look(),
+                        cat_frame.bob,
+                    )
+                }
+                _ => None,
+            },
             pet_on_glass
                 .then(|| {
                     pet.body_px(

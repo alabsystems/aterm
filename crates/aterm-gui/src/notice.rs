@@ -68,13 +68,13 @@ pub(crate) const SHADOW_MARGIN: f32 = 12.0;
 ///
 /// Data rather than a literal inside the loop so [`shadow_stays_inside_its_margin`] can
 /// re-derive the furthest reach from the same numbers the renderer draws.
-/// `pub(crate)`: the provisioning progress card (`app_render::pkg_progress_card`)
-/// draws the same falloff, so the two cards cannot drift apart — and its shadow
-/// inherits this table's proven [`SHADOW_MARGIN`] bound. The comment
+/// Module-private again since the provisioning progress card was retired
+/// (2026-08-26): it was this table's one outside reader, drawing the same
+/// falloff so the two cards could not drift apart. The comment
 /// beside the loop has always claimed these stay inside [`SHADOW_MARGIN`]; until this
 /// was a table, nothing checked it, and a fourth layer or a bigger spread would have
 /// been cropped by the compositor's paint region with no test to say so.
-pub(crate) const SHADOW_LAYERS: [(f32, f32, u8); 3] =
+const SHADOW_LAYERS: [(f32, f32, u8); 3] =
     [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
 
 /// The alpha below which the card stops being a click target. The exit tail runs the
@@ -149,11 +149,26 @@ impl TransientNotice {
     }
 
     pub(crate) fn update_status(text: impl Into<String>, now: Instant) -> Self {
+        Self::update_status_for(text, TTL, now)
+    }
+
+    /// [`Self::update_status`] with an explicit lifetime, for a card that
+    /// reports work still in progress (the [`Self::ttl`] override that field's
+    /// doc anticipates). The handoff's "installing / finishing" cards use it:
+    /// the default 5.4 s has under a second of headroom over a cold 4.5 s apply
+    /// and none at all over the ready deadline's ceiling, and its last 800 ms
+    /// are the fade ramp — so the card explaining the freeze would visibly
+    /// dissolve part-way through the freeze it is explaining.
+    pub(crate) fn update_status_for(
+        text: impl Into<String>,
+        ttl: Duration,
+        now: Instant,
+    ) -> Self {
         Self {
             kind: NoticeKind::UpdateStatus { text: text.into() },
             spawned: now,
             anchor: None,
-            ttl: TTL,
+            ttl,
         }
     }
 
@@ -556,9 +571,10 @@ fn luma(c: [u8; 3]) -> f32 {
 /// Black or white, whichever stays legible ON `fill`. The badge pictogram sits on a
 /// themed disc whose luminance is not knowable ahead of time (the accent is user
 /// configurable and `Celebrate` takes the live cursor colour), so the contrast is
-/// computed rather than assumed. `pub(crate)` — shared with the provisioning
-/// progress card for the same on-a-computed-fill question.
-pub(crate) fn on_fill(fill: [u8; 3]) -> [u8; 3] {
+/// computed rather than assumed. (It was `pub(crate)` for the provisioning
+/// progress card, which asked the same on-a-computed-fill question; that card
+/// is gone, so this is module-private again.)
+fn on_fill(fill: [u8; 3]) -> [u8; 3] {
     if luma(fill) > 140.0 {
         [0x10, 0x12, 0x16]
     } else {
@@ -582,9 +598,9 @@ const CHEVRON_STROKE: f32 = 1.75;
 
 /// `fill` pushed away from `surface` until the two can be told apart.
 ///
-/// `pub(crate)` — shared with the provisioning progress card, whose rainbow
-/// segments and status marks sit on the same elevated surface and owe their
-/// legibility to the same walk.
+/// (It was `pub(crate)` for the provisioning progress card, whose rainbow
+/// segments sat on the same elevated surface; that card is gone, so this is
+/// module-private again.)
 ///
 /// `Celebrate` takes the LIVE CURSOR COLOUR, which the user owns and which has no
 /// relationship to the card's elevated surface — a dark-grey cursor on a dark card paints
@@ -592,7 +608,7 @@ const CHEVRON_STROKE: f32 = 1.75;
 /// discard the user's colour, it is walked toward white (on a dark card) or black (on a
 /// light one) by the smallest step that clears [`BADGE_CONTRAST`], so the hue survives and
 /// the disc is always seen.
-pub(crate) fn legible_on(fill: [u8; 3], surface: [u8; 3]) -> [u8; 3] {
+fn legible_on(fill: [u8; 3], surface: [u8; 3]) -> [u8; 3] {
     let ls = luma(surface);
     if (luma(fill) - ls).abs() >= BADGE_CONTRAST {
         return fill;
@@ -835,23 +851,23 @@ pub(crate) fn rainbow(h: f32) -> [u8; 3] {
 /// How many sparkles ring the celebration card.
 const SPARKLES: usize = 14;
 /// Hue turns per second for the badge and the ring — slow enough to read as a shimmer
-/// rather than a strobe. `pub(crate)`: the progress card's bar cycles at this same
-/// rate, so the whole product shimmers at one tempo.
-pub(crate) const RAINBOW_TURNS_PER_SEC: f32 = 0.22;
+/// rather than a strobe. (The retired progress card's bar cycled at this same
+/// rate; with it gone the pill is the only shimmer left at this tempo.)
+const RAINBOW_TURNS_PER_SEC: f32 = 0.22;
 
 /// How far outside the card the sparkle ring sits, in tray px. Kept well inside
 /// [`SHADOW_MARGIN`] so the compositor's paint region already covers it.
 const SPARKLE_INSET: f32 = 3.0;
-/// Sparkle radius at its dimmest and brightest (`pub(crate)`: the progress card's
-/// completion bursts twinkle between the same bounds).
-pub(crate) const SPARKLE_MIN_R: f32 = 0.7;
-pub(crate) const SPARKLE_MAX_R: f32 = 2.1;
+/// Sparkle radius at its dimmest and brightest (the retired progress card's
+/// completion bursts twinkled between the same bounds).
+const SPARKLE_MIN_R: f32 = 0.7;
+const SPARKLE_MAX_R: f32 = 2.1;
 
 /// A point at fraction `f` (0..1) around the perimeter of a rounded rect, walked as a
 /// plain rectangle — close enough for decorative trim, and unlike a circle it keeps
-/// the spacing even along a long pill. `pub(crate)` — the progress card's sparkle
-/// rings walk the same perimeter.
-pub(crate) fn perimeter_point(x: f32, y: f32, w: f32, h: f32, f: f32) -> (f32, f32) {
+/// the spacing even along a long pill. (The retired progress card's sparkle
+/// rings walked the same perimeter; this is module-private again.)
+fn perimeter_point(x: f32, y: f32, w: f32, h: f32, f: f32) -> (f32, f32) {
     let per = 2.0 * (w + h);
     let d = (f.fract() + 1.0).fract() * per;
     if d < w {

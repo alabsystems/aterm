@@ -290,34 +290,66 @@ pub struct EffectGeom {
 ///   remains on glass while a one-frame DECTCEM hide fades it; that frame has
 ///   no honest caret coordinate, so the cell is `None` while the exact body
 ///   rectangle below continues to own pixel custody.
-/// * `body_px` — the companion's LIVE drawn body in grid pixels
+/// * `body_px` — the companion's LIVE drawn SPRITE in grid pixels
 ///   `(x0, x1, y0, y1)`, right/bottom exclusive. The pixel-yield layer
-///   (`CatTick::companion_px`) collides SPRITES, and the resident PET
-///   ([`crate::kitty_pet`]) is nothing like the flying head: ~2.8 columns ×
-///   1.70 rows, planted wherever the animal actually stands — routinely whole
-///   rows away from the caret. A caret-anchored band models the flying head
-///   only, so an ambient cat could rise straight under the pet's body. `None`
-///   keeps the classic flying-head model (a 2-cell × 1-row band at the caret).
-///   Hosts get the rect from [`crate::kitty_pet::PetFrame::body_px`] — the
-///   same feet-anchored dest math the pet emission draws with.
+///   (`CompanionFootprint`, built by `Self::footprint`) collides SPRITES, so it
+///   needs the rect the host is about to DRAW, for EITHER animal. The resident PET
+///   ([`crate::kitty_pet`]) is ~2.8 columns × 1.70 rows planted wherever the
+///   animal walked — routinely whole rows from the caret — and the flying head
+///   flies a 3/4-cell LEAD ahead of the caret cell's right edge and stands
+///   ~1.70 cells tall, so it sits about 1.75 cells RIGHT of the caret column
+///   and about 0.4 rows ABOVE the caret row. Neither is the caret's own cell.
+///   Hosts get the pet's rect from [`crate::kitty_pet::PetFrame::body_px`] and
+///   the head's from [`WordDecorations::kitty_cursor_footprint`] — in both
+///   cases the same dest math the emission draws with. `None` is the
+///   degraded fallback for a host that has not resolved a rect: only the caret
+///   band below then stands in for the sprite.
+/// * `guards_caret` — whether the caret's OWN cell band is companion glass
+///   too. The flying head escorts the caret and the pair reads as one unit, so
+///   an ambient cat landing on the caret cell reads as a second kitty at the
+///   companion even though it misses the sprite; the head therefore guards
+///   both rects. The pet stands wherever its brain walked it and has no claim
+///   on the caret, so it guards only its body.
+///
+/// TWO RECTS, NOT ONE UNION: a union of the caret band with a head that starts
+/// 1.75 cells to its right is far greedier than either, and greediness is what
+/// swallowed the legitimate "peeks BESIDE the companion" case the first time
+/// (`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`).
 #[derive(Clone, Copy, Debug)]
 pub struct CompanionOnGlass {
     /// The visible caret cell `(row, col)` in pre-splice grid coords. `None`
     /// only for a still-visible resident body whose caret is currently hidden.
     pub cell: Option<(u16, u16)>,
-    /// The companion's live drawn body `(x0, x1, y0, y1)` in grid pixels, when
-    /// the resident pet is the companion; `None` for the flying head.
+    /// The companion's live drawn sprite `(x0, x1, y0, y1)` in grid pixels.
+    /// `None` only when the host could not resolve one this frame.
     pub body_px: Option<(i32, i32, i32, i32)>,
+    /// Does the caret cell's own band belong to the companion as well? True
+    /// for the caret-escorting flying head, false for the resident pet.
+    pub guards_caret: bool,
 }
 
 impl CompanionOnGlass {
-    /// The flying head: caret cell only; the pixel yield keeps its classic
-    /// 2-cell × 1-row model.
+    /// The flying head with NO resolved sprite rect — the degraded fallback.
+    /// Only the caret band stands in for the pixel yield, which under-covers
+    /// the sprite (the head is ~1.75 cells right of the caret column). Prefer
+    /// [`Self::at_head`] wherever the footprint can be resolved.
     #[must_use]
     pub fn at_cell(cell: (u16, u16)) -> Self {
         Self {
             cell: Some(cell),
             body_px: None,
+            guards_caret: true,
+        }
+    }
+
+    /// The flying head with its live drawn rect, from
+    /// [`WordDecorations::kitty_cursor_footprint`]. Guards the caret band too.
+    #[must_use]
+    pub fn at_head(cell: (u16, u16), head_px: (i32, i32, i32, i32)) -> Self {
+        Self {
+            cell: Some(cell),
+            body_px: Some(head_px),
+            guards_caret: true,
         }
     }
 
@@ -328,7 +360,58 @@ impl CompanionOnGlass {
         Self {
             cell,
             body_px: Some(body_px),
+            guards_caret: false,
         }
+    }
+
+    /// The rects an ambient cat must not stack on this frame.
+    #[must_use]
+    fn footprint(self, geom: EffectGeom) -> CompanionFootprint {
+        CompanionFootprint {
+            rects: [
+                self.body_px,
+                self.guards_caret
+                    .then(|| {
+                        let (row, col) = self.cell?;
+                        let cw = i32::from(geom.cell_w);
+                        let ch = i32::from(geom.cell_h);
+                        let x0 = i32::from(col) * cw;
+                        let y0 = i32::from(row) * ch;
+                        // Two cells wide from the caret column and exactly the
+                        // caret's own row band.
+                        //
+                        // The band is deliberately NOT grown upward or right to
+                        // the head's real extent — that is what `body_px` is
+                        // for now. An ambient cat peeking UP from a word several
+                        // rows below legitimately passes through the rows above
+                        // the caret, and `a_feline_word_away_from_the_caret_
+                        // still_peeks_beside_the_companion` pins that it must
+                        // still draw. What this band alone must stop is a cat
+                        // landing ON the caret the user is typing at.
+                        Some((x0, x0 + 2 * cw, y0, y0 + ch))
+                    })
+                    .flatten(),
+            ],
+        }
+    }
+}
+
+/// The pixels the live cursor companion owns this frame — up to TWO rects, and
+/// an ambient cat yields if it is stacked on EITHER. See [`CompanionOnGlass`]
+/// for why the flying head needs two and the pet needs one.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompanionFootprint {
+    rects: [Option<(i32, i32, i32, i32)>; 2],
+}
+
+impl CompanionFootprint {
+    /// Is the cat rect `(x, w, top..bottom)` stacked on any companion rect?
+    #[must_use]
+    pub(crate) fn stacked_on(&self, x: i32, w: i32, top: i32, bottom: i32) -> bool {
+        self.rects
+            .iter()
+            .flatten()
+            .any(|rect| cat_is_stacked_on(*rect, x, w, top, bottom))
     }
 }
 
@@ -2415,6 +2498,22 @@ pub struct WordDecorations {
     /// ticks several panes per frame must not multiply it, while a host that
     /// never brackets keeps the historical one-prologue-per-tick behaviour.
     host_brackets_frames: bool,
+    /// THE ONE-BODY LAW: has a cursor-companion BODY already reached this
+    /// host frame's free stream?
+    ///
+    /// The host's own custody law decides WHICH companion owns a frame (the
+    /// resident pet or the flying head — `app_render::cursor_companion_duty`),
+    /// and the two emitters below are the only doors a companion body can come
+    /// through. This latch is the door lock, so a future host seam that
+    /// resolves a second companion cannot draw it: whichever body arrives
+    /// first owns the frame and the second is refused, which is precisely the
+    /// "two overlapping kitties" shape the owner reported.
+    ///
+    /// Armed only for a BRACKETING host ([`Self::host_brackets_frames`]) —
+    /// without a frame bracket there is no frame to be the one body of, and the
+    /// gallery/preview/test hosts that emit several companions into several
+    /// buffers from one engine are not drawing them into one frame.
+    companion_body_drawn: bool,
 }
 
 /// One pane's episode + grid state while another pane is bound.
@@ -2923,6 +3022,9 @@ impl WordDecorations {
     pub fn begin_host_frame(&mut self) {
         self.host_brackets_frames = true;
         self.cat_baker_ready = false;
+        // A new frame: the ONE-BODY LAW's door reopens for exactly one
+        // companion body ([`Self::companion_body_drawn`]).
+        self.companion_body_drawn = false;
     }
 
     /// Drop parked state for panes this window no longer shows, and unbind the
@@ -3548,6 +3650,12 @@ impl WordDecorations {
         if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
+        // THE ONE-BODY LAW ([`Self::companion_body_drawn`]): if the resident
+        // pet already put a body in this frame, the flying head does not get a
+        // second one — notes included, since they are the head's own stream.
+        if !self.claim_companion_body() {
+            return None;
+        }
         let footprint = placement.sample;
         debug_assert_eq!(
             Some(footprint),
@@ -3885,6 +3993,23 @@ impl WordDecorations {
         Some(fp)
     }
 
+    /// Claim this host frame's ONE companion body, or refuse.
+    ///
+    /// See [`Self::companion_body_drawn`]. The claim is taken at the top of an
+    /// emitter, before any baking: over-claiming on a frame whose bake then
+    /// misses costs nothing, because a frame only ever WANTS one body, and
+    /// under-claiming would be the bug itself.
+    fn claim_companion_body(&mut self) -> bool {
+        if !self.host_brackets_frames {
+            return true;
+        }
+        if self.companion_body_drawn {
+            return false;
+        }
+        self.companion_body_drawn = true;
+        true
+    }
+
     /// Emit the full-body **pet** ([`crate::kitty_pet`]) as one free sprite.
     ///
     /// The placement law is the whole difference between this and
@@ -3923,6 +4048,11 @@ impl WordDecorations {
         // `lane_alpha == 0` implies `alpha == 0` (the struct's invariant),
         // so nothing that used to draw is lost.
         if pet.lane_alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
+            return None;
+        }
+        // THE ONE-BODY LAW ([`Self::companion_body_drawn`]): the frame's one
+        // companion body, or nothing.
+        if !self.claim_companion_body() {
             return None;
         }
         self.cat_baker.set_free_tiles(true);
@@ -6642,33 +6772,14 @@ impl WordDecorations {
             sightings: &mut self.sightings,
             peek_cues: &mut self.peek_cues,
             // The companion's own footprint — see `CatTick::companion_px`.
-            // The resident PET hands in its LIVE drawn body (`body_px`):
-            // ~2.8 columns × 1.70 rows planted wherever the animal actually
-            // stands, routinely whole rows away from the caret, so the
-            // caret-anchored band below would let an ambient cat rise
-            // straight under it. The flying head carries no body rect and
-            // keeps the classic model.
-            companion_px: companion.and_then(|c| {
-                c.body_px.or_else(|| {
-                    let (row, col) = c.cell?;
-                    let cw = i32::from(geom.cell_w);
-                    let ch = i32::from(geom.cell_h);
-                    let x0 = i32::from(col) * cw;
-                    let y0 = i32::from(row) * ch;
-                    // Two cells wide from the caret column — the 3/4-cell lead
-                    // plus the body — and exactly the caret's own row band.
-                    //
-                    // The band is deliberately NOT grown upward to the
-                    // companion's full ~1.45-cell height. An ambient cat
-                    // peeking UP from a word several rows below legitimately
-                    // passes through the rows above the caret, and
-                    // `a_feline_word_away_from_the_caret_still_peeks_beside_
-                    // the_companion` pins that it must still draw. What must
-                    // not happen is a cat landing ON the caret, and a cat that
-                    // reaches the caret's own band is doing exactly that.
-                    Some((x0, x0 + 2 * cw, y0, y0 + ch))
-                })
-            }),
+            // BOTH animals hand in the rect the host is about to DRAW: the pet
+            // its ~2.8-column × 1.70-row body wherever its brain walked it, the
+            // flying head its lead-offset sprite (~1.75 cells right of the
+            // caret column, ~0.4 rows above the caret row). Neither sprite is
+            // at the caret cell, so a caret-anchored band alone under-covers
+            // both — the head by 96% of itself, which is exactly how an ambient
+            // cat drawn squarely ON the singing head sailed past this yield.
+            companion_px: companion.map_or_else(CompanionFootprint::default, |c| c.footprint(geom)),
         };
         let mut cats = 0usize;
         let mut animals = 0usize;
@@ -9150,19 +9261,26 @@ struct CatTick<'a> {
     /// the owner reported: two DIFFERENT coats stacked at the caret, because
     /// they are two different cats, not one drawn twice.
     ///
-    /// Sized to the companion's REAL extent, not to whole cells: the flying
-    /// head flies `KITTY_LEAD_NUM/DEN` of a cell ahead of the caret and stands
-    /// ~1.45 cells tall, so it reaches about two cells right of the caret
-    /// column and about half a cell above the caret row. A cell-granular box
-    /// was tried first and was too greedy — it swallowed the legitimate "peeks
-    /// BESIDE the companion" case that `a_feline_word_away_from_the_caret_
-    /// still_peeks_beside_the_companion` pins, where the away cat lands one
-    /// row clear. The resident PET is a different animal in a different
-    /// place — ~2.8 columns × 1.70 rows standing wherever its brain walked it
-    /// — so the host hands in its live drawn body
-    /// ([`crate::kitty_pet::PetFrame::body_px`] via
-    /// [`CompanionOnGlass::body_px`]) and that rect is used verbatim instead.
-    companion_px: Option<(i32, i32, i32, i32)>,
+    /// TWO RECTS, each sized to what is really there, never cell-granular:
+    ///
+    /// * the SPRITE ([`CompanionOnGlass::body_px`]) — for the pet its live
+    ///   ~2.8-column × 1.70-row body ([`crate::kitty_pet::PetFrame::body_px`]),
+    ///   for the flying head its lead-offset dest
+    ///   ([`WordDecorations::kitty_cursor_footprint`]). The head flies
+    ///   `KITTY_LEAD_NUM/DEN` of a cell past the caret cell's RIGHT EDGE and
+    ///   stands [`WordDecorations::COMPANION_CELL_H`] cells tall centred on the
+    ///   caret row, so it sits ~1.75 cells right of the caret column and ~0.4
+    ///   rows above the caret row — nowhere near the caret cell.
+    /// * the CARET BAND ([`CompanionOnGlass::guards_caret`]) — a 2-cell × 1-row
+    ///   box on the caret itself, kept only for the caret-escorting head, so an
+    ///   ambient cat can never land on the glyph being typed.
+    ///
+    /// A cell-granular box was tried first and was too greedy — it swallowed
+    /// the legitimate "peeks BESIDE the companion" case that
+    /// `a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`
+    /// pins, where the away cat lands one row clear. Unioning the two rects
+    /// would be greedier still; they are collided separately.
+    companion_px: CompanionFootprint,
 }
 
 /// Is the cat rect `(x, w, top..bottom)` STACKED on the companion box `a` —
@@ -9468,9 +9586,10 @@ fn emit_cat(
     // cat was SEEN". The episode and its one-shot live in the caller and are
     // untouched. A cat that merely stands NEXT to the companion still draws;
     // only a genuine overlap yields.
-    if ctx.companion_px.is_some_and(|box_px| {
-        cat_is_stacked_on(box_px, i32::from(g.x), i32::from(g.w), top, bottom)
-    }) {
+    if ctx
+        .companion_px
+        .stacked_on(i32::from(g.x), i32::from(g.w), top, bottom)
+    {
         return;
     }
     let n_free = free.len();
@@ -9696,9 +9815,7 @@ fn emit_animal(
     };
     // Yield to the companion in pixels, exactly like a cat: overlapping the
     // flying head or the resident pet draws nothing this frame.
-    if companion_px.is_some_and(|box_px| {
-        cat_is_stacked_on(box_px, i32::from(g.x), i32::from(g.w), top, bottom)
-    }) {
+    if companion_px.stacked_on(i32::from(g.x), i32::from(g.w), top, bottom) {
         return;
     }
     let pose = if in_dwell && !cfg.reduced_motion {
@@ -10753,6 +10870,214 @@ mod tests {
         );
         // Degenerate rects can never be judged stacked (no divide by zero).
         assert!(!cat_is_stacked_on(companion, 0, 0, 60, 60));
+    }
+
+    /// THE OWNER'S "two overlapping kitties", v2 (2026-08-21, on glass in
+    /// `rainbow kitty` with a sing-along holding the frame): the yield above is
+    /// sound, but for the FLYING HEAD it was collided against the wrong
+    /// rectangle. The head does not stand on the caret — it flies a 3/4-cell
+    /// LEAD past the caret cell's right edge and stands
+    /// [`WordDecorations::COMPANION_CELL_H`] cells tall centred on the caret
+    /// row, i.e. ~1.75 cells RIGHT of the caret column and ~0.4 rows ABOVE its
+    /// row. A caret-anchored 2×1 band and that sprite are very nearly disjoint,
+    /// so an ambient word-cat drawn SQUARELY ON the singing head covered only
+    /// ~4% of the band, sailed past the one-third threshold, and drew.
+    ///
+    /// Every rectangle here comes from the production
+    /// [`WordDecorations::kitty_cursor_footprint`], never a literal, so the
+    /// pin tracks the sprite rather than a transcription of it.
+    #[test]
+    fn an_ambient_cat_on_the_flying_head_yields_to_it() {
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 6,
+            cols: 20,
+        };
+        let cell = (3u16, 0u16);
+        let wd = WordDecorations::default();
+        let head = wd
+            .kitty_cursor_footprint(KittyCursorLayout {
+                geom,
+                cursor: cell,
+                look: KittyLook::default(),
+                bob: 0.0,
+            })
+            .expect("the head is placeable on a 20-column grid");
+        let head_rect = (
+            head.x,
+            head.x + i32::from(head.w),
+            head.y,
+            head.y + i32::from(head.h),
+        );
+        // The head really is off the caret cell — the premise of the bug.
+        assert!(
+            head.x >= i32::from(geom.cell_w),
+            "the head leads the caret column by more than a whole cell (x = {})",
+            head.x
+        );
+
+        // An ambient cat drawn exactly where the head is drawn.
+        let (cx, cw) = (head.x, i32::from(head.w));
+        let (ctop, cbot) = (head.y, head.y + i32::from(head.h));
+
+        let fixed = CompanionOnGlass::at_head(cell, head_rect).footprint(geom);
+        assert!(
+            fixed.stacked_on(cx, cw, ctop, cbot),
+            "a cat drawn on the flying head must yield to it"
+        );
+
+        // NEGATIVE CONTROL, and the reason this test fails without the fix:
+        // the old caret-band-only model lets that very same cat draw.
+        let caret_band_only = CompanionOnGlass::at_cell(cell).footprint(geom);
+        assert!(
+            !caret_band_only.stacked_on(cx, cw, ctop, cbot),
+            "the caret band alone cannot see the head — this WAS the bug"
+        );
+
+        // The caret band is kept, not replaced: a cat on the glyph being typed
+        // still yields (the promise `only_a_cat_stacked_on_the_companion_yields`
+        // pins), and it is the BAND that catches it, not the head rect.
+        assert!(
+            fixed.stacked_on(2, 20, 58, 82),
+            "a cat on the caret cell still yields"
+        );
+        assert!(
+            caret_band_only.stacked_on(2, 20, 58, 82),
+            "non-vacuous: the caret band is what catches the caret cat"
+        );
+
+        // …and the yield did NOT get greedier. The measured away cat from
+        // `a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`
+        // still draws — against BOTH rects, which is why they are collided
+        // separately instead of unioned.
+        assert!(
+            !fixed.stacked_on(8, 33, 76, 104),
+            "the away cat still peeks beside the companion"
+        );
+
+        // The resident PET guards its body and nothing else: it stands where
+        // its brain walked it and has no claim on the caret.
+        let pet = CompanionOnGlass::at_body(Some(cell), (100, 128, 40, 74)).footprint(geom);
+        assert!(
+            pet.stacked_on(100, 28, 40, 74),
+            "a cat on the pet's body yields to it"
+        );
+        assert!(
+            !pet.stacked_on(2, 20, 58, 82),
+            "the pet claims no caret band"
+        );
+    }
+
+    /// THE ONE-BODY LAW at the door the sprites come through: whichever
+    /// companion body lands first owns the host frame, and the second is
+    /// refused — the structural backstop behind the host's custody law.
+    #[test]
+    fn one_host_frame_admits_exactly_one_companion_body() {
+        use crate::kitty_cursor::CursorCatPlacementFrame;
+
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 6,
+            cols: 20,
+        };
+        let now = Instant::now();
+        let cell = (3u16, 4u16);
+        let head_frame = |wd: &mut WordDecorations, free: &mut Vec<FreeSprite>| {
+            let layout = KittyCursorLayout {
+                geom,
+                cursor: cell,
+                look: KittyLook::default(),
+                bob: 0.0,
+            };
+            let placement = wd
+                .resolve_kitty_cursor_placement(
+                    layout,
+                    CursorCatPlacementFrame {
+                        sampled_at: now,
+                        fold: None,
+                        facing_left: false,
+                    },
+                )
+                .expect("placeable companion");
+            wd.kitty_cursor_at_placement(
+                KittyCursorFrame {
+                    geom,
+                    cursor: cell,
+                    look: layout.look,
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                placement,
+                free,
+            )
+        };
+
+        // POSITIVE VERDICT FIRST: in its own frame the head really does draw,
+        // so the refusal below is a refusal and not an empty emitter.
+        let mut wd = WordDecorations::default();
+        wd.begin_host_frame();
+        let mut alone = Vec::new();
+        assert!(
+            head_frame(&mut wd, &mut alone).is_some() && !alone.is_empty(),
+            "non-vacuous: the flying head emits a body in a frame of its own"
+        );
+
+        // Now a frame the PET has already claimed. Same call, no body.
+        wd.begin_host_frame();
+        let mut free = Vec::new();
+        let pet =
+            crate::kitty_pet::PetBrain::default().tick_static_capture(crate::kitty_pet::PetSense {
+                now,
+                caret: Some(cell),
+                rows: geom.rows,
+                cols: geom.cols,
+                cell_w: geom.cell_w,
+                cell_h: geom.cell_h,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            });
+        assert!(pet.alpha > 0, "non-vacuous: the pet is on glass");
+        assert!(
+            wd.pet_cursor(
+                PetCursorFrame {
+                    geom,
+                    colors: CatColorKey::default(),
+                    coat: 0,
+                    iris: 0,
+                    pet,
+                },
+                &mut free,
+            )
+            .is_some(),
+            "the pet claims the frame"
+        );
+        let after_pet = free.len();
+        assert!(after_pet > 0, "non-vacuous: the pet body landed");
+        assert!(
+            head_frame(&mut wd, &mut free).is_none(),
+            "the flying head may not add a second body to the pet's frame"
+        );
+        assert_eq!(
+            free.len(),
+            after_pet,
+            "not one sprite — notes included — from the refused companion"
+        );
+
+        // The door reopens with the next frame.
+        wd.begin_host_frame();
+        let mut next = Vec::new();
+        assert!(
+            head_frame(&mut wd, &mut next).is_some(),
+            "the next frame admits a companion again"
+        );
     }
 
     // The ignored performance gates share the same test binary. `cargo test`

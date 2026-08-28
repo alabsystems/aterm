@@ -2875,7 +2875,7 @@ fn security_label(key: &str) -> &'static str {
 /// Truthful copy for `motion = "auto"` differs with the shipping platform
 /// seam: macOS observes Reduce Motion live, Windows samples its animations
 /// switch when a window attaches, and other platforms have no OS query yet.
-fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) {
+pub(crate) fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) {
     match target_os {
         "macos" => (
             "auto (follows live macOS Reduce Motion)",

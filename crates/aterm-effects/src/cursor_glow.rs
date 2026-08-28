@@ -20330,6 +20330,13 @@ fn rainbow_momentum_bands(col: f32, row: f32, phase: f32, disp: f32) -> [u32; 6]
     for (c, &hsv) in b.iter_mut().zip(RAINBOW_BANDS_HSV.iter()) {
         *c = rotate_hue(hsv, hue_off);
     }
+    // No anchor needs a swing clamp on this palette: the nearest anchor to
+    // the measured cyan band [165, 195] is blue at 240°, which bottoms out at
+    // 225.6° under the full ±14.4° swing. (The azure palette DID need one —
+    // 204° rotated to 189.6°, inside the band — and if an anchor is ever
+    // moved back toward the band, `hot_momentum_spectrum_carries_no_cyan`
+    // is the tripwire: it sweeps THESE rotated bands and fails on the first
+    // saturated in-band pixel.)
     b
 }
 
@@ -31226,7 +31233,19 @@ mod tests {
         let (r, g, b) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
         let hi = r.max(g).max(b);
         let lo = r.min(g).min(b);
-        hi.saturating_sub(lo) > 12 && lo < 100
+        let chroma = hi.saturating_sub(lo);
+        // TWO CLAUSES. The first is the historical rule and described a FULLY
+        // SATURATED spectrum: real chroma with a low floor. The green→blue
+        // crossing is now a pastel bridge (S = 0.33 — see the cyan essay in
+        // `rainbow_gradient_of`), and quads are stored PREMULTIPLIED by their
+        // coverage, so a bridge-hued highlighter quad at the quiet
+        // [`RAINBOW_HIGHLIGHTER_GAIN`] arrives as e.g. (17, 26, 23): chroma 9,
+        // under the absolute floor even though the colour is unmistakably of
+        // the spectrum. Saturation survives premultiplication, so the second
+        // clause admits by RATIO — S ≥ 0.25 with any real chroma at all.
+        // Near-white glints (high floor, tiny ratio) and neutral scrims fail
+        // both clauses exactly as they always did.
+        (chroma > 12 && lo < 100) || (chroma > 3 && chroma * 4 >= hi)
     }
 
     /// The distinct cell columns (`(x - origin_x) / cw`) a ribbon occupies on
@@ -31238,6 +31257,46 @@ mod tests {
             .filter(|q| q.row == row && is_ribbon_quad(q.color))
             .map(|q| (q.x - g.origin_x) / g.cw as u16)
             .collect()
+    }
+
+    /// THE HOT CYAN CENSUS — the momentum-rotated twin of
+    /// `cursor_rainbow::caret_spectrum_cyan_census` (which sweeps the COLD
+    /// anchors only). At full momentum the iridescence rotates the six
+    /// anchors ±14.4°, which is precisely how azure (204°) used to reach
+    /// 189.6° — inside the [165, 195] cyan band — as a saturated segment
+    /// ENDPOINT no crossing bridge could shade. The swing clamp in
+    /// [`rainbow_momentum_bands`] holds azure at its own hue on the downward
+    /// half of the swing; this census is what makes the clamp permanent.
+    /// Remove it and the negative-rotation phases here count saturated
+    /// in-band pixels immediately.
+    #[test]
+    fn hot_momentum_spectrum_carries_no_cyan() {
+        let mut cyan = 0usize;
+        let mut total = 0usize;
+        let mut worst: Option<(f32, u32)> = None;
+        for phase_step in 0..64 {
+            let phase = phase_step as f32 / 64.0 * RAINBOW_PHASE_RING;
+            for (col, row) in [(0.0, 0.0), (7.0, 1.0), (19.0, 3.0), (41.0, 12.0)] {
+                let bands = rainbow_momentum_bands(col, row, phase, 1.0);
+                for i in 0..=256 {
+                    let rgb = rainbow_gradient_of(&bands, i as f32 / 256.0);
+                    let (h, s, v) = crate::color_math::rgb2hsv(rgb);
+                    total += 1;
+                    if (165.0..=195.0).contains(&h) && s >= 0.35 && v * 255.0 >= 110.0 {
+                        cyan += 1;
+                        if worst.is_none_or(|(wh, _)| (h - 180.0).abs() < (wh - 180.0).abs()) {
+                            worst = Some((h, rgb));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cyan, 0,
+            "ROYGBIV has no cyan, hot or cold: {cyan} of {total} rotated-band \
+             samples landed in hue [165, 195] at S >= 0.35, V >= 110/255 \
+             (worst: {worst:?})"
+        );
     }
 
     /// EASED MOMENTUM SPINE — DOES NOT STEP: after a fast burst the spine LAGS the

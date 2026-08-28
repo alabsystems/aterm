@@ -347,6 +347,18 @@ impl App {
     /// [`crate::notice::TransientNotice::gesture_failure`]): every call site
     /// pairs this with the stderr line that carries the full error — the card
     /// answers the person, the log answers the investigator.
+    /// [`Self::surface_nonmodal_update_status`] with an explicit lifetime — for
+    /// the handoff cards, which must outlive the freeze they explain rather than
+    /// fading out in the middle of it.
+    pub(crate) fn surface_update_status_for(&mut self, text: &str, ttl: std::time::Duration) {
+        self.notice = Some(crate::notice::TransientNotice::update_status_for(
+            text,
+            ttl,
+            std::time::Instant::now(),
+        ));
+        self.request_redraw_all_windows();
+    }
+
     pub(crate) fn surface_gesture_failure(&mut self, text: &str) {
         self.notice = Some(crate::notice::TransientNotice::gesture_failure(
             text,

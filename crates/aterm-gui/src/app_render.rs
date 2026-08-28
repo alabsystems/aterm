@@ -3021,8 +3021,20 @@ mod canonical_layout_scheduler_tests {
     /// * THE PLANES. `prepare_native_input_scratch` opens with `fill_divider_grid`,
     ///   whose `clear_effect_overlays_for_compose` half empties every host bling
     ///   plane — the free-sprite plane above all, which is where the pet body and its
-    ///   mote lane live. Neuter its `free_sprites`/`free_atlas`/`nova_add`/
-    ///   `cursor_glow_add` lines and this test fails with both sprites still aboard.
+    ///   mote lane live.
+    ///
+    ///   CORRECTION (the review of this commit ran the experiment this comment used
+    ///   to claim). Neutering only `clear_effect_overlays_for_compose`'s
+    ///   `free_sprites`/`free_atlas` lines does NOT fail this test, and the earlier
+    ///   wording — "and this test fails with both sprites still aboard" — was wrong.
+    ///   `prepare_layout_coordinate_space` runs FIRST and its
+    ///   `retire_torn_cursor_fx` → `suppress_torn_cursor_projection` already clears
+    ///   `free_sprites`, `free_atlas`, `cursor_glow_add`, `cat_quads` and `cat_atlas`
+    ///   on this edge. So the sprite plane has TWO independent guards, not one, and
+    ///   what this bullet genuinely pins alone is `nova_add`: neuter the whole
+    ///   function body and the failure lands on the supernova/cursor-light assertion,
+    ///   not the free-sprite one. Good news for the product, and the reason the
+    ///   correction is recorded here rather than quietly dropped.
     /// * THE BRAIN. The front-content identity fence (`lib.rs`'s `sync_window` arm,
     ///   `retire_cursor_pet_coordinate_space`) fires first on this edge, and
     ///   `prepare_layout_coordinate_space` → `retire_torn_cursor_fx` backs it up
@@ -6134,27 +6146,68 @@ pub(crate) fn retire_pet_without_owner(
     }
 }
 
-/// Describe the one cursor companion actually drawn on this frame.
+/// Describe the one cursor companion actually drawn on this frame, for the
+/// ambient word-cats' pixel yield.
+///
+/// Driven by [`CompanionDuty`], the same value the emitters match on, so the
+/// rect handed to the engine always belongs to the sprite that is really
+/// drawn. That identity is the whole fix for the owner's "two overlapping
+/// kitties": the yield used to model the FLYING HEAD as a 2-cell band on the
+/// caret, while the head actually flies ~1.75 cells right of the caret column
+/// and ~0.4 rows above its row. An ambient cat drawn squarely ON the singing
+/// head intersected that band by under 5% of itself, sailed past the
+/// one-third stacking threshold, and drew a second kitty on top of the first.
 ///
 /// The resident pet's exact body is authoritative and may outlive a visible
 /// caret for the bounded DECTCEM fade. In that case `cell` stays `None`: the
 /// ambient-word engine receives the real pixel ownership without inventing a
-/// stale caret anchor. The classic flying head has no independent placement,
-/// so it can claim glass only while a visible cursor cell exists.
+/// stale caret anchor.
+///
+/// `head_px` is the flying head's live footprint
+/// ([`crate::word_decorations::WordDecorations::kitty_cursor_footprint`], the
+/// same rect `kitty_cursor_at_placement` debug-asserts its placement against).
+/// `None` degrades to the caret band alone — honest for a host that cannot
+/// resolve it, never correct for one that can.
 #[inline]
 pub(crate) fn cursor_companion_on_glass(
+    duty: CompanionDuty,
     cursor: Option<(u16, u16)>,
-    kitty_alpha: u8,
+    head_px: Option<(i32, i32, i32, i32)>,
     pet_body_px: Option<(i32, i32, i32, i32)>,
 ) -> Option<crate::word_decorations::CompanionOnGlass> {
-    if let Some(body_px) = pet_body_px {
-        return Some(crate::word_decorations::CompanionOnGlass::at_body(
-            cursor, body_px,
-        ));
+    match duty {
+        CompanionDuty::Idle => None,
+        CompanionDuty::Pet => pet_body_px
+            .map(|body_px| crate::word_decorations::CompanionOnGlass::at_body(cursor, body_px)),
+        CompanionDuty::FlyingHead { cell } => Some(head_px.map_or_else(
+            || crate::word_decorations::CompanionOnGlass::at_cell(cell),
+            |head_px| crate::word_decorations::CompanionOnGlass::at_head(cell, head_px),
+        )),
     }
-    cursor
-        .filter(|_| kitty_alpha > 0)
-        .map(crate::word_decorations::CompanionOnGlass::at_cell)
+}
+
+/// The flying head's live drawn rect in grid pixels `(x0, x1, y0, y1)`, for
+/// the ambient word-cats' pixel yield.
+///
+/// Pure and cheap: [`crate::word_decorations::WordDecorations::kitty_cursor_footprint`]
+/// takes `&self`, latches nothing, and is exactly what the emitter's own
+/// placement is debug-asserted to equal — so this may be called BEFORE the
+/// word tick, which is where the yield box is needed and hours before the
+/// placement is resolved.
+pub(crate) fn flying_head_footprint_px(
+    word_decos: &crate::word_decorations::WordDecorations,
+    geom: crate::word_decorations::EffectGeom,
+    cell: (u16, u16),
+    look: aterm_effects::kitty_registry::KittyLook,
+    bob: f32,
+) -> Option<(i32, i32, i32, i32)> {
+    let fp = word_decos.kitty_cursor_footprint(crate::word_decorations::KittyCursorLayout {
+        geom,
+        cursor: cell,
+        look,
+        bob,
+    })?;
+    Some((fp.x, fp.x + i32::from(fp.w), fp.y, fp.y + i32::from(fp.h)))
 }
 
 /// Feed the resident pet the presentation context shared by live glass and
@@ -6351,7 +6404,11 @@ pub(crate) fn emit_single_cursor_companion(
     accent: u32,
 ) -> u64 {
     let mut fp = 0;
-    if pet_on_glass {
+    // ONE BODY, ONE MATCH ([`CompanionDuty`]). Two independent `if`s used to
+    // stand here — a shape in which a future seam that set both alphas would
+    // silently draw two companions. The match makes that unrepresentable.
+    let duty = cursor_companion_duty(pet_on_glass, kitty_alpha, cursor);
+    if let CompanionDuty::Pet = duty {
         let look = cat_frame.look.normalized();
         let (coat, iris) = sync_pet_companion_look(ws, look, present, now);
         let colors = ws.cursor_pet.appearance_colors().unwrap_or_else(|| {
@@ -6388,9 +6445,7 @@ pub(crate) fn emit_single_cursor_companion(
         }
     }
 
-    if kitty_alpha > 0
-        && let Some(cell) = cursor
-    {
+    if let CompanionDuty::FlyingHead { cell } = duty {
         let layout = aterm_effects::word_decorations::KittyCursorLayout {
             geom,
             cursor: cell,
@@ -6445,8 +6500,9 @@ pub(crate) fn emit_single_cursor_companion(
 #[cfg(test)]
 mod resident_pet_presentation_tests {
     use super::{
-        cursor_companion_on_glass, prepare_resident_pet_tick, resident_pet_presentation_enabled,
-        shed_companion_alpha, shed_companion_presentable, shed_envelope_transitioning,
+        CompanionDuty, cursor_companion_duty, cursor_companion_on_glass,
+        prepare_resident_pet_tick, resident_pet_presentation_enabled, shed_companion_alpha,
+        shed_companion_presentable, shed_envelope_transitioning,
     };
     use crate::cursor_glow::GlowStyle;
     use crate::word_decorations::WordDecorations;
@@ -6496,7 +6552,7 @@ mod resident_pet_presentation_tests {
     #[test]
     fn hidden_caret_keeps_exact_resident_body_custody_without_a_stale_cell() {
         let body = (37, 66, 48, 82);
-        let fading = cursor_companion_on_glass(None, 0, Some(body))
+        let fading = cursor_companion_on_glass(CompanionDuty::Pet, None, None, Some(body))
             .expect("a visible fading pet still owns glass");
         assert_eq!(fading.cell, None, "DECTCEM supplies no honest caret cell");
         assert_eq!(
@@ -6504,15 +6560,78 @@ mod resident_pet_presentation_tests {
             Some(body),
             "the emitted body is the yield box"
         );
-
         assert!(
-            cursor_companion_on_glass(None, 255, None).is_none(),
+            !fading.guards_caret,
+            "the pet stands where its brain walked it and has no caret claim"
+        );
+
+        assert_eq!(
+            cursor_companion_duty(false, 255, None),
+            CompanionDuty::Idle,
             "the flying head may not guess a hidden cursor anchor"
         );
-        let flying = cursor_companion_on_glass(Some((4, 9)), 255, None)
+        assert!(
+            cursor_companion_on_glass(CompanionDuty::Idle, None, None, None).is_none(),
+            "an idle frame owns no glass"
+        );
+
+        // THE OWNER'S BUG: the head is NOT at the caret, so a caret band alone
+        // under-covers it and an ambient cat drawn on the head sails through
+        // the yield. The rect handed in must be the sprite's own.
+        let head = (26, 85, 73, 123);
+        let duty = cursor_companion_duty(false, 255, Some((4, 9)));
+        assert_eq!(duty, CompanionDuty::FlyingHead { cell: (4, 9) });
+        let flying = cursor_companion_on_glass(duty, Some((4, 9)), Some(head), None)
             .expect("a visible classic kitty owns its caret");
         assert_eq!(flying.cell, Some((4, 9)));
-        assert_eq!(flying.body_px, None);
+        assert_eq!(flying.body_px, Some(head), "the head's REAL drawn rect");
+        assert!(
+            flying.guards_caret,
+            "the escorting head guards the caret cell as well as its sprite"
+        );
+        let degraded = cursor_companion_on_glass(duty, Some((4, 9)), None, None)
+            .expect("an unresolved footprint still claims the caret band");
+        assert_eq!(degraded.body_px, None);
+        assert!(degraded.guards_caret);
+    }
+
+    #[test]
+    fn exactly_one_companion_can_own_a_frame_even_if_both_alphas_arrive() {
+        // Both alphas positive at once is not reachable through the custody
+        // law ([`pet_companion_admitted`] is the exact complement of
+        // [`flying_kitty_admitted`] in pet mode) — which is why the SHAPE
+        // matters: a future seam that broke that complement must still not be
+        // able to draw two bodies. The pet, as the resident, wins.
+        assert_eq!(
+            cursor_companion_duty(true, 255, Some((4, 9))),
+            CompanionDuty::Pet,
+        );
+        // The yield box then describes the PET, never the head, so an ambient
+        // cat is never told to avoid a sprite that is not there.
+        let pet_body = (37, 66, 48, 82);
+        let head = (26, 85, 73, 123);
+        let on_glass = cursor_companion_on_glass(
+            cursor_companion_duty(true, 255, Some((4, 9))),
+            Some((4, 9)),
+            Some(head),
+            Some(pet_body),
+        )
+        .expect("the pet owns the frame");
+        assert_eq!(on_glass.body_px, Some(pet_body));
+        assert!(!on_glass.guards_caret);
+        // Negative control: with the pet off glass the very same inputs hand
+        // the frame to the head, so the assertion above is not vacuous.
+        assert_eq!(
+            cursor_companion_on_glass(
+                cursor_companion_duty(false, 255, Some((4, 9))),
+                Some((4, 9)),
+                Some(head),
+                Some(pet_body),
+            )
+            .expect("the head owns the frame")
+            .body_px,
+            Some(head),
+        );
     }
 
     #[test]
@@ -10081,6 +10200,50 @@ pub(crate) fn flying_kitty_admitted(pet_mode: bool, sing: f32) -> bool {
 /// pet-mode frame, including the song's wind-down.
 pub(crate) fn pet_companion_admitted(pet_visible: bool, sing: f32) -> bool {
     pet_visible && !flying_kitty_admitted(true, sing)
+}
+
+/// WHICH companion — at most ONE, always — puts a body in this frame.
+///
+/// [`flying_kitty_admitted`] and [`pet_companion_admitted`] compute two
+/// ALPHAS, and an alpha is only a permission. This is the custody law as a
+/// single value, so the emitters cannot draw two bodies even if both alphas
+/// somehow arrived positive: there is one variant, one match, one sprite.
+/// Every seam that must agree about the companion reads it —
+/// [`emit_single_cursor_companion`], `compose_cursor_companion`, and
+/// [`cursor_companion_on_glass`], which is how the ambient word-cats' pixel
+/// yield is guaranteed to describe the sprite that is really drawn rather than
+/// the other animal's.
+///
+/// THE PET WINS A TIE. It is the resident; the flying head is the earned
+/// flypast, and in pet mode it is admitted only for the sing-along, exactly
+/// when `pet_companion_admitted` is false. A tie is therefore already
+/// impossible upstream — this makes it impossible downstream too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompanionDuty {
+    /// No companion body this frame.
+    Idle,
+    /// The full-body resident pet ([`aterm_effects::kitty_pet`]).
+    Pet,
+    /// The earned flying head ([`crate::kitty_cursor`]), escorting the caret
+    /// at `cell`.
+    FlyingHead { cell: (u16, u16) },
+}
+
+/// Resolve [`CompanionDuty`] from this frame's two already-gated alphas.
+pub(crate) fn cursor_companion_duty(
+    pet_on_glass: bool,
+    kitty_alpha: u8,
+    cursor: Option<(u16, u16)>,
+) -> CompanionDuty {
+    if pet_on_glass {
+        return CompanionDuty::Pet;
+    }
+    match cursor {
+        // The head has no independent placement: it can claim glass only while
+        // a visible cursor cell exists to escort.
+        Some(cell) if kitty_alpha > 0 => CompanionDuty::FlyingHead { cell },
+        _ => CompanionDuty::Idle,
+    }
 }
 
 /// Cursor companions are active-grid decorations. Keep the broader decoration
@@ -23395,6 +23558,11 @@ impl App {
             // but only one companion is put on glass.
             let pet_on_glass =
                 pet_companion_admitted(pet_visible, cat_frame.sing) && pet_frame.alpha > 0;
+            // THE FRAME'S ONE COMPANION ([`CompanionDuty`]), resolved once and
+            // read by both the ambient word-cats' yield box below and
+            // [`emit_single_cursor_companion`] — so the rect the word engine
+            // avoids is always the sprite the emitter really draws.
+            let companion_duty = cursor_companion_duty(pet_on_glass, kitty_alpha, cur);
             // PETTING (wave 1): stash the body the emitter is about to draw,
             // in FRAME px, for the mouse seam's hit test — and CLEAR it on
             // every frame the pet is not drawn, so a stale rect can never
@@ -23538,8 +23706,22 @@ impl App {
                         // 1.70-row animal standing wherever its brain walked
                         // it, not the flying head's caret-anchored band.
                         cursor_companion_on_glass(
+                            companion_duty,
                             cur,
-                            kitty_alpha,
+                            // The HEAD's real rect, resolved from the same pure
+                            // footprint the emitter's placement is asserted
+                            // against. Before the tick because the tick is what
+                            // needs it; the emitter re-resolves it below.
+                            match companion_duty {
+                                CompanionDuty::FlyingHead { cell } => flying_head_footprint_px(
+                                    &ws.word_decos,
+                                    effect_geom,
+                                    cell,
+                                    cat_frame.render_look(),
+                                    cat_frame.bob,
+                                ),
+                                _ => None,
+                            },
                             pet_on_glass
                                 .then(|| {
                                     pet_frame.body_px(
@@ -26916,9 +27098,12 @@ impl App {
             // focused pane (see `compose_pet_companion`), so the rect is
             // already in this pane's pixel space, same as the word-cats'.
             let companion_pet = ctx.pet_visible && ctx.pet.alpha > 0;
+            let companion_duty =
+                cursor_companion_duty(companion_pet, ctx.kitty_alpha, ctx.focus_cursor);
             let companion_at = (input.session == ctx.focus)
                 .then(|| {
                     cursor_companion_on_glass(
+                        companion_duty,
                         // `input.cursor` is the scanner's live-grid coordinate
                         // and deliberately survives DECTCEM. Companion custody
                         // may not: the resident pet can keep fading at its exact
@@ -26928,7 +27113,19 @@ impl App {
                         // visible-caret truth shared by composed glass and
                         // composed capture.
                         ctx.focus_cursor,
-                        ctx.kitty_alpha,
+                        // The flying head's real rect, in this pane's pixel
+                        // space — the same space the pane's word-cats live in,
+                        // because the emitter draws it at this pane's geometry.
+                        match companion_duty {
+                            CompanionDuty::FlyingHead { cell } => flying_head_footprint_px(
+                                &ws.word_decos,
+                                geom,
+                                cell,
+                                ctx.cat_frame.render_look(),
+                                ctx.cat_frame.bob,
+                            ),
+                            _ => None,
+                        },
                         companion_pet
                             .then(|| {
                                 ctx.pet
@@ -27232,14 +27429,15 @@ impl App {
         // present (outside this function, which the sparkle master can skip), so
         // this is pure emission.
         //
-        // `pet_visible` already carries the shared one-companion custody gate.
-        if ctx.pet_visible {
-            return self.compose_pet_companion(wid, ctx, focus_place);
-        }
-        if ctx.kitty_alpha == 0 {
-            return 0;
-        }
-        let (Some(place), Some(cell)) = (focus_place, ctx.focus_cursor) else {
+        // `pet_visible` already carries the shared one-companion custody gate;
+        // [`CompanionDuty`] is that gate as ONE value, matched here and in the
+        // single-pane twin so neither path can put two bodies in a frame.
+        let cell = match cursor_companion_duty(ctx.pet_visible, ctx.kitty_alpha, ctx.focus_cursor) {
+            CompanionDuty::Pet => return self.compose_pet_companion(wid, ctx, focus_place),
+            CompanionDuty::Idle => return 0,
+            CompanionDuty::FlyingHead { cell } => cell,
+        };
+        let Some(place) = focus_place else {
             return 0;
         };
         let reduced = !ctx.animate_cat;

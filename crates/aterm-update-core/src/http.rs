@@ -982,6 +982,27 @@ fn download_resume_args<'a>(
     args
 }
 
+/// The `https`-only pin for the VENDOR lane, prepended to [`download_resume_args`].
+///
+/// `--proto-redir =https` (already on every lane) constrains where a REDIRECT may land;
+/// `--proto =https` constrains the INITIAL request too. `require_https_url` checks the
+/// URL's spelling, and this makes curl enforce the same rule on the wire — a second,
+/// independent gate for the one lane whose URL is a vendor's, not GitHub's. The release
+/// lanes are deliberately untouched (byte-for-byte historical argv).
+const HTTPS_ONLY_ARGS: [&str; 2] = ["--proto", "=https"];
+
+/// [`download_resume_args`] with the initial-request scheme pinned to `https` as well.
+fn download_resume_args_https_only<'a>(
+    cap: &'a str,
+    max_time: &'a str,
+    dest: &'a str,
+    offset: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args: Vec<&str> = HTTPS_ONLY_ARGS.to_vec();
+    args.extend(download_resume_args(cap, max_time, dest, offset));
+    args
+}
+
 /// Download an asset to `dest`, RESUMABLY: bytes land in a sibling `<dest>.part` that
 /// SURVIVES a failed attempt, and the next call continues from where the last one
 /// stopped. On success the part is renamed onto `dest`, so `dest` only ever exists
@@ -1029,6 +1050,38 @@ pub fn download_to_resumable(
     dest: &Path,
     max_filesize: u64,
 ) -> Result<(), String> {
+    download_to_resumable_with(asset_url, token, dest, max_filesize, false)
+}
+
+/// [`download_to_resumable`] for a VENDOR-hosted asset: identical transfer, `.part`
+/// lifecycle and cap arithmetic, with curl's own scheme pin (`--proto =https`) added
+/// beside the redirect pin so neither the first hop nor any redirect can leave https.
+///
+/// Intended to be called with `token = None` — a vendor host is never GitHub, and the
+/// GitHub credential must not be presented to it. The lane does not enforce that (the
+/// caller's fetcher owns "which credential goes where"), but it documents it.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_to_resumable_https_only(
+    asset_url: &str,
+    token: Option<&str>,
+    dest: &Path,
+    max_filesize: u64,
+) -> Result<(), String> {
+    download_to_resumable_with(asset_url, token, dest, max_filesize, true)
+}
+
+/// The shared body of [`download_to_resumable`] / [`download_to_resumable_https_only`];
+/// `https_only` selects the argv builder and nothing else.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+fn download_to_resumable_with(
+    asset_url: &str,
+    token: Option<&str>,
+    dest: &Path,
+    max_filesize: u64,
+    https_only: bool,
+) -> Result<(), String> {
     require_https_url(asset_url)?;
     let Some(part) = part_path(dest) else {
         return Err("destination has no file name".to_string());
@@ -1058,11 +1111,12 @@ pub fn download_to_resumable(
         let offset_text = plan.offset.to_string();
         // `None` at offset 0: a fresh transfer must carry no range at all.
         let offset = (plan.offset > 0).then_some(offset_text.as_str());
-        let out = curl_fetch(
-            &download_resume_args(&cap, &max_time, part_s, offset),
-            asset_url,
-            token,
-        )?;
+        let args = if https_only {
+            download_resume_args_https_only(&cap, &max_time, part_s, offset)
+        } else {
+            download_resume_args(&cap, &max_time, part_s, offset)
+        };
+        let out = curl_fetch(&args, asset_url, token)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // A RESUMED attempt the server refused at the range itself: discard the
@@ -1130,7 +1184,8 @@ mod tests {
     use super::{
         HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, conditional_args, curl_argv,
         curl_bin, curl_fetch, curl_prepared, download_bytes_args, download_max_time_secs,
-        download_resume_args, download_to_args, download_to_resumable, etag_from_header_dump,
+        download_resume_args, download_resume_args_https_only, download_to_args,
+        download_to_resumable, download_to_resumable_https_only, etag_from_header_dump,
         is_not_modified, keep_partial, part_path, range_refused, resume_plan, token_config_safe,
         transient_api_status, validator_safe,
     };
@@ -1741,6 +1796,43 @@ mod tests {
             !resumed.contains(&"--"),
             "no caller-side end-of-options marker"
         );
+    }
+
+    /// The VENDOR lane pins the scheme on BOTH hops: `--proto =https` for the initial
+    /// request and `--proto-redir =https` for every redirect — and is otherwise the
+    /// historical resumable argv, byte for byte (the release lanes keep theirs unchanged).
+    #[test]
+    fn the_vendor_lane_pins_https_on_the_first_hop_and_every_redirect() {
+        let plain = download_resume_args("100", "600", "/s/claude.part", None);
+        let pinned = download_resume_args_https_only("100", "600", "/s/claude.part", None);
+        assert_eq!(&pinned[..2], ["--proto", "=https"]);
+        assert_eq!(
+            &pinned[2..],
+            &plain[..],
+            "everything after the pin is the plain argv"
+        );
+        let redir = pinned
+            .iter()
+            .position(|a| *a == "--proto-redir")
+            .expect("redirect pin present");
+        assert_eq!(pinned[redir + 1], "=https");
+        // The release lane is untouched: no `--proto` on its own.
+        assert!(!plain.contains(&"--proto"), "{plain:?}");
+        // Resume flags ride behind the pin exactly as before.
+        let resumed = download_resume_args_https_only("60", "600", "/s/claude.part", Some("40"));
+        assert_eq!(resumed.len(), pinned.len() + 2);
+        assert_eq!(&resumed[resumed.len() - 2..], ["--continue-at", "40"]);
+        // And the scheme gate still refuses a non-https URL before spawning anything.
+        let dir = std::env::temp_dir().join(format!("aterm-vendor-lane-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let err =
+            download_to_resumable_https_only("http://example.invalid/x", None, &dir.join("x"), 10)
+                .unwrap_err();
+        assert!(err.contains("non-https"), "{err}");
+        let err =
+            download_to_resumable("ftp://example.invalid/x", None, &dir.join("x"), 10).unwrap_err();
+        assert!(err.contains("non-https"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The anti-wedge rule: a failed attempt keeps its prefix only if it MOVED. A 416

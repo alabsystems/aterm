@@ -725,6 +725,18 @@ impl crate::flow::Fetcher for GithubFetcher {
         Err(msg)
     }
 
+    fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
+        // THE VENDOR LANE. The URL is the roster-signed row's own (already admitted by
+        // `vendor::check_row`: https, allow-listed host), so no slug, no override, no
+        // release listing is consulted — nothing about this fetcher's account reaches
+        // the request. And NO CREDENTIAL: the GitHub token is for GitHub; a vendor host
+        // (and `github.com` release downloads need none either) must never see it, so
+        // this lane presents `None` unconditionally rather than `self.credential()`.
+        // `cap` is the signed `size`, exactly. Resumable like every big transfer, and
+        // the https pin covers the first hop as well as every redirect.
+        aterm_update_core::download_to_resumable_https_only(url, None, dest, cap)
+    }
+
     fn source_id(&self) -> String {
         format!("github:{}/{}", self.owner, crate::discovery::index_repo())
     }
@@ -987,6 +999,14 @@ impl crate::flow::Fetcher for ChainFetcher {
                     .download_for(program, repo, asset, dest)
                     .map_err(|e2| chain_err(&e2, &e1))
             })
+    }
+
+    fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
+        // The PRIMARY (network) leg only. A vendor URL names bytes the sealed seed never
+        // carries — third-party bytes are never sealed — so the local leg has nothing to
+        // offer and must not be asked (its default refuses anyway; skipping it keeps the
+        // error the user sees the network's, not a spurious "cannot fetch" from the seed).
+        self.primary.download_url(url, dest, cap)
     }
 
     fn source_id(&self) -> String {

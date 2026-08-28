@@ -11,9 +11,14 @@
 //!
 //! 1. **Download integrity** — the COMPRESSED asset's SHA-256 equals the signed
 //!    `artifact.sha256`. A corrupted/substituted download is refused before extraction.
-//! 2. **Tar-slip-safe extraction** — into a scratch SIBLING of the build dir via
-//!    [`crate::extract::extract_tar_zst`] (every entry vetted; size-capped from the signed
-//!    `disk_installed`). The live tree is never extracted over.
+//! 2. **Slip-safe staging** — into a scratch SIBLING of the build dir, through the lane
+//!    the signed row's `payload` names ([`stage_payload`]): the historical `.tar.zst`
+//!    extraction for a release bundle, or one of the `https` protocol lanes (`tar-zst` /
+//!    `tar-gz` / `zip` archives with `strip_components` and in-root symlinks, a
+//!    `raw-binary` that becomes `bin/<entry>`, a `dmg` whose single `.app` is copied
+//!    out of the mounted image), then the row's `links` as relative symlinks under
+//!    `bin/`. Every archive entry is vetted before a byte is written and size-capped from
+//!    the signed `disk_installed`. The live tree is never extracted over.
 //! 3. **Apply-time re-verify (TOCTOU)** — the extracted tree's [`crate::tree::tree_root`]
 //!    equals the signed `artifact.tree_root` (when the producer set one). An already-
 //!    extracted tree can't be re-checked against the compressed `sha256`, so this closes
@@ -29,9 +34,13 @@
 //! build never reaches activation, and **a stage that cannot install the new build must not
 //! have uninstalled the old one**.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
-use crate::extract::{ExtractError, extract_tar_zst_rooted};
+use crate::extract::{
+    ExtractError, ExtractOptions, TreeAccumulator, extract_tar_gz_tree, extract_tar_zst_tree,
+    extract_zip_tree,
+};
 use crate::manifest::Artifact;
 use crate::tree::{file_sha256, tree_root};
 
@@ -58,6 +67,12 @@ pub enum StageError {
     Extract(ExtractError),
     /// The extracted tree's `tree_root` did not match the signed `artifact.tree_root`.
     TreeRootMismatch { expected: String, got: String },
+    /// An `https` payload could not be laid down as the row describes: an unknown
+    /// `payload` lane, an inadmissible `entry`/`links` name or target, a `links` target
+    /// missing from the staged tree, or the `dmg` tooling (`hdiutil`/`ditto`)
+    /// refusing the image. Names the field or tool, so a mis-authored row fails fast on
+    /// the authoring machine.
+    Payload(String),
 }
 
 // Hand-rendered through `Formatter::write_str` + direct `Display::fmt` calls (no
@@ -87,6 +102,10 @@ impl std::fmt::Display for StageError {
                 f.write_str(expected)?;
                 f.write_str(", got ")?;
                 f.write_str(got)
+            }
+            StageError::Payload(m) => {
+                f.write_str("payload: ")?;
+                f.write_str(m)
             }
         }
     }
@@ -164,18 +183,18 @@ pub fn verify_and_stage(
         ))
     })?;
     std::fs::create_dir_all(&incoming).map_err(StageError::Io)?;
-    //    The extraction hands back the `tree_root` of what it wrote, folded from the
-    //    bytes as they went past (see [`crate::extract::extract_tar_zst_rooted`]). This
-    //    is the ONE pass over the uncompressed payload: the digest step 3 compares is a
-    //    by-product of the writing, not a second reading of it.
-    let extracted_root =
-        match extract_tar_zst_rooted(archive, &incoming, size_cap(artifact), MAX_ENTRIES) {
-            Ok(root) => root,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&incoming);
-                return Err(StageError::Extract(e));
-            }
-        };
+    //    The stage hands back the `tree_root` of what it wrote, folded from the bytes
+    //    as they went past (see [`crate::extract::extract_tar_zst_rooted`]). This is
+    //    the ONE pass over the uncompressed payload: the digest step 3 compares is a
+    //    by-product of the writing, not a second reading of it. (The `dmg` lane is
+    //    the exception — `ditto` wrote its bytes, so it walks them once.)
+    let extracted_root = match stage_payload(artifact, archive, &incoming) {
+        Ok(root) => root,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&incoming);
+            return Err(e);
+        }
+    };
 
     // 3. Apply-time re-verify (TOCTOU): the extracted tree must match the signed tree_root
     //    (when the producer emitted one). A mismatch — tamper or partial extract — aborts,
@@ -256,6 +275,435 @@ pub fn verify_and_stage(
         crate::store::sync_dir(parent);
     }
     Ok(())
+}
+
+/// Lay the verified download at `archive` down under `dest` in the shape
+/// `artifact.payload` names, and return the `tree_root` of what was laid down.
+///
+/// THE ONE PRODUCER of a staged tree, shared by the client stage ([`verify_and_stage`],
+/// step 2) and the authoring ceremony: the tool that writes a signed row's `tree_root`
+/// must stage through THIS function over the same download, or the two roots disagree
+/// by construction — the normalizations below (mode sanitizing, `strip_components`,
+/// the `links` shape, which `.app` is copied) are not something a second implementation
+/// can be trusted to reproduce. Lanes, by `payload`:
+///
+/// * `""` — a release bundle (`binary` / `sysroot-bundle`): `.tar.zst`, symlinks
+///   refused, nothing stripped — byte-for-byte the historical extraction;
+/// * `tar-zst` / `tar-gz` / `zip` — a vendor archive: `strip_components` applied and
+///   in-root symlinks admitted ([`crate::extract::ExtractOptions`]), modes sanitized to
+///   `0755`/`0644` exactly as for a release bundle;
+/// * `raw-binary` — the download IS the binary: it becomes `bin/<entry>`, mode `0755`;
+/// * `dmg` — the single `.app` at the image root, copied with `ditto` (mode bits
+///   PRESERVED, not sanitized: the bundle is the vendor's, signed and notarized as
+///   laid out), macOS only.
+///
+/// Then, for every lane, the row's `links` are created as RELATIVE symlinks
+/// `bin/<name> -> ../<target>` ([`apply_links`]) so the shims resolve `bin/<tool>`. The
+/// root is folded from what was written for the archive and raw lanes; the `dmg`
+/// lane walks the finished tree once (its bytes were laid by `ditto`, not by this
+/// process's write loop).
+///
+/// `dest` must be an empty (or absent) directory the caller owns — the fold's
+/// precondition, enforced by every lane. On error the caller removes `dest`.
+///
+/// # Errors
+/// [`StageError::Extract`] for anything the extractor refused (a slip, a cap, a
+/// malformed container), [`StageError::Payload`] for a row the lane cannot honour, and
+/// [`StageError::Io`] for the filesystem.
+pub fn stage_payload(
+    artifact: &Artifact,
+    archive: &Path,
+    dest: &Path,
+) -> Result<String, StageError> {
+    let cap = size_cap(artifact);
+    let vendor = ExtractOptions {
+        strip_components: artifact.strip_components,
+        in_root_symlinks: true,
+    };
+    let mut folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
+        "" => Some(
+            extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, ExtractOptions::default())
+                .map_err(StageError::Extract)?,
+        ),
+        "tar-zst" => Some(
+            extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, vendor)
+                .map_err(StageError::Extract)?,
+        ),
+        "tar-gz" => Some(
+            extract_tar_gz_tree(archive, dest, cap, MAX_ENTRIES, vendor)
+                .map_err(StageError::Extract)?,
+        ),
+        "zip" => Some(
+            extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor)
+                .map_err(StageError::Extract)?,
+        ),
+        "raw-binary" => Some(stage_raw_binary(archive, dest, &artifact.entry, cap)?),
+        "dmg" => {
+            stage_dmg(archive, dest)?;
+            None
+        }
+        other => return Err(payload2("unknown payload lane: ", other)),
+    };
+    apply_links(dest, &artifact.links, folded.as_mut())?;
+    match folded {
+        Some(tree) => Ok(tree.root()),
+        None => tree_root(dest).map_err(StageError::Io),
+    }
+}
+
+/// A [`StageError::Payload`] from `<head><detail>` (manual concat — see `lib.rs` on
+/// `format!`).
+fn payload2(head: &str, detail: &str) -> StageError {
+    let mut m = String::from(head);
+    m.push_str(detail);
+    StageError::Payload(m)
+}
+
+/// The `raw-binary` lane: the download becomes `bin/<entry>` at mode `0755` — under the
+/// platform's EXECUTABLE spelling of the logical name (`bin/claude` on Unix,
+/// `bin/claude.exe` on Windows: [`crate::store::ToolName::exe_file`], the file the shim
+/// forwards to) — through the very write loop the archive lanes use, so the one file
+/// folds into the digest exactly as an archived `bin/<entry>` would.
+fn stage_raw_binary(
+    archive: &Path,
+    dest: &Path,
+    entry: &str,
+    cap: u64,
+) -> Result<TreeAccumulator, StageError> {
+    // Belt and braces over `vendor::check_row` (which the client ran before download):
+    // this function is also the AUTHORING producer, and a separator here would be a
+    // path, not a name.
+    let Some(tool) = crate::store::ToolName::new(entry) else {
+        return Err(payload2(
+            "raw-binary entry is not a single admissible tool name: ",
+            entry,
+        ));
+    };
+    std::fs::create_dir_all(dest).map_err(StageError::Io)?;
+    crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
+    let bin = dest.join("bin");
+    std::fs::create_dir_all(&bin).map_err(StageError::Io)?;
+    crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
+    let target = bin.join(tool.exe_file());
+    let file = std::fs::File::open(archive).map_err(StageError::Io)?;
+    let written =
+        crate::extract::stage_file(file, &target, 0o755, cap).map_err(StageError::Extract)?;
+    let mut tree = TreeAccumulator::new();
+    let rel = crate::extract::rel_bytes_under(dest, &target).map_err(StageError::Extract)?;
+    tree.record_file(rel, written.mode, written.content_sha_hex);
+    Ok(tree)
+}
+
+/// Whether a `links` TARGET is admissible here: a relative, `..`-free, `.`-free,
+/// separator-clean path (the same rule `vendor::check_row` applied to the signed row;
+/// repeated because this is also the authoring producer).
+fn link_target_admissible(target: &str) -> bool {
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.ends_with('/')
+        || target.contains('\0')
+        || target.contains('\\')
+    {
+        return false;
+    }
+    target
+        .split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        && Path::new(target)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Create the row's `links`: for every `(name, target)`, the RELATIVE symlink
+/// `bin/<name> -> ../<target>`, and record it in the open fold (when there is one) so
+/// the root closes over the finished tree. Fail-closed on a name that is not a tool
+/// name, a target that is not a clean relative path, a target absent from the staged
+/// tree (an authoring slip: the link would dangle), or a `bin/<name>` something already
+/// occupies (the link would either fail or shadow an extracted entry).
+fn apply_links(
+    dest: &Path,
+    links: &BTreeMap<String, String>,
+    mut tree: Option<&mut TreeAccumulator>,
+) -> Result<(), StageError> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    let bin = dest.join("bin");
+    for (name, target) in links {
+        if crate::store::ToolName::new(name).is_none() {
+            return Err(payload2(
+                "links name is not an admissible tool name: ",
+                name,
+            ));
+        }
+        if !link_target_admissible(target) {
+            return Err(payload2(
+                "links target must be a relative, `..`-free path inside the staged tree: ",
+                target,
+            ));
+        }
+        if std::fs::symlink_metadata(dest.join(target)).is_err() {
+            return Err(payload2("links target is not in the staged tree: ", target));
+        }
+        std::fs::create_dir_all(&bin).map_err(StageError::Io)?;
+        crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
+        let link = bin.join(name);
+        if std::fs::symlink_metadata(&link).is_ok() {
+            return Err(payload2(
+                "links name collides with a staged entry: bin/",
+                name,
+            ));
+        }
+        let mut rel_target = PathBuf::from("..");
+        rel_target.push(target);
+        crate::extract::create_symlink(&rel_target, &link).map_err(StageError::Io)?;
+        if let Some(tree) = tree.as_deref_mut() {
+            let rel = crate::extract::rel_bytes_under(dest, &link).map_err(StageError::Extract)?;
+            let target_bytes = crate::call1(crate::platform::os_str_bytes, rel_target.as_os_str());
+            tree.record_symlink(rel, target_bytes);
+        }
+    }
+    Ok(())
+}
+
+/// The mount point for a `dmg` stage: a SIBLING of `dest` named `<dest>.mnt`. The
+/// name is deliberately outside every scratch recogniser (`store::stage_scratch_of`
+/// wants `<n>.incoming-<digits>`), so neither the store sweep nor GC will ever
+/// `remove_dir_all` a directory that may be a live mount; the [`Mount`] guard is what
+/// reclaims it, on every path.
+#[cfg(target_os = "macos")]
+fn dmg_mount_point(dest: &Path) -> Result<PathBuf, StageError> {
+    let name = crate::call1(std::path::Path::file_name, dest)
+        .and_then(|n| crate::call1(std::ffi::OsStr::to_str, n))
+        .ok_or_else(|| {
+            payload2(
+                "dmg stage dir has no name: ",
+                &crate::call1(std::path::Path::to_string_lossy, dest),
+            )
+        })?;
+    let mut mnt = String::from(name);
+    mnt.push_str(".mnt");
+    Ok(dest.with_file_name(mnt))
+}
+
+/// Run `/usr/bin/<tool>` to completion with no stdin; a non-zero exit is a
+/// [`StageError::Payload`] naming the tool and the tail of its stderr.
+#[cfg(target_os = "macos")]
+fn run_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
+    let mut path = String::from("/usr/bin/");
+    path.push_str(tool);
+    let out = std::process::Command::new(&path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(StageError::Io)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut m = String::from(tool);
+    m.push_str(" failed");
+    if let Some(code) = out.status.code() {
+        m.push_str(" (exit ");
+        m.push_str(&crate::dec_u64(u64::from(code.unsigned_abs())));
+        m.push(')');
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let tail = stderr.trim();
+    if !tail.is_empty() {
+        m.push_str(": ");
+        // The LAST line is where hdiutil/ditto put the reason.
+        m.push_str(tail.lines().last().unwrap_or(tail));
+    }
+    Err(StageError::Payload(m))
+}
+
+/// An attached disk image, detached on EVERY path (`Drop` for the error paths, an
+/// explicit [`Mount::detach`] on the happy path so a detach failure is reported
+/// rather than swallowed). The mount point directory is removed with it.
+#[cfg(target_os = "macos")]
+struct Mount {
+    point: PathBuf,
+    attached: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Mount {
+    /// `hdiutil attach -nobrowse -readonly -noverify -noautoopen -quiet -mountpoint
+    /// <point> <image>`: not in Finder, never written, no second checksum pass (the
+    /// download's sha256 gate already ran over these bytes), nothing auto-opened. With
+    /// stdin closed an image that demands a license click fails instead of hanging.
+    fn attach(image: &Path, dest: &Path) -> Result<Self, StageError> {
+        let point = dmg_mount_point(dest)?;
+        // An EMPTY leftover from a crashed run is ours; a live mount there refuses the
+        // `remove_dir` and then refuses the attach below, which is the right outcome.
+        let _ = std::fs::remove_dir(&point);
+        std::fs::create_dir_all(&point).map_err(StageError::Io)?;
+        let mut m = Mount {
+            point,
+            attached: false,
+        };
+        if let Err(e) = run_tool(
+            "hdiutil",
+            &[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-readonly".as_ref(),
+                "-noverify".as_ref(),
+                "-noautoopen".as_ref(),
+                "-quiet".as_ref(),
+                "-mountpoint".as_ref(),
+                m.point.as_os_str(),
+                image.as_os_str(),
+            ],
+        ) {
+            let _ = std::fs::remove_dir(&m.point);
+            return Err(e);
+        }
+        m.attached = true;
+        Ok(m)
+    }
+
+    /// The ONE `.app` directory at the image root. Anything else there (`Applications`
+    /// link, `.background`, `.DS_Store`, a README) is ignored; zero or several apps is
+    /// a refusal — the row said which bundle to stage by saying there is one.
+    fn single_app(&self) -> Result<PathBuf, StageError> {
+        let mut apps: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&self.point)
+            .map_err(StageError::Io)?
+            .flatten()
+        {
+            let path = entry.path();
+            let is_app = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("app"));
+            // A real directory, not a link to one.
+            if is_app && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                apps.push(path);
+            }
+        }
+        apps.sort();
+        if apps.len() == 1 {
+            return Ok(apps.swap_remove(0));
+        }
+        Err(payload2(
+            "dmg image root must hold exactly one .app, found ",
+            &crate::dec_u64(apps.len() as u64),
+        ))
+    }
+
+    fn detach_now(&mut self) -> Result<(), StageError> {
+        if !self.attached {
+            return Ok(());
+        }
+        self.attached = false;
+        let quiet = run_tool(
+            "hdiutil",
+            &["detach".as_ref(), "-quiet".as_ref(), self.point.as_os_str()],
+        );
+        let r = match quiet {
+            Ok(()) => Ok(()),
+            // Something still has a file open on the image (Spotlight is the usual
+            // culprit): force it, once.
+            Err(_) => run_tool(
+                "hdiutil",
+                &[
+                    "detach".as_ref(),
+                    "-force".as_ref(),
+                    "-quiet".as_ref(),
+                    self.point.as_os_str(),
+                ],
+            ),
+        };
+        let _ = std::fs::remove_dir(&self.point);
+        r
+    }
+
+    /// Detach and report. Consumes the guard so `Drop` has nothing left to do.
+    fn detach(mut self) -> Result<(), StageError> {
+        self.detach_now()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Mount {
+    fn drop(&mut self) {
+        let _ = self.detach_now();
+    }
+}
+
+/// The `dmg` lane: attach the image read-only, require exactly one `.app` at its
+/// root, `ditto` that bundle into `dest` (modes, symlinks and extended attributes
+/// preserved, as Finder would), refuse any link in it that leaves the stage root
+/// ([`vet_copied_tree`]), detach. Nothing else on the image is copied and nothing on
+/// it is executed.
+#[cfg(target_os = "macos")]
+fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
+    std::fs::create_dir_all(dest).map_err(StageError::Io)?;
+    crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
+    let mount = Mount::attach(image, dest)?;
+    let app = mount.single_app()?;
+    let name = crate::call1(std::path::Path::file_name, &app).ok_or_else(|| {
+        payload2(
+            "dmg bundle has no name: ",
+            &crate::call1(std::path::Path::to_string_lossy, &app),
+        )
+    })?;
+    let out = dest.join(name);
+    run_tool("ditto", &[app.as_os_str(), out.as_os_str()])?;
+    // `ditto` laid the bundle VERBATIM, links included, with nothing of ours vetting
+    // them on the way — so vet them now, before the mount is released and long before
+    // the swap: the archive lanes' in-root rule, applied to the finished copy.
+    if let Err(e) = vet_copied_tree(dest, &out) {
+        let _ = mount.detach();
+        return Err(e);
+    }
+    mount.detach()
+}
+
+/// Every SYMLINK under `dir` (the copied `.app`) must resolve LEXICALLY inside the
+/// stage `root` — the rule the archive lanes enforce per entry
+/// ([`crate::extract::vet_symlink`]), applied after the fact because `ditto` preserves
+/// links as the image carries them. An image whose bundle holds
+/// `Contents/MacOS/x -> /usr/bin/x` or `-> ../../../..` would otherwise sit in a tree
+/// the digest describes only by target bytes, and a `links` target or a shim could then
+/// resolve through it to somewhere outside the store. Anything that is not a file, a
+/// directory or a symlink is refused as well (the walk would refuse it at the re-verify,
+/// but saying which entry is better than a bare mismatch).
+#[cfg(target_os = "macos")]
+fn vet_copied_tree(root: &Path, dir: &Path) -> Result<(), StageError> {
+    for entry in std::fs::read_dir(dir).map_err(StageError::Io)? {
+        let entry = entry.map_err(StageError::Io)?;
+        let path = entry.path();
+        // `DirEntry::file_type` never follows a link.
+        let ft = entry.file_type().map_err(StageError::Io)?;
+        if ft.is_symlink() {
+            let rel = path.strip_prefix(root).map_err(|_| {
+                StageError::Extract(ExtractError::Rejected(
+                    crate::extract::ExtractReject::RootEscape,
+                    path.clone(),
+                ))
+            })?;
+            let target = std::fs::read_link(&path).map_err(StageError::Io)?;
+            crate::extract::vet_symlink(root, rel, &target, 0)
+                .map_err(|r| StageError::Extract(ExtractError::Rejected(r, rel.to_path_buf())))?;
+        } else if ft.is_dir() {
+            vet_copied_tree(root, &path)?;
+        } else if !ft.is_file() {
+            return Err(payload2(
+                "dmg bundle carries an entry that is not a file, directory or symlink: ",
+                &crate::call1(std::path::Path::to_string_lossy, &path),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `dmg` needs `hdiutil` and `ditto`; off macOS the lane fails closed.
+#[cfg(not(target_os = "macos"))]
+fn stage_dmg(_image: &Path, _dest: &Path) -> Result<(), StageError> {
+    Err(StageError::Payload(String::from(
+        "dmg payloads can only be staged on macOS (hdiutil/ditto)",
+    )))
 }
 
 /// Whether [`DISK_REVERIFY_ENV`] arms the on-disk cross-check. Read here, passed DOWN as a
@@ -452,6 +900,19 @@ mod tests {
                 disk_installed: 1 << 20,
                 build_seconds: 0,
             },
+            url: String::new(),
+            payload: String::new(),
+            entry: String::new(),
+            strip_components: 0,
+            links: std::collections::BTreeMap::new(),
+            vendor: String::new(),
+            protocol: "github-release".into(),
+            signer_team: String::new(),
+            elevated: false,
+            provides: vec![],
+            manager: String::new(),
+            package: String::new(),
+            label_prefix: String::new(),
         }
     }
 
@@ -1212,5 +1673,600 @@ mod tests {
             }
         }
         None
+    }
+
+    // ===== the https payload lanes =====
+
+    #[cfg(unix)]
+    use crate::extract::fixtures::gzip_bytes;
+    use crate::extract::fixtures::{ZipMember, tar_bytes, zip_bytes};
+
+    /// An https artifact over `archive`, signed for ITS bytes and for `root`.
+    fn vendor_artifact(archive: &Path, payload: &str, root: &str) -> Artifact {
+        let mut a = artifact(&file_sha256(archive).unwrap(), root);
+        a.kind = if payload == "dmg" {
+            "app-bundle".into()
+        } else {
+            "binary".into()
+        };
+        a.protocol = "https".into();
+        a.payload = payload.into();
+        a.size = std::fs::metadata(archive).unwrap().len();
+        a
+    }
+
+    /// Write `content` at `dir/rel` with `mode`, creating parents — the REPLICA the
+    /// expected roots below are learned from, so no expectation ever comes out of the
+    /// function under test.
+    #[cfg(unix)]
+    fn lay(dir: &Path, rel: &str, content: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn lay_link(dir: &Path, rel: &str, target: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, p).unwrap();
+    }
+
+    /// The `gh` archive shape as tar bytes: a versioned top-level directory to strip,
+    /// an executable, a plain file.
+    fn gh_tar() -> Vec<u8> {
+        tar_bytes(&[
+            ("gh_2.80.0_macOS_arm64/", b'5', "", b"", 0o755),
+            (
+                "gh_2.80.0_macOS_arm64/bin/gh",
+                b'0',
+                "",
+                b"#!/bin/sh\necho gh\n",
+                0o755,
+            ),
+            ("gh_2.80.0_macOS_arm64/LICENSE", b'0', "", b"MIT", 0o644),
+        ])
+    }
+
+    /// …and the same shape as a zip.
+    fn gh_zip() -> Vec<u8> {
+        zip_bytes(
+            &[
+                ZipMember {
+                    name: "gh_2.80.0_macOS_arm64/",
+                    mode: 0o040_755,
+                    data: b"",
+                    deflate: false,
+                },
+                ZipMember {
+                    name: "gh_2.80.0_macOS_arm64/bin/gh",
+                    mode: 0o100_755,
+                    data: b"#!/bin/sh\necho gh\n",
+                    deflate: true,
+                },
+                ZipMember {
+                    name: "gh_2.80.0_macOS_arm64/LICENSE",
+                    mode: 0o100_644,
+                    data: b"MIT",
+                    deflate: false,
+                },
+            ],
+            false,
+        )
+    }
+
+    /// The tree the `gh` shape must stage to, learned from a hand-laid replica.
+    #[cfg(unix)]
+    fn gh_expected_root(dir: &Path) -> String {
+        let replica = dir.join("replica");
+        lay(&replica, "bin/gh", b"#!/bin/sh\necho gh\n", 0o755);
+        lay(&replica, "LICENSE", b"MIT", 0o644);
+        tree_root(&replica).unwrap()
+    }
+
+    /// The `tar-gz` and `zip` lanes stage the `gh` shape — top level stripped, modes
+    /// sanitized — to the root a hand-laid replica walks to, and a row that FORGOT its
+    /// `strip_components` is refused at the re-verify (the tree is honestly different).
+    #[cfg(unix)]
+    #[test]
+    fn tar_gz_and_zip_vendor_payloads_stage_with_strip_components() {
+        let d = tmp("vendor-archives");
+        let expected = gh_expected_root(&d);
+        let gz = d.join("gh.tar.gz");
+        std::fs::write(&gz, gzip_bytes(&gh_tar())).unwrap();
+        let zip = d.join("gh.zip");
+        std::fs::write(&zip, gh_zip()).unwrap();
+        for (label, archive, payload) in [("gz", &gz, "tar-gz"), ("zip", &zip, "zip")] {
+            let mut art = vendor_artifact(archive, payload, &expected);
+            art.strip_components = 1;
+            let build = d.join(format!("store/gh-{label}/18"));
+            verify_and_stage(&art, archive, &build).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(crate::store::build_is_complete(&build), "{label}");
+            assert_eq!(
+                std::fs::read(build.join("bin/gh")).unwrap(),
+                b"#!/bin/sh\necho gh\n",
+                "{label}"
+            );
+            assert_eq!(
+                std::fs::read(build.join("LICENSE")).unwrap(),
+                b"MIT",
+                "{label}"
+            );
+            assert!(
+                !build.join("gh_2.80.0_macOS_arm64").exists(),
+                "{label}: stripped"
+            );
+            assert_eq!(
+                tree_root(&build).unwrap(),
+                expected,
+                "{label}: the walk agrees after the swap"
+            );
+            assert!(scratch_beside(&build).is_empty(), "{label}");
+
+            // Unstripped, the tree is `gh_.../bin/gh` — a different root, refused.
+            let mut unstripped = vendor_artifact(archive, payload, &expected);
+            unstripped.strip_components = 0;
+            let build2 = d.join(format!("store/gh-{label}-unstripped/18"));
+            let err = verify_and_stage(&unstripped, archive, &build2).unwrap_err();
+            assert!(
+                matches!(err, StageError::TreeRootMismatch { .. }),
+                "{label}: {err:?}"
+            );
+            assert!(
+                !build2.exists(),
+                "{label}: nothing staged on a root mismatch"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The `tar-zst` vendor lane is the historical extractor plus the vendor options
+    /// — the same tar bytes reach the same root as the gzip lane.
+    #[cfg(unix)]
+    #[test]
+    fn tar_zst_vendor_payload_matches_the_gzip_lane() {
+        let d = tmp("vendor-zst");
+        let expected = gh_expected_root(&d);
+        let zst = d.join("gh.tar.zst");
+        std::fs::write(&zst, zstd::encode_all(&gh_tar()[..], 0).unwrap()).unwrap();
+        let mut art = vendor_artifact(&zst, "tar-zst", &expected);
+        art.strip_components = 1;
+        let build = d.join("store/gh/18");
+        verify_and_stage(&art, &zst, &build).unwrap();
+        assert_eq!(tree_root(&build).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The `raw-binary` lane: the download becomes `bin/<entry>` at `0755`, and the
+    /// root it folds is the one a hand-laid `bin/<entry>` walks to. An `entry` that is
+    /// not a bare tool name is refused before anything is written.
+    #[cfg(unix)]
+    #[test]
+    fn raw_binary_payload_becomes_bin_entry_at_0755() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp("vendor-raw");
+        let payload: Vec<u8> = (0..300_000usize).map(|i| (i % 253) as u8).collect();
+        let dl = d.join("claude-2.1.231-darwin-arm64");
+        std::fs::write(&dl, &payload).unwrap();
+        let replica = d.join("replica");
+        lay(&replica, "bin/claude", &payload, 0o755);
+        let expected = tree_root(&replica).unwrap();
+
+        let mut art = vendor_artifact(&dl, "raw-binary", &expected);
+        art.entry = "claude".into();
+        let build = d.join("store/claude/2026082601");
+        verify_and_stage(&art, &dl, &build).unwrap();
+        assert!(crate::store::build_is_complete(&build));
+        assert_eq!(std::fs::read(build.join("bin/claude")).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(build.join("bin/claude"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        assert_eq!(tree_root(&build).unwrap(), expected);
+        // The download itself is untouched (flow reclaims it).
+        assert_eq!(std::fs::metadata(&dl).unwrap().len(), payload.len() as u64);
+
+        for bad in ["", "bin/claude", "../claude", "sudo"] {
+            let mut art = vendor_artifact(&dl, "raw-binary", &expected);
+            art.entry = bad.into();
+            let build = d.join("store/bad/1");
+            let err = verify_and_stage(&art, &dl, &build).unwrap_err();
+            assert!(matches!(err, StageError::Payload(_)), "{bad:?}: {err:?}");
+            assert!(!build.exists(), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `links` lay RELATIVE symlinks `bin/<name> -> ../<target>` after extraction, fold
+    /// into the root exactly as the walk reads them, and resolve to the staged file.
+    /// A dangling target, a `..` target, and a name that collides with an extracted
+    /// entry are each refused with nothing staged.
+    #[cfg(unix)]
+    #[test]
+    fn links_lay_relative_symlinks_under_bin_and_fold_into_the_root() {
+        let d = tmp("vendor-links");
+        let gz = d.join("emacs.tar.gz");
+        std::fs::write(
+            &gz,
+            gzip_bytes(&tar_bytes(&[
+                (
+                    "Emacs.app/Contents/MacOS/Emacs",
+                    b'0',
+                    "",
+                    b"#!/bin/sh\necho emacs\n",
+                    0o755,
+                ),
+                (
+                    "Emacs.app/Contents/MacOS/bin/emacsclient",
+                    b'0',
+                    "",
+                    b"#!/bin/sh\necho client\n",
+                    0o755,
+                ),
+                ("bin/taken", b'0', "", b"already here", 0o644),
+            ])),
+        )
+        .unwrap();
+        let replica = d.join("replica");
+        lay(
+            &replica,
+            "Emacs.app/Contents/MacOS/Emacs",
+            b"#!/bin/sh\necho emacs\n",
+            0o755,
+        );
+        lay(
+            &replica,
+            "Emacs.app/Contents/MacOS/bin/emacsclient",
+            b"#!/bin/sh\necho client\n",
+            0o755,
+        );
+        lay(&replica, "bin/taken", b"already here", 0o644);
+        lay_link(&replica, "bin/emacs", "../Emacs.app/Contents/MacOS/Emacs");
+        lay_link(
+            &replica,
+            "bin/emacsclient",
+            "../Emacs.app/Contents/MacOS/bin/emacsclient",
+        );
+        let expected = tree_root(&replica).unwrap();
+
+        let mut art = vendor_artifact(&gz, "tar-gz", &expected);
+        art.links
+            .insert("emacs".into(), "Emacs.app/Contents/MacOS/Emacs".into());
+        art.links.insert(
+            "emacsclient".into(),
+            "Emacs.app/Contents/MacOS/bin/emacsclient".into(),
+        );
+        let build = d.join("store/emacs/18");
+        verify_and_stage(&art, &gz, &build).unwrap();
+        assert_eq!(
+            std::fs::read_link(build.join("bin/emacs")).unwrap(),
+            Path::new("../Emacs.app/Contents/MacOS/Emacs")
+        );
+        assert_eq!(
+            std::fs::read(build.join("bin/emacs")).unwrap(),
+            b"#!/bin/sh\necho emacs\n"
+        );
+        assert_eq!(
+            std::fs::read(build.join("bin/emacsclient")).unwrap(),
+            b"#!/bin/sh\necho client\n"
+        );
+        assert_eq!(tree_root(&build).unwrap(), expected);
+        // Without the links the root is different: the fold really carries them.
+        let plain = vendor_artifact(&gz, "tar-gz", &expected);
+        let err = verify_and_stage(&plain, &gz, &d.join("store/plain/18")).unwrap_err();
+        assert!(
+            matches!(err, StageError::TreeRootMismatch { .. }),
+            "{err:?}"
+        );
+
+        let refused: &[(&str, &str, &str)] = &[
+            ("dangling", "emacs", "Emacs.app/Contents/MacOS/Nope"),
+            ("dotdot", "emacs", "../outside"),
+            (
+                "absolute",
+                "emacs",
+                "/Applications/Emacs.app/Contents/MacOS/Emacs",
+            ),
+            ("collides", "taken", "Emacs.app/Contents/MacOS/Emacs"),
+            ("bad-name", "bin/emacs", "Emacs.app/Contents/MacOS/Emacs"),
+        ];
+        for (label, name, target) in refused {
+            let mut art = vendor_artifact(&gz, "tar-gz", &expected);
+            art.links.insert((*name).into(), (*target).into());
+            let build = d.join(format!("store/{label}/18"));
+            let err = verify_and_stage(&art, &gz, &build).unwrap_err();
+            assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
+            assert!(!build.exists(), "{label}: nothing staged");
+            assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A slip in a vendor archive aborts the stage in extraction — nothing outside the
+    /// scratch, no scratch left, and (for a re-stage) the installed build untouched —
+    /// through the gzip lane and the zip lane alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_slip_in_a_vendor_archive_aborts_before_the_swap_in_every_lane() {
+        let d = tmp("vendor-slip");
+        let expected = gh_expected_root(&d);
+        // Install the good gzip build first, so there is something to survive.
+        let good = d.join("gh.tar.gz");
+        std::fs::write(&good, gzip_bytes(&gh_tar())).unwrap();
+        let mut art = vendor_artifact(&good, "tar-gz", &expected);
+        art.strip_components = 1;
+        let build = d.join("store/gh/18");
+        verify_and_stage(&art, &good, &build).unwrap();
+        let witness = build.join("this-tree-survived");
+        std::fs::write(&witness, b"old").unwrap();
+
+        let slip_tar = tar_bytes(&[
+            ("top/ok", b'0', "", b"fine", 0o644),
+            ("top/../../escape", b'0', "", b"pwned", 0o644),
+        ]);
+        let gz = d.join("slip.tar.gz");
+        std::fs::write(&gz, gzip_bytes(&slip_tar)).unwrap();
+        let zip = d.join("slip.zip");
+        std::fs::write(
+            &zip,
+            zip_bytes(
+                &[
+                    ZipMember {
+                        name: "top/ok",
+                        mode: 0o100_644,
+                        data: b"fine",
+                        deflate: false,
+                    },
+                    ZipMember {
+                        name: "top/../../escape",
+                        mode: 0o100_644,
+                        data: b"pwned",
+                        deflate: true,
+                    },
+                    ZipMember {
+                        name: "top/bin/x",
+                        mode: 0o120_777,
+                        data: b"../../../etc/passwd",
+                        deflate: false,
+                    },
+                ],
+                false,
+            ),
+        )
+        .unwrap();
+        for (label, archive, payload) in [("gz", &gz, "tar-gz"), ("zip", &zip, "zip")] {
+            let mut art = vendor_artifact(archive, payload, "");
+            art.strip_components = 1;
+            let err = verify_and_stage(&art, archive, &build).unwrap_err();
+            assert!(matches!(err, StageError::Extract(_)), "{label}: {err:?}");
+            assert!(witness.exists(), "{label}: the installed build survived");
+            assert!(crate::store::build_is_complete(&build), "{label}");
+            assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
+            assert!(
+                !d.join("escape").exists() && !d.join("store/escape").exists(),
+                "{label}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An unknown payload lane is refused before any byte is extracted; nothing staged.
+    #[test]
+    fn an_unknown_payload_lane_is_refused_before_extraction() {
+        let b = bundle("unknown-payload");
+        let mut art = b.art.clone();
+        art.kind = "binary".into();
+        art.protocol = "https".into();
+        art.payload = "pkg".into();
+        let build = b.build();
+        let err = verify_and_stage(&art, &b.archive, &build).unwrap_err();
+        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
+        assert!(!build.exists());
+        assert!(scratch_beside(&build).is_empty());
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// The `dmg` lane, for real: a tiny image is built with `hdiutil create` around
+    /// a `Foo.app` (an executable, a `0600` file, an internal symlink) beside the usual
+    /// `Applications` link and a README; the stage copies ONLY the bundle, preserves its
+    /// modes and links, lays the row's `links`, detaches the image, and the root equals a
+    /// hand-laid replica's walk. Zero or two apps at the root are refused — detached
+    /// either way. Runs only where `hdiutil` exists (this Mac); skips elsewhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_app_payload_stages_the_single_app_and_its_links() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !Path::new("/usr/bin/hdiutil").exists() || !Path::new("/usr/bin/ditto").exists() {
+            eprintln!("skipping: hdiutil/ditto not available");
+            return;
+        }
+        let d = tmp("vendor-dmg");
+        let src = d.join("src");
+        lay(
+            &src,
+            "Foo.app/Contents/MacOS/foo",
+            b"#!/bin/sh\necho foo\n",
+            0o755,
+        );
+        lay(&src, "Foo.app/Contents/Info.plist", b"<plist/>", 0o644);
+        lay(&src, "Foo.app/Contents/Resources/secret", b"s", 0o600);
+        lay_link(&src, "Foo.app/Contents/current", "MacOS/foo");
+        lay(&src, "README.txt", b"not copied", 0o644);
+        lay_link(&src, "Applications", "/Applications");
+        let dmg = d.join("foo.dmg");
+        let status = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["create", "-quiet", "-srcfolder"])
+            .arg(&src)
+            .args(["-volname", "FooTest", "-format", "UDZO"])
+            .arg(&dmg)
+            .status()
+            .unwrap();
+        assert!(status.success(), "hdiutil create");
+
+        let replica = d.join("replica");
+        lay(
+            &replica,
+            "Foo.app/Contents/MacOS/foo",
+            b"#!/bin/sh\necho foo\n",
+            0o755,
+        );
+        lay(&replica, "Foo.app/Contents/Info.plist", b"<plist/>", 0o644);
+        lay(&replica, "Foo.app/Contents/Resources/secret", b"s", 0o600);
+        lay_link(&replica, "Foo.app/Contents/current", "MacOS/foo");
+        lay_link(&replica, "bin/foo", "../Foo.app/Contents/MacOS/foo");
+        let expected = tree_root(&replica).unwrap();
+
+        let mut art = vendor_artifact(&dmg, "dmg", &expected);
+        art.links
+            .insert("foo".into(), "Foo.app/Contents/MacOS/foo".into());
+        let build = d.join("store/foo/2026082601");
+        verify_and_stage(&art, &dmg, &build).unwrap();
+        assert!(crate::store::build_is_complete(&build));
+        assert_eq!(
+            std::fs::read(build.join("bin/foo")).unwrap(),
+            b"#!/bin/sh\necho foo\n"
+        );
+        assert_eq!(
+            std::fs::read_link(build.join("Foo.app/Contents/current")).unwrap(),
+            Path::new("MacOS/foo")
+        );
+        assert_eq!(
+            std::fs::metadata(build.join("Foo.app/Contents/Resources/secret"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600,
+            "dmg preserves mode bits"
+        );
+        assert!(
+            !build.join("README.txt").exists(),
+            "only the .app is copied"
+        );
+        assert!(!build.join("Applications").exists());
+        assert_eq!(tree_root(&build).unwrap(), expected);
+        assert!(scratch_beside(&build).is_empty());
+        // The mount point (`<build>.incoming-<pid>.mnt`) is gone and the image is detached.
+        let mounts: Vec<_> = std::fs::read_dir(build.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".mnt"))
+            .collect();
+        assert!(mounts.is_empty(), "no mount point left behind: {mounts:?}");
+        let info = std::process::Command::new("/usr/bin/hdiutil")
+            .arg("info")
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&info.stdout).contains(&d.display().to_string()),
+            "the image must be detached"
+        );
+
+        // Two apps at the root, and none: refused, detached, nothing staged.
+        for (label, apps) in [("two", &["A.app", "B.app"][..]), ("none", &[][..])] {
+            let src2 = d.join(format!("src-{label}"));
+            for app in apps {
+                lay(&src2, &format!("{app}/Contents/MacOS/x"), b"x", 0o755);
+            }
+            lay(&src2, "README.txt", b"r", 0o644);
+            let dmg2 = d.join(format!("{label}.dmg"));
+            let status = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["create", "-quiet", "-srcfolder"])
+                .arg(&src2)
+                .args(["-volname", "Bad", "-format", "UDZO"])
+                .arg(&dmg2)
+                .status()
+                .unwrap();
+            assert!(status.success(), "hdiutil create {label}");
+            let art = vendor_artifact(&dmg2, "dmg", &expected);
+            let build2 = d.join(format!("store/{label}/1"));
+            let err = verify_and_stage(&art, &dmg2, &build2).unwrap_err();
+            assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
+            assert!(!build2.exists(), "{label}");
+            assert!(scratch_beside(&build2).is_empty(), "{label}");
+            let info = std::process::Command::new("/usr/bin/hdiutil")
+                .arg("info")
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&info.stdout).contains(&d.display().to_string()),
+                "{label}: detached on the error path"
+            );
+        }
+
+        // A link INSIDE the bundle that leaves the stage root — absolute, or `..` above
+        // it — is refused after the copy and before the swap: an extraction-class
+        // rejection naming the link, nothing staged, the image detached. A link that
+        // climbs to the bundle's own root and back down is fine (frameworks do that).
+        for (label, target, ok) in [
+            ("abs-link", "/etc/passwd", false),
+            ("up-link", "../../../../outside", false),
+            ("in-root-link", "../../Bad.app/Contents/MacOS/x", true),
+        ] {
+            let src3 = d.join(format!("src-{label}"));
+            lay(
+                &src3,
+                "Bad.app/Contents/MacOS/x",
+                b"#!/bin/sh\nexit 0\n",
+                0o755,
+            );
+            lay_link(&src3, "Bad.app/Contents/Resources/escape", target);
+            let dmg3 = d.join(format!("{label}.dmg"));
+            let status = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["create", "-quiet", "-srcfolder"])
+                .arg(&src3)
+                .args(["-volname", "Link", "-format", "UDZO"])
+                .arg(&dmg3)
+                .status()
+                .unwrap();
+            assert!(status.success(), "hdiutil create {label}");
+            let replica3 = d.join(format!("replica-{label}"));
+            lay(
+                &replica3,
+                "Bad.app/Contents/MacOS/x",
+                b"#!/bin/sh\nexit 0\n",
+                0o755,
+            );
+            lay_link(&replica3, "Bad.app/Contents/Resources/escape", target);
+            let expected3 = tree_root(&replica3).unwrap();
+            let art = vendor_artifact(&dmg3, "dmg", &expected3);
+            let build3 = d.join(format!("store/{label}/1"));
+            let res = verify_and_stage(&art, &dmg3, &build3);
+            if ok {
+                res.unwrap_or_else(|e| panic!("{label}: an in-root link is admitted: {e}"));
+                assert_eq!(
+                    std::fs::read_link(build3.join("Bad.app/Contents/Resources/escape")).unwrap(),
+                    Path::new(target),
+                    "{label}: laid verbatim"
+                );
+            } else {
+                let err = res.unwrap_err();
+                assert!(
+                    matches!(err, StageError::Extract(ExtractError::Rejected(_, _))),
+                    "{label}: {err:?}"
+                );
+                assert!(
+                    err.to_string().contains("Resources/escape"),
+                    "{label}: names the link: {err}"
+                );
+                assert!(!build3.exists(), "{label}: nothing staged");
+                assert!(scratch_beside(&build3).is_empty(), "{label}");
+            }
+            let info = std::process::Command::new("/usr/bin/hdiutil")
+                .arg("info")
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&info.stdout).contains(&d.display().to_string()),
+                "{label}: detached"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

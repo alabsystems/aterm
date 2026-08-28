@@ -343,6 +343,223 @@ impl Layout {
         self.prefix.join("declined")
     }
 
+    /// `optin/` — the per-program EXTRAS opt-in markers directory. One `0600` regular file
+    /// per extra ([`crate::manifest::Program::extra`]) this machine asked for by name —
+    /// `aterm pkg install codex`, the typed-name consent stub, Settings — so the default-set
+    /// pass unions it into the wanted set ([`crate::manifest::Index::installable_with_optins`])
+    /// on every later pass. The marker is the consent record: it is written only by an
+    /// explicit answer, and it is what ADDS work (the bump file stays reorder-only).
+    ///
+    /// Cleared by `uninstall <name>` and by `uninstall --all` (a decline): removing an extra
+    /// is withdrawing the opt-in, and a declined machine wants none of the set.
+    #[must_use]
+    pub fn optin_dir(&self) -> PathBuf {
+        self.prefix.join("optin")
+    }
+
+    /// `optin/<program>` — one opt-in marker. Only ever joined with a [`shim_allowed`]-shape
+    /// name; [`Self::record_optin`] gates the name before creating one.
+    #[must_use]
+    pub fn optin_marker(&self, program: &str) -> PathBuf {
+        self.optin_dir().join(program)
+    }
+
+    /// Whether an opt-in marker exists for `program`: a REGULAR, non-symlink file at
+    /// [`Self::optin_marker`] (the same symlink-refusing rule the other prefix markers
+    /// follow — a link planted there is not a consent this machine recorded). A name that
+    /// could never be a program answers `false` without touching the filesystem.
+    #[must_use]
+    pub fn optin_exists(&self, program: &str) -> bool {
+        if ToolName::new(program).is_none() {
+            return false;
+        }
+        std::fs::symlink_metadata(self.optin_marker(program)).is_ok_and(|m| m.file_type().is_file())
+    }
+
+    /// Record an opt-in for `program`. Idempotent; the payload is documentation for whoever
+    /// finds the file, never something read back — consent is the marker's EXISTENCE.
+    ///
+    /// # Errors
+    /// The name is not a [`shim_allowed`] shape (never joined onto the path), the directory
+    /// could not be created/hardened, or the marker could not be written.
+    pub fn record_optin(&self, program: &str) -> std::io::Result<()> {
+        if ToolName::new(program).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "opt-in name is not an installable program name",
+            ));
+        }
+        if self.optin_exists(program) {
+            return Ok(());
+        }
+        let dir = self.optin_dir();
+        self.ensure_dir(&dir)?;
+        let path = self.optin_marker(program);
+        // Refuse to write THROUGH a planted symlink: `open_create_write` creates the file
+        // fresh; if something non-regular already sits there, leave it and fail closed.
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "opt-in marker path is occupied by something that is not a marker",
+            ));
+        }
+        let mut f = crate::platform::open_create_write(&path, 0o600)?;
+        use std::io::Write as _;
+        f.write_all(
+            b"# This machine opted in to this EXTRA (not a default-set member) by name.
+              # The default-set pass keeps it installed and current while this file exists.
+              # Removed by `aterm pkg uninstall <name>` or `aterm pkg uninstall --all`.
+",
+        )
+    }
+
+    /// Forget the opt-in for `program` (a no-op when none is recorded). Only a REGULAR
+    /// file is ever removed — a planted symlink at the marker path is left alone.
+    pub fn clear_optin(&self, program: &str) {
+        if ToolName::new(program).is_none() {
+            return;
+        }
+        let path = self.optin_marker(program);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Forget EVERY opt-in (a decline: `uninstall --all`). Regular files only, as above.
+    pub fn clear_all_optins(&self) {
+        for name in self.optins() {
+            self.clear_optin(&name);
+        }
+    }
+
+    /// The extras this machine opted in to: every regular-file marker under `optin/` whose
+    /// name is a [`shim_allowed`] shape. Sorted (a `BTreeSet`), so the union into the wanted
+    /// set is deterministic. Missing directory ⇒ empty.
+    #[must_use]
+    pub fn optins(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(self.optin_dir()) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if self.optin_exists(name) {
+                out.insert(name.to_string());
+            }
+        }
+        out
+    }
+
+    /// `retired/` — the per-program RETIREMENT markers directory. One `0600` regular file
+    /// per program whose managed copy atpkg retired in favour of a system install
+    /// (`cli::satisfy_by_system`); its first line is the day it happened (`YYYY-MM-DD`),
+    /// which the canonical `system: <path> — not managed by aterm (managed copy retired
+    /// <date>)` state and `atpkg which` read back. Cleared when the program is
+    /// uninstalled on purpose; a later managed reinstall simply overwrites the next
+    /// retirement's date.
+    #[must_use]
+    pub fn retired_dir(&self) -> PathBuf {
+        self.prefix.join("retired")
+    }
+
+    /// `retired/<program>` — one retirement marker (name-gated like [`Self::optin_marker`]).
+    #[must_use]
+    pub fn retired_marker(&self, program: &str) -> PathBuf {
+        self.retired_dir().join(program)
+    }
+
+    /// The `YYYY-MM-DD` day a managed copy of `program` was retired for a system
+    /// install, if this machine recorded one: the first line of a REGULAR, non-symlink
+    /// marker (a planted link is not a record), trimmed, and only when it reads as a
+    /// date shape (ten bytes, digits and two dashes) — a scribbled-over marker answers
+    /// `None` rather than a mangled date.
+    #[must_use]
+    pub fn retired_date(&self, program: &str) -> Option<String> {
+        ToolName::new(program)?;
+        let path = self.retired_marker(program);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            return None;
+        }
+        let text = crate::metadata_io::read_bounded_regular_utf8(&path, 4096).ok()?;
+        let first = text.lines().next()?.trim();
+        let shaped = first.len() == 10
+            && first.bytes().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            });
+        shaped.then(|| first.to_string())
+    }
+
+    /// Record that `program`'s managed copy was retired on `date` (`YYYY-MM-DD`).
+    /// Overwrites an earlier record: the newest retirement is the one the row names.
+    ///
+    /// # Errors
+    /// The name is not a [`shim_allowed`] shape, the directory could not be created or
+    /// hardened, the marker path is occupied by something that is not a regular file, or
+    /// the write failed.
+    pub fn record_retired(&self, program: &str, date: &str) -> std::io::Result<()> {
+        if ToolName::new(program).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "retirement name is not an installable program name",
+            ));
+        }
+        let dir = self.retired_dir();
+        self.ensure_dir(&dir)?;
+        let path = self.retired_marker(program);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "retirement marker path is occupied by something that is not a marker",
+                ));
+            }
+            Err(_) => {}
+        }
+        let mut f = crate::platform::open_create_write(&path, 0o600)?;
+        use std::io::Write as _;
+        f.write_all(date.as_bytes())?;
+        f.write_all(
+            b"
+# The day atpkg retired its managed copy of this program because a system install of
+# the same name appeared on PATH. Read back by `aterm pkg which` and the status row.
+",
+        )
+    }
+
+    /// Forget the retirement record for `program` (a no-op when none exists). Regular
+    /// files only — a planted symlink is left alone.
+    pub fn clear_retired(&self, program: &str) {
+        if ToolName::new(program).is_none() {
+            return;
+        }
+        let path = self.retired_marker(program);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Forget EVERY retirement record (`uninstall --all`).
+    pub fn clear_all_retired(&self) {
+        let Ok(entries) = std::fs::read_dir(self.retired_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                self.clear_retired(name);
+            }
+        }
+    }
+
     /// `links/` — the per-program dev-link markers directory (§13). One `0600` marker per
     /// dev-linked program; its presence makes `update`/`apply` HARD-SKIP that program.
     #[must_use]
@@ -1097,6 +1314,69 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700)).unwrap();
         h
+    }
+
+    /// The EXTRAS opt-in markers: recorded by name (idempotent, `0600`, regular file),
+    /// listed, cleared one at a time and all at once; a name that could never be a
+    /// program is refused rather than joined onto the path; a planted symlink is never a
+    /// consent, never written through, never removed.
+    #[test]
+    fn optin_markers_record_list_clear_and_refuse_links() {
+        let h = temp_home("optin");
+        let l = Layout { prefix: h.clone() };
+        assert!(l.optins().is_empty());
+        assert!(!l.optin_exists("codex"));
+        l.record_optin("codex").unwrap();
+        l.record_optin("codex").unwrap(); // idempotent
+        assert!(l.optin_exists("codex"));
+        assert_eq!(l.optin_marker("codex"), h.join("optin").join("codex"));
+        assert_eq!(l.optins(), ["codex".to_string()].into_iter().collect());
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(l.optin_marker("codex"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "a marker is private state");
+        }
+        for bad in ["", ".", "..", "../evil", "a/b", "a\\b", "sudo", "git"] {
+            assert!(l.record_optin(bad).is_err(), "{bad:?} must be refused");
+            assert!(!l.optin_exists(bad));
+        }
+        assert!(!h.join("optin").join("evil").exists());
+        #[cfg(unix)]
+        {
+            let target = h.join("elsewhere");
+            std::fs::write(&target, b"not a marker").unwrap();
+            std::os::unix::fs::symlink(&target, l.optin_marker("claude")).unwrap();
+            assert!(!l.optin_exists("claude"), "a planted link is not a consent");
+            assert!(!l.optins().contains("claude"));
+            assert!(
+                l.record_optin("claude").is_err(),
+                "never write through a planted link"
+            );
+            l.clear_optin("claude");
+            assert!(
+                std::fs::symlink_metadata(l.optin_marker("claude")).is_ok(),
+                "a link is never what clear removes"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"not a marker");
+        }
+        l.clear_optin("codex");
+        assert!(!l.optin_exists("codex"));
+        l.clear_optin("codex"); // absent: a no-op
+        l.record_optin("codex").unwrap();
+        l.record_optin("gh").unwrap();
+        assert_eq!(
+            l.optins(),
+            ["codex".to_string(), "gh".to_string()]
+                .into_iter()
+                .collect()
+        );
+        l.clear_all_optins();
+        assert!(l.optins().is_empty());
+        let _ = std::fs::remove_dir_all(&h);
     }
 
     #[test]
