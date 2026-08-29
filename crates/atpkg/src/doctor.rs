@@ -655,15 +655,57 @@ pub fn run_with(
             .into_iter()
             .find_map(|tool| {
                 crate::vendor::shadowing_binary_on_path(&layout.prefix, tool.as_str(), path_var)
+                    .map(|path| (tool, path))
             });
-        if let Some(path) = shadow {
+        if let Some((tool, path)) = shadow {
+            // The canonical state in the canonical words, then — when `alab-<tool>` is
+            // laid — the one trailing sentence that names the way to the managed copy
+            // without touching PATH (`cli::alias_fix`; never part of the state).
+            let fix = crate::cli::alias_fix(layout, &tool, program, path_var)
+                .map(|f| format!(" — {f}"))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
                 "{p}: warn — {program}: {} (not the pinned build; atpkg never edits PATH — \
-                 remove or reorder that copy if you want the managed one)",
+                 remove or reorder that copy if you want the managed one){fix}",
                 crate::state::shadowed(*build, &path)
             );
         }
+    }
+    // (10f) MANAGED MEMBERS WHOSE SHIM EXPORTS AN ENVIRONMENT (design S7): a vendor tool
+    // whose signed manifest declared `shim_env` runs, through the managed shim, with its
+    // own updater off — `self-update off (DISABLE_AUTOUPDATER=1)`. Read off the shim as
+    // laid (the thing that runs), printed as ONE trailing sentence after the canonical
+    // row, never inside it; withheld when a foreign copy shadows the shim (the env never
+    // reaches a system copy — that member's line is (10d)'s warn). An `ok`, never a fault.
+    for (program, build) in &installed {
+        if crate::linkmode::is_linked(layout, program) {
+            continue;
+        }
+        let tools = crate::ops::active_tools(layout, program, *build);
+        let Some(fix) = tools
+            .iter()
+            .find_map(|t| crate::cli::shim_env_fix(&layout.shim(t)))
+        else {
+            continue;
+        };
+        if tools.iter().any(|t| {
+            crate::vendor::shadowing_binary_on_path(&layout.prefix, t.as_str(), path_var).is_some()
+        }) {
+            continue;
+        }
+        let state = status
+            .as_ref()
+            .and_then(|s| s.programs.get(program))
+            .filter(|r| crate::state::managed_pin(&r.state).is_some())
+            .map_or_else(
+                || crate::state::managed(*build, build_floor.index_build),
+                |r| r.state.clone(),
+            );
+        let _ = writeln!(
+            out,
+            "{p}: ok — {program}: {state} — {fix} (updates arrive with the ALab index)"
+        );
     }
     // EVERY problem, not the first one. This scan used to `.find()`, so a second failing
     // program was invisible until the first was fixed — a diagnostic that reveals its
@@ -776,7 +818,7 @@ pub fn run_with(
 /// convenience, and the store integrity checks above are the real verdict.
 fn probe_version(bin: &Path) -> String {
     const UNKNOWN: &str = "unknown";
-    let Ok(out) = std::process::Command::new(bin).arg("--version").output() else {
+    let Some(out) = output_bounded(std::process::Command::new(bin).arg("--version")) else {
         return UNKNOWN.to_string();
     };
     if !out.status.success() {
@@ -809,11 +851,70 @@ fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
 
 /// Whether `rustup` is on PATH and answers `--version`.
 fn rustup_present() -> bool {
-    std::process::Command::new("rustup")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    output_bounded(std::process::Command::new("rustup").arg("--version"))
+        .is_some_and(|o| o.status.success())
+}
+
+/// How long ONE `--version` probe may take before `doctor` gives up on it.
+///
+/// These are local binaries printing one line; a healthy one answers in
+/// milliseconds. The ceiling exists for the unhealthy case, which is not
+/// hypothetical here: `doctor` and `status` probe EVERY installed program plus
+/// `rustup`, so one wedged binary — a stale NFS mount, a `rustup` shim waiting
+/// on a network toolchain fetch, a program stopped on a debugger — hung the
+/// whole report with no output and no way to tell what it was waiting for.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Poll interval while waiting for a probe to exit.
+const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Run a version probe with a bounded wall clock, killing and reaping it on
+/// timeout. `None` when it could not be spawned, did not finish in time, or
+/// could not be waited for.
+///
+/// Fails to `None`, not to an error, and that is the right direction HERE (the
+/// opposite of the updater's fail-closed helpers this mirrors): the probe is a
+/// convenience that renders one column of a report, and `doctor`'s contract is
+/// that it never fails because a probe failed — the store integrity checks are
+/// the verdict. A timed-out probe reads `unknown`, exactly like a binary that
+/// will not run.
+fn output_bounded(cmd: &mut std::process::Command) -> Option<std::process::Output> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(PROBE_POLL.min(remaining));
+            }
+            Err(_) => return None,
+        }
+    };
+    // The child has exited, so its stdout is closed and this read cannot block —
+    // and a version line is one line, far inside any pipe buffer, so nothing
+    // could have wedged the child on a full pipe before it got here either.
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
 }
 
 /// Copy-pasteable manual PATH-append for the shell of THIS platform: PowerShell on Windows
@@ -942,7 +1043,13 @@ mod tests {
 
     fn install(layout: &Layout, program: &str, build: u64) {
         let dir = install_build_tree(layout, program, build);
-        install_shims(layout, &dir, &[program.to_string()]).unwrap();
+        install_shims(
+            layout,
+            &dir,
+            &[program.to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
         activate_channel(layout, "stable", &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
     }
@@ -1404,7 +1511,7 @@ mod tests {
         let l = layout("witness-absent");
         install_build_tree(&l, "ay", 18);
         let dir = l.build_dir("ay", 18);
-        install_shims(&l, &dir, &["ay".to_string()]).unwrap(); // shimmed, never activated
+        install_shims(&l, &dir, &["ay".to_string()], crate::activate::Aliases::Off).unwrap(); // shimmed, never activated
         crate::store::mark_build_ready(&dir).unwrap();
         let home = synthetic_home("witness-absent");
         assert!(
@@ -1738,7 +1845,180 @@ mod tests {
         let (ok, out) = run(&behind);
         assert!(ok, "{out}");
         assert!(!out.contains("SHADOWED"), "{out}");
+        // No alias laid (a vendor-shaped install): no fix-line either.
+        let (_, out) = run(&ahead);
+        assert!(!out.contains("for the managed one"), "{out}");
         let _ = std::fs::remove_dir_all(&foreign);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// DESIGN S7 on the `doctor` surface: a managed member whose shim exports its
+    /// manifest's `shim_env` gets ONE `ok` line — the canonical row (the recorded one when
+    /// it is managed, else derived) and the trailing `self-update off (…)` sentence —
+    /// never a fault, never inside the state; a plain shim gets no such line, and a
+    /// shadowed one keeps (10d)'s warn alone (the env never reaches the system copy).
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_member_with_a_shim_env_says_self_update_off_as_a_trailing_line() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let l = layout("shim-env");
+        let dir = install_build_tree(&l, "claude", 2026082701);
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        crate::activate::install_tools_env(
+            &l,
+            &dir,
+            &[tool("claude")],
+            crate::activate::Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        activate_channel(&l, "stable", &dir).unwrap();
+        crate::store::mark_build_ready(&dir).unwrap();
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "claude".to_string(),
+            crate::ProgramStatus {
+                installed_build: Some(2026082701),
+                state: crate::state::managed(2026082701, 41),
+                tree_root: String::new(),
+            },
+        );
+        crate::status::write(
+            &l,
+            &crate::Status {
+                schema: 1,
+                updated_at: "2026-08-28T00:00:00Z".into(),
+                enabled: true,
+                index_source: "alabsystems/aterm".into(),
+                outcome: "up to date".into(),
+                programs,
+            },
+        )
+        .unwrap();
+        let home = synthetic_home("shim-env");
+        let now = crate::flow::rfc3339_to_unix("2026-08-28T00:00:00Z").unwrap();
+        let run = |path: &std::ffi::OsStr| {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(path),
+                now,
+                None,
+                None,
+                "doctor",
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        let managed_only = std::env::join_paths([l.bin_dir()]).unwrap();
+        let (ok, out) = run(&managed_only);
+        assert!(ok, "{out}");
+        let line = out
+            .lines()
+            .find(|l| l.contains("ok — claude:"))
+            .unwrap_or_else(|| panic!("an ok line for claude:\n{out}"));
+        assert_eq!(
+            line,
+            "doctor: ok — claude: managed 2026082701 — pinned by index 41 — self-update off \
+             (DISABLE_AUTOUPDATER=1) (updates arrive with the ALab index)"
+        );
+        // Shadowed: the warn alone — the foreign copy runs, and runs without the env.
+        let foreign = l
+            .prefix
+            .parent()
+            .unwrap()
+            .join(format!("atpkg-doctor-env-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).unwrap();
+        let exe = foreign.join("claude");
+        std::fs::write(&exe, b"#!/bin/sh\necho vendor\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ahead = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
+        let (ok, out) = run(&ahead);
+        assert!(ok, "{out}");
+        assert!(out.contains("warn — claude:"), "{out}");
+        assert!(!out.contains("self-update"), "{out}");
+        // A plain shim: no line about it at all.
+        crate::activate::install_tools(&l, &dir, &[tool("claude")], crate::activate::Aliases::Off)
+            .unwrap();
+        let (ok, out) = run(&managed_only);
+        assert!(ok, "{out}");
+        assert!(!out.contains("self-update"), "{out}");
+        let _ = std::fs::remove_dir_all(&foreign);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE p11-kit STORY (§17.11): a Homebrew-style `trust` ahead of the managed bin/
+    /// shadows ALab's `trust`; the warn line keeps the canonical state and gains ONE
+    /// trailing sentence naming the alias that runs the managed copy — because the alias
+    /// is laid, and only because of that.
+    #[cfg(unix)]
+    #[test]
+    fn a_shadowed_alab_tool_names_its_alias_as_the_way_to_the_managed_copy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let l = layout("shadowed-alias");
+        let dir = install_build_tree(&l, "trust", 6808);
+        install_shims(
+            &l,
+            &dir,
+            &["trust".to_string()],
+            crate::activate::Aliases::Alab,
+        )
+        .unwrap();
+        activate_channel(&l, "stable", &dir).unwrap();
+        crate::store::mark_build_ready(&dir).unwrap();
+        let homebrew = l
+            .prefix
+            .parent()
+            .unwrap()
+            .join(format!("atpkg-doctor-homebrew-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&homebrew);
+        std::fs::create_dir_all(&homebrew).unwrap();
+        let exe = homebrew.join("trust");
+        std::fs::write(&exe, b"#!/bin/sh\necho p11-kit\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = synthetic_home("shadowed-alias");
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let ahead = std::env::join_paths([homebrew.clone(), l.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let ok = run_with(
+            &l,
+            Some(&home),
+            Some(&ahead),
+            now,
+            None,
+            None,
+            "doctor",
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert!(ok, "a shadow is a warning, not a structural fault:\n{out}");
+        let state = crate::state::shadowed(6808, &exe);
+        let line = out
+            .lines()
+            .find(|l| l.contains("warn — trust:"))
+            .unwrap_or_else(|| panic!("a warn line for trust:\n{out}"));
+        assert!(
+            line.contains(&format!("doctor: warn — trust: {state} (")),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(" — type alab-trust for the managed one"),
+            "the fix-line is the trailing sentence: {line}"
+        );
+        // And the alias really is what runs the managed copy.
+        assert!(
+            crate::which(&l, "alab-trust").is_some_and(|t| t.starts_with(&dir)),
+            "alab-trust resolves into the managed build"
+        );
+        let _ = std::fs::remove_dir_all(&homebrew);
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }

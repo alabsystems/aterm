@@ -53,6 +53,14 @@ const TAB_LIST: NodeId = NodeId(2);
 /// mistaken for a Settings control id (`field_index + 1`) or a section group
 /// ([`GROUP_BASE`]) by [`crate::app::App::on_accessibility_action`]'s routing.
 const TAB_BASE: u64 = 1 << 40;
+/// One node per live STATUS BAR row (`STATUS_BAR_BASE + bar_index`), published
+/// only while a bar is on screen. The bars reserve real terminal rows and say
+/// what the app is doing in the background — an update downloading, a toolchain
+/// installing — so a tree that omitted them described a window one or two rows
+/// taller than the one on glass, and silently dropped the only announcement of
+/// work the user did not start. Disjoint from every other range so the routing
+/// in `on_accessibility_action` can never mistake one for a tab or a control.
+const STATUS_BAR_BASE: u64 = 1 << 44;
 /// One `Role::TextRun` per visible grid ROW — at `ROW_BASE + row_index * RUNS_PER_ROW`,
 /// plus one id per extra run a row wider than [`RUN_CHARS`] is split into. Disjoint from
 /// every other id range above, and STABLE across frames: AccessKit's consumer diffs the
@@ -366,6 +374,11 @@ pub(crate) struct GridGeometry {
     pub(crate) strip_y: f64,
     /// Height of the whole strip band in physical px; `0.0` when no strip is drawn.
     pub(crate) strip_h: f64,
+    /// Top edge of the STATUS BAR band — directly below the strip, directly above
+    /// grid row 0. Equal to `origin_y` when no bar is up.
+    pub(crate) bars_y: f64,
+    /// Height of one bar row in physical px (each bar is exactly one row).
+    pub(crate) bar_h: f64,
 }
 
 /// One publishable tab of the in-grid strip: the label the strip painted, whether it is
@@ -457,6 +470,7 @@ pub(crate) fn grid_tree(
     snap: &crate::accessibility::AccessibleSnapshot,
     geom: Option<GridGeometry>,
     tabs: &[GridTab],
+    status_bars: &[String],
 ) -> TreeUpdate {
     // One text run per visible row. `split_inclusive` keeps each row's terminating '\n'
     // inside its run, which is exactly how AccessKit represents a hard line break: it is
@@ -596,6 +610,28 @@ pub(crate) fn grid_tree(
         nodes.push((TAB_LIST, list));
         root_children.push(TAB_LIST);
     }
+    // THE STATUS BARS, between the strip and the grid exactly as they are on
+    // glass. One `Label` per row carrying the spoken sentence: they are not
+    // controls (a press opens Settings, but the row itself is a report, not a
+    // button), and announcing a block-character meter would be noise.
+    for (index, line) in status_bars.iter().enumerate() {
+        let id = NodeId(STATUS_BAR_BASE + index as u64);
+        let mut node = Node::new(Role::Label);
+        node.set_label(line.clone());
+        if let Some(g) = geom
+            && g.bar_h > 0.0
+        {
+            let y0 = g.bars_y + index as f64 * g.bar_h;
+            node.set_bounds(Rect {
+                x0: g.origin_x,
+                y0,
+                x1: g.origin_x + snap.cols as f64 * g.cell_w,
+                y1: y0 + g.bar_h,
+            });
+        }
+        nodes.push((id, node));
+        root_children.push(id);
+    }
     root_children.push(GRID);
 
     let mut root = Node::new(Role::Window);
@@ -634,7 +670,7 @@ mod tests {
         crate::accessibility::AccessibleSnapshot::from_cells(&cells, usize::from(cols), cursor)
     }
 
-    fn node<'a>(update: &'a TreeUpdate, id: NodeId) -> &'a Node {
+    fn node(update: &TreeUpdate, id: NodeId) -> &Node {
         &update.nodes.iter().find(|(n, _)| *n == id).unwrap().1
     }
 
@@ -645,7 +681,52 @@ mod tests {
         cell_h: 18.0,
         strip_y: 12.0,
         strip_h: 18.0,
+        bars_y: 30.0,
+        bar_h: 18.0,
     };
+
+    /// THE STATUS BARS ARE NOT MUTE. They reserve real terminal rows and are the
+    /// only announcement of work the user did not start (a toolchain installing,
+    /// an update downloading), so a tree that omitted them both described a
+    /// window taller than the one on glass and said nothing about the work. One
+    /// `Label` per row, in painted order, between the strip and the grid.
+    #[test]
+    fn grid_tree_publishes_a_live_status_bar_between_the_strip_and_the_grid() {
+        let snap = live_grid(2, 20, b"hi", Some((0, 2)));
+        let bars = vec![
+            "Installing the ALab toolchain, trust — extracting 120 MB / 900 MB, 3 of 10"
+                .to_string(),
+            "aterm update v0.62.0, downloading…, 45 MB / 74 MB".to_string(),
+        ];
+        let update = grid_tree(&snap, Some(GEOM), &[], &bars);
+
+        for (index, spoken) in bars.iter().enumerate() {
+            let bar = node(&update, NodeId(STATUS_BAR_BASE + index as u64));
+            assert_eq!(bar.role(), Role::Label);
+            assert_eq!(bar.label(), Some(spoken.as_str()));
+            let bounds = bar.bounds().expect("a published bar carries its band");
+            // One row each, stacked below the strip and above grid row 0.
+            assert_eq!(bounds.y0, GEOM.bars_y + index as f64 * GEOM.bar_h);
+            assert_eq!(bounds.y1, bounds.y0 + GEOM.bar_h);
+        }
+        // Painted order, and the grid still comes last so a reader meets the
+        // chrome before the content it sits above.
+        let root = node(&update, ROOT);
+        let children = root.children();
+        let bar_ids: Vec<NodeId> = (0..bars.len())
+            .map(|i| NodeId(STATUS_BAR_BASE + i as u64))
+            .collect();
+        assert_eq!(&children[..bars.len()], &bar_ids[..]);
+        assert_eq!(children.last().copied(), Some(GRID));
+
+        // …and with no bar up the tree is byte-identical to the no-bar path.
+        let without = grid_tree(&snap, Some(GEOM), &[], &[]);
+        assert_eq!(
+            without.nodes.len() + bars.len(),
+            update.nodes.len(),
+            "a hidden bar publishes no node at all"
+        );
+    }
 
     /// DEFAULT-2: `grid_tree` publishes the terminal grid as a read-only `Role::Terminal`
     /// node under a `Role::Window` root, carrying the snapshot's visible text — what a
@@ -653,7 +734,7 @@ mod tests {
     #[test]
     fn grid_tree_publishes_the_terminal_grid() {
         let snap = live_grid(2, 10, b"hello", Some((0, 5)));
-        let update = grid_tree(&snap, None, &[]);
+        let update = grid_tree(&snap, None, &[], &[]);
         assert_eq!(update.focus, GRID);
         let root = node(&update, ROOT);
         let grid = node(&update, GRID);
@@ -685,7 +766,7 @@ mod tests {
     #[test]
     fn terminal_node_publishes_one_text_run_per_row() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
-        let update = grid_tree(&snap, Some(GEOM), &[]);
+        let update = grid_tree(&snap, Some(GEOM), &[], &[]);
         let grid = node(&update, GRID);
         let rows: Vec<NodeId> = (0..3)
             .map(|r| NodeId(ROW_BASE + r * RUNS_PER_ROW))
@@ -733,7 +814,7 @@ mod tests {
     #[test]
     fn caret_is_a_degenerate_selection_at_the_cursor() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
-        let update = grid_tree(&snap, Some(GEOM), &[]);
+        let update = grid_tree(&snap, Some(GEOM), &[], &[]);
         let selection = node(&update, GRID).text_selection().copied().unwrap();
         assert_eq!(
             selection.anchor, selection.focus,
@@ -755,7 +836,7 @@ mod tests {
     #[test]
     fn caret_in_trailing_blanks_clamps_onto_the_line_break() {
         let snap = live_grid(2, 20, b"hi", Some((0, 17)));
-        let update = grid_tree(&snap, None, &[]);
+        let update = grid_tree(&snap, None, &[], &[]);
         let selection = node(&update, GRID).text_selection().copied().unwrap();
         assert_eq!(selection.focus.node, NodeId(ROW_BASE));
         assert_eq!(
@@ -774,7 +855,7 @@ mod tests {
     #[test]
     fn hidden_cursor_publishes_no_caret() {
         let snap = live_grid(2, 10, b"hello", None);
-        let update = grid_tree(&snap, None, &[]);
+        let update = grid_tree(&snap, None, &[], &[]);
         assert_eq!(node(&update, GRID).text_selection(), None);
         assert_eq!(snap.cursor_offset(), None);
     }
@@ -794,7 +875,7 @@ mod tests {
         let cols: u16 = 300;
         let text: Vec<u8> = std::iter::repeat_n(b'w', 290).collect();
         let snap = live_grid(2, cols, &text, Some((0, 281)));
-        let update = grid_tree(&snap, None, &[]);
+        let update = grid_tree(&snap, None, &[], &[]);
         let grid = node(&update, GRID);
 
         // Row 0 spends more than one run; every run stays addressable.
@@ -829,8 +910,13 @@ mod tests {
 
     #[test]
     fn row_ids_are_stable_across_frames() {
-        let first = grid_tree(&live_grid(3, 12, b"one", Some((0, 3))), None, &[]);
-        let second = grid_tree(&live_grid(3, 12, b"one\r\ntwo", Some((1, 3))), None, &[]);
+        let first = grid_tree(&live_grid(3, 12, b"one", Some((0, 3))), None, &[], &[]);
+        let second = grid_tree(
+            &live_grid(3, 12, b"one\r\ntwo", Some((1, 3))),
+            None,
+            &[],
+            &[],
+        );
         let ids = |u: &TreeUpdate| node(u, GRID).children().to_vec();
         assert_eq!(ids(&first), ids(&second), "same row ids frame to frame");
         assert_ne!(
@@ -846,7 +932,7 @@ mod tests {
     #[test]
     fn character_geometry_tracks_the_cell_grid() {
         let snap = live_grid(2, 10, b"abc", Some((0, 3)));
-        let update = grid_tree(&snap, Some(GEOM), &[]);
+        let update = grid_tree(&snap, Some(GEOM), &[], &[]);
         let run = node(&update, NodeId(ROW_BASE));
         assert_eq!(run.value(), Some("abc\n"));
         assert_eq!(run.character_positions().unwrap(), [0.0, 9.0, 18.0, 27.0]);
@@ -882,7 +968,7 @@ mod tests {
     #[test]
     fn missing_geometry_degrades_only_the_geometry() {
         let snap = live_grid(2, 10, b"abc", Some((0, 3)));
-        let update = grid_tree(&snap, None, &[]);
+        let update = grid_tree(&snap, None, &[], &[]);
         let run = node(&update, NodeId(ROW_BASE));
         assert_eq!(run.value(), Some("abc\n"));
         assert_eq!(run.character_lengths().len(), 4);
@@ -905,7 +991,7 @@ mod tests {
         assert_eq!(word_starts_of(""), [0]);
         assert_eq!(word_starts_of("   "), [0]);
         assert_eq!(word_starts_of("$ echo hi"), [0, 2, 7]);
-        let update = grid_tree(&live_grid(1, 20, b"echo hi", Some((0, 7))), None, &[]);
+        let update = grid_tree(&live_grid(1, 20, b"echo hi", Some((0, 7))), None, &[], &[]);
         assert_eq!(node(&update, NodeId(ROW_BASE)).word_starts(), [0, 5]);
     }
 
@@ -932,7 +1018,7 @@ mod tests {
                 end_col: 20,
             },
         ];
-        let update = grid_tree(&snap, Some(GEOM), &tabs);
+        let update = grid_tree(&snap, Some(GEOM), &tabs, &[]);
         assert_eq!(
             node(&update, ROOT).children(),
             [TAB_LIST, GRID],

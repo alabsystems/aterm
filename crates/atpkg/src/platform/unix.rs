@@ -268,9 +268,14 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Install a bin shim at `shim` forwarding to `target`. On Unix a shim IS a symlink,
-/// so this is exactly [`atomic_symlink`].
-pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
+/// Install a bin shim at `shim` forwarding to `target`, exporting `env` first (design
+/// S7; an empty `env` is the plain shim). The `(shim, target)` form without an
+/// environment is [`super::install_shim_to`].
+pub fn install_shim_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<()> {
     // An EXEC STUB, not a symlink. See `platform::sh_shim_content` for why: Trust's
     // `targo` refuses to authenticate when its own `current_exe` is a symlink or a
     // non-canonical path, so a symlinked shim made the product's headline tool fail
@@ -279,7 +284,7 @@ pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
     //
     // Written temp+rename so the swap stays atomic exactly as `atomic_symlink` was:
     // a shim on the user's PATH is never briefly absent or half-written.
-    let body = super::sh_shim_content(target);
+    let body = super::sh_shim_content_env(target, env);
     let tmp = shim.with_extension("atpkg-new");
     let _ = std::fs::remove_file(&tmp);
     {
@@ -361,6 +366,17 @@ pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     let content =
         crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES).ok()?;
     super::parse_sh_shim_target(&content)
+}
+
+/// The environment the shim at `shim` exports before it execs — its `export` lines,
+/// parsed back by [`super::parse_sh_shim_env`] (fail-closed: NONE for a symlink an older
+/// atpkg left, a tombstone, a pending stub, or anything the rule refuses).
+#[must_use]
+pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
+    match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
+        Ok(content) => super::parse_sh_shim_env(&content),
+        Err(_) => crate::shim_env::ShimEnv::NONE,
+    }
 }
 
 /// Replace the current process image with `command` (`execve`); returns only on failure.

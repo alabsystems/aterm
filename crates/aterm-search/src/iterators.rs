@@ -10,6 +10,7 @@ use crate::bitmap::SparseBitmap;
 
 use super::index::SearchIndex;
 use super::types::SearchMatch;
+use crate::bytesearch::Searcher;
 use crate::grapheme::ColumnMap;
 
 /// Source of candidate line numbers for search iteration.
@@ -153,6 +154,10 @@ impl CandidateSource {
 /// is what makes budgeted results equal to one-shot results by construction
 /// rather than by reimplementation.
 ///
+/// The needle arrives as a PREPARED [`Searcher`] rather than a `&str` because
+/// this is called once per match: preparing it here would recompute the
+/// needle's critical factorization for every occurrence on the line.
+///
 /// Semantics (unchanged from the loop this was extracted from): byte spans that
 /// resolve to zero display columns are skipped, and the resume offset advances
 /// by ONE character past the match start so overlapping matches are preserved.
@@ -160,20 +165,21 @@ impl CandidateSource {
 pub(crate) fn next_literal_match(
     line: usize,
     text: &str,
-    query: &str,
+    searcher: &Searcher<'_>,
     col_map: &ColumnMap,
     from_byte: usize,
 ) -> Option<(SearchMatch, usize)> {
     let mut next_byte = from_byte;
     while let Some(tail) = text.get(next_byte..) {
-        // E9b: SIMD memmem for the forward literal verify, matching the reverse
-        // iterator's `memmem::rfind`. Byte-identical to `tail.find(query)`: a
+        // E9b: the crate's own Two-Way substring search for the forward literal
+        // verify, matching the reverse iterator's `rfind`. Byte-identical to
+        // `tail.find(query)`: a
         // byte-aligned occurrence of a valid-UTF-8 needle in a valid-UTF-8
         // haystack is necessarily char-aligned, so the offset is the same one
         // str::find's two-way scan returns — just found with the faster scanner.
-        let relative = memchr::memmem::find(tail.as_bytes(), query.as_bytes())?;
+        let relative = searcher.find_in(tail.as_bytes())?;
         let abs_pos = next_byte.checked_add(relative)?;
-        let match_end = abs_pos.checked_add(query.len())?;
+        let match_end = abs_pos.checked_add(searcher.needle().len())?;
         let step = text
             .get(abs_pos..)
             .and_then(|suffix| suffix.chars().next())
@@ -196,8 +202,8 @@ pub(crate) fn next_literal_match(
 pub(crate) struct SearchMatchIterator<'a> {
     /// The search index.
     index: &'a SearchIndex,
-    /// The query string.
-    query: &'a str,
+    /// The query, prepared once for the whole walk.
+    searcher: Searcher<'a>,
     /// Candidate line numbers source.
     candidates: CandidateSource,
     /// Candidate line currently being verified, if any.
@@ -211,7 +217,7 @@ impl<'a> SearchMatchIterator<'a> {
     pub(super) fn new(index: &'a SearchIndex, query: &'a str, candidates: CandidateSource) -> Self {
         Self {
             index,
-            query,
+            searcher: Searcher::new(query.as_bytes()),
             candidates,
             current_line: None,
             next_byte: 0,
@@ -236,7 +242,7 @@ impl Iterator for SearchMatchIterator<'_> {
                     }
                 };
                 if let Some((found, resume)) =
-                    next_literal_match(line_num, text, self.query, col_map, self.next_byte)
+                    next_literal_match(line_num, text, &self.searcher, col_map, self.next_byte)
                 {
                     self.next_byte = resume;
                     return Some(found);
@@ -260,8 +266,12 @@ impl Iterator for SearchMatchIterator<'_> {
 pub(crate) struct SearchMatchReverseIterator<'a> {
     /// The search index.
     index: &'a SearchIndex,
-    /// The query string.
-    query: &'a str,
+    /// The query, prepared once for the whole walk.
+    ///
+    /// One preparation per query, not per match: this iterator calls
+    /// [`Searcher::rfind_in`] once for every occurrence on a line, and each of
+    /// those used to re-derive the needle's critical factorization.
+    searcher: Searcher<'a>,
     /// Candidate line numbers source (yields in descending order).
     candidates: CandidateSource,
     /// Candidate line currently being verified, if any.
@@ -275,7 +285,7 @@ impl<'a> SearchMatchReverseIterator<'a> {
     pub(super) fn new(index: &'a SearchIndex, query: &'a str, candidates: CandidateSource) -> Self {
         Self {
             index,
-            query,
+            searcher: Searcher::new(query.as_bytes()),
             candidates,
             current_line: None,
             before_byte: usize::MAX,
@@ -292,14 +302,15 @@ impl Iterator for SearchMatchReverseIterator<'_> {
                 && self.before_byte != 0
                 && let Some(text) = self.index.lines.get(&line_num)
             {
-                let query_len = self.query.len();
+                let query_len = self.searcher.needle().len();
                 let prefix_end = text
                     .len()
                     .min(self.before_byte.saturating_add(query_len.saturating_sub(1)));
-                let abs_pos = memchr::memmem::rfind(
-                    text.as_bytes().get(..prefix_end)?,
-                    self.query.as_bytes(),
-                );
+                // A REVERSE scan, so this stops at the first match to the left
+                // of the cursor rather than walking the line from 0 to find it:
+                // the whole reverse walk of a line costs one pass over it, not
+                // one pass per match.
+                let abs_pos = self.searcher.rfind_in(text.as_bytes().get(..prefix_end)?);
                 if let Some(abs_pos) = abs_pos {
                     self.before_byte = abs_pos;
                     let match_end = abs_pos.checked_add(query_len)?;

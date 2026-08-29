@@ -534,7 +534,7 @@ fn native_lane_rustflags(repo: &Path) -> Result<Vec<String>> {
             return Err(Error::new(format!("read {}: {error}", path.display())));
         }
     };
-    let value: toml::Value = text
+    let value: aterm_toml::Value = text
         .parse()
         .map_err(|error| Error::new(format!("parse {}: {error}", path.display())))?;
     Ok(value

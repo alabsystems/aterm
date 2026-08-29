@@ -106,11 +106,14 @@ fn an_empty_body_repeat_collapses_instead_of_spinning() {
             pattern.len() <= MAX_PATTERN_LEN,
             "{pattern:?} has to be a pattern the call sites would actually accept"
         );
-        let re = bounded(pattern)
-            .unwrap_or_else(|e| panic!("{pattern:?} collapses to an empty match, not an error: {e}"));
+        let re = bounded(pattern).unwrap_or_else(|e| {
+            panic!("{pattern:?} collapses to an empty match, not an error: {e}")
+        });
         let haystack = "ab\u{e9}";
-        let mine: Vec<(usize, usize)> =
-            re.find_iter(haystack).map(|m| (m.start(), m.end())).collect();
+        let mine: Vec<(usize, usize)> = re
+            .find_iter(haystack)
+            .map(|m| (m.start(), m.end()))
+            .collect();
         let theirs: Vec<(usize, usize)> = regex::Regex::new(pattern)
             .expect("the oracle compiles all of these in microseconds")
             .find_iter(haystack)
@@ -150,7 +153,10 @@ fn an_unbounded_repetition_count_fails_fast_instead_of_allocating() {
 fn the_size_limit_is_the_thing_that_decides() {
     let pattern = "(a{50}){50}"; // 2,500 instructions
     assert!(
-        RegexBuilder::new(pattern).size_limit(1 << 20).build().is_ok(),
+        RegexBuilder::new(pattern)
+            .size_limit(1 << 20)
+            .build()
+            .is_ok(),
         "2,500 instructions fit in 1 MiB"
     );
     assert!(
@@ -236,7 +242,10 @@ fn pathological_patterns_finish_promptly() {
         let re = Regex::new(pattern).expect("compiles");
         let haystack = "a".repeat(n);
         let started = Instant::now();
-        assert!(!re.is_match(&haystack), "{pattern:?} must not match a run of `a`");
+        assert!(
+            !re.is_match(&haystack),
+            "{pattern:?} must not match a run of `a`"
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed.as_secs() < 5,
@@ -276,7 +285,10 @@ fn match_accessors() {
     assert!(!m.is_empty());
     assert_eq!(&text[m.start()..m.end()], "caf\u{e9}");
 
-    let empty = Regex::new("x*").expect("compiles").find("y").expect("matches");
+    let empty = Regex::new("x*")
+        .expect("compiles")
+        .find("y")
+        .expect("matches");
     assert_eq!(empty.len(), 0);
     assert!(empty.is_empty() && empty.as_str().is_empty());
 }
@@ -338,12 +350,21 @@ fn syntax_errors_are_constructible_and_intelligible() {
     let mine = Error::Syntax(format!(
         "pattern exceeds maximum length ({MAX_PATTERN_LEN} bytes)"
     ));
-    assert_eq!(mine.to_string(), "pattern exceeds maximum length (1024 bytes)");
+    assert_eq!(
+        mine.to_string(),
+        "pattern exceeds maximum length (1024 bytes)"
+    );
 
     let err = Regex::new("(unclosed").expect_err("must fail").to_string();
     assert!(err.contains("unclosed group"), "{err}");
-    assert!(err.contains("(unclosed"), "the message must quote the pattern: {err}");
-    assert!(err.contains('^'), "the message must point at the position: {err}");
+    assert!(
+        err.contains("(unclosed"),
+        "the message must quote the pattern: {err}"
+    );
+    assert!(
+        err.contains('^'),
+        "the message must point at the position: {err}"
+    );
 
     assert_eq!(
         Error::CompiledTooBig(1 << 20).to_string(),
@@ -353,7 +374,10 @@ fn syntax_errors_are_constructible_and_intelligible() {
     // Every refusal says something a person can act on.
     for pattern in ["[a", "a{2,1}", "\\", "(?=a)", "\\p{L}", "[a&&b]", "(?-u)x"] {
         let err = Regex::new(pattern).expect_err("must fail").to_string();
-        assert!(err.len() > 20, "{pattern:?} produced a useless message: {err}");
+        assert!(
+            err.len() > 20,
+            "{pattern:?} produced a useless message: {err}"
+        );
         assert!(err.contains("error: "), "{pattern:?}: {err}");
     }
 }
@@ -434,7 +458,10 @@ fn offsets_are_byte_offsets_on_code_point_boundaries() {
 fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
     // Refused outright: the two amplifiers that motivated the 128 KiB ceiling.
     for pattern in ["(?:x?){2000}z", "(?:x|x|x|x|x|x|x|x){400}z"] {
-        assert!(pattern.len() <= MAX_PATTERN_LEN, "these pass the length gate");
+        assert!(
+            pattern.len() <= MAX_PATTERN_LEN,
+            "these pass the length gate"
+        );
         assert!(
             matches!(bounded(pattern), Err(Error::CompiledTooBig(_))),
             "{pattern:?} costs tens of milliseconds per row and must not compile"
@@ -446,7 +473,10 @@ fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
     for pattern in ["(?:x?){1020}z", "(?:x|x|x|x|x|x|x|x){100}z"] {
         let Ok(re) = bounded(pattern) else { continue };
         let started = Instant::now();
-        assert!(!re.is_match(&row), "{pattern:?} must not match a run of `x`");
+        assert!(
+            !re.is_match(&row),
+            "{pattern:?} must not match a run of `x`"
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed.as_secs() < 5,

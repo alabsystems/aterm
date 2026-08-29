@@ -917,13 +917,13 @@ impl RestoreManifest {
     }
 
     pub(crate) fn to_toml(&self) -> Result<String, String> {
-        toml::to_string(self).map_err(|e| format!("serialize restore manifest: {e}"))
+        aterm_toml::to_string(self).map_err(|e| format!("serialize restore manifest: {e}"))
     }
 
     /// FAIL-SAFE parse: any TOML error or schema mismatch yields `None`, so a corrupt or
     /// old-version manifest never blocks launch — the app just starts fresh.
     pub(crate) fn from_toml(s: &str) -> Option<Self> {
-        let mut manifest: Self = toml::from_str(s).ok()?;
+        let mut manifest: Self = aterm_toml::from_str(s).ok()?;
         if manifest.schema != LEGACY_SCHEMA && manifest.schema != SCHEMA {
             return None;
         }
@@ -1316,7 +1316,7 @@ fn cell_metrics_scale_milli(scale: f64) -> u32 {
 /// (the caller cold-launches), mirroring the manifest's parse contract.
 fn read_cell_metrics(path: &Path) -> Option<CellMetricsCache> {
     let text = fs::read_to_string(path).ok()?;
-    let cache: CellMetricsCache = toml::from_str(&text).ok()?;
+    let cache: CellMetricsCache = aterm_toml::from_str(&text).ok()?;
     (cache.schema == CELL_METRICS_SCHEMA).then_some(cache)
 }
 
@@ -1435,7 +1435,8 @@ fn store_cell_metrics_to(
                 cache.entries.push(entry);
             }
         }
-        let toml = toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
+        let toml =
+            aterm_toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
         write_restore_locked(path, toml.as_bytes())
     })
 }
@@ -1578,7 +1579,7 @@ mod tests {
 
         // Serialize the deliberately noncanonical structure directly: the
         // ordinary constructor already sanitizes and would not exercise parse.
-        let wire = toml::to_string(&manifest).expect("serialize hostile fixture");
+        let wire = aterm_toml::to_string(&manifest).expect("serialize hostile fixture");
         let decoded = RestoreManifest::from_toml(&wire).expect("bounded restore parses");
         let RestoredSplitTree::Leaf {
             view: RestoredView::Terminal(terminal),
@@ -1660,7 +1661,7 @@ focused = true
     #[test]
     fn malformed_native_metadata_and_aliasing_order_fail_closed() {
         let mut malformed_uri = mixed_sample("https://example.invalid/not-local.md");
-        let toml = toml::to_string(&malformed_uri).unwrap();
+        let toml = aterm_toml::to_string(&malformed_uri).unwrap();
         assert!(RestoreManifest::from_toml(&toml).is_none());
 
         malformed_uri.windows[0].native_tabs[1] = NativeTabRestore::Editor {
@@ -1671,7 +1672,7 @@ focused = true
             TabOrderEntry::Terminal { index: 0 },
             TabOrderEntry::Native { index: 0 },
         ];
-        let toml = toml::to_string(&malformed_uri).unwrap();
+        let toml = aterm_toml::to_string(&malformed_uri).unwrap();
         assert!(
             RestoreManifest::from_toml(&toml).is_none(),
             "duplicate descriptor indices may not alias one live tab"
@@ -1804,7 +1805,7 @@ metadata = "opaque=copy-me"
         tab.focused_path = vec![RestoreBranch::First];
         manifest.windows[0].restored_tabs = vec![tab];
         manifest.windows[0].active_item = Some(0);
-        let encoded = toml::to_string(&manifest).unwrap();
+        let encoded = aterm_toml::to_string(&manifest).unwrap();
         let decoded = RestoreManifest::from_toml(&encoded).expect("NaN ratio is recoverable");
         assert!(matches!(
             decoded.windows[0].restored_tabs[0].root,
@@ -1848,7 +1849,7 @@ metadata = "opaque=copy-me"
             zoomed: false,
         }];
         assert!(
-            RestoreManifest::from_toml(&toml::to_string(&manifest).unwrap()).is_none(),
+            RestoreManifest::from_toml(&aterm_toml::to_string(&manifest).unwrap()).is_none(),
             "adversarial depth must fail before runtime allocation"
         );
     }
@@ -1862,7 +1863,7 @@ metadata = "opaque=copy-me"
         // Valid TOML, wrong schema → ignored.
         let mut m = sample();
         m.schema = 999;
-        let toml = toml::to_string(&m).unwrap();
+        let toml = aterm_toml::to_string(&m).unwrap();
         assert!(
             RestoreManifest::from_toml(&toml).is_none(),
             "stale schema is ignored"

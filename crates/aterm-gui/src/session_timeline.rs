@@ -468,10 +468,23 @@ pub(crate) fn write_session_meta(
 }
 
 /// One recorded lifecycle event. `kind` is a closed vocabulary (`spawned`,
-/// `state-change`, `title-change`, `cwd-change`, `meta-change`); `payload` is a
-/// short space-separated `k=v` token string whose free-text values are ALREADY
-/// pct-encoded at record time, so the `timeline` verb and the events digest can
-/// print it verbatim as the line tail (one line per event, always).
+/// `state-change`, `title-change`, `cwd-change`, `meta-change`, `closing`);
+/// `payload` is a short space-separated `k=v` token string whose free-text
+/// values are ALREADY pct-encoded at record time, so the `timeline` verb and the
+/// events digest can print it verbatim as the line tail (one line per event,
+/// always).
+///
+/// WHO CAN READ WHICH. The `timeline` verb lists every kind a LIVE session has
+/// recorded. The last two rows a session ever records — `closing reason= by=`
+/// (only when the close path said why) and `state-change state=closed` — are
+/// written by the store as it deregisters the session, and the sid stops
+/// resolving in that same write, so no request can reach them through the verb.
+/// The `subscribe … events` digest pushes exactly two kinds from this ring:
+/// `meta-change` as `EVENT <local> meta …` and `closing` as `EVENT <local>
+/// closing …` (the dying watch's final pass, ahead of its `exited` frame); the
+/// final `state-change` has no wire form of its own — `exited` is that fact.
+/// Afterwards the same reason and actor stay answerable on the instance's
+/// `exits` ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineEvent {
     /// Per-session monotonic id (1-based), the `since=<id>` resume key.

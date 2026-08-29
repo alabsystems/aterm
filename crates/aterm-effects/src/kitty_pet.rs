@@ -12,22 +12,79 @@
 //!
 //! | what the caret does | what the pet does | why |
 //! |---|---|---|
-//! | one column, unhurried | **walks** | the gap it must close is one cell |
-//! | column after column, fast | **runs** | the caret is outpacing it |
-//! | a word jump / Home / End / tab-complete | **pounces** | too far to walk: crouch, ballistic arc, landing squash |
-//! | Enter, a wrapped line, an arrow up or down | **hops** the row | the ground line moved, so it must leave the floor — one gathered tick, then an arc sized to the span |
+//! | one column, unhurried | **ambles** — the lateral walk, one leg at a time | a caret it can stroll after is not a thing to trot after: under [`LAT_SPEED`] the walk swaps to [`PetBrain::CYCLE_LWALK`] on its own shorter stride |
+//! | one column, briskly | **trots** | the diagonal pairs, the gait it has always had, from [`LAT_SPEED`] up |
+//! | column after column, fast | **runs** | the caret is outpacing it — and on the rare gallop that blows past its own station (the brake's gate wants a follower step that CROSSES the station while still over [`RUN_SPEED`], which an eased follower reaches only when the caret snaps back under it) the cat **skids**, braced on a planted frame, before it trots back |
+//! | a word jump / End / tab-complete | **pounces** | too far to walk: crouch, ballistic arc, landing squash |
+//! | a jump HOME — [`SNAP_COLS`] or more, backwards, in one move | **snaps** after it, quietly | a caret that left is not a thing coming at the pet: it faces the move, latches a quiet leap and goes — no fright, and never the screen-crossing show |
+//! | Enter, a wrapped line, an arrow up or down | **hops** the row — or **bounds** it, quietly | the ground line moved, so it must leave the floor. A wrap folds to the one character it typed first; a line change (a row change, whichever way the column went) then tiers by its span: within [`POUNCE_SPAN_MAX`] one gathered tick and a hop, beyond it one quiet bound (two only if the crossing would take longer than [`QUIET_ONE_BOUND_SECS`] at the pane's pace, which no ordinary width reaches) — never the screen-crossing show, and never faster than [`QUIET_PANE_PER_SEC`] of the pane a second |
+//! | Enter exactly one row under a SLEEPING cat | **drops off the line** | the floor moved out from under it: it falls ([`DROP_DUR`]) still asleep, spends the wake stretch in the air, lands, and sits staring at whoever did it ([`DROP_SIT`]) before the ordinary trip home |
+//! | moves TWICE while the pet is in the air | **lands, stares at the empty cell, then admits it** | the one mid-air re-aim is spent, so wherever it lands is already wrong: it stands on the cell facing the way it flew ([`COMMIT_STARE`]), then does the double-take after the caret |
 //! | a backspace or two | **flinches** | a typo being fixed is not a threat: a duck and a hard look at the caret |
 //! | a real retreat — four columns, or a held delete | **startles** | the thing it was chasing is coming back at it: the full bottle, facing the caret |
 //! | forward, back, forward, back (editing) | **frolics** | direction reversals are play, not travel |
+//! | line after line, faster than a person types | **sits down and watches** | a build log is a program printing, not a person writing: [`STREAM_RUN`] line events inside [`STREAM_WINDOW`] arm the stream watch, the chase target becomes the pet's own feet, and the whole reaction ladder stands down until the events lapse |
 //! | stops | **stands**, then **sits**, then **grooms** | it caught up; there is nothing to chase |
-//! | stays stopped | **sleeps** | and stretches itself awake when you come back |
-//! | a good long run, then quiet | **purrs** | contentment is earned by the run and spent while settled |
+//! | stays stopped | **sleeps** | and stretches itself awake — front, then hind — when you come back |
+//! | a good long run, then quiet | **purrs from the moment it sits**, and two long dwells in three wear the purr's pose as well | contentment is earned by the run and spent while settled — but "the cat is purring" and "the cat is wearing the purr" are two facts, so the TELL (the chest swell, the ♪ and ♥) rides every settled frame while the POSE waits for the long dwell, where it does not cost the seat its beats. One dwell in three loafs anyway, so the loaf keeps its own vocabulary too |
 //!
 //! Nothing here is a random flourish keyed off a wall clock. Every action is a
 //! function of caret geometry and elapsed time, so the same typing always
 //! produces the same cat — which is what makes the behaviour testable, and what
 //! makes it read as an animal reacting to *you* rather than a loop playing near
 //! your text.
+//!
+//! ## No flight outruns the animal that flies it
+//!
+//! Every departure from the ground goes through ONE door
+//! ([`PetBrain::leave_ground`]), and that door decides the TIER before the
+//! paws leave: a predicted equivalent span (columns, with a row worth
+//! [`ROW_AS_COLS`] of them — see [`span_eq`]) within [`POUNCE_SPAN_MAX`] is a
+//! hop or a pounce, anything longer is a bound. The tier is what keeps the
+//! speed honest, because the law is judged at LAUNCH, not per frame: a hop
+//! may never exceed [`HOP_SPEED_MAX`], and EVERY bound — the chosen show
+//! included — flies at [`QUIET_PANE_PER_SEC`] of the pane a second (never
+//! over the law's [`BIG_HOP_SPEED_MAX`] ceiling), so on the panes people
+//! actually type in no crossing is more than about a cell a frame. Past
+//! ~189 columns the clamp pins the pace at the law's own ceiling and a bound
+//! crosses 2.33 cells in a frame — which is not a defect, because CELLS ARE
+//! THE WRONG UNIT for "teleport". The eye loses a moving OBJECT when it
+//! moves a good part of its own size between frames, and the object is
+//! [`art_cols`] ≈ 5.6 columns wide: 2.33 cells is 0.42 of the animal, where
+//! 80 columns gives 0.18. As a fraction of the PANE the wide one is quieter
+//! still (1.17 % a frame against 1.24 %). See [`QUIET_PANE_PER_SEC`]. The
+//! show's identity is
+//! its notice, its butt-wiggle, its touch-down between two bounds and its
+//! dust; the speed never was. A crossing the WORLD forced — a seam, a line
+//! change, a snap — bets only the DECAYED drift of its own station, never a
+//! bet that the caret types forever: `v̂` collapses over [`VEL_TAU`] the
+//! moment the caret stops, so the lead is ~0 for a crossing nothing follows
+//! and real for a caret that typed on through the seam (see
+//! [`PetBrain::station_drift`], which also records what a hard zero there
+//! costs). The one mid-air re-aim is judged the same way,
+//! on the span it still has to cover in the time it has left — and paced by
+//! the DESTINATION'S intent, never by the costume of the flight already in
+//! the air. A re-aim that would break the law is REFUSED rather than solved:
+//! the flight finishes where it was going and the latched intent launches a
+//! lawful new one from the landing.
+//!
+//! ## The three wraps
+//!
+//! A margin wrap is one character of travel, and the pet must read it as one
+//! however the grid reported it. Typing past the right margin moves the caret
+//! down a row and back to column 0, which is folded to the single cell it
+//! really covered. A wrap on the LAST row SCROLLS instead: the caret's row
+//! never changes and the delta is byte-identical to `Home` pressed at the
+//! last column, so no heuristic can tell them apart and this brain does not
+//! try — the emulator says which it was ([`PetSense::wrapped`], fed from the
+//! grid's own wrap serial) and the fold answers with the one character the
+//! text really moved. The third shape is the shell's own new line at the
+//! bottom of the pane after a short command: no wrap happened, so the fact is
+//! false by construction, and the fold that catches it is a same-row retreat
+//! landing at the row's HOME edge — the margin, or the end of a prompt that
+//! starts at the margin, because a prompt is as wide as its author made it
+//! ([`PetBrain::caret_at_home`]). Everything larger than that is the SNAP,
+//! and none of the three is a fright.
 //!
 //! ## Screen awareness
 //!
@@ -49,11 +106,15 @@
 //!
 //! ## Gait is driven by distance, not by the clock
 //!
-//! The walk and run cycles advance by how far the pet has actually travelled
-//! ([`STRIDE_CELLS`]), never by elapsed seconds. A wall-clock cycle moon-walks
-//! the instant the pet's speed and the animation rate disagree — the feet slide
-//! along a floor they are supposed to be pushing against. Distance-driven feet
-//! cannot: half a stride is half a cell, at every speed, forever.
+//! The amble, walk and run cycles advance by how far the pet has actually
+//! travelled ([`LAT_STRIDE_CELLS`], [`STRIDE_CELLS`], [`RUN_STRIDE_CELLS`]),
+//! never by elapsed seconds. A wall-clock cycle moon-walks the instant the
+//! pet's speed and the animation rate disagree — the feet slide along a floor
+//! they are supposed to be pushing against. Distance-driven feet cannot: half
+//! a stride is half a cell, at every speed, forever. And the stride is a
+//! CYCLE COUNT, not a phase in cells, so a gait swapping its divisor changes
+//! the cadence and never the beat: a cat easing out of the amble into the
+//! trot keeps its feet.
 //!
 //! ## The breed handoff (two kitties on glass)
 //!
@@ -76,6 +137,16 @@
 //! off — the old cat leaving, the new one arriving — never a one-frame
 //! recolour (owner: "switching the cats all the time is too abrupt").
 //!
+//! …and the ceremony is RATIONED, because it is a greeting: a cat this
+//! window has already worn comes HOME rather than arriving
+//! ([`PetArrival::Quiet`]). The homecoming is a [`HOMECOMING_IN`] crossfade
+//! in place — the new coat up, the old one out as a zero-span `still`
+//! departure at the pet's own feet — no run, no theater, and no
+//! displacement of either body. The host owns the roster (which cats this
+//! window has met, and how recently); the brain owns what each verdict
+//! looks like, and both verdicts land the same `(coat, iris)` on the same
+//! debounce.
+//!
 //! Departing bodies are scripted transients, not second brains: each is a
 //! pure function of its spawn record and the brain's own clock (clockless,
 //! dieless, bounded by [`DEPART_MAX`]), resolved into [`PetFrame::departures`]
@@ -92,6 +163,68 @@
 //! how long it has been QUIET, i.e. of the settle the user is actually watching,
 //! so a test can drive the exact sequence a user sees and the flourishes cannot
 //! depend on how long the window happened to have been open.
+//!
+//! Every ARRIVAL deals a hand — `settle_seed`, minted in
+//! [`PetBrain::enter_settled`] from the settle serial and the mote serial —
+//! and the idle ladder reads it through accessors ([`PetBrain::loaf_after`],
+//! [`PetBrain::groom_after`], [`PetBrain::groom_skip`]) rather than off the
+//! constants, so two settles in a row are not the same performance and the
+//! same typing is still the same cat. The deal never bumps the mote serial:
+//! that serial's parity feeds the ear twitch and the stumble, and re-dealing
+//! it per settle would move sequences that already shipped.
+//!
+//! The IDLE reads that hand too, through one splitter
+//! ([`PetBrain::sit_beat`] for the window, [`PetBrain::beat_deal`] for the
+//! hand this beat was dealt): whether the tail flicks once, twice, swings
+//! behind the seat or stays still, when the eyes blink and whether they
+//! blink twice, whether the seat yawns before it loafs, when eye contact
+//! breaks and comes back, whether the loaf peeks before it sleeps, and which
+//! way round each wash goes. Nothing on that list is a metronome and nothing
+//! on it is random. Deep sleep is exempt by law — past [`SLEEP_AFTER`] plus
+//! [`BREATH_WINDOW`] every hand is byte-stable and the frame lane goes to
+//! zero.
+//!
+//! ## The seat has one precedence
+//!
+//! `sit_front` (blinking or not, until a look opens) > `peek` > the yawn >
+//! the ear frame > the head tip > the tail beat > the blink > the plain sit.
+//! The top two are the settled GAZE and are state; everything under them is a
+//! dealt beat, and the TAIL is the one rider — while it is off its rest, the
+//! three beats above it stand down, because a frame cutting into the swing
+//! would put the tail on the other side of the cat between two frames.
+//!
+//! The LOOK is the door the whole vocabulary comes through: face-on is the
+//! ORDINARY settled pose (measured, 88.8 % of all settled frames), and every
+//! beat below the top line is drawn side-on, so without a door a cat that
+//! types would never show one of these frames. A door alone was not enough,
+//! and that was measured too — over 368 506 frames of five session shapes the
+//! tail's three frames, the yawn and both ear frames registered ZERO onsets
+//! while the wall-side control fired them 240 times in seven minutes, because
+//! each was ALSO phased shut behind the door. So: the tail deals off the
+//! GLANCE's own clock face-on ([`PetBrain::sit_tail`]) rather than the beat
+//! it was deliberately phased away from; the yawn opens a look of its own
+//! ([`PetBrain::sit_look`]), because a cat looks away to yawn; and the ear
+//! frame comes through the same fit rule as the blink
+//! ([`PetBrain::side_on_holds`]). Nothing comes through that the look cannot
+//! CONTAIN — a gesture cut at the door's edge is the teleport in miniature —
+//! and the face-on seat has its own blink now, so eye contact is not a stare
+//! even with the door shut.
+//!
+//! ## The airborne frame has one owner
+//!
+//! [`PetBrain::flight_pose`] decides every Leap frame, in fixed precedence:
+//! the RELEASE (`PetLaunch`, on the coil's last tick and the `u = 0` frame it
+//! launches — the two ticks a pose swap needs, and never in the air, because
+//! the art is planted); the FALL (a sleeper dropped off its line wears the
+//! sleeping frame, then the wake stretch, then the descent — never the launch,
+//! because nothing about a fall was a decision); the TUCK (a short vertical
+//! step down wears `PetHop` through the middle of its arc, never the pounce's
+//! stretched hero); then the time-based schedule
+//! ([`PetBrain::pose_schedule`]) of rise, hero and descent — whose hero SPLITS
+//! at its own midpoint on a big bound, because a bound's hero window is up to
+//! 0.67 s and the hang holds the lift and the stretch flat right through it,
+//! so the top of the arc gets `PetApex` rather than forty ticks of one
+//! unchanging bitmap. An ordinary pounce keeps its three beats.
 
 use core::f32::consts::TAU;
 
@@ -139,6 +272,16 @@ const FLIP_SPEED: f32 = 1.2;
 /// so a shade over half a body length per cycle is a natural stride: shorter
 /// scurries, longer moon-walks.
 const STRIDE_CELLS: f32 = 1.7;
+/// Seconds of ease with which a stopping or landing cat's stride idles
+/// toward its nearest foot-down frame ([`PetBrain::plant_stride`]).
+const STRIDE_EASE: f32 = 0.09;
+/// …and how close to that frame the foot is simply DOWN. The ease only ever
+/// APPROACHES its whole cycle, and a stride a hair BELOW the target is the
+/// cycle's LAST frame, not its first: from half a cycle out a landing
+/// recovery ended on `PetWalk3`, a mid-swing pose carrying travel the paws
+/// never made. A twentieth of a cycle is 0.085 cells of phase — no position
+/// moves, the foot just finishes coming down.
+const STRIDE_PLANT: f32 = 0.05;
 /// Cells of travel per full four-frame RUN cycle. A gallop covers ground in
 /// bounds, so its stride is double the walk's — and the number is a frame-rate
 /// law, not taste: at [`MAX_SPEED`] a 1.7-cell stride cycles at 15.3 Hz, which
@@ -146,6 +289,41 @@ const STRIDE_CELLS: f32 = 1.7;
 /// the stride tops the gallop out at ~7.6 cycles/s, so every frame holds the
 /// glass for at least two ticks.
 const RUN_STRIDE_CELLS: f32 = 3.4;
+/// Cells of travel per full four-frame LATERAL WALK cycle — the amble a
+/// caret the pet can stroll after earns ([`LAT_SPEED`]). One leg at a time
+/// covers less ground than the trot's diagonal pairs, so the stride is
+/// SHORTER than [`STRIDE_CELLS`]: the same speed cycles the feet faster,
+/// which is what a stroll looks like next to a trot.
+const LAT_STRIDE_CELLS: f32 = 1.2;
+/// Chase speed (cells/s) under which the walk is the LATERAL walk. A caret
+/// a letter or two behind — hunt-and-peck, a pause in the middle of a word —
+/// is not a thing to trot after; the pet ambles.
+///
+/// Measured against real cadences rather than chosen: the follower's PEAK
+/// speed over one keystroke is 5.1 cells/s at 0.45 s a key (an unhurried
+/// peck), 6.9 at 0.30 s, and 8.4 at 0.20 s — which is already a run
+/// ([`RUN_SPEED`] + [`GAIT_HYST`] = 8.1). So the amble's ceiling
+/// (`LAT_SPEED + LAT_HYST` = 5.5) sits between the first two: a pecking
+/// caret is ambled after from the first frame to the last, a prose cadence
+/// trots, and a burst runs.
+const LAT_SPEED: f32 = 4.0;
+/// Hysteresis band on [`LAT_SPEED`], the [`GAIT_HYST`] idiom: the amble
+/// holds until the speed climbs a clear cell and a half a second past the
+/// threshold, so a follower easing through it does not flicker between two
+/// cycles. Wider than the band's own width on purpose — the run stands
+/// down at `RUN_SPEED − GAIT_HYST` = 4.9, so a decelerating cat has to
+/// spend a stretch of the trot before the amble takes it back.
+const LAT_HYST: f32 = 1.5;
+/// THE FRAME-RATE LAW, the amble's half: the lateral walk is only ever worn
+/// under `LAT_SPEED + LAT_HYST`, so its worst-case cycle rate is decidable
+/// at build time exactly like the gallop's — 5.5 cells/s over a 1.2-cell
+/// stride is 4.6 cycles/s, 18.3 art frames a second, inside half of 60 fps.
+/// The half a constant cannot state is checked by
+/// `the_lateral_walk_cycle_never_exceeds_half_frame_rate`.
+const _: () = assert!(
+    (LAT_SPEED + LAT_HYST) / LAT_STRIDE_CELLS <= 30.0,
+    "the lateral walk cycle must stay at or under half of 60 fps"
+);
 /// THE FRAME-RATE LAW ITSELF, held where a violation cannot ship. Both terms
 /// are constants, so the gallop's worst-case cycle rate is decidable at build
 /// time — it does not need a test run to have happened, and a future speed-up
@@ -187,6 +365,22 @@ const LEAD_TIME: f32 = 0.25;
 /// an anchored visible edge is what makes a bigger lead read as "ahead"
 /// rather than "gone".
 const LEAD_MAX: f32 = 4.0;
+/// The most a FLIGHT's keep-ahead prediction may add to its aim. The
+/// station's own lead is clamped at [`LEAD_MAX`]; a flight's prediction
+/// horizon is over a second, and an uncapped prediction landed the paws a
+/// dozen cells past a caret that stopped typing at the wrap (measured: 14
+/// cells, then a gallop back with the drift-brake's stumble, or a second
+/// flight). A landing short of a caret that kept going is the ordinary
+/// chase; a landing far past one that stopped is a comedy beat nobody
+/// asked for — so the cap sits under [`BRAKE_DIST`] and [`POUNCE_GAP`],
+/// where the walk home is just a walk. A BOUND bets the SAME cap, not a
+/// smaller one — the door tiers on the predicted aim, so a tighter cap
+/// here would make [`POUNCE_SPAN_MAX`] a discontinuity in where the paws
+/// come down (measured: 2.8 cells behind as a bound, 5 ahead as a hop, for
+/// the same trip). What bets nothing at all is a crossing the WORLD forced
+/// — a seam, a line change, a snap — which lands on a line the caret has
+/// barely started; the chase closes what the caret does next.
+const FLIGHT_LEAD_MAX: f32 = 2.0 * LEAD_MAX;
 /// The rhythm gate: the lead grows only once this many SAME-direction moves
 /// have landed, each within [`RHYTHM_WINDOW`] seconds of the last.
 /// Hunt-and-peck — a letter every second or two, or editing back and forth —
@@ -370,6 +564,8 @@ const SLEEP_FLIP_DWELL: f32 = 1.2;
 /// pet is inked. The brain's inputs ([`PetSense`]) carry no grid content, so
 /// that probe cannot be wired from here without a new host-supplied bit —
 /// deferred until the sense grows one, rather than faked from geometry.
+/// The FLOOR of the deal: every settle reads [`PetBrain::loaf_after`]
+/// (this plus 0.8 s × `settle_seed % 3`), never the constant.
 const LOAF_AFTER: f32 = 2.8;
 
 // ── ink awareness (the 0.19.0 gauntlet's F1 seam) ───────────────────────────
@@ -481,6 +677,16 @@ const PECK_CLEAR: f32 = 0.30;
 /// stretch) while you keep typing. That is a cat that got left behind and has to
 /// sprint, not a cat that saw something jump.
 const POUNCE_GAP: f32 = 14.0;
+/// THE SNAP: a same-row move BACK of at least this many columns in one go
+/// — the last-row Enter with a prompt, `Home`, Ctrl-U, Claude Code's
+/// submit clearing its line — is a JUMP, not a fright. The bottle was
+/// written for a deletion coming back at the pet (a few columns, a held
+/// key); a caret that snaps home by a third of the line is the world
+/// re-seating the writing, and the answer is the same quiet crossing an
+/// Enter gets ([`PetBrain::quiet_leap`]). The everyday `-1..-3` flinch and
+/// the `-4..-13` bottle are untouched below it. Deliberately the pounce
+/// gap: a snap is exactly a gap that opened all at once.
+const SNAP_COLS: f32 = POUNCE_GAP;
 /// A SINGLE observed caret move of at least this many columns is a jump —
 /// a word-skip, a tab completion, `End`, a paste — and earns a pounce outright,
 /// however small the resulting gap. Latched into [`PetBrain::pending_pounce`]
@@ -541,6 +747,30 @@ const COIL_RELEASE: f32 = 0.04;
 const FLIGHT_PER_CELL: f32 = 0.021;
 const FLIGHT_MIN: f32 = 0.16;
 const FLIGHT_MAX: f32 = 0.42;
+
+/// A FLIGHT IS A SCHEDULE, NOT AN INTEGRATION — so it keeps its own stall
+/// bound, wider than the motion clamp.
+///
+/// `dt = elapsed.min(0.10)` protects a body whose position is integrated from
+/// a SPEED: a long gap must not compound into a screen-crossing step. An arc
+/// is not integrated. Its position is `from + (to − from) · t/dur`, bounded by
+/// its own endpoints for any `t`, so the clamp buys it nothing — and costs it
+/// the one thing it needs, which is to finish on WALL TIME.
+///
+/// The host holds a frame for up to `app_render::SYNC_HOLD_CAP` (150 ms) while
+/// a DEC-2026 synchronized-output bracket is open, and does not tick the pet
+/// at all for that whole hold. Against the 100 ms motion clamp that is a 50 ms
+/// deficit PER BRACKET, and a full-screen TUI brackets every repaint — so in
+/// the app the owner uses most, the cat's arcs fell behind wall time without
+/// bound: it hung in mid-air, landed late and behind the caret, and the
+/// follower then closed the gap in a lunge. That is the "slides, snaps, or
+/// teleports" report, and no test could see it: 177 of the crate's ~185 tick
+/// steps are a uniform 16 ms, a cadence the host never produces.
+///
+/// 0.16 s clears the hold cap with a frame to spare. A stall longer than this
+/// is a hidden window or a suspended machine, where the arc is bounded again —
+/// and where nobody is watching, because `alpha` has gone with it.
+const FLIGHT_STALL_MAX: f32 = 0.16;
 /// Peak height of a pounce arc, in cell heights, and how far it grows with
 /// distance. A jump that stays flat reads as a slide.
 const ARC_BASE: f32 = 0.55;
@@ -551,6 +781,18 @@ const ARC_MAX: f32 = 1.5;
 /// wider by `0.6 q` — so both companions land like the same animal.
 const LAND_DUR: f32 = 0.26;
 const LAND_SQUASH: f32 = 0.24;
+/// THE TOUCHDOWN ATTACK (variety wave): the landing squash ramps in over
+/// this many seconds instead of arriving whole on the touchdown frame —
+/// the 0.184 cliff in `scale_y` between the last airborne frame and the
+/// first braced one becomes a step of a tenth or less a tick.
+///
+/// Three ticks of a 60 fps lane, not two: at 0.033 the worst per-tick step
+/// in the envelope's VOLUME (`scale_x · scale_y`) was 4.46 % on the pounce
+/// and the big bound — over the wave's own 3 % envelope law, which nothing
+/// asserted. At 0.05 every measured touchdown is inside it, and
+/// `the_touchdown_is_not_a_cliff` pins the volume step as well as the
+/// `scale_y` one.
+const LAND_ATTACK: f32 = 0.05;
 /// A row change always arcs, however small the column delta: the pet is on a
 /// line, and lines are surfaces. Vertical arcs are shorter and lower than a
 /// horizontal pounce of the same span — dropping to the next line is a step
@@ -594,6 +836,29 @@ const LEAP_DESC_T: f32 = 0.11;
 /// `3·MIN_HERO` the flight cannot fit three legible beats at all and the
 /// schedule falls back to two, split at the apex.
 const MIN_HERO: f32 = 0.048;
+/// THE HOP TUCK (variety wave): a vertical flight whose equivalent span
+/// ([`span_eq`]) is at most this many cells — the everyday Enter from near
+/// the margin, the wall transit's two-cell arc — wears the tucked
+/// `PetHop` frame at its apex instead of the pounce's stretched hero. A
+/// step down is not a pounce, and the schedule above cannot tell them
+/// apart: it deals by DURATION, and a two-cell hop and a twenty-cell
+/// pounce are both `HOP_DUR`-ish. The bar is unfrozen until the owner sees
+/// it on a real pane (design §6); at 4.0 the reference eight-cell Enter
+/// still wears the pounce schedule.
+const HOP_TIGHT: f32 = 4.0;
+/// A tucked hop keeps its on-axis stretch under this — and none at all on
+/// the tuck frame itself, because the tuck IS the shape. Under
+/// [`LAUNCH_STRETCH`], so the pose swap at 25 % of the flight is a step of
+/// 0.03 rather than the 0.07 the full launch stretch would drop.
+const HOP_STRETCH: f32 = 0.06;
+/// THE RELEASE FRAME (variety wave): the coil's last [`LAUNCH_LEAD`]
+/// seconds (one tick at 60 fps) and the `u = 0` frame of the flight it
+/// launches wear `PetLaunch`, the planted rear-up off the hind paws — two
+/// ticks, so the swap honours the frame-rate law. Never elsewhere: the art
+/// is planted, and a rear-up in the air reads as a hovering cat. The `u = 0`
+/// frame alone guarantees the pose appears whatever the lane's dt; the
+/// coil's last tick is the anticipation the release is FOR.
+const LAUNCH_LEAD: f32 = 0.02;
 /// THE HANG (rung 10), `f.big` only: a screen-crossing bound floats its apex.
 /// `h(u) = 1 − |2u−1|^p` with `p = 3.0` rising and `HANG_P_DOWN` falling —
 /// steeper up, a shade softer down — grows the `lift ≥ 0.9·arc` window from
@@ -641,6 +906,153 @@ const POUNCE_SPAN_MAX: f32 = HOP_SPEED_MAX * FLIGHT_MAX;
 /// `HOP_SPEED_MAX × WALL_HOP_DUR` = 13.75 cells. A wider transit hops this
 /// far and leaves the remaining gap to the ladder on later ticks.
 const WALL_SPAN_MAX: f32 = HOP_SPEED_MAX * WALL_HOP_DUR;
+/// THE LONGEST A QUIET CROSSING MAY STAY IN ONE BOUND — 1.7 SECONDS of
+/// flight, two full [`BIG_FLIGHT_MAX`] bounds' worth, measured against the
+/// crossing's duration at the pane's own quiet pace
+/// (`|delta| / quiet_speed_max(cols)`, [`PetBrain::launch_big`]). Past it a
+/// quiet crossing splits in two; the chosen SHOW keeps splitting at
+/// [`TWO_BOUND_FRAC`] of the grid, because the split IS the flourish there.
+///
+/// IT IS A TIME, and the `_SECS` in the name is doing work: this constant
+/// spent a while called `_MAX` with a doc that read "the longest equivalent
+/// span ONE bound covers … 119 cells", and three doc links pointed at a
+/// `BIG_SPAN_MAX` that has never existed. Under the real rule the split is
+/// unreachable on any pane people use: it needs
+/// `|delta| > 1.7 · quiet_speed_max(cols)`, which for 74..=189 columns is
+/// `|delta| > 1.258 · cols` while `|delta|` is bounded by `cols`; the first
+/// width where it can fire at all is 239 columns, and only for a crossing
+/// spanning the whole pane. That is a
+/// DELIBERATE outcome, not an oversight — see [`QUIET_PANE_PER_SEC`] for
+/// why one long bound beats two on a wide pane — but the prose has to say
+/// it, because a rule that fires nowhere and a rule that fires at 119 cells
+/// are not the same rule and only one of them is the code.
+const QUIET_ONE_BOUND_SECS: f32 = 2.0 * BIG_FLIGHT_MAX;
+/// A row in the speed law's cells: a cell is about half as wide as it is
+/// tall, so one row of travel counts as two columns of it (the flight
+/// stretch in `emit` already judges its axis in those pixels). Without it a
+/// three-row prompt hop measured its span as the column travel alone and
+/// flew 7.1 rows/s while claiming to be lawful.
+const ROW_AS_COLS: f32 = 2.0;
+/// The tiers must nest: a single move that latches the SHOW
+/// ([`BIG_JUMP_COLS`]) is always past the hop tier, or a chosen jump could
+/// tier down into a pounce.
+const _: () = assert!(
+    POUNCE_SPAN_MAX < BIG_JUMP_COLS,
+    "the hop tier must end before the screen-crossing latch begins"
+);
+
+/// A flight's EQUIVALENT span in columns: its column travel and its row
+/// travel (at [`ROW_AS_COLS`] each) as one diagonal — the distance the
+/// speed law and the flight shapes measure, so a three-row prompt tiers
+/// and times by its pixel diagonal rather than by its column count alone.
+fn span_eq(dcol: f32, drow: f32) -> f32 {
+    dcol.hypot(ROW_AS_COLS * drow)
+}
+
+/// THE QUIET PACE: EVERY bound — the chosen show included — is paced
+/// against the PANE, not against the law's ceiling. The eye judges a
+/// crossing against the field it crosses, not in cells: the show already
+/// kept this pace on its own (its split bounds peak at 135 c/s on 200
+/// columns and under 60 c/s on 80, both ≈ 0.7 pane widths a second), and a
+/// transit flown any faster on a narrow pane is over a cell a frame — a
+/// cut with an animation on it (the owner's teleport, measured at 1.37
+/// cells a frame on the scrolled wrap). Clamped to the law's own bounds:
+/// never below the hop's [`HOP_SPEED_MAX`] (a pace the hop already
+/// flies), never above [`BIG_HOP_SPEED_MAX`] (the law). The number: on an
+/// 80-column pane at 60 fps one cell a frame is 60 c/s, three quarters of
+/// the pane a second — so the pace sits just under 0.75, and a quiet
+/// crossing at 80 columns is 0.987 cells a frame at most.
+///
+/// That last sentence is an EIGHTY-COLUMN promise, and the clamp is why:
+/// past `BIG_HOP_SPEED_MAX / QUIET_PANE_PER_SEC` ≈ 189 columns the pace
+/// pins at the law's ceiling, so a bound on a 200-column pane crosses 2.33
+/// cells in a frame (measured on the probe's S4 at 200: one bound, 184.3
+/// cells, 1.316 s, 140.0 c/s). Narrow panes are clamped the other way,
+/// where the pace LIFTS to [`HOP_SPEED_MAX`] — 0.92 cells a frame at 40
+/// columns, which is 2.3 % of the pane and the FASTEST pane-relative pace
+/// in the product.
+///
+/// THE PROMISE IS WRITTEN IN THE WRONG UNIT, and the two invariant readings
+/// both say the wide pane is the quiet one:
+///
+/// * as a fraction of the ANIMAL ([`art_cols`] ≈ 5.61 columns, which is
+///   what an eye tracks frame to frame), the ceiling is
+///   `BIG_HOP_SPEED_MAX / 60 / art_cols` = **0.42 body widths a frame** at
+///   any width, against 0.18 at 80 columns;
+/// * as a fraction of the PANE it is `quiet_speed_max(cols) / 60 / cols` =
+///   1.24 % a frame at 80 and **1.17 % at 200** — lower, not higher.
+///
+/// Only the raw cell count rises, and a cell is not a perceptual unit.
+/// `no_bound_crosses_more_than_half_the_animal_in_a_frame` pins the first
+/// reading across a width sweep rather than pinning one width's number.
+///
+/// AND THE ALTERNATIVE WAS PRICED, not waved away. Splitting a wide
+/// crossing into two bounds instead of speeding it up costs more than it
+/// buys: S4 at 200 columns is 184.3 cells, 1.316 s at the ceiling, which is
+/// INSIDE [`QUIET_ONE_BOUND_SECS`]; forcing a split gives two ~92-cell
+/// bounds that each saturate [`BIG_FLIGHT_MAX`] — 1.70 s of flight against
+/// 1.316 s — plus an intermediate touchdown and a second airborne episode,
+/// on the very scenario "one bounded, quiet flight" is the promise for. And
+/// each half still flies 108 c/s = 1.80 cells a frame, so it does not even
+/// buy the cell count. Buying it outright (one cell a frame at 200 columns)
+/// costs 3.07 s of continuous flight for one Enter.
+///
+/// Applied where the bound's ONE duration backstop lives
+/// ([`PetBrain::begin_big_arc`]) and to the remaining pace of the one
+/// mid-air re-aim; hops obey by their span cap as ever. There is no
+/// exemption for the show — `the_chosen_show_is_paced_like_every_other_bound`
+/// is the assertion, and the module doc states the same rule.
+const QUIET_PANE_PER_SEC: f32 = 0.74;
+
+/// The quiet pace in cells/s on a `cols`-wide pane — see
+/// [`QUIET_PANE_PER_SEC`].
+fn quiet_speed_max(cols: u16) -> f32 {
+    (QUIET_PANE_PER_SEC * f32::from(cols)).clamp(HOP_SPEED_MAX, BIG_HOP_SPEED_MAX)
+}
+
+// ── the stream watch (the wrapping log) ─────────────────────────────────────
+//
+// A program printing is not a person typing: a build log, a `cat`, a
+// full-screen paint move the caret by rows and wraps and whole-line jumps
+// many times a second, and a cat that answered every one — measured, a
+// Startle every other frame for the length of a log, and a bound treadmill
+// once the wrap folded — is a strobe, not an animal. Three LINE EVENTS in
+// half a second arm the watch: the cat sits down where it is, the chase
+// target becomes its own feet (no door sees a gap), and the move sensor
+// keeps only its bookkeeping until the events stop. Narrow in intent but
+// not in reach, and the difference is worth stating plainly: the watch
+// holds the CHASE and, through the pose hold in `tick`, every door, the
+// pointer play, the bat, the look, the owed groom, the breed handoff and
+// the whole settle ladder. What it does NOT hold is the ink ladder (F1 — a
+// pose never loiters on the words; a walled-shut row keeps rule 4), a
+// flight already in the air, or the LIVE-EDGE HUG, which is the one trip a
+// stream may ask for and is exempted at both sites.
+//
+// Why not `output_burst` ([`PetSense::output_burst`], which the
+// perk-and-watch heat reads): it is true while typing inside Claude Code
+// and false without shell integration, so it cannot be the only witness
+// that a pane is streaming — the caret's own geometry is the honest one.
+// The two facts ask different questions (that one "is this pane
+// interesting?", this one "is this caret mine to chase?") and they are
+// EITHER-OR where they meet, at the hug: one stimulus, two witnesses, one
+// animal. Gating the hug on the heat alone gave two different animals for
+// one build log depending on whether the shell had OSC 133 wired up.
+
+/// Line events, each within [`STREAM_WINDOW`] of the last, that arm the
+/// watch — three Enters in half a second is already a program.
+const STREAM_RUN: u8 = 3;
+const STREAM_WINDOW: f32 = 0.5;
+/// The watch stands down this long after the LAST event (on the brain
+/// clock, the `tennis_last` idiom): a paragraph's last line, a prompt
+/// returning, and the ordinary ladder resumes — one trip home.
+const STREAM_LAPSE: f32 = 0.8;
+
+/// A same-row caret jump counts as a line event from this size on — a
+/// quarter of the pane, never under the pounce gap — so a held word-jump
+/// (eight cells a frame) is typing, and a coalesced log line is not.
+fn stream_jump(cols: u16) -> f32 {
+    POUNCE_GAP.max(0.25 * f32::from(cols))
+}
 
 // ── the reactive states ─────────────────────────────────────────────────────
 
@@ -681,6 +1093,15 @@ const FROLIC_HOLD: f32 = 0.85;
 /// gather, leap — rather than two rules that can disagree about whether a given
 /// move was big.
 const PERK_HOLD: f32 = 0.30;
+/// A `Stand` is a settled pose, but a stand YOUNGER than this is a cat that
+/// just stopped between two keystrokes (the wall side parks it every key:
+/// the station only moves with the caret there), not a cat at rest — and
+/// the double-take is for a cat at rest. Neither the jump's Perk nor the
+/// notice before a bound ([`PetBrain::at_rest`]) fires from it, so an Enter
+/// or a wrap typed at the margin crosses at once. The typing rhythm's own
+/// window: a pause shorter than it keeps the run alive, so a stand that
+/// has held through one is genuinely stopped.
+const STAND_REST: f32 = RHYTHM_WINDOW;
 
 // ── the settled states ──────────────────────────────────────────────────────
 
@@ -700,6 +1121,8 @@ const SLEEP_AFTER: f32 = 22.0;
 const WAKE_DUR: f32 = 0.62;
 /// Quiet (seconds) inside a sit before the pet grooms, and how long a groom
 /// lasts. Sitting perfectly still forever is the one thing a cat never does.
+/// The CEILING of the deal: every settle reads [`PetBrain::groom_after`]
+/// (this minus 0.45 s × `(settle_seed / 3) % 3`), never the constant.
 const GROOM_AFTER: f32 = 6.5;
 const GROOM_DUR: f32 = 1.70;
 /// Sleep breathing: seconds per full in-out cycle. A resting cat is around
@@ -913,9 +1336,60 @@ const STUMBLE_DUR: f32 = 0.12;
 /// signature failure to stop.
 const BRAKE_DIST: f32 = 12.0;
 const BRAKE_OVERSHOOT: f32 = 2.0;
+/// How far the braced body leans into the run-out at the moment it blows
+/// past its station: the skid's stretch along the travel, `0.4 ×` of it
+/// gathered out of the height (the landing's shape family, softened —
+/// a slide is not an impact). Eased to nothing as the paws reach the
+/// overshoot, so the pose relaxes into the trot home instead of snapping
+/// out of it.
+const SKID_LEAN: f32 = 0.08;
 /// THE SKIP: a content cat's walk bobs one stride in four — a skip, not a
 /// march.
 const SKIP_CONTENT: f32 = 0.6;
+
+// ── the sleeper's drop, the commit stare and the scrabble (variety wave) ────
+
+/// THE SLEEPER'S DROP: seconds of the fall when the floor moves out from
+/// under a sleeping cat — an Enter exactly one row below it. One row in
+/// 0.18 s is 11 equivalent cells a second, a tenth of the hop's cap: this
+/// is a body falling off a ledge, not a leap, and the drop is deliberately
+/// the slowest flight in the vocabulary per cell travelled.
+const DROP_DUR: f32 = 0.18;
+/// The fall's first beat: seconds still wearing the sleeping frame, before
+/// the cat has caught up with the floor. Three ticks of a 60 fps lane —
+/// over the frame-rate law's two-tick floor.
+const DROP_SLEEP: f32 = 0.05;
+/// …and its second: the wake stretch, spent in the air where the drop put
+/// it (five ticks), before the descent onto its feet.
+const DROP_STRETCH: f32 = 0.08;
+/// …and the stare it lands in: seconds of sitting exactly where it fell,
+/// facing whoever moved the floor, before the ordinary trip home.
+const DROP_SIT: f32 = 0.5;
+/// THE SCRABBLE: how far a landing has to miss the station it was aimed at
+/// before the paws have to scrabble for it — six columns, a whole body
+/// length, so an aim the keep-ahead prediction merely rounded is never a
+/// failure. Measured against the SAME prediction the launch made, so a
+/// pounce that led a still-typing caret correctly cannot trip it.
+const SCRABBLE_MISS: f32 = 6.0;
+/// …and how long the scramble for it lasts, against [`LAND_DUR`]'s 0.26 s:
+/// the paws hunt for the ground for an extra eighth of a second before the
+/// chase takes over.
+const SCRABBLE_DUR: f32 = 0.38;
+/// The scrabble's first beat: seconds braced on the landing frame before
+/// the paws start hunting (eight ticks — over the frame-rate law's floor).
+const SCRABBLE_PLANT: f32 = 0.14;
+/// I MEANT TO DO THAT: seconds a flight that was moved twice — landed at a
+/// station the caret had already left — stands still on the empty cell
+/// before turning to look where the caret actually went. Long enough to
+/// read as a beat, short enough that the trip home is not a punishment.
+const COMMIT_STARE: f32 = 0.25;
+/// THE FRAME-RATE LAW'S FLOOR, in seconds: two ticks of a 60 fps lane. A
+/// pose that some EVENT can cut short — as against a pose whose own clock
+/// runs out — is held at least this long, so the swap can never be a
+/// one-frame flash. Measured on the stare: a third jump arriving on the
+/// tick after the landing left exactly ONE frame of `PetStand` between the
+/// landing and the coil (review, 2026-08-27).
+const POSE_FLOOR: f32 = 2.0 / 60.0;
 
 // ── wave 4b: the bored-cat vignettes (owner: bat the cursor, roll around,
 // playfully attack the cursor) ──────────────────────────────────────────────
@@ -929,9 +1403,10 @@ const BORED_AFTER: f32 = 8.0;
 const BORED_UNTIL: f32 = SLEEP_AFTER - 4.0;
 /// One vignette per cooldown: a treat, not a tic.
 const BORED_COOL: f32 = 24.0;
-/// THE WRIGGLE: seconds of rolling around on its back (the roll is faked
-/// with the sleep/loaf frames flip-flopping — a true roll cycle is authored
-/// art, queued for the rig).
+/// THE WRIGGLE: seconds of rolling around on its back — the authored
+/// `PetRoll0`/`PetRoll1`/`PetRoll2` cycle, dealt on the wriggle beat in
+/// `emit`'s `Loaf if wriggle_t > 0.0` arm (the placeholder this doc used to
+/// describe was retired with the wave-4c art).
 const WRIGGLE_DUR: f32 = 2.2;
 /// The wriggle's flip-flop beat.
 const WRIGGLE_BEAT: f32 = 0.35;
@@ -1044,11 +1519,83 @@ pub const PET_DEPARTURES_MAX: usize = 3;
 const FLICK_EVERY: f32 = 3.0;
 const FLICK_DUR: f32 = 0.15;
 /// The ear twitch: an output PULSE (a burst rising edge) at a settled pet
-/// still below [`WATCH_GATE`] flicks one ear — shipped art-free as a
-/// [`TWITCH_BOB`] procedural head-scale bob (the flinch envelope's
-/// precedent), upgraded to real ear frames when the art wave lands them.
-const TWITCH_DUR: f32 = 0.12;
+/// still below [`WATCH_GATE`] flicks one ear. The art wave landed the real
+/// frames, so a settled pose that HAS an ear frame (the plain sit, the
+/// stand, the loaf) swaps to it for the hold; the poses that do not
+/// (the face-on sit, the purr, the wash) keep the [`TWITCH_BOB`]
+/// head-scale bob that shipped in its place. The hold is long enough for
+/// the swap to read as an ear rather than a one-frame glitch (the
+/// frame-rate law's two-tick floor, with room to spare).
+const TWITCH_DUR: f32 = 0.16;
 const TWITCH_BOB: f32 = 0.02;
+
+/// THE WAKE, IN TWO HALVES (variety wave). The stretch was one pose held
+/// for the whole [`WAKE_DUR`]; it is now the front stretch drawing out
+/// along its own axis, then the hind leg reaching back — the mirror half
+/// the art wave authored. [`STRETCH_SPLIT`] is where the weight shifts,
+/// [`STRETCH_LEAD`] how long the front half takes to reach full reach and
+/// [`STRETCH_AMP`] how far the body draws out getting there.
+const STRETCH_SPLIT: f32 = 0.55;
+const STRETCH_LEAD: f32 = 0.20;
+const STRETCH_AMP: f32 = 0.06;
+
+/// THE SEAT'S DEALT BEATS (variety wave). Every one of these is a window
+/// inside the SIT's own span — `quiet - SIT_AFTER`, so the sequence is a
+/// function of THIS settle and of the hand [`PetBrain::settle_seed`] dealt
+/// it, never of a wall clock. The sit is a short pose by the ladder's own
+/// arithmetic (it begins at [`SIT_AFTER`] and melts at
+/// [`PetBrain::loaf_after`], 1.4 s at the shortest), so every beat's first
+/// window sits INSIDE the first period rather than after it: a metronome
+/// that only starts on its second beat would never be seen at all. The
+/// offsets are what keep the fold, the beats and each other apart.
+const TAIL_PERIOD: f32 = 2.4;
+const TAIL_PERIOD_STEP: f32 = 0.6;
+/// The fold owns the sit's first [`SIT_FOLD`] — the tail beat starts after it.
+const TAIL_AT: f32 = SIT_FOLD;
+/// One tip-up flick, and the two taps (and the gap) of the double.
+const TAIL_FLICK: f32 = 0.22;
+const TAIL_TAP: f32 = 0.14;
+const TAIL_GAP: f32 = 0.10;
+/// One leg of the away-and-back swing: flick → behind → rest → behind →
+/// flick, five segments of this, so every side change lands BETWEEN two
+/// tip-up frames and the tail swings across instead of teleporting.
+const TAIL_SWING: f32 = 0.11;
+const BLINK_PERIOD: f32 = 3.1;
+const BLINK_PERIOD_STEP: f32 = 0.5;
+const BLINK_AT: f32 = 0.9;
+const BLINK_DUR: f32 = 0.10;
+const BLINK_GAP: f32 = 0.08;
+/// The yawn hands the seat into the loaf: it plays in the last of the sit.
+const YAWN_DUR: f32 = 0.45;
+/// The glance: eye contact breaks for this long, on a dealt beat.
+const GLANCE_PERIOD: f32 = 2.6;
+const GLANCE_PERIOD_STEP: f32 = 0.7;
+const GLANCE_AT: f32 = 0.8;
+const LOOK_DUR: f32 = 0.6;
+/// THE LONG LOOK, dealt on the two hands in three whose seat is long enough
+/// to hold it (`GLANCE_AT + LOOK_DUR_LONG` against `loaf_after() -
+/// SIT_AFTER` — 1.75 s against the 2.2 s and 3.0 s seats, and NOT the 1.4 s
+/// one, which is why the deal and the fit are the same `seed % 3`).
+///
+/// It exists because the glance is the seat's DOOR ([`PetBrain::sit_tail`]):
+/// a side-on beat may only play face-on inside a look that will outlast it,
+/// and the tail's SWING runs `7 · TAIL_SWING` = 0.77 s — longer than
+/// [`LOOK_DUR`], so on the ordinary look the seat's biggest gesture could
+/// never come through. One hand in three keeps the short look, so the
+/// longer one is a variation and not the new normal.
+const LOOK_DUR_LONG: f32 = 0.95;
+/// Eye contact must come back for at least this long before the seat melts,
+/// or the long look is not dealt at all — see [`PetBrain::look_dur`]. Half a
+/// second short of a beat is a flicker, not a return.
+const LOOK_RETURN_MIN: f32 = 0.3;
+/// THE BLINK OPENS INSIDE THE LOOK, NEVER BEFORE IT. Both beats run on the
+/// sit's own clock from [`SIT_AFTER`], so a blink can only ever begin
+/// face-on with the look already open — which is what lets
+/// [`PetBrain::side_on_holds`] ask about a beat's REMAINING time alone
+/// rather than also proving where it started.
+const _: () = assert!(BLINK_AT >= GLANCE_AT);
+/// The loaf opens its eyes for this long on its own dealt thump beat.
+const LOAF_PEEK_DUR: f32 = 0.25;
 
 // ── fade ────────────────────────────────────────────────────────────────────
 
@@ -1082,8 +1629,17 @@ pub const ART_ROWS: f32 = 1.70;
 /// constant rather than a per-frame lookup. Pinned to the assets by
 /// `pet_art_quality`'s viewbox check, so it cannot drift from the art.
 pub const ART_ASPECT: f32 = 244.0 / 148.0;
-/// The pet's width in cells, given a cell aspect. Cells are taller than they are
-/// wide (~0.5), so the pet is a little under three columns across.
+/// The pet's width in cells, given a cell aspect.
+///
+/// `ART_ROWS · ART_ASPECT` is 2.80 — the width in units of the CELL HEIGHT,
+/// which is not a column count. Cells are about half as wide as they are
+/// tall, so dividing through by the cell aspect roughly DOUBLES it: the
+/// animal is **5.6 columns** across at a 1:2 cell and 5.96 at 8×17. (The
+/// sentence here used to stop at 2.80 and call it "a little under three
+/// columns", which is the same number wearing the wrong unit. It is worth
+/// more than its size: the station, the wall check and every clamp in this
+/// file are written in this width, and so is the only perceptual reading of
+/// the pace law — a frame step of 2.33 cells is 0.42 of THIS.)
 #[must_use]
 pub fn art_cols(cell_w: u16, cell_h: u16) -> f32 {
     if cell_w == 0 || cell_h == 0 {
@@ -1309,8 +1865,9 @@ pub enum PetAction {
     /// Playing: the caret is being fussed with rather than driven.
     Frolic,
     /// The sulk: a command failed, and the pet takes it personally — body
-    /// low, feet planted, zero motes. Borrows the loaf art until the art
-    /// wave lands a flat-ears frame.
+    /// low, ears flat, feet planted, zero motes. Its own frame, in two
+    /// readings: the flat sphinx off its feet, the head-down seat when the
+    /// grief interrupted a sit.
     Droop,
 }
 
@@ -1593,8 +2150,84 @@ struct Flight {
     /// flight finite under a held word-jump).
     reaimed: bool,
     /// A screen-crossing bound: lands with the heavy recovery (weighted
-    /// squash, skid, dust) instead of the pounce's.
+    /// squash, skid) instead of the pounce's.
     big: bool,
+    /// A CHOSEN jump — the show the pet decided on (the big door's
+    /// notice → wiggle → bound) — as against a quiet transit the caret
+    /// forced on it (a line change, a wrap, a re-anchor, a stale wall
+    /// latch). Dust flies only on a chosen landing: a shorter animation
+    /// at the same rate is still a tic, and a puff on every Enter would
+    /// be one.
+    show: bool,
+    /// A TUCKED hop (variety wave): a vertical flight within [`HOP_TIGHT`]
+    /// equivalent cells, or the wall transit's small arc — wears the hop
+    /// frame at its apex instead of the pounce's stretched hero, and keeps
+    /// its stretch under [`HOP_STRETCH`].
+    hop: bool,
+    /// Left from a COIL — the crouch's last frame wore the release, so the
+    /// `u = 0` frame is its second tick and earns `PetLaunch`. False for a
+    /// flight off flat feet (an ink re-anchor, a wall arc, the second bound
+    /// of a split) and for the crouches that are HOLDS rather than coils
+    /// (the hide under the words, the stakeout at a toy), where a rear-up
+    /// would be a tell.
+    coiled: bool,
+    /// THE SLEEPER'S DROP: this flight is a FALL, not a leap — no arc, no
+    /// stretch, no launch frame, and its own pose schedule (asleep, then
+    /// the wake stretch spent in the air, then the descent onto its feet).
+    drop: bool,
+    /// I MEANT TO DO THAT: the caret jumped AGAIN after this flight had
+    /// spent its one mid-air re-aim, so wherever it lands is already the
+    /// wrong cell. Earns the stare on touchdown.
+    late_move: bool,
+}
+
+/// What kind of flight [`PetBrain::begin_arc`] opens — the flags every
+/// flight is stamped with, bundled so the primitive's signature stays
+/// readable as the flags grow (and under clippy's argument bar).
+#[derive(Clone, Copy, Debug)]
+struct FlightKind {
+    big: bool,
+    show: bool,
+    hop: bool,
+    /// A FALL (the sleeper's drop): see [`Flight::drop`].
+    drop: bool,
+}
+
+impl FlightKind {
+    /// An ordinary hop or pounce: not big, not the chosen show, not tucked,
+    /// and something the cat decided on rather than fell into.
+    const PLAIN: Self = Self {
+        big: false,
+        show: false,
+        hop: false,
+        drop: false,
+    };
+}
+
+/// Who decided a flight. The door that opens it ([`PetBrain::leave_ground`])
+/// says whether it is the pet's own show or the world's quiet errand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeapPolicy {
+    /// A caret-forced transit: tiered by its PREDICTED span, no dust, the
+    /// wall latch consumed (the flight lands on the caret's new side).
+    Quiet,
+    /// The chosen screen-crossing show: always a bound, split at
+    /// [`TWO_BOUND_FRAC`] of the grid, dust on the landing.
+    Show,
+    /// A play launch at a toy: no caret prediction (the aim already
+    /// carries the pointer's own lead), the wall latch left alone.
+    Play,
+}
+
+/// The tier a flight is flown in, decided AT LAUNCH from its predicted
+/// equivalent span ([`span_eq`]): at most [`POUNCE_SPAN_MAX`] is a hop or
+/// pounce ([`PetBrain::flight_shape`], under [`HOP_SPEED_MAX`] by
+/// construction); anything longer is a bound ([`PetBrain::launch_big`],
+/// under [`BIG_HOP_SPEED_MAX`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    Hop,
+    Bound,
 }
 
 /// Which animal the pet is drawn as.
@@ -1752,6 +2385,13 @@ pub struct PetBrain {
     /// host feeds it, and every ink-aware rule is inert while it is.
     ink_base: u16,
     ink_spans: Vec<(u16, u16)>,
+    /// THE SCROLL FACT: this frame's ink map is last frame's shifted up by
+    /// exactly one row — the shell opened a new text line. Derived in
+    /// [`Self::sense_ink`] from two consecutive host inputs, so it is a
+    /// FACT about content of the same class as [`PetSense::wrapped`], not an
+    /// inference about the caret. False whenever the host does not feed the
+    /// map, which keeps the seam-less host's behaviour byte-identical.
+    ink_scrolled: bool,
     /// The newest inked row on glass — the live output edge the watch hugs.
     ink_live: Option<u16>,
 
@@ -1874,6 +2514,36 @@ pub struct PetBrain {
     /// runs to rather than a place it is put — see the guard in `tick`.
     /// `braking` outlives it, so the trot home cannot arm a second brake.
     brake_over: Option<f32>,
+    /// The run-out's SECOND puff has been spent — the one the paws throw
+    /// halfway through the slide, as against the one the arming threw.
+    /// A latch, so a slide that dawdles at the halfway mark cannot smoke.
+    skid_puff: bool,
+    /// THE LATERAL WALK is the gait on glass (variety wave): the amble the
+    /// pet uses for a caret it can stroll after, one leg at a time, on its
+    /// own shorter stride ([`LAT_STRIDE_CELLS`]). Hysteretic on
+    /// [`LAT_SPEED`] like the walk/run choice itself, and read by the
+    /// stride divisor a tick later — the gait the GLASS is showing, which
+    /// is what keeps the cadence from chattering at the threshold.
+    lateral: bool,
+    /// THE SLEEPER'S DROP is owed: the floor moved out from under a
+    /// sleeping cat and the wake is going to be spent falling. Latched by
+    /// the move sensor for exactly one tick and spent by the drop arm.
+    pending_drop: bool,
+    /// …and the stare it lands in: seconds of sitting where it fell,
+    /// looking at whoever moved the floor ([`DROP_SIT`]).
+    drop_sit_t: f32,
+    /// THE FALL WAS THE DOUBLE TAKE: set when a sleeper's drop lands, spent
+    /// by the trip home ([`Self::leave_ground`]) or by the cat settling
+    /// where it fell ([`Self::enter_settled`], the `quiet_leap` idiom — a
+    /// latch with no other owner and no timer). Read only by
+    /// [`Self::notices`].
+    drop_stare: bool,
+    /// THE SCRABBLE: this landing recovery is the long one — the paws
+    /// missed the station by [`SCRABBLE_MISS`] and are hunting for it.
+    scrabble: bool,
+    /// I MEANT TO DO THAT: seconds left of the stare a flight that was
+    /// moved twice stands out on the empty cell ([`COMMIT_STARE`]).
+    commit_t: f32,
     /// The pose (and its hold clock) a re-anchor hop owes back on landing.
     ///
     /// F1's law is "pose and hold kept, feet moved". Now that the feet move
@@ -1898,6 +2568,10 @@ pub struct PetBrain {
     twitch_t: f32,
     twitch_up: bool,
     last_burst: bool,
+    /// Whether the sulk began from a SEATED pose (a sit, a purr, a wash) —
+    /// the droop then keeps its seat instead of sinking onto its belly.
+    /// One bit, latched where the droop is entered.
+    droop_seated: bool,
     /// A jump was seen; pounce as soon as the pet is free to act on it.
     pending_pounce: bool,
     /// A SCREEN-CROSSING jump was seen (or earned by joy); play the full
@@ -1906,9 +2580,27 @@ pub struct PetBrain {
     /// The current crouch is the big jump's gather (the butt-wiggle), not
     /// the pounce's quick coil.
     big_gather: bool,
-    /// The second bound of a split screen-crossing jump: final `(col, row)`,
+    /// THE QUIET LEAP: the next crossing was forced on the pet by the world
+    /// — a line change (Enter, a printed line, a multi-row prompt), a wrap,
+    /// a snap home, a re-anchor — and is therefore never the chosen show.
+    /// One flag serves all of them: it stands the big-jump door down (latch
+    /// AND standing-gap clause) so the crossing falls through to the
+    /// row-hop and pounce doors and tiers there by span, quietly, with no
+    /// notice-wiggle and no landing dust. Latched by the move sensor and by
+    /// [`Self::on_move`]; consumed by [`Self::leave_ground`], which is the
+    /// only place a caret-driven flight begins.
+    quiet_leap: bool,
+    /// THE STREAM WATCH (see [`STREAM_RUN`]): a program is printing, so the
+    /// pet sits down and watches instead of chasing. `stream_run` counts
+    /// line events inside [`STREAM_WINDOW`] of each other and `stream_last`
+    /// stamps the last one on the brain clock (never `dt`).
+    stream: bool,
+    stream_run: u8,
+    stream_last: f64,
+    /// The second bound of a split screen-crossing jump: final `(col, row)`
+    /// and whether the crossing is the chosen show (the landing's dust),
     /// launched when the touch-land between bounds expires.
-    bound2: Option<(f32, f32)>,
+    bound2: Option<(f32, f32, bool)>,
     /// Span of the big landing currently being absorbed (0 = a normal
     /// landing): scales the recovery squash and drives the skid.
     land_span: f32,
@@ -1918,6 +2610,18 @@ pub struct PetBrain {
     /// The mote lane (dust / z's / notes) and its deterministic serial.
     motes: [Option<Mote>; PET_MOTES_MAX],
     mote_serial: u8,
+    /// THE SETTLE DEAL (variety wave): one hand per ARRIVAL. `settle_serial`
+    /// counts the settles (bumped in [`Self::enter_settled`] on the one
+    /// tick an unsettled pose becomes a settled one), and `settle_seed` is
+    /// the hand that arrival was dealt — `settle_serial + mote_serial`, so
+    /// the same typing deals the same hand (the brain is diceless). Every
+    /// idle variation — the loaf's onset, the groom's, its skipped second
+    /// wash — reads the SEED through an accessor, never the constant. The
+    /// mote serial itself is never bumped for a deal: its parity feeds the
+    /// ear twitch and the stumble idiom, and a bump per settle would
+    /// re-deal shipped sequences.
+    settle_serial: u8,
+    settle_seed: u8,
     /// Cadence mark for the settled emissions (sleep z's, purr notes): the
     /// last quiet-derived beat index a mote was spawned for — a pure
     /// function of the settle the user is watching, never of a wall clock.
@@ -1927,6 +2631,12 @@ pub struct PetBrain {
     /// the over-the-shoulder peek for a far caret behind the facing.
     sit_front: bool,
     peek: bool,
+    /// Which way the settled head is tipped: -1 the caret is a row ABOVE
+    /// the pet's feet, +1 a row below, 0 same row (the common case — the
+    /// pet stands on the caret's own row unless the ink ladder or the
+    /// watcher's hug parked it off one). Emit-only, re-read every settled
+    /// tick beside `sit_front`/`peek`; never a hold.
+    look_row: i8,
     /// The settle-turn's dwell clock (seconds): how long the gaze target has
     /// held the side the pet is NOT facing, CONTINUOUSLY. Rewound to zero by
     /// any frame the target is not committed to that side, which is what makes
@@ -2034,6 +2744,7 @@ impl Default for PetBrain {
             retreat_gap: 60.0,
             ink_base: 0,
             ink_spans: Vec::new(),
+            ink_scrolled: false,
             ink_live: None,
             content: 0.0,
             pending_bell: None,
@@ -2075,6 +2786,13 @@ impl Default for PetBrain {
             leg_dist: 0.0,
             braking: false,
             brake_over: None,
+            skid_puff: false,
+            lateral: false,
+            pending_drop: false,
+            drop_sit_t: 0.0,
+            drop_stare: false,
+            scrabble: false,
+            commit_t: 0.0,
             resume: None,
             bored_cool: 0.0,
             wriggle_t: 0.0,
@@ -2084,18 +2802,26 @@ impl Default for PetBrain {
             twitch_t: 0.0,
             twitch_up: false,
             last_burst: false,
+            droop_seated: false,
             pending_pounce: false,
             pending_big_jump: false,
             big_gather: false,
+            quiet_leap: false,
+            stream: false,
+            stream_run: 0,
+            stream_last: 0.0,
             bound2: None,
             land_span: 0.0,
             skid_from: 0.0,
             skid_dir: 0.0,
             motes: [None; PET_MOTES_MAX],
             mote_serial: 0,
+            settle_serial: 0,
+            settle_seed: 0,
             mote_mark: 0,
             sit_front: false,
             peek: false,
+            look_row: 0,
             gaze_dwell: 0.0,
             alpha: 0.0,
             colors: None,
@@ -2250,7 +2976,40 @@ impl PetBrain {
     /// pre-seam behavior. Copies into resident storage — allocation-free
     /// after warmup, the crate's per-frame law.
     pub fn sense_ink(&mut self, base_row: u16, spans: &[(u16, u16)], live_row: Option<u16>) {
+        // THE SCROLL FACT, read before the map is replaced. A shell's new
+        // line moves every inked row of the viewport up exactly one index,
+        // so "the text line advanced" is visible in the CONTENT — the same
+        // class of fact as [`PetSense::wrapped`], and obtainable without a
+        // new sense field, a host edit or a caret inference. Five clauses,
+        // each keeping something else out: the same window (`base_row`
+        // unchanged, so a scrollback scroll cannot claim it), two non-empty
+        // maps of the same length (a resize or a first sighting cannot), at
+        // least one inked row (a blank pane scrolling is not an event), a map
+        // that actually MOVED (a screenful of identical lines re-fed
+        // unchanged satisfies the shift trivially, and nothing happened), and
+        // the shape itself — `new[i] == old[i + 1]` for every row but the
+        // last, which is the newly opened line and is free to be anything.
+        //
+        // It describes the frame it was fed for. `sense_ink`'s contract is a
+        // feed just before every `tick`, which is what makes it exact; a host
+        // that feeds sparsely leaves the last answer standing, and the worst
+        // that buys is the arm's own documented direction — quiet where it
+        // might have been frightened.
+        self.ink_scrolled = self.ink_base == base_row
+            && !self.ink_spans.is_empty()
+            && self.ink_spans.len() == spans.len()
+            && self.ink_spans.iter().any(|&(f, e)| e > f)
+            && self.ink_spans.as_slice() != spans
+            && self
+                .ink_spans
+                .iter()
+                .skip(1)
+                .zip(spans.iter())
+                .all(|(old, new)| old == new);
         self.ink_base = base_row;
+        // Overwritten in place, never re-allocated (the per-frame law): the
+        // scroll fact above is decided BEFORE this line, against the map
+        // this one replaces, so no second buffer has to carry it forward.
         self.ink_spans.clear();
         self.ink_spans.extend_from_slice(spans);
         self.ink_live = live_row;
@@ -2287,10 +3046,10 @@ impl PetBrain {
         let mut ink_spans = std::mem::take(&mut self.ink_spans);
         ink_spans.clear();
 
-        // A LITERAL, not a default-then-assign: the carried-over fields are
-        // the whole point of this fn, and spelling them in the initializer is
-        // what makes "everything else is reset" readable at a glance (and what
-        // `clippy::field_reassign_with_default` asks for).
+        // One expression, not a seventeen-step ritual: `..Self::default()`
+        // STATES the contract — every field not named here is reset — where a
+        // build-then-assign block leaves the reader to check completeness by
+        // eye (and is what `clippy::field_reassign_with_default` asks for).
         *self = Self {
             species,
             body_left_px,
@@ -2308,7 +3067,7 @@ impl PetBrain {
             last_frolic,
             bored_cool,
             ink_spans,
-            ..Default::default()
+            ..Self::default()
         };
     }
 
@@ -2349,6 +3108,35 @@ impl PetBrain {
             return None;
         }
         self.ink_span_idx(row.round() as i64)
+    }
+
+    /// Whether the caret has come HOME on its row: the column a freshly
+    /// printed line leaves it at, which is what
+    /// [`Self::caret_delta`]'s third arm means by "the shell's own new
+    /// line". Two ways to be true, one rule:
+    ///
+    /// * the MARGIN itself — where a one- or two-column prompt (`> `, `$ `)
+    ///   puts it, and the only answer a host that never feeds the ink map
+    ///   ([`Self::sense_ink`]) can give, so the seam-less host keeps exactly
+    ///   the behaviour it had;
+    /// * or a row whose ink STARTS at the margin and ENDS at or before the
+    ///   caret — where a prompt of any width puts it, trailing blanks and
+    ///   all.
+    ///
+    /// Ink to the RIGHT of the caret is what keeps ordinary editing out: a
+    /// `Ctrl-W` inside a sentence leaves the rest of the line standing, so
+    /// that row does not end under the caret and the delta keeps its
+    /// fright. A `Ctrl-W` over the LAST word of a line is indistinguishable
+    /// from a short command's Enter by anything the brain can see — same
+    /// row, same landing, same blank to the right — and is the arm's one
+    /// named false positive, quiet rather than frightened, which is the
+    /// direction this wave was asked for.
+    fn caret_at_home(&self, row: u16, col: u16) -> bool {
+        if f32::from(col) <= WRAP_SLOP {
+            return true;
+        }
+        self.ink_span(f32::from(row))
+            .is_some_and(|(first, end)| first <= WRAP_SLOP && end <= f32::from(col) + 0.5)
     }
 
     /// Whether a footprint standing at `col` on `row` covers glyphs: the
@@ -2420,7 +3208,16 @@ impl PetBrain {
             return (want, row);
         }
         let beside = self.ink_safe_col(want, row, width, cols);
-        if (beside - want).abs() <= INK_EVICT_MAX {
+        // Rule 2 accepts only REAL ground. A row walled shut on both sides
+        // answers `want` itself, and `|want - want| <= INK_EVICT_MAX` is
+        // trivially true — which seated the cat ON the words at the wall
+        // and, one keystroke later, hopped it back UP from the blank row
+        // below (measured on an 80-column line inked to 78: caret 72-74
+        // took row 7, caret 75+ took the ink on row 6, and every Enter then
+        // launched from a cat sitting on the line). The blank neighbour is
+        // the cheaper answer; the walled stand stays rule 4's, where "the
+        // answer to nowhere to stand is never leave" was always meant.
+        if (beside - want).abs() <= INK_EVICT_MAX && !self.ink_overlaps(beside, row, width) {
             return (beside, row);
         }
         // Down first: the row under the caret is the one the stream has not
@@ -2489,13 +3286,79 @@ impl PetBrain {
     /// line of text gained, one character on. Both arms measure the same
     /// seam through the one shared [`wrap_bar`]. Hosts without the fact pass
     /// `false` and keep the heuristic arm's behaviour exactly.
-    fn caret_delta(prev: (u16, u16), now: (u16, u16), cols: u16, wrapped: bool) -> (f32, f32) {
+    ///
+    /// THE SHELL'S OWN NEW LINE is a THIRD shape, and no wrap at all: with
+    /// the prompt on the last row, Enter after a SHORT command scrolls, and
+    /// the host reports `dr = 0, dc = -(what you typed)` — four to thirteen
+    /// columns for `ls -la`, `make`, `git log`. The emulator's `wrapped` is
+    /// FALSE there by construction (nothing wrapped), and the fact arm's
+    /// shared bar could not claim an eight-cell delta even if it were true,
+    /// so the delta fell to the retreat arm and startled the cat on Enter,
+    /// every ordinary command (verified by measurement at 80 and 200
+    /// columns, 2026-08-27). It is reported as the LINE CHANGE it is —
+    /// `dr = 1` with its own leftward column delta — so the quiet leap and
+    /// the span tier own it exactly like an Enter one row up. It does not
+    /// fold to one character, because nobody typed past the margin: the
+    /// text line advanced while the caret came home to the margin.
+    ///
+    /// `home` is what "came home" means, and it is the CALLER's fact
+    /// ([`PetBrain::caret_at_home`]) for the same reason `wrapped` is: the
+    /// answer is a property of the row, not of the delta. Reading the
+    /// caret's ABSOLUTE column instead — the rule this arm shipped with —
+    /// was this rule with a TWO-COLUMN prompt baked into it: `bash`'s
+    /// default `\u@\h:\w\$ `, a `(venv) $ `, starship and p10k all leave
+    /// the caret a dozen columns in, the arm never fired, and every one of
+    /// those shells kept the fright the arm exists to remove.
+    ///
+    /// `scrolled` is the same arm's answer to what `home` still cannot see,
+    /// and it is a FACT rather than an inference: the ink map SCROLLED —
+    /// every inked row moved up exactly one index between two consecutive
+    /// host frames ([`PetBrain::ink_scrolled`]). A right-hand prompt is the
+    /// case that needs it. `ink_spans` keeps ONE `[first, end)` per row, so
+    /// a row carrying `~/src` at the left and a clock at column 72 is
+    /// reported as one span `0..79`, `caret_at_home` is false, and MEASURED
+    /// on that fixture the cat answered an ordinary Enter with
+    /// `Startle@+0.02 … Run@+0.42` — the full fright plus a gallop home,
+    /// the exact pair this rule exists to remove — while the identical
+    /// script without the right-hand half pounced quietly and settled in
+    /// 0.68 s. Every zsh `RPROMPT`, powerlevel10k right prompt and starship
+    /// right module is in that configuration on every Enter, and so is every
+    /// `zsh-autosuggestions` or `fish` prompt, whose greyed completion inks
+    /// the row past the caret.
+    ///
+    /// The two clauses are `||`-ed, not `&&`-ed: each is sufficient evidence
+    /// on its own and neither is necessary, and a host that feeds no ink map
+    /// still has `home`'s margin rule. Note what that does NOT buy — the
+    /// arm's named false positive below survives, because a `Home` from
+    /// column 8 is still `home`. Gating the arm on the scroll alone would
+    /// retire it, and would also retire every Enter on a host whose ink map
+    /// the scroll cannot be read from; it is not worth a real fright to
+    /// close a quiet one.
+    ///
+    /// The three arms partition the space and cannot collide: the wrap fold
+    /// takes `|dr| == 1`, the fact arm takes a same-row seam at or past the
+    /// bar, and this arm takes a same-row landing at the row's HOME edge
+    /// between [`STARTLE_COLS`] and [`SNAP_COLS`]. Bigger same-row retreats
+    /// need no rescue — [`SNAP_COLS`] already makes them jumps rather than
+    /// frights in [`Self::on_move`] — so this arm stops where the snap tier
+    /// begins and a `Home` from mid-line keeps its literal delta.
+    ///
+    /// The third value says whether a fold happened at all: a seam is the
+    /// world's, and the crossing it forces is a quiet one.
+    fn caret_delta(
+        prev: (u16, u16),
+        now: (u16, u16),
+        cols: u16,
+        wrapped: bool,
+        home: bool,
+        scrolled: bool,
+    ) -> (f32, f32, bool) {
         let dr = f32::from(now.0) - f32::from(prev.0);
         let dc = f32::from(now.1) - f32::from(prev.1);
         let w = f32::from(cols);
         let bar = wrap_bar(w);
         if dr.abs() == 1.0 && dc.signum() != dr.signum() && dc.abs() >= bar {
-            (0.0, dc + dr * w)
+            (0.0, dc + dr * w, true)
         } else if wrapped && dr == 0.0 && dc.signum() < 0.0 && dc.abs() >= bar {
             // The scrolled wrap, folded on the fact alone: the grid moved a
             // line up underneath a caret pinned to the bottom row. The bar
@@ -2503,9 +3366,20 @@ impl PetBrain {
             // the last read", and only a delta shaped like the seam may
             // claim it (a `Home` pressed mid-line the same frame keeps its
             // literal retreat).
-            (1.0, dc + w)
+            (1.0, dc + w, true)
+        } else if dr == 0.0 && dc <= -STARTLE_COLS && dc > -SNAP_COLS && (home || scrolled) {
+            // …and the shell's own new line (above). The named false
+            // positive is the snap's argument at a smaller size: a leftward
+            // move of at least [`STARTLE_COLS`] that lands at the row's HOME
+            // edge in ONE move — `Home` from column 8, a `Ctrl-W` over a
+            // word with nothing but blanks behind it — is quiet now instead
+            // of a fright. A deletion walks column by column and never
+            // arrives in one move, so a held backspace keeps its flinch, and
+            // a `Ctrl-W` inside a sentence leaves the rest of the line
+            // standing to the caret's right, which is not home.
+            (1.0, dc, true)
         } else {
-            (dr, dc)
+            (dr, dc, false)
         }
     }
 
@@ -2816,6 +3690,13 @@ impl PetBrain {
             self.alpha = (self.alpha - dt / FADE_OUT).max(0.0);
             if self.alpha == 0.0 {
                 self.colors = None;
+                // A quiet leap latched for a caret that never came back is
+                // owed to nobody (the `pending_pounce` precedent: not
+                // cleared per hidden frame, only once the pet is gone) —
+                // and neither is a stream nobody is watching any more.
+                self.quiet_leap = false;
+                self.stream = false;
+                self.stream_run = 0;
                 if let Some((col, row)) = self.deferred_hidden_landing.take() {
                     self.col = col;
                     self.row = row;
@@ -2888,20 +3769,39 @@ impl PetBrain {
             // Micro-life sleeps with the audience gone.
             self.twitch_t = 0.0;
             self.last_burst = false;
+            self.droop_seated = false;
             // No caret, no gaze: a hidden cursor is not a thing to look at,
             // and a dwell it was earning dies with it.
             self.sit_front = false;
             self.peek = false;
+            self.look_row = 0;
             self.gaze_dwell = 0.0;
             // The wave-4 comedy dies with the audience too.
             self.tennis = false;
             self.stumble_t = 0.0;
             self.braking = false;
             self.brake_over = None;
+            self.skid_puff = false;
+            self.lateral = false;
             self.leg_dist = 0.0;
+            // A fall nobody is watching is not a fall, and neither the
+            // drop's stare nor the commit stare has an audience.
+            self.pending_drop = false;
+            self.drop_sit_t = 0.0;
+            self.drop_stare = false;
+            self.commit_t = 0.0;
+            self.scrabble = false;
             self.wriggle_t = 0.0;
             self.hide_to = None;
             self.hiding = false;
+            // A cat in the AIR is never settled here, and needs no guard
+            // saying so: this arm's very first act was `flight.take()` —
+            // the retirement above, which hands the authored parabola to
+            // `retired_flight_lift` (so a still-visible body eases down
+            // through the same curve rather than stepping) and the
+            // destination to `deferred_hidden_landing` (taken only if the
+            // fade completes). There is never a live flight left for
+            // `enter_settled` to re-pose.
             self.enter_settled(dt);
             return self.emit(sense, width);
         };
@@ -2950,6 +3850,39 @@ impl PetBrain {
                     self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
                 self.col = c;
                 self.row = r;
+                // No trip to clear here either: `was_invisible` means the
+                // previous frame took the no-caret arm, which retired the
+                // flight and cleared `bound2`/`land_t`/`land_span`/
+                // `skid_dir` on its way through. A re-seat cannot land on a
+                // live arc.
+            } else {
+                // A VISIBLE cat re-sighting the caret after a one-frame hide
+                // (a prompt redraw, a scrollback scroll) lost the move that
+                // happened meanwhile, but its SHAPE is still readable off the
+                // cat's own feet: a caret on another row, or a whole SNAP
+                // behind the cat, is the line change or the snap the sensor
+                // would have latched quietly — the prompt redraw from the end
+                // of a long line is still an Enter, never the show. A caret
+                // ahead on the same row keeps whatever the standing gap
+                // decides.
+                //
+                // The retreat is measured against the SNAP's own bar, not
+                // against the body: a resting cat's station IS `caret +
+                // STATION_LEAD`, so a bare `cc < self.col` is true of a
+                // caret that did not move at all, and every hidden frame the
+                // host feeds — a DECTCEM hide, a scrollback scroll, a prompt
+                // redraw — would latch `quiet_leap` on a cat standing still.
+                // The latch survives until the next flight, so the next
+                // genuinely chosen screen-crossing jump would silently lose
+                // its notice-wiggle, its dust and its show to an unrelated
+                // cursor blink. A move the sensor would have called a snap is
+                // a move worth reconstructing; anything smaller could not
+                // have opened the big door in the first place.
+                let other_row = (f32::from(cr) - self.row).abs() >= 0.5;
+                let behind = f32::from(cc) < self.col - SNAP_COLS;
+                if other_row || behind {
+                    self.quiet_leap = true;
+                }
             }
         }
         self.last_caret = Some((cr, cc));
@@ -2962,8 +3895,51 @@ impl PetBrain {
             // The emulator's wrap fact rides the same diff: it is consumed
             // here and nowhere else, so the whole brain sees a wrap as the
             // one-character move it is.
-            let (dr, dc) = Self::caret_delta(pcell, (cr, cc), sense.cols, sense.wrapped);
+            let (dr, dc, folded) = Self::caret_delta(
+                pcell,
+                (cr, cc),
+                sense.cols,
+                sense.wrapped,
+                self.caret_at_home(cr, cc),
+                self.ink_scrolled,
+            );
             move_dc = dc;
+            // THE STREAM WATCH's sensor (see [`STREAM_RUN`]): a line event
+            // is a row change, a folded seam, or a same-row jump of a
+            // quarter of the pane. A run of them arms the watch — which
+            // drops every travel latch (the events ARE the reason not to
+            // travel), sits a settled cat up to watch, and stands a launch
+            // coil down rather than letting it hop in place at a gap that
+            // is gone.
+            if dr != 0.0 || folded || dc.abs() >= stream_jump(sense.cols) {
+                self.stream_run = if (self.clock - self.stream_last) as f32 <= STREAM_WINDOW {
+                    self.stream_run.saturating_add(1)
+                } else {
+                    1
+                };
+                self.stream_last = self.clock;
+                if self.stream_run >= STREAM_RUN && !self.stream {
+                    self.stream = true;
+                    self.pending_pounce = false;
+                    self.pending_big_jump = false;
+                    self.quiet_leap = false;
+                    let coiled = self.action == PetAction::Crouch
+                        && !self.hiding
+                        && !self.stakeout
+                        && self.play_to.is_none();
+                    self.hop_crouch = false;
+                    self.big_gather = false;
+                    if self.action.settled() || coiled {
+                        self.set_action(PetAction::Perk);
+                    }
+                }
+            }
+            // A seam is one character, and the seam it crosses is the
+            // world's: whatever crossing it forces is a quiet one. (While
+            // the stream watch holds there is no crossing to latch for.)
+            if !self.stream {
+                self.quiet_leap |= folded;
+            }
             let was_asleep = self.action == PetAction::Sleep;
             self.on_move(dr, dc, f32::from(cc), sense.cols, sense.reduced_motion);
             // Waking pops ONE startled z ahead of the stretch — the sleep
@@ -2983,6 +3959,16 @@ impl PetBrain {
             // resident until unrelated redraws happen to advance it. Snap to
             // the static final opacity on this very first live-caret sample.
             self.alpha = 1.0;
+            // THE PIN IS THE CONTRACT, and it is deliberately a hard assign:
+            // under reduced motion the pet does not travel to its station, it
+            // simply IS there. Easing here would be animation, which is the
+            // one thing this arm exists to refuse
+            // (`reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait`).
+            //
+            // That makes this arm safe ONLY for a stable preference. A caller
+            // that raises the flag on a VISIBLE walking cat gets a teleport by
+            // construction — see `app_render`'s `pet_reduced_motion`, which is
+            // why the performance shed is no longer allowed to reach it.
             self.col = Self::station(cc, sense.cols, width);
             self.row = f32::from(cr);
             self.speed = 0.0;
@@ -2997,7 +3983,24 @@ impl PetBrain {
             self.pending_wall_transit = false;
             // Reduced motion plays NO choreography and spawns NO particles.
             self.pending_big_jump = false;
+            self.quiet_leap = false;
+            self.stream = false;
+            self.stream_run = 0;
             self.big_gather = false;
+            // No gait at all here, so no gait FLAG either: the amble and the
+            // drift-brake's slide are motion, and the pet simply IS at its
+            // station.
+            self.lateral = false;
+            self.braking = false;
+            self.brake_over = None;
+            self.skid_puff = false;
+            // No fall, no stare: reduced motion has no floor to lose and no
+            // beat to spend on an empty cell.
+            self.pending_drop = false;
+            self.drop_sit_t = 0.0;
+            self.drop_stare = false;
+            self.commit_t = 0.0;
+            self.scrabble = false;
             self.bound2 = None;
             self.land_span = 0.0;
             self.motes = [None; PET_MOTES_MAX];
@@ -3019,9 +4022,16 @@ impl PetBrain {
             self.watch_t = 0.0;
             self.watch_spent = false;
             self.clear_play();
-            // No micro-life either: the bob is motion.
+            // No micro-life either: the bob is motion, and so is every
+            // dealt idle beat — the seat's tail, its blink, its yawn, its
+            // glance, the loaf's peek and the wash's second half all read
+            // the pose off `quiet` and the hand, and none of them is
+            // reachable from here. The two emit-only bits they share are
+            // cleared with the rest of the latches.
             self.twitch_t = 0.0;
             self.last_burst = false;
+            self.droop_seated = false;
+            self.look_row = 0;
             // BREED HANDOFF under reduced motion: the parked look applies
             // IMMEDIATELY (the departure is theater; the costume is state),
             // and no departing body ever spawns — or survives a mid-flight
@@ -3061,6 +4071,24 @@ impl PetBrain {
         self.action_t += dt;
         self.land_t = (self.land_t - dt).max(0.0);
         self.flinch_t = (self.flinch_t - dt).max(0.0);
+        // THE VARIETY WAVE'S LANDED BEATS are each tied to the pose they
+        // belong to, and a beat whose pose has been taken away — a fright, a
+        // re-anchor hop, the stream watch sitting the cat down — is over.
+        // Stated here rather than trusted to the arms that spend them: an
+        // unspent latch would pin the frame lane forever (idle-to-zero), and
+        // every one of these is reachable from a pose some other rule owns.
+        if self.action != PetAction::Waking {
+            self.pending_drop = false;
+        }
+        if !matches!(self.action, PetAction::Land | PetAction::Sit) {
+            self.drop_sit_t = 0.0;
+        }
+        if !matches!(self.action, PetAction::Land | PetAction::Stand) {
+            self.commit_t = 0.0;
+        }
+        if self.action != PetAction::Land {
+            self.scrabble = false;
+        }
         self.pet_hold_t = (self.pet_hold_t - dt).max(0.0);
         // The wave-1 latch TTLs, on the injected clock (never dt, which is
         // motion-clamped): a bell that outlived its window mid-flight
@@ -3094,6 +4122,19 @@ impl PetBrain {
         {
             self.pending_look = None;
             self.look_at = None;
+        }
+        // THE STREAM WATCH stands down [`STREAM_LAPSE`] after the LAST line
+        // event (the brain clock, never `dt`) — and hands the ladder back a
+        // QUIET leap. The trip home after a build log is the same forced
+        // crossing every other seam is: the pet did not choose the far side
+        // of a screen of output, a program put the prompt there. Without the
+        // latch the standing-gap clause opened the full show on the far side
+        // of every noisy command — the notice, the butt-wiggle, two bounds
+        // and landing dust — which for a developer is most commands.
+        if self.stream && (self.clock - self.stream_last) as f32 > STREAM_LAPSE {
+            self.stream = false;
+            self.stream_run = 0;
+            self.quiet_leap = true;
         }
         // PERK-AND-WATCH heat (wave 2): pure per-tick bookkeeping, integrated
         // unconditionally (like the flinch envelope) so a burst that lands
@@ -3327,6 +4368,18 @@ impl PetBrain {
                     self.ink_safe_col(self.col, self.row, width, sense.cols),
                     self.row,
                 )
+            } else if self.stream {
+                // UNDER THE STREAM WATCH the eviction keeps the LADDER and
+                // gives up the CHASE, exactly like every other rule the
+                // watch holds: the ladder is anchored at the cat's OWN
+                // column instead of the caret's station, so a pose the log
+                // inked under still steps off the words (rule 2) or hops the
+                // row (rule 3) — it just stops being dragged after a caret
+                // nobody is chasing. Anchored at the station instead, the
+                // eviction was the one rule the watch did not hold, and a
+                // build log re-anchored the cat across the pane line after
+                // line: the very tic the watch exists to remove.
+                self.ink_stand(self.col, self.row, width, sense.cols, sense.rows)
             } else {
                 self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
             };
@@ -3357,28 +4410,30 @@ impl PetBrain {
                 // CHOSE. This one is the world shoving it off its spot, and a
                 // shoved cat leaves at once — which is also what keeps the
                 // F1 law that a pose may never loiter on the user's words.
-                self.resume = Some((self.action, self.action_t));
+                //
+                // A REACTION is consumed by the hop, never owed back: the
+                // flight IS the fright (measured on the scrolled wrap, three
+                // Startles per line, each replayed one frame before the next
+                // hop — the borrowed fright, replayed after the trip it was
+                // the reason for). The settled and grieving poses keep the
+                // hand-back: a sleeper goes straight back to sleep on the
+                // far side, a droop resumes where the grief can be read.
+                self.resume = if matches!(
+                    self.action,
+                    PetAction::Startle | PetAction::Frolic | PetAction::Perk
+                ) {
+                    None
+                } else {
+                    Some((self.action, self.action_t))
+                };
                 self.hop_crouch = false;
                 self.big_gather = false;
-                let span = (safe - self.col).abs();
-                if span > POUNCE_SPAN_MAX {
-                    // THE SPAN CAP (the launch law): `flight_shape`'s
-                    // vertical branch saturates its duration at
-                    // [`FLIGHT_MAX`] whatever the span, so a re-anchor
-                    // across a typed-through wrap flew 191 cells in 0.42 s —
-                    // 455.7 c/s, measured, the fastest teleport in the
-                    // product. Past the lawful pounce span the shove is
-                    // answered with `launch_big` instead: ink-safe at its
-                    // touch point, apex-clamped, split at [`TWO_BOUND_FRAC`]
-                    // — and still with no perk and no gather, exactly as the
-                    // big-jump arm's ink collapse skips the notice, because
-                    // the no-gather rule above is the point: a shoved cat
-                    // leaves at once.
-                    self.launch_big(safe, safe_row, sense.cols, width);
-                } else {
-                    let (dur, arc) = Self::flight_shape(span, true);
-                    self.begin_arc(safe, safe_row, dur, arc, false);
-                }
+                // It leaves through the one door every caret-driven flight
+                // uses ([`Self::leave_ground`]): a hop within
+                // [`POUNCE_SPAN_MAX`], a quiet bound beyond — never a
+                // [`FLIGHT_MAX`] arc stretched across the pane, which was the
+                // 455.7 c/s teleport the launch-time law is named for.
+                self.leave_ground(safe, safe_row, true, sense.cols, width, LeapPolicy::Quiet);
             } else {
                 // A step aside is a step aside: the column glides and the row
                 // does not move at all. `is_re_anchor` already proved the
@@ -3399,8 +4454,20 @@ impl PetBrain {
         // [`WATCH_HUG_ROWS`] of hysteresis so a fast stream reads as pursuit
         // rather than a strobe. Any travel latch drops the override at once —
         // work outranks attention, exactly as the watch always ruled.
-        let (target, target_row) = if self.watch_heat >= WATCH_GATE
-            && !self.watch_spent
+        //
+        // ONE STIMULUS, TWO WITNESSES. `watch_heat` is charged from
+        // [`PetSense::output_burst`], which the host only sets with shell
+        // integration; the stream watch's line-event run needs none. Gating
+        // the hug on the heat alone therefore gave two different animals for
+        // one log — MEASURED: an 18-row build log with the caret riding it
+        // left the feet 17.00 rows behind the edge, in old scrollback, with
+        // AND without `output_burst`, while the same log with the caret
+        // parked (heat armed, stream not) hugged to 1.41. So the hug arms
+        // from EITHER witness, and it is the one thing the stream's pose
+        // hold below stands aside for.
+        let mut hugging = false;
+        let (target, target_row) = if (self.stream
+            || (self.watch_heat >= WATCH_GATE && !self.watch_spent))
             && !self.pending_pounce
             && !self.pending_big_jump
             && self.flight.is_none()
@@ -3410,6 +4477,18 @@ impl PetBrain {
             if (live - self.row).abs() >= WATCH_HUG_ROWS {
                 // Re-station beside the newest line's end — blank ground by
                 // construction, one clear lead cell off the ink.
+                //
+                // `hugging` is set HERE and not on the gate, because it is
+                // the flag that stands the stream's pose hold down and the
+                // hold must only stand down for a TRIP. A last-row scrolling
+                // log has `live == the cat's own row` every frame, and
+                // arming on the gate stood the hold down there too — the cat
+                // got up instead of sitting to watch (`a_wrapping_build_log_
+                // sits_the_cat_down_to_watch` goes red on that form).
+                hugging = true;
+                // A crossing a program forced is the world's, by this file's
+                // own rule: latch it quiet so the trip cannot open the show.
+                self.quiet_leap = true;
                 let col = self
                     .ink_span(live)
                     .map(|(_, end)| {
@@ -3468,17 +4547,49 @@ impl PetBrain {
             (target, target_row)
         };
 
+        // ── THE STREAM WATCH holds the CHASE target (see [`STREAM_RUN`]) ──
+        // The pet's own feet are the target: no gap for the row-hop, wall
+        // or pounce doors, nothing for the follower to run down. The ink
+        // ladder above already had its say (a re-anchor it demanded is a
+        // flight now, and a flight finishes), and the live-edge hug keeps
+        // its precedence — a watcher pulled to the newest line is the one
+        // trip a stream is allowed to ask for. That precedence is real in
+        // BOTH places or in neither: the pose hold below carries the same
+        // `!hugging`, because holding the pose returns before every door and
+        // would otherwise discard the target chosen here.
+        let (target, target_row) = if self.stream && self.flight.is_none() && !hugging {
+            (self.col, self.row)
+        } else {
+            (target, target_row)
+        };
+
         // ── flight owns the position while it lasts ────────────────────────
         if let Some(mut f) = self.flight {
             // The ONE mid-air re-aim: a large caret move while airborne
             // retargets the landing column at the newly predicted station —
             // never the duration, and never twice. Small moves still only
             // latch `pending_pounce` (the interruption law is unchanged).
+            //
+            // I MEANT TO DO THAT: a SECOND big move while airborne — after
+            // the one re-aim has been spent, or after the refusal below
+            // declined it — is the caret going somewhere this flight can no
+            // longer reach. Wherever it lands is already the wrong cell,
+            // and the pet is going to have to admit that on the ground.
+            if move_dc.abs() >= POUNCE_JUMP && f.reaimed {
+                f.late_move = true;
+            }
             if move_dc.abs() >= POUNCE_JUMP && !f.reaimed {
                 f.reaimed = true;
+                // The wall side is otherwise STALE in the air (the latch
+                // above gates `update_wall` on `flight.is_none()`), and a
+                // stale side aims the re-aim at the wrong side of the
+                // caret. Read it fresh; the transit it may report is
+                // discarded — a flight crosses in the air and lands on the
+                // side it aimed at.
+                let _ = self.update_wall(cc, sense.cols, width);
                 let t_rem = (f.dur - f.t).max(0.0) + LAND_DUR;
                 let predict = if self.rhythm_open() {
-                    self.vhat * t_rem
+                    (self.vhat * t_rem).clamp(-FLIGHT_LEAD_MAX, FLIGHT_LEAD_MAX)
                 } else {
                     0.0
                 };
@@ -3487,9 +4598,8 @@ impl PetBrain {
                 // second bound were all cut against that row. A ladder row
                 // the flight did not take is picked up by the eviction one
                 // tick after the paws are down.
-                let aim = self
-                    .station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
-                    .0;
+                let (aim, aim_row) =
+                    self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
                 let to = (aim + predict).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
                 // REBASE, or the re-aim IS a teleport.
                 //
@@ -3506,7 +4616,34 @@ impl PetBrain {
                 // before `f.t` advances, so `u` is the frame already on
                 // glass): `from' + (to' - from')·u == col`.
                 let u_now = (f.t / f.dur).clamp(0.0, 1.0);
-                if u_now <= REAIM_MAX_U {
+                // …AND REFUSED, NEVER SOLVED, when it would outrun the
+                // flight. The rebase keeps the CLOCK (the flight's clock is
+                // the law), so the whole new span has to fit in the time
+                // LEFT — which the launch-time law never saw, because it
+                // judges an arc once, at `begin_arc`. Measured at this base:
+                // an Enter re-aiming a mid-air row hop flew 85 cells in
+                // 0.251 s, 338.3 c/s, 5.64 cells in ONE frame. The cap is
+                // judged on the remaining span over the remaining time. A
+                // ROW change is refused too — a row change is always a hop,
+                // cut and landed against its own row. Either way the flight
+                // finishes where it was going and the latched intent
+                // launches a lawful new flight from the landing, which is
+                // exactly what the `REAIM_MAX_U` bar below already argued
+                // for a late re-aim.
+                //
+                // The pace is the DESTINATION's, never the costume of the
+                // flight already in the air: a re-aim is never a chosen
+                // jump — something moved the caret while the pet was
+                // committed — so it is paced like every other forced
+                // crossing ([`quiet_speed_max`]).
+                let cap = if f.big {
+                    quiet_speed_max(sense.cols)
+                } else {
+                    HOP_SPEED_MAX
+                };
+                let same_row = (aim_row - f.to_row).abs() < 0.5;
+                let in_time = (to - self.col).abs() / (f.dur - f.t).max(1e-3) <= cap;
+                if same_row && in_time && u_now <= REAIM_MAX_U {
                     f.from_col = (self.col - to * u_now) / (1.0 - u_now);
                     f.to_col = to;
                 }
@@ -3523,7 +4660,11 @@ impl PetBrain {
                 // exceptional path.
                 self.bound2 = None;
             }
-            f.t += dt;
+            // …on the FLIGHT's own stall bound, not the motion clamp: an arc
+            // is a schedule and must finish on wall time even when the host
+            // withheld frames for a synchronized-output bracket. See
+            // [`FLIGHT_STALL_MAX`].
+            f.t += elapsed.min(FLIGHT_STALL_MAX);
             let u = (f.t / f.dur).clamp(0.0, 1.0);
             self.col = f.from_col + (f.to_col - f.from_col) * u;
             self.row = f.from_row + (f.to_row - f.from_row) * u;
@@ -3535,6 +4676,11 @@ impl PetBrain {
                 let span = (f.to_col - f.from_col).abs();
                 self.content = (self.content + span * CONTENT_PER_CELL).min(1.0);
                 self.flight = None;
+                self.scrabble = false;
+                // …and the stare, so a split crossing's second bound cannot
+                // inherit the first's (the relaunch consumes the touch-land
+                // below; only the flight that was actually stranded stares).
+                self.commit_t = 0.0;
                 if f.big && self.bound2.is_some() {
                     // The touch-land between the two bounds of a split
                     // crossing: brief, light, and the relaunch consumes
@@ -3554,10 +4700,83 @@ impl PetBrain {
                     } else {
                         0.0
                     };
-                    self.spawn_dust(width);
+                    // Dust only on a CHOSEN landing (the tic law): a quiet
+                    // transit keeps the weight and the skid, not the puff.
+                    // A shorter animation at the same rate is still a tic,
+                    // and a puff on every Enter — or on a prompt redraw
+                    // nobody asked for — is one.
+                    if f.show {
+                        self.spawn_dust(width);
+                    }
                 } else {
                     self.land_t = LAND_DUR;
                     self.land_span = 0.0;
+                    // THE SCRABBLE (variety wave): a landing that MISSED —
+                    // the station moved out from under the aim while the cat
+                    // was in the air — scrambles for its footing instead of
+                    // arriving cleanly. Judged against the SAME prediction
+                    // the launch made, so a pounce that led a still-typing
+                    // caret correctly never scrabbles, and rationed by the
+                    // stride/serial idiom (one landing in four on the gate)
+                    // so a run of near-misses is not a tic. Never on a fall
+                    // (nothing was aimed at) and never on a play flight (the
+                    // toy IS where the cat wanted to be).
+                    let lead_now = if self.rhythm_open() {
+                        self.vhat * LAND_DUR
+                    } else {
+                        0.0
+                    };
+                    let miss = (f.to_col - (target + lead_now)).abs();
+                    // …AND THE GROUND HAS TO HAVE MOVED. `f.reaimed` is set
+                    // by a caret JUMP in the air (spent or refused, it does
+                    // not matter — something moved the destination), which
+                    // is the beat's whole story. The miss alone was not the
+                    // gate it was written to be: with the one-in-four
+                    // ration forced on, an ordinary fast typing run missed
+                    // by 6.91 cells against [`SCRABBLE_MISS`] 6.0 and
+                    // scrabbled — the rarity, not the measure, was doing
+                    // the work (review, 2026-08-27). A rhythm the launch
+                    // predicted is never a surprise, however far the caret
+                    // has run by the landing.
+                    if f.reaimed
+                        && !f.drop
+                        && !self.stream
+                        && self.play_land.is_none()
+                        && miss >= SCRABBLE_MISS
+                        && (self.stride as u32).wrapping_add(u32::from(self.mote_serial)) % 4 == 0
+                    {
+                        self.land_t = SCRABBLE_DUR;
+                        self.scrabble = true;
+                        self.spawn_dust(width);
+                    }
+                }
+                // A FALL lands in a stare: the cat sits where it fell and
+                // looks at whoever moved the floor (see [`DROP_SIT`]).
+                if f.drop {
+                    self.drop_sit_t = DROP_SIT;
+                    self.drop_stare = true;
+                }
+                // …and a flight the caret moved out from under lands in a
+                // stare of its own — but only if the cell it was aimed at
+                // really is empty now (a late move the station absorbed is
+                // no mistake at all).
+                // Never under the STREAM WATCH: a program printing is not
+                // addressed to the cat (and the watch's own hold would cut
+                // the stand to a single frame, under the frame-rate law).
+                if f.late_move && !self.stream && (target - self.col).abs() >= POUNCE_JUMP {
+                    self.commit_t = COMMIT_STARE;
+                    // Facing the way it FLEW, which is the whole beat: the
+                    // move that stranded it may have been a retreat or a
+                    // snap, and those turn the head at the sensor. The
+                    // stare is about the cell the cat committed to, so the
+                    // flight's own direction is re-asserted for it; the
+                    // double-take at the end of the hold is what turns the
+                    // head after the caret.
+                    if f.to_col > f.from_col {
+                        self.facing_left = false;
+                    } else if f.to_col < f.from_col {
+                        self.facing_left = true;
+                    }
                 }
                 self.set_action(PetAction::Land);
             } else {
@@ -3568,14 +4787,20 @@ impl PetBrain {
             return self.emit(sense, width);
         }
 
+        // A landing recovery that has run out owes nothing more — the paws
+        // have stopped scrabbling whatever happens next (idle-to-zero).
+        if self.action == PetAction::Land && self.land_t <= 0.0 {
+            self.scrabble = false;
+        }
+
         // The second bound of a split crossing: its touch-land just expired,
         // so the pet leaves the ground again — before any other rule can
         // claim the tick (the split is ONE choreography, not two decisions).
         if self.action == PetAction::Land
             && self.land_t <= 0.0
-            && let Some((c2, r2)) = self.bound2.take()
+            && let Some((c2, r2, show2)) = self.bound2.take()
         {
-            self.begin_big_arc(c2, r2);
+            self.begin_big_arc(c2, r2, sense.cols, show2);
             return self.emit(sense, width);
         }
 
@@ -3598,6 +4823,68 @@ impl PetBrain {
         {
             self.set_action(pose);
             self.action_t = held;
+            return self.emit(sense, width);
+        }
+
+        // THE SLEEPER'S DROP: the floor moved out from under a sleeping cat
+        // (an Enter exactly one row below it), so the wake is spent FALLING.
+        // Straight down at the cat's own column — one row over [`DROP_DUR`],
+        // no arc, no coil, no gather: a body coming off a ledge, which is
+        // the one flight in the vocabulary that is not a decision.
+        //
+        // REFUSED OVER INK. The whole point is that the row below is the
+        // floor; if the caret's new line already reaches under the cat's own
+        // column there is nothing to land on, and the ordinary wake (stretch,
+        // then whatever door the ladder opens) is the honest answer. The
+        // ladder's own sideways answer is not taken here — a cat that falls
+        // sideways is not falling.
+        if self.action == PetAction::Waking && self.pending_drop {
+            self.pending_drop = false;
+            let to_col = self.ink_safe_col(self.col, target_row, width, sense.cols);
+            // ONE ROW, and the cat's own column. The move sensor already
+            // proved the caret went down exactly one; the ink ladder may
+            // still answer with somewhere else (the row below inked, a
+            // sideways stand), and neither of those is a hole in the floor.
+            if (target_row - self.row - 1.0).abs() < 0.5
+                && (to_col - self.col).abs() < 0.5
+                && !self.ink_overlaps(to_col, target_row, width)
+            {
+                // A stale hop or gather cannot ride a fall.
+                self.hop_crouch = false;
+                self.big_gather = false;
+                self.begin_arc(
+                    to_col,
+                    target_row,
+                    DROP_DUR,
+                    0.0,
+                    FlightKind {
+                        drop: true,
+                        ..FlightKind::PLAIN
+                    },
+                );
+                return self.emit(sense, width);
+            }
+        }
+
+        // I MEANT TO DO THAT: a flight the caret moved out from under
+        // arrives at an empty cell. The cat stands on it and looks at it —
+        // facing exactly where it was going, because that is the whole joke
+        // — before the double-take turns its head after the caret.
+        if self.action == PetAction::Land && self.land_t <= 0.0 && self.commit_t > 0.0 {
+            self.set_action(PetAction::Stand);
+            self.speed = 0.0;
+            return self.emit(sense, width);
+        }
+
+        // …and the stare a FALL lands in: the cat sits exactly where it fell
+        // and looks at whoever moved the floor, before the ordinary ladder
+        // takes it home.
+        if self.action == PetAction::Land && self.land_t <= 0.0 && self.drop_sit_t > 0.0 {
+            self.sit_front = true;
+            self.peek = false;
+            self.facing_left = f32::from(cc) < self.col + width * 0.5;
+            self.set_action(PetAction::Sit);
+            self.speed = 0.0;
             return self.emit(sense, width);
         }
 
@@ -3637,6 +4924,76 @@ impl PetBrain {
 
         // ── one-shot holds ─────────────────────────────────────────────────
         match self.action {
+            PetAction::Sit | PetAction::Stand | PetAction::Perk if self.stream && !hugging => {
+                // THE STREAM WATCH sits the cat down: the notice keeps its
+                // beat, a stand (the ladder's "just arrived") sits at once,
+                // the sit holds until the events lapse. Above the tennis
+                // watch and every idle vignette — a program printing is
+                // closer to work than a rally is to play.
+                //
+                // EXCEPT for the live-edge hug's own trip (`hugging`): the
+                // hold returns before every door, so a hold that outranked
+                // the hug computed the newest line's stand and then threw it
+                // away — 17 rows of lag, measured. The hug asks for a trip
+                // only when the edge is [`WATCH_HUG_ROWS`] away, so the hold
+                // still owns every frame of an ordinary last-row log.
+                if self.action == PetAction::Stand
+                    || (self.action == PetAction::Perk && self.action_t >= PERK_HOLD)
+                {
+                    self.set_action(PetAction::Sit);
+                }
+                self.speed = 0.0;
+                return self.emit(sense, width);
+            }
+            PetAction::Stand if self.commit_t > 0.0 => {
+                // THE COMMIT STARE: planted on the empty cell, facing the
+                // way it flew. A THIRD jump abandons it at once — the caret
+                // has moved on again, and a beat about being wrong is not
+                // worth being wrong twice for. Judged on THIS TICK'S move,
+                // never on the latch: the second mid-air move already left
+                // `pending_pounce` set (it is what takes the cat home after
+                // the beat), so a latch test would cut the stare to one
+                // frame every time.
+                if move_dc.abs() >= POUNCE_JUMP {
+                    self.commit_t = 0.0;
+                    // …but the POSE still holds the frame-rate law's floor.
+                    // A third jump arriving on the tick after the landing
+                    // left exactly ONE frame of `PetStand` between the
+                    // landing and the coil (review, 2026-08-27) — a flash,
+                    // not a beat. The stare is over either way; it is the
+                    // fall-through that waits a tick.
+                    if self.action_t < POSE_FLOOR {
+                        self.speed = 0.0;
+                        return self.emit(sense, width);
+                    }
+                } else {
+                    self.commit_t = (self.commit_t - dt).max(0.0);
+                    if self.commit_t <= 0.0 {
+                        // …then it looks where the caret actually went.
+                        self.facing_left = target < self.col;
+                        self.set_action(PetAction::Perk);
+                    }
+                    self.speed = 0.0;
+                    return self.emit(sense, width);
+                }
+            }
+            PetAction::Sit if self.drop_sit_t > 0.0 => {
+                // THE DROP'S STARE: feet planted, eye contact held, the
+                // ladder's own beats not yet running (`quiet` is zero — the
+                // caret just moved). It spends itself and falls through to
+                // the doors, which the latched quiet leap takes home.
+                self.drop_sit_t = (self.drop_sit_t - dt).max(0.0);
+                self.speed = 0.0;
+                return self.emit(sense, width);
+            }
+            PetAction::Land if self.stream && self.land_t <= 0.0 => {
+                // A landing recovery that ran out under the watch (the
+                // second bound, the pose hand-back and the play flourish
+                // above all had their turn): sit, skip the arrival ladder.
+                self.set_action(PetAction::Sit);
+                self.speed = 0.0;
+                return self.emit(sense, width);
+            }
             PetAction::Crouch if self.big_gather => {
                 // The big jump's gather: the butt-wiggle plays through
                 // BIG_CROUCH_DUR, then the bound (or bounds) launch at the
@@ -3650,16 +5007,41 @@ impl PetBrain {
                 };
                 if self.action_t >= dur {
                     self.big_gather = false;
-                    self.launch_big(target, target_row, sense.cols, width);
+                    self.leave_ground(
+                        target,
+                        target_row,
+                        false,
+                        sense.cols,
+                        width,
+                        LeapPolicy::Show,
+                    );
                 }
                 return self.emit(sense, width);
             }
             PetAction::Crouch if self.hop_crouch => {
-                // The Enter hop's one-tick anticipation: gathered last frame,
-                // airborne this one. The target is re-read fresh, so a caret
-                // that moved again during the gather is still the one chased.
-                self.hop_crouch = false;
-                self.begin_flight(target, target_row, true, sense.cols, width);
+                // The row hop's anticipation: ONE tick for a hop (gathered
+                // last frame, airborne this one), the pounce's [`CROUCH_DUR`]
+                // coil when the predicted span makes it a BOUND — a bound
+                // from flat feet reads as a launch, not a jump. The target is
+                // re-read fresh every tick, so a caret that moved again
+                // during the gather is still the one chased.
+                let tier = self.predicted_tier(target, target_row, true, sense.cols, width);
+                if tier == Tier::Hop || self.action_t >= CROUCH_DUR {
+                    self.hop_crouch = false;
+                    self.leave_ground(
+                        target,
+                        target_row,
+                        true,
+                        sense.cols,
+                        width,
+                        LeapPolicy::Quiet,
+                    );
+                } else {
+                    // A coil the door dealt as one tick that now has to hold
+                    // (the caret moved into the bound tier): the release
+                    // envelope waits for the coil's real end.
+                    self.coil_d = CROUCH_DUR;
+                }
                 return self.emit(sense, width);
             }
             PetAction::Loaf if self.wriggle_t > 0.0 => {
@@ -3767,21 +5149,33 @@ impl PetBrain {
                     // than [`POUNCE_SPAN_MAX`] is struck short and the
                     // pursuit closes the rest on paws.
                     let vertical = (tr - self.row).abs() >= 0.5;
-                    let tc = self.col + (tc - self.col).clamp(-POUNCE_SPAN_MAX, POUNCE_SPAN_MAX);
-                    let (dur, arc) = Self::flight_shape((tc - self.col).abs(), vertical);
-                    self.begin_arc(tc, tr, dur, arc, false);
+                    self.leave_ground(tc, tr, vertical, sense.cols, width, LeapPolicy::Play);
                 } else {
                     // THE SCALED COIL (rung 7): a longer jump gathers
                     // longer — the hold stretches past CROUCH_DUR to the
                     // live span's coil_dur, refreshed every tick because
                     // the aim is live (the launch below re-reads the
                     // station, so its wind-up must track the same target).
-                    // `emit` reads the refreshed field for the envelope.
-                    self.coil_d = Self::coil_dur((target - self.col).abs());
+                    // `emit` reads the refreshed field for the envelope. A
+                    // QUIET leap keeps the quick coil: the scaled gather is
+                    // the anticipation of a jump the pet CHOSE.
+                    self.coil_d = if self.quiet_leap {
+                        CROUCH_DUR
+                    } else {
+                        Self::coil_dur((target - self.col).abs())
+                    };
                     if self.action_t < self.coil_d {
                         return self.emit(sense, width);
                     }
-                    self.launch(target, target_row, sense.cols, width);
+                    let vertical = (target_row - self.row).abs() >= 0.5;
+                    self.leave_ground(
+                        target,
+                        target_row,
+                        vertical,
+                        sense.cols,
+                        width,
+                        LeapPolicy::Quiet,
+                    );
                 }
                 return self.emit(sense, width);
             }
@@ -3848,14 +5242,21 @@ impl PetBrain {
                 // THE RECOVERY (rung 8): the landing steps off on a CONTACT
                 // frame. While the body absorbs, the stride eases to the
                 // nearest foot-down frame under `enter_settled`'s own law
-                // (`1 − exp(−dt/0.09)`) — the gait otherwise resumed at the
-                // phase frozen at launch, mid-swing, paws sliding on ground
-                // they never covered: the moon-walk the module doc forbids.
-                // Eased, never snapped — a snap is the same crime paid in
-                // one frame (up to half a stride of foot travel for zero
-                // cells of ground).
-                let planted = self.stride.round();
-                self.stride += (planted - self.stride) * (1.0 - (-dt / 0.09).exp());
+                // ([`Self::plant_stride`]) — the gait otherwise resumed at
+                // the phase frozen at launch, mid-swing, paws sliding on
+                // ground they never covered: the moon-walk the module doc
+                // forbids. Eased, never snapped — a snap is the same crime
+                // paid in one frame (up to half a stride of foot travel for
+                // zero cells of ground) — and inside [`STRIDE_PLANT`] the
+                // foot is simply down, so the recovery cannot step off on
+                // the cycle's LAST frame from a hair under a whole cycle.
+                //
+                // NOT between the bounds of a split: that touch relaunches,
+                // it never walks, and planting a gait phase mid-crossing
+                // spends the recovery the second bound is about to undo.
+                if self.bound2.is_none() {
+                    self.plant_stride(dt);
+                }
                 self.speed = 0.0;
                 return self.emit(sense, width);
             }
@@ -3872,8 +5273,19 @@ impl PetBrain {
         // The choreography is always notice → wiggle → bound(s): a pet not
         // already perked perks first, and the gather begins when that hold
         // has played out.
-        if (self.pending_big_jump
-            || (self.pursuit_t.is_none() && gap.abs() >= BIG_GAP_FRAC * f32::from(sense.cols)))
+        //
+        // A QUIET leap stands this door down entirely — the latch AND the
+        // standing-gap clause: a line change, a wrap or a snap the move
+        // sensor latched is the world moving the caret, not a jump the pet
+        // chose, so whatever size it was it falls through to the row-hop
+        // and pounce doors and tiers by span there — no notice-wiggle, no
+        // dust. A chosen jump keeps the whole show.
+        if self.quiet_leap {
+            self.pending_big_jump = false;
+        }
+        if !self.quiet_leap
+            && (self.pending_big_jump
+                || (self.pursuit_t.is_none() && gap.abs() >= BIG_GAP_FRAC * f32::from(sense.cols)))
             && gap.abs() > ARRIVED
         {
             // On ink the notice is SKIPPED outright (gauntlet F1): the perk
@@ -3896,11 +5308,35 @@ impl PetBrain {
 
         // ── a row change is always a hop ───────────────────────────────────
         if (target_row - self.row).abs() >= 0.5 {
-            // One tick of gathered crouch first — the anticipation that makes
-            // the hop read as a jump rather than a launch from flat feet.
+            // THE NOTICE: a cat at rest about to BOUND looks up first — one
+            // Perk beat, then the coil — from this door as from the big one
+            // (the prompt redraw that hid the caret for a frame used to cut
+            // a Sit straight into a 91 c/s hop). Never on ink (F1: a pose
+            // may not loiter on the words), never for a cat already on its
+            // feet, and never twice: the Perk hold plays out and lands back
+            // here wearing Perk.
+            if self.notices(target, target_row, true, sense.cols, width) {
+                self.set_action(PetAction::Perk);
+                return self.emit(sense, width);
+            }
+            // The gathered crouch first — the anticipation that makes the
+            // hop read as a jump rather than a launch from flat feet; the
+            // hold arm above keeps it one tick for a hop and [`CROUCH_DUR`]
+            // for a bound.
             self.hop_crouch = true;
             // A stale big gather must not hijack this hop into a bound.
             self.big_gather = false;
+            // The coil's length BY TIER — one tick for a hop (its single
+            // frame is the release), [`CROUCH_DUR`] for a bound — so the
+            // emit can put `PetLaunch` on the coil's last tick. The hold
+            // arm above re-reads the tier every tick and lengthens the coil
+            // if the caret moves the trip into the bound tier.
+            self.coil_d =
+                if self.predicted_tier(target, target_row, true, sense.cols, width) == Tier::Hop {
+                    0.0
+                } else {
+                    CROUCH_DUR
+                };
             self.set_action(PetAction::Crouch);
             return self.emit(sense, width);
         }
@@ -3918,18 +5354,31 @@ impl PetBrain {
                 // FIXED, so the span is what carries the rate — a latch that
                 // survived a hold used to cross whatever gap had opened
                 // meanwhile in one 0.25 s arc, span-blind and unbounded.
-                // The hop reaches at most [`WALL_SPAN_MAX`] cells; the
-                // remaining gap falls to the ladder on later ticks (the
-                // pounce band, the follower). The row-hop arm above already
-                // owns any real row change, so `target_row` here is the row
-                // the pet is on.
-                let to = if gap.abs() > WALL_SPAN_MAX {
-                    self.col + WALL_SPAN_MAX * gap.signum()
-                } else {
-                    target
-                };
-                self.begin_arc(to, target_row, WALL_HOP_DUR, WALL_HOP_ARC, false);
-                return self.emit(sense, width);
+                // The everyday two-cell crossing keeps that fixed arc; past
+                // [`WALL_SPAN_MAX`] it is a flight like any other and the
+                // LATCH BECOMES THE POUNCE'S, so the one door tiers it. It
+                // used to truncate the arc at 13.75 cells instead, which
+                // kept the law and bought a stubby hop followed by a second
+                // flight for the remainder — two airborne episodes for one
+                // trip home (measured on the trip back from a build log).
+                // The row-hop arm above already owns any real row change, so
+                // `target_row` here is the row the pet is on.
+                if gap.abs() <= WALL_SPAN_MAX {
+                    // The everyday transit is a two-cell arc: a TUCKED hop,
+                    // never the pounce's stretched hero.
+                    self.begin_arc(
+                        target,
+                        target_row,
+                        WALL_HOP_DUR,
+                        WALL_HOP_ARC,
+                        FlightKind {
+                            hop: true,
+                            ..FlightKind::PLAIN
+                        },
+                    );
+                    return self.emit(sense, width);
+                }
+                self.pending_pounce = true;
             }
         }
 
@@ -3942,19 +5391,24 @@ impl PetBrain {
         // paws (that is what makes it a chase) — only a latched caret intent
         // may still fly.
         //
-        // The door is a BAND, not an open half-line (the launch law): a
-        // pounce's flight time clamps at [`FLIGHT_MAX`], so a span past
-        // [`POUNCE_SPAN_MAX`] cannot be flown lawfully — an uncapped door
-        // launched a just-under-half-grid gap at 238 c/s on a 200-column
-        // pane, measured. Past the band the arm declines and the gap falls
-        // through to the follower's gallop (the big-jump door above already
-        // owns the half-grid tier), which carries the cat until the gap
-        // shrinks INTO the band and the pounce fires at a speed a body
-        // could choose.
+        // The door is no longer a BAND. It was, because a pounce's flight
+        // time clamps at [`FLIGHT_MAX`] and a span past [`POUNCE_SPAN_MAX`]
+        // could not be flown lawfully as a pounce — so the arm declined and
+        // the cat jogged until the gap shrank into the band (measured: a
+        // 38.3-cell prompt redraw walked and ran for 0.73 s before it left
+        // the ground). [`Self::leave_ground`] tiers instead: past the pounce
+        // span the same door flies a BOUND, which is a shape a body can
+        // choose for that distance. The half-grid tier above still owns the
+        // chosen show; this arm owns everything the caret forced.
         if (self.pending_pounce || (self.pursuit_t.is_none() && gap.abs() >= POUNCE_GAP))
             && gap.abs() > ARRIVED
-            && gap.abs() <= POUNCE_SPAN_MAX
         {
+            // The notice (see the row hop): a cat at rest looks up before a
+            // bound, the latch kept for the coil that follows the beat.
+            if self.notices(target, target_row, false, sense.cols, width) {
+                self.set_action(PetAction::Perk);
+                return self.emit(sense, width);
+            }
             self.pending_pounce = false;
             // A stale hop or big gather (its trigger vanished before launch)
             // must not hijack this pounce's crouch.
@@ -3962,7 +5416,13 @@ impl PetBrain {
             self.big_gather = false;
             // THE SCALED COIL (rung 7): the gather's length is set by the
             // span it is winding up for — and kept live by the launch arm.
-            self.coil_d = Self::coil_dur(gap.abs());
+            // A quiet leap keeps the quick coil (the scaled gather is a
+            // chosen jump's anticipation).
+            self.coil_d = if self.quiet_leap {
+                CROUCH_DUR
+            } else {
+                Self::coil_dur(gap.abs())
+            };
             self.set_action(PetAction::Crouch);
             return self.emit(sense, width);
         }
@@ -3983,8 +5443,15 @@ impl PetBrain {
         // The gallop's four frames cover twice the ground per cycle — see
         // [`RUN_STRIDE_CELLS`]. Keyed on the gait the glass is showing (last
         // frame's action), which the hysteresis keeps stable.
+        // …and the AMBLE's stride is shorter than the trot's, so the same
+        // ground cycles the feet faster (see [`LAT_STRIDE_CELLS`]). The
+        // stride is a CYCLE COUNT, not a phase in cells: swapping the
+        // divisor changes the cadence from here on and never jumps the
+        // odometer, so a cat easing across the threshold keeps its feet.
         let stride_cells = if self.action == PetAction::Run {
             RUN_STRIDE_CELLS
+        } else if self.lateral {
+            LAT_STRIDE_CELLS
         } else {
             STRIDE_CELLS
         };
@@ -4002,6 +5469,44 @@ impl PetBrain {
         // during the very moment the gallop is meant to read as momentum.
         // Arming only moves the AIM; the guard below stands down until the
         // paws get there, and the stumble is the same beat it always was.
+        //
+        // ── IT IS RARE, AND HERE IS THE MEASUREMENT (2026-08-27) ─────────
+        //
+        // The gate wants a step that CROSSES the station, and this follower
+        // is built never to make one: `want` is `gap · gain`, so the desired
+        // speed collapses as the gap closes, and the overshoot guard below
+        // clamps any step that would cross anyway. Over 368 506 frames of
+        // five realistic session shapes and 808 arrivals the brake armed
+        // ZERO times, and `pet_skid` — an authored pose behind a fully built
+        // beat: the arming, the run-out, two dust puffs, the stumble, the
+        // lean envelope — was never once on glass.
+        //
+        // The obvious repair was to admit an ARRIVAL AT SPEED instead of a
+        // crossing — "the paws got there this frame and the legs were still
+        // going". It was built, measured, and REFUSED, because it is worse
+        // than the disease. Those frames do exist, and every one of them is
+        // a cat TRACKING a caret that is still moving away: the gap is
+        // momentarily inside one step's travel while the speed has not yet
+        // decayed through [`SPEED_TAU`], and `leg_dist` is long precisely
+        // because the leg has not ended. Measured on a fast typing burst,
+        // the candidate armed at [`MAX_SPEED`] three times before the user
+        // stopped typing — so it would put a two-cell overshoot and a trot
+        // home in the MIDDLE of a sentence, which is the tic law's exact
+        // prohibition. Once the caret comes to rest, where a run-out is the
+        // only thing it could read as, the follower gets there at 5.2 c/s
+        // at most (mean 3.5) — under [`RUN_SPEED`], never mind twice it.
+        // Both halves are pinned by
+        // [`the_drift_brakes_gate_is_rare_by_construction`].
+        //
+        // So the beat is RARE BY CONSTRUCTION and the honest thing is to say
+        // so rather than to widen the gate until it fires. Also considered
+        // and refused, with the reason: arming EARLY, while the cat is still
+        // fast and still short of its station, would make the run-out a
+        // decision rather than a consequence — and because the aim moves two
+        // cells FURTHER away, `want = gap · gain` would then ACCELERATE the
+        // cat into it. A lunge is not a skid. The change that would earn
+        // this beat is a follower that carries momentum, which is a change
+        // to every arrival in the product and not this wave's.
         if !self.braking
             && (target - self.col).signum() != gap.signum()
             && self.pursuit_t.is_none()
@@ -4019,16 +5524,25 @@ impl PetBrain {
             );
             self.speed *= 0.15;
             self.stumble_t = STUMBLE_DUR;
+            self.skid_puff = false;
             self.spawn_dust(width);
         }
         // The run-out is spent the moment the paws reach it: the aim comes
         // home and the cat trots back. `braking` outlives the run-out (it is
         // cleared at arrival) so the trot cannot arm a brake of its own and
         // set the follower wobbling.
-        if let Some(over) = self.brake_over
-            && (over - self.col).abs() <= ARRIVED
-        {
-            self.brake_over = None;
+        if let Some(over) = self.brake_over {
+            // Halfway down the run-out the braced paws throw a second puff —
+            // the slide's own dust, as against the one the arming threw at
+            // the moment of the mistake. Latched, so a slide that dawdles at
+            // the halfway mark smokes exactly once.
+            if !self.skid_puff && (over - self.col).abs() <= 0.5 * BRAKE_OVERSHOOT {
+                self.skid_puff = true;
+                self.spawn_dust(width);
+            }
+            if (over - self.col).abs() <= ARRIVED {
+                self.brake_over = None;
+            }
         }
 
         // Overshoot guard: a follower must never oscillate around its aim, so
@@ -4309,7 +5823,7 @@ impl PetBrain {
                 Some((px, _)) if self.pointer_heat > 0.0 => px,
                 _ => f32::from(cc),
             };
-            self.settle_gaze(gaze_col, width, dt);
+            self.settle_gaze(gaze_col, f32::from(cr), width, dt);
             // Gauntlet F9: the face-on sit (the hunt-and-peck stare) parks
             // its muzzle CLEAR of the caret cell — one small deterministic
             // scoot at settle-turn time, only when the caret sits to the
@@ -4358,6 +5872,16 @@ impl PetBrain {
                 self.stumble_t = STUMBLE_DUR;
                 self.spawn_dust(width);
             }
+            // THE AMBLE (variety wave): under [`LAT_SPEED`] the walk is the
+            // LATERAL walk — one leg at a time instead of the trot's
+            // diagonal pairs. Hysteretic on the same idiom as the gait
+            // choice above and for the same reason: a follower easing
+            // through the threshold must not flicker between two cycles.
+            self.lateral = if self.lateral {
+                self.speed.abs() < LAT_SPEED + LAT_HYST
+            } else {
+                self.speed.abs() < LAT_SPEED
+            };
             self.set_action_keep(if fast {
                 PetAction::Run
             } else {
@@ -4418,6 +5942,37 @@ impl PetBrain {
         if reduced {
             return;
         }
+        // THE STREAM WATCH (see [`STREAM_RUN`]) holds the whole reaction
+        // ladder shut: no impulse, no fright, no frolic, no travel latch,
+        // the facing untouched — a program printing is not addressed to the
+        // cat. Only the wake gets through: a sleeper still stirs.
+        if self.stream {
+            if self.action == PetAction::Sleep {
+                self.set_action(PetAction::Waking);
+            }
+            return;
+        }
+        // A LINE CHANGE — Enter, a multi-row prompt, a scrolled reprint, an
+        // arrow up or down: at least a row, whichever way the column went —
+        // is the world moving the caret, not a jump the pet chose. Whatever
+        // its size it crosses QUIETLY: the big door stands aside and the
+        // row-hop door tiers it by span.
+        //
+        // Latched before the wake return, so an Enter that wakes a sleeper
+        // from far down the line cannot open the show after the stretch.
+        //
+        // A ROW CHANGE IS A ROW CHANGE, whichever way the caret went. The
+        // rule could have read `dc <= 0.0`, on the argument that a
+        // down-and-RIGHT move is a click and a click is chosen — but a
+        // printed line has the same delta, so every new line that ended
+        // further right than it started (a command whose output stops
+        // mid-screen, a log's first line, a right-aligned prompt) would play
+        // the whole chosen show: the notice, the butt-wiggle, the dust. The
+        // show keeps every crossing the pet really did choose — a same-row
+        // word jump, a paste, a standing gap — and gives up the one shape it
+        // could not tell from a program printing.
+        let line_change = dr.abs() >= 1.0;
+        self.quiet_leap |= line_change;
         // v̂'s impulse half (the decay lives in `tick`): this move's columns,
         // spread over the EMA window.
         self.vhat = (self.vhat + dc / VEL_TAU).clamp(-VEL_MAX, VEL_MAX);
@@ -4441,6 +5996,24 @@ impl PetBrain {
 
         let woke = self.action == PetAction::Sleep;
         if woke {
+            // THE SLEEPER'S DROP: a line opened EXACTLY one row below a
+            // sleeping cat is the floor going out from under it — the
+            // ground line it was asleep on is now a line of text, and the
+            // next one down is where it belongs. That reads as a fall, not
+            // as a stretch and a hop: the cat spends its wake in the air.
+            // One row only — a three-line prompt, an arrow up, a scrolled
+            // reprint two rows down are all ordinary wakes, because a cat
+            // does not fall past a floor it could have landed on. Reduced
+            // motion returned long above, so the latch is unreachable there.
+            self.pending_drop = dr == 1.0;
+            // The wake returns ABOVE the jump latch, so a drop has to latch
+            // what the sensor would have: the caret that opened the line is
+            // a whole column jump away, and the cat's trip home from where
+            // it fell is one quiet flight (the latched leap below), never a
+            // gallop across the line it just landed on.
+            if self.pending_drop && dc.abs() >= POUNCE_JUMP {
+                self.pending_pounce = true;
+            }
             self.set_action(PetAction::Waking);
             return;
         }
@@ -4454,6 +6027,23 @@ impl PetBrain {
         // `facing_left = true` turned it away from the very deletion that
         // scared it.
         if dr == 0.0 && dc < 0.0 {
+            if dc <= -SNAP_COLS {
+                // THE SNAP ([`SNAP_COLS`]): a jump home, not a thing coming
+                // at the pet — `Home`, `Ctrl-U`, a submit clearing its line,
+                // a last-row Enter that reprints a prompt. Face the caret
+                // like any retreat, forget the held-delete run (this was ONE
+                // move, not a key held down), latch the jump and make it a
+                // quiet one — never the show. The everyday `-1..-3` flinch
+                // and the `-4..-13` bottle below are untouched: a deletion
+                // walks, it does not snap.
+                self.facing_left = caret_col < self.col;
+                self.retreat_run = 0;
+                self.retreat_gap = 0.0;
+                self.pending_pounce = true;
+                self.quiet_leap = true;
+                self.clear_play_intents();
+                return;
+            }
             self.retreat_run = if self.retreat_gap <= STARTLE_RUN_WINDOW {
                 self.retreat_run.saturating_add(1)
             } else {
@@ -4517,36 +6107,55 @@ impl PetBrain {
         // line — the exact opposite of noticing something.
         if dc.abs() >= POUNCE_JUMP {
             self.pending_pounce = true;
-            // The caret is work, the pointer is play: a travel latch CLEARS
-            // every pending play intent (wave 2) — the un-launched play
-            // crouch re-aims at the station, and a play flight already in
-            // the air lands into work instead of the flourish. The wave-3
-            // games end the same way: chase dropped mid-stride (a short
-            // cooldown so typing truly ends it), stakeout stood down, the
-            // far look and the owed groom forgotten — work first.
-            self.pending_pointer_pounce = None;
-            self.play_to = None;
-            self.play_land = None;
-            self.pursuit_t = None;
-            self.pursuit_cool = self.pursuit_cool.max(1.0);
-            self.stakeout = false;
-            self.pending_look = None;
-            self.look_at = None;
-            self.groom_owed = false;
-            self.hide_to = None;
-            self.hiding = false;
+            self.clear_play_intents();
             // The SCREEN-CROSSING latch, two of its three doors: (a) one move
             // covering max(BIG_JUMP_COLS, BIG_JUMP_COLS_FRAC·cols) is a jump
             // across the screen whatever the resulting gap; (c) a settled cat
             // carrying JOY_CONTENT answers even a word jump with the show.
-            if dc.abs() >= BIG_JUMP_COLS.max(BIG_JUMP_COLS_FRAC * f32::from(cols))
-                || (self.action.settled() && self.content >= JOY_CONTENT)
+            // Neither opens on a LINE CHANGE: an Enter from the end of a
+            // long line is the size of a screen crossing and is still an
+            // Enter — the quiet leap above owns it, joy or no joy.
+            //
+            // NOT the same rule as the big door's `if self.quiet_leap {
+            // pending_big_jump = false }`, though they agree on most moves.
+            // The door is only reached on a tick no earlier hold returned
+            // from, and the hold that gathers a row hop LAUNCHES — it
+            // spends the quiet leap in [`Self::leave_ground`] and returns —
+            // so an Enter arriving during a gather never meets the door's
+            // clause at all, and would come down from that flight with the
+            // latch standing and the leap spent. Refusing the latch here is
+            // what keeps that Enter quiet; the door's clause is what
+            // cancels a show already latched when a seam happens before it
+            // flies. Pinned by
+            // `an_enter_during_a_gather_never_latches_the_show`.
+            if !line_change
+                && (dc.abs() >= BIG_JUMP_COLS.max(BIG_JUMP_COLS_FRAC * f32::from(cols))
+                    || (self.action.settled() && self.content >= JOY_CONTENT))
             {
                 self.pending_big_jump = true;
             }
-            if self.action.settled() && self.action != PetAction::Perk {
+            // A cat AT REST gets the double-take first (a hop-tier Enter
+            // reads as noticing); a cat that stopped between two keystrokes
+            // is already looking and crosses at once.
+            if self.at_rest() && self.action != PetAction::Perk {
                 self.set_action(PetAction::Perk);
             }
+        }
+    }
+
+    /// The stopping or landing cat's stride idles toward its nearest
+    /// foot-down frame — EASED (`1 − exp(−dt/STRIDE_EASE)`), never snapped,
+    /// because a snap is up to half a stride of foot travel for zero cells
+    /// of ground — and, inside [`STRIDE_PLANT`], simply arrives. The ease
+    /// only ever approaches its target, and a phase a hair BELOW a whole
+    /// cycle is that cycle's LAST frame: from half a cycle out a landing
+    /// recovery stepped off on `PetWalk3`, mid-swing.
+    fn plant_stride(&mut self, dt: f32) {
+        let target = self.stride.round();
+        if (target - self.stride).abs() < STRIDE_PLANT {
+            self.stride = target;
+        } else {
+            self.stride += (target - self.stride) * (1.0 - (-dt / STRIDE_EASE).exp());
         }
     }
 
@@ -4555,23 +6164,83 @@ impl PetBrain {
         self.speed = 0.0;
         // The stride idles toward a foot-down frame so a stopping cat plants its
         // feet instead of freezing mid-swing.
-        let target = self.stride.round();
-        self.stride += (target - self.stride) * (1.0 - (-dt / 0.09).exp());
+        self.plant_stride(dt);
+        // IDLE-TO-ZERO for the quiet leap. [`Self::leave_ground`] spends it
+        // whenever a crossing actually happens, which is every crossing big
+        // enough to open a door — but the seam folds latch it for moves too
+        // small to open one ([`Self::caret_delta`]'s third arm fires from
+        // [`STARTLE_COLS`], four columns, while [`POUNCE_JUMP`] is six), and
+        // a latch nothing consumes has no timer and no other owner. Left
+        // standing it shuts the big door for the rest of the session, so an
+        // `ls -l` at the bottom row silently ate the next chosen jump's
+        // notice, butt-wiggle and dust minutes later. The crossing a quiet
+        // leap describes is over when the cat is standing still on the far
+        // side of it.
+        self.quiet_leap = false;
+        // Same idiom, same reason: a cat that settled where it fell has
+        // spent the fall's beat by standing still on the far side of it.
+        self.drop_stare = false;
+
+        // THE DEAL: one hand per arrival — minted on the tick an unsettled
+        // pose (a walk, a landing, a wake) becomes a settled one, and held
+        // for the whole settle (Stand → Sit → Groom → Loaf hand nothing new
+        // out). A pure function of the serial and the mote serial, so the
+        // same typing deals the same idle.
+        if !self.action.settled() {
+            self.settle_serial = self.settle_serial.wrapping_add(1);
+            self.settle_seed = self.settle_serial.wrapping_add(self.mote_serial);
+        }
 
         let next = if self.quiet >= SLEEP_AFTER {
             PetAction::Sleep
         } else if self.quiet >= SIT_AFTER {
             let since_sit = self.quiet - SIT_AFTER;
-            // One wash per groom cycle, deterministically placed.
-            let cycle = GROOM_AFTER + GROOM_DUR;
-            if since_sit >= GROOM_AFTER && (since_sit % cycle) >= GROOM_AFTER {
+            // One wash per groom cycle, deterministically placed — the
+            // cycle's onset dealt per settle, and one hand in four skips
+            // the SECOND wash (the silence is the variety).
+            let groom_after = self.groom_after();
+            let cycle = groom_after + GROOM_DUR;
+            let in_wash = since_sit >= groom_after && (since_sit % cycle) >= groom_after;
+            let second_wash = since_sit >= cycle && since_sit < 2.0 * cycle;
+            if in_wash && !(second_wash && self.groom_skip()) {
                 PetAction::Groom
-            } else if self.content >= PURR_GATE {
-                PetAction::Purr
-            } else if self.quiet >= LOAF_AFTER {
-                // The LONG dwell: the sit melts into the loaf, and sleep
-                // still follows it on the same quiet ladder.
-                PetAction::Loaf
+            } else if self.quiet >= self.loaf_after() {
+                // The LONG dwell: the sit melts into the loaf — or into the
+                // purr, when the cat earned one — and sleep still follows on
+                // the same quiet ladder.
+                //
+                // THE SEAT COMES FIRST. The purr used to outrank the whole
+                // seat: [`PURR_GATE`] is 13 cells of travel at
+                // [`CONTENT_PER_CELL`] — one pounce, or thirteen keystrokes
+                // of following — so a working cat purred from [`SIT_AFTER`]
+                // straight through to the loaf and the sit arm never ran at
+                // all. Every beat the dealt seat is FOR was shelf art for
+                // anyone who types. Contentment is a long dwell's reward
+                // now, not the seat's landlord: the cat spends its
+                // [`SIT_AFTER`] of sit, deals its beats, and purrs where it
+                // would otherwise have loafed.
+                //
+                // …AND THE DWELL IS DEALT, for the same reason the seat's
+                // beats are. `PetAction::Purr` is ONE static frame with a
+                // swell on it and no beats of its own, and it measured 14.0
+                // % of every frame in a 368 506-frame sample — while
+                // `pet_loaf_ear`, whose trigger (a background line) fires
+                // in the middle of every think-pause, measured ZERO onsets,
+                // because the twitch always landed on a purring cat and the
+                // purr has no ear frame. One long dwell in three loafs even
+                // for a working cat, which puts the loaf's own vocabulary —
+                // the thump, the drowsy peek, the ear, the roll — back
+                // within reach of someone who types. The purr the other two
+                // hands earn is unchanged, and the TELL ([`Self::purring`])
+                // is on every one of them from the seat onward, so a
+                // loafing hand is not a cat that stopped being happy.
+                let owed = CONTENT_DECAY
+                    * (self.quiet - SIT_AFTER).clamp(0.0, self.loaf_after() - SIT_AFTER);
+                if self.content + owed >= PURR_GATE && !self.settle_seed.is_multiple_of(3) {
+                    PetAction::Purr
+                } else {
+                    PetAction::Loaf
+                }
             } else {
                 PetAction::Sit
             }
@@ -4582,6 +6251,333 @@ impl PetBrain {
             PetAction::Stand
         };
         self.set_action_keep(next);
+    }
+
+    /// THE CAT IS PURRING — the TELL, which is not the same fact as the
+    /// pose. A purr is audible long before a cat rearranges itself around
+    /// it, and [`PURR_GATE`] is met by thirteen keystrokes of following, so
+    /// making the seat wait for the long dwell to be told it is happy threw
+    /// away the one thing upstream's ladder had right. The POSE still waits
+    /// (see [`Self::enter_settled`]) because the seat's dealt beats need
+    /// their window and `PetPurr` has none of them.
+    ///
+    /// The DWELL is in too, both halves of it. One long dwell in three is
+    /// dealt the loaf rather than the purr (`enter_settled`), and a cat that
+    /// lies down has not stopped being happy — without this the tell would
+    /// switch off at the melt on a third of settles, which is the seam the
+    /// split exists to remove. The wash is out (a cat mid-wash is doing
+    /// something else with its body) and so is SLEEP, which must stay
+    /// byte-stable past the breath window or idle-to-zero fails.
+    ///
+    /// Note the asymmetry, and it is deliberate: a live `Purr` is purring
+    /// whatever the ledger says now — `enter_settled` admits it on
+    /// `content + owed`, so the contentment can decay under a purr already
+    /// in progress and the sound does not stop mid-breath.
+    fn purring(&self) -> bool {
+        self.action == PetAction::Purr
+            || (matches!(self.action, PetAction::Sit | PetAction::Loaf)
+                && self.content >= PURR_GATE)
+    }
+
+    /// The dealt loaf onset: [`LOAF_AFTER`] plus 0.8 s per `seed % 3` —
+    /// 2.8 / 3.6 / 4.4 s of quiet, every hand under the long-dwell bar.
+    fn loaf_after(&self) -> f32 {
+        LOAF_AFTER + 0.8 * f32::from(self.settle_seed % 3)
+    }
+
+    /// The dealt groom onset inside the sit: [`GROOM_AFTER`] minus 0.45 s
+    /// per `(seed / 3) % 3` — 6.5 / 6.05 / 5.6 s, every hand's wash window
+    /// `[g, g + GROOM_DUR)` still covering the seven-second sample.
+    fn groom_after(&self) -> f32 {
+        GROOM_AFTER - 0.45 * f32::from((self.settle_seed / 3) % 3)
+    }
+
+    /// One hand in four skips the second wash of a settle.
+    fn groom_skip(&self) -> bool {
+        self.settle_seed % 4 == 3
+    }
+
+    /// Test seam: deal a chosen hand to the CURRENT settle (the next
+    /// arrival deals its own again).
+    #[cfg(test)]
+    fn force_seed(&mut self, settle: u8) {
+        self.settle_seed = settle;
+    }
+
+    /// The beat index and the phase inside it, on the SIT's own clock, for a
+    /// beat of `period` seconds whose window opens `at` seconds into each
+    /// beat. `None` before the sit, and before the window opens.
+    ///
+    /// Every dealt idle beat shares this: an index to deal on and a phase to
+    /// shape with, both pure functions of `quiet` and nothing else.
+    fn sit_beat(&self, period: f32, at: f32) -> Option<(i64, f32)> {
+        self.sit_beat_at(self.quiet - SIT_AFTER, period, at)
+    }
+
+    /// The same, on an arbitrary `since` — so a beat can ask what another
+    /// beat is doing at an instant that is not now. Every dealt seat beat
+    /// is a pure function of the sit's clock, which is exactly what makes
+    /// the question answerable (the ear twitch is the one exception: it is
+    /// event-driven, and only its END is predictable, from `twitch_t`).
+    fn sit_beat_at(&self, since: f32, period: f32, at: f32) -> Option<(i64, f32)> {
+        if since < 0.0 {
+            return None;
+        }
+        let beat = (since / period).floor();
+        let phase = since - beat * period - at;
+        (phase >= 0.0).then_some((beat as i64, phase))
+    }
+
+    /// The hand this beat was dealt, `0..n`.
+    fn beat_deal(&self, beat: i64, n: i64) -> i64 {
+        (beat + i64::from(self.settle_seed)).rem_euclid(n)
+    }
+
+    /// THE SEAT'S TAIL, DEALT. Four hands per beat, and the beat index is
+    /// dealt too, so consecutive beats (and consecutive settles) are never
+    /// the same shape:
+    ///
+    /// * 0 — one tip-up flick,
+    /// * 1 — a double: two taps with a beat of stillness between them,
+    /// * 2 — THE SWING: the tail goes away behind the seat and comes back,
+    /// * 3 — nothing at all. The silence is the treat: a metronome that
+    ///   never misses is a tic, and the tic law is what this wave is for.
+    ///
+    /// The swing is the reason the away-side has TWO frames. A tail cannot
+    /// change sides by cutting: every side change here lands between two
+    /// TIP-UP frames (`PetSitFlick` ↔ `PetSitTailBack`), so the tail is up
+    /// and moving on both sides of the swap and the eye reads one gesture.
+    /// The whole excursion is contained in its own beat for the same
+    /// reason — a side that outlived its beat could be cut short by the
+    /// loaf, the wash or a new hand, and that cut IS the teleport.
+    ///
+    /// FACE-ON IT RIDES THE GLANCE. The tail's frames are SIDE-ON art, and
+    /// the face-on seat is the ordinary settled pose (the station is
+    /// `caret + 1`, well inside [`SIT_FRONT_GAP`]) — measured over a
+    /// 368 506-frame sample of five session shapes, `sit_front` is true on
+    /// 88.8 % of all settled frames and every one of these poses registered
+    /// ZERO onsets in the four ordinary sessions while the wall-side control
+    /// fired them 240 times in seven minutes. The gate was not the only
+    /// problem: the two beats were PHASED APART on purpose (`TAIL_AT` =
+    /// [`SIT_FOLD`] = 0.22 against `GLANCE_AT` = 0.8) so their windows are
+    /// disjoint for the whole sit, which means opening the door alone would
+    /// still never have let a tail through it. So face-on the tail deals off
+    /// the GLANCE's beat and phase, and a hand may only start if the look
+    /// will outlast it — the identical rule [`Self::sit_blink_beat`]'s
+    /// riders already use, and the reason [`LOOK_DUR_LONG`] exists.
+    fn sit_tail(&self) -> Option<PetGlyphId> {
+        let (period, at) = self.tail_clock();
+        let (beat, p) = if self.sit_front {
+            let (beat, p) = self.sit_beat(period, at)?;
+            // The one fit rule: a hand the look cannot contain never starts,
+            // so no excursion is ever cut by eye contact coming back — and
+            // the cut IS the teleport this wave exists to remove.
+            if !self.side_on_holds(p, Self::tail_hand_len(self.beat_deal(beat, 4))) {
+                return None;
+            }
+            (beat, p)
+        } else {
+            self.sit_beat(period, at)?
+        };
+        match self.beat_deal(beat, 4) {
+            0 => (p < TAIL_FLICK).then_some(PetGlyphId::PetSitFlick),
+            1 => (p < TAIL_TAP || (TAIL_TAP + TAIL_GAP..2.0 * TAIL_TAP + TAIL_GAP).contains(&p))
+                .then_some(PetGlyphId::PetSitFlick),
+            2 => match (p / TAIL_SWING).floor() as i64 {
+                0 | 6 => Some(PetGlyphId::PetSitFlick),
+                1 | 2 | 5 => Some(PetGlyphId::PetSitTailBack),
+                3 | 4 => Some(PetGlyphId::PetSitTailLow),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The authored length of the tail's dealt `hand` — the WHOLE excursion,
+    /// its internal silences included — so a door can ask whether a gesture
+    /// fits before letting it start. Hand 3 is the silence and has none.
+    fn tail_hand_len(hand: i64) -> f32 {
+        match hand {
+            0 => TAIL_FLICK,
+            1 => 2.0 * TAIL_TAP + TAIL_GAP,
+            2 => 7.0 * TAIL_SWING,
+            _ => 0.0,
+        }
+    }
+
+    /// The tail's own beat: its period and the phase its window opens at.
+    /// Face-on the tail rides the GLANCE's clock (see [`Self::sit_tail`]),
+    /// so that is the beat it keeps there.
+    fn tail_clock(&self) -> (f32, f32) {
+        if self.sit_front {
+            (self.glance_period(), GLANCE_AT)
+        } else {
+            (
+                TAIL_PERIOD + TAIL_PERIOD_STEP * f32::from(self.settle_seed % 3),
+                TAIL_AT,
+            )
+        }
+    }
+
+    /// THE ROOM A BEAT NEEDS BESIDE THE TAIL, for a beat `elapsed` seconds
+    /// into a gesture `len` seconds long. The seat's one rider says every
+    /// beat above the tail stands down while the tail is off its rest — an
+    /// ear or a yawn cutting into the swing would put the tail on the other
+    /// side of the cat between two frames. A beat that is CUT by the
+    /// excursion, or that pops in for the excursion's leftovers, is the
+    /// same flash from the other end, and both were measured as one-tick
+    /// ear frames under the frame-rate law's floor.
+    ///
+    /// So the question is asked about the gesture's START (`p - elapsed`)
+    /// and its END (`p + len - elapsed`), never about now — and because `p`
+    /// and `elapsed` advance together, the answer is a constant over the
+    /// gesture's whole life. Admitted on the first frame, admitted on the
+    /// last; refused on the first, refused throughout.
+    fn tail_room(&self, elapsed: f32, len: f32) -> bool {
+        let (period, at) = self.tail_clock();
+        let Some((beat, p)) = self.sit_beat(period, at) else {
+            return true;
+        };
+        p - elapsed >= Self::tail_hand_len(self.beat_deal(beat, 4)) && p + len - elapsed <= period
+    }
+
+    /// The dealt glance's period — 2.6 / 3.3 / 4.0 s, one hand each.
+    fn glance_period(&self) -> f32 {
+        GLANCE_PERIOD + GLANCE_PERIOD_STEP * f32::from(self.settle_seed % 3)
+    }
+
+    /// The dealt look's LENGTH: [`LOOK_DUR`], or [`LOOK_DUR_LONG`] on the
+    /// seat that can hold it.
+    ///
+    /// The condition is the arithmetic, not a hand: the long look only
+    /// belongs to a sit with room for the look, and for a legible return of
+    /// eye contact after it. That is `GLANCE_AT + LOOK_DUR_LONG +
+    /// LOOK_RETURN_MIN` = 2.05 s against `loaf_after() - SIT_AFTER`, which
+    /// is 1.4 / 2.2 / 3.0 — so the shortest seat keeps the short look, and
+    /// it is also the one hand in three that never glances at all (the
+    /// deal and the period share `seed % 3`, so `beat_deal(0, 3)` is zero
+    /// exactly there).
+    ///
+    /// On an EVEN hand of the 2.2 s seat the return is spent by the yawn's
+    /// own look opening on the frame the glance closes. That is a sequence
+    /// — look away, yawn, melt — and not a cut: no gesture is shortened,
+    /// and the cat's next pose is the yawn it was always going to play.
+    fn look_dur(&self) -> f32 {
+        if self.loaf_after() - SIT_AFTER >= GLANCE_AT + LOOK_DUR_LONG + LOOK_RETURN_MIN {
+            LOOK_DUR_LONG
+        } else {
+            LOOK_DUR
+        }
+    }
+
+    /// THE SEAT'S BLINK, DEALT: one blink on two hands in three, a double on
+    /// the third. Lids are the smallest beat the roster has (the whole
+    /// change is the eye region), so it is held well past the frame-rate
+    /// law's two-tick floor and never lands inside the fold.
+    ///
+    /// Answers `(phase, length)` of the WHOLE beat — the double's gap
+    /// included — while the lids are down, so a face-on seat riding the
+    /// glance can tell whether the glance will outlast the blink it is
+    /// about to start (see [`Self::sit_glance_left`]).
+    fn sit_blink_beat(&self) -> Option<(f32, f32)> {
+        self.sit_blink_beat_at(self.quiet - SIT_AFTER)
+    }
+
+    /// The blink beat at an arbitrary `since` — see [`Self::sit_beat_at`].
+    /// The seat's LOWEST beat is the one every other beat can strand: a
+    /// beat above it that ENDS inside this window leaves the lids showing
+    /// for the remainder alone, which is the flash the frame-rate law
+    /// forbids (measured: a one-tick `PetSitBlink` behind an ear twitch).
+    fn sit_blink_beat_at(&self, since: f32) -> Option<(f32, f32)> {
+        let period = BLINK_PERIOD + BLINK_PERIOD_STEP * f32::from((self.settle_seed / 2) % 3);
+        let (beat, p) = self.sit_beat_at(since, period, BLINK_AT)?;
+        if self.beat_deal(beat, 3) == 2 {
+            let len = 2.0 * BLINK_DUR + BLINK_GAP;
+            (p < BLINK_DUR || (BLINK_DUR + BLINK_GAP..len).contains(&p)).then_some((p, len))
+        } else {
+            (p < BLINK_DUR).then_some((p, BLINK_DUR))
+        }
+    }
+
+    /// THE YAWN, DEAL-GATED: half the hands yawn the seat into its loaf —
+    /// the last [`YAWN_DUR`] of the sit, handing straight into the melt.
+    fn sit_yawn(&self) -> bool {
+        self.settle_seed.is_multiple_of(2)
+            && self.quiet >= self.loaf_after() - YAWN_DUR
+            && self.quiet < self.loaf_after()
+    }
+
+    /// THE GLANCE: eye contact is not a stare. On a dealt beat the face-on
+    /// sit looks away for [`LOOK_DUR`] and comes back — the plain sit IS
+    /// the looking-away frame, so the beat costs no art and, crucially, no
+    /// body turn: the glance never writes `facing_left` (the 2026-08-12
+    /// ruling — the body never flips at rest, a glance is the answer).
+    /// While pointer attention is live the pet is already looking at the
+    /// toy; nothing is owed a second audience.
+    /// Seconds of the look still to run, `None` when the seat is not
+    /// glancing. The face-on seat's beats RIDE this window — the cat is
+    /// side-on for it, which is the ground they are drawn on — so a beat
+    /// may only play here if the glance outlasts it; cut at the glance's
+    /// edge, a blink is a two-frame flash and the frame-rate law says no.
+    fn sit_glance_left(&self) -> Option<f32> {
+        if self.pointer_heat > 0.0 {
+            return None;
+        }
+        let (beat, p) = self.sit_beat(self.glance_period(), GLANCE_AT)?;
+        let len = self.look_dur();
+        (p < len && self.beat_deal(beat, 3) != 0).then_some(len - p)
+    }
+
+    /// Seconds of ANY look-away still to run — the seat's DOOR, as against
+    /// [`Self::sit_glance_left`]'s dealt beat alone.
+    ///
+    /// A cat looks away to YAWN, and the yawn hands straight into the melt,
+    /// long after the glance's window has closed — so before this the
+    /// biggest face beat in the roster was unreachable in the seat 88.8 % of
+    /// settled frames are spent in. The yawn's own look is exactly the yawn
+    /// ([`YAWN_DUR`] at most, ending on the loaf), so it cannot outlive the
+    /// gesture that opened it, and the two windows never overlap: the
+    /// glance is over by `GLANCE_AT + look_dur()` and the yawn opens at
+    /// `loaf_after() - YAWN_DUR`, which [`Self::look_dur`]'s fit keeps
+    /// strictly later.
+    fn sit_look_left(&self) -> Option<f32> {
+        if self.pointer_heat > 0.0 {
+            return None;
+        }
+        if self.sit_yawn() {
+            return Some(self.loaf_after() - self.quiet);
+        }
+        self.sit_glance_left()
+    }
+
+    /// The seat is looking away.
+    fn sit_glance(&self) -> bool {
+        self.sit_look_left().is_some()
+    }
+
+    /// A SIDE-ON BEAT MAY PLAY FACE-ON only inside a look that will OUTLAST
+    /// it — `phase` seconds in, `len` seconds long, so `left + phase >= len`
+    /// is "the whole look this beat began in covers the whole beat". Side-on
+    /// is free: the beats are drawn on the side-on seat and the cat is
+    /// already wearing it.
+    ///
+    /// This is the rule the blink's riders already used, written once, and
+    /// it cannot flip mid-beat: the beat's remaining time and the look's
+    /// both count down at one second per second, so their difference is a
+    /// constant over the beat's whole life.
+    ///
+    /// It says nothing about the beat having STARTED inside the look, and
+    /// it does not need to. The two callers are covered by facts rather
+    /// than by a clause: the blink's window opens at [`BLINK_AT`], strictly
+    /// after [`GLANCE_AT`] (const-asserted below), so a face-on blink can
+    /// only ever begin with the look already open; and the ear's other
+    /// guard, [`Self::tail_room`], asks `p - elapsed >= tail_hand_len(..)`
+    /// with both terms non-negative, which is exactly "the twitch was armed
+    /// at or after the look opened". A clause for it here would be dead
+    /// code, and dead code in a precedence chain is how the chain stops
+    /// being readable.
+    fn side_on_holds(&self, phase: f32, len: f32) -> bool {
+        !self.sit_front || self.sit_look_left().is_some_and(|left| left + phase >= len)
     }
 
     /// THE SCALED COIL's length (rung 7) for a pounce winding up `span`
@@ -4645,14 +6641,127 @@ impl PetBrain {
         }
     }
 
-    /// Duration and arc for a flight covering `span` columns. The vertical
-    /// branch is clamped exactly like the horizontal one, and for a sharper
-    /// reason: its `span` is the HORIZONTAL distance, and the commonest
-    /// vertical move — a wrap or Enter from the end of a long line — has a
-    /// span of nearly the whole grid width. Unclamped, that is seconds of
-    /// flight on one flat arc, during which the flight block owns the
-    /// position and every caret move you make is ignored. A row change must
-    /// always read as one hop.
+    /// THE POSE SCHEDULE (rung 9, upstream's shape): seconds of rise and of
+    /// descent a flight `dur` seconds long deals, the hero frame between
+    /// them. Both approaches are authored in SECONDS ([`LEAP_RISE_T`],
+    /// [`LEAP_DESC_T`]) and scale by ONE shared factor when they would
+    /// leave the hero under [`MIN_HERO`]; under `3·MIN_HERO` the flight
+    /// cannot fit three legible beats and the caller falls back to two,
+    /// split at the apex.
+    fn pose_schedule(dur: f32) -> (f32, f32) {
+        let (rise, desc) = (LEAP_RISE_T, LEAP_DESC_T);
+        if rise + desc + MIN_HERO > dur {
+            let k = (dur - MIN_HERO) / (rise + desc);
+            (rise * k, desc * k)
+        } else {
+            (rise, desc)
+        }
+    }
+
+    /// THE ONE OWNER of the airborne frame, in fixed precedence:
+    ///
+    /// 1. THE RELEASE — `PetLaunch` on the `u = 0` frame of a coiled
+    ///    flight, the only Leap frame with no lift, and the second tick of
+    ///    the release the coil's last frame began. Never anywhere else: the
+    ///    art is planted, and a rear-up in mid-air reads as a hovering cat.
+    /// 2. THE TUCK — a short vertical step down ([`Flight::hop`]) wears
+    ///    `PetHop` through the middle of its arc, never the pounce's
+    ///    stretched hero: a hop and a pounce of the same DURATION are
+    ///    different gestures, and the duration schedule below cannot tell
+    ///    them apart.
+    /// 3. THE SCHEDULE — rise / hero / descend by [`Self::pose_schedule`],
+    ///    falling back to two poses split at the apex when the flight is
+    ///    too short for three legible beats.
+    /// 4. THE APEX, on a BIG bound only — the hero window splits at its
+    ///    midpoint and the top of the arc gets its own frame. See the
+    ///    measurement below.
+    ///
+    /// WHY A BOUND NEEDS A FOURTH BEAT AND A POUNCE DOES NOT. The hero
+    /// window is `dur − LEAP_RISE_T − LEAP_DESC_T`: 0.16 s at the pounce's
+    /// longest and 0.27–0.67 s on a bound. Through a bound's hero window
+    /// NOTHING moves — not the pose, and not the two envelopes either. The
+    /// hang ([`Self::flight_lift`]) holds within 10 % of the apex for
+    /// `u ∈ [0.268, 0.69]`, 42 % of the flight, and the asymmetric launch
+    /// stretch is exactly zero at `u = 0.5` with a slope of
+    /// `LAUNCH_STRETCH / 0.5` — 0.06 of scale spread over twenty-odd ticks,
+    /// sub-pixel per frame. That is up to forty ticks of one unchanging
+    /// bitmap at one unchanging height and one unchanging scale, on the
+    /// beat the owner's complaint named. Measured on glass before the fix:
+    /// `PetLeap` held a mean unbroken run of 15.4 / 19.0 / 29.4 ticks in a
+    /// typist / shell / editor session.
+    ///
+    /// The pounce is left alone deliberately: it is the commonest flight by
+    /// far, its hero is a fifth of a bound's, and a fourth beat there would
+    /// be a flicker rather than a gesture. The `4·MIN_HERO` guard is the
+    /// frame-rate law's, restated for the split — each half of the hero is
+    /// then at least `2·MIN_HERO` = 0.096 s, five ticks and change, so no
+    /// admitted split can put a beat under the two-tick floor.
+    fn flight_pose(f: &Flight) -> PetGlyphId {
+        // The schedule reads the flight's OWN clock, clamped to its own
+        // length exactly as the `u` the arc is drawn from is.
+        let t = f.t.clamp(0.0, f.dur);
+        if t <= 0.0 && f.coiled {
+            return PetGlyphId::PetLaunch;
+        }
+        // THE FALL: still asleep for the first frames — the cat has not
+        // caught up with the floor yet — then the wake stretch, spent in
+        // the air where the drop put it, then the descent onto its feet.
+        // Never the launch frame: nothing about this was a decision.
+        if f.drop {
+            return if t < DROP_SLEEP {
+                PetGlyphId::PetSleep1
+            } else if t < DROP_SLEEP + DROP_STRETCH {
+                PetGlyphId::PetStretch
+            } else {
+                PetGlyphId::PetLeapDescend
+            };
+        }
+        if f.hop {
+            return if t < 0.25 * f.dur {
+                PetGlyphId::PetLeapRise
+            } else if t < 0.65 * f.dur {
+                PetGlyphId::PetHop
+            } else {
+                PetGlyphId::PetLeapDescend
+            };
+        }
+        if f.dur < 3.0 * MIN_HERO {
+            return if t < 0.5 * f.dur {
+                PetGlyphId::PetLeapRise
+            } else {
+                PetGlyphId::PetLeapDescend
+            };
+        }
+        let (rise, desc) = Self::pose_schedule(f.dur);
+        if t < rise {
+            PetGlyphId::PetLeapRise
+        } else if t > f.dur - desc {
+            PetGlyphId::PetLeapDescend
+        } else if f.big && f.dur - rise - desc >= 4.0 * MIN_HERO && t >= 0.5 * (rise + f.dur - desc)
+        {
+            // The top of the bound. The split is at the hero window's own
+            // midpoint, not the flight's, so the climb keeps exactly the
+            // half of the hero it earned.
+            PetGlyphId::PetApex
+        } else {
+            PetGlyphId::PetLeap
+        }
+    }
+
+    /// Duration and arc for a hop or pounce covering `span` EQUIVALENT cells
+    /// ([`span_eq`]). The vertical branch is clamped exactly like the
+    /// horizontal one, and for a sharper reason: the commonest vertical move
+    /// — a wrap or Enter from the end of a long line — spans nearly the whole
+    /// grid width. Unclamped, that is seconds of flight on one flat arc,
+    /// during which the flight block owns the position and every caret move
+    /// you make is ignored. A row change must always read as one hop.
+    ///
+    /// The clamp is also why this shape carries NO speed backstop: a hop
+    /// stretched past [`FLIGHT_MAX`] is the glide the clamp exists to
+    /// forbid, so the launch-time law is kept by the SPAN instead — past
+    /// [`POUNCE_SPAN_MAX`] the door ([`Self::leave_ground`]) flies a bound,
+    /// and within it this curve is under [`HOP_SPEED_MAX`] by construction
+    /// (23.1 cells in 0.42 s).
     fn flight_shape(span: f32, vertical: bool) -> (f32, f32) {
         if vertical {
             (
@@ -4668,33 +6777,237 @@ impl PetBrain {
         }
     }
 
-    /// Begin a pounce/hop toward `(to_col, to_row)`.
+    /// HOW FAR THE STATION ITSELF WILL HAVE MOVED in `t` seconds — the one
+    /// prediction every flight's aim is allowed, taken under the SAME decay
+    /// the velocity estimate is built on ([`VEL_TAU`]) rather than under a
+    /// bet that the caret types forever.
     ///
-    /// FLIGHT AIM: the paws should come down where the station will BE, not
-    /// where it was when the crouch began — so under an open rhythm the
-    /// target is advanced by `v̂ · (flight + landing)`, wall-clamped like
-    /// every station. Without the rhythm (a lone Enter, a one-off jump) the
-    /// aim is the plain target, exactly as before.
-    fn begin_flight(&mut self, to_col: f32, to_row: f32, vertical: bool, cols: u16, width: f32) {
-        let (dur0, _) = Self::flight_shape((to_col - self.col).abs(), vertical);
-        let to_col = if self.rhythm_open() {
-            (to_col + self.vhat * (dur0 + LAND_DUR)).clamp(0.0, (f32::from(cols) - width).max(0.0))
+    /// The station is `caret + STATION_LEAD + lead(v̂)`, so its drift has
+    /// two terms and they pull opposite ways: the caret travels
+    /// `∫₀ᵗ v̂·e^{−s/τ} ds = v̂·τ·(1 − e^{−t/τ})`, and the station's own
+    /// keep-ahead ([`Self::lead`]) decays out from under it by
+    /// `lead·(1 − e^{−t/τ})`. Both share the factor, so the whole drift is
+    /// `(1 − e^{−t/τ}) · (v̂·τ − lead)` — still capped at
+    /// [`FLIGHT_LEAD_MAX`], which now binds only above ~34 cells/s.
+    ///
+    /// A CROSSING THE WORLD FORCED BETS THE DECAY, NOT ZERO — and this
+    /// paragraph replaces a rule the code no longer implements, so read it
+    /// before restoring one. The earlier design gated the whole lead on the
+    /// quiet-leap latch (`if !self.rhythm_open() || self.quiet_leap`), on
+    /// the argument that a seam, a line change or a snap is the world's
+    /// move and deserves no bet. The trouble is WHICH quiet crossing that
+    /// hits: a line change reverses the typing run by itself, so most never
+    /// reach the lead at all, but the MARGIN WRAP does — the seam folds to
+    /// one character FORWARD and the run sails on through it — so the
+    /// commonest quiet crossing in the product got the zero. That is not
+    /// neutral; it is a bet that a caret mid-word stops dead, and it lands
+    /// SHORT. MEASURED, by reinstating the latch clause above: a typed wrap
+    /// at 80 columns aimed 5.38 against a final station of 6.30 and walked
+    /// the rest, settling in 2.13 s instead of 1.62 s; the scrolled wrap
+    /// (S5) paid the same 0.51 s, and the 200-column wrap 0.52 s.
+    /// The decay is the honest answer to both worlds: with `v̂` collapsing
+    /// the moment the caret stops, it IS ~0 for a crossing nothing follows,
+    /// and it is a real lead for a caret that typed on through the seam.
+    /// The over-lead the latch was written against — paws at 13.4 for a
+    /// caret at 5 — was a `v̂·t` bet, and [`FLIGHT_LEAD_MAX`] still bounds it.
+    fn station_drift(&self, t: f32) -> f32 {
+        if !self.rhythm_open() {
+            return 0.0;
+        }
+        let k = 1.0 - (-t / VEL_TAU).exp();
+        (k * (self.vhat * VEL_TAU - self.lead())).clamp(-FLIGHT_LEAD_MAX, FLIGHT_LEAD_MAX)
+    }
+
+    /// Where a hop's paws should come down: the station advanced by the
+    /// drift it will have accumulated over `flight + landing` under an open
+    /// rhythm (the paws land where the station will BE, not where it was
+    /// when the crouch began), capped at [`FLIGHT_LEAD_MAX`] by
+    /// [`Self::station_drift`] and wall-clamped like every station; the
+    /// plain target without a rhythm (a lone Enter, a one-off jump).
+    fn hop_aim(&self, to_col: f32, to_row: f32, vertical: bool, cols: u16, width: f32) -> f32 {
+        if !self.rhythm_open() {
+            return to_col;
+        }
+        let (dur0, _) = Self::flight_shape(span_eq(to_col - self.col, to_row - self.row), vertical);
+        let lead = self.station_drift(dur0 + LAND_DUR);
+        (to_col + lead).clamp(0.0, (f32::from(cols) - width).max(0.0))
+    }
+
+    /// The tier a caret-driven flight to `(to_col, to_row)` would fly in —
+    /// judged on the PREDICTED aim, not the bare target: under a rhythm the
+    /// aim leads by up to [`FLIGHT_LEAD_MAX`], and a hop tiered on the naive
+    /// span would launch past the cap and be truncated into a landing short
+    /// of anywhere useful (measured: a 37.5-cell Enter flew a span-truncated
+    /// 23.1-cell hop at exactly [`HOP_SPEED_MAX`], landed 15 cells short,
+    /// re-crouched and pounced the rest — two airborne episodes for one
+    /// keystroke).
+    fn predicted_tier(
+        &self,
+        to_col: f32,
+        to_row: f32,
+        vertical: bool,
+        cols: u16,
+        width: f32,
+    ) -> Tier {
+        let aim = self.hop_aim(to_col, to_row, vertical, cols, width);
+        if span_eq(aim - self.col, to_row - self.row) <= POUNCE_SPAN_MAX {
+            Tier::Hop
         } else {
-            to_col
+            Tier::Bound
+        }
+    }
+
+    /// A cat AT REST: a settled pose that is not merely a stand caught
+    /// between two keystrokes ([`STAND_REST`]). The double-take — the jump's
+    /// Perk in [`Self::on_move`] and the notice before a bound — is for a
+    /// cat that was doing nothing; a cat that stopped a tenth of a second
+    /// ago beside the caret it was following is already looking.
+    fn at_rest(&self) -> bool {
+        self.action.settled() && !(self.action == PetAction::Stand && self.action_t < STAND_REST)
+    }
+
+    /// THE NOTICE RULE: a cat at rest looks up before a bound — from ANY
+    /// door, not only the chosen show's. True when the pet is at rest but
+    /// not already perked, stands on blank ground (F1), and the flight it is
+    /// about to make predicts as a bound.
+    ///
+    /// WHAT IT COSTS, since the number is worth having written down: the
+    /// beat is [`PERK_HOLD`], and it sits in front of the gather. A prompt
+    /// redraw that moves the caret 37.5 cells therefore spends 0.30
+    /// (notice) + 0.10 (coil) + 0.675 (the bound, at the pane's own quiet
+    /// pace) + [`BIG_LAND_DUR`] = 1.475 s before the paws can be still —
+    /// measured 1.52 s to the settled pose. The wave's earlier target for
+    /// that trip was 1.3 s, written before this rule existed, and no
+    /// arrangement of the current vocabulary reaches it with the notice in
+    /// front: the flight's own duration is the quiet pace's, and the pace
+    /// is a law. The beat is kept and the target is the thing that moved —
+    /// recorded here rather than quietly ignored, so whoever wants 1.3 s
+    /// back knows the only levers are this beat or the pace.
+    ///
+    /// AND THE BAR WAS READ OFF THE WRONG INSTANT. "Settled" is the settle
+    /// LADDER's pose, which is touchdown plus [`BIG_LAND_DUR`] of in-place
+    /// recovery in every scenario — 0.40 s during which the body travels
+    /// about half a cell (measured on S6: 3.800 → 3.095 across the whole
+    /// recovery, under a tenth of a cell a frame after the second one). The
+    /// complaint this wave exists for is about TRAVEL, so that is the
+    /// quantity the bar belongs on, and the probe now prints `home (travel
+    /// over)` beside the settled reading. Under that reading the typed
+    /// wrap's travel is over at +1.25 s against a 1.6 s bar and the
+    /// 200-column wrap's at +1.47 s; the prompt redraw's is +1.52 s, still
+    /// past 1.3, and the reason is this beat, stated honestly.
+    ///
+    /// THE SECOND CLAUSE COSTS NOTHING TO STATE AND IS THE REAL PROMISE:
+    /// one flight, and no gallop home. That is what a user would call
+    /// teleporting, it holds at both widths on every new-line scenario, and
+    /// `a_new_line_costs_one_flight_and_no_gallop` asserts it rather than
+    /// leaving it an observation in a probe nobody runs.
+    ///
+    /// WHAT WAS CONSIDERED AND REFUSED, with the price of each: dropping
+    /// the notice buys 0.30 s and reaches 1.22 s, and sells the anti-
+    /// teleport beat to hit a number — `the_notice_beat_is_only_paid_by_a_cat_at_rest`
+    /// is the guard against exactly that trade. Overlapping the notice with
+    /// the coil buys 0.10 s, lands at 1.42 s (still past 1.3) and risks a
+    /// pose swap under the frame-rate law's two-tick floor. Speeding the
+    /// pace is a law.
+    ///
+    /// AND WHERE IT IS NOT EARNED: the cat that just FELL. The sleeper's
+    /// drop already spends [`DROP_SIT`] = 0.5 s sitting where it landed and
+    /// looking at whoever moved the floor — that IS the double take, and it
+    /// is authored, held and paid for. Asking the same cat to look up again
+    /// before it may leave is the one place the beat is describing something
+    /// that already happened. Measured on the probe's S7 (Enter while
+    /// asleep, the slowest new-line reaction in the product): the trace was
+    /// `Leap@+0.02 Land@+0.20 Sit@+0.47 Perk@+0.98 Crouch@+1.28 Leap@+1.38
+    /// Land@+2.00 Sit@+2.40` — a fall, a half-second stare, and then a
+    /// SECOND look before the coil. `drop_stare` stands the rule down for
+    /// exactly that trip and costs nothing anywhere else: every other probe
+    /// scenario is unchanged to the frame, because none of them falls.
+    fn notices(&self, to_col: f32, to_row: f32, vertical: bool, cols: u16, width: f32) -> bool {
+        self.at_rest()
+            && self.action != PetAction::Perk
+            && !self.drop_stare
+            && !self.ink_overlaps(self.col, self.row, width)
+            && self.predicted_tier(to_col, to_row, vertical, cols, width) == Tier::Bound
+    }
+
+    /// THE ONE DOOR every caret-driven flight leaves through, tiered by
+    /// predicted span so the launch-time law holds by construction: up to
+    /// [`POUNCE_SPAN_MAX`] a hop or pounce ([`Self::flight_shape`],
+    /// 0.16..0.42 s, under [`HOP_SPEED_MAX`]); past it a bound
+    /// ([`Self::launch_big`], 0.45..0.85 s, under [`BIG_HOP_SPEED_MAX`]),
+    /// which a QUIET crossing splits only past [`QUIET_ONE_BOUND_SECS`] and the
+    /// chosen SHOW splits at [`TWO_BOUND_FRAC`] of the grid as ever. A
+    /// show is always a bound (the joy variant turns a word jump into it);
+    /// a play launch tiers on its bare span with no caret prediction.
+    ///
+    /// This replaces the old `begin_flight`, whose span CLAMP kept the law
+    /// by landing short — lawful, and a cat stranded mid-pane that then had
+    /// to crouch and pounce again. Tiering up instead spends the same span
+    /// in one flight a body could choose.
+    ///
+    /// The door consumes the quiet-leap latch, and — for every policy but
+    /// play — the wall latch: a flight lands on the caret's new side by
+    /// [`Self::station_now`], so a transit fired after it would cross a
+    /// caret the cat is already past.
+    fn leave_ground(
+        &mut self,
+        to_col: f32,
+        to_row: f32,
+        vertical: bool,
+        cols: u16,
+        width: f32,
+        policy: LeapPolicy,
+    ) {
+        // The quiet-leap latch is NOT read by the aim below — the aim's one
+        // prediction is [`Self::station_drift`], which is decay-gated rather
+        // than latch-gated (see its doc for the measurement that settled
+        // it). What the latch still rules is the SHOW: the big door stands
+        // down entirely for a crossing the world forced. It is spent at the
+        // end of this function, which is the moment that crossing actually
+        // happens.
+        if policy != LeapPolicy::Play {
+            self.pending_wall_transit = false;
+        }
+        let (aim, tier) = match policy {
+            LeapPolicy::Show => (to_col, Tier::Bound),
+            LeapPolicy::Play => {
+                let tier = if span_eq(to_col - self.col, to_row - self.row) <= POUNCE_SPAN_MAX {
+                    Tier::Hop
+                } else {
+                    Tier::Bound
+                };
+                (to_col, tier)
+            }
+            LeapPolicy::Quiet => (
+                self.hop_aim(to_col, to_row, vertical, cols, width),
+                self.predicted_tier(to_col, to_row, vertical, cols, width),
+            ),
         };
-        // THE SPAN CAP (the launch law): both branches of `flight_shape`
-        // saturate their duration at [`FLIGHT_MAX`], so the longest span an
-        // ordinary flight can cover lawfully is [`POUNCE_SPAN_MAX`] — the
-        // same bar that bands the pounce door, because it is the same
-        // arithmetic. A wider ask — a caret that kept moving through the
-        // gather, a keep-ahead prediction stretching the aim, a mid-line
-        // Enter from far out — lands SHORT, on the aimed row, and the
-        // ladder closes the remainder on its feet. The clamp is on the
-        // span, never the row: a row change is still paid in full by this
-        // one arc.
-        let to_col = self.col + (to_col - self.col).clamp(-POUNCE_SPAN_MAX, POUNCE_SPAN_MAX);
-        let (dur, arc) = Self::flight_shape((to_col - self.col).abs(), vertical);
-        self.begin_arc(to_col, to_row, dur, arc, false);
+        match tier {
+            Tier::Hop => {
+                let span = span_eq(aim - self.col, to_row - self.row);
+                let (dur, arc) = Self::flight_shape(span, vertical);
+                self.begin_arc(
+                    aim,
+                    to_row,
+                    dur,
+                    arc,
+                    FlightKind {
+                        // THE TUCK: a short vertical step down (the everyday
+                        // Enter from near the margin) is not a pounce.
+                        hop: vertical && span <= HOP_TIGHT,
+                        ..FlightKind::PLAIN
+                    },
+                );
+            }
+            Tier::Bound => {
+                self.launch_big(to_col, to_row, cols, width, policy == LeapPolicy::Show);
+            }
+        }
+        self.quiet_leap = false;
+        // …and the fall's beat, for the same reason: the trip home is the
+        // crossing the stare was owed to.
+        self.drop_stare = false;
     }
 
     /// The flight primitive: face the travel, own the position, leap.
@@ -4711,13 +7024,25 @@ impl PetBrain {
     /// exactly `bound × dur`. Reduced motion is exempt by the ladder's
     /// shape, not by a branch here: its arm returns before any arc can be
     /// launched, so no flight ever exists under it.
-    fn begin_arc(&mut self, to_col: f32, to_row: f32, dur: f32, arc: f32, big: bool) {
+    fn begin_arc(&mut self, to_col: f32, to_row: f32, dur: f32, arc: f32, kind: FlightKind) {
+        let FlightKind {
+            big,
+            show,
+            hop,
+            drop,
+        } = kind;
         let bound = if big {
             BIG_HOP_SPEED_MAX
         } else {
             HOP_SPEED_MAX
         };
-        let rate = (to_col - self.col).abs() / dur.max(0.05);
+        // The rate is measured on the EQUIVALENT span ([`span_eq`]): a hop
+        // that crosses three prompt rows travels those rows too, and judging
+        // its columns alone let a three-row Enter fly 7.1 rows/s and call
+        // itself lawful. The clamp below spends the same span, so the law and
+        // the measurement cannot disagree about how far the animal went.
+        let span = span_eq(to_col - self.col, to_row - self.row);
+        let rate = span / dur.max(0.05);
         debug_assert!(
             rate <= bound + 1e-3,
             "no flight may outrun the animal that flies it: {rate:.1} c/s over \
@@ -4725,6 +7050,21 @@ impl PetBrain {
              {dur:.3}s, big={big})",
             from = self.col
         );
+        debug_assert!(
+            !show || big,
+            "the chosen show is always a bound, never a hop"
+        );
+        // THE LAW IS A CLAMP, NOT AN ASSERTION. `debug_assert!` compiles to
+        // nothing under `--release`, so the bound above governed only the
+        // test suite: any caller the suite's enumeration did not reach shipped
+        // its arc unbounded to the one binary the user runs. That is the same
+        // shape as a green test standing in for a guarantee the program does
+        // not have. The animal takes as long as it takes — an over-fast arc
+        // is stretched in TIME rather than cut in distance, so the body still
+        // arrives where the ladder aimed it, just at a speed a cat could
+        // choose. The assert stays as a development tripwire: in a debug
+        // build an unlawful caller is still a bug to fix at the source.
+        let dur = dur.max(span / bound);
         if to_col > self.col {
             self.facing_left = false;
         } else if to_col < self.col {
@@ -4740,12 +7080,19 @@ impl PetBrain {
             t: 0.0,
             reaimed: false,
             big,
+            show,
+            hop,
+            // THE RELEASE's other half: a flight leaves from a coil when the
+            // pose it leaves from is a launching crouch. The two crouches
+            // that are HOLDS — the hide under the words, the stakeout at a
+            // toy — are excluded by name: they wear no coil envelope, so a
+            // `PetLaunch` off them would be a rear-up out of nowhere (and,
+            // under ink, a tell).
+            coiled: self.action == PetAction::Crouch && !self.hiding && !self.stakeout,
+            drop,
+            late_move: false,
         });
         self.set_action(PetAction::Leap);
-    }
-
-    fn launch(&mut self, to_col: f32, to_row: f32, cols: u16, width: f32) {
-        self.begin_flight(to_col, to_row, false, cols, width);
     }
 
     /// Duration and arc for one screen-crossing bound of `span` columns —
@@ -4762,24 +7109,63 @@ impl PetBrain {
     /// [`ART_ROWS`] above its baseline, so the arc may use at most
     /// `mid_row + 1 − ART_ROWS` cell heights (the 509c9f01 faith — nothing
     /// renders above the line).
-    fn begin_big_arc(&mut self, to_col: f32, to_row: f32) {
-        let (dur, arc) = Self::big_shape((to_col - self.col).abs());
+    fn begin_big_arc(&mut self, to_col: f32, to_row: f32, cols: u16, show: bool) {
+        let span = span_eq(to_col - self.col, to_row - self.row);
+        let (dur, arc) = Self::big_shape(span);
+        // THE ONE DURATION BACKSTOP in the vocabulary, and it lives here
+        // because the bound is the only shape whose curve does not already
+        // cap its own span: a bound is paced against the PANE
+        // ([`quiet_speed_max`]), never merely against the law's ceiling, so
+        // a crossing stays under a cell a frame at 60 fps on an ordinary
+        // pane. A hop stretched the same way would be the glide
+        // [`Self::flight_shape`] forbids; hops obey by their span cap.
+        let dur = dur.max(span / quiet_speed_max(cols));
         let mid_row = (self.row + to_row) * 0.5;
         let arc = arc.min((mid_row + 1.0 - ART_ROWS).max(0.0));
-        self.begin_arc(to_col, to_row, dur, arc, true);
+        self.begin_arc(
+            to_col,
+            to_row,
+            dur,
+            arc,
+            FlightKind {
+                big: true,
+                show,
+                ..FlightKind::PLAIN
+            },
+        );
     }
 
     /// The screen-crossing launch: aim predicted and wall-clamped like every
-    /// flight, shortened by the skid (the slide finishes the journey), and —
-    /// the variance flourish — split 60/40 into TWO bounds when the span
-    /// crosses [`TWO_BOUND_FRAC`] of the grid. Deterministic from the span.
-    fn launch_big(&mut self, to_col: f32, to_row: f32, cols: u16, width: f32) {
-        let (dur0, _) = Self::big_shape((to_col - self.col).abs());
-        let mut aim = if self.rhythm_open() {
-            to_col + self.vhat * (dur0 + BIG_LAND_DUR)
-        } else {
-            to_col
-        };
+    /// flight, shortened by the skid (the slide finishes the journey), and
+    /// split 60/40 into TWO bounds — at [`TWO_BOUND_FRAC`] of the grid for
+    /// the chosen SHOW (the variance flourish), and for a QUIET crossing
+    /// only when the crossing would spend longer in the air than
+    /// [`QUIET_ONE_BOUND_SECS`] at the pane's own pace. One bound is quieter
+    /// than two, and no pane narrower than 239 columns can ask for the
+    /// second one. Deterministic from the span.
+    fn launch_big(&mut self, to_col: f32, to_row: f32, cols: u16, width: f32, show: bool) {
+        let span0 = span_eq(to_col - self.col, to_row - self.row);
+        let (dur0, _) = Self::big_shape(span0);
+        // The horizon the aim leads over is the flight the pace allows.
+        let dur0 = dur0.max(span0 / quiet_speed_max(cols));
+        // ONE flight lead cap, the hop's ([`FLIGHT_LEAD_MAX`]), and the tier
+        // boundary is why: the door tiers on the PREDICTED aim, so a second,
+        // tighter cap here would make [`POUNCE_SPAN_MAX`] a discontinuity in
+        // where the paws come down — measured, an 18.5-cell trip launched
+        // mid-rhythm landed 2.8 cells BEHIND a caret that the same trip, one
+        // tenth of a cell shorter and flown as a hop, landed 5 cells ahead
+        // of. A bound's horizon is longer, which is what the cap is for; it
+        // is not a reason to bet a different amount.
+        //
+        // Both tiers take the same bet from the same place — the hop
+        // through [`Self::hop_aim`], the bound here — so the tier boundary
+        // is not a discontinuity in the lead either. Note what the bet is
+        // NOT gated on: the quiet-leap latch is still in hand at this point
+        // (the door spends it on the way out) and neither tier reads it.
+        // A forced crossing bets the DECAYED drift, which is ~0 exactly when
+        // it should be and a real lead when it should not be; the latch's
+        // job is the show, not the aim ([`Self::station_drift`]).
+        let mut aim = to_col + self.station_drift(dur0 + BIG_LAND_DUR);
         aim = aim.clamp(0.0, (f32::from(cols) - width).max(0.0));
         let delta = aim - self.col;
         let dir = if delta > 0.0 {
@@ -4795,7 +7181,12 @@ impl PetBrain {
         } else {
             aim
         };
-        if delta.abs() >= TWO_BOUND_FRAC * f32::from(cols) {
+        let split = if show {
+            delta.abs() >= TWO_BOUND_FRAC * f32::from(cols)
+        } else {
+            delta.abs() / quiet_speed_max(cols) > QUIET_ONE_BOUND_SECS
+        };
+        if split {
             // The touch point between bounds must come down on BLANK cells
             // (gauntlet F1: the relaunch paws clipped "touchland"'s
             // ascenders): nudge the 60% point off the row's ink, and when
@@ -4814,15 +7205,15 @@ impl PetBrain {
                 (aim_short + 4.0, self.col - 4.0)
             };
             if !self.ink_overlaps(touch, to_row, width) && touch >= lo && touch <= hi {
-                self.bound2 = Some((aim_short, to_row));
-                self.begin_big_arc(touch, to_row);
+                self.bound2 = Some((aim_short, to_row, show));
+                self.begin_big_arc(touch, to_row, cols, show);
             } else {
                 self.bound2 = None;
-                self.begin_big_arc(aim_short, to_row);
+                self.begin_big_arc(aim_short, to_row, cols, show);
             }
         } else {
             self.bound2 = None;
-            self.begin_big_arc(aim_short, to_row);
+            self.begin_big_arc(aim_short, to_row, cols, show);
         }
     }
 
@@ -4874,13 +7265,29 @@ impl PetBrain {
     /// over-the-shoulder `peek` stays instantaneous on purpose: a glance
     /// costs the animal nothing, which is exactly why it is the answer to a
     /// target the body should not chase.
-    fn settle_gaze(&mut self, target_col: f32, width: f32, dt: f32) {
+    fn settle_gaze(&mut self, target_col: f32, caret_row: f32, width: f32, dt: f32) {
         if !self.action.settled() || self.quiet < SETTLE_TURN {
             self.sit_front = false;
             self.peek = false;
+            self.look_row = 0;
             self.gaze_dwell = 0.0;
             return;
         }
+        // THE HEAD'S TIP (variety wave). The gaze COLUMN can be the
+        // pointer's; the row the head tips toward is always the CARET's,
+        // because the thing a pet parked off the caret's line is looking at
+        // is the line it is not on — the ink ladder's blank row below, the
+        // watcher's hug two rows up. Same row (the common case) is no tip
+        // at all, and the half-cell dead band keeps a mid-hop fraction from
+        // reading as a tip.
+        let drow = caret_row - self.row;
+        self.look_row = if drow <= -0.5 {
+            -1
+        } else if drow >= 0.5 {
+            1
+        } else {
+            0
+        };
         let asleep = self.action == PetAction::Sleep;
         let gap = self.col - target_col;
         // Which side of the pet's own midline the target is on — or NEITHER,
@@ -4979,7 +7386,12 @@ impl PetBrain {
                     });
                 }
             }
-            PetAction::Purr => {
+            // The ♪ and ♥ are part of the TELL, so they ride the seat on
+            // the same terms the swell does ([`Self::purring`]). The beat
+            // is already keyed on `quiet - SIT_AFTER`, so a seat that purrs
+            // and then melts into `PetAction::Purr` keeps ONE unbroken
+            // sequence across the change — no new clock, no restart.
+            PetAction::Purr | PetAction::Sit | PetAction::Loaf if self.purring() => {
                 let beat = ((self.quiet - SIT_AFTER).max(0.0) / PURR_MOTE_EVERY).floor() as i64;
                 if beat >= 1 && beat != self.mote_mark {
                     self.mote_mark = beat;
@@ -5063,6 +7475,14 @@ impl PetBrain {
             }
             self.pending_sulk = false;
             self.quiet = 0.0;
+            // A sulk from a SEATED pose keeps its seat: the head goes down
+            // and the ears flatten, but a cat that was already sitting does
+            // not lie down to be disappointed. Off its feet (a stand, a
+            // walk, the stretch out of a wake) it sinks onto its belly.
+            self.droop_seated = matches!(
+                self.action,
+                PetAction::Sit | PetAction::Purr | PetAction::Groom
+            );
             self.set_action(PetAction::Droop);
             return true;
         }
@@ -5111,6 +7531,27 @@ impl PetBrain {
 
     /// Drop every wave-2 play envelope — the no-audience and reduced-motion
     /// arms' shared clear (dropped, not parked, the wave-1 stimulus rule).
+    /// The caret is work, the pointer is play: a travel latch CLEARS every
+    /// pending play intent (wave 2) — the un-launched play crouch re-aims at
+    /// the station, and a play flight already in the air lands into work
+    /// instead of the flourish. The wave-3 games end the same way: chase
+    /// dropped mid-stride (a short cooldown so typing truly ends it),
+    /// stakeout stood down, the far look and the owed groom forgotten — work
+    /// first. Shared by the jump latch and the snap.
+    fn clear_play_intents(&mut self) {
+        self.pending_pointer_pounce = None;
+        self.play_to = None;
+        self.play_land = None;
+        self.pursuit_t = None;
+        self.pursuit_cool = self.pursuit_cool.max(1.0);
+        self.stakeout = false;
+        self.pending_look = None;
+        self.look_at = None;
+        self.groom_owed = false;
+        self.hide_to = None;
+        self.hiding = false;
+    }
+
     fn clear_play(&mut self) {
         self.last_pointer = None;
         self.pointer_vx = 0.0;
@@ -5510,11 +7951,16 @@ impl PetBrain {
         let mut scale_x = 1.0f32;
         let mut scale_y = 1.0f32;
         let mut lift = 0.0f32;
-        let purr = if matches!(self.action, PetAction::Purr) {
-            self.content
-        } else {
-            0.0
-        };
+        // THE EAR TWITCH's frame, when the settled pose has one authored:
+        // the arms below set this, and the procedural bob at the bottom
+        // stands down for those frames. A pose without an ear frame
+        // keeps the procedural bob it shipped with.
+        let mut ear_frame = false;
+        // THE TELL. Reduced motion is bookkeeping only — it reports no purr
+        // and paints no swell, exactly as it did when the tell was welded to
+        // the pose.
+        let tell = self.purring() && !sense.reduced_motion;
+        let purr = if tell { self.content } else { 0.0 };
 
         let pose = match self.action {
             // The breath is the ONE animation a settled pet keeps, so reduced
@@ -5538,36 +7984,143 @@ impl PetBrain {
                     PetGlyphId::PetSleep0
                 }
             }
-            PetAction::Waking => PetGlyphId::PetStretch,
+            PetAction::Waking => {
+                // THE STRETCH, IN TWO HALVES: the front reach draws the
+                // body out along its own axis over [`STRETCH_LEAD`] and
+                // eases back, then the weight shifts and the hind leg
+                // reaches back — the mirror half. One pose held for the
+                // whole wake was the placeholder; this is the gesture.
+                if self.action_t < STRETCH_SPLIT * WAKE_DUR {
+                    let k = (self.action_t / STRETCH_LEAD).min(1.0);
+                    scale_x *= 1.0 + STRETCH_AMP * (core::f32::consts::PI * k).sin();
+                    PetGlyphId::PetStretch
+                } else {
+                    PetGlyphId::PetStretchHind
+                }
+            }
             PetAction::Stand => {
                 // The last beats of the stand gather down toward the fold
                 // ([`SIT_FOLD`]), so the sit does not snap on.
                 let pre = ((self.quiet - (SIT_AFTER - SIT_FOLD)) / SIT_FOLD).clamp(0.0, 1.0);
                 scale_y -= 0.05 * pre;
                 scale_x += 0.03 * pre;
-                PetGlyphId::PetStand
+                if self.twitch_t > 0.0 {
+                    ear_frame = true;
+                    PetGlyphId::PetStandEar
+                } else {
+                    PetGlyphId::PetStand
+                }
             }
             PetAction::Sit if sense.reduced_motion => PetGlyphId::PetSit,
             PetAction::Sit => {
-                // The tail flick: a settled cat is never perfectly inert.
-                // Phased on QUIET, not on the free-running clock, so it is a
-                // function of this settle rather than of how long the window has
-                // been open — which is what makes the sequence reproducible.
-                let beat = ((self.quiet - SIT_AFTER).max(0.0) * 0.5).rem_euclid(1.0);
                 // The other half of the stand→sit fold: the sit's first beats
                 // rise back from the stand's gathered-down height to rest.
                 let fold = (1.0 - (self.quiet - SIT_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
                 scale_y -= 0.05 * fold;
                 scale_x += 0.03 * fold;
-                // The settled gaze (review #6): eye contact face-on when the
-                // caret is close, the over-the-shoulder peek when it is
-                // behind — the plain sit (and its flick) otherwise.
-                if self.sit_front {
-                    PetGlyphId::PetSitFront
+                //
+                // ── THE SEAT'S ONE PRECEDENCE ──────────────────────────
+                //
+                //   sit_front (blinking or not, until a look opens) >
+                //   peek > yawn > ear > look_row > tail beat > blink >
+                //   the plain sit
+                //
+                // Top two are the settled GAZE (review #6) and are state,
+                // not beats: eye contact face-on when the caret is close,
+                // the over-the-shoulder peek when it is behind. Everything
+                // below them is a dealt beat on the sit's own clock — see
+                // [`Self::sit_beat`] — and every one of them is a pure
+                // function of `quiet` and the hand.
+                //
+                // ONE RIDER, and it is the tail's: while the tail is off
+                // its rest (a flick, or away behind the seat) the three
+                // beats ABOVE it stand down for those frames. A yawn, an
+                // ear or a head-tip cutting into the swing would put the
+                // tail back on the other side of the cat between two
+                // frames — the teleport this wave exists to remove. The
+                // ear still BOBS there; only the ear FRAME stands down.
+                //
+                // …AND THE LOOK IS THE SEAT'S DOOR — the whole door, now.
+                // `sit_front` is the ORDINARY settled pose (the station is
+                // `caret + 1`, well inside [`SIT_FRONT_GAP`]: measured,
+                // 88.8 % of all settled frames) and face-on it outranked
+                // every beat below it, so a typing user only ever met the
+                // seat's vocabulary with the cat parked wall-side. The
+                // first pass at this opened the door to the blink and the
+                // head tips only, and measured ZERO onsets for the tail's
+                // three frames, the yawn and both ear frames across four
+                // ordinary sessions — because a door is not enough when the
+                // beats behind it are phased shut. Each of those three had
+                // its own reason and each now has its own answer:
+                //
+                // * THE TAIL was phased apart from the glance on purpose
+                //   (`TAIL_AT` 0.22 against `GLANCE_AT` 0.8) so the windows
+                //   never met — so face-on it deals off the GLANCE's clock
+                //   instead ([`Self::sit_tail`]), and its longest hand is
+                //   why [`LOOK_DUR_LONG`] exists.
+                // * THE YAWN hands into the melt, long after the glance has
+                //   closed — so it OPENS ITS OWN look
+                //   ([`Self::sit_look_left`]): a cat looks away to yawn.
+                // * THE EAR FRAME stood down face-on because it is side-on
+                //   art — so it comes through the same fit rule as the
+                //   blink ([`Self::side_on_holds`]), which cannot cut it
+                //   because [`TWITCH_DUR`] and the look's remaining time
+                //   count down together. Below the door the procedural bob
+                //   is still what a face-on twitch gets.
+                let tail = self.sit_tail();
+                if self.sit_front && !self.sit_glance() {
+                    // EYE CONTACT, AND ITS OWN BEAT. This is the most-worn
+                    // awake frame in the roster — 9.0 % of all frames and
+                    // 641 onsets averaging 0.86 s over the measured sample
+                    // — and it had no beat at all: `PetSitBlink` is drawn
+                    // on the side-on seat, so the only way for a face-on
+                    // cat to break a stare was to look away. The lids are a
+                    // strict one-field departure from the frame beneath
+                    // them, so the swap cannot move anything else.
+                    if self.sit_blink_beat().is_some() {
+                        PetGlyphId::PetSitFrontBlink
+                    } else {
+                        PetGlyphId::PetSitFront
+                    }
                 } else if self.peek {
                     PetGlyphId::PetPeekShoulder
-                } else if beat > 0.86 {
-                    PetGlyphId::PetSitFlick
+                } else if tail.is_none() && self.sit_yawn() {
+                    PetGlyphId::PetYawn
+                } else if tail.is_none()
+                    && self.twitch_t > 0.0
+                    && self.side_on_holds(TWITCH_DUR - self.twitch_t, TWITCH_DUR)
+                    && self.tail_room(TWITCH_DUR - self.twitch_t, TWITCH_DUR)
+                    && self
+                        .sit_blink_beat_at(self.quiet - SIT_AFTER + self.twitch_t)
+                        .is_none()
+                {
+                    // Three clauses and each closes one end of a cut. The
+                    // look must CONTAIN the twitch (the frames are side-on
+                    // art); the tail must be off its rest for the whole of
+                    // it (the seat's one rider); and the twitch must not
+                    // END inside a blink, which would strand the lids for
+                    // their remainder alone. Fail any of them and the ear
+                    // keeps the procedural bob it shipped with — the
+                    // fallback is a beat, not nothing.
+                    ear_frame = true;
+                    if self.twitch_up {
+                        PetGlyphId::PetSitEar
+                    } else {
+                        PetGlyphId::PetSitEarFar
+                    }
+                } else if tail.is_none() && self.look_row < 0 {
+                    PetGlyphId::PetSitLookup
+                } else if tail.is_none() && self.look_row > 0 {
+                    PetGlyphId::PetSitLookdown
+                } else if let Some(pose) = tail {
+                    pose
+                } else if let Some((p, len)) = self.sit_blink_beat()
+                    && self.side_on_holds(p, len)
+                {
+                    // The same `left + p >= len` the guard here spelled out
+                    // before [`Self::side_on_holds`] gave every side-on beat
+                    // one rule, plus that rule's second clause.
+                    PetGlyphId::PetSitBlink
                 } else {
                     PetGlyphId::PetSit
                 }
@@ -5590,7 +8143,7 @@ impl PetBrain {
                 // The melt: the loaf's first beats ease down from the sit's
                 // height, through the same envelope plumbing as every other
                 // settled transition — no snapping.
-                let fold = (1.0 - (self.quiet - LOAF_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
+                let fold = (1.0 - (self.quiet - self.loaf_after()) / SIT_FOLD).clamp(0.0, 1.0);
                 scale_y += 0.05 * fold;
                 scale_x -= 0.02 * fold;
                 // IDLE MICRO-LIFE (wave 2): the loaf's tail thump — a tiny
@@ -5600,7 +8153,7 @@ impl PetBrain {
                 // beat parity. Structurally inside the lane-hot window:
                 // the loaf ends at SLEEP_AFTER, and the settle window's
                 // frames carry it — deep sleep stays byte-stable.
-                let since = (self.quiet - LOAF_AFTER).max(0.0);
+                let since = (self.quiet - self.loaf_after()).max(0.0);
                 let beat = (since / FLICK_EVERY).floor();
                 let phase = since - beat * FLICK_EVERY;
                 if beat >= 1.0 && phase < FLICK_DUR {
@@ -5608,25 +8161,90 @@ impl PetBrain {
                     let dir = if (beat as i64) % 2 == 0 { 1.0 } else { -1.0 };
                     scale_y += amp * dir;
                 }
-                PetGlyphId::PetLoaf
+                // THE LOAF'S PRECEDENCE: the roll (its own arm, above) >
+                // the ear > the peek > the loaf. The loaf's eyes are shut
+                // by the art, so its beat is the OPPOSITE of the seat's
+                // blink — one dealt thump beat in three, the cat cracks an
+                // eye open at whatever woke it and settles again. Dealt on
+                // the thump's own beat index, so the peek rides a beat the
+                // body is already keeping.
+                if self.twitch_t > 0.0 {
+                    ear_frame = true;
+                    PetGlyphId::PetLoafEar
+                } else if beat >= 1.0
+                    && phase < LOAF_PEEK_DUR
+                    && self.beat_deal(beat as i64, 3) == 1
+                {
+                    PetGlyphId::PetLoafOpen
+                } else {
+                    PetGlyphId::PetLoaf
+                }
             }
             PetAction::Purr => {
                 // A purr entered straight off the fold eases in the same way.
+                // The SWELL is not here any more — it moved below the match,
+                // because it belongs to the TELL and not to this pose.
                 let fold = (1.0 - (self.quiet - SIT_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
-                let t = (self.clock % f64::from(1.0 / PURR_HZ)) as f32;
-                let s = (TAU * PURR_HZ * t).sin();
-                scale_y += s * PURR_DEPTH - 0.05 * fold;
-                scale_x += 0.03 * fold - s * PURR_DEPTH * 0.6;
+                scale_y -= 0.05 * fold;
+                scale_x += 0.03 * fold;
                 PetGlyphId::PetPurr
             }
-            PetAction::Groom => PetGlyphId::PetGroom,
+            PetAction::Groom => {
+                // ALTERNATING WASHES: a cat does not lick the same paw
+                // twice. The wash's own cycle index (the same arithmetic
+                // `enter_settled` places the washes with) decides which
+                // half comes first — chest then flank on even washes,
+                // flank then chest on odd — so the second wash of a settle
+                // reads as a different gesture from the first.
+                //
+                // The OWED groom (post-chase dignity) is always the paw
+                // lick: it is a one-shot with its own hold, off the
+                // settle's cycle entirely, and the gesture it is pretending
+                // with is the chest wash.
+                if self.groom_owed {
+                    PetGlyphId::PetGroom
+                } else {
+                    let since_sit = (self.quiet - SIT_AFTER).max(0.0);
+                    let cycle = self.groom_after() + GROOM_DUR;
+                    let into = (since_sit - self.groom_after()).max(0.0);
+                    let k = (into / cycle).floor();
+                    let u = (into - k * cycle) / GROOM_DUR;
+                    if (u < 0.6) != ((k as i64).rem_euclid(2) == 1) {
+                        PetGlyphId::PetGroom
+                    } else {
+                        PetGlyphId::PetGroomFlank
+                    }
+                }
+            }
+            // THE TRAVEL PERK looks where it is going: a notice with a jump
+            // already latched turns its head toward the caret it is about
+            // to cross to. A perk with nothing latched (a cheer, a bell, a
+            // double-take that came to nothing) keeps the square-on frame —
+            // and a wall transit is a STEP, not a trip, so it does not
+            // earn the turn either.
+            PetAction::Perk if self.pending_pounce || self.pending_big_jump => {
+                PetGlyphId::PetPerkTurn
+            }
             PetAction::Perk => PetGlyphId::PetPerk,
             PetAction::Startle => PetGlyphId::PetStartle,
             PetAction::Frolic if self.swipe => {
-                // The bat swipe (wave 2): pinned to the forepaw pose for the
+                // The bat swipe (wave 2): PINNED to the forepaw pose for the
                 // whole hold — a swipe that playbows halfway reads as two
-                // gestures. The dedicated BatSwipe frame is queued for the
-                // art wave; PetBat is the shipping placeholder.
+                // gestures.
+                //
+                // `PetBat` is the swipe's OWN frame, not a stand-in for one.
+                // The code here used to promise a dedicated `BatSwipe`, and
+                // that promise was written before the pose sheet was: the
+                // authored note on `pet_bat` (`art/pet/poses.py`) reads
+                // "Frolic, swipe: reared back on the haunch, a paw batting
+                // the caret", which is this beat and nothing else. Rendered
+                // beside `pet_playbow` the pair reads as a frolic, and the
+                // real complaint the old comment was making — that the
+                // plain Frolic ALSO wears this frame — is answered by the
+                // rhythm rather than by a second pose: the swipe holds it
+                // for the whole `BAT_HOLD` while the frolic alternates it
+                // against the bow every `FROLIC_HOLD · 0.5`. That is reuse,
+                // which is what the pose sheet is for.
                 PetGlyphId::PetBat
             }
             PetAction::Frolic => {
@@ -5638,13 +8256,19 @@ impl PetBrain {
             }
             PetAction::Droop => {
                 // The sulk sinks: a shade shorter and wider as the hold
-                // plays out (the landing shape law at grief pace) over the
-                // borrowed loaf art — the low pose the roster has, until
-                // the art wave lands a flat-ears frame. Zero motes.
+                // plays out (the landing shape law at grief pace). Zero
+                // motes. The frame is the sulk's OWN now — flat ears, head
+                // hung — in the two readings the grief can find the animal
+                // in: still seated when it was sitting, down on its belly
+                // when it was on its feet.
                 let u = (self.action_t / DROOP_HOLD).clamp(0.0, 1.0);
                 scale_y -= 0.06 * u;
                 scale_x += 0.03 * u;
-                PetGlyphId::PetLoaf
+                if self.droop_seated {
+                    PetGlyphId::PetDroopSit
+                } else {
+                    PetGlyphId::PetDroop
+                }
             }
             PetAction::Crouch if self.big_gather => {
                 // THE COIL (rung 7) under the butt-wiggle. The envelope's
@@ -5663,9 +8287,16 @@ impl PetBrain {
                 let (cy, cx) = Self::coil_envelope(self.action_t, dur);
                 scale_y *= cy;
                 scale_x *= cx;
+                // THE RELEASE: the gather's last tick wears the launch
+                // frame, and the flight's `u = 0` frame is its second — the
+                // wiggle resolves into a push-off instead of cutting from a
+                // squat straight to the rise.
+                if self.action_t >= dur - LAUNCH_LEAD {
+                    PetGlyphId::PetLaunch
+                }
                 // The butt-wiggle: PetCrouch / PetCrouchWiggle alternating at
                 // ~WIGGLE_HZ full cycles per second through the big gather.
-                if ((self.action_t * WIGGLE_HZ * 2.0) as u32).is_multiple_of(2) {
+                else if ((self.action_t * WIGGLE_HZ * 2.0) as u32).is_multiple_of(2) {
                     PetGlyphId::PetCrouch
                 } else {
                     PetGlyphId::PetCrouchWiggle
@@ -5678,7 +8309,14 @@ impl PetBrain {
                 let (cy, cx) = Self::coil_envelope(self.action_t, CROUCH_DUR);
                 scale_y *= cy;
                 scale_x *= cx;
-                PetGlyphId::PetCrouch
+                // THE RELEASE, on the coil the door dealt by tier: a hop's
+                // single crouch frame IS the release; a bound's coil holds
+                // for [`CROUCH_DUR`] and wears it on its last tick.
+                if self.action_t >= self.coil_d - LAUNCH_LEAD {
+                    PetGlyphId::PetLaunch
+                } else {
+                    PetGlyphId::PetCrouch
+                }
             }
             PetAction::Crouch if !self.hiding && !self.stakeout && self.play_to.is_none() => {
                 // The pounce coil, squashing through its span-scaled length
@@ -5690,16 +8328,33 @@ impl PetBrain {
                 let (cy, cx) = Self::coil_envelope(self.action_t, self.coil_d);
                 scale_y *= cy;
                 scale_x *= cx;
-                PetGlyphId::PetCrouch
+                // THE RELEASE: the coil's last tick, then the flight's
+                // `u = 0` frame — two ticks of `PetLaunch`, which is the
+                // frame-rate law's floor for a pose swap.
+                if self.action_t >= self.coil_d - LAUNCH_LEAD {
+                    PetGlyphId::PetLaunch
+                } else {
+                    PetGlyphId::PetCrouch
+                }
             }
+            // A crouch that is not a coil (the hide under the words, the
+            // stakeout at a toy, the play gather) never wears the release:
+            // the art is planted, and a rear-up under ink or at prey is a
+            // tell.
             PetAction::Crouch => PetGlyphId::PetCrouch,
             PetAction::Leap => {
-                let mut u = 0.5;
+                // EVERY flight gets an ascent and a landing approach —
+                // scheduled in SECONDS through rung 9's normalizer, with
+                // the release frame and the hop's tuck ahead of it: one
+                // owner, [`Self::flight_pose`]. A flightless leap frame
+                // keeps the hero.
+                let mut pose = PetGlyphId::PetLeap;
                 if let Some(f) = self.flight {
-                    u = (f.t / f.dur).clamp(0.0, 1.0);
+                    let u = (f.t / f.dur).clamp(0.0, 1.0);
                     // The parabola — or, on a big bound alone, THE HANG
                     // (rung 10): see `flight_lift` for both laws.
                     lift = Self::flight_lift(f.arc, u, f.big);
+                    pose = Self::flight_pose(&f);
                     // Stretch into the rise, gather at the apex — ALONG THE
                     // MOTION. A body elongates on its velocity axis: stretch
                     // applied blindly to height made a horizontal pounce leave
@@ -5713,10 +8368,21 @@ impl PetBrain {
                     // elongates at LAUNCH_STRETCH, the fall at half that —
                     // in BOTH axis branches, so a row-dominant hop sheds its
                     // touchdown cliff exactly like a horizontal pounce.
-                    let stretch = if u < 0.5 {
-                        LAUNCH_STRETCH * (1.0 - 2.0 * u)
+                    //
+                    // A TUCKED hop stretches by [`HOP_STRETCH`] and not at
+                    // all on the tuck frame itself: the tuck IS the shape,
+                    // and the smaller launch keeps the swap into it from
+                    // dropping 0.07 of on-axis stretch in one tick.
+                    //
+                    // A FALL carries no launch at all: nothing pushed off,
+                    // so nothing stretches (and the tuck IS its own shape).
+                    let launch = if f.hop { HOP_STRETCH } else { LAUNCH_STRETCH };
+                    let stretch = if f.drop || pose == PetGlyphId::PetHop {
+                        0.0
+                    } else if u < 0.5 {
+                        launch * (1.0 - 2.0 * u)
                     } else {
-                        DESCEND_STRETCH * (2.0 * u - 1.0)
+                        DESCEND_STRETCH.min(launch) * (2.0 * u - 1.0)
                     };
                     let dx = (f.to_col - f.from_col).abs() * f32::from(sense.cell_w);
                     let dy = (f.to_row - f.from_row).abs() * f32::from(sense.cell_h);
@@ -5728,48 +8394,7 @@ impl PetBrain {
                         scale_x -= 0.6 * stretch;
                     }
                 }
-                // EVERY flight gets an ascent and a landing approach — now
-                // scheduled in SECONDS through rung 9's normalizer: the rise
-                // and the approach are beats a pose must hold long enough to
-                // read, however long or short the flight (the old 0.25/0.6
-                // u-window crushed the rise on a minimum pounce and
-                // stretched the descend to a third of a bound). A flightless
-                // leap frame keeps the hero (`u` defaults to 0.5).
-                match self.flight {
-                    None => PetGlyphId::PetLeap,
-                    Some(f) if f.dur < 3.0 * MIN_HERO => {
-                        // Too short for three legible beats: two poses,
-                        // split at the apex — the hero is never crushed
-                        // below MIN_HERO, and a descend can never clamp
-                        // longer than its own flight.
-                        if u < 0.5 {
-                            PetGlyphId::PetLeapRise
-                        } else {
-                            PetGlyphId::PetLeapDescend
-                        }
-                    }
-                    Some(f) => {
-                        let mut rise = LEAP_RISE_T;
-                        let mut desc = LEAP_DESC_T;
-                        if rise + desc + MIN_HERO > f.dur {
-                            // ONE shared scale factor for both approaches —
-                            // the explicit normalizer, never two independent
-                            // clamp chains — leaving the hero exactly its
-                            // floor.
-                            let s = (f.dur - MIN_HERO) / (rise + desc);
-                            rise *= s;
-                            desc *= s;
-                        }
-                        let t = u * f.dur;
-                        if t < rise {
-                            PetGlyphId::PetLeapRise
-                        } else if t <= f.dur - desc {
-                            PetGlyphId::PetLeap
-                        } else {
-                            PetGlyphId::PetLeapDescend
-                        }
-                    }
-                }
+                pose
             }
             PetAction::Land => {
                 // Three recoveries, one shape law (shorter by q, wider by
@@ -5787,6 +8412,37 @@ impl PetBrain {
                 // cleanly because its face is a tucked profile.
                 let (dur, q0, pose) = if self.bound2.is_some() {
                     (TOUCH_LAND_DUR, LAND_SQUASH * 0.5, PetGlyphId::PetCrouch)
+                } else if self.scrabble {
+                    // THE SCRABBLE: braced on the landing frame for
+                    // [`SCRABBLE_PLANT`], then the paws HUNT — the gallop's
+                    // first beat with a fast wobble over it. The squash is
+                    // the ordinary landing's, so the recovery still reads
+                    // as one.
+                    //
+                    // THIS IS NOT A PLACEHOLDER, and the dedicated frame it
+                    // used to promise has been authored, rendered and
+                    // REFUSED (2026-08-27). The candidate was a real pose —
+                    // asymmetric forelegs hunting for a floor that moved,
+                    // the rump sunk, the ears back, 13 layers / 337 commands
+                    // and planted — and at the 34 px ship tile it is
+                    // indistinguishable from `PetLand`: the whole gesture is
+                    // a foreleg-angle delta of about two pixels, and the far
+                    // foreleg, which carries the asymmetry that makes a
+                    // scramble read, is drawn BEHIND the body. Even at 68 px
+                    // the silhouette is the landing's. What is here instead
+                    // is a 3 Hz whole-body wobble, and motion survives 34 px
+                    // where a limb angle does not — so the placeholder is
+                    // strictly the better frame at the size that ships. If
+                    // the beat ever wants more, the honest upgrade is a
+                    // bigger wobble or a second dust puff, not a roster slot.
+                    let elapsed = SCRABBLE_DUR - self.land_t;
+                    let pose = if elapsed < SCRABBLE_PLANT {
+                        PetGlyphId::PetLand
+                    } else {
+                        scale_x *= 1.0 + 0.03 * (TAU * 3.0 * elapsed).sin();
+                        PetGlyphId::PetRun0
+                    };
+                    (SCRABBLE_DUR, LAND_SQUASH, pose)
                 } else if self.land_span > 0.0 {
                     (
                         BIG_LAND_DUR,
@@ -5800,15 +8456,70 @@ impl PetBrain {
                     (LAND_DUR, LAND_SQUASH, PetGlyphId::PetLand)
                 };
                 let u = 1.0 - (self.land_t / dur).clamp(0.0, 1.0);
-                let q = q0 * (-3.0 * u).exp() * (TAU * 1.35 * u).cos();
+                // THE TOUCHDOWN ATTACK (variety wave): the squash RAMPS IN
+                // over [`LAND_ATTACK`] from the touchdown frame instead of
+                // arriving whole on it. The damped ring is authored to
+                // oscillate — that is the recovery — but its first sample
+                // was a cliff: the last airborne frame sat at a stretch and
+                // the first braced one at `1 − q0`, a 0.184 step in
+                // `scale_y` in one tick, which reads as a hitch rather than
+                // as weight. Three ticks of ramp put every measured landing
+                // inside the wave's 3 % per-tick volume law.
+                let a = ((dur - self.land_t) / LAND_ATTACK).clamp(0.0, 1.0);
+                let q = q0 * a * (-3.0 * u).exp() * (TAU * 1.35 * u).cos();
                 scale_y *= 1.0 - q;
                 scale_x *= 1.0 + q * 0.6;
                 pose
+            }
+            // THE SKID (variety wave): while the drift-brake's run-out is
+            // live AND the paws are still travelling down it, the gait
+            // stops cycling and the body braces — forelegs out, rump sunk,
+            // leaning into the slide by [`SKID_LEAN`], easing off as the
+            // paws reach the overshoot. The instant the cat turns for home
+            // the cycle resumes: the trot back is a trot, not a slide.
+            PetAction::Walk | PetAction::Run
+                if self
+                    .brake_over
+                    .is_some_and(|over| (over - self.col) * self.speed >= 0.0) =>
+            {
+                let over = self.brake_over.expect("checked by the guard");
+                let w = ((over - self.col).abs() / BRAKE_OVERSHOOT).clamp(0.0, 1.0);
+                scale_x *= 1.0 + SKID_LEAN * w;
+                scale_y *= 1.0 - 0.4 * SKID_LEAN * w;
+                PetGlyphId::PetSkid
+            }
+            // THE AMBLE (variety wave): the stroll's own four beats, on the
+            // stride the follower has already been cycling at.
+            PetAction::Walk if self.lateral => {
+                Self::CYCLE_LWALK[self.gait_index(Self::CYCLE_LWALK.len())]
             }
             PetAction::Walk => Self::CYCLE_WALK[self.gait_index(Self::CYCLE_WALK.len())],
             PetAction::Run => Self::CYCLE_RUN[self.gait_index(Self::CYCLE_RUN.len())],
         };
 
+        // THE PURR'S CHEST SWELL, ONE SITE, ON THE TELL. `PURR_GATE` is
+        // thirteen cells of travel — one pounce, or thirteen keystrokes of
+        // following — and upstream's ladder therefore purred from
+        // [`SIT_AFTER`], owning the whole dwell with ONE static frame and
+        // starving every beat the dealt seat exists for; ours moved the purr
+        // to the long dwell to give the seat its window back, and a working
+        // cat then had to wait 1.4–3.0 s to be told it was happy at all.
+        // Neither is right, because "the cat is purring" and "the cat is
+        // wearing the purr's pose" are two independent facts. The POSE stays
+        // on the dwell, where the seat can keep its beats and the loaf can
+        // keep its own; the TELL — this swell, [`PetFrame::purr`] and the
+        // ♪/♥ of [`Self::tend_motes`] — rides every settled frame a content
+        // cat has, from the moment it sits down. See [`Self::purring`].
+        //
+        // Applied HERE rather than in three arms so there is exactly one
+        // swell in the file: the fold, the melt and the thump are each that
+        // pose's own business and compose with it, as the flinch below does.
+        if tell {
+            let t = (self.clock % f64::from(1.0 / PURR_HZ)) as f32;
+            let s = (TAU * PURR_HZ * t).sin();
+            scale_y += s * PURR_DEPTH;
+            scale_x -= s * PURR_DEPTH * 0.6;
+        }
         // The small-retreat flinch: a decaying duck over whatever pose is up
         // (in practice the perk), shaped by the landing's law — shorter by q,
         // wider by 0.6 q.
@@ -5835,11 +8546,13 @@ impl PetBrain {
             }
         }
 
-        // IDLE MICRO-LIFE (wave 2): the ear-twitch stand-in — a 2% head-
-        // scale bob over the settled pose (the flinch envelope's precedent),
-        // which ear by mote-serial parity at arm time. Upgraded to real
-        // ear-twitch frames when the art wave lands them.
-        if self.twitch_t > 0.0 {
+        // IDLE MICRO-LIFE (wave 2): the ear twitch. The art wave landed
+        // the real frames, so the poses that HAVE one wore it above
+        // (`ear_frame`) and pay nothing here; the rest — the face-on sit,
+        // the purr, the wash, the roll — keep the 2% head-scale bob that
+        // stood in for it (the flinch envelope's precedent), which ear by
+        // mote-serial parity at arm time.
+        if self.twitch_t > 0.0 && !ear_frame {
             let q = TWITCH_BOB * (self.twitch_t / TWITCH_DUR).clamp(0.0, 1.0);
             scale_y *= if self.twitch_up { 1.0 + q } else { 1.0 - q };
         }
@@ -5898,6 +8611,15 @@ impl PetBrain {
         PetGlyphId::PetWalk1,
         PetGlyphId::PetWalk2,
         PetGlyphId::PetWalk3,
+    ];
+    /// The AMBLE's four beats: one leg lifted at a time over three planted,
+    /// the body a shade lower on the foreleg swings — the stroll the pet
+    /// uses under [`LAT_SPEED`], on its own shorter stride.
+    const CYCLE_LWALK: [PetGlyphId; 4] = [
+        PetGlyphId::PetLwalk0,
+        PetGlyphId::PetLwalk1,
+        PetGlyphId::PetLwalk2,
+        PetGlyphId::PetLwalk3,
     ];
     const CYCLE_RUN: [PetGlyphId; 4] = [
         PetGlyphId::PetRun0,
@@ -6022,11 +8744,23 @@ impl PetBrain {
                     // round-trip flip came home) clears the clock — no swap,
                     // no ghost, exactly as if nothing had ever been asked.
                     self.handoff_parked_clock = park.is_some().then_some(self.clock);
-                }
-                if park.is_some() {
-                    // The LAST park's arrival wins — on the fresh park and
-                    // on every agreeing re-sync alike.
-                    self.pending_arrival = arrival;
+                    if park.is_some() {
+                        // THE PARK EDGE OWNS THE ARRIVAL — and this must
+                        // NOT move to the agreeing re-sync, which is the
+                        // shape the host actually produces. The seam sends
+                        // `Ceremony` exactly ONCE: `commit_hello` flips the
+                        // tenure latch on the very frame the park is taken,
+                        // so all ~156 remaining frames of
+                        // `HANDOFF_DEBOUNCE` re-sync this SAME park with
+                        // `Quiet`. Letting the last write win therefore
+                        // downgraded EVERY ceremony to the in-place
+                        // re-dress before the handoff could fire — the
+                        // arrival wave, dead on glass. A standing park
+                        // keeps the ruling it was taken under until it is
+                        // replaced (a different park re-enters here) or
+                        // discharged (the handoff consumes it).
+                        self.pending_arrival = arrival;
+                    }
                 }
                 self.pending_worn = park;
                 SyncLookOutcome { worn, parked }
@@ -6151,6 +8885,32 @@ impl PetBrain {
             || self.wriggle_t > 0.0
             || self.hide_to.is_some()
             || self.hiding
+            // The stream watch must tick to lapse (bounded by
+            // [`STREAM_LAPSE`] past the last event).
+            || self.stream
+            // The variety wave's landed beats: the sleeper's drop is latched
+            // for one tick and spent by the drop arm, its stare is
+            // [`DROP_SIT`] of a SETTLED pose (which the ladder below would
+            // otherwise release), the commit stare is [`COMMIT_STARE`] of a
+            // stand, and the scrabble is a longer landing recovery — all
+            // finite by construction.
+            //
+            // BELT AND BRACES, and worth saying so rather than letting the
+            // next reader assume otherwise: none of these four is ever the
+            // DECIDING term in a state that is reachable. `pending_drop`
+            // implies `Waking` and `scrabble` implies `Land`, both of which
+            // the unsettled-pose term below already holds the lane for;
+            // `drop_sit_t` implies `Sit` and `commit_t` implies `Stand`,
+            // both settled but always entered with `quiet` a fraction of a
+            // second old, which the settle window below already covers.
+            // Removing all four leaves the crate green — measured. They are
+            // kept because each states the beat's OWN claim on the lane, so
+            // a later change that let one outlive its pose is caught here
+            // rather than by whichever coarser term happened to cover it.
+            || self.pending_drop
+            || self.drop_sit_t > 0.0
+            || self.commit_t > 0.0
+            || self.scrabble
         {
             return true;
         }
@@ -6740,7 +9500,8 @@ mod tests {
                         f.lift > 0.0
                             || matches!(
                                 f.pose,
-                                PetGlyphId::PetLeapRise
+                                PetGlyphId::PetLaunch
+                                    | PetGlyphId::PetLeapRise
                                     | PetGlyphId::PetLeap
                                     | PetGlyphId::PetLeapDescend
                             )
@@ -6956,9 +9717,69 @@ mod tests {
         let mut worked = PetBrain::default();
         let t = awake(&mut worked, start, 3, 2);
         let (t, _) = type_run(&mut worked, t, 3, 4, 40, 0.05);
-        let (_, f) = idle(&mut worked, t, (3, 44), SIT_AFTER + 0.6);
-        assert_eq!(f.action, PetAction::Purr, "a sentence of running earns it");
-        assert!(f.purr > 0.0);
+        // THE TELL COMES FIRST, and it is seed-independent: a content cat
+        // is purring from the moment it sits down, whatever pose the dealt
+        // dwell later turns up ([`PetBrain::purring`]). This is the half of
+        // upstream's ladder that was right — it purred from [`SIT_AFTER`] —
+        // recovered without giving the seat's window back up.
+        let (_, f) = idle(&mut worked, t, (3, 44), SIT_AFTER + 0.2);
+        assert_eq!(f.action, PetAction::Sit, "the seat still comes first");
+        assert!(f.purr > 0.0, "a sentence of running earns the purr at once");
+
+        // …and the POSE is the long dwell's, on the two hands in three the
+        // dwell is dealt to. Past the LONGEST dealt loaf onset
+        // (`loaf_after()` 2.8/3.6/4.4) a purring hand wears `PetPurr`; the
+        // third hand loafs, which is what puts the loaf's own beats back
+        // within reach of a cat that works.
+        let mut purred = 0u32;
+        let mut loafed = 0u32;
+        for seed in 0..12u8 {
+            let mut w = PetBrain::default();
+            let t0 = awake(&mut w, start, 3, 2);
+            let (t0, _) = type_run(&mut w, t0, 3, 4, 40, 0.05);
+            let (t0, _) = idle(&mut w, t0, (3, 44), SIT_AFTER + 0.1);
+            w.force_seed(seed);
+            let (_, f) = idle(&mut w, t0, (3, 44), 3.4);
+            assert!(f.purr > 0.0, "hand {seed}: the tell rides the whole dwell");
+            match f.action {
+                PetAction::Purr => purred += 1,
+                PetAction::Loaf => loafed += 1,
+                other => {
+                    panic!("hand {seed}: a content long dwell is one or the other, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(purred, 8, "two hands in three purr ({purred}/12)");
+        assert_eq!(loafed, 4, "…and one in three loafs ({loafed}/12)");
+
+        // …and the WINDOW the reorder took away is pinned where the old one
+        // used to be. Upstream ranked the purr above the loaf, so a content
+        // cat purred from [`SIT_AFTER`] onward and the whole dealt seat was
+        // unreachable for anyone who types. The seat comes first now: at
+        // `SIT_AFTER + 0.6` a working cat is still SITTING, for every hand
+        // the deal can turn up.
+        for seed in 0..12u8 {
+            let mut w = PetBrain::default();
+            let t = awake(&mut w, start, 3, 2);
+            let (t, _) = type_run(&mut w, t, 3, 4, 40, 0.05);
+            let (t2, seated) = idle(&mut w, t, (3, 44), 1.2);
+            assert!(
+                seated.action.settled(),
+                "fixture: seed {seed} settles, got {:?}",
+                seated.action
+            );
+            w.force_seed(seed);
+            let (_, e) = idle(&mut w, t2, (3, 44), 0.8);
+            assert!(
+                w.content >= PURR_GATE,
+                "fixture: seed {seed} is a content cat"
+            );
+            assert_eq!(
+                e.action,
+                PetAction::Sit,
+                "hand {seed}: the seat comes before the purr"
+            );
+        }
 
         // A cat that has only just woken up and taken two steps has not earned
         // anything: contentment is bought with travel, not with elapsed time.
@@ -7340,6 +10161,142 @@ mod tests {
         );
     }
 
+    // ── the lateral walk (variety wave): the amble and its cadence ──────
+
+    /// Drive `keys` keystrokes at `gap` seconds each from a settled, awake
+    /// cat and return every frame's `(action, pose, stride)` — the gait
+    /// tests read the whole run, not just its last frame.
+    fn gait_run(gap: f32, keys: u16) -> Vec<(PetAction, PetGlyphId, f32)> {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 3, 5);
+        let mut out = Vec::new();
+        for k in 0..keys {
+            let until = t + Duration::from_secs_f32(gap);
+            while t < until {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((3, 7 + k))));
+                out.push((f.action, f.pose, pet.stride));
+            }
+            t = until;
+            let f = pet.tick(sense(t, Some((3, 8 + k))));
+            out.push((f.action, f.pose, pet.stride));
+        }
+        out
+    }
+
+    /// Which cycle a walk pose came from, and its beat: `(lateral, index)`.
+    fn cycle_beat(pose: PetGlyphId) -> Option<(bool, usize)> {
+        if let Some(i) = PetBrain::CYCLE_LWALK.iter().position(|p| *p == pose) {
+            return Some((true, i));
+        }
+        PetBrain::CYCLE_WALK
+            .iter()
+            .position(|p| *p == pose)
+            .map(|i| (false, i))
+    }
+
+    /// THE AMBLE (variety wave): a caret the pet can stroll after gets the
+    /// lateral walk — one leg at a time — and a brisker one gets the trot.
+    /// Measured, not asserted by taste: the follower peaks at 5.1 cells/s
+    /// under a 0.45 s peck (inside the amble's 5.5 ceiling) and at 6.9
+    /// under a 0.30 s prose cadence (past it).
+    #[test]
+    fn a_slow_caret_walks_laterally_and_a_brisk_one_trots() {
+        let slow = gait_run(0.45, 12);
+        let slow_walk: Vec<PetGlyphId> = slow
+            .iter()
+            .filter(|(a, _, _)| *a == PetAction::Walk)
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert!(
+            slow_walk.len() > 40,
+            "fixture: a pecking caret must walk the cat ({} frames)",
+            slow_walk.len()
+        );
+        assert!(
+            slow_walk.iter().all(|p| PetBrain::CYCLE_LWALK.contains(p)),
+            "a pecked caret is ambled after, never trotted after: {:?}",
+            slow_walk
+                .iter()
+                .filter(|p| !PetBrain::CYCLE_LWALK.contains(p))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            slow.iter().all(|(a, _, _)| *a != PetAction::Run),
+            "fixture: and never runs"
+        );
+
+        let brisk = gait_run(0.30, 12);
+        let brisk_walk: Vec<PetGlyphId> = brisk
+            .iter()
+            .filter(|(a, _, _)| *a == PetAction::Walk)
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert!(
+            brisk_walk.iter().any(|p| PetBrain::CYCLE_WALK.contains(p)),
+            "a prose cadence earns the trot"
+        );
+
+        // ACROSS THE FLIP the stride is a cycle count, not a phase in cells:
+        // swapping the divisor changes the cadence and never the beat, so
+        // consecutive walk frames step the cycle by at most one.
+        let mut prev: Option<usize> = None;
+        for (a, pose, _) in &brisk {
+            if *a != PetAction::Walk {
+                prev = None;
+                continue;
+            }
+            let (_, idx) = cycle_beat(*pose).expect("a walk frame is a walk pose");
+            if let Some(p) = prev {
+                let step = (idx + 4 - p) % 4;
+                assert!(
+                    step <= 1,
+                    "the gait skipped from beat {p} to {idx} across the flip"
+                );
+            }
+            prev = Some(idx);
+        }
+    }
+
+    /// The gallop's frame-rate law, the amble's half: the constant-vs-constant
+    /// part is a build-time `const _` beside [`LAT_STRIDE_CELLS`]; what is
+    /// left here is that the lateral gait on glass actually paces itself by
+    /// that stride — every beat holding at least two ticks of a 60 fps lane.
+    #[test]
+    fn the_lateral_walk_cycle_never_exceeds_half_frame_rate() {
+        let run = gait_run(0.45, 12);
+        let mut prev: Option<f32> = None;
+        let mut worst = 0.0f32;
+        let mut beats = 0usize;
+        for (a, pose, stride) in &run {
+            if *a != PetAction::Walk {
+                prev = None;
+                continue;
+            }
+            assert!(
+                PetBrain::CYCLE_LWALK.contains(pose),
+                "fixture: this cadence must amble"
+            );
+            beats += 1;
+            if let Some(p) = prev {
+                worst = worst.max((stride - p).abs());
+            }
+            prev = Some(*stride);
+        }
+        assert!(
+            beats > 40,
+            "fixture: need a sustained amble ({beats} frames)"
+        );
+        // A four-beat cycle holds each beat for a quarter of a cycle, so two
+        // ticks a beat is an eighth of a cycle a tick.
+        assert!(
+            worst <= 0.125,
+            "the amble cycled {worst} of a cycle in one tick — under two \
+             ticks a beat"
+        );
+    }
+
     // ── the keep-ahead lead ─────────────────────────────────────────────
 
     /// "I'd like for it to keep ahead of the cursor": under a sustained
@@ -7557,8 +10514,16 @@ mod tests {
             poses.contains(&PetGlyphId::PetCrouchWiggle) && poses.contains(&PetGlyphId::PetCrouch),
             "the gather must alternate crouch and wiggle"
         );
+        // The notice, and EXACTLY which frame it wears: a screen-crossing
+        // move latches its jump before the double-take, and a perk with a
+        // jump latched looks where it is going (BV-4). A disjunct over the
+        // two perk frames would be a weaker statement than this fixture —
+        // the one place the whole choreography is enumerated — can make.
+        assert!(
+            poses.contains(&PetGlyphId::PetPerkTurn),
+            "choreography must include the notice, turned toward the crossing"
+        );
         for id in [
-            PetGlyphId::PetPerk,
             PetGlyphId::PetLeapRise,
             PetGlyphId::PetLeap,
             PetGlyphId::PetLeapDescend,
@@ -7769,6 +10734,681 @@ mod tests {
         );
     }
 
+    // ── the sleeper's drop (variety wave, BV-7) ─────────────────────────
+
+    /// Drive `ticks` frames with the caret at `caret` and hand back every
+    /// frame — the drop's whole beat is what is under test, not its end.
+    fn drop_run(
+        pet: &mut PetBrain,
+        start: Instant,
+        caret: (u16, u16),
+        ticks: u32,
+    ) -> Vec<PetFrame> {
+        let mut t = start;
+        let mut out = Vec::new();
+        for _ in 0..ticks {
+            t += Duration::from_millis(16);
+            out.push(pet.tick(sense(t, Some(caret))));
+        }
+        out
+    }
+
+    /// Take a fresh pet to a DEEP sleep at `(row, col)` and hand back the
+    /// clock — every drop fixture starts here.
+    fn asleep_at(pet: &mut PetBrain, start: Instant, row: u16, col: u16) -> Instant {
+        let t = awake(pet, start, row, col);
+        let (t, f) = idle(pet, t, (row, col + 2), SLEEP_AFTER + 1.0);
+        assert_eq!(f.action, PetAction::Sleep, "fixture: a sleeping cat");
+        t
+    }
+
+    /// THE SLEEPER'S DROP: an Enter exactly one row under a sleeping cat is
+    /// the floor going out from under it. It falls — still asleep for the
+    /// first frames, the wake stretch spent in the air — lands, sits where
+    /// it fell and stares at whoever moved the floor, and only then takes
+    /// the ordinary quiet trip home. Never the show.
+    #[test]
+    fn an_enter_drops_the_sleeper_off_the_line() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = asleep_at(&mut pet, start, 4, 18);
+        let col0 = pet.col;
+        let frames = drop_run(&mut pet, t, (5, 0), 200);
+
+        // Off the ledge inside three ticks, asleep, with no arc at all.
+        let f0 = &frames[0];
+        assert_eq!(f0.action, PetAction::Leap, "the floor went: the cat falls");
+        assert_eq!(f0.pose, PetGlyphId::PetSleep1, "and it is still asleep");
+        assert_eq!(f0.lift, 0.0, "a fall has no arc");
+        assert!(
+            frames.iter().all(|f| f.action != PetAction::Waking),
+            "the stretch is spent in the air, never on the old floor"
+        );
+        assert!(
+            frames.iter().all(|f| f.pose != PetGlyphId::PetCrouchWiggle),
+            "and a fall is not a show"
+        );
+        assert!(
+            frames
+                .iter()
+                .take_while(|f| f.action == PetAction::Leap)
+                .any(|f| f.pose == PetGlyphId::PetStretch),
+            "the wake stretch plays where the drop put it"
+        );
+
+        // Straight down: one row inside 0.2 s, and never a sideways cell.
+        let landed = frames
+            .iter()
+            .position(|f| f.action == PetAction::Land)
+            .expect("the fall must land");
+        assert!(
+            landed <= 13,
+            "a one-row fall is over inside 0.2 s ({landed} ticks)"
+        );
+        assert!(
+            (frames[landed].row - 5.0).abs() < 0.01,
+            "onto the row the line opened, got {}",
+            frames[landed].row
+        );
+        let mut prev = col0;
+        for f in &frames[..=landed] {
+            assert!(
+                (f.col - prev).abs() < 0.01,
+                "a fall is straight down: {prev} -> {}",
+                f.col
+            );
+            prev = f.col;
+        }
+
+        // …and it lands in a stare: eye contact, planted, for its own beat.
+        let stare: Vec<&PetFrame> = frames[landed..]
+            .iter()
+            .skip_while(|f| f.action == PetAction::Land)
+            .take_while(|f| f.action == PetAction::Sit)
+            .collect();
+        assert!(
+            stare.len() >= 25,
+            "the stare holds its beat ({} ticks)",
+            stare.len()
+        );
+        for f in &stare {
+            assert_eq!(f.pose, PetGlyphId::PetSitFront, "facing whoever did it");
+            assert_eq!(f.lift, 0.0, "planted");
+        }
+        assert!(
+            stare.iter().all(|f| (f.col - prev).abs() < 0.01),
+            "and it stares from exactly where it fell"
+        );
+        assert!(
+            pet.speed.abs() < 0.01,
+            "at a standstill, speed {}",
+            pet.speed
+        );
+
+        // Then the ordinary ladder: a coil, one quiet flight, a landing.
+        let after: Vec<PetAction> = frames[landed + stare.len()..]
+            .iter()
+            .map(|f| f.action)
+            .collect();
+        assert!(
+            after.contains(&PetAction::Crouch) && after.contains(&PetAction::Leap),
+            "then it coils and takes the trip home: {after:?}"
+        );
+        let last = frames.last().expect("frames");
+        assert!(
+            last.action.settled()
+                && (last.col - PetBrain::station(0, 100, art_cols(10, 20))).abs() < 1.5,
+            "and it ends home at its station, got {} ({:?})",
+            last.col,
+            last.action
+        );
+        // …and the whole beat is idle-to-zero: nothing the fall latched is
+        // still owed once the cat is asleep again.
+        let (_, f) = idle(&mut pet, t, (5, 0), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+        assert_eq!(f.action, PetAction::Sleep);
+        assert!(
+            !pet.needs_frames(),
+            "the drop's latches must all be spent by the time it sleeps"
+        );
+    }
+
+    /// A WOKEN CAT DOES NOT LOOK UP TWICE.
+    ///
+    /// The fall already ends in [`DROP_SIT`] = 0.5 s of eye contact with
+    /// whoever moved the floor — that IS the double take the notice rule
+    /// exists to play. Before `drop_stare` the trip home asked for another
+    /// [`PERK_HOLD`] on top of it, which made S7 the slowest new-line
+    /// reaction in the product: measured on the probe, `Sit@+0.47
+    /// Perk@+0.98 Crouch@+1.28 … Sit@+2.40`. The beat is not deleted, it is
+    /// spent — the stare is where it was paid.
+    #[test]
+    fn a_woken_cat_does_not_look_up_twice() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = asleep_at(&mut pet, start, 4, 18);
+        // Far enough left that the trip home predicts as a BOUND, which is
+        // the only flight the notice rule gates.
+        let frames = drop_run(&mut pet, t, (5, 60), 200);
+        let landed = frames
+            .iter()
+            .position(|f| f.action == PetAction::Land)
+            .expect("the fall must land");
+        let launched = frames
+            .iter()
+            .rposition(|f| f.action == PetAction::Leap)
+            .expect("and then take the trip home");
+        assert!(launched > landed, "fixture: the trip home follows the fall");
+        assert!(
+            frames[landed..launched]
+                .iter()
+                .all(|f| f.action != PetAction::Perk),
+            "the fall's stare is the double take; nothing looks up again: {:?}",
+            frames[landed..launched]
+                .iter()
+                .map(|f| f.action)
+                .collect::<Vec<_>>()
+        );
+        // …and the stare itself is untouched — this rule spends the notice,
+        // it does not cut the beat that replaced it.
+        let stare = frames[landed..launched]
+            .iter()
+            .filter(|f| f.action == PetAction::Sit)
+            .count();
+        assert!(
+            stare >= 25,
+            "the stare keeps its whole hold ({stare} ticks)"
+        );
+    }
+
+    /// THE STALE-LATCH GUARD, and the reason `drop_stare` is cleared in two
+    /// places rather than one: a cat that fell, stared and then SETTLED has
+    /// spent the beat, so the next unexplained jump gets its notice back.
+    /// Left standing, the latch would silently eat every later double take
+    /// for the rest of the session (the `quiet_leap` bug, one beat over).
+    #[test]
+    fn a_settled_cat_after_a_drop_still_notices() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = asleep_at(&mut pet, start, 4, 18);
+        // The caret opens a line directly under the cat, so the fall lands
+        // the cat at its station and no trip home is owed…
+        let frames = drop_run(&mut pet, t, (5, 18), 400);
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Leap),
+            "fixture: the floor went and the cat fell"
+        );
+        let mut t = t + Duration::from_millis(16 * 400);
+        let (t2, f) = idle(&mut pet, t, (5, 18), SIT_AFTER + 0.5);
+        t = t2;
+        assert!(f.action.settled(), "fixture: settled where it fell");
+        assert!(
+            !pet.drop_stare,
+            "the fall's beat is spent by settling, not carried"
+        );
+        // …and NOW a prompt redraw far away must get its notice.
+        let mut perked = false;
+        let mut launched = false;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((5, 80))));
+            perked |= f.action == PetAction::Perk;
+            launched |= f.action == PetAction::Leap;
+        }
+        assert!(perked, "a settled cat still looks up before a bound");
+        assert!(launched, "…and then goes");
+    }
+
+    /// A caret going UP is not a hole in the floor: the ordinary wake, with
+    /// its stretch on the ground where the cat already is.""
+    #[test]
+    fn a_caret_going_up_is_not_a_hole_in_the_floor() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = asleep_at(&mut pet, start, 4, 18);
+        let frames = drop_run(&mut pet, t, (3, 0), 40);
+        assert_eq!(frames[0].action, PetAction::Waking, "a wake, not a fall");
+        assert_eq!(frames[0].pose, PetGlyphId::PetStretch);
+        assert!(!pet.pending_drop, "and nothing is owed a fall afterwards");
+    }
+
+    /// A three-line prompt is not a hole in the floor either — a cat does
+    /// not fall past a floor it could have landed on.
+    #[test]
+    fn a_three_line_prompt_wakes_the_ordinary_way() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = asleep_at(&mut pet, start, 4, 18);
+        let frames = drop_run(&mut pet, t, (7, 0), 40);
+        assert_eq!(frames[0].action, PetAction::Waking, "a wake, not a fall");
+        assert_eq!(frames[0].pose, PetGlyphId::PetStretch);
+        assert!(
+            frames
+                .iter()
+                .take(37)
+                .all(|f| f.action == PetAction::Waking),
+            "the stretch keeps its whole hold"
+        );
+    }
+
+    /// …and the drop REFUSES ink under its own column: the row below is only
+    /// a floor if there is something to land on. The ordinary wake answers.
+    #[test]
+    fn the_drop_refuses_ink_under_its_own_column() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = asleep_at(&mut pet, start, 4, 18);
+        // The new line reaches under the sleeper's own column — but not the
+        // caret's station, so the ladder still answers with that row.
+        let mut spans = [(0u16, 0u16); 12];
+        spans[5] = (15, 40);
+        pet.sense_ink(0, &spans, Some(5));
+        assert!(
+            pet.col > 15.0 && pet.col < 40.0,
+            "fixture: ink under the cat"
+        );
+        let frames = drop_run(&mut pet, t, (5, 0), 40);
+        assert_eq!(
+            frames[0].action,
+            PetAction::Waking,
+            "nothing to land on: the ordinary wake"
+        );
+        assert_eq!(frames[0].pose, PetGlyphId::PetStretch);
+        assert!(!pet.pending_drop, "and the latch is spent, not left owing");
+    }
+
+    // ── the scrabble (variety wave, BV-9): the rarity gate first ────────
+
+    /// The run-lengths of consecutive `Land` frames in a drive.
+    fn land_runs(frames: &[PetFrame]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut run = 0usize;
+        for f in frames {
+            if f.action == PetAction::Land {
+                run += 1;
+            } else if run > 0 {
+                out.push(run);
+                run = 0;
+            }
+        }
+        if run > 0 {
+            out.push(run);
+        }
+        out
+    }
+
+    /// …and the same run-lengths paired with whether that recovery was the
+    /// BOUND's weighted one (`land_span > 0`), which is longer than the
+    /// scrabble's and is not one.
+    fn land_runs_tiered(frames: &[(PetFrame, bool)]) -> Vec<(usize, bool)> {
+        let mut out = Vec::new();
+        let mut run = 0usize;
+        let mut big = false;
+        for (f, b) in frames {
+            if f.action == PetAction::Land {
+                run += 1;
+                big |= *b;
+            } else if run > 0 {
+                out.push((run, big));
+                run = 0;
+                big = false;
+            }
+        }
+        if run > 0 {
+            out.push((run, big));
+        }
+        out
+    }
+
+    /// THE RARITY GATE, and it comes first: ordinary typing never scrabbles.
+    /// A failure beat that fired on the landings a user actually sees would
+    /// be a tic, so the miss is measured against the SAME keep-ahead
+    /// prediction the launch made — a pounce that led a still-typing caret
+    /// correctly cannot trip it — and rationed on top of that.
+    #[test]
+    fn ordinary_typing_never_scrabbles() {
+        // (a) the word jump mid-rhythm, then more typing (the
+        // a_pounce_mid_rhythm fixture).
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (mut t, _) = type_run(&mut pet, t, 4, 12, 20, 0.05);
+        let mut caret = 40u16;
+        let mut next_key = t + Duration::from_millis(50);
+        // Each frame paired with whether the recovery it belongs to is the
+        // BOUND's weighted one: in this tree the word jump the fixture opens
+        // is tiered as a bound, and a bound's landing is [`BIG_LAND_DUR`] by
+        // design — which is longer than the scrabble and has nothing to do
+        // with it.
+        let mut frames: Vec<(PetFrame, bool)> = Vec::new();
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            if t >= next_key {
+                next_key += Duration::from_millis(50);
+                caret = (caret + 1).min(95);
+            }
+            // THE RATION IS FORCED ON for every landing here, so what this
+            // test proves is the MISS measure and not the one-in-four
+            // stride/serial ration: with [`SCRABBLE_MISS`] mutated to zero
+            // the ration alone kept the fixture green (review, 2026-08-27).
+            // The stride is frozen while airborne, so the serial dealt here
+            // is the serial the touchdown reads.
+            if pet.flight.is_some() {
+                let k = (pet.stride as u32) % 4;
+                pet.mote_serial = u8::try_from((4 - k) % 4).expect("0..4");
+            }
+            frames.push((pet.tick(sense(t, Some((4, caret)))), pet.land_span > 0.0));
+            assert!(!pet.scrabble, "typing never scrabbles");
+        }
+        assert!(
+            frames.iter().any(|(f, _)| f.action == PetAction::Land),
+            "fixture: the word jump must pounce and land"
+        );
+        // THE SCRABBLE IS VISIBLE, and this is the tier-blind statement of
+        // it: the scramble's hunting frame is [`PetGlyphId::PetRun0`] worn
+        // during a `Land`, which nothing else in the recovery ever does.
+        assert!(
+            frames
+                .iter()
+                .all(|(f, _)| f.action != PetAction::Land || f.pose != PetGlyphId::PetRun0),
+            "a typing landing never scrabbles for its footing"
+        );
+        // …and each recovery is exactly the length its own tier earns.
+        for (run, big) in land_runs_tiered(&frames) {
+            let (bar, what) = if big {
+                (26, "the bound's weighted recovery")
+            } else {
+                (18, "the ordinary recovery")
+            };
+            assert!(run <= bar, "a typing landing is {what}, got {run} ticks");
+        }
+
+        // (b) the sustained gallop (the frame-rate fixture): one column
+        // every three ticks, which chases without ever launching.
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 3, 2);
+        let mut caret = 4u16;
+        for i in 0..240 {
+            t += Duration::from_millis(16);
+            if i % 3 == 2 {
+                caret = (caret + 1).min(95);
+            }
+            let _ = pet.tick(sense(t, Some((3, caret))));
+            assert!(!pet.scrabble, "a gallop never scrabbles");
+        }
+    }
+
+    /// Land a pounce a long way from where the station ended up: the caret
+    /// jumps twice while the cat is airborne, so the one mid-air re-aim is
+    /// spent and the landing column is stale by tens of cells. `on_gate`
+    /// puts the stride/serial ration on (or off) the scrabble's one in four.
+    fn missed_landing(on_gate: bool) -> Vec<PetFrame> {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        let mut caret = 30u16;
+        let (mut two, mut three, mut dealt) = (false, false, false);
+        let mut out = Vec::new();
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            if let Some(f) = pet.flight {
+                let u = f.t / f.dur;
+                if !two && u >= 0.3 {
+                    caret = 60;
+                    two = true;
+                } else if two && !three && u >= 0.6 {
+                    caret = 20;
+                    three = true;
+                }
+                if three && !dealt && u >= 0.8 {
+                    dealt = true;
+                    let k = (pet.stride as u32) % 4;
+                    let want: u32 = u32::from(!on_gate);
+                    pet.mote_serial = u8::try_from((4 + want - k) % 4).expect("0..4");
+                }
+            }
+            out.push(pet.tick(sense(t, Some((4, caret)))));
+        }
+        assert!(
+            dealt,
+            "fixture: the ration must be dealt before the landing"
+        );
+        out
+    }
+
+    /// …and a landing that genuinely missed MAY scrabble: on the ration the
+    /// recovery is the long one and the paws hunt for the ground (the
+    /// gallop's first beat with a 3 Hz wobble over it — the frame this beat
+    /// KEEPS, after a dedicated pose was authored, rendered at 34 and 68 px
+    /// and refused for reading as the landing at ship size; the reasoning
+    /// is at the arm in `emit`); off it, the ordinary landing, unchanged.
+    #[test]
+    fn a_landing_far_from_the_moved_station_may_scrabble() {
+        let on = missed_landing(true);
+        let runs = land_runs(&on);
+        let run = *runs.first().expect("the pounce lands");
+        assert!(
+            run >= 22,
+            "on the ration the recovery is [`SCRABBLE_DUR`], got {run} ticks"
+        );
+        let poses: Vec<PetGlyphId> = on
+            .iter()
+            .skip_while(|f| f.action != PetAction::Land)
+            .take_while(|f| f.action == PetAction::Land)
+            .map(|f| f.pose)
+            .collect();
+        assert_eq!(poses[0], PetGlyphId::PetLand, "braced first");
+        assert!(
+            poses.iter().filter(|p| **p == PetGlyphId::PetLand).count() >= 8,
+            "for [`SCRABBLE_PLANT`] before the paws start hunting: {poses:?}"
+        );
+        assert_eq!(
+            *poses.last().expect("poses"),
+            PetGlyphId::PetRun0,
+            "then it scrabbles"
+        );
+        assert!(
+            on.iter().any(|f| f
+                .motes
+                .iter()
+                .flatten()
+                .any(|m| m.kind == PetMoteKind::Dust)),
+            "and the scramble kicks its own dust"
+        );
+
+        let off = missed_landing(false);
+        let run = *land_runs(&off).first().expect("the pounce lands");
+        assert!(
+            run <= 18,
+            "off the ration the landing is the ordinary one, got {run} ticks"
+        );
+        assert!(
+            off.iter()
+                .skip_while(|f| f.action != PetAction::Land)
+                .take_while(|f| f.action == PetAction::Land)
+                .all(|f| f.pose == PetGlyphId::PetLand),
+            "and it never scrabbles"
+        );
+
+        // …AND THE MISS IS THE MEASURE, not the move. One mid-air jump the
+        // flight's own re-aim ABSORBS (a ten-cell jump back, rebased onto
+        // the station the caret asked for) lands where it was going, so
+        // however hard the ration is forced there is nothing to scrabble
+        // about (review, 2026-08-27: with the ration on, the gate has to be
+        // the miss).
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        let mut caret = 30u16;
+        let (mut moved, mut dealt) = (false, false);
+        let mut absorbed = Vec::new();
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            if let Some(f) = pet.flight {
+                let u = f.t / f.dur;
+                if !moved && u >= 0.3 {
+                    caret = 20;
+                    moved = true;
+                }
+                if moved && !dealt && u >= 0.8 {
+                    dealt = true;
+                    let k = (pet.stride as u32) % 4;
+                    pet.mote_serial = u8::try_from((4 - k) % 4).expect("0..4");
+                }
+            }
+            absorbed.push(pet.tick(sense(t, Some((4, caret)))));
+            assert!(
+                !pet.scrabble,
+                "a landing the re-aim brought home never scrabbles"
+            );
+        }
+        assert!(
+            dealt,
+            "fixture: the re-aim happened and the ration was dealt"
+        );
+        let run = *land_runs(&absorbed).first().expect("the pounce lands");
+        assert!(
+            run <= 18,
+            "and its recovery is the ordinary one, got {run} ticks"
+        );
+    }
+
+    // ── I meant to do that (variety wave, BV-8) ─────────────────────────
+
+    /// Fly a pounce that the caret moves out from under TWICE: the first
+    /// big move mid-air spends the flight's one re-aim, the second has
+    /// nothing left to spend. Returns every frame from the launch on,
+    /// paired with the stare clock.
+    fn twice_moved(third: Option<u16>) -> (PetBrain, Vec<(PetFrame, f32)>) {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        let mut caret = 30u16;
+        let (mut two, mut three, mut fourth) = (false, false, false);
+        let mut out = Vec::new();
+        for _ in 0..300 {
+            t += Duration::from_millis(16);
+            if let Some(f) = pet.flight {
+                let u = f.t / f.dur;
+                if !two && u >= 0.3 {
+                    caret = 60;
+                    two = true;
+                } else if two && !three && u >= 0.6 {
+                    caret = 20;
+                    three = true;
+                }
+            }
+            // The optional THIRD jump, dealt the moment the stare begins.
+            if let Some(c) = third
+                && !fourth
+                && pet.commit_t > 0.0
+                && pet.action == PetAction::Stand
+            {
+                caret = c;
+                fourth = true;
+            }
+            out.push((pet.tick(sense(t, Some((4, caret)))), pet.commit_t));
+        }
+        assert!(
+            two && three,
+            "fixture: the caret must move twice in the air"
+        );
+        (pet, out)
+    }
+
+    /// I MEANT TO DO THAT: a flight moved twice lands on a cell the caret
+    /// has already left. The cat stands on it, looks at it for a beat —
+    /// facing exactly the way it flew, which is the whole joke — then does
+    /// the double-take after the caret and takes the ordinary trip home.
+    #[test]
+    fn a_twice_moved_flight_lands_and_stares_before_it_admits_it() {
+        let (pet, frames) = twice_moved(None);
+        let landed = frames
+            .iter()
+            .position(|(f, _)| f.action == PetAction::Land)
+            .expect("the pounce lands");
+        let stare: Vec<&PetFrame> = frames[landed..]
+            .iter()
+            .skip_while(|(f, _)| f.action == PetAction::Land)
+            .take_while(|(f, _)| f.action == PetAction::Stand)
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            stare.len() >= 14,
+            "the stare holds [`COMMIT_STARE`] ({} ticks)",
+            stare.len()
+        );
+        for f in &stare {
+            assert!(!f.facing_left, "facing the way it flew — that IS the joke");
+            assert_eq!(f.lift, 0.0, "planted on the empty cell");
+        }
+        let after: Vec<&PetFrame> = frames[landed + stare.len()..]
+            .iter()
+            .map(|(f, _)| f)
+            .collect();
+        let perk = after
+            .iter()
+            .position(|f| f.action == PetAction::Perk)
+            .expect("then the double-take");
+        assert!(
+            after[perk].facing_left,
+            "…which turns the head after the caret"
+        );
+        let tail: Vec<PetAction> = after[perk..].iter().map(|f| f.action).collect();
+        assert!(
+            tail.contains(&PetAction::Crouch) && tail.contains(&PetAction::Leap),
+            "and then it goes: {tail:?}"
+        );
+        let last = frames.last().expect("frames").0;
+        assert!(
+            (last.col - PetBrain::station(20, 100, art_cols(10, 20))).abs() < 1.5,
+            "home at the station it was left with, got {}",
+            last.col
+        );
+        assert_eq!(pet.commit_t, 0.0, "and the beat is spent, not owed");
+    }
+
+    /// A THIRD jump abandons the stare: a beat about being wrong is not
+    /// worth being wrong twice for — but never before the frame-rate law's
+    /// floor, or the abandon is a one-frame flash of `PetStand` between the
+    /// landing and the coil.
+    #[test]
+    fn a_third_jump_abandons_the_stare() {
+        let (_, frames) = twice_moved(Some(4));
+        let landed = frames
+            .iter()
+            .position(|(f, _)| f.action == PetAction::Land)
+            .expect("the pounce lands");
+        // THE BEAT WAS ARMED. Without this the whole test passes with the
+        // stare deleted: a stare that never existed is also a short one.
+        assert!(
+            frames[landed..].iter().any(|(_, c)| *c > 0.0),
+            "fixture: the stare arms before the third jump takes it away"
+        );
+        let stare = frames[landed..]
+            .iter()
+            .skip_while(|(f, _)| f.action == PetAction::Land)
+            .take_while(|(f, _)| f.action == PetAction::Stand)
+            .count();
+        assert!(
+            stare >= 2,
+            "a pose swap holds two ticks even when it is abandoned ({stare} ticks)"
+        );
+        assert!(
+            stare <= 4,
+            "the third jump cuts the stare short ({stare} ticks)"
+        );
+        let after: Vec<PetAction> = frames[landed + stare..]
+            .iter()
+            .map(|(f, _)| f.action)
+            .take(40)
+            .collect();
+        assert!(
+            after.contains(&PetAction::Crouch) || after.contains(&PetAction::Leap),
+            "it leaves at once instead: {after:?}"
+        );
+    }
+
     // ── the athletic vocabulary (DESIGN-kitty-motion §3, rungs 7-10) ────
 
     /// §8.7: the coil and its release land as ONE change — across the
@@ -7948,9 +11588,17 @@ mod tests {
         }
         // And on glass: every airborne frame of an Enter hop carries the
         // exact parabola of its own live arc.
+        //
+        // A SHORT Enter, deliberately. The fixture used to cross 28 columns,
+        // which the launch-time law now tiers UP into a bound
+        // ([`POUNCE_SPAN_MAX`] is 23.1 equivalent cells, and a row counts as
+        // [`ROW_AS_COLS`] of them): flown as a hop it would have to be a
+        // 0.42 s arc landing short, or a glide. The parabola under test is
+        // the NON-big lift's, so the fixture flies a span the hop tier
+        // really owns.
         let start = Instant::now();
         let mut pet = PetBrain::default();
-        let mut t = awake(&mut pet, start, 4, 30);
+        let mut t = awake(&mut pet, start, 4, 10);
         let mut airborne = false;
         for _ in 0..200 {
             t += Duration::from_millis(16);
@@ -8180,7 +11828,12 @@ mod tests {
         for _ in 0..320 {
             t += Duration::from_millis(16);
             let f = pet.tick(sense(t, Some((3, 44))));
-            if f.action == PetAction::Purr {
+            // MEASURED ON THE TELL, not on the pose. The swell moved out of
+            // the `Purr` arm and onto every settled frame a content cat has
+            // ([`PetBrain::purring`]), and one long dwell in three is dealt
+            // the LOAF — so a fixture pinned to `action == Purr` was pinned
+            // to the deal rather than to the swell.
+            if f.purr > 0.0 {
                 min_scale_y = min_scale_y.min(f.scale_y);
                 max_scale_y = max_scale_y.max(f.scale_y);
             }
@@ -8522,8 +12175,9 @@ mod tests {
                 saw_droop = true;
                 assert_eq!(
                     f.pose,
-                    PetGlyphId::PetLoaf,
-                    "the droop borrows the loaf until the flat-ears frame lands"
+                    PetGlyphId::PetDroop,
+                    "the sulk wears its own flat-ears frame — off its feet, \
+                     the grief interrupted a stand"
                 );
                 assert!(f.motes.iter().all(Option::is_none), "grief floats NOTHING");
             }
@@ -9006,11 +12660,20 @@ mod tests {
         let (mut t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.3);
         pet.note_peek(t, 22.0, 4.0);
         // The caret jumps the same instant: work first.
+        //
+        // A 22-column jump, not 26. The launch law tiers a flight by its
+        // span now ([`POUNCE_SPAN_MAX`] = 23.1 equivalent cells), and a
+        // 26-column trip is a BOUND — whose heavier landing
+        // ([`BIG_LAND_DUR`]) puts the pet back on its feet 1.54 s after the
+        // peek was noted, 36 ms past [`BAT_TTL`]. That is the TTL doing its
+        // job (the head really has pulled back by then), not the ranking
+        // failing, so the fixture asks its question with a span the pounce
+        // tier owns and the ranking is what gets tested.
         let mut first_land: Option<f32> = None;
         let mut swiped_after_land = false;
         for _ in 0..250 {
             t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 40))));
+            let f = pet.tick(sense(t, Some((4, 36))));
             if f.action == PetAction::Land && first_land.is_none() {
                 first_land = Some(f.col);
             }
@@ -9020,7 +12683,7 @@ mod tests {
             }
         }
         let w = art_cols(10, 20);
-        let station = PetBrain::station(40, 100, w);
+        let station = PetBrain::station(36, 100, w);
         let land = first_land.expect("the caret jump must fly");
         assert!(
             (land - station).abs() < 6.0,
@@ -9059,31 +12722,6 @@ mod tests {
     }
 
     // ── wave 2: idle micro-life ─────────────────────────────────────────
-
-    #[test]
-    fn an_output_pulse_twitches_the_settled_ear() {
-        let start = Instant::now();
-        let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 12);
-        let (mut t, _) = idle(&mut pet, t, (4, 14), 0.4);
-        // ONE burst frame — a pulse, not a stream (heat stays far below
-        // the watch gate).
-        t += Duration::from_millis(16);
-        let mut s = sense(t, Some((4, 14)));
-        s.output_burst = true;
-        let _ = pet.tick(s);
-        let mut bobbed = false;
-        for _ in 0..10 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 14))));
-            assert_ne!(f.action, PetAction::Perk, "a pulse is not a stream");
-            assert!(f.motes.iter().all(Option::is_none), "and floats nothing");
-            if (f.scale_y - 1.0).abs() > 0.005 {
-                bobbed = true;
-            }
-        }
-        assert!(bobbed, "the ear twitch: a visible 2% bob, nothing more");
-    }
 
     #[test]
     fn flick_beats_are_quiet_phased() {
@@ -9519,6 +13157,102 @@ mod tests {
         assert!(
             ghost_frames > (EDGE_FADE / 0.016) as u32 + 4,
             "…and lived a run's life, not a re-dress fade ({ghost_frames} frames)"
+        );
+    }
+
+    /// A FLIGHT FINISHES ON WALL TIME EVEN WHEN THE HOST WITHHELD FRAMES.
+    ///
+    /// `redraw_window` returns at the glass boundary while a DEC-2026
+    /// synchronized-output bracket is open — up to `SYNC_HOLD_CAP` (150 ms) —
+    /// and the pet is not ticked at all for that hold. A full-screen TUI
+    /// brackets every repaint, so this is most frames of every stream in the
+    /// app the owner uses most.
+    ///
+    /// Against the 100 ms MOTION clamp that was a 50 ms deficit per bracket,
+    /// unbounded across brackets: the arc hung in mid-air and landed late and
+    /// behind the caret, and the follower closed the gap in a lunge. No test
+    /// could see it — 177 of this file's ~185 tick steps are a uniform 16 ms,
+    /// a cadence the host never produces. This one drives the cadence the host
+    /// ACTUALLY produces.
+    #[test]
+    fn a_flight_lands_on_wall_time_through_synchronized_output_holds() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 20);
+
+        // Launch a bound with a known authored duration, then advance wall
+        // time in 150 ms sync-hold steps — the host's worst case.
+        // Span chosen lawful under HOP_SPEED_MAX (55 c/s): 20 cells / 0.45 s
+        // = 44.4 c/s.
+        pet.begin_arc(40.0, 4.0, 0.45, 1.0, FlightKind::PLAIN);
+        let dur = pet.flight.expect("fixture: airborne").dur;
+
+        let mut waited = 0.0f32;
+        for _ in 0..40 {
+            t += Duration::from_millis(150);
+            waited += 0.150;
+            let _ = pet.tick(sense(t, Some((4, 20))));
+            if pet.flight.is_none() {
+                break;
+            }
+        }
+
+        assert!(
+            pet.flight.is_none(),
+            "the flight never completed: {waited:.2}s of wall time elapsed \
+             against an authored {dur:.2}s duration"
+        );
+        // The landing may overshoot by at most ONE hold, never accumulate.
+        assert!(
+            waited <= dur + 0.16,
+            "the arc fell behind wall time: took {waited:.2}s to fly {dur:.2}s \
+             (a per-bracket deficit that compounds)"
+        );
+    }
+
+    /// THE HOST'S REAL SEQUENCE, and the reason the test above was not
+    /// enough: the seam sends `Ceremony` EXACTLY ONCE. `commit_hello` flips
+    /// the tenure latch to `Quiet` on the very frame the park is taken, so
+    /// every one of the ~156 frames remaining in `HANDOFF_DEBOUNCE` re-syncs
+    /// the SAME standing park with `PetArrival::Quiet`.
+    ///
+    /// A brain that lets an agreeing re-sync rewrite the parked arrival
+    /// therefore downgrades every ceremony to the in-place re-dress before
+    /// the handoff ever fires — the whole arrival wave, dead on glass, with
+    /// `a_ceremony_park_still_runs_today_s_theater` green the entire time
+    /// because it holds `Ceremony` high for all 600 frames.
+    ///
+    /// THE LAW: the PARK EDGE owns the arrival. A standing park keeps the
+    /// ruling it was taken under until it is replaced or discharged.
+    #[test]
+    fn an_agreeing_re_sync_cannot_downgrade_a_parked_ceremony() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 48);
+        assert_eq!(pet.sync_look((3, 1), PetArrival::Ceremony).worn, (3, 1));
+        let (mut t, _) = idle(&mut pet, t, (4, 50), 0.2);
+
+        // The ONE Ceremony the host ever sends, then Quiet forever after.
+        let out = pet.sync_look((9, 4), PetArrival::Ceremony);
+        assert!(out.parked, "fixture: the stranger parks");
+
+        let mut ghost_first: Option<f32> = None;
+        let mut ghost_last = 0.0f32;
+        for _ in 0..600 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 50))));
+            // …exactly as the seam does once the latch has been committed.
+            let _ = pet.sync_look((9, 4), PetArrival::Quiet);
+            if let Some(d) = f.departures.iter().flatten().next() {
+                ghost_first.get_or_insert(d.col);
+                ghost_last = d.col;
+            }
+        }
+        let first = ghost_first.expect("the ceremony spawned a departing body");
+        assert!(
+            ghost_last > first + 10.0,
+            "the ceremony survived the Quiet re-syncs and RAN \
+             ({first} -> {ghost_last}); a downgrade leaves a zero-span fade"
         );
     }
 
@@ -10659,37 +14393,399 @@ mod tests {
     fn a_wrap_is_one_character_not_a_screen_crossing_jump() {
         // Forward: the caret falls off the right margin onto the next row.
         assert_eq!(
-            PetBrain::caret_delta((5, 99), (6, 0), 100, false),
-            (0.0, 1.0),
+            PetBrain::caret_delta((5, 99), (6, 0), 100, false, true, false),
+            (0.0, 1.0, true),
             "typing past the margin moved the text on by one"
         );
         // Backward over the same seam — and the row folds to zero, which is
         // what hands it to the retreat arm instead of the jump ladder.
         assert_eq!(
-            PetBrain::caret_delta((6, 0), (5, 99), 100, false),
-            (0.0, -1.0),
+            PetBrain::caret_delta((6, 0), (5, 99), 100, false, false, false),
+            (0.0, -1.0, true),
             "backspacing over the seam deleted one"
         );
         // A double-width glyph wraps from cols - 2; WRAP_SLOP covers it.
         assert_eq!(
-            PetBrain::caret_delta((5, 98), (6, 0), 100, false),
-            (0.0, 2.0)
+            PetBrain::caret_delta((5, 98), (6, 0), 100, false, true, false),
+            (0.0, 2.0, true)
         );
-        // NEGATIVE CONTROLS — everything else keeps its literal delta.
+        // NEGATIVE CONTROLS — everything else keeps its literal delta, and
+        // reports no fold, so nothing downstream reads it as the world's own
+        // seam.
         assert_eq!(
-            PetBrain::caret_delta((10, 5), (2, 70), 100, false),
-            (-8.0, 65.0),
+            PetBrain::caret_delta((10, 5), (2, 70), 100, false, false, false),
+            (-8.0, 65.0, false),
             "a real row jump is not a seam"
         );
         assert_eq!(
-            PetBrain::caret_delta((5, 2), (6, 70), 100, false),
-            (1.0, 68.0),
+            PetBrain::caret_delta((5, 2), (6, 70), 100, false, false, false),
+            (1.0, 68.0, false),
             "down AND right is not a wrap in either direction"
         );
         assert_eq!(
-            PetBrain::caret_delta((5, 16), (6, 1), 20, false),
-            (1.0, -15.0),
+            PetBrain::caret_delta((5, 16), (6, 1), 20, false, true, false),
+            (1.0, -15.0, false),
             "a 15-cell move in a 20-wide pane is a jump, not a seam"
+        );
+    }
+
+    /// THE SHELL'S OWN NEW LINE — the delta neither the heuristic fold nor
+    /// the emulator's `wrapped` fact can ever claim, and the last path in
+    /// the newline set that still frightened the cat.
+    ///
+    /// With the prompt on the LAST row, Enter after a short command scrolls
+    /// instead of changing rows: the host reports `dr = 0` and a leftward
+    /// `dc` the size of what you typed. `wrapped` is FALSE (nothing wrapped
+    /// — measured against the emulator, at 80 and 200 columns), and the fact
+    /// arm's shared [`wrap_bar`] could not claim an eight-column delta even
+    /// if the fact were true, so `ls -la`, `make`, `git log` — four to
+    /// thirteen characters, most commands a developer runs — fell to the
+    /// retreat arm and bottled the pet up on every Enter.
+    ///
+    /// It is reported as the LINE CHANGE it is: `dr = 1` with its own
+    /// leftward delta, folded, so the quiet leap and the span tier own it
+    /// exactly like an Enter one row up. The three arms partition the space:
+    /// this one stops where [`SNAP_COLS`] begins, because a bigger same-row
+    /// retreat is already a jump rather than a fright in `on_move`.
+    #[test]
+    fn the_shells_own_new_line_is_a_line_change_not_a_retreat() {
+        // `ls -la` from the last row: eight columns back onto the margin.
+        assert_eq!(
+            PetBrain::caret_delta((29, 8), (29, 0), 80, false, true, false),
+            (1.0, -8.0, true),
+            "a short command's Enter is the line advancing, not a retreat"
+        );
+        // Width-blind — the fright was, too.
+        assert_eq!(
+            PetBrain::caret_delta((29, 8), (29, 0), 200, false, true, false),
+            (1.0, -8.0, true)
+        );
+        // The double-width margin: a caret landing at column 1 or 2 still
+        // came home.
+        assert_eq!(
+            PetBrain::caret_delta((29, 13), (29, 2), 80, false, true, false),
+            (1.0, -11.0, true)
+        );
+        // NEGATIVE CONTROLS.
+        assert_eq!(
+            PetBrain::caret_delta((29, 3), (29, 0), 80, false, true, false),
+            (0.0, -3.0, false),
+            "under STARTLE_COLS nothing was ever frightening: the flinch              keeps its everyday backspace"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((29, 20), (29, 0), 80, false, true, false),
+            (0.0, -20.0, false),
+            "at SNAP_COLS and beyond the snap tier owns it — this arm must              not also claim it, or a mid-line Home would report a row it              never changed"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((29, 40), (29, 8), 80, false, false, false),
+            (0.0, -32.0, false),
+            "a retreat that does not land at the row's home edge is not a \
+             new line"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((29, 0), (29, 8), 80, false, false, false),
+            (0.0, 8.0, false),
+            "and the forward direction is just typing"
+        );
+        // THE CASE THE CONTROLS ABOVE CANNOT REACH, and the one every shell
+        // but `sh` actually produces: the same eight-column Enter, landing
+        // at the end of a TWELVE-column prompt. The delta is identical in
+        // every respect the arm can measure except the caret's absolute
+        // column, which is the prompt's width and nothing else — the old
+        // `now.1 <= WRAP_SLOP` gate read it as a fright. The `-32` control
+        // above cannot expose that, because the SNAP tier catches a
+        // 32-column retreat whatever this arm says.
+        assert_eq!(
+            PetBrain::caret_delta((23, 20), (23, 12), 80, false, true, false),
+            (1.0, -8.0, true),
+            "a wide prompt is still the shell's own new line"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((23, 20), (23, 12), 80, false, false, false),
+            (0.0, -8.0, false),
+            "…and with a line still standing to the caret's right it is an \
+             ordinary mid-line deletion, which keeps its fright"
+        );
+    }
+
+    /// The third arm's two witnesses at the delta level: either one folds
+    /// the shell's own new line, and neither invents a fold on its own.
+    #[test]
+    fn the_scroll_fact_folds_a_new_line_the_row_inference_cannot_see() {
+        // Ink past the caret ⇒ `home` is false. With the scroll fact the
+        // move is the LINE CHANGE it is; without either witness it stays the
+        // literal retreat that startled the cat.
+        assert_eq!(
+            PetBrain::caret_delta((29, 30), (29, 24), 100, false, false, true),
+            (1.0, -6.0, true),
+            "the map scrolled: the text line advanced"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((29, 30), (29, 24), 100, false, false, false),
+            (0.0, -6.0, false),
+            "…and with neither witness it is a retreat, unchanged"
+        );
+        // The scroll cannot widen the arm's window: past the snap it is a
+        // jump, under [`STARTLE_COLS`] it is a deletion.
+        assert_eq!(
+            PetBrain::caret_delta((29, 40), (29, 24), 100, false, false, true),
+            (0.0, -16.0, false),
+            "past the snap tier the scroll changes nothing"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((29, 27), (29, 24), 100, false, false, true),
+            (0.0, -3.0, false),
+            "and a three-column backspace is still a backspace"
+        );
+        // It cannot invent a fold on a move that went the other way, or on
+        // one that changed rows (the wrap arm owns those).
+        assert_eq!(
+            PetBrain::caret_delta((29, 24), (29, 30), 100, false, false, true),
+            (0.0, 6.0, false),
+            "a forward move is a forward move"
+        );
+    }
+
+    /// THE SCROLL FACT itself, on `sense_ink` alone: what it claims and —
+    /// four ways — what it refuses to claim.
+    #[test]
+    fn the_ink_map_scroll_fact_is_only_true_for_a_one_row_scroll() {
+        let up = |m: &[(u16, u16)]| {
+            let mut v = m.to_vec();
+            v.remove(0);
+            v.push((0, 12));
+            v
+        };
+        let page = [(0, 0), (0, 40), (0, 44), (0, 30), (0, 24)];
+
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &page, Some(4));
+        assert!(
+            !pet.ink_scrolled,
+            "the FIRST map has nothing to be a scroll of"
+        );
+        pet.sense_ink(0, &up(&page), Some(4));
+        assert!(pet.ink_scrolled, "every inked row moved up exactly one");
+
+        // …and nothing else does.
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &page, Some(4));
+        pet.sense_ink(0, &page, Some(4));
+        assert!(!pet.ink_scrolled, "a map that did not move is not a scroll");
+
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &page, Some(4));
+        pet.sense_ink(0, &up(&up(&page)), Some(4));
+        assert!(!pet.ink_scrolled, "TWO rows is a jump, not a line");
+
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &page, Some(4));
+        pet.sense_ink(1, &up(&page), Some(5));
+        assert!(
+            !pet.ink_scrolled,
+            "a moved window is scrollback, not a new line"
+        );
+
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &page, Some(4));
+        pet.sense_ink(0, &up(&page)[1..], Some(4));
+        assert!(
+            !pet.ink_scrolled,
+            "a resize rewrites the map, it does not shift it"
+        );
+
+        let blank = [(0u16, 0u16); 5];
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &blank, Some(4));
+        pet.sense_ink(0, &up(&blank), Some(4));
+        assert!(
+            !pet.ink_scrolled,
+            "a blank pane has no content to have advanced"
+        );
+
+        // The pane switch takes the comparison buffer with it: the first map
+        // of a new surface cannot be a scroll of the old surface's last.
+        let mut pet = PetBrain::default();
+        pet.sense_ink(0, &page, Some(4));
+        pet.retire_coordinate_space();
+        pet.sense_ink(0, &up(&page), Some(4));
+        assert!(!pet.ink_scrolled, "retirement clears the comparison buffer");
+    }
+
+    /// INK STANDING TO THE RIGHT OF THE CARET — the case the row inference
+    /// cannot see, and the reason the scroll fact exists.
+    ///
+    /// [`PetBrain::caret_at_home`] asks "does this row's ink end at or before
+    /// the caret", and answers NO for every prompt row that carries anything
+    /// to the caret's right. That is not a corner: `zsh-autosuggestions` and
+    /// `fish` both print a greyed completion immediately after the caret on
+    /// every prompt, so the row's ink outlasts the caret on every Enter, and
+    /// the shell's own new line fell through to the RETREAT arm and startled
+    /// the cat. Below, the same script differs only in whether the prompt
+    /// carries a three-column suggestion; with the fact off, the suggestion
+    /// arm alone startles and walks home.
+    ///
+    /// A right-hand prompt (`RPROMPT`, powerlevel10k, a starship right
+    /// module) is the same failure of the inference and the fact fixes it
+    /// too, but it is a poor FIXTURE: a right-aligned prompt inks the row to
+    /// the margin, so the ink ladder's walled-shut rule 4 seats the cat on
+    /// the words and the re-anchor owns the frame whichever way the delta
+    /// folds. Measured — with a full-width prompt row, the arm changes
+    /// `quiet_leap`/`pending_pounce` from `false` to `true` (the crossing
+    /// stops being a fright) but the emitted pose is the eviction's either
+    /// way. The suggestion keeps the cat on real ground, so what the arm
+    /// does is visible.
+    ///
+    /// The scroll is the honest witness: the shell's new line moved every
+    /// inked row of the viewport up one, which no `Home`, `Ctrl-W` or click
+    /// does.
+    #[test]
+    fn a_prompt_row_that_inks_past_the_caret_still_gets_a_quiet_new_line() {
+        let start = Instant::now();
+        // `true` prints a three-column autosuggestion after the caret;
+        // `false` is the identical script with a bare prompt.
+        let run = |suggest: bool| -> (bool, bool) {
+            let mut pet = PetBrain::default();
+            // A 24-column prompt, older output scrolled up behind it.
+            let tail = u16::from(suggest) * 3;
+            let mut spans: Vec<(u16, u16)> = vec![(0, 0); 30];
+            for span in spans.iter_mut().take(29).skip(21) {
+                *span = (0, 46);
+            }
+            spans[29] = (0, 24 + tail);
+            pet.sense_ink(0, &spans, Some(29));
+            // `ls -la`: six characters past the prompt, and what wakes the cat.
+            let (t, _) = type_run(&mut pet, start, 29, 24, 6, 0.06);
+            spans[29] = (0, 30);
+            pet.sense_ink(0, &spans, Some(29));
+            let (mut t, f) = idle(&mut pet, t, (29, 30), SIT_AFTER + 0.3);
+            assert!(f.action.settled(), "fixture: a settled cat");
+            assert!(
+                f.col > 30.0,
+                "fixture: standing clear of the line's ink at {:.2}",
+                f.col
+            );
+            // ENTER at the bottom row: the pane SCROLLS, so the caret's row
+            // never changes and its column comes home from 30 to 24 — six
+            // columns, inside the arm's window and nothing like a wrap.
+            for r in 0..29 {
+                spans[r] = spans[r + 1];
+            }
+            spans[29] = (0, 24 + tail);
+            let (mut startled, mut ran) = (false, false);
+            for _ in 0..120 {
+                t += Duration::from_millis(16);
+                // The host feeds the map every frame, as `sense_ink` asks.
+                pet.sense_ink(0, &spans, Some(29));
+                let f = pet.tick(sense(t, Some((29, 24))));
+                startled |= f.action == PetAction::Startle;
+                ran |= f.action == PetAction::Run;
+            }
+            (startled, ran)
+        };
+        assert_eq!(
+            run(true),
+            (false, false),
+            "an autosuggestion does not make the shell's own new line a fright"
+        );
+        assert_eq!(
+            run(false),
+            (false, false),
+            "…and the bare prompt it must stay equal to"
+        );
+    }
+
+    /// The row fact the arm above is gated on: a caret is HOME either on the
+    /// margin (the seam-less host's only answer) or at the end of ink that
+    /// starts at the margin (a prompt of any width). Ink standing to the
+    /// RIGHT is what keeps ordinary editing out.
+    #[test]
+    fn a_wide_prompt_still_leaves_the_caret_at_home() {
+        let mut pet = PetBrain::default();
+        // No ink seam at all: the margin is the only home there is, exactly
+        // as the arm behaved before the fact existed.
+        assert!(pet.caret_at_home(23, 0));
+        assert!(pet.caret_at_home(23, 2));
+        assert!(!pet.caret_at_home(23, 12));
+        // `user@host:~/proj$ ` — seventeen inked columns and a blank, the
+        // caret at eighteen.
+        pet.sense_ink(20, &[(0, 0), (0, 0), (0, 0), (0, 17)], Some(23));
+        assert!(
+            pet.caret_at_home(23, 18),
+            "the caret sits past the prompt's trailing blank and is still home"
+        );
+        assert!(pet.caret_at_home(23, 17), "and hard against its last glyph");
+        // The same row with the rest of a sentence still standing.
+        pet.sense_ink(20, &[(0, 0), (0, 0), (0, 0), (0, 60)], Some(23));
+        assert!(
+            !pet.caret_at_home(23, 18),
+            "ink to the right of the caret is a line, not a prompt"
+        );
+        // An indented row is not a prompt either — home is the MARGIN's end,
+        // not any old run of ink.
+        pet.sense_ink(20, &[(0, 0), (0, 0), (0, 0), (30, 42)], Some(23));
+        assert!(!pet.caret_at_home(23, 42));
+    }
+
+    /// The end-to-end half, on the prompt every shell but `sh` actually
+    /// prints: twelve columns of prompt, an eight-character command, Enter
+    /// at the bottom row. The caret comes home to column TWELVE — and
+    /// measuring that column against the MARGIN, which is what this arm
+    /// shipped with, startled the cat on every ordinary command.
+    #[test]
+    fn a_wide_prompt_s_own_new_line_does_not_startle() {
+        let start = Instant::now();
+        // `true` feeds the ink seam (the row's prompt), `false` is a host
+        // that never feeds it — which still has only the margin to go on,
+        // and is the honest limit of the fix.
+        let run = |inked: bool| -> bool {
+            let mut pet = PetBrain::default();
+            let mut spans = vec![(0u16, 0u16); 30];
+            // The prompt, then the command typed out to column 20 — which
+            // is also what wakes the cat.
+            spans[29] = (0, 12);
+            if inked {
+                pet.sense_ink(0, &spans, Some(29));
+            }
+            let (t, _) = type_run(&mut pet, start, 29, 12, 8, 0.06);
+            spans[29] = (0, 20);
+            if inked {
+                pet.sense_ink(0, &spans, Some(29));
+            }
+            let (mut t, f) = idle(&mut pet, t, (29, 20), SIT_AFTER + 0.3);
+            assert!(
+                f.action.settled(),
+                "fixture: a settled cat beside the line's end"
+            );
+            assert!(
+                f.col > 20.0,
+                "fixture: and clear of the line's ink, col {}",
+                f.col
+            );
+            // Enter. The pane SCROLLS — nothing wrapped, the caret's row is
+            // unchanged — and a fresh twelve-column prompt prints under it.
+            spans[29] = (0, 12);
+            if inked {
+                pet.sense_ink(0, &spans, Some(29));
+            }
+            let mut startled = false;
+            for _ in 0..90 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((29, 12))));
+                startled |= f.action == PetAction::Startle;
+            }
+            startled
+        };
+        assert!(
+            !run(true),
+            "a twelve-column prompt's own new line is a line change, not a fright"
+        );
+        assert!(
+            run(false),
+            "fixture: without the ink seam the margin is all there is, so \
+             the same Enter DOES still startle — the assertion above is \
+             about the seam, not about the delta"
         );
     }
 
@@ -10804,21 +14900,27 @@ mod tests {
     #[test]
     fn a_scrolled_wrap_is_a_wrap() {
         assert_eq!(
-            PetBrain::caret_delta((29, 99), (29, 0), 100, true),
-            (1.0, 1.0),
+            PetBrain::caret_delta((29, 99), (29, 0), 100, true, true, false),
+            (1.0, 1.0, true),
             "a scrolled wrap is one character on"
         );
         assert_eq!(
-            PetBrain::caret_delta((29, 99), (29, 0), 100, false),
-            (0.0, -99.0),
+            PetBrain::caret_delta((29, 99), (29, 0), 100, false, true, false),
+            (0.0, -99.0, false),
             "without the fact the delta stays literal — the fact, never a \
-             looser heuristic, is what tells the seam from Home"
+             looser heuristic, is what tells the seam from Home. (The pet is \
+             no longer FRIGHTENED by that literal delta — [`SNAP_COLS`] makes \
+             a 99-column same-row retreat a jump — but it is still read as a \
+             jump home rather than as a line of text gained, which is what \
+             the fact buys.)"
         );
         assert_eq!(
-            PetBrain::caret_delta((29, 40), (29, 0), 100, true),
-            (0.0, -40.0),
+            PetBrain::caret_delta((29, 40), (29, 0), 100, true, true, false),
+            (0.0, -40.0, false),
             "the shared bar still guards the fact arm: a mid-line Home in a \
-             frame that also wrapped keeps its literal retreat"
+             frame that also wrapped keeps its literal retreat — and the \
+             shell's-new-line arm stops at SNAP_COLS, so it does not claim \
+             this one either"
         );
 
         let script = |fact: bool| -> Vec<PetAction> {
@@ -10894,12 +14996,212 @@ mod tests {
             "and no big-jump show: the watch keeps the ground and the fold \
              keeps the latch, got {with_fact:?}"
         );
+        // THE CONTROL, REPAIRED, AND WHY. It used to demand that the same
+        // script BOTTLE UP without the fact — the fold being the only thing
+        // standing between a 99-column same-row delta and the fright. That
+        // is no longer the only thing: [`SNAP_COLS`] rules that a same-row
+        // move back of a third of the line is a JUMP, not a thing coming at
+        // the pet, so the blind run is quiet too. Two independent mechanisms
+        // now refuse the same fright, and demanding one of them still fire
+        // would be asking the pet to be frightened to keep a control honest.
+        //
+        // The fact still buys what nothing else can: the blind delta reads
+        // as a jump HOME (a retreat the snap tier catches), the folded one
+        // as one character ON — the text gained a line and moved forward —
+        // which is what keeps the caret's rhythm and the pet's lead pointing
+        // the way the writing is actually going. That is asserted at the
+        // unit level above.
         let blind = script(false);
         assert!(
-            blind.contains(&PetAction::Startle),
-            "control: without the fact the same script must bottle up — \
-             otherwise this test asserts nothing, got {blind:?}"
+            !blind.contains(&PetAction::Startle),
+            "the snap tier catches what the fact does not see: a same-row \
+             retreat of a third of the line is a jump, never a fright, got \
+             {blind:?}"
         );
+        // …and the harness can still SEE a fright, so neither assertion
+        // above is vacuous: an ordinary mid-line deletion — under the snap
+        // bar, not landing on the margin — bottles the same cat on the same
+        // row.
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 29, 60);
+        let mut bottled = false;
+        for _ in 0..30 {
+            t += Duration::from_millis(16);
+            bottled |= pet.tick(sense(t, Some((29, 54)))).action == PetAction::Startle;
+        }
+        assert!(
+            bottled,
+            "control: the harness must still be able to see a bottle, or \
+             the assertions above assert nothing"
+        );
+    }
+
+    /// A world for the launch-time law: a `cols`×`rows` pane at 10×20 px
+    /// cells, a hand-painted ink map, and EVERY frame judged by
+    /// [`lawful_tick`] — the per-frame bound, the launch bound and the
+    /// re-aim bound together.
+    struct Law {
+        pet: PetBrain,
+        t: Instant,
+        last: (f32, f32, u16, u16),
+        cols: u16,
+        rows: u16,
+        spans: Vec<(u16, u16)>,
+        live: Option<u16>,
+        /// Every flight as it left the ground.
+        launches: Vec<Flight>,
+        /// The action on every judged frame.
+        actions: Vec<PetAction>,
+        /// Every judged frame (poses, motes, alpha).
+        frames: Vec<PetFrame>,
+    }
+
+    impl Law {
+        /// Sight the pet at `caret`. The seed frame is exempt: nothing was
+        /// on the glass to move.
+        fn new(cols: u16, rows: u16, caret: (u16, u16)) -> Self {
+            let t = Instant::now();
+            let mut pet = PetBrain::default();
+            let mut s = sense(t, Some(caret));
+            s.cols = cols;
+            s.rows = rows;
+            let f = pet.tick(s);
+            Self {
+                pet,
+                t,
+                last: (f.col, f.row, cols, rows),
+                cols,
+                rows,
+                spans: vec![(0, 0); usize::from(rows)],
+                live: None,
+                launches: Vec::new(),
+                actions: Vec::new(),
+                frames: Vec::new(),
+            }
+        }
+
+        /// Paint row `row`'s ink as the half-open span `[first, end)`.
+        fn ink(&mut self, row: u16, first: u16, end: u16) {
+            self.spans[usize::from(row)] = (first, end);
+        }
+
+        /// One 60 fps frame, judged.
+        fn frame(&mut self, caret: Option<(u16, u16)>) -> PetFrame {
+            self.t += Duration::from_millis(16);
+            self.pet.sense_ink(0, &self.spans, self.live);
+            let mut s = sense(self.t, caret);
+            s.cols = self.cols;
+            s.rows = self.rows;
+            let pre = self.pet.flight;
+            let f = lawful_tick(&mut self.pet, s, &mut self.last);
+            if pre.is_none()
+                && let Some(fl) = self.pet.flight
+            {
+                self.launches.push(fl);
+            }
+            self.actions.push(f.action);
+            self.frames.push(f);
+            f
+        }
+
+        /// The number of frames judged so far — a mark to measure from.
+        fn now(&self) -> usize {
+            self.actions.len()
+        }
+
+        /// Onsets of `a` (a frame wearing it after one that did not) from
+        /// frame `from` on.
+        fn onsets(&self, from: usize, a: PetAction) -> usize {
+            let prev = if from == 0 {
+                None
+            } else {
+                self.actions.get(from - 1).copied()
+            };
+            let mut was = prev == Some(a);
+            let mut n = 0;
+            for &x in &self.actions[from.min(self.actions.len())..] {
+                if x == a && !was {
+                    n += 1;
+                }
+                was = x == a;
+            }
+            n
+        }
+
+        /// Airborne episodes (Leap onsets) from frame `from` on.
+        fn episodes(&self, from: usize) -> usize {
+            self.onsets(from, PetAction::Leap)
+        }
+
+        /// The frame index of the LAST touchdown (a Leap ending) at or after
+        /// `from` — `None` if nothing flew, or the pet is still up.
+        fn touchdown(&self, from: usize) -> Option<usize> {
+            if self.pet.flight.is_some() {
+                return None;
+            }
+            let mut last = None;
+            for i in from.max(1)..self.actions.len() {
+                if self.actions[i - 1] == PetAction::Leap && self.actions[i] != PetAction::Leap {
+                    last = Some(i);
+                }
+            }
+            last
+        }
+
+        /// A dust puff on any frame from `from` on.
+        fn dust(&self, from: usize) -> bool {
+            self.frames[from.min(self.frames.len())..].iter().any(|f| {
+                f.motes
+                    .iter()
+                    .flatten()
+                    .any(|m| m.kind == PetMoteKind::Dust)
+            })
+        }
+
+        /// The pose `pose` worn on any frame from `from` on.
+        fn wore(&self, from: usize, pose: PetGlyphId) -> bool {
+            self.frames[from.min(self.frames.len())..]
+                .iter()
+                .any(|f| f.pose == pose)
+        }
+
+        fn hold(&mut self, caret: Option<(u16, u16)>, frames: u32) {
+            for _ in 0..frames {
+                let _ = self.frame(caret);
+            }
+        }
+
+        /// Type `(row, from)` → `(row, to)`, `frames_per_key` frames a key,
+        /// the row's ink growing with the caret.
+        fn type_to(&mut self, row: u16, from: u16, to: u16, frames_per_key: u32) {
+            for c in (from + 1)..=to {
+                self.ink(row, 0, c);
+                self.hold(Some((row, c)), frames_per_key);
+            }
+        }
+
+        /// Backspace `(row, from)` → `(row, to)`, the ink shrinking with it.
+        fn delete_to(&mut self, row: u16, from: u16, to: u16, frames_per_key: u32) {
+            for c in (to..from).rev() {
+                self.ink(row, 0, c);
+                self.hold(Some((row, c)), frames_per_key);
+            }
+        }
+
+        /// The probe's history: sighted 16 short of `col`, typed to 8 short,
+        /// 2.5 s quiet (awake, settled), typed to `col` at 100 ms a key.
+        fn warm(cols: u16, rows: u16, row: u16, col: u16) -> Self {
+            let start = col.saturating_sub(16);
+            let mid = col.saturating_sub(8);
+            let mut w = Self::new(cols, rows, (row, start));
+            w.live = Some(row);
+            w.ink(row, 0, start);
+            w.type_to(row, start, mid, 6);
+            w.hold(Some((row, mid)), 150);
+            w.type_to(row, mid, col, 6);
+            w
+        }
     }
 
     /// §0.1's MISSING LAW, test-side. The `debug_assert` in `begin_arc`
@@ -10918,24 +15220,37 @@ mod tests {
     /// rate `begin_arc` chose.
     #[test]
     fn no_flight_may_outrun_the_animal_that_flies_it() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
         /// Judge every live arc, count fresh launches, remember the fastest.
-        struct Law {
+        struct Judge {
             in_flight: bool,
             launches: u32,
             fastest: f32,
+            /// The live arc's target and column, so a mid-air RE-AIM can be
+            /// judged on what it leaves the flight to do.
+            aimed: Option<(f32, f32)>,
+            /// The fastest re-aim's remaining pace.
+            fastest_reaim: f32,
         }
-        impl Law {
+        impl Judge {
             fn new() -> Self {
-                Law {
+                Judge {
                     in_flight: false,
                     launches: 0,
                     fastest: 0.0,
+                    aimed: None,
+                    fastest_reaim: 0.0,
                 }
             }
             fn judge(&mut self, pet: &PetBrain) {
                 match pet.flight {
                     Some(f) => {
-                        let rate = (f.to_col - f.from_col).abs() / f.dur;
+                        // The EQUIVALENT span ([`span_eq`]): a hop across
+                        // three prompt rows travels those rows too, and
+                        // judging its columns alone let a multi-row Enter
+                        // fly 7.1 rows/s and call itself lawful.
+                        let rate = span_eq(f.to_col - f.from_col, f.to_row - f.from_row) / f.dur;
                         let bound = if f.big {
                             BIG_HOP_SPEED_MAX
                         } else {
@@ -10947,13 +15262,36 @@ mod tests {
                              {rate:.1} c/s against {bound:.0} (big={})",
                             f.big
                         );
+                        // THE RE-AIM is a second launch the law never saw:
+                        // it keeps the flight's CLOCK and moves its target,
+                        // so the remaining span has to fit in the remaining
+                        // time. Measured before the refusal landed: 338.3
+                        // c/s and 5.64 cells in one frame, from an arc that
+                        // was lawful at launch.
+                        if let Some((was_to, was_col)) = self.aimed
+                            && (f.to_col - was_to).abs() > 1e-3
+                        {
+                            let pace = (f.to_col - was_col).abs() / (f.dur - f.t).max(1e-3);
+                            assert!(
+                                pace <= bound + 1e-3,
+                                "a mid-air re-aim outruns the flight it \
+                                 rebased: {pace:.1} c/s against {bound:.0} \
+                                 (big={})",
+                                f.big
+                            );
+                            self.fastest_reaim = self.fastest_reaim.max(pace);
+                        }
+                        self.aimed = Some((f.to_col, pet.col));
                         if !self.in_flight {
                             self.launches += 1;
                             self.fastest = self.fastest.max(rate);
                         }
                         self.in_flight = true;
                     }
-                    None => self.in_flight = false,
+                    None => {
+                        self.in_flight = false;
+                        self.aimed = None;
+                    }
                 }
             }
         }
@@ -10989,10 +15327,10 @@ mod tests {
 
         // (1) THE TYPED-THROUGH WRAP'S INK RE-ANCHOR at cols = 200 — the
         // measured 455.7 c/s streak, now routed through `launch_big` and
-        // split. The screen is dense (the rows around the pair are inked),
+        // paced. The screen is dense (the rows around the pair are inked),
         // so the ink ladder cannot re-seat the cat off its row pre-wrap.
         let mut pet = PetBrain::default();
-        let mut law = Law::new();
+        let mut law = Judge::new();
         let mut t = start;
         let _ = pet.tick(wide(t, Some((6, 195))));
         let mut spans = vec![(0u16, 0u16); 12];
@@ -11028,43 +15366,78 @@ mod tests {
             let _ = pet.tick(wide(t, Some((7, 0))));
             law.judge(&pet);
         }
+        // ONE bound, not two — and that is the improvement, not a hole in
+        // the fixture. The quiet split is a TIME bar, and
+        // [`the_quiet_split_needs_a_pane_wider_than_anyone_has`] pins the
+        // arithmetic: no pane narrower than 239 columns can reach it, so at
+        // 200 this crossing flies a single airborne episode where it used
+        // to fly two (S4 at 200 columns settles 1.02 s sooner for it).
+        // Demanding `launches >= 2` here would demand that regression back.
+        // What the LAW needs from the fixture is that something flew, and
+        // that it flew at a BOUND's pace: past anything an ordinary hop may
+        // do, and — measured at exactly [`BIG_HOP_SPEED_MAX`], which is the
+        // bar biting rather than idling — no faster than a bound may.
         assert!(
-            law.launches >= 2 && law.fastest > HOP_SPEED_MAX,
-            "fixture: the wrap crossing must fly, split, and fly faster than \
-             any ordinary hop may ({} launches, fastest {:.1})",
+            law.launches >= 1
+                && law.fastest > HOP_SPEED_MAX
+                && law.fastest <= BIG_HOP_SPEED_MAX + 1e-3,
+            "fixture: the wrap crossing must fly, and fly at a bound's pace \
+             — past any ordinary hop, inside the bound's own bar ({} \
+             launches, fastest {:.1})",
             law.launches,
             law.fastest
         );
 
         // (2) THE WALL TRANSIT across a wide span: the fixed-duration arc
-        // was span-blind. A settled wall-side cat whose caret leaps 42
-        // columns back re-crosses in a capped hop, and the remainder falls
-        // to the pounce band on later ticks.
+        // was span-blind, so a latch that survived a hold crossed whatever
+        // gap had opened meanwhile in one 0.25 s arc (~120 c/s, measured).
+        // [`WALL_SPAN_MAX`] is still the bar — but past it the latch is now
+        // the POUNCE's and the one door tiers the crossing, instead of
+        // truncating the arc at 13.75 cells and leaving the remainder to a
+        // second flight. ONE trip home, not a stubby hop and a pounce.
         let mut pet = PetBrain::default();
-        let mut law = Law::new();
+        let mut law = Judge::new();
         let mut t = awake(&mut pet, start, 6, 95);
         t += Duration::from_millis(16);
         let _ = pet.tick(sense(t, Some((6, 55))));
         law.judge(&pet);
         let end = t + Duration::from_secs_f32(3.0);
+        let mut last = 0.0f32;
         while t < end {
             t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((6, 55))));
+            last = pet.tick(sense(t, Some((6, 55)))).col;
             law.judge(&pet);
         }
+        assert_eq!(
+            law.launches, 1,
+            "the wall crossing is ONE flight now, not a capped transit plus \
+             the remainder"
+        );
         assert!(
-            law.launches >= 2,
-            "fixture: the capped transit hop and the band pounce must both \
-             fly, got {}",
-            law.launches
+            law.fastest <= quiet_speed_max(100) + 1e-3,
+            "and it is paced (fastest {:.1})",
+            law.fastest
+        );
+        let w = art_cols(10, 20);
+        let station = PetBrain::station(55, 100, w);
+        assert!(
+            (last - station).abs() < 3.0,
+            "and the cat arrives on the caret's far side (col {last}, \
+             station {station})"
         );
 
-        // (3) THE POUNCE at cols = 200: the door used to be an open
-        // half-line, launching a 40-cell standing gap inside FLIGHT_MAX.
-        // Now it declines past the band, the follower gallops the distance
-        // down, and the pounce fires only once a pounce can be flown.
+        // (3) THE 42-COLUMN JUMP at cols = 200. The door used to be an open
+        // half-line, launching that gap inside FLIGHT_MAX at 238 c/s; then
+        // it was a BAND, which kept the law by declining — the follower
+        // gallopped the distance down for 0.73 s and the pounce fired only
+        // once a pounce could be flown, which is a cat jogging to its own
+        // launch pad. It is a DOOR again, and it TIERS: past
+        // [`POUNCE_SPAN_MAX`] the same door flies a BOUND, which is a shape
+        // a body can choose for that distance. One flight, no jog, and
+        // paced against the pane ([`quiet_speed_max`]) rather than merely
+        // under the law's ceiling.
         let mut pet = PetBrain::default();
-        let mut law = Law::new();
+        let mut law = Judge::new();
         let mut t = awake_wide(&mut pet, start, 6, 8);
         t += Duration::from_millis(16);
         let _ = pet.tick(wide(t, Some((6, 50))));
@@ -11076,11 +15449,13 @@ mod tests {
             final_col = pet.tick(wide(t, Some((6, 50)))).col;
             law.judge(&pet);
         }
+        assert_eq!(
+            law.launches, 1,
+            "fixture: the gap closes in ONE flight, not a jog and a pounce"
+        );
         assert!(
-            law.launches >= 1 && law.fastest <= HOP_SPEED_MAX + 1e-3,
-            "fixture: the gap must close with a lawful pounce ({} launches, \
-             fastest {:.1})",
-            law.launches,
+            law.fastest > HOP_SPEED_MAX && law.fastest <= quiet_speed_max(200) + 1e-3,
+            "and it is a bound, paced against the pane (fastest {:.1})",
             law.fastest
         );
         assert!(
@@ -11088,11 +15463,19 @@ mod tests {
             "and the cat still arrives, got col {final_col}"
         );
 
-        // (4) THE SPLIT BOUND — the shape that derives the big bar: its
-        // first bound must fly faster than any ordinary hop and still land
-        // under BIG_HOP_SPEED_MAX.
+        // (4) THE BOUND THAT DERIVES THE BIG BAR — a pane-wide crossing at
+        // 200 columns: it must fly faster than any ordinary hop and still
+        // land under [`BIG_HOP_SPEED_MAX`]. Measured, this one does arrive
+        // in two bounds (fastest 130.7 c/s) because nothing inks the 60 %
+        // touch point — but the split is a POLICY of the quiet pace, not
+        // the law: [`the_quiet_split_needs_a_pane_wider_than_anyone_has`]
+        // pins the time bar that turns it on, and
+        // [`the_chosen_show_is_paced_like_every_other_bound`] shows inked
+        // ground refusing it at the same widths. So this guard asks for a
+        // launch and not for a count; the law's own claim is the PACE, and
+        // it holds whether the crossing arrives in one bound or two.
         let mut pet = PetBrain::default();
-        let mut law = Law::new();
+        let mut law = Judge::new();
         let mut t = awake_wide(&mut pet, start, 6, 4);
         t += Duration::from_millis(16);
         let _ = pet.tick(wide(t, Some((6, 199))));
@@ -11104,13 +15487,2057 @@ mod tests {
             law.judge(&pet);
         }
         assert!(
-            law.launches >= 2
+            law.launches >= 1
                 && law.fastest > HOP_SPEED_MAX
                 && law.fastest <= BIG_HOP_SPEED_MAX + 1e-3,
-            "fixture: the crossing must split into bounds that outrun a hop \
-             yet obey the bound's own bar ({} launches, fastest {:.1})",
+            "fixture: the crossing must fly at a bound's pace — outrunning \
+             any ordinary hop, yet obeying the bound's own bar ({} \
+             launches, fastest {:.1})",
             law.launches,
             law.fastest
+        );
+
+        // ── AND THE EIGHT SCRIPTS THE PORTED WAVE MEASURED ────────────────
+        //
+        // Same law, driven through the [`Law`] harness (every frame judged
+        // by [`lawful_tick`], which also owns the re-aim bound the
+        // `begin_arc` assert can never see). The number in brackets is the
+        // launch the brain made before the door tiered by predicted span:
+        // (a) the ink re-anchor hop of a settled cat when a paragraph prints
+        // under it at 200 columns [450 c/s]; (b) the scrolled last-row wrap
+        // while typing with ink — lawful in the old brain only because the
+        // ladder seated the cat ON the words at the wall (the walled-shut
+        // rule 2), so the scroll never inked its feet; once the ladder takes
+        // the blank row above, the scroll's re-anchor is this law's; (c) a
+        // settled cat's Enter from column 41 at 200 and 80 columns [88.8 c/s
+        // at 200]; (d) a fresh pet whose caret jumps sixty cells during the
+        // wake stretch [143 c/s]; (e) a held backspace from the wall side,
+        // whose stale wall latch fired a span-blind 0.25 s arc [~120 c/s];
+        // (f) a prompt redraw that hides the caret for one frame before the
+        // next line [91 c/s]; (g) the wall-side Enter that arrives while the
+        // cat is mid row-hop, whose re-aim was solved for the whole
+        // remaining span in the remaining time [338 c/s, measured at THIS
+        // base]; (h) a caret that snaps home mid-SHOW, whose re-aim took its
+        // cap from the flight's costume. Every script runs even when an
+        // earlier one fails, so one red run reports them all.
+
+        let scripts: [(&str, fn()); 8] = [
+            ("(a) the ink re-anchor at 200 columns", || {
+                let mut w = Law::warm(200, 30, 4, 190);
+                w.hold(Some((4, 190)), 150);
+                // A paragraph prints on every row, indented past a prompt
+                // by more than the cat is wide (5.6 cells at 10×20 px), so
+                // the ladder's far stand is the blank margin on its LEFT —
+                // 189 cells away. (A narrower indent leaves the row walled
+                // shut on both sides, which is BM-4's ladder bug, not this
+                // law's.)
+                for r in 0..30 {
+                    w.ink(r, 8, 200);
+                }
+                w.hold(Some((4, 190)), 200);
+            }),
+            ("(b) the scrolled last-row wrap while typing", || {
+                let mut w = Law::warm(200, 30, 29, 199);
+                // The line scrolls up a row; the caret is back at column 0
+                // of the SAME (last) row, and typing carries on.
+                w.ink(28, 0, 200);
+                w.ink(29, 0, 0);
+                w.hold(Some((29, 0)), 2);
+                w.type_to(29, 0, 5, 2);
+                w.hold(Some((29, 5)), 200);
+            }),
+            (
+                "(c) a settled cat's Enter from column 41 at 200 and 80 columns",
+                || {
+                    for cols in [200u16, 80] {
+                        let mut w = Law::warm(cols, 30, 5, 41);
+                        w.hold(Some((5, 41)), 150);
+                        w.ink(6, 0, 3);
+                        w.live = Some(6);
+                        w.hold(Some((6, 3)), 200);
+                    }
+                },
+            ),
+            ("(d) a sixty-cell jump during the wake stretch", || {
+                let mut w = Law::new(200, 30, (3, 5));
+                w.hold(Some((3, 5)), 2);
+                // The first move wakes the sleeper; 0.2 s into the stretch
+                // the caret is sixty cells away.
+                w.hold(Some((3, 6)), 12);
+                w.hold(Some((3, 65)), 200);
+            }),
+            ("(e) a held backspace from the wall side", || {
+                let mut w = Law::warm(100, 30, 5, 99);
+                w.delete_to(5, 99, 60, 2);
+                w.hold(Some((5, 60)), 200);
+            }),
+            ("(f) a hidden frame before the next line", || {
+                let mut w = Law::warm(80, 30, 5, 41);
+                w.hold(Some((5, 41)), 150);
+                w.hold(None, 1);
+                w.ink(6, 0, 3);
+                w.live = Some(6);
+                w.hold(Some((6, 3)), 200);
+            }),
+            ("(g) the wall-side Enter that arrives mid row-hop", || {
+                let mut w = Law::warm(80, 24, 6, 78);
+                w.ink(7, 0, 2);
+                w.live = Some(7);
+                w.hold(Some((7, 2)), 200);
+            }),
+            ("(h) a caret that snaps home mid-SHOW", || {
+                let mut w = Law::warm(80, 24, 6, 18);
+                // The line is CLEARED (the owner's own 2026-08-10 repro,
+                // "like in claude code if you clear the line"), so the
+                // ground under the crossing is blank and the re-aim's
+                // station keeps the flight's row instead of being refused
+                // for a row change before the pace is ever consulted.
+                w.ink(6, 0, 0);
+                w.hold(Some((6, 18)), 150);
+                // A 56-cell same-row jump to the end of the suggestion:
+                // the chosen show, the one door that still plays it.
+                w.hold(Some((6, 74)), 56);
+                assert!(
+                    w.pet.flight.is_some_and(|f| f.show && f.t > 0.25 * f.dur),
+                    "fixture: the show's bound is in the air"
+                );
+                // …and the caret snaps home while it is up there. The
+                // re-aim used to take its cap from the flight's COSTUME
+                // (`f.show` ⇒ the law's bare 140 c/s) and the rebase
+                // compresses the whole remaining span into the time that
+                // is left: 93 c/s here, and 139.6 c/s in the review's own
+                // fixture — eleven consecutive frames of 2.33 cells, a
+                // 25-cell reversal in 0.18 s at full opacity.
+                w.hold(Some((6, 2)), 200);
+            }),
+        ];
+        let failures: Vec<String> = scripts
+            .iter()
+            .filter_map(|(name, script)| {
+                catch_unwind(AssertUnwindSafe(script)).err().map(|e| {
+                    let msg = e
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(ToString::to_string))
+                        .unwrap_or_else(|| "(no message)".to_string());
+                    format!("{name}: {msg}")
+                })
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of 8 scripts broke the launch-time law:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+
+    /// One notice, then one quiet bound, from the door `p` was driven
+    /// through — the shape the notice rule owes every settled cat.
+    fn assert_notice_then_one_quiet_bound(p: &Probe, door: &str) {
+        let tr = p.trigger.expect("fixture: marked");
+        let after: Vec<(f32, PetAction)> = p
+            .actions
+            .iter()
+            .copied()
+            .filter(|(at, _)| *at >= tr)
+            .collect();
+        let perks: Vec<usize> = after
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, a))| *a == PetAction::Perk)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(perks.len(), 1, "{door}: exactly one notice, got {after:?}");
+        let i = perks[0];
+        let (perk_at, _) = after[i];
+        let (next_at, next) = after
+            .get(i + 1)
+            .copied()
+            .expect("the notice ends in the coil");
+        assert_eq!(
+            next,
+            PetAction::Crouch,
+            "{door}: the notice hands straight into the coil, got {after:?}"
+        );
+        assert!(
+            next_at - perk_at <= PERK_HOLD + 0.04,
+            "{door}: one beat, not a hold: {:.2} s of Perk",
+            next_at - perk_at
+        );
+        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
+        assert_eq!(flights.len(), 1, "{door}: one quiet bound, got {flights:?}");
+        let fl = flights[0];
+        assert!(
+            fl.big && !fl.show,
+            "{door}: a bound, and not the show: {fl:?}"
+        );
+        let land = after
+            .iter()
+            .find(|(_, a)| *a == PetAction::Land)
+            .map(|(at, _)| at - tr)
+            .expect("the bound lands");
+        assert!(
+            land <= 1.3,
+            "{door}: paws down within 1.3 s of the trigger, got {land:.2}"
+        );
+    }
+
+    // ── the one door, the quiet leap, the snap and the stream watch ───
+    //
+    // The rules this wave re-applied on top of the launch law, each with the
+    // measurement that bought it. They share the [`Law`] harness above (every
+    // frame judged by [`lawful_tick`]) where the geometry needs judging, and
+    // the plain fixtures where the ACTION sequence is the whole claim.
+
+    /// A short Enter is still a HOP: from a column inside the hop tier the
+    /// row change coils for exactly one tick and flies one `flight_shape`
+    /// arc — the tiering door never turns an everyday line change into a
+    /// bound, and the hop is under [`HOP_SPEED_MAX`] by construction.
+    #[test]
+    fn a_short_enter_still_hops() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        // `awake` leaves the caret at 12 and the cat stationed beside it.
+        let mut t = awake(&mut pet, start, 4, 10);
+        let mut crouch_run = 0u16;
+        let mut max_crouch = 0u16;
+        let mut leap_frames = 0u16;
+        let mut launch: Option<Flight> = None;
+        let mut landed = false;
+        let mut last_row = 4.0f32;
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            let pre = pet.flight;
+            let f = pet.tick(sense(t, Some((5, 0))));
+            if pre.is_none()
+                && let Some(fl) = pet.flight
+            {
+                launch = Some(fl);
+            }
+            if f.action == PetAction::Crouch {
+                crouch_run += 1;
+                max_crouch = max_crouch.max(crouch_run);
+            } else {
+                crouch_run = 0;
+            }
+            if f.action == PetAction::Leap {
+                leap_frames += 1;
+            }
+            if f.action == PetAction::Land {
+                landed = true;
+            }
+            last_row = f.row;
+        }
+        let fl = launch.expect("the Enter must leave the ground");
+        assert!(
+            !fl.big && !fl.show,
+            "a twelve-cell line change is a hop, not a bound: {fl:?}"
+        );
+        assert_eq!(max_crouch, 1, "the hop coils for exactly one tick");
+        assert!(
+            f32::from(leap_frames) * 0.016 <= FLIGHT_MAX + 0.02,
+            "one FLIGHT_MAX arc at most, flew {leap_frames} frames"
+        );
+        let rate = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row) / fl.dur;
+        assert!(
+            rate <= HOP_SPEED_MAX + 1e-3,
+            "launched at {rate:.1} c/s over the hop cap"
+        );
+        assert!(landed, "and it lands");
+        assert!((last_row - 5.0).abs() < 0.01, "on row 5, got {last_row}");
+    }
+
+    /// THE NOTICE RULE: a settled cat looks up before a BOUND from any door,
+    /// not only the chosen show's. The prompt redraw that hides the caret
+    /// for a frame reaches the row-hop door (S6) or, at the bottom of the
+    /// pane, the pounce door (S11) with no move latched — both used to cut
+    /// a Sit straight into a 91 c/s arc. Now: exactly one Perk beat, the
+    /// coil, one quiet bound (no show, no dust), paws down within 1.3 s.
+    /// A cat mid-typing is on its feet already and never perks — the S2b
+    /// fixture from column 40, whose Enter is the size of a screen-crossing
+    /// latch (`BIG_JUMP_COLS`) and is still a line change: quiet.
+    #[test]
+    fn a_settled_cat_notices_before_a_bound_from_any_door() {
+        // (S6) the hidden frame before the next line: the row-hop door.
+        let mut p = Probe::new(80);
+        p.warm(6, 40);
+        p.hold(Some((6, 40)), 2.5);
+        p.mark();
+        let _ = p.frame(None);
+        p.ink(7, 0, 2);
+        p.live = Some(7);
+        let _ = p.frame(Some((7, 2)));
+        p.hold(Some((7, 2)), 3.0);
+        assert_notice_then_one_quiet_bound(&p, "S6 (row-hop door)");
+
+        // (S11) the prompt redraw at the bottom: the pounce door.
+        let mut p = Probe::new(80);
+        p.warm(23, 40);
+        p.hold(Some((23, 40)), 2.5);
+        p.mark();
+        let _ = p.frame(None);
+        p.ink(22, 0, 40);
+        p.ink(23, 0, 2);
+        p.live = Some(23);
+        let _ = p.frame(Some((23, 2)));
+        p.hold(Some((23, 2)), 3.0);
+        assert_notice_then_one_quiet_bound(&p, "S11 (pounce door)");
+
+        // (S2b) mid-typing: on its feet, no notice at all.
+        let mut p = Probe::new(80);
+        p.warm(6, 40);
+        p.mark();
+        p.ink(7, 0, 2);
+        p.live = Some(7);
+        let _ = p.frame(Some((7, 2)));
+        p.hold(Some((7, 2)), 3.0);
+        let tr = p.trigger.expect("fixture: marked");
+        assert!(
+            p.actions
+                .iter()
+                .all(|(at, a)| *at < tr || *a != PetAction::Perk),
+            "a cat on its feet never perks: {:?}",
+            p.actions
+        );
+        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
+        assert_eq!(flights.len(), 1, "one quiet bound, got {flights:?}");
+        assert!(
+            flights[0].big && !flights[0].show,
+            "a bound, not the show: {:?}",
+            flights[0]
+        );
+    }
+
+    /// S8: a three-line prompt. The flight tiers and times by its pixel
+    /// DIAGONAL ([`span_eq`]), not by its column count — a 28-column,
+    /// three-row Enter used to fly the 0.42 s hop at 7.1 rows/s.
+    #[test]
+    fn a_multi_row_prompt_flies_at_a_lawful_row_rate() {
+        let mut p = Probe::new(80);
+        p.warm(6, 30);
+        p.hold(Some((6, 30)), 2.5);
+        p.mark();
+        for r in 7..=9 {
+            p.ink(r, 0, 2);
+        }
+        p.live = Some(9);
+        let _ = p.frame(Some((9, 2)));
+        p.hold(Some((9, 2)), 3.0);
+        let tr = p.trigger.expect("fixture: marked");
+        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
+        assert_eq!(
+            flights.len(),
+            1,
+            "one flight to the prompt, got {flights:?}"
+        );
+        let fl = flights[0];
+        let span = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row);
+        let cap = if fl.big {
+            BIG_HOP_SPEED_MAX
+        } else {
+            HOP_SPEED_MAX
+        };
+        assert!(
+            span / fl.dur <= cap + 1e-3,
+            "launched at {:.1} c/s over the {cap} c/s cap: {fl:?}",
+            span / fl.dur
+        );
+        let row_rate = (fl.to_row - fl.from_row).abs() / fl.dur;
+        assert!(
+            row_rate <= 8.0,
+            "three rows at {row_rate:.1} rows/s is a drop, not a jump"
+        );
+        let last = p.last.expect("frames were drawn");
+        assert!(
+            (last.row - 9.0).abs() < 0.01,
+            "and it lands on row 9, got {}",
+            last.row
+        );
+    }
+
+    /// THE ENTER RULE (BM-6): an Enter from mid-line is a LINE CHANGE and
+    /// crosses quietly — one bound sized by its span, never the chosen
+    /// show, whatever size the move latched. From a settled cat: at most
+    /// the one notice beat (`on_move`'s double-take), then the coil, then
+    /// one quiet bound (`big`, lawful, no dust), paws down on the new row
+    /// within 1.6 s. From a Run (typing at 10 keys/s up to the Enter): no
+    /// notice at all, paws down within 1.3 s, landing at or ahead of the
+    /// caret. Measured before: the same Enter played Perk → butt-wiggle →
+    /// bound with dust (S2a/S2b).
+    #[test]
+    fn an_enter_from_mid_line_is_one_quiet_bound() {
+        let judge = |p: &Probe, door: &str, bar: f32, perks_max: usize| {
+            assert!(!p.wiggle, "{door}: never the show's gather");
+            assert!(!p.dust, "{door}: no dust on a quiet landing");
+            let perks = p.onsets(PetAction::Perk);
+            assert!(
+                perks <= perks_max,
+                "{door}: at most {perks_max} notice beat(s), got {perks}: {:?}",
+                p.actions
+            );
+            assert_eq!(
+                p.episodes, 1,
+                "{door}: one airborne episode: {:?}",
+                p.actions
+            );
+            let flights = p.launches();
+            assert_eq!(flights.len(), 1, "{door}: one flight, got {flights:?}");
+            let fl = flights[0];
+            assert!(fl.big && !fl.show, "{door}: a quiet bound: {fl:?}");
+            let rate = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row) / fl.dur;
+            assert!(
+                rate <= BIG_HOP_SPEED_MAX + 1e-3,
+                "{door}: lawful launch, {rate:.1} c/s"
+            );
+            let down = p.grounded_at().expect("paws down by the end");
+            assert!(
+                down <= bar,
+                "{door}: paws down within {bar} s, got {down:.2}"
+            );
+            let last = p.last.expect("frames were drawn");
+            assert!(
+                (last.row - 6.0).abs() < 0.01,
+                "{door}: on row 6, got {}",
+                last.row
+            );
+        };
+
+        // Settled at (5,40), then Enter → (6,3).
+        let mut p = Probe::new(80);
+        p.warm(5, 40);
+        p.hold(Some((5, 40)), 2.5);
+        assert!(p.pet.action.settled(), "fixture: settled");
+        p.mark();
+        p.ink(6, 0, 3);
+        p.live = Some(6);
+        let _ = p.frame(Some((6, 3)));
+        p.hold(Some((6, 3)), 3.0);
+        judge(&p, "settled", 1.6, 1);
+        let (perk_at, _) = p
+            .actions
+            .iter()
+            .copied()
+            .find(|(at, a)| *at >= p.trigger.unwrap_or(0.0) && *a == PetAction::Perk)
+            .expect("a settled cat looks up first");
+        let (next_at, _) = p
+            .actions
+            .iter()
+            .copied()
+            .find(|(at, _)| *at > perk_at)
+            .expect("and then moves");
+        assert!(
+            next_at - perk_at <= PERK_HOLD + 0.04,
+            "one beat of notice, not a hold: {:.2} s",
+            next_at - perk_at
+        );
+
+        // From a Run: typed to 40 at 10 keys/s, row 5 inked, then Enter.
+        let mut p = Probe::new(80);
+        p.warm(5, 40);
+        assert!(
+            matches!(p.pet.action, PetAction::Run | PetAction::Walk),
+            "fixture: on its feet, got {:?}",
+            p.pet.action
+        );
+        p.mark();
+        p.ink(6, 0, 3);
+        p.live = Some(6);
+        let _ = p.frame(Some((6, 3)));
+        p.hold(Some((6, 3)), 3.0);
+        judge(&p, "typing", 1.3, 0);
+        let last = p.last.expect("frames were drawn");
+        assert!(
+            last.col >= 3.0,
+            "typing lands at or ahead of the caret, got col {:.2}",
+            last.col
+        );
+    }
+
+    /// The JOY door never opens on a line change: a content, settled cat
+    /// answers a word jump with the whole show — but an Enter is an Enter,
+    /// and it hops the line quietly (no butt-wiggle, no dust).
+    #[test]
+    fn a_content_cat_still_hops_the_line_quietly() {
+        let start = Instant::now();
+        let mut joyful = PetBrain::default();
+        let t = awake(&mut joyful, start, 3, 2);
+        let (t, _) = type_run(&mut joyful, t, 3, 4, 60, 0.05);
+        let (t, f) = idle(&mut joyful, t, (3, 64), 2.0);
+        assert!(
+            joyful.content() >= JOY_CONTENT && f.action.settled(),
+            "fixture: a joyful, settled cat"
+        );
+        let (poses, frames) = drive_and_collect(&mut joyful, t, (4, 2), 200);
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Leap),
+            "the Enter is still answered with a flight"
+        );
+        assert!(
+            !poses.contains(&PetGlyphId::PetCrouchWiggle),
+            "no butt-wiggle on a line change, joy or no joy"
+        );
+        assert!(
+            frames.iter().all(|f| f
+                .motes
+                .iter()
+                .flatten()
+                .all(|m| m.kind != PetMoteKind::Dust)),
+            "and no dust"
+        );
+        assert!(
+            (frames.last().expect("frames").row - 4.0).abs() < 0.01,
+            "on the new row"
+        );
+    }
+
+    /// S3b: the wall-side Enter that arrives while the cat is mid row-hop.
+    /// The one mid-air re-aim keeps the flight's clock, so the whole new
+    /// span had to fit in the time LEFT — measured, 5.64 cells in one
+    /// frame (338 c/s). Now the re-aim is REFUSED: the hop lands at its
+    /// original aim, every frame is lawful, no fright, and the latched
+    /// intent flies to the row-7 station from the landing — ONE quiet bound
+    /// (the line change is a quiet leap, never the show's two bounds).
+    #[test]
+    fn a_re_aim_never_outruns_the_flight() {
+        let mut w = Law::warm(80, 24, 6, 70);
+        // Two or three more keys: the led station hangs off the margin, the
+        // wall side flips, and the ladder seats the cat on the blank row
+        // below — a hop, caught in its first half.
+        let mut hopped = false;
+        'keys: for c in 71..=78u16 {
+            w.ink(6, 0, c);
+            for _ in 0..6 {
+                let _ = w.frame(Some((6, c)));
+                if w.pet
+                    .flight
+                    .is_some_and(|f| (0.03..=f.dur * 0.5).contains(&f.t))
+                {
+                    hopped = true;
+                    break 'keys;
+                }
+            }
+        }
+        assert!(
+            hopped,
+            "fixture: the wall-side ladder hops the cat down mid-typing"
+        );
+        let before = w.pet.flight.expect("fixture: airborne");
+        // THE ENTER, mid-hop.
+        w.ink(7, 0, 2);
+        w.live = Some(7);
+        let _ = w.frame(Some((7, 2)));
+        let after = w
+            .pet
+            .flight
+            .expect("a refused re-aim lets the hop finish its flight");
+        assert!(
+            (after.to_col - before.to_col).abs() < 1e-6
+                && (after.to_row - before.to_row).abs() < 1e-6,
+            "the re-aim is refused, never solved: {before:?} -> {after:?}"
+        );
+        assert!(after.reaimed, "and the one re-aim is spent on the refusal");
+        let seen = w.launches.len();
+        w.hold(Some((7, 2)), 220);
+        let further = &w.launches[seen..];
+        assert!(
+            !w.actions.contains(&PetAction::Startle),
+            "no fright anywhere in the crossing"
+        );
+        assert_eq!(
+            further.len(),
+            1,
+            "exactly one quiet crossing to the row-7 station, got {further:?}"
+        );
+        assert!(
+            further.iter().all(|f| (f.to_row - 7.0).abs() < 0.01),
+            "every further flight aims at row 7: {further:?}"
+        );
+        let (col, row, _, _) = w.last;
+        assert!(w.pet.flight.is_none(), "and it is down by the end");
+        assert!((row - 7.0).abs() < 0.01, "on row 7, got {row}");
+        let (station, _) = w.pet.station_safe((7, 2), 80, 24, art_cols(10, 20), 10);
+        assert!(
+            (col - station).abs() < 1.5,
+            "beside the prompt (station {station:.2}), got {col:.2}"
+        );
+    }
+
+    /// A re-aim never changes ROW: a row change is always a hop, cut and
+    /// landed against its own row. A pounce along row 4 that an Enter
+    /// re-aims at row 5 mid-arc keeps its target whole and lands there;
+    /// ONE further flight then takes the cat down to the new line.
+    #[test]
+    fn a_re_aim_that_changes_row_is_refused() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        // `awake` leaves the caret at 22; a +18 word jump is a pounce.
+        let mut t = awake(&mut pet, start, 4, 20);
+        let caret = (4, 40u16);
+        let mut spins = 0;
+        while pet.flight.is_none() && spins < 60 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some(caret)));
+            spins += 1;
+        }
+        let f0 = pet.flight.expect("fixture: the word jump pounces");
+        assert!(!f0.big, "fixture: a pounce, inside the hop tier: {f0:?}");
+        // Fly to about a third of the arc, then Enter to the next row.
+        while pet.flight.is_some_and(|f| f.t / f.dur < 0.3) {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some(caret)));
+        }
+        assert!(pet.flight.is_some(), "fixture: still airborne");
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((5, 2))));
+        let f1 = pet.flight.expect("the pounce is still in the air");
+        assert!(
+            (f1.to_row - 4.0).abs() < 1e-6,
+            "a re-aim never changes row, got {f1:?}"
+        );
+        assert!(
+            (f1.to_col - f0.to_col).abs() < 1e-6,
+            "nor the column: the row change is refused whole, got {f1:?}"
+        );
+        let mut launches = 0;
+        let mut last = pet.flight;
+        let mut final_row = 4.0f32;
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((5, 2))));
+            if last.is_none() && pet.flight.is_some() {
+                launches += 1;
+            }
+            last = pet.flight;
+            final_row = f.row;
+        }
+        assert_eq!(launches, 1, "one flight down to row 5 after the landing");
+        assert!(
+            (final_row - 5.0).abs() < 0.01,
+            "and it ends on row 5, got {final_row}"
+        );
+    }
+
+    /// The ink ladder's walled-shut short-circuit. A row inked to column 78
+    /// of 80 leaves no blank ground beside the wall-side station: rule 2
+    /// used to accept the walled-shut `want` (it is trivially within
+    /// [`INK_EVICT_MAX`] of itself) and seat the cat ON the words, so the
+    /// stand flip-flopped between the blank row below (caret 72–74) and the
+    /// ink (caret 75+) as you typed. Rule 2 now accepts only real ground:
+    /// the stand is the blank row below — above, on the last row — and
+    /// typing along the line never hops the cat back up onto it.
+    #[test]
+    fn the_wall_side_stand_takes_the_blank_row_below() {
+        let w = art_cols(10, 20);
+        let mut pet = PetBrain::default();
+        let mut spans = vec![(0u16, 0u16); 24];
+        spans[6] = (0, 78);
+        pet.sense_ink(0, &spans, Some(6));
+        let (_, row) = pet.station_safe((6, 75), 80, 24, w, 10);
+        assert!(
+            (row - 7.0).abs() < 0.01,
+            "the walled-shut row hands the stand to the blank row below, got row {row}"
+        );
+        let mut spans = vec![(0u16, 0u16); 24];
+        spans[23] = (0, 78);
+        pet.sense_ink(0, &spans, Some(23));
+        let (_, row) = pet.station_safe((23, 75), 80, 24, w, 10);
+        assert!(
+            (row - 22.0).abs() < 0.01,
+            "and on the last row, to the blank row above, got row {row}"
+        );
+
+        // On the real brain: typing 72 → 78 along that line, at 100 ms a
+        // key, never hops the cat back up onto the words once it has taken
+        // the blank row.
+        for (row, blank) in [(6u16, 7.0f32), (23, 22.0)] {
+            let mut p = Probe::new(80);
+            p.warm(row, 72);
+            p.mark();
+            let mut taken = false;
+            let mut check = |p: &Probe, f: PetFrame, at: &str| {
+                if p.pet.flight.is_none() && (f.row - blank).abs() < 0.01 {
+                    taken = true;
+                }
+                if taken {
+                    assert!(
+                        (f.row - blank).abs() < 0.01,
+                        "row {row}: hopped back toward the words at {at}: row {}",
+                        f.row
+                    );
+                }
+            };
+            for c in 73..=78u16 {
+                p.ink(row, 0, c);
+                for _ in 0..6 {
+                    let f = p.frame(Some((row, c)));
+                    check(&p, f, &format!("caret {c}"));
+                }
+            }
+            for _ in 0..120 {
+                let f = p.frame(Some((row, 78)));
+                check(&p, f, "the quiet after");
+            }
+            assert!(taken, "row {row}: fixture — the cat took the blank row");
+        }
+    }
+
+    /// The wall transit fires ONCE, and never after a flight that already
+    /// crossed: a wrap's bound lands on the caret's new side by
+    /// `station_now`, so the latch it consumed would only have flown a
+    /// span-blind third arc for nothing (S4/S5, measured). After the
+    /// crossing's landing the cat walks the lead — no further flight, and
+    /// it ends stationed on the caret's right.
+    ///
+    /// THE LATCH IS PROVABLY ARMED HERE (review, 2026-08-27): the wrap flips
+    /// the hysteretic wall side on a frame with no flight in the air, which
+    /// IS the arming condition, and the assertions below are written against
+    /// the arc's own SHAPE ([`WALL_HOP_DUR`]/[`WALL_HOP_ARC`]) rather than
+    /// the probe's debug label, which the doors may silently rename.
+    #[test]
+    fn the_wall_transit_never_fires_after_a_flight_that_already_crossed() {
+        let mut p = Probe::new(80);
+        p.warm(5, 79);
+        p.mark();
+        assert!(
+            p.pet.wall_side && p.pet.flight.is_none(),
+            "fixture: at the right wall, on its feet, before the wrap"
+        );
+        // The typed wrap, then typing on at ~8 keys/s for 1.5 s.
+        p.live = Some(6);
+        p.ink(6, 0, 0);
+        let _ = p.frame(Some((6, 0)));
+        assert!(
+            !p.pet.wall_side,
+            "fixture: the wrap flips the wall side — the transit latched on this frame"
+        );
+        let mut latched_airborne = false;
+        for c in 1..=12u16 {
+            p.ink(6, 0, c);
+            for _ in 0..8 {
+                let _ = p.frame(Some((6, c)));
+                latched_airborne |= p.pet.pending_wall_transit && p.pet.flight.is_some();
+            }
+        }
+        p.hold(Some((6, 12)), 2.0);
+        assert!(
+            !latched_airborne,
+            "a flight consumes the transit latch on its way out, never carries it"
+        );
+        let tr = p.trigger.expect("fixture: marked");
+        let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
+        assert!(!flights.is_empty(), "fixture: the wrap flies");
+        assert!(
+            flights.iter().all(|f| (f.dur - WALL_HOP_DUR).abs() > 1e-4
+                || (f.arc - WALL_HOP_ARC).abs() > 1e-4),
+            "no span-blind wall arc after a flight that already crossed: {flights:?}"
+        );
+        let episodes = flights
+            .iter()
+            .filter(|f| !f.site.starts_with("bound 2"))
+            .count();
+        assert_eq!(
+            episodes, 1,
+            "exactly one airborne episode after the wrap: {flights:?}"
+        );
+        let last = p.last.expect("frames were drawn");
+        assert!(p.pet.flight.is_none(), "and it is down by the end");
+        assert!(
+            last.col > 12.0 && (last.row - 6.0).abs() < 0.01,
+            "stationed on the caret's right on the new row, got ({:.2}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// THE SNAP (BM-7): a same-row move back of [`SNAP_COLS`] or more in one
+    /// go — Home, Ctrl-U, the last-row Enter with a prompt — is a jump, not
+    /// a fright: no Startle, no butt-wiggle, ONE airborne episode, every
+    /// frame lawful. On the last row with the line still inked the stand is
+    /// the blank row above (the ladder's rule 3), and — the reaction pose
+    /// being consumed by the hop, never owed back — no Startle plays after
+    /// the landing either. Measured before (S9): Startle → Perk → wiggle →
+    /// two bounds with dust.
+    #[test]
+    fn a_snap_home_is_a_jump_not_a_fright() {
+        let judge = |w: &Law, from: usize, door: &str| {
+            assert_eq!(
+                w.onsets(from, PetAction::Startle),
+                0,
+                "{door}: no fright, got {:?}",
+                &w.actions[from..]
+            );
+            assert!(
+                !w.wore(from, PetGlyphId::PetCrouchWiggle),
+                "{door}: never the show's gather"
+            );
+            assert_eq!(
+                w.episodes(from),
+                1,
+                "{door}: one airborne episode: {:?}",
+                &w.actions[from..]
+            );
+            assert!(w.pet.flight.is_none(), "{door}: down by the end");
+            assert!(!w.dust(from), "{door}: no dust");
+        };
+
+        // Settled beside (5,60) on an open row; Home → (5,3).
+        let mut w = Law::warm(80, 30, 5, 60);
+        w.hold(Some((5, 60)), 150);
+        assert!(w.pet.action.settled(), "fixture: settled");
+        let at = w.now();
+        let _ = w.frame(Some((5, 3)));
+        assert!(
+            w.pet.pending_pounce && w.pet.quiet_leap && !w.pet.pending_big_jump,
+            "the snap latches a quiet jump, never the show"
+        );
+        w.hold(Some((5, 3)), 120);
+        judge(&w, at, "open row");
+
+        // The last row, the typed line still inked: (23,40) → (23,3).
+        let mut w = Law::warm(80, 24, 23, 40);
+        w.hold(Some((23, 40)), 150);
+        let at = w.now();
+        let _ = w.frame(Some((23, 3)));
+        w.hold(Some((23, 3)), 120);
+        judge(&w, at, "last row");
+        let (_, row, _, _) = w.last;
+        assert!(
+            (row - 22.0).abs() < 0.01,
+            "the stand is the blank row above the inked line, got {row}"
+        );
+        let down = w.touchdown(at).expect("landed");
+        assert!(
+            w.actions[down..].iter().all(|a| *a != PetAction::Startle),
+            "and nothing replays a fright after the landing"
+        );
+    }
+
+    /// A REACTION IS CONSUMED BY THE HOP, never replayed (BM-11): a settled
+    /// cat startles at a line retreating six cells, and a beat later the
+    /// row is inked through its footprint. The re-anchor hop borrows the
+    /// pose for the arc — and does NOT hand the fright back on landing (the
+    /// flight was the fright): exactly one Startle onset in two seconds,
+    /// and a settled pose after the paws are down. Measured before on the
+    /// scrolled wrap: three Startles a line, each replayed one frame before
+    /// the next hop.
+    #[test]
+    fn a_startle_shoved_off_its_spot_is_not_replayed() {
+        let mut w = Law::warm(80, 30, 5, 30);
+        w.hold(Some((5, 30)), 150);
+        assert!(w.pet.action.settled(), "fixture: settled");
+        let at = w.now();
+        // The retreat: a real one, the bottle.
+        let _ = w.frame(Some((5, 24)));
+        assert_eq!(w.pet.action, PetAction::Startle, "fixture: the fright");
+        w.hold(Some((5, 24)), 3);
+        // …and the line reprints through the cat's footprint.
+        w.ink(5, 0, 40);
+        w.hold(Some((5, 24)), 120);
+        assert_eq!(
+            w.onsets(at, PetAction::Startle),
+            1,
+            "exactly one fright: {:?}",
+            &w.actions[at..]
+        );
+        let down = w.touchdown(at).expect("the eviction hops");
+        assert!(
+            w.actions[down..].iter().all(|a| *a != PetAction::Startle),
+            "never replayed after the hop: {:?}",
+            &w.actions[down..]
+        );
+        assert!(w.pet.action.settled(), "and settled after it");
+    }
+
+    /// The same seam, driven through the whole brain: a wrap must not launch
+    /// the screen-crossing show. (The test this replaces asserted at 0.25 s
+    /// inside a 0.62 s wake hold — vacuous, as the design doc noted.) An
+    /// awake cat beside a line typed to the margin: the wrap folds to one
+    /// character, latches nothing but the quiet leap, and the crossing that
+    /// follows is ONE quiet bound under the law — no fright, no notice (the
+    /// cat is on its feet), no butt-wiggle, no dust, paws down on the new
+    /// row within 1.6 s.
+    #[test]
+    fn typing_past_the_margin_never_launches_the_show() {
+        let mut w = Law::new(100, 30, (5, 95));
+        w.live = Some(5);
+        w.ink(5, 0, 95);
+        // Wake, walk, settle — the `awake` fixture's shape.
+        w.type_to(5, 95, 97, 3);
+        w.hold(Some((5, 97)), 100);
+        assert!(w.pet.action.settled(), "fixture: a settled cat at the wall");
+        // The line grows under the cat (its stand steps down to row 6)…
+        w.type_to(5, 97, 99, 3);
+        // …and the next keystroke wraps.
+        w.ink(5, 0, 100);
+        w.ink(6, 0, 1);
+        w.live = Some(6);
+        let at_wrap = w.now();
+        let _ = w.frame(Some((6, 0)));
+        assert!(
+            !w.pet.pending_big_jump && !w.pet.pending_pounce,
+            "a wrap latches no travel: big={} pounce={}",
+            w.pet.pending_big_jump,
+            w.pet.pending_pounce
+        );
+        assert!(w.pet.quiet_leap, "a wrap's crossing is a quiet one");
+        w.hold(Some((6, 0)), 120);
+        assert_eq!(w.onsets(at_wrap, PetAction::Startle), 0, "no fright");
+        assert_eq!(
+            w.onsets(at_wrap, PetAction::Perk),
+            0,
+            "a cat on its feet does not look up first: {:?}",
+            &w.actions[at_wrap..]
+        );
+        assert!(
+            !w.wore(at_wrap, PetGlyphId::PetCrouchWiggle),
+            "never the show's gather"
+        );
+        assert_eq!(
+            w.episodes(at_wrap),
+            1,
+            "exactly one airborne episode (a 92-cell span is one bound): {:?}",
+            &w.actions[at_wrap..]
+        );
+        let launched: Vec<&Flight> = w.launches.iter().collect();
+        let fl = launched.last().expect("the wrap flies");
+        assert!(fl.big && !fl.show, "a quiet bound, not the show: {fl:?}");
+        let rate = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row) / fl.dur;
+        assert!(
+            rate <= BIG_HOP_SPEED_MAX + 1e-3,
+            "lawful launch, {rate:.1} c/s"
+        );
+        let down = w.touchdown(at_wrap).expect("paws down by the end");
+        let secs = (down - at_wrap) as f32 * 0.016;
+        assert!(secs <= 1.6, "paws down within 1.6 s, got {secs:.2}");
+        let (_, row, _, _) = w.last;
+        assert!((row - 6.0).abs() < 0.01, "on row 6, got {row}");
+        assert!(!w.dust(at_wrap), "no dust on a quiet landing");
+    }
+
+    /// A HIDDEN FRAME at the Enter (BM-10): the prompt redraw hides the caret
+    /// for one frame before the next line. The cat never went off the glass
+    /// (alpha stays high), the re-sighting reads the line change off the
+    /// cat's own feet, and the crossing is the quiet one: no Startle, one
+    /// notice beat (a settled cat), one airborne episode, lawful, paws down
+    /// on row 6 within 1.3 s — at 80 and at 200 columns.
+    #[test]
+    fn a_hidden_frame_at_enter_still_crosses_lawfully() {
+        for cols in [80u16, 200] {
+            let mut w = Law::warm(cols, 30, 5, 41);
+            w.hold(Some((5, 41)), 150);
+            w.ink(5, 0, 40);
+            let at = w.now();
+            let _ = w.frame(None);
+            w.ink(6, 0, 3);
+            w.live = Some(6);
+            let _ = w.frame(Some((6, 3)));
+            w.hold(Some((6, 3)), 120);
+            assert_eq!(
+                w.onsets(at, PetAction::Startle),
+                0,
+                "{cols} cols: no fright: {:?}",
+                &w.actions[at..]
+            );
+            assert_eq!(
+                w.onsets(at, PetAction::Perk),
+                1,
+                "{cols} cols: one notice beat: {:?}",
+                &w.actions[at..]
+            );
+            assert_eq!(
+                w.episodes(at),
+                1,
+                "{cols} cols: one airborne episode: {:?}",
+                &w.actions[at..]
+            );
+            assert!(
+                w.frames[at..].iter().all(|f| f.alpha > 150),
+                "{cols} cols: the cat never left the glass"
+            );
+            let down = w.touchdown(at).expect("paws down by the end");
+            let secs = (down - at) as f32 * 0.016;
+            assert!(
+                secs <= 1.3,
+                "{cols} cols: paws down within 1.3 s, got {secs:.2}"
+            );
+            let (_, row, _, _) = w.last;
+            assert!((row - 6.0).abs() < 0.01, "{cols} cols: on row 6, got {row}");
+        }
+    }
+
+    // TWO OF BM-10'S GUARDS ARE UPSTREAM'S JOB, and its answer is better —
+    // so ours were dropped rather than layered. `a_hidden_frame_never_
+    // reposes_a_cat_in_the_air` and `a_long_hide_mid_flight_reseats_without
+    // _a_snap` asserted that a hidden frame FREEZES a live arc and that the
+    // re-seat then drops it. This brain RETIRES the arc on the hidden frame
+    // instead (`flight.take()`), hands the authored parabola to
+    // `retired_flight_lift` so the visible body eases down through the same
+    // curve, and parks the destination in `deferred_hidden_landing` to be
+    // taken only if the fade COMPLETES — covered by
+    // `a_caret_withheld_mid_flight_holds_its_fade_and_lands_when_dark` and
+    // `a_quick_caret_return_cancels_the_deferred_hidden_landing`. With the
+    // flight always taken, `enter_settled` can never re-pose a cat in the
+    // air and the re-seat can never land on a live trip, so both of our
+    // guards were provably dead code. The hidden-frame rules that ARE ours
+    // — the crossing after a redraw, and the re-sighting read against the
+    // snap bar — are the two tests either side of this note.
+
+    /// THE STREAM WATCH (BM-9): a wrapping build log on the last row — the
+    /// caret at the end of a full line one frame and the start of the next
+    /// the next frame, for four seconds. Measured before: a Startle every
+    /// other frame for the length of the log; with the wrap folded and no
+    /// gate, a bound treadmill. Now the run of line events sits the cat
+    /// down: at most two airborne episodes, no fright after the first fifth
+    /// of a second, the body still from 1.5 s on wearing only Perk / Sit /
+    /// Leap / Land, the frame lane held throughout, every frame lawful —
+    /// with and without `output_burst`. The ink ladder is NOT bypassed:
+    /// with the row above the log left blank, the cat is seated on it
+    /// (rule 3). When the prompt returns on a blank last row: one trip home
+    /// (at most two bounds) within 3 s, and the lane released once settled.
+    #[test]
+    fn a_wrapping_build_log_sits_the_cat_down_to_watch() {
+        let last = PROBE_ROWS - 1;
+        for (burst, above) in [(false, true), (true, true), (false, false)] {
+            let door = format!("burst={burst} row-above-inked={above}");
+            let mut p = Probe::judged(80);
+            p.warm(last, 40);
+            p.hold(Some((last, 40)), 2.5);
+            p.mark();
+            p.log_rows(240, burst, above);
+            assert!(p.pet.stream, "{door}: the watch is armed");
+            assert!(
+                p.episodes <= 2,
+                "{door}: at most two airborne episodes, got {}: {:?}",
+                p.episodes,
+                p.actions
+            );
+            assert!(
+                p.actions
+                    .iter()
+                    .all(|(at, a)| *a != PetAction::Startle
+                        || *at < p.trigger.unwrap_or(0.0) + 0.2),
+                "{door}: no fright after 0.2 s: {:?}",
+                p.actions
+            );
+            let still: Vec<&(f32, PetFrame)> =
+                p.trace.iter().filter(|(at, _)| *at >= 1.5).collect();
+            let (c0, r0) = (still[0].1.col, still[0].1.row);
+            assert!(
+                still
+                    .iter()
+                    .all(|(_, f)| (f.col - c0).abs() < 1e-3 && (f.row - r0).abs() < 1e-3),
+                "{door}: still from 1.5 s on"
+            );
+            assert!(
+                still.iter().all(|(_, f)| matches!(
+                    f.action,
+                    PetAction::Perk | PetAction::Sit | PetAction::Leap | PetAction::Land
+                )),
+                "{door}: sat down to watch: {:?}",
+                p.actions
+            );
+            assert!(p.needs_always, "{door}: the lane is held throughout");
+            if !above {
+                assert!(
+                    (r0 - f32::from(last - 1)).abs() < 0.01,
+                    "{door}: seated on the blank row above the log (rule 3), got row {r0}"
+                );
+            }
+            // The prompt returns on a blank last row.
+            let flights_before = p.flights.len();
+            let at_prompt = p.now();
+            p.ink(last, 0, 2);
+            if above {
+                p.ink(last - 1, 0, 80);
+            }
+            let _ = p.frame(Some((last, 2)));
+            p.hold(Some((last, 2)), 3.0);
+            let home: Vec<&ProbeFlight> = p.flights[flights_before..].iter().collect();
+            assert!(
+                (1..=2).contains(&home.len()),
+                "{door}: one trip home, at most two bounds: {home:?}"
+            );
+            assert!(p.pet.flight.is_none(), "{door}: home within 3 s");
+            let tr = p.trigger.expect("marked");
+            let down = p.touchdown.expect("landed") - (at_prompt - tr);
+            assert!(
+                down <= 3.0,
+                "{door}: paws down within 3 s of the prompt, got {down:.2}"
+            );
+            let last_f = p.last.expect("frames");
+            assert!(
+                (last_f.row - f32::from(last)).abs() < 0.01,
+                "{door}: home on the last row"
+            );
+            assert!(!p.pet.stream, "{door}: the watch lapsed");
+            p.hold(Some((last, 2)), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+            assert!(
+                !p.pet.needs_frames(),
+                "{door}: the lane is released once settled"
+            );
+        }
+    }
+
+    /// A top-down paint (BM-9): the caret walks down the pane a row a frame.
+    /// Without the watch that is thirty row hops; with it, at most two
+    /// airborne episodes before the cat sits, then one trip after the lapse.
+    #[test]
+    fn a_top_down_paint_never_hops_every_row() {
+        let mut w = Law::warm(80, 30, 0, 10);
+        let at = w.now();
+        for r in 1..30u16 {
+            let _ = w.frame(Some((r, 0)));
+        }
+        assert!(w.pet.stream, "the paint arms the watch");
+        assert!(
+            w.episodes(at) <= 2,
+            "at most two hops during the paint: {:?}",
+            &w.actions[at..]
+        );
+        let after = w.now();
+        w.hold(Some((29, 0)), 200);
+        assert!(!w.pet.stream, "the watch lapses");
+        assert!(
+            (1..=2).contains(&w.episodes(after)),
+            "one trip after the lapse: {:?}",
+            &w.actions[after..]
+        );
+        let (_, row, _, _) = w.last;
+        assert!(
+            w.pet.flight.is_none() && (row - 29.0).abs() < 0.01,
+            "home on row 29"
+        );
+    }
+
+    /// A held word-jump (BM-9) — eight cells a frame along one row — is
+    /// typing, not a program: never a line event, never the watch.
+    #[test]
+    fn a_held_word_jump_is_not_a_stream() {
+        let mut w = Law::new(100, 30, (4, 2));
+        w.hold(Some((4, 2)), 2);
+        for k in 1..=11u16 {
+            let _ = w.frame(Some((4, 2 + 8 * k)));
+            assert!(!w.pet.stream, "a held word-jump never arms the watch");
+        }
+        w.hold(Some((4, 90)), 60);
+        assert!(!w.pet.stream);
+    }
+
+    /// A ROW CHANGE IS A ROW CHANGE, whichever way the caret went. The rule
+    /// used to read `dr >= 1 && dc <= 0`, on the argument that a
+    /// down-and-RIGHT move is a click and a click is chosen — but a printed
+    /// line has the same delta, so every new line that ended further right
+    /// than it started (a command whose output stops mid-screen, a log's
+    /// first line, a right-aligned prompt) played the whole chosen show:
+    /// the notice, the butt-wiggle, the dust, and a bound that was exempt
+    /// from the quiet pace (86.5 c/s measured on a 100-column pane).
+    #[test]
+    fn a_line_change_to_the_right_is_still_a_quiet_crossing() {
+        for cols in [80u16, 100] {
+            let mut p = Probe::judged(cols);
+            p.warm(6, 2);
+            p.hold(Some((6, 2)), 2.5);
+            p.mark();
+            // The line prints: the caret ends one row DOWN and most of a
+            // pane to the RIGHT of where it started.
+            let end = cols - 8;
+            p.ink(7, 0, end);
+            p.live = Some(7);
+            let _ = p.frame(Some((7, end)));
+            p.hold(Some((7, end)), 3.0);
+            let tr = p.trigger.expect("marked");
+            let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
+            assert!(
+                !flights.is_empty(),
+                "{cols}: fixture — the line change flies"
+            );
+            assert!(
+                flights.iter().all(|f| !f.show),
+                "{cols}: a printed line is not a chosen jump: {flights:?}"
+            );
+            assert!(!p.wiggle, "{cols}: no gather on a printed line");
+            assert!(!p.dust, "{cols}: no dust on a printed line");
+            assert!(
+                p.onsets(PetAction::Startle) == 0,
+                "{cols}: no fright on a printed line: {:?}",
+                p.actions
+            );
+            let bar = quiet_speed_max(cols) * PROBE_FRAME.as_secs_f32() + 1e-3;
+            assert!(
+                p.max_dcol.0 <= bar,
+                "{cols}: {:.3} cells in one frame, the quiet pace allows {bar:.3}",
+                p.max_dcol.0
+            );
+        }
+    }
+
+    /// THE PROMISE A USER WOULD RECOGNISE: one flight, and no gallop home.
+    ///
+    /// The wave's bars were written on the SETTLED pose, which is touchdown
+    /// plus [`BIG_LAND_DUR`] of in-place recovery — half a cell of travel
+    /// dressed up as four tenths of a second of reaction (see
+    /// [`PetBrain::notices`], and the probe's `home (travel over)` reading).
+    /// This is the clause that is actually about teleporting and it costs
+    /// nothing to state: the new line is answered by ONE bounded flight, and
+    /// the cat does not then run across the pane to finish the job. A
+    /// landing short of the station was the failure — measured before the
+    /// predicted tier existed, a 37.5-cell Enter flew a span-truncated hop,
+    /// landed 15 cells short, re-crouched and pounced the rest.
+    ///
+    /// SCOPED, DELIBERATELY, to a caret that came to rest. A caret that
+    /// keeps TYPING after its new line has earned a chase, and the cat
+    /// running after it is the follower doing its job, not a teleport
+    /// artefact: the sweep's own scrolled-Enter script types four more
+    /// characters after the Enter and gallops the four cells, at this
+    /// commit and at the wave's base commit alike. Asserting "never a Run"
+    /// over those would be asserting that the chase is a bug.
+    #[test]
+    fn a_new_line_costs_one_flight_and_no_gallop() {
+        for cols in [80u16, 200] {
+            for from in [10u16, 40, 70] {
+                let mut p = Probe::judged(cols);
+                p.warm(6, from);
+                p.mark();
+                p.live = Some(7);
+                p.ink(6, 0, from);
+                p.ink(7, 0, 2);
+                let _ = p.frame(Some((7, 2)));
+                // …and then the caret STAYS PUT: this is the reaction alone.
+                p.hold(Some((7, 2)), 3.0);
+                assert_eq!(
+                    p.episodes, 1,
+                    "{cols} cols, Enter from {from}: one new line, one flight — {:?}",
+                    p.actions
+                );
+                assert_eq!(
+                    p.onsets(PetAction::Run),
+                    0,
+                    "{cols} cols, Enter from {from}: no gallop home — {:?}",
+                    p.actions
+                );
+                assert_eq!(
+                    p.onsets(PetAction::Startle),
+                    0,
+                    "{cols} cols, Enter from {from}: and no fright — {:?}",
+                    p.actions
+                );
+            }
+        }
+    }
+
+    /// THE NOTICE BEAT IS ONLY PAID BY A CAT AT REST — the red-proof for
+    /// keeping it.
+    ///
+    /// [`PetBrain::notices`] costs [`PERK_HOLD`] on exactly four of the
+    /// probe's eighteen scenarios, and it is the beat that turns an
+    /// unexplained caret jump into a REACTION rather than a cut with an
+    /// animation on it. It is also the obvious thing to delete when someone
+    /// wants the settle bar under 1.3 s. This pins the trade: a cat caught
+    /// between keystrokes does NOT pay it (so the beat is not a tax on
+    /// typing), and a cat that was doing nothing DOES.
+    #[test]
+    fn the_notice_beat_is_only_paid_by_a_cat_at_rest() {
+        // THE PROMPT REDRAW is the shape that isolates this rule. The caret
+        // vanishes for a frame and reappears 37.5 cells away with no input
+        // from the user, so there is no move sensor event to perk at — the
+        // beat here is [`PetBrain::notices`]'s and nothing else's. (An
+        // ordinary Enter from a settled cat also perks, but that one comes
+        // from `on_move`'s own settled-cat double take, which is why it is
+        // NOT the fixture: it would pass with this rule deleted.)
+        let mut rested = Probe::judged(80);
+        rested.warm(6, 40);
+        rested.hold(Some((6, 40)), 1.5);
+        rested.mark();
+        let _ = rested.frame(None);
+        rested.live = Some(7);
+        rested.ink(6, 0, 0);
+        rested.ink(7, 0, 2);
+        let _ = rested.frame(Some((7, 2)));
+        rested.hold(Some((7, 2)), 2.5);
+        assert!(
+            rested.onsets(PetAction::Perk) >= 1,
+            "a cat at rest looks up before the bound: {:?}",
+            rested.actions
+        );
+        assert!(
+            rested.onsets(PetAction::Leap) >= 1,
+            "fixture: and then crosses"
+        );
+        // The same redraw taken MID-CHASE: the cat is already looking, and
+        // the rule stands itself down ([`PetBrain::at_rest`]).
+        let mut typing = Probe::judged(80);
+        typing.warm(6, 40);
+        typing.mark();
+        let _ = typing.frame(None);
+        typing.live = Some(7);
+        typing.ink(6, 0, 0);
+        typing.ink(7, 0, 2);
+        let _ = typing.frame(Some((7, 2)));
+        typing.hold(Some((7, 2)), 2.5);
+        assert_eq!(
+            typing.onsets(PetAction::Perk),
+            0,
+            "a cat mid-chase does not pay the beat: {:?}",
+            typing.actions
+        );
+    }
+
+    /// THE PACE LAW IN THE UNIT THAT IS INVARIANT — the ANIMAL, not the
+    /// cell.""
+    ///
+    /// "No crossing is more than about a cell a frame" is an eighty-column
+    /// promise the pace cannot keep at every width, and a reviewer who
+    /// measures a 200-column pane will find 2.33 and file it as a defect.
+    /// What actually decides whether the eye keeps hold of a moving object
+    /// is how far it moves relative to its OWN SIZE, and the pet is
+    /// [`art_cols`] ≈ 5.6 columns wide. This sweep pins that reading across
+    /// the clamp's whole range, including both of its corners, so nobody has
+    /// to re-derive it from one width's number.
+    #[test]
+    fn no_bound_crosses_more_than_half_the_animal_in_a_frame() {
+        let animal = art_cols(10, 20);
+        for cols in [20u16, 40, 80, 120, 200, 400] {
+            let per_frame = quiet_speed_max(cols) / 60.0;
+            assert!(
+                per_frame <= 0.5 * animal,
+                "{cols} cols: a bound steps {per_frame:.2} cells a frame, \
+                 {:.2} of the animal's own {animal:.2}-column width",
+                per_frame / animal
+            );
+        }
+        // The clamp's two corners, stated rather than assumed — the sweep
+        // above is not monotonic in `cols` and a reader should not think it
+        // is. Below ~74 columns the pace is LIFTED to the hop's ceiling
+        // (which is the fastest pane-relative pace in the product), above
+        // ~189 it is capped at the law's.
+        assert!(
+            (quiet_speed_max(20) - HOP_SPEED_MAX).abs() < 0.01
+                && (quiet_speed_max(40) - HOP_SPEED_MAX).abs() < 0.01,
+            "a narrow pane is held up to the hop's own pace"
+        );
+        assert!(
+            (quiet_speed_max(400) - BIG_HOP_SPEED_MAX).abs() < 0.01,
+            "and a wide one is held down to the law's"
+        );
+        // …and at 80 the pane-relative rule is what is actually in force,
+        // which is what makes the promise in [`QUIET_PANE_PER_SEC`] true
+        // THERE and only there.
+        assert!(
+            (quiet_speed_max(80) / 60.0 - 0.987).abs() < 0.01,
+            "80 columns: {}",
+            quiet_speed_max(80) / 60.0
+        );
+    }
+
+    /// THE QUIET SPLIT IS A TIME BAR, AND NO PANE PEOPLE USE REACHES IT.
+    ///
+    /// [`QUIET_ONE_BOUND_SECS`] is 1.7 seconds of flight compared against
+    /// `|delta| / quiet_speed_max(cols)`, so the split needs
+    /// `|delta| > 1.7 · quiet_speed_max(cols)` while `|delta| < cols`. This
+    /// pins the arithmetic so the doc cannot drift back into describing a
+    /// 119-CELL span bar, which is what it said for a while and which would
+    /// split every ordinary wide wrap.
+    #[test]
+    fn the_quiet_split_needs_a_pane_wider_than_anyone_has() {
+        for cols in [40u16, 80, 100, 120, 160, 200, 238] {
+            let widest = f32::from(cols); // the whole pane, the largest delta there is
+            assert!(
+                widest / quiet_speed_max(cols) <= QUIET_ONE_BOUND_SECS,
+                "{cols} cols: even a pane-wide quiet crossing stays one bound"
+            );
+        }
+        // …and it is not vacuous: a genuinely enormous pane does split. The
+        // crossover is `BIG_HOP_SPEED_MAX * QUIET_ONE_BOUND_SECS` = 238
+        // columns, and only for a crossing that spans the WHOLE pane.
+        assert!(
+            f32::from(239u16) / quiet_speed_max(239) > QUIET_ONE_BOUND_SECS,
+            "the bar is reachable in principle, from 239 columns up"
+        );
+    }
+
+    /// THE CHOSEN SHOW KEEPS ITS CHOREOGRAPHY, NOT AN EXEMPTION FROM THE
+    /// PACE."" Its notice, its butt-wiggle, its touch-land between two bounds
+    /// and its dust are what make it the show; the speed never was. The
+    /// two-bound split that kept it short is REFUSED whenever the 60 % touch
+    /// point is inked — which is the common case, a printed line under the
+    /// crossing — and the one long bound that replaced it was the last
+    /// motion in the brain allowed over a cell a frame (1.47 measured).
+    #[test]
+    fn the_chosen_show_is_paced_like_every_other_bound() {
+        for cols in [80u16, 100, 120] {
+            let mut p = Probe::judged(cols);
+            p.warm(6, 3);
+            p.hold(Some((6, 3)), 2.5);
+            p.mark();
+            // A paragraph prints AROUND the cat and a long line lands on
+            // the caret's OWN row: the same-row jump past BIG_JUMP_COLS
+            // latches the show, the walled-shut ladder keeps the cat on its
+            // row (rule 4 — "the answer to nowhere to stand is never
+            // leave"), and the inked touch point refuses the split. One
+            // long bound is what the owner actually gets.
+            let end = cols - 1;
+            for r in 4..=8u16 {
+                p.ink(r, 0, cols);
+            }
+            let _ = p.frame(Some((6, end - 1)));
+            p.hold(Some((6, end - 1)), 3.0);
+            let tr = p.trigger.expect("marked");
+            let flights: Vec<&ProbeFlight> = p.flights.iter().filter(|f| f.at >= tr).collect();
+            assert!(
+                flights.iter().any(|f| f.show),
+                "{cols}: fixture — the chosen show plays: {flights:?}"
+            );
+            for f in &flights {
+                let rate = span_eq(f.to_col - f.from_col, f.to_row - f.from_row) / f.dur;
+                assert!(
+                    rate <= quiet_speed_max(cols) + 1e-3,
+                    "{cols}: the show flew at {rate:.1} c/s over the {:.1} c/s pace: {f:?}",
+                    quiet_speed_max(cols)
+                );
+            }
+            let bar = quiet_speed_max(cols) * PROBE_FRAME.as_secs_f32() + 1e-3;
+            assert!(
+                p.max_dcol.0 <= bar,
+                "{cols}: {:.3} cells in one frame, the quiet pace allows {bar:.3}",
+                p.max_dcol.0
+            );
+        }
+    }
+
+    /// AFTER A BURST OF LINES THE TRIP HOME IS QUIET. The stream watch drops
+    /// every travel latch while it holds and parks the chase on the cat's
+    /// own feet, so at the lapse the standing gap is whatever the last line
+    /// left behind — and nothing latched the quiet leap, so the big door
+    /// opened the full show at a caret no one moved on purpose. Reachable
+    /// from a plain held Enter, which is Enters and nothing else.
+    #[test]
+    fn a_burst_of_new_lines_comes_home_quietly() {
+        let mut p = Probe::judged(80);
+        // From the wall side, so the standing gap the burst leaves behind
+        // is over BIG_GAP_FRAC of the pane — the clause that opens the show.
+        p.warm(6, 70);
+        p.hold(Some((6, 70)), 2.5);
+        p.mark();
+        // Ten Enters at 50 ms: three inside STREAM_WINDOW arm the watch.
+        for row in 7..=16u16 {
+            p.ink(row, 0, 2);
+            p.live = Some(row);
+            let _ = p.frame(Some((row, 2)));
+            p.hold_frames(Some((row, 2)), 2);
+        }
+        assert!(p.pet.stream, "fixture: the watch is armed by the burst");
+        let held = p.flights.len();
+        // The lapse, then the trip home.
+        p.hold(Some((16, 2)), 3.0);
+        assert!(!p.pet.stream, "fixture: the watch lapsed");
+        let home: Vec<&ProbeFlight> = p.flights[held..].iter().collect();
+        assert!(!home.is_empty(), "fixture: the cat comes home");
+        assert!(
+            (home[0].from_col - home[0].to_col).abs() >= BIG_GAP_FRAC * 80.0,
+            "fixture: the gap the burst left is the standing-gap clause's: {home:?}"
+        );
+        assert!(
+            home.iter().all(|f| !f.show),
+            "the trip home after a burst is quiet, never the show: {home:?}"
+        );
+        assert!(!p.wiggle, "no butt-wiggle on a held Enter: {:?}", p.actions);
+        assert!(!p.dust, "and no landing dust");
+        assert!(p.pet.flight.is_none(), "down by the end");
+    }
+
+    /// A ONE-FRAME CARET HIDE THAT HID NO MOVE IS NOT A LINE CHANGE. The
+    /// re-sighting rule reconstructs the move a hidden frame swallowed by
+    /// reading its shape off the cat's own feet — but a resting cat's
+    /// station IS `caret + STATION_LEAD`, so "the caret is behind me" was
+    /// true of a caret that had not moved at all. Every DECTCEM hide, every
+    /// scrollback scroll, every prompt redraw therefore latched the quiet
+    /// leap on a cat standing still, and the next genuinely CHOSEN
+    /// screen-crossing jump lost its notice-wiggle, its dust and its show
+    /// to an unrelated cursor blink.
+    #[test]
+    fn a_hidden_frame_that_hid_no_move_keeps_the_next_show() {
+        fn run(hide: bool) -> (bool, bool, bool) {
+            let mut p = Probe::new(100);
+            p.warm(6, 30);
+            p.hold(Some((6, 30)), 2.5);
+            assert!(p.pet.action.settled(), "fixture: settled");
+            if hide {
+                let _ = p.frame(None);
+                let _ = p.frame(Some((6, 30)));
+                assert!(
+                    !p.pet.quiet_leap,
+                    "a hidden frame that hid no move latched the quiet leap"
+                );
+            }
+            p.mark();
+            // A chosen 65-cell same-row jump: the whole show by design.
+            let _ = p.frame(Some((6, 95)));
+            p.hold(Some((6, 95)), 3.0);
+            let tr = p.trigger.expect("marked");
+            (
+                p.wiggle,
+                p.dust,
+                p.flights.iter().any(|f| f.at >= tr && f.show),
+            )
+        }
+        assert_eq!(
+            run(false),
+            (true, true, true),
+            "fixture: a chosen jump plays the whole show"
+        );
+        assert_eq!(
+            run(true),
+            run(false),
+            "a hidden frame with no move behind it changes nothing"
+        );
+    }
+
+    /// IDLE-TO-ZERO, for the quiet leap: a latch returns to false.
+    ///
+    /// The third [`PetBrain::caret_delta`] fold reports a short retreat onto
+    /// the row's home edge as the line change it is, and latches the quiet
+    /// leap with it. A FOUR-column one — `make`, `ls -l`, a `Ctrl-W` over a
+    /// short word — is under [`POUNCE_JUMP`], so no door opens and nothing
+    /// ever leaves the ground to spend it. Left standing it shuts the big
+    /// door for the rest of the session (both the latch and the
+    /// standing-gap clause read it), and the next genuinely chosen
+    /// screen-crossing jump silently loses its notice, its butt-wiggle and
+    /// its dust — minutes later, to an Enter nobody remembers. The arrival
+    /// spends it: a crossing nothing crossed for is over when the cat sits
+    /// down.
+    #[test]
+    fn a_short_new_line_does_not_stand_down_the_next_show() {
+        fn run(newline: bool) -> (bool, bool, bool) {
+            let mut p = Probe::new(100);
+            p.warm(23, 5);
+            p.hold(Some((23, 5)), 2.5);
+            assert!(p.pet.action.settled(), "fixture: settled");
+            if newline {
+                let _ = p.frame(Some((23, 1)));
+                p.hold(Some((23, 1)), 2.5);
+                assert!(p.pet.action.settled(), "fixture: settled again");
+                assert!(
+                    !p.pet.quiet_leap,
+                    "a quiet leap no flight consumed outlived the arrival that ended it"
+                );
+            }
+            p.mark();
+            // A chosen 89-cell same-row jump: the whole show by design.
+            let _ = p.frame(Some((23, 90)));
+            p.hold(Some((23, 90)), 3.0);
+            let tr = p.trigger.expect("marked");
+            (
+                p.wiggle,
+                p.dust,
+                p.flights.iter().any(|f| f.at >= tr && f.show),
+            )
+        }
+        assert_eq!(
+            run(false),
+            (true, true, true),
+            "fixture: a chosen jump plays the whole show"
+        );
+        assert_eq!(
+            run(true),
+            run(false),
+            "a four-column new line the pet never left the ground for cannot \
+             spend the next jump's show"
+        );
+    }
+
+    /// A CROSSING THE WORLD FORCED NEVER BETS PAST THE STATION.
+    ///
+    /// (Was `a_seam_crossing_bets_no_lead`. The old name described a rule
+    /// the code does not implement — a hard zero on the quiet-leap latch —
+    /// while the assertion below has always been the weaker, true one: the
+    /// paws may not come down past the station's own keep-ahead. Renamed so
+    /// nobody "restores" the rule the name promised; see
+    /// [`PetBrain::station_drift`] for the 0.51 s that costs.)
+    ///
+    /// The margin wrap is the one seam that reaches the lead at all: the
+    /// fold reports one character FORWARD, so the typing run is never
+    /// reversed and the rhythm stays open. Before any bound on the bet, that
+    /// let it spend the whole [`FLIGHT_LEAD_MAX`] — twice the station's own
+    /// — on a caret that had just come home to a fresh line: measured on the
+    /// probe's typed wrap at 80 columns, the paws came down at column 13.4
+    /// for a caret sitting at 5, and the walk home broke into a RUN, exactly
+    /// the comedy [`FLIGHT_LEAD_MAX`] is documented to bound. What bounds it
+    /// now is the DECAY: [`PetBrain::station_drift`] predicts only as far as
+    /// `v̂` survives [`VEL_TAU`], and subtracts the station's own keep-ahead
+    /// so the two cannot double-count.
+    ///
+    /// The station's OWN keep-ahead ([`PetBrain::lead`], capped at
+    /// [`LEAD_MAX`]) is untouched and is still in the target the door is
+    /// handed — the bar below is that cap, so the assertion is "the flight
+    /// added nothing on top of the station", not "nobody leads". A CHOSEN
+    /// crossing still bets its own lead, which
+    /// `a_pounce_mid_rhythm_lands_at_the_predicted_station` pins.
+    #[test]
+    fn a_seam_crossing_never_bets_past_the_station() {
+        let mut p = Probe::new(80);
+        p.warm(6, 79);
+        assert!(
+            p.pet.rhythm_open(),
+            "fixture: a real typing run is under way, so the lead is live"
+        );
+        p.mark();
+        p.live = Some(7);
+        p.ink(7, 0, 0);
+        let _ = p.frame_wrapped(Some((7, 0)));
+        p.hold(Some((7, 0)), 3.0);
+        let tr = p.trigger.expect("marked");
+        let cross = p
+            .flights
+            .iter()
+            .find(|f| f.at >= tr && f.big)
+            .expect("the wrap is crossed in one bound");
+        let station = PetBrain::station(0, 80, art_cols(10, 20));
+        assert!(
+            cross.to_col <= station + LEAD_MAX,
+            "a seam's bound may not bet past the station's own lead \
+             ({station:.2} + {LEAD_MAX}), landed at {:.2}",
+            cross.to_col
+        );
+        // …and it never breaks into a run coming home, which is what an
+        // overshot landing costs.
+        assert!(
+            !p.actions
+                .iter()
+                .any(|(t, a)| *t >= tr && *a == PetAction::Run),
+            "no gallop home from a wrap: {:?}",
+            p.actions
+        );
+    }
+
+    /// THE TWO CLAUSES THAT STAND THE SHOW DOWN ON A LINE CHANGE DO
+    /// DIFFERENT JOBS, and this is the ordering that tells them apart.
+    ///
+    /// [`PetBrain::on_move`] refuses to LATCH the screen-crossing jump on a
+    /// line change; the big door separately CLEARS a latch a seam has
+    /// happened since. For most moves both apply and they agree, which is
+    /// why deleting either looks free — but the door is only reached on a
+    /// tick no earlier hold returns from, and the hold that gathers a row
+    /// hop LAUNCHES: [`PetBrain::leave_ground`] spends the quiet leap and
+    /// returns, so an Enter that lands DURING a gather never meets the
+    /// door's clause at all. It meets it after the flight, with the latch
+    /// standing and the leap spent — and if the caret went on typing while
+    /// the cat was in the air, there is a gap waiting for it. Without the
+    /// latch refusal that Enter plays the whole chosen show.
+    #[test]
+    fn an_enter_during_a_gather_never_latches_the_show() {
+        let mut p = Probe::new(80);
+        p.warm(6, 41);
+        // A row change big enough to GATHER for — a bound-tier row hop
+        // holds its coil for [`CROUCH_DUR`] — but under the screen-crossing
+        // bar, so nothing is latched by it.
+        p.ink(14, 0, 24);
+        p.live = Some(14);
+        let _ = p.frame(Some((14, 24)));
+        p.hold_frames(Some((14, 24)), 2);
+        assert_eq!(
+            p.pet.action,
+            PetAction::Crouch,
+            "fixture: gathering for the row hop: {:?}",
+            p.actions
+        );
+        assert!(!p.pet.pending_big_jump, "fixture: nothing latched yet");
+        p.mark();
+        // THE ENTER, inside the gather: a line change well past
+        // `max(BIG_JUMP_COLS, BIG_JUMP_COLS_FRAC · cols)`.
+        p.ink(15, 0, 4);
+        p.live = Some(15);
+        let _ = p.frame(Some((15, 60)));
+        assert!(
+            !p.pet.pending_big_jump,
+            "an Enter never latches the screen-crossing jump, whatever its size"
+        );
+        // The author types on while the cat is in the air, so its landing
+        // has a gap to look at — well under [`BIG_GAP_FRAC`] of the grid,
+        // so a LATCH is the only thing that could open the show here.
+        let mut c = 60u16;
+        for _ in 0..10 {
+            c += 1;
+            let _ = p.frame(Some((15, c)));
+            p.hold_frames(Some((15, c)), 5);
+        }
+        p.hold(Some((15, c)), 4.0);
+        let tr = p.trigger.expect("marked");
+        assert!(
+            p.flights.iter().any(|f| f.at >= tr),
+            "fixture: the gather really launches: {:?}",
+            p.actions
+        );
+        assert!(
+            !p.wiggle,
+            "an Enter is never the chosen show, whoever spent the quiet leap: {:?}",
+            p.actions
+        );
+        assert!(!p.dust, "…and a crossing nobody chose puffs no dust");
+        assert!(
+            !p.flights.iter().any(|f| f.at >= tr && f.show),
+            "…and no flight leaves through the show's door"
+        );
+    }
+
+    /// RUNG 7's scaled coil, which neither tree pinned: a longer jump
+    /// GATHERS LONGER and squashes DEEPER for it
+    /// ([`PetBrain::coil_dur`] and [`PetBrain::coil_envelope`]'s
+    /// `dur / COIL_MAX` depth term). Replacing the whole span term with a
+    /// flat [`CROUCH_DUR`] left the entire crate green, so the beat existed
+    /// only in the prose. `the_coil_releases_without_a_volume_pop` pins the
+    /// RELEASE; this pins the gather.
+    #[test]
+    fn the_coil_scales_with_the_span() {
+        let start = Instant::now();
+        // A chosen same-row word jump of `jump` columns: how long the
+        // gather held, and how deep it went.
+        let gather = |jump: u16| -> (f32, f32) {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            let (mut t, f) = idle(&mut pet, t, (4, 12), 0.5);
+            assert!(f.action.settled(), "fixture: a settled cat");
+            let caret = 12 + jump;
+            let mut held = 0.0f32;
+            let mut trough = 1.0f32;
+            let mut leapt = false;
+            for _ in 0..180 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, caret))));
+                match f.action {
+                    PetAction::Crouch => {
+                        held += 0.016;
+                        trough = trough.min(f.scale_y);
+                    }
+                    PetAction::Leap => {
+                        leapt = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(leapt, "fixture: a {jump}-column jump leaves the ground");
+            (held, trough)
+        };
+        let (short_t, short_q) = gather(8);
+        let (long_t, long_q) = gather(22);
+        assert!(
+            long_t > short_t + 0.03,
+            "a longer jump gathers longer: {short_t:.3}s for 8 cells, {long_t:.3}s for 22"
+        );
+        assert!(
+            long_q < short_q - 0.02,
+            "…and squashes deeper for it: {short_q:.3} against {long_q:.3}"
+        );
+        // Both inside the ordering law: never under the old fixed crouch,
+        // never past the ceiling the big gather has to outrank.
+        for (name, t) in [("short", short_t), ("long", long_t)] {
+            assert!(
+                (CROUCH_DUR - 0.017..=COIL_MAX + 0.017).contains(&t),
+                "the {name} gather stays inside [CROUCH_DUR, COIL_MAX], got {t:.3}s"
+            );
+        }
+    }
+
+    /// THE STREAM WATCH HOLDS THE CHASE — AND THE EVICTION IS PART OF IT.
+    /// The watch parks the chase target on the cat's own feet, but the ink
+    /// eviction ran upstream of it and re-stationed at the CARET's station,
+    /// so with ink fed (a log printing under the cat, which is the whole
+    /// point) it chased the ping-ponging caret across the pane: five big
+    /// bounds in 6.4 s, measured, every one of them launched by the
+    /// eviction. It keeps the ink LADDER — a pose still never loiters on
+    /// the user's words — anchored at the cat's own column.
+    #[test]
+    fn a_build_log_under_the_cat_is_not_chased_across_the_pane() {
+        let last = PROBE_ROWS - 1;
+        let mut p = Probe::judged(80);
+        p.warm(last, 40);
+        p.hold(Some((last, 40)), 2.5);
+        p.mark();
+        for k in 0..240u32 {
+            for r in (last - 5)..=last {
+                p.ink(r, 0, 80);
+            }
+            p.live = Some(last);
+            let caret = if k % 2 == 0 { (last, 79) } else { (last, 0) };
+            let _ = p.frame(Some(caret));
+        }
+        assert!(p.pet.stream, "fixture: the watch is armed");
+        assert!(
+            p.episodes <= 2,
+            "at most two airborne episodes under the watch, got {}: {:?}",
+            p.episodes,
+            p.actions
+        );
+        assert_eq!(
+            p.onsets(PetAction::Startle),
+            0,
+            "and no fright: {:?}",
+            p.actions
+        );
+        let cols: Vec<f32> = p
+            .trace
+            .iter()
+            .filter(|(at, _)| *at >= 1.5)
+            .map(|(_, f)| f.col)
+            .collect();
+        let lo = cols.iter().copied().fold(f32::MAX, f32::min);
+        let hi = cols.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            hi - lo <= 8.0,
+            "the cat is not towed after a caret nobody is chasing ({lo:.1}..{hi:.1})"
+        );
+    }
+
+    /// THE NEW-LINE SWEEP (BM-12) — the probe made a bounded law, IMPL_NOTES'
+    /// definition of done: for 80 and 200 columns, from columns 10, 40 and
+    /// 78, settled / mid-typing / asleep / with a one-frame hidden caret,
+    /// onto a one-row and a three-row prompt — plus the typed margin wrap
+    /// and the scrolled last-row wrap at both widths — every launch and
+    /// re-aim is within the law, at most two airborne episodes, no Startle,
+    /// at most one Perk, no butt-wiggle, no dust, under a cell a frame at
+    /// 80 columns, and paws down within 1.6 s (settled) / 1.3 s (typing) /
+    /// 2.0 s (asleep, the stretch included) — 2.7 s for the one-row prompt
+    /// an asleep cat is DROPPED off (see (3) below).
+    ///
+    /// Three bars are stated here because the plan's did not survive the
+    /// arithmetic: (1) the HIDDEN frame on a settled cat plays the notice
+    /// beat like any settled cat (the notice rule's own S6 fixture), so from
+    /// column 78 — a 68-cell crossing at the quiet pace — it cannot land
+    /// under 1.3 s; it carries the settled bar (1.6 s) there and the 1.3 s
+    /// of the prompt-redraw scenario from columns 10 and 40. (2) A wrap at
+    /// 200 columns is a 190-cell crossing: two quiet bounds at BIG_FLIGHT_MAX
+    /// with the touch between (0.85 + 0.13 + 0.85 s) after the coil is 1.93 s
+    /// by construction, so the 200-column wraps carry a 2.0 s bar; the
+    /// 80-column wraps keep 1.6 s. (3) THE SLEEPER'S DROP (variety wave)
+    /// spends a beat ON PURPOSE: an Enter exactly one row under a sleeping
+    /// cat drops it off the line (0.18 s), it absorbs the landing (0.26 s)
+    /// and SITS AND STARES at whoever moved the floor ([`DROP_SIT`], 0.5 s)
+    /// before the latched quiet leap takes it home — 0.94 s of theater the
+    /// wave chose, gated behind [`SLEEP_AFTER`] seconds of quiet. From
+    /// column 78 at 80 columns that is a 2.58 s touchdown, so the asleep
+    /// one-row bar is 2.7 s; the three-row prompt is an ordinary wake and
+    /// keeps 2.0 s. "Paws down" is the last touchdown (the
+    /// Leap ending), the plan's "ground within"; the probe's own settle
+    /// measure (the landing recovery absorbed, a settled pose at the
+    /// station) runs 0.4 s longer and is reported by the ruler, not pinned
+    /// here. Judged probes run the law's 16 ms frame. Every scenario runs
+    /// even when an earlier one fails, so one red run reports them all.
+    #[test]
+    fn every_new_line_reaction_is_lawful_and_brief() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum State {
+            Settled,
+            Typing,
+            Asleep,
+            Hidden,
+        }
+
+        fn panic_msg(e: &(dyn std::any::Any + Send)) -> String {
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(ToString::to_string))
+                .unwrap_or_else(|| "(no message)".to_string())
+        }
+
+        /// The verdict on a finished probe: every bar of the definition of
+        /// done, as a list of what it broke.
+        fn judge(name: &str, p: &Probe, bar: f32, row: u16) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut fail = |msg: String| out.push(format!("{name}: {msg}"));
+            if p.episodes > 2 {
+                fail(format!("{} airborne episodes: {:?}", p.episodes, p.actions));
+            }
+            if p.episodes == 0 {
+                fail(format!("never flew: {:?}", p.actions));
+            }
+            let startles = p.onsets(PetAction::Startle);
+            if startles > 0 {
+                fail(format!("{startles} fright(s): {:?}", p.actions));
+            }
+            let perks = p.onsets(PetAction::Perk);
+            if perks > 1 {
+                fail(format!("{perks} notice beats: {:?}", p.actions));
+            }
+            if p.wiggle {
+                fail("the show's gather played".to_string());
+            }
+            if p.dust {
+                fail("dust on a quiet landing".to_string());
+            }
+            if p.cols == 80 && p.max_dcol.0 >= 1.0 {
+                fail(format!(
+                    "{:.3} cells in one frame at {:+.2}s ({:?})",
+                    p.max_dcol.0, p.max_dcol.1, p.max_dcol.2
+                ));
+            }
+            match p.grounded_at() {
+                None => fail("not on the ground by the end".to_string()),
+                Some(t) if t > bar => fail(format!("paws down at {t:.2} s, bar {bar} s")),
+                Some(_) => {}
+            }
+            if let Some(f) = p.last
+                && (f.row - f32::from(row)).abs() > 0.01
+            {
+                fail(format!("ended on row {}, not {row}", f.row));
+            }
+            out
+        }
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut check = |name: String, bar: f32, row: u16, build: &mut dyn FnMut() -> Probe| {
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Err(e) => failures.push(format!("{name}: {}", panic_msg(&*e))),
+                Ok(p) => failures.extend(judge(&name, &p, bar, row)),
+            }
+        };
+
+        for cols in [80u16, 200] {
+            for col0 in [10u16, 40, 78] {
+                for state in [State::Settled, State::Typing, State::Asleep, State::Hidden] {
+                    for prompt_rows in [1u16, 3] {
+                        let to_row = 6 + prompt_rows;
+                        // THE BARS THIS SWEEP INVENTS ARE STATED FROM THE
+                        // CONSTRUCTION, never from the measurement. The
+                        // 1.3 s typing and 1.6 s settled bars are the
+                        // owner's and are written as given; the wall-side
+                        // HIDDEN bar and the 200-column wrap's below are
+                        // this sweep's own, and both used to sit exactly on
+                        // the number the brain happened to produce — one
+                        // extra frame anywhere turned the sweep red for no
+                        // stated reason (review, 2026-08-27). A hidden
+                        // frame from the wall side is: the notice
+                        // ([`PERK_HOLD`]) + the coil ([`CROUCH_DUR`]) + a
+                        // WHOLE PANE at the quiet pace, which is the
+                        // longest crossing this door can be asked for.
+                        let pane_crossing = f32::from(cols) / quiet_speed_max(cols);
+                        let bar = match state {
+                            State::Settled => 1.6,
+                            State::Typing => 1.3,
+                            State::Hidden if col0 <= 40 => 1.3,
+                            State::Hidden => PERK_HOLD + CROUCH_DUR + pane_crossing,
+                            // The drop's own beat — one row down only.
+                            State::Asleep if prompt_rows == 1 => 2.7,
+                            State::Asleep => 2.0,
+                        };
+                        let name = format!(
+                            "{cols} cols, Enter from {col0} ({state:?}) onto a {prompt_rows}-row prompt"
+                        );
+                        check(name, bar, to_row, &mut || {
+                            let mut p = Probe::judged(cols);
+                            p.warm(6, col0);
+                            match state {
+                                State::Settled | State::Hidden => p.hold(Some((6, col0)), 2.5),
+                                State::Asleep => p.hold(Some((6, col0)), 25.0),
+                                State::Typing => {}
+                            }
+                            p.mark();
+                            if state == State::Hidden {
+                                let _ = p.frame(None);
+                            }
+                            for r in 7..=to_row {
+                                p.ink(r, 0, 2);
+                            }
+                            p.live = Some(to_row);
+                            let _ = p.frame(Some((to_row, 2)));
+                            p.hold(Some((to_row, 2)), 3.0);
+                            p
+                        });
+                    }
+                }
+            }
+            // At 80 columns a wrap is ONE quiet bound and the owner's 1.6 s
+            // bar owns it. The wide bar is NOT a split's construction —
+            // [`QUIET_ONE_BOUND_SECS`] is unreachable under 239 columns, so
+            // 200 is one bound too, and this bar is simply the loosest shape
+            // a single quiet crossing can take here: the coil, a bound at
+            // the pace's own worst case, and the landing. Stated because the
+            // number used to be justified by a split that never happens, and
+            // a bar that passes for the wrong reason is a bar nobody can
+            // tighten.
+            let wrap_bar = if cols == 80 {
+                1.6
+            } else {
+                CROUCH_DUR + 2.0 * BIG_FLIGHT_MAX + LAND_DUR
+            };
+            check(
+                format!("{cols} cols, the typed margin wrap"),
+                wrap_bar,
+                7,
+                &mut || {
+                    let mut p = Probe::judged(cols);
+                    p.warm(6, cols - 1);
+                    p.mark();
+                    p.live = Some(7);
+                    p.ink(7, 0, 0);
+                    let _ = p.frame(Some((7, 0)));
+                    p.hold_frames(Some((7, 0)), 5);
+                    p.type_to(7, 0, 5);
+                    p.hold(Some((7, 5)), 3.0);
+                    p
+                },
+            );
+            let last = PROBE_ROWS - 1;
+            // THE SHELL'S OWN NEW LINE, which is the shape a developer
+            // actually types: a SHORT command on the last row, so Enter
+            // scrolls and the caret comes home to the prompt column with
+            // `dr = 0, dc = -10`. Only the full-width line below was ever
+            // covered, and this one startled the cat every single time
+            // (review, 2026-08-27).
+            check(
+                format!("{cols} cols, the scrolled Enter after a short command"),
+                1.6,
+                last,
+                &mut || {
+                    let mut p = Probe::judged(cols);
+                    p.warm(last, 10);
+                    p.mark();
+                    p.ink(last - 1, 0, 10);
+                    p.ink(last, 0, 2);
+                    p.live = Some(last);
+                    let _ = p.frame(Some((last, 2)));
+                    p.hold_frames(Some((last, 2)), 5);
+                    p.type_to(last, 2, 6);
+                    p.hold(Some((last, 6)), 3.0);
+                    p
+                },
+            );
+            check(
+                format!("{cols} cols, the scrolled wrap on the last row"),
+                wrap_bar,
+                last,
+                &mut || {
+                    let mut p = Probe::judged(cols);
+                    p.warm(last, cols - 1);
+                    p.mark();
+                    p.ink(last - 1, 0, cols);
+                    p.ink(last, 0, 0);
+                    p.live = Some(last);
+                    // THE EMULATOR'S OWN FACT rides this one frame
+                    // ([`PetSense::wrapped`]): on the last row a wrap
+                    // SCROLLS, the caret's row never changes, and the delta
+                    // is byte-identical to `Home` pressed at the last
+                    // column. No heuristic can tell them apart and this
+                    // brain does not try — the host says which it was, and
+                    // the fold answers with the one character the text
+                    // really moved. (Withheld, the snap tier still keeps
+                    // the pet from being frightened; it just reads the
+                    // move as a jump home instead of a line gained.)
+                    let _ = p.frame_wrapped(Some((last, 0)));
+                    p.hold_frames(Some((last, 0)), 5);
+                    p.type_to(last, 0, 5);
+                    p.hold(Some((last, 5)), 3.0);
+                    p
+                },
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "{} scenario(s) broke the new-line law:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
         );
     }
 
@@ -11172,8 +17599,17 @@ mod tests {
         // — past `BIG_HOP_SPEED_MAX` and refused by the launch law (§0.1).
         // The extra 50 ms only moves the 100 ms sample EARLIER in the arc, so
         // the mid-flight assertions below hold with more room, not less.
-        pet.begin_arc(target_col, target_row, 0.45, 1.0, true);
-        pet.bound2 = Some((target_col + 5.0, target_row));
+        pet.begin_arc(
+            target_col,
+            target_row,
+            0.45,
+            1.0,
+            FlightKind {
+                big: true,
+                ..FlightKind::PLAIN
+            },
+        );
+        pet.bound2 = Some((target_col + 5.0, target_row, false));
         t += Duration::from_millis(100);
         let mid = pet.tick(sense(t, Some((0, 12))));
         let live = pet.flight.expect("the fixture is genuinely mid-flight");
@@ -11252,7 +17688,16 @@ mod tests {
         // — past `BIG_HOP_SPEED_MAX` and refused by the launch law (§0.1).
         // The extra 50 ms only moves the 100 ms sample EARLIER in the arc, so
         // the mid-flight assertions below hold with more room, not less.
-        pet.begin_arc(target_col, target_row, 0.45, 1.0, true);
+        pet.begin_arc(
+            target_col,
+            target_row,
+            0.45,
+            1.0,
+            FlightKind {
+                big: true,
+                ..FlightKind::PLAIN
+            },
+        );
         t += Duration::from_millis(100);
         let mid = pet.tick(sense(t, Some((0, 12))));
         assert!(pet.flight.is_some());
@@ -11425,7 +17870,8 @@ mod tests {
                 )
             })
         };
-        let (pre_c, pre_r) = rate(pet.flight);
+        let pre_flight = pet.flight;
+        let (pre_c, pre_r) = rate(pre_flight);
         let f = pet.tick(s);
         let (post_c, post_r) = rate(pet.flight);
         let give_col = ((f32::from(cols0) - w).max(0.0) - (f32::from(s.cols) - w).max(0.0)).abs();
@@ -11451,6 +17897,62 @@ mod tests {
             f.row,
             f.action
         );
+        // THE LAUNCH-TIME LAW (design 2026-08-19 §0.1), judged where the
+        // per-frame bound cannot see it: that bound is DERIVED from a live
+        // arc's own rate, so a 0.42 s arc across the whole pane is
+        // frame-lawful and still a teleport. A NEW flight is judged at its
+        // launch on its EQUIVALENT span ([`span_eq`] — rows count too) over
+        // its duration; the one mid-air RE-AIM on the span it still has to
+        // cover over the time it has left, which `begin_arc`'s own assert
+        // can never see because a re-aim never calls it. The per-frame bound
+        // above and the reduced-motion exemption are untouched.
+        //
+        // A BOUND'S CAP IS THE QUIET PACE ([`quiet_speed_max`], never above
+        // the law's [`BIG_HOP_SPEED_MAX`] ceiling): every bound carries it,
+        // so the law pins what the brain actually promises rather than the
+        // ceiling it never has to reach.
+        let cap = |big: bool| {
+            if big {
+                quiet_speed_max(s.cols)
+            } else {
+                HOP_SPEED_MAX
+            }
+        };
+        match (pre_flight, pet.flight) {
+            (None, Some(fl)) => {
+                let span = span_eq(fl.to_col - fl.from_col, fl.to_row - fl.from_row);
+                let rate = span / fl.dur;
+                assert!(
+                    rate <= cap(fl.big) + 1e-3,
+                    "the flight outruns the animal: launched at {rate:.1} c/s over the {} c/s \
+                     cap (span_eq {span:.1} cells in {:.3} s, big {}, ({:.2},r{:.0}) -> \
+                     ({:.2},r{:.0}), action {:?})",
+                    cap(fl.big),
+                    fl.dur,
+                    fl.big,
+                    fl.from_col,
+                    fl.from_row,
+                    fl.to_col,
+                    fl.to_row,
+                    f.action
+                );
+            }
+            (Some(a), Some(b)) if (b.to_col - a.to_col).abs() > 1e-6 => {
+                let left = (b.to_col - f.col).abs();
+                let t_rem = (b.dur - b.t).max(1e-3);
+                let rate = left / t_rem;
+                assert!(
+                    rate <= cap(b.big) + 1e-3,
+                    "the re-aim outruns the flight: {left:.2} cells left to fly in {t_rem:.3} s \
+                     is {rate:.1} c/s over the {} c/s cap (to {:.2} -> {:.2}, big {})",
+                    cap(b.big),
+                    a.to_col,
+                    b.to_col,
+                    b.big
+                );
+            }
+            _ => {}
+        }
         *last = (f.col, f.row, s.cols, s.rows);
         f
     }
@@ -11470,6 +17972,20 @@ mod tests {
     /// station, with no motion of any kind in between, so under it every
     /// caret move is a jump BY DESIGN. `reduced_motion` is never set in this
     /// script; the reduced-motion tests own that arm.
+    ///
+    /// A RESIZE FRAME IS EXEMPT TOO, and by the same kind of argument: the
+    /// coordinate space itself moved. `emit`'s clamp holds the body inside
+    /// the new pane, and `lawful_tick`'s `give_col`/`give_row` budget
+    /// exactly that shrink, so a pane narrowed from 100 to 40 columns may
+    /// move a cat standing near column 90 by the whole difference in one
+    /// frame without the law noticing. That is deliberate — the cell it
+    /// stood on no longer exists, so there is no ground for it to walk
+    /// across — but the exemption is stated here rather than left to be
+    /// inferred from the formula. (The host has an honest alternative,
+    /// `retire_coordinate_space`, which fades the pet out and materialises
+    /// it again at the new station; `aterm-gui` calls it at an owner or
+    /// presentability boundary, not on a plain resize, so the clamp path
+    /// is the live one.)
     #[test]
     fn the_cat_never_changes_position_without_animating_it() {
         let start = Instant::now();
@@ -11814,6 +18330,63 @@ mod tests {
         );
     }
 
+    /// ONE STIMULUS, ONE ANIMAL: a streaming pane is followed whether or not
+    /// the shell has told the host it is running a command.
+    ///
+    /// The pane has two witnesses that a program is printing, and they are
+    /// fed from different places. `watch_heat` is charged from
+    /// [`PetSense::output_burst`], which `app_render` only sets when shell
+    /// integration says a command is executing; the stream watch's own line
+    /// -event run ([`STREAM_RUN`]) needs no integration at all. The live-edge
+    /// hug — the ONLY rule that walks a watcher down to the newest line —
+    /// used to arm on the heat alone, while the stream watch's pose hold
+    /// returned before every door. So on the commonest streaming shape of
+    /// all, a build log with the caret riding it, the hug computed the
+    /// newest line's stand and the hold threw it away: MEASURED at 17.00
+    /// rows of lag, the cat left in old scrollback, identically with and
+    /// without `output_burst`. Now: 2.82 in both arms.
+    ///
+    /// Both arms are asserted deliberately. Equal-and-good is the claim; a
+    /// test that only checked the integrated arm would have passed
+    /// throughout the defect.
+    #[test]
+    fn a_streaming_pane_is_followed_with_or_without_shell_integration() {
+        let lag = |burst: bool| -> f32 {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            pet.sense_ink(0, &[(0, 13), (0, 13), (0, 13)], Some(2));
+            let t = awake(&mut pet, start, 2, 10);
+            let (mut t, f) = idle(&mut pet, t, (2, 12), SIT_AFTER + 0.4);
+            assert!(f.action.settled(), "fixture: a settled cat");
+            // An 18-row log with the caret RIDING it — which is what arms
+            // the stream watch, and what shell integration has no say over.
+            let mut spans = vec![(0u16, 13u16); 3];
+            let mut worst = 0.0f32;
+            for edge in 3u16..=20 {
+                spans.push((0, 14));
+                pet.sense_ink(0, &spans, Some(edge));
+                for _ in 0..12 {
+                    t += Duration::from_millis(16);
+                    let mut s = sense(t, Some((edge, 15)));
+                    s.output_burst = burst;
+                    let f = pet.tick(s);
+                    worst = worst.max(f32::from(edge) - f.row);
+                }
+            }
+            worst
+        };
+        let (without, with) = (lag(false), lag(true));
+        assert!(
+            without <= 4.0,
+            "a log follows without shell integration too, worst lag {without} rows"
+        );
+        assert!(
+            (without - with).abs() < 0.01,
+            "and the SAME log gives the same animal either way: \
+             {without} without OSC 133, {with} with it"
+        );
+    }
+
     /// F5: the watcher hugs the live edge. A stream that runs rows below the
     /// perch pulls the watcher down to the newest inked row — station beside
     /// its end, tracking as the edge advances.
@@ -11829,6 +18402,7 @@ mod tests {
         // edge. Each row is a short "stream line N".
         let mut spans = vec![(0u16, 13u16); 3];
         let mut f = f;
+        let mut worst_lag = 0.0f32;
         for edge in 3u16..=10 {
             spans.push((0, 14));
             pet.sense_ink(0, &spans, Some(edge));
@@ -11837,7 +18411,49 @@ mod tests {
                 let mut s = sense(t, Some((2, 12)));
                 s.output_burst = true;
                 f = pet.tick(s);
+                worst_lag = worst_lag.max(f32::from(edge) - f.row);
             }
+        }
+        // TRACKING, judged over the whole stream rather than on its last
+        // frame. A row hop is timed by the travel it actually makes now —
+        // the [`span_eq`] the launch law measures counts each row as
+        // [`ROW_AS_COLS`] columns of it — so an eight-row pull takes a
+        // third of a second instead of a fifth, and the feet ride a couple
+        // of rows behind an edge advancing five rows a second. That is a
+        // cat following a stream; it is not a cat in old scrollback, which
+        // is the failure this test was written for (measured then: eight
+        // rows above the edge, and never closing).
+        assert!(
+            worst_lag <= 4.0,
+            "the watcher must FOLLOW the stream, worst lag {worst_lag} rows"
+        );
+        // THE REGRESSION THIS TEST CARRIES, stated rather than absorbed.
+        // Upstream made the assertion below — a STRICT `< WATCH_HUG_ROWS` —
+        // on this exact frame, the stream's last, and passed it at 1.36
+        // rows. It measures 2.00 now, so a strict bar here would be red.
+        // Both numbers are the same mechanism seen at two hop speeds: the
+        // hug re-stations only once the edge is [`WATCH_HUG_ROWS`] away, so
+        // the lag saws between nothing and that bar, and where in the saw a
+        // given frame lands is decided by how long a row hop takes. Making
+        // each hop pay for its rows ([`span_eq`], the launch law's own
+        // measure) lengthened the hop and moved the phase; it did not
+        // loosen the bound, which is and was the hysteresis itself. So the
+        // bar for a frame INSIDE the stream is that bound, inclusive, and
+        // it is pinned here so the phase cannot drift further unremarked;
+        // the strict bar keeps its place below, on a settled watcher, where
+        // the hug really has closed.
+        assert!(
+            10.0 - f.row <= WATCH_HUG_ROWS,
+            "mid-stream the lag is bounded by the hug's own hysteresis: \
+             feet at row {}, edge 10",
+            f.row
+        );
+        // …and when the stream stops, the hug closes.
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            let mut s = sense(t, Some((2, 12)));
+            s.output_burst = true;
+            f = pet.tick(s);
         }
         assert!(
             (f.row - 10.0).abs() < WATCH_HUG_ROWS,
@@ -11854,26 +18470,52 @@ mod tests {
     /// F6's brain half: the touch between two bounds wears the COIL — the
     /// pose whose face survives tile LOD — and it wears it in BOTH
     /// directions, so the twins mirror cleanly.
+    ///
+    /// THE LEFTWARD FIXTURE CHANGED, and the rule is why. It used to drive a
+    /// same-row jump straight back from the wall — which is now a SNAP
+    /// ([`SNAP_COLS`]): the world re-seating the writing, not a crossing the
+    /// pet chose, so it flies as ONE quiet bound with no split and no touch
+    /// at all. The leftward SHOW still exists and is still what this test is
+    /// about; it is reached the way a leftward show is actually reached —
+    /// the caret runs home under a held delete, the bottle holds the cat
+    /// still, and the standing gap it leaves opens the door. The retired
+    /// shape is pinned at the bottom, where its coverage used to live.
     #[test]
     fn touch_land_mirrors_cleanly() {
         let start = Instant::now();
-        let touch_poses = |from: u16, to: u16| -> Vec<(PetGlyphId, bool)> {
-            let mut pet = PetBrain::default();
-            let t = awake(&mut pet, start, 4, from);
-            let (_, frames) = drive_and_collect(&mut pet, t, (4, to), 260);
+        fn pet_touching(f: &PetFrame) -> bool {
+            // The touch is the only Land whose squash law halves — cheap to
+            // spot by pose: the coil IS the touch's costume now.
+            f.pose == PetGlyphId::PetCrouch
+        }
+        let touches = |frames: &[PetFrame]| -> Vec<(PetGlyphId, bool)> {
             frames
                 .iter()
                 .filter(|f| f.action == PetAction::Land && pet_touching(f))
                 .map(|f| (f.pose, f.facing_left))
                 .collect()
         };
-        fn pet_touching(f: &PetFrame) -> bool {
-            // The touch is the only Land whose squash law halves — cheap to
-            // spot by pose: the coil IS the touch's costume now.
-            f.pose == PetGlyphId::PetCrouch
-        }
-        let rightward = touch_poses(2, 78);
-        let leftward = touch_poses(78, 2);
+        let rightward = {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 2);
+            let (_, frames) = drive_and_collect(&mut pet, t, (4, 78), 260);
+            touches(&frames)
+        };
+        let leftward = {
+            let mut pet = PetBrain::default();
+            let mut t = awake(&mut pet, start, 4, 78);
+            // A held backspace from column 80 to 10: the bottle holds the
+            // cat still while the caret runs home, and the gap it leaves is
+            // the show's own door.
+            let mut col = 80u16;
+            while col > 10 {
+                col -= 1;
+                t += Duration::from_millis(33);
+                let _ = pet.tick(sense(t, Some((4, col))));
+            }
+            let (_, frames) = drive_and_collect(&mut pet, t, (4, 10), 300);
+            touches(&frames)
+        };
         assert!(
             !rightward.is_empty() && !leftward.is_empty(),
             "both twin-bound crossings must touch down between bounds \
@@ -11890,6 +18532,26 @@ mod tests {
                 .iter()
                 .all(|&(p, face)| p == PetGlyphId::PetCrouch && face),
             "leftward touch: the SAME coil, mirrored — got {leftward:?}"
+        );
+
+        // The shape this fixture USED to drive — a same-row jump straight
+        // back from the wall — is a SNAP now, and a snap is one quiet bound
+        // with no split and no touch at all. Pinned here, where the
+        // coverage it replaced used to live.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 78);
+        let (_, frames) = drive_and_collect(&mut pet, t, (4, 2), 260);
+        assert!(
+            touches(&frames).is_empty(),
+            "a leftward SNAP is one bound: no touch-land between two"
+        );
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Leap),
+            "fixture: the snap crosses"
+        );
+        assert!(
+            !frames.iter().any(|f| f.pose == PetGlyphId::PetCrouchWiggle),
+            "and it is quiet: never the show's gather"
         );
     }
 
@@ -12010,12 +18672,20 @@ mod tests {
         let base = pet.col + 12.0;
         let mut chased = false;
         let mut ran = false;
+        // The owed groom lands on the arrival after the break-off — which,
+        // depending on the settle's dealt ladder, may fall inside this loop
+        // (the break-off walks home and grooms with seconds of toy time
+        // left) or after it; count it wherever it plays.
+        let mut groomed = false;
         let mut phase = 0.0f32;
         for _ in 0..700 {
             t += Duration::from_millis(16);
             phase += 0.04;
             let px = base + 8.0 * phase.sin();
             let f = ptick(&mut pet, t, (4, 44), Some((px, 4.0)));
+            if chased && pet.pursuit_t.is_none() {
+                groomed |= f.action == PetAction::Groom;
+            }
             if pet.pursuit_t.is_some() {
                 chased = true;
                 if matches!(f.action, PetAction::Walk | PetAction::Run) {
@@ -12038,7 +18708,7 @@ mod tests {
         );
         // The groom lands on the next arrival (or already played): run the
         // toy away and let the pet come home.
-        let mut groomed = pet.action == PetAction::Groom;
+        groomed |= pet.action == PetAction::Groom;
         for _ in 0..500 {
             t += Duration::from_millis(16);
             let f = ptick(&mut pet, t, (4, 44), None);
@@ -12250,6 +18920,95 @@ mod tests {
         );
     }
 
+    /// THE SKID (variety wave): while the drift-brake's run-out is live the
+    /// gait stops cycling and the body braces on a PLANTED frame — forelegs
+    /// out, rump sunk, leaning into the slide and easing off as the paws
+    /// reach the overshoot. The cycle resumes the moment the run-out is
+    /// spent.
+    ///
+    /// The fixture ARMS the run-out by hand, exactly as the brake block
+    /// does (`braking`, the overshoot aim, the 0.15 speed kill, the stumble
+    /// beat), because the arming GATE itself — a follower step that crosses
+    /// its station while still over [`RUN_SPEED`] — is not reachable from a
+    /// plain caret chase in this tree: an eased follower's step is at most
+    /// 0.42 cells and its speed at that gap is a tenth of the threshold, so
+    /// `a_long_gallop_overshoots_then_trots_back` guards its own assertions
+    /// with `if overshot` for the same reason. What is under test here is
+    /// the run-out's POSE, and the machinery that spends it is the real one.
+    ///
+    /// That unreachability was re-measured on 2026-08-27 and is now pinned
+    /// rather than left as a remark — see
+    /// [`the_drift_brakes_gate_is_rare_by_construction`] and the block
+    /// comment at the gate. Both the crossing and the gentler "the paws got
+    /// there this frame" reading were counted over 368 506 frames of
+    /// realistic sessions: zero arms, a fastest arriving speed of 5.2 c/s
+    /// once the caret is at rest, and — for the gentler reading — repeated
+    /// arms in the middle of ordinary typing, which is why it was refused
+    /// rather than adopted.
+    #[test]
+    fn the_drift_brake_skids_on_a_planted_frame() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 3, 2);
+        let mut caret = 4u16;
+        let mut armed = false;
+        let mut skids: Vec<(PetGlyphId, f32, f32)> = Vec::new();
+        let mut after: Vec<PetGlyphId> = Vec::new();
+        let mut puffed = false;
+        for i in 0..200 {
+            t += Duration::from_millis(16);
+            if i % 4 == 3 && i < 160 {
+                caret += 1;
+            }
+            if !armed && i > 100 && pet.action == PetAction::Run && pet.speed > 12.0 {
+                armed = true;
+                pet.braking = true;
+                pet.brake_over = Some(pet.col + BRAKE_OVERSHOOT);
+                pet.speed *= 0.15;
+                pet.stumble_t = STUMBLE_DUR;
+                pet.skid_puff = false;
+            }
+            let f = pet.tick(sense(t, Some((3, caret))));
+            if !armed {
+                continue;
+            }
+            if pet.brake_over.is_some() {
+                skids.push((f.pose, f.scale_x, f.lift));
+            } else {
+                puffed |= pet.skid_puff;
+                if matches!(f.action, PetAction::Walk | PetAction::Run) {
+                    after.push(f.pose);
+                }
+            }
+        }
+        assert!(armed, "fixture: the chase must reach a gallop to arm");
+        assert!(
+            skids.len() >= 4,
+            "fixture: the run-out must last a few frames ({})",
+            skids.len()
+        );
+        for (pose, sx, lift) in &skids {
+            assert_eq!(*pose, PetGlyphId::PetSkid, "the run-out is a braced slide");
+            assert!(*sx > 1.0, "and it leans into the travel (scale_x {sx})");
+            assert_eq!(*lift, 0.0, "on a PLANTED frame — the paws never leave");
+        }
+        assert!(
+            skids[0].1 > skids[skids.len() - 1].1,
+            "the lean eases as the paws reach the overshoot ({} -> {})",
+            skids[0].1,
+            skids[skids.len() - 1].1
+        );
+        assert!(puffed, "and the paws throw one more puff halfway down it");
+        assert!(
+            after.iter().any(|p| PetBrain::CYCLE_RUN.contains(p)),
+            "the gallop cycle comes back once the run-out is spent: {after:?}"
+        );
+        assert!(
+            !after.contains(&PetGlyphId::PetSkid),
+            "and the slide does not outlive its own run-out"
+        );
+    }
+
     /// HIDE-BEHIND-WORDS (wave 4c): a bored cat with a word in reach ducks
     /// behind it — drawn UNDER the glyphs while it lurks — then strolls
     /// home and surfaces.
@@ -12319,23 +19078,1620 @@ mod tests {
         assert!(!pet.watch_spent, "and the next stream earns a fresh stare");
     }
 
-    // ── the NEW-LINE probe (a ruler, not a law — `#[ignore]`d) ──────────
+    // ── the variety wave: the flight poses and the dealt settle ─────────
+
+    /// The schedule fills the flight and never crushes the hero frame below
+    /// [`MIN_HERO`]: the three phases sum to the duration, both approaches
+    /// scale by ONE shared factor, and a longer flight never spends less on
+    /// its descent, its hero, or its approaches together.
+    #[test]
+    fn the_pose_schedule_always_shows_the_hero_or_falls_back_to_two() {
+        let durs = [0.05f32, 0.10, 0.16, 0.20, 0.25, 0.42, 0.85];
+        let mut prev: Option<(f32, f32, f32)> = None;
+        for dur in durs {
+            let (rise, desc) = PetBrain::pose_schedule(dur);
+            let hero = dur - rise - desc;
+            assert!(
+                (rise + hero + desc - dur).abs() < 1e-6,
+                "{dur}: the three phases fill the flight"
+            );
+            assert!(
+                hero >= MIN_HERO - 1e-6,
+                "{dur}: the hero frame holds at least MIN_HERO, got {hero}"
+            );
+            assert!(rise > 0.0 && desc > 0.0, "{dur}: both approaches survive");
+            if let Some((pd, ph, ps)) = prev {
+                assert!(desc >= pd - 1e-6, "{dur}: descent is monotone");
+                assert!(hero >= ph - 1e-6, "{dur}: hero is monotone");
+                assert!(
+                    rise + desc >= ps - 1e-6,
+                    "{dur}: rise + descent is monotone"
+                );
+            }
+            prev = Some((desc, hero, rise + desc));
+        }
+        // …and under `3·MIN_HERO` the flight cannot fit three legible beats
+        // at all, so the OWNER deals two, split at the apex.
+        let short = Flight {
+            from_col: 0.0,
+            from_row: 0.0,
+            to_col: 2.0,
+            to_row: 0.0,
+            dur: 2.0 * MIN_HERO,
+            arc: 0.5,
+            t: 0.0,
+            reaimed: false,
+            big: false,
+            show: false,
+            hop: false,
+            coiled: false,
+            drop: false,
+            late_move: false,
+        };
+        let mut seen = Vec::new();
+        for i in 0..=20 {
+            let mut f = short;
+            f.t = short.dur * i as f32 / 20.0;
+            let p = PetBrain::flight_pose(&f);
+            if seen.last() != Some(&p) {
+                seen.push(p);
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![PetGlyphId::PetLeapRise, PetGlyphId::PetLeapDescend],
+            "too short for three beats: two poses, split at the apex"
+        );
+    }
+
+    /// A short Enter is a TUCKED hop: the release, the rise, the hop frame
+    /// at the apex and the descent — never the pounce's hero frame, which
+    /// is a stretched pounce silhouette and reads as a leap across the pane
+    /// rather than a step down onto the next line.
+    #[test]
+    fn a_short_enter_hop_never_wears_the_pounce_hero_frame() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 1);
+        let mut leap: Vec<(PetGlyphId, f32)> = Vec::new();
+        let mut last_row = 4.0f32;
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((5, 0))));
+            if f.action == PetAction::Leap {
+                leap.push((f.pose, f.lift));
+            }
+            last_row = f.row;
+        }
+        assert!(!leap.is_empty(), "the Enter must fly");
+        let poses: Vec<PetGlyphId> = leap.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            poses[0],
+            PetGlyphId::PetLaunch,
+            "the release first: {poses:?}"
+        );
+        let mut order: Vec<PetGlyphId> = Vec::new();
+        for p in &poses {
+            if order.last() != Some(p) {
+                order.push(*p);
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                PetGlyphId::PetLaunch,
+                PetGlyphId::PetLeapRise,
+                PetGlyphId::PetHop,
+                PetGlyphId::PetLeapDescend,
+            ],
+            "release, rise, tuck, descend — and never the hero: {poses:?}"
+        );
+        assert!(
+            leap.iter().any(|(_, l)| *l > 0.0),
+            "the hop leaves the floor"
+        );
+        assert!((last_row - 5.0).abs() < 0.01, "and lands on row 5");
+    }
+
+    /// THE RELEASE PRECEDES THE RISE: on every coil → flight transition the
+    /// coil's last frame and the flight's `u = 0` frame wear `PetLaunch`,
+    /// and no `PetLaunch` frame is ever in the air — the art is planted, and
+    /// a rear-up off the ground reads as a hovering cat. Driven through a
+    /// pounce, a tucked Enter and the chosen show.
+    #[test]
+    fn the_release_precedes_the_rise() {
+        let start = Instant::now();
+        let mut transitions = 0u32;
+        let mut check = |frames: &[PetFrame], name: &str| {
+            for w in frames.windows(2) {
+                let (a, b) = (&w[0], &w[1]);
+                if a.action == PetAction::Crouch && b.action == PetAction::Leap {
+                    transitions += 1;
+                    // …and the two ticks of it are ONE change: the coil's
+                    // exit shape and the flight's `u = 0` shape are inside
+                    // the wave's 3 % per-tick volume law, so the same art
+                    // twice does not read as a pop. (Measured: 1.5 % on the
+                    // pounce, 2.2 % on the tucked hop — whose one-tick coil
+                    // is an identity by upstream's design, so its step is
+                    // the launch stretch arriving — 0.8 % on the show.)
+                    let (va, vb) = (a.scale_x * a.scale_y, b.scale_x * b.scale_y);
+                    assert!(
+                        (vb - va).abs() / va <= 0.03,
+                        "{name}: the release popped the volume by {:.2} %",
+                        (vb - va).abs() / va * 100.0
+                    );
+                    assert_eq!(
+                        a.pose,
+                        PetGlyphId::PetLaunch,
+                        "{name}: the coil's last frame is the release"
+                    );
+                    assert_eq!(
+                        b.pose,
+                        PetGlyphId::PetLaunch,
+                        "{name}: and the u = 0 frame is its second tick"
+                    );
+                    assert!(b.lift == 0.0, "{name}: the release is on the ground");
+                }
+            }
+            for f in frames {
+                if f.pose == PetGlyphId::PetLaunch {
+                    assert!(
+                        f.lift == 0.0,
+                        "{name}: a PetLaunch frame in the air (lift {})",
+                        f.lift
+                    );
+                }
+            }
+        };
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (_, frames) = drive_and_collect(&mut pet, t, (4, 30), 140);
+        check(&frames, "pounce");
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 1);
+        let (_, frames) = drive_and_collect(&mut pet, t, (5, 0), 120);
+        check(&frames, "hop");
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (_, frames) = drive_and_collect(&mut pet, t, (4, 60), 200);
+        check(&frames, "show");
+        assert_eq!(transitions, 3, "fixture: three coil → flight transitions");
+    }
+
+    /// The touchdown is not a cliff: across the last airborne frame and
+    /// every landing frame no tick moves `scale_y` by more than 0.12 (0.184
+    /// before the attack), and — the wave's own envelope law, asserted
+    /// nowhere until this line — no tick moves the body's VOLUME by more
+    /// than 3 %.
+    #[test]
+    fn the_touchdown_is_not_a_cliff() {
+        let start = Instant::now();
+        // A pounce, a screen-crossing bound, and a tucked Enter: every
+        // landing the caret-driven vocabulary has.
+        for (from, to) in [
+            ((4u16, 10u16), (4u16, 32u16)),
+            ((4, 4), (4, 74)),
+            ((4, 1), (5, 0)),
+        ] {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, from.0, from.1);
+            let (_, frames) = drive_and_collect(&mut pet, t, to, 240);
+            let mut worst = 0.0f32;
+            let mut worst_vol = 0.0f32;
+            for w in frames.windows(2) {
+                let (a, b) = (&w[0], &w[1]);
+                let landing = b.action == PetAction::Land
+                    || (a.action == PetAction::Land && b.action != PetAction::Leap);
+                if landing {
+                    worst = worst.max((b.scale_y - a.scale_y).abs());
+                    let (va, vb) = (a.scale_x * a.scale_y, b.scale_x * b.scale_y);
+                    worst_vol = worst_vol.max((vb - va).abs() / va.max(1e-6));
+                }
+            }
+            assert!(
+                worst > 0.0,
+                "fixture: the {from:?}->{to:?} flight lands and squashes"
+            );
+            assert!(
+                worst <= 0.12,
+                "the {from:?}->{to:?} touchdown stepped scale_y by {worst:.3} in one tick"
+            );
+            assert!(
+                worst_vol <= 0.03 + 1e-6,
+                "the {from:?}->{to:?} touchdown stepped the volume by {:.2} % in one tick",
+                worst_vol * 100.0
+            );
+        }
+    }
+
+    /// The landing steps off on a PLANTED frame. The eased recovery only
+    /// ever APPROACHES its whole cycle, and a phase a hair BELOW the target
+    /// is the cycle's LAST frame, not its first — so from half a cycle out
+    /// the walk home used to begin on `PetWalk3`, a mid-swing pose carrying
+    /// travel the paws never made. Inside [`STRIDE_PLANT`] the foot is
+    /// simply down.
+    #[test]
+    fn the_landing_steps_off_on_a_planted_frame() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        // THE EASE HAS TO HAVE SOMETHING TO CORRECT: the stride is frozen
+        // while the cat is airborne, so a flight that launches ON a contact
+        // frame lands on one whatever the recovery does.
+        pet.stride = pet.stride.trunc() + 0.5;
+        let mut caret = 32u16;
+        let mut landed = false;
+        // The pose AND which cycle it came from: a caret walking one cell
+        // every 0.19 s is an amble ([`LAT_SPEED`]), so the contact frame the
+        // law is about is the LATERAL cycle's — the rule is "frame 0 of
+        // whichever cycle the gait is showing", never one named pose.
+        let mut first_walk: Option<(PetGlyphId, bool)> = None;
+        let mut planted = 1.0f32;
+        for k in 0..400 {
+            t += Duration::from_millis(16);
+            // Once the paws are down, walk the caret away one cell at a time
+            // so the gait resumes and shows which frame it stepped off on.
+            if landed && k % 12 == 0 {
+                caret += 1;
+            }
+            let f = pet.tick(sense(t, Some((4, caret))));
+            if f.action == PetAction::Land {
+                landed = true;
+                planted = (pet.stride - pet.stride.round()).abs();
+            } else if landed && f.action == PetAction::Walk && first_walk.is_none() {
+                first_walk = Some((f.pose, pet.lateral));
+            }
+        }
+        assert!(landed, "fixture: the word jump must pounce and land");
+        assert!(
+            planted < 1e-6,
+            "the recovery must ARRIVE on a contact frame, {planted} of a cycle off"
+        );
+        let (pose, lateral) = first_walk.expect("fixture: the cat walks after the landing");
+        assert_eq!(
+            pose,
+            if lateral {
+                PetGlyphId::PetLwalk0
+            } else {
+                PetGlyphId::PetWalk0
+            },
+            "and the walk home starts on the cycle's foot-down frame"
+        );
+    }
+
+    // ── the settle deal (variety wave): one hand per arrival ────────────
+
+    /// Idle `secs` of 16 ms frames and return the quiet clock at the first
+    /// frame wearing `want` (None if it never came).
+    fn onset_of(
+        pet: &mut PetBrain,
+        start: Instant,
+        caret: (u16, u16),
+        secs: f32,
+        want: PetAction,
+    ) -> (Instant, Option<f32>) {
+        let mut t = start;
+        let end = start + Duration::from_secs_f32(secs);
+        let mut onset = None;
+        while t < end {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some(caret)));
+            if f.action == want && onset.is_none() {
+                onset = Some(pet.quiet);
+            }
+        }
+        (t, onset)
+    }
+
+    #[test]
+    fn consecutive_settles_deal_different_seeds() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        assert!(pet.action.settled(), "fixture: the first arrival settled");
+        let a = (pet.settle_serial, pet.settle_seed);
+        // A second arrival: a few keys, then the settle again.
+        let (t, _) = type_run(&mut pet, t, 4, 12, 4, 0.05);
+        let (t, f) = idle(&mut pet, t, (4, 16), SIT_AFTER + 0.2);
+        assert!(f.action.settled(), "fixture: the second arrival settled");
+        let b = (pet.settle_serial, pet.settle_seed);
+        assert_ne!(a.0, b.0, "every arrival bumps the settle serial");
+        assert_ne!(a.1, b.1, "and deals a fresh hand: {a:?} then {b:?}");
+        // The hand is held for the WHOLE settle: the ladder's own
+        // transitions (sit, groom, loaf) deal nothing new.
+        let (_, f) = idle(&mut pet, t, (4, 16), GROOM_AFTER + GROOM_DUR + 1.0);
+        assert!(f.action.settled());
+        assert_eq!(
+            (pet.settle_serial, pet.settle_seed),
+            b,
+            "a settle keeps its hand through its own ladder"
+        );
+    }
+
+    #[test]
+    fn consecutive_settles_climb_different_ladders() {
+        let start = Instant::now();
+        // Settle A: the natural hand; its loaf onset is the dealt one.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        assert!(
+            pet.content() < PURR_GATE,
+            "fixture: no purr to pre-empt the loaf"
+        );
+        let seed_a = pet.settle_seed;
+        let (t, loaf_a) = onset_of(&mut pet, t, (4, 12), 8.0, PetAction::Loaf);
+        let loaf_a = loaf_a.expect("settle A loafs");
+        assert!(
+            (loaf_a - pet.loaf_after()).abs() < 0.02,
+            "the loaf comes at the dealt onset: {loaf_a} vs {}",
+            pet.loaf_after()
+        );
+        // Settle B: the next hand (forced to the neighbouring seed, so the
+        // ladder rung it deals is guaranteed different: a % 3 != b % 3).
+        let (t, _) = type_run(&mut pet, t, 4, 12, 2, 0.05);
+        let (t, f) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.2);
+        assert!(f.action.settled(), "fixture: settle B arrived");
+        pet.force_seed(seed_a.wrapping_add(1));
+        let (t, loaf_b) = onset_of(&mut pet, t, (4, 14), 8.0, PetAction::Loaf);
+        let loaf_b = loaf_b.expect("settle B loafs");
+        assert!(
+            (loaf_a - loaf_b).abs() >= 0.7,
+            "consecutive hands climb different ladders: {loaf_a} vs {loaf_b}"
+        );
+        // Settle C: the same rung as A (a % 3 == c % 3) loafs at A's onset.
+        let (t, _) = type_run(&mut pet, t, 4, 14, 2, 0.05);
+        let (t, f) = idle(&mut pet, t, (4, 16), SIT_AFTER + 0.2);
+        assert!(f.action.settled(), "fixture: settle C arrived");
+        pet.force_seed(seed_a.wrapping_add(3));
+        let (_, loaf_c) = onset_of(&mut pet, t, (4, 16), 8.0, PetAction::Loaf);
+        let loaf_c = loaf_c.expect("settle C loafs");
+        assert!(
+            (loaf_a - loaf_c).abs() < 0.05,
+            "the same rung is the same ladder: {loaf_a} vs {loaf_c}"
+        );
+    }
+
+    /// Whatever the hand, the sleep is at [`SLEEP_AFTER`] to the tick and
+    /// the deep-sleep frame is byte-stable with the lane released: the deal
+    /// varies the MIDDLE of the ladder, never its end.
+    #[test]
+    fn every_ladder_deal_sleeps_at_twenty_two_and_goes_byte_stable() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            pet.force_seed(seed);
+            let (t, slept) = onset_of(&mut pet, t, (4, 12), SLEEP_AFTER + 1.0, PetAction::Sleep);
+            let slept = slept.unwrap_or_else(|| panic!("hand {seed}: never slept"));
+            assert!(
+                (slept - SLEEP_AFTER).abs() <= 0.017,
+                "hand {seed}: first sleep frame at quiet {slept}, not {SLEEP_AFTER}"
+            );
+            let (t, f) = idle(&mut pet, t, (4, 12), BREATH_WINDOW + 2.0);
+            assert_eq!(f.action, PetAction::Sleep, "hand {seed}: still asleep");
+            assert!(
+                !pet.needs_frames(),
+                "hand {seed}: the lane is released past the breath window"
+            );
+            assert!(
+                f.motes.iter().all(Option::is_none),
+                "hand {seed}: deep sleep holds an empty mote lane"
+            );
+            let a = pet.tick(sense(t + Duration::from_secs(1), Some((4, 12))));
+            let b = pet.tick(sense(t + Duration::from_secs(2), Some((4, 12))));
+            assert_eq!(a.fp(), b.fp(), "hand {seed}: deep sleep is byte-stable");
+        }
+    }
+
+    /// The idle sweep guard, run for every hand: an Enter (a fresh arrival
+    /// and a fresh deal) and one output pulse (the ear twitch) inside the
+    /// script, and still the settle window closes on a byte-stable sleeper
+    /// with nothing asking for frames.
+    #[test]
+    fn every_idle_deal_goes_byte_stable_by_the_breath_window() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            // The Enter: a new line, a quiet hop, a new arrival.
+            let (mut t, _) = idle(&mut pet, t, (5, 0), 1.6);
+            assert!(
+                pet.action.settled(),
+                "hand {seed}: fixture: settled after the Enter"
+            );
+            pet.force_seed(seed);
+            // One output pulse: the twitch's rising edge.
+            t += Duration::from_millis(16);
+            let mut s = sense(t, Some((5, 0)));
+            s.output_burst = true;
+            let _ = pet.tick(s);
+            let (t, f) = idle(&mut pet, t, (5, 0), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+            assert_eq!(f.action, PetAction::Sleep, "hand {seed}: deeply asleep");
+            assert!(
+                !pet.needs_frames(),
+                "hand {seed}: every idle envelope died inside the settle window"
+            );
+            assert!(
+                f.motes.iter().all(Option::is_none),
+                "hand {seed}: the mote lane is empty"
+            );
+            let a = pet.tick(sense(t + Duration::from_secs(1), Some((5, 0))));
+            let b = pet.tick(sense(t + Duration::from_secs(2), Some((5, 0))));
+            assert_eq!(a.fp(), b.fp(), "hand {seed}: deep sleep is byte-stable");
+        }
+    }
+
+    /// No idle beat moves the body (the tic law): on every settled frame of
+    /// every hand the lift is exactly zero, the row never changes, and the
+    /// feet never STEP — the variety is in the poses and the scale
+    /// envelopes, never the position.
+    ///
+    /// The one settled displacement the vocabulary already has is the
+    /// SEAT'S OWN CLEARANCE: a face-on sit scoots [`PECK_CLEAR`] clear of
+    /// the caret cell, and the follower gives that third of a cell back
+    /// when the seat melts into the loaf. It is bounded by `PECK_CLEAR`,
+    /// arrives a ten-thousandth of a cell at a time, and belongs to
+    /// upstream's seat, not to any beat — so the bar is stated in those
+    /// terms rather than pretending the cat is nailed down.
+    #[test]
+    fn no_idle_beat_moves_the_body() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            pet.force_seed(seed);
+            let mut t = t;
+            let mut anchor: Option<(f32, f32)> = None;
+            let mut prev_col: Option<f32> = None;
+            let end = t + Duration::from_secs_f32(SLEEP_AFTER + BREATH_WINDOW + 1.0);
+            while t < end {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 12))));
+                if !f.action.settled() {
+                    anchor = None;
+                    prev_col = None;
+                    continue;
+                }
+                assert!(
+                    f.lift == 0.0,
+                    "hand {seed}: a settled {:?} frame lifted the body by {}",
+                    f.action,
+                    f.lift
+                );
+                if let Some(c) = prev_col {
+                    assert!(
+                        (f.col - c).abs() <= 0.01,
+                        "hand {seed}: a settled {:?} frame STEPPED the feet by {}",
+                        f.action,
+                        (f.col - c).abs()
+                    );
+                }
+                prev_col = Some(f.col);
+                match anchor {
+                    None => anchor = Some((f.col, f.row)),
+                    Some((c, r)) => {
+                        assert!(
+                            (f.row - r).abs() < 1e-6,
+                            "hand {seed}: a settled {:?} frame changed the row: {r} -> {}",
+                            f.action,
+                            f.row
+                        );
+                        assert!(
+                            (f.col - c).abs() <= PECK_CLEAR + 1e-3,
+                            "hand {seed}: a settled {:?} frame moved the feet {} cells \
+                             — past the seat's own clearance",
+                            f.action,
+                            (f.col - c).abs()
+                        );
+                    }
+                }
+            }
+            assert!(
+                anchor.is_some(),
+                "hand {seed}: fixture: the run ends settled"
+            );
+        }
+    }
+
+    /// One hand in four skips the SECOND wash of a settle — the silence is
+    /// the variety. The first wash always plays (a cat that never washed
+    /// would just be a cat that never washed), and the sleep still lands at
+    /// [`SLEEP_AFTER`] either way.
+    #[test]
+    fn one_hand_in_four_skips_the_second_wash() {
+        let start = Instant::now();
+        let mut skipped = 0u32;
+        let mut washed_twice = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            pet.force_seed(seed);
+            assert!(
+                pet.content() < PURR_GATE,
+                "fixture: a cold cat climbs the whole ladder"
+            );
+            // Two full wash cycles inside the settle window.
+            let mut t = t;
+            let mut washes = 0u32;
+            let mut in_wash = false;
+            let end = t + Duration::from_secs_f32(2.2 * (GROOM_AFTER + GROOM_DUR));
+            while t < end {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 12))));
+                let now = f.action == PetAction::Groom;
+                if now && !in_wash {
+                    washes += 1;
+                }
+                in_wash = now;
+            }
+            assert!(washes >= 1, "hand {seed}: the first wash always plays");
+            if pet.groom_skip() {
+                assert_eq!(washes, 1, "hand {seed}: the dealt skip drops the second");
+                skipped += 1;
+            } else {
+                assert_eq!(washes, 2, "hand {seed}: two washes in two cycles");
+                washed_twice += 1;
+            }
+        }
+        assert!(
+            skipped >= 2,
+            "twelve hands must include the skip ({skipped})"
+        );
+        assert!(
+            washed_twice >= 6,
+            "…and it must stay the minority ({washed_twice})"
+        );
+    }
+
+    /// THE SEAT IS REACHABLE FOR A CAT THAT WORKS. The purr used to outrank
+    /// the whole seat, and [`PURR_GATE`] is thirteen cells of travel at
+    /// [`CONTENT_PER_CELL`] — one pounce, or thirteen keystrokes of
+    /// following — so a working cat purred from [`SIT_AFTER`] straight
+    /// through to the loaf and the sit arm never ran at all. Every beat the
+    /// dealt seat exists FOR was shelf art for anyone who types.
+    /// Contentment is a long dwell's reward now: the seat gets its whole
+    /// dealt window, and the purr takes the one the loaf would have had.
+    ///
+    /// The WINDOW is what this test pins; that the beats drawn inside it are
+    /// actually reachable for a working cat is
+    /// [`the_dealt_seat_is_reachable_for_a_cat_that_works`]'s.
+    #[test]
+    fn a_working_cat_still_gets_its_seat_and_its_beats() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 4);
+            // A sentence of following: content well past PURR_GATE.
+            let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
+            let (mut t, f) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.1);
+            assert!(
+                pet.content() >= PURR_GATE,
+                "fixture: a cat that has been working ({})",
+                pet.content()
+            );
+            assert_eq!(
+                f.action,
+                PetAction::Sit,
+                "hand {seed}: the seat comes before the purr, whatever the ledger says"
+            );
+            pet.force_seed(seed);
+            let want = pet.loaf_after();
+            let seated_at = pet.quiet;
+            let mut sat = 0.0f32;
+            let mut dwelt_at = None;
+            for _ in 0..400 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 36))));
+                match f.action {
+                    PetAction::Sit => sat += 0.016,
+                    // THE LONG DWELL, whichever of its two poses this hand
+                    // was dealt. One hand in three loafs even for a content
+                    // cat ([`PetBrain::enter_settled`]), which is what puts
+                    // the loaf's OWN beats — the thump, the drowsy peek, the
+                    // ear, the roll — back within reach of someone who
+                    // types; the purr's tell rides both
+                    // ([`PetBrain::purring`]), so the hand decides the pose
+                    // and never the contentment.
+                    PetAction::Purr | PetAction::Loaf if dwelt_at.is_none() => {
+                        assert!(f.purr > 0.0, "hand {seed}: the tell rides either dwell");
+                        dwelt_at = Some(pet.quiet);
+                    }
+                    _ => {}
+                }
+            }
+            let dwelt_at =
+                dwelt_at.unwrap_or_else(|| panic!("hand {seed}: never reaches its long dwell"));
+            assert!(
+                (dwelt_at - want).abs() < 0.05,
+                "hand {seed}: the long dwell takes its dealt window ({dwelt_at} vs {want})"
+            );
+            assert!(
+                sat >= want - seated_at - 0.05,
+                "hand {seed}: the seat keeps its whole dealt window ({sat} s of sit, \
+                 seated at {seated_at}, loaf due at {want})"
+            );
+        }
+    }
+
+    /// THE SEAT'S BEATS ARE REACHABLE FOR A CAT THAT WORKS. Two gates used
+    /// to close the whole dealt seat for anyone who types. (a) THE PURR
+    /// outranked the sit — [`a_working_cat_still_gets_its_seat_and_its_beats`]
+    /// pins the window that fix gives back. (b) FACE-ON is the ORDINARY
+    /// settled pose (the station is `caret + 1`, well inside
+    /// [`SIT_FRONT_GAP`]) and it outranked every beat below it, so ten
+    /// authored frames were shelf art for anyone who types (review,
+    /// 2026-08-27). The glance — which already swaps the face-on frame for
+    /// the side-on sit — is the door those beats come through.
+    #[test]
+    fn the_dealt_seat_is_reachable_for_a_cat_that_works() {
+        let start = Instant::now();
+        let mut beats: Vec<PetGlyphId> = Vec::new();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 4);
+            // A sentence of following: content well past PURR_GATE.
+            let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
+            let (t, f) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.1);
+            assert!(
+                pet.content() >= PURR_GATE,
+                "fixture: a cat that has been working ({})",
+                pet.content()
+            );
+            assert_eq!(
+                f.action,
+                PetAction::Sit,
+                "the seat comes before the purr, whatever the ledger says"
+            );
+            assert!(pet.sit_front, "fixture: the ordinary face-on seat");
+            pet.force_seed(seed);
+            // …and a program prints one line while it sits, which is the
+            // ear twitch's own trigger: the authored ear frame is reachable
+            // face-on too, where before it could only ever be the bob.
+            let (t, runs_a) = pose_runs(&mut pet, t, (4, 36), 0.9);
+            pulse(&mut pet, t, (4, 36));
+            let (_, runs_b) = pose_runs(&mut pet, t, (4, 36), 2.1);
+            for (pose, _, ticks) in runs_a.iter().chain(runs_b.iter()) {
+                if seat_beat(*pose) && *pose != PetGlyphId::PetSit {
+                    assert!(
+                        *ticks >= 2,
+                        "hand {seed}: {pose:?} held {ticks} tick(s) — the frame-rate law"
+                    );
+                    if !beats.contains(pose) {
+                        beats.push(*pose);
+                    }
+                }
+            }
+        }
+        assert!(
+            beats.contains(&PetGlyphId::PetSitBlink),
+            "the seat blinks where a working cat can see it: {beats:?}"
+        );
+
+        // …AND THE HEAD TIPS, in the seat every developer has: editing
+        // mid-line, the ink ladder parks the cat on the blank row BELOW the
+        // caret (rule 3) and it is still within [`SIT_FRONT_GAP`] of the
+        // caret's column, so face-on outranked the tip toward the line the
+        // cat is not on.
+        let mut tipped = 0u32;
+        for seed in [1u8, 2, 4, 5] {
+            let mut pet = PetBrain::default();
+            let mut spans = vec![(0u16, 0u16); 30];
+            spans[4] = (0, 40);
+            pet.sense_ink(0, &spans, Some(4));
+            // `awake` already settles the cat (quiet ≈ SIT_AFTER + 0.2), so
+            // the glance's own window is still ahead of the pose walk below.
+            let t = awake(&mut pet, start, 4, 18);
+            let (t, f) = idle(&mut pet, t, (4, 20), 0.1);
+            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
+            assert!(
+                (f.row - 4.0).abs() > 0.5,
+                "fixture: the ladder parked the seat off the caret's row ({})",
+                f.row
+            );
+            assert!(pet.sit_front, "fixture: face-on, beside the caret's column");
+            pet.force_seed(seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 20), 1.5);
+            if let Some((_, _, ticks)) = runs.iter().find(|(p, ..)| *p == PetGlyphId::PetSitLookup)
+            {
+                assert!(
+                    *ticks >= 2,
+                    "hand {seed}: the tip held {ticks} tick(s) — the frame-rate law"
+                );
+                tipped += 1;
+            }
+        }
+        assert!(
+            tipped >= 3,
+            "the head tips toward the line it is not on, face-on ({tipped}/4 hands)"
+        );
+    }
+
+    // ── the variety wave: the placeholders retire, the idle is dealt ────
+
+    /// A settled cat parked WALL-SIDE. The station is clamped to the pane,
+    /// so the caret sits ~4.6 cells off the pet's own column: past
+    /// [`SIT_FRONT_GAP`], ahead of the facing, which makes the seat the
+    /// PLAIN sit — the leaf every dealt beat below `sit_front` is written
+    /// on. Deals `seed` to the settle that has already arrived.
+    /// The seat's SIDE-ON vocabulary: the plain sit and every dealt beat
+    /// drawn on it. These are the frames the seat may wear while the cat is
+    /// looking away — face-on `PetSitFront` and the over-the-shoulder
+    /// `PetPeekShoulder` are the two poses that are not one of them.
+    /// The tail's own three frames — the excursion, as against the rest of
+    /// the seat's vocabulary.
+    fn tail_frame(pose: PetGlyphId) -> bool {
+        matches!(
+            pose,
+            PetGlyphId::PetSitFlick | PetGlyphId::PetSitTailBack | PetGlyphId::PetSitTailLow
+        )
+    }
+
+    fn seat_beat(pose: PetGlyphId) -> bool {
+        matches!(
+            pose,
+            PetGlyphId::PetSit
+                | PetGlyphId::PetSitBlink
+                | PetGlyphId::PetYawn
+                | PetGlyphId::PetSitEar
+                | PetGlyphId::PetSitEarFar
+                | PetGlyphId::PetSitLookup
+                | PetGlyphId::PetSitLookdown
+                | PetGlyphId::PetSitFlick
+                | PetGlyphId::PetSitTailBack
+                | PetGlyphId::PetSitTailLow
+        )
+    }
+
+    fn plain_seat(pet: &mut PetBrain, start: Instant, seed: u8) -> Instant {
+        let t = awake(pet, start, 4, 97);
+        assert!(pet.action.settled(), "fixture: settled");
+        assert!(!pet.sit_front && !pet.peek, "fixture: the plain seat");
+        pet.force_seed(seed);
+        t
+    }
+
+    /// Drive `secs` of 16 ms frames and return the pose timeline, run-length
+    /// encoded as (pose, quiet at the first frame of the run, tick count).
+    fn pose_runs(
+        pet: &mut PetBrain,
+        start: Instant,
+        caret: (u16, u16),
+        secs: f32,
+    ) -> (Instant, Vec<(PetGlyphId, f32, u32)>) {
+        let mut t = start;
+        let end = start + Duration::from_secs_f32(secs);
+        let mut runs: Vec<(PetGlyphId, f32, u32)> = Vec::new();
+        while t < end {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some(caret)));
+            match runs.last_mut() {
+                Some(r) if r.0 == f.pose => r.2 += 1,
+                _ => runs.push((f.pose, pet.quiet, 1)),
+            }
+        }
+        (t, runs)
+    }
+
+    /// One output pulse — a burst's rising edge, the ear twitch's trigger.
+    fn pulse(pet: &mut PetBrain, t: Instant, caret: (u16, u16)) {
+        let mut s = sense(t, Some(caret));
+        s.output_burst = true;
+        let _ = pet.tick(s);
+    }
+
+    /// THE SULK'S OWN FRAME, off its feet: the grief interrupted a stand, so
+    /// the body goes down flat — ears pinned, head hung. (The seated
+    /// reading is `a_seated_sulk_keeps_its_seat`.)
+    #[test]
+    fn the_dog_sulks_in_its_own_skin() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        pet.set_species(PetSpecies::Dog);
+        let t = awake(&mut pet, start, 3, 2);
+        let (t, _) = type_run(&mut pet, t, 3, 4, 30, 0.05);
+        let (mut t, _) = idle(&mut pet, t, (3, 34), 0.6);
+        pet.note_command_done(t, true, Some(120_000));
+        let mut saw = false;
+        for _ in 0..160 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((3, 34))));
+            if f.action == PetAction::Droop {
+                saw = true;
+                assert_eq!(
+                    f.pose,
+                    PetGlyphId::PetDogDroop,
+                    "the dog sulks in its own skin"
+                );
+            }
+        }
+        assert!(saw, "a failure must droop");
+    }
+
+    /// A cat that was already SITTING does not lie down to be disappointed:
+    /// the head goes down and the ears flatten on the seat it kept.
+    #[test]
+    fn a_seated_sulk_keeps_its_seat() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 3, 2);
+        let (t, _) = type_run(&mut pet, t, 3, 4, 30, 0.05);
+        let (mut t, f) = idle(&mut pet, t, (3, 34), SIT_AFTER + 0.2);
+        assert!(
+            matches!(f.action, PetAction::Sit | PetAction::Purr),
+            "fixture: seated, got {:?}",
+            f.action
+        );
+        pet.note_command_done(t, true, Some(120_000));
+        let mut saw = false;
+        for _ in 0..160 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((3, 34))));
+            if f.action == PetAction::Droop {
+                saw = true;
+                assert_eq!(
+                    f.pose,
+                    PetGlyphId::PetDroopSit,
+                    "a sulk off a seat keeps the seat"
+                );
+                assert!(f.motes.iter().all(Option::is_none), "grief floats NOTHING");
+            }
+        }
+        assert!(saw, "a failure must droop");
+    }
+
+    /// THE WAKE IS A GESTURE, not a held pose: the front reach draws the
+    /// body out along its own axis, then the weight shifts and the hind leg
+    /// reaches back. Both halves play, in that order, inside one WAKE_DUR.
+    #[test]
+    fn the_wake_stretches_front_then_hind() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 18);
+        let (mut t, f) = idle(&mut pet, t, (4, 20), SLEEP_AFTER + 0.4);
+        assert_eq!(f.action, PetAction::Sleep, "fixture: asleep");
+        let mut front = Vec::new();
+        let mut hind = Vec::new();
+        let mut drawn = 0.0f32;
+        for k in 0..(WAKE_DUR / 0.016) as u32 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 21))));
+            assert_eq!(f.action, PetAction::Waking, "fixture: inside the wake");
+            match f.pose {
+                PetGlyphId::PetStretch => front.push(k),
+                PetGlyphId::PetStretchHind => hind.push(k),
+                other => panic!("the wake wears only its two halves, got {other:?}"),
+            }
+            if k as f32 * 0.016 < STRETCH_LEAD {
+                drawn = drawn.max(f.scale_x);
+            }
+        }
+        assert!(!front.is_empty() && !hind.is_empty(), "both halves play");
+        assert!(
+            front.last() < hind.first(),
+            "the front reach leads and the hind leg follows: {front:?} then {hind:?}"
+        );
+        assert!(
+            front.len() >= 2 && hind.len() >= 2,
+            "each half holds past the frame-rate law's two ticks"
+        );
+        assert!(
+            drawn >= 1.04,
+            "the front reach draws the body out ({drawn} at full reach)"
+        );
+    }
+
+    /// THE EAR TWITCH wears the authored frame now. A pulse at a STAND
+    /// swaps the ear out and back; it is still not a stream, and it still
+    /// floats nothing.
+    #[test]
+    fn an_output_pulse_twitches_the_settled_ear() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 12);
+        // A fresh arrival: quiet under SIT_AFTER, so the pose is the stand.
+        let (t, _) = type_run(&mut pet, t, 4, 14, 3, 0.05);
+        let (mut t, f) = idle(&mut pet, t, (4, 17), 0.9);
+        assert_eq!(f.action, PetAction::Stand, "fixture: on its feet");
+        assert_eq!(f.pose, PetGlyphId::PetStand);
+        // ONE burst frame — a pulse, not a stream (heat stays far below
+        // the watch gate).
+        t += Duration::from_millis(16);
+        pulse(&mut pet, t, (4, 17));
+        let mut eared = 0u32;
+        for _ in 0..10 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 17))));
+            assert_ne!(f.action, PetAction::Perk, "a pulse is not a stream");
+            assert!(f.motes.iter().all(Option::is_none), "and floats nothing");
+            if f.pose == PetGlyphId::PetStandEar {
+                eared += 1;
+                assert_eq!(f.scale_y, 1.0, "the frame IS the twitch: no bob on top");
+            }
+        }
+        assert!(eared >= 2, "the ear frame holds ({eared} ticks)");
+        let (_, f) = idle(&mut pet, t, (4, 17), 0.3);
+        assert_ne!(
+            f.pose,
+            PetGlyphId::PetStandEar,
+            "and the ear comes back down"
+        );
+    }
+
+    /// Which ear flicks alternates with the mote serial, exactly as the bob
+    /// it replaces did — and on the seat both authored ears are real frames.
+    #[test]
+    fn the_ear_that_flicks_alternates_by_serial() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        // Hand 3: the tail is dealt SILENCE this beat and the yawn is an
+        // even-hand beat, so the seat's leaf is the plain sit throughout.
+        let mut t = plain_seat(&mut pet, start, 3);
+        let mut ears = Vec::new();
+        for _ in 0..2 {
+            t += Duration::from_millis(16);
+            pulse(&mut pet, t, (4, 99));
+            let mut seen = None;
+            for _ in 0..10 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 99))));
+                assert_eq!(f.action, PetAction::Sit, "fixture: still seated");
+                if matches!(f.pose, PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar) {
+                    seen = Some(f.pose);
+                }
+            }
+            ears.push(seen.expect("a pulse flicks an ear"));
+            let (t2, _) = idle(&mut pet, t, (4, 99), 0.1);
+            t = t2;
+        }
+        assert_ne!(ears[0], ears[1], "the twitch alternates ears: {ears:?}");
+    }
+
+    /// The loaf has its own ear frame too — the beat is the settled pet's,
+    /// not the sit's.
+    #[test]
+    fn a_loafed_cat_flicks_its_own_ear() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = plain_seat(&mut pet, start, 3);
+        let (mut t, f) = idle(&mut pet, t, (4, 99), 2.0);
+        assert_eq!(f.action, PetAction::Loaf, "fixture: melted into the loaf");
+        t += Duration::from_millis(16);
+        pulse(&mut pet, t, (4, 99));
+        let mut eared = 0u32;
+        for _ in 0..10 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 99))));
+            if f.pose == PetGlyphId::PetLoafEar {
+                eared += 1;
+            }
+        }
+        assert!(eared >= 2, "the loaf flicks its own ear ({eared} ticks)");
+    }
+
+    /// REDUCED MOTION: the pet simply IS. No twitch, no ear frame, no bob —
+    /// the pulse is bookkeeping the reduced arm never even reaches.
+    #[test]
+    fn reduced_motion_never_flicks() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = start;
+        for k in 0..120u32 {
+            t += Duration::from_millis(16);
+            let mut s = sense(t, Some((4, 20)));
+            s.reduced_motion = true;
+            s.output_burst = k % 20 < 3;
+            let f = pet.tick(s);
+            assert!(
+                matches!(f.pose, PetGlyphId::PetSit | PetGlyphId::PetSleep0),
+                "reduced motion holds one still frame, got {:?}",
+                f.pose
+            );
+            assert_eq!(f.scale_y, 1.0, "and never bobs");
+            assert_eq!(f.scale_x, 1.0);
+        }
+        assert_eq!(pet.twitch_t, 0.0, "no twitch was ever armed");
+    }
+
+    /// THE TRAVEL PERK looks where it is going: the notice before a jump
+    /// turns its head toward the caret. A notice with nothing latched — the
+    /// celebration's double-take — keeps the square-on frame.
+    #[test]
+    fn a_travel_perk_looks_where_it_is_going() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (mut t, _) = idle(&mut pet, t, (4, 12), SIT_AFTER + 0.4);
+        // A screen-crossing move: the jump latches, then the notice.
+        let mut turned = 0u32;
+        for _ in 0..30 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 70))));
+            if f.action == PetAction::Perk {
+                assert_eq!(
+                    f.pose,
+                    PetGlyphId::PetPerkTurn,
+                    "a notice with a trip latched looks where it is going"
+                );
+                turned += 1;
+            }
+        }
+        assert!(turned >= 2, "the travel notice holds its turn ({turned})");
+
+        // The celebration's notice has nowhere to go: square on.
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (mut t, _) = idle(&mut pet, t, (4, 12), SIT_AFTER + 0.4);
+        pet.note_command_done(t, false, Some(40_000));
+        let mut square = 0u32;
+        for _ in 0..30 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            if f.action == PetAction::Perk {
+                assert_eq!(
+                    f.pose,
+                    PetGlyphId::PetPerk,
+                    "a notice with nothing latched stays square on"
+                );
+                square += 1;
+            }
+        }
+        assert!(square >= 2, "the cheer's notice plays ({square})");
+    }
+
+    // ── the seat's dealt beats: tail, blink, yawn, glance, look ─────────
+
+    /// The tail beat is DEALT, not metronomed: over the twelve hands the
+    /// same seat shows a beat with no flick at all, a beat with one and a
+    /// beat with two — which is the whole point of the tic law. A metronome
+    /// would show the same count every time.
+    #[test]
+    fn sit_flicks_are_dealt_not_metronomed() {
+        let start = Instant::now();
+        let mut counts = std::collections::BTreeSet::new();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = plain_seat(&mut pet, start, seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 99), 2.6);
+            let flicks = runs
+                .iter()
+                .filter(|(p, ..)| *p == PetGlyphId::PetSitFlick)
+                .count();
+            for (pose, at, ticks) in &runs {
+                assert!(
+                    *ticks >= 2 || *at < SIT_AFTER,
+                    "hand {seed}: {pose:?} at {at} held {ticks} tick(s) — \
+                     the frame-rate law wants two"
+                );
+            }
+            counts.insert(flicks);
+        }
+        assert!(
+            counts.contains(&0) && counts.contains(&1) && counts.contains(&2),
+            "the hands deal silence, one flick and two: {counts:?}"
+        );
+    }
+
+    /// The seat's beats are phased on QUIET, never on the wall clock: the
+    /// same settle driven from two different absolute instants is
+    /// byte-identical, frame for frame.
+    #[test]
+    fn sit_flicks_are_quiet_phased() {
+        let run = |start: Instant| -> Vec<u64> {
+            let mut pet = PetBrain::default();
+            let mut t = plain_seat(&mut pet, start, 2);
+            let mut fps = Vec::new();
+            for _ in 0..120 {
+                t += Duration::from_millis(16);
+                fps.push(pet.tick(sense(t, Some((4, 99)))).fp());
+            }
+            fps
+        };
+        let a = run(Instant::now());
+        let b = run(Instant::now() + Duration::from_millis(4_321));
+        assert_eq!(a, b, "the seat's beats are quiet-phased, not wall-clocked");
+        assert!(
+            a.windows(2).any(|w| w[0] != w[1]),
+            "and a beat actually plays inside the window"
+        );
+    }
+
+    /// THE TAIL NEVER TELEPORTS. It has two sides and four frames, and the
+    /// only way across is through the tip-up frame of each side: every
+    /// transition into or out of the away-side pair is `PetSitFlick` ↔
+    /// `PetSitTailBack`. (This is the tic law's smallest case: a limb that
+    /// changes sides between two frames is a cut, not a swing.)
+    #[test]
+    fn the_tail_swaps_sides_only_between_tip_up_frames() {
+        let behind =
+            |p: PetGlyphId| matches!(p, PetGlyphId::PetSitTailLow | PetGlyphId::PetSitTailBack);
+        let start = Instant::now();
+        let mut swung = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = plain_seat(&mut pet, start, seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 99), SLEEP_AFTER + 2.0);
+            for pair in runs.windows(2) {
+                let (a, b) = (pair[0].0, pair[1].0);
+                if behind(a) == behind(b) {
+                    continue;
+                }
+                swung += 1;
+                let ok = (a == PetGlyphId::PetSitFlick && b == PetGlyphId::PetSitTailBack)
+                    || (a == PetGlyphId::PetSitTailBack && b == PetGlyphId::PetSitFlick);
+                assert!(
+                    ok,
+                    "hand {seed}: the tail changed sides on {a:?} -> {b:?} \
+                     at quiet {} — it must swing through two tip-up frames",
+                    pair[1].1
+                );
+            }
+        }
+        assert!(
+            swung >= 4,
+            "some hand must actually swing its tail ({swung})"
+        );
+    }
+
+    /// The blink is dealt too: nearly every hand blinks inside its seat,
+    /// one hand in three blinks twice, and no blink lands inside the
+    /// stand→sit fold. A hand whose tail or yawn owns the blink's window
+    /// keeps its eyes open — the seat's one precedence, doing its job.
+    #[test]
+    fn a_settled_cat_blinks_on_a_dealt_beat() {
+        let start = Instant::now();
+        let mut doubles = 0u32;
+        let mut blinked = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = plain_seat(&mut pet, start, seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 99), 3.2);
+            let blinks: Vec<_> = runs
+                .iter()
+                .filter(|(p, ..)| *p == PetGlyphId::PetSitBlink)
+                .collect();
+            blinked += u32::from(!blinks.is_empty());
+            for (_, at, ticks) in &blinks {
+                assert!(
+                    *at >= SIT_AFTER + SIT_FOLD,
+                    "hand {seed}: a blink inside the fold, at quiet {at}"
+                );
+                assert!(
+                    (2..=8).contains(ticks),
+                    "hand {seed}: a {ticks}-tick blink is not a blink"
+                );
+            }
+            if blinks.len() >= 2 {
+                doubles += 1;
+            }
+        }
+        assert!(
+            blinked >= 9,
+            "the seat blinks on all but a hand or two ({blinked}/12)"
+        );
+        assert!(
+            doubles >= 3,
+            "one hand in three blinks twice ({doubles}/12)"
+        );
+    }
+
+    /// The blink rides the same quiet clock as everything else here.
+    #[test]
+    fn blinks_are_quiet_phased() {
+        let run = |start: Instant| -> Vec<(PetGlyphId, u32)> {
+            let mut pet = PetBrain::default();
+            let t = plain_seat(&mut pet, start, 5);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 99), 2.0);
+            runs.iter().map(|(p, _, n)| (*p, *n)).collect()
+        };
+        let a = run(Instant::now());
+        let b = run(Instant::now() + Duration::from_millis(7_777));
+        assert_eq!(a, b, "the blink schedule is quiet-phased");
+        assert!(
+            a.iter().any(|(p, _)| *p == PetGlyphId::PetSitBlink),
+            "and a blink plays inside the window: {a:?}"
+        );
+    }
+
+    /// THE YAWN hands the seat into its loaf — on half the hands. The other
+    /// half melt down without one: a yawn on every single dwell is a tic.
+    #[test]
+    fn the_seat_yawns_before_it_loafs_on_even_deals() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = plain_seat(&mut pet, start, seed);
+            let loaf_at = pet.loaf_after();
+            let (_, runs) = pose_runs(&mut pet, t, (4, 99), loaf_at + 0.6);
+            let yawns: Vec<_> = runs
+                .iter()
+                .filter(|(p, ..)| *p == PetGlyphId::PetYawn)
+                .collect();
+            if seed % 2 == 1 {
+                assert!(yawns.is_empty(), "hand {seed}: an odd hand never yawns");
+                continue;
+            }
+            let &&(_, at, _) = yawns
+                .first()
+                .unwrap_or_else(|| panic!("hand {seed}: an even hand yawns into its loaf"));
+            assert!(
+                at >= loaf_at - YAWN_DUR - 0.02 && at < loaf_at,
+                "hand {seed}: the yawn plays in the last of the sit, at {at} of {loaf_at}"
+            );
+            let after = runs
+                .iter()
+                .position(|(p, ..)| *p == PetGlyphId::PetYawn)
+                .and_then(|i| runs.get(i + 1))
+                .map(|(p, ..)| *p);
+            assert_eq!(
+                after,
+                Some(PetGlyphId::PetLoaf),
+                "hand {seed}: the yawn hands straight into the melt"
+            );
+        }
+    }
+
+    /// EYE CONTACT IS NOT A STARE: on a dealt beat the face-on sit looks
+    /// away for [`LOOK_DUR`] and comes back. One hand in three never
+    /// glances at all.
+    #[test]
+    fn eye_contact_breaks_and_returns_on_a_dealt_beat() {
+        let start = Instant::now();
+        let mut glanced = 0u32;
+        let mut returned = 0u32;
+        let mut handed = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 12);
+            assert!(pet.sit_front, "fixture: eye contact");
+            pet.force_seed(seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 14), 2.0);
+            let looks: Vec<_> = runs
+                .iter()
+                .filter(|(p, ..)| *p == PetGlyphId::PetSit)
+                .collect();
+            if seed % 3 == 0 {
+                assert!(looks.is_empty(), "hand {seed}: this hand never glances");
+                continue;
+            }
+            glanced += 1;
+            let &&(_, at, ticks) = looks.first().expect("the dealt hand glances");
+            assert!(
+                at >= SIT_AFTER + GLANCE_AT - 0.02,
+                "hand {seed}: the glance waits for its beat, at {at}"
+            );
+            assert!(
+                ticks >= 2,
+                "hand {seed}: a {ticks}-tick glance is a blink, not a look"
+            );
+            // The glance is the SEAT'S DOOR as well as a look: while it
+            // holds, the cat is side-on and the seat's dealt beats play
+            // (the blink, the ear, a head tip, the tail, the yawn). Eye
+            // contact returns when the whole window is over, so the frame
+            // that ends it is the first one that is not a seat beat.
+            //
+            // …UNLESS THE NEXT LOOK TOOK IT OVER. The yawn opens a look of
+            // its own ([`PetBrain::sit_look`]) — a cat looks away to yawn —
+            // and on an even hand of the 2.2 s seat the yawn's window opens
+            // on the very frame the glance's closes. That is a SEQUENCE,
+            // not a cut: look away, yawn, melt. Nothing is shortened, and
+            // the cat's next pose is the yawn it was always going to play.
+            // Which of the two happens is arithmetic, so assert the
+            // arithmetic rather than accepting either.
+            let i = runs
+                .iter()
+                .position(|(p, ..)| *p == PetGlyphId::PetSit)
+                .expect("the dealt hand glances");
+            let back = runs
+                .iter()
+                .skip(i + 1)
+                .find(|(p, ..)| !seat_beat(*p))
+                .map(|(p, ..)| *p);
+            let sit_len = pet.loaf_after() - SIT_AFTER;
+            // `at` is absolute quiet; the sit's own clock runs from
+            // [`SIT_AFTER`].
+            let handover = pet.settle_seed.is_multiple_of(2)
+                && (at - SIT_AFTER) + pet.look_dur() >= sit_len - YAWN_DUR;
+            if handover {
+                handed += 1;
+                assert_eq!(
+                    back,
+                    Some(PetGlyphId::PetLoaf),
+                    "hand {seed}: the look hands into the yawn and melts"
+                );
+                assert!(
+                    runs.iter()
+                        .skip(i + 1)
+                        .any(|(p, ..)| *p == PetGlyphId::PetYawn),
+                    "hand {seed}: …and the yawn is what took the look over"
+                );
+            } else {
+                returned += 1;
+                assert_eq!(
+                    back,
+                    Some(PetGlyphId::PetSitFront),
+                    "hand {seed}: and the eyes come back"
+                );
+            }
+        }
+        assert_eq!(glanced, 8, "two hands in three glance ({glanced}/12)");
+        assert!(
+            returned >= 4,
+            "eye contact must come back on most hands ({returned}/8)"
+        );
+        assert!(
+            handed >= 1,
+            "…and the yawn's hand-over must be reachable, or this arm is dead ({handed}/8)"
+        );
+    }
+
+    /// The 2026-08-12 ruling, in the smallest place it could have been
+    /// broken: a glance costs the animal nothing, so it never turns the
+    /// body. The facing is the same on every frame of the look.
+    #[test]
+    fn the_glance_never_flips_the_body() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 12);
+        pet.force_seed(1);
+        let mut t = t;
+        let facing = pet.facing_left;
+        let mut looked = 0u32;
+        for _ in 0..130 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 14))));
+            assert_eq!(f.facing_left, facing, "the glance never turns the body");
+            if f.pose == PetGlyphId::PetSit {
+                looked += 1;
+            }
+        }
+        assert!(
+            looked >= 2,
+            "fixture: the glance actually played ({looked})"
+        );
+    }
+
+    /// THE HEAD TIPS toward the line the pet is NOT on. The ink ladder parks
+    /// the seat a row off the caret's own line; the head follows it up or
+    /// down from there, and sits level when they share a row.
+    #[test]
+    fn the_settled_gaze_follows_the_caret_row() {
+        let start = Instant::now();
+        for (caret_row, want) in [
+            (6u16, PetGlyphId::PetSitLookup),
+            (29u16, PetGlyphId::PetSitLookdown),
+        ] {
+            for species in [PetSpecies::Cat, PetSpecies::Dog] {
+                let mut pet = PetBrain::default();
+                pet.set_species(species);
+                let mut spans = vec![(0u16, 0u16); 30];
+                spans[caret_row as usize] = (0, 100);
+                pet.sense_ink(0, &spans, Some(caret_row));
+                let t = awake(&mut pet, start, caret_row, 97);
+                let (t, _) = idle(&mut pet, t, (caret_row, 99), 0.3);
+                // Hand 3: a silent tail and no yawn, so the leaf under the
+                // head tip is the plain sit.
+                pet.force_seed(3);
+                let (_, f) = idle(&mut pet, t, (caret_row, 99), 0.3);
+                assert_eq!(f.action, PetAction::Sit, "fixture: seated");
+                assert!(
+                    (f.row - f32::from(caret_row)).abs() > 0.5,
+                    "fixture: the ladder parked the seat off the caret's row ({})",
+                    f.row
+                );
+                assert_eq!(
+                    f.pose,
+                    species.skin(want),
+                    "the head tips toward the caret's line"
+                );
+            }
+        }
+        // Level with the caret: no tip at all.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 97);
+        let (t, _) = idle(&mut pet, t, (4, 99), 0.3);
+        pet.force_seed(3);
+        let (_, f) = idle(&mut pet, t, (4, 99), 0.3);
+        assert_eq!(f.pose, PetGlyphId::PetSit, "same row is no tip at all");
+    }
+
+    /// THE LOAF'S BEAT is the opposite of the seat's: its eyes are shut by
+    /// the art, so its dealt beat is a moment of them OPEN. It rides the
+    /// thump's own beat index, it stops with the loaf, and deep sleep is
+    /// still byte-stable behind it.
+    #[test]
+    fn the_loaf_peeks_then_sleeps() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = plain_seat(&mut pet, start, seed);
+            let (t, runs) = pose_runs(&mut pet, t, (4, 99), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+            let peeks: Vec<_> = runs
+                .iter()
+                .filter(|(p, ..)| *p == PetGlyphId::PetLoafOpen)
+                .collect();
+            assert!(!peeks.is_empty(), "hand {seed}: the loaf must peek");
+            for (_, at, ticks) in &peeks {
+                assert!(
+                    *at > pet.loaf_after() && *at < SLEEP_AFTER,
+                    "hand {seed}: a peek at quiet {at} is outside the loaf"
+                );
+                assert!(*ticks >= 2, "hand {seed}: a {ticks}-tick peek");
+            }
+            assert!(
+                !pet.needs_frames(),
+                "hand {seed}: the peek dies inside the settle window"
+            );
+            let a = pet.tick(sense(t + Duration::from_secs(1), Some((4, 99))));
+            let b = pet.tick(sense(t + Duration::from_secs(2), Some((4, 99))));
+            assert_eq!(a.fp(), b.fp(), "hand {seed}: deep sleep is byte-stable");
+        }
+    }
+
+    /// REDUCED MOTION: no beat at all — not the seat's, not the loaf's.
+    #[test]
+    fn reduced_motion_never_peeks() {
+        let mut pet = PetBrain::default();
+        let mut t = Instant::now();
+        let mut poses = std::collections::BTreeSet::new();
+        for k in 0..((SLEEP_AFTER + 4.0) / 0.016) as u32 {
+            t += Duration::from_millis(16);
+            // A minute of typing first, so the seated frame is reached at
+            // all, then the long quiet down to sleep.
+            let col = 20 + u16::try_from(k.min(60) / 6).unwrap_or(0);
+            let mut s = sense(t, Some((4, col)));
+            s.reduced_motion = true;
+            let f = pet.tick(s);
+            poses.insert(f.pose as u8);
+            assert_eq!(f.lift, 0.0);
+        }
+        assert_eq!(
+            poses,
+            [PetGlyphId::PetSit as u8, PetGlyphId::PetSleep0 as u8]
+                .into_iter()
+                .collect(),
+            "reduced motion has exactly two frames: seated and asleep"
+        );
+    }
+
+    /// THE FRAME-RATE LAW, on the whole idle: no pose the settle deals may
+    /// be a one-tick flash. Every run of every hand — the plain seat and
+    /// the face-on seat, from the arrival through the loaf, the washes and
+    /// the sleep — holds at least two ticks at 60 fps, and the pulse's ear
+    /// frame does too.
+    #[test]
+    fn every_dealt_idle_frame_holds_at_least_two_ticks() {
+        let start = Instant::now();
+        for seed in 0..12u8 {
+            for (label, caret, warm) in [
+                ("the plain seat", (4u16, 99u16), (4u16, 97u16)),
+                ("eye contact", (4, 14), (4, 12)),
+            ] {
+                let mut pet = PetBrain::default();
+                let t = awake(&mut pet, start, warm.0, warm.1);
+                pet.force_seed(seed);
+                let (mut t, runs) = pose_runs(&mut pet, t, caret, SLEEP_AFTER + 1.0);
+                // The last run is cut by the end of the drive, not by a beat.
+                for (pose, at, ticks) in runs.iter().take(runs.len() - 1) {
+                    assert!(
+                        *ticks >= 2,
+                        "hand {seed} ({label}): {pose:?} flashed for {ticks} tick(s) \
+                         at quiet {at}"
+                    );
+                }
+                // …and the same for the ear the pulse swaps in.
+                let (t2, f) = idle(&mut pet, t, caret, 0.1);
+                t = t2;
+                if !matches!(f.action, PetAction::Sleep | PetAction::Waking) {
+                    t += Duration::from_millis(16);
+                    pulse(&mut pet, t, caret);
+                    let (_, runs) = pose_runs(&mut pet, t, caret, TWITCH_DUR + 0.2);
+                    for (pose, at, ticks) in runs.iter().take(runs.len() - 1) {
+                        assert!(
+                            *ticks >= 2,
+                            "hand {seed} ({label}): the twitch flashed {pose:?} for \
+                             {ticks} tick(s) at quiet {at}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cat does not lick the same paw twice: the second wash of a settle
+    /// leads with the flank.
+    #[test]
+    fn consecutive_grooms_differ() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        // Hand 0 washes twice (`groom_skip` is a one-in-four hand).
+        let t = plain_seat(&mut pet, start, 0);
+        assert!(!pet.groom_skip(), "fixture: this hand washes twice");
+        let (_, runs) = pose_runs(&mut pet, t, (4, 99), SLEEP_AFTER);
+        let washes: Vec<Vec<PetGlyphId>> = runs
+            .split(|(p, ..)| !matches!(p, PetGlyphId::PetGroom | PetGlyphId::PetGroomFlank))
+            .filter(|w| !w.is_empty())
+            .map(|w| w.iter().map(|(p, ..)| *p).collect())
+            .collect();
+        assert!(washes.len() >= 2, "the settle washes twice: {washes:?}");
+        assert_eq!(
+            washes[0],
+            vec![PetGlyphId::PetGroom, PetGlyphId::PetGroomFlank],
+            "the first wash goes chest then flank"
+        );
+        assert_eq!(
+            washes[1],
+            vec![PetGlyphId::PetGroomFlank, PetGlyphId::PetGroom],
+            "and the second the other way round"
+        );
+    }
+
+    /// The OWED groom — post-chase dignity — is always the paw lick: it is a
+    /// one-shot off the settle's cycle, and the gesture it is pretending
+    /// with is the chest wash.
+    #[test]
+    fn the_owed_groom_is_the_paw_lick() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        let base = pet.col + 12.0;
+        let mut phase = 0.0f32;
+        let mut owed = 0u32;
+        let check = |pet: &PetBrain, f: PetFrame, owed: &mut u32| {
+            if f.action == PetAction::Groom && pet.groom_owed {
+                assert_eq!(
+                    f.pose,
+                    PetGlyphId::PetGroom,
+                    "the groom of dignity is the paw lick"
+                );
+                *owed += 1;
+            }
+        };
+        for _ in 0..700 {
+            t += Duration::from_millis(16);
+            phase += 0.04;
+            let px = base + 8.0 * phase.sin();
+            let f = ptick(&mut pet, t, (4, 44), Some((px, 4.0)));
+            check(&pet, f, &mut owed);
+        }
+        for _ in 0..500 {
+            t += Duration::from_millis(16);
+            let f = ptick(&mut pet, t, (4, 44), None);
+            check(&pet, f, &mut owed);
+        }
+        assert!(owed >= 2, "the break-off owes a groom ({owed} frames)");
+    }
+
+    // ── the NEW-LINE harness ────────────────────────────────────────────
     //
     // Drives the real brain at 60 fps through every caret shape a new line
-    // takes and PRINTS what the pet did: each flight the brain launched,
+    // takes and records what the pet did: each flight the brain launched,
     // attributed to the code path that launched it; the action sequence with
     // timestamps; the largest single-frame displacement; and how long until
-    // the cat is settled again. Nothing is asserted — later waves re-run it
-    // to show their numbers moved. Run with:
-    //   targo --unverified test -p aterm-effects --lib \
-    //     kitty_pet::tests::probe_newline_scenarios -- --ignored --nocapture
+    // the cat is settled again.
+    //
+    // It is a HARNESS, not a test. Its one consumer is
+    // `every_new_line_reaction_is_lawful_and_brief`, which JUDGES what it
+    // records against the definition of done. There was also an `#[ignore]`d
+    // twin that only PRINTED the same numbers for a human; it is deleted,
+    // because a sweep that asserts strictly more than the printer showed
+    // makes the printer a second thing to keep true for no coverage — and an
+    // ignored test is a test nobody runs. To read the numbers, run the sweep
+    // itself with `--nocapture`; it names every scenario it judges.
 
     /// One 60 fps frame.
     const PROBE_FRAME: Duration = Duration::from_micros(16_667);
     const PROBE_ROWS: u16 = 24;
+    /// STILL, for the travel reading: a frame that moves the body less than
+    /// a tenth of a cell has not travelled. Arbitrary but chosen once and
+    /// for a reason — at a 10 px cell that is ONE PIXEL, the smallest step
+    /// glass can show — and the settled reading is printed beside it, so
+    /// the question is answered rather than replaced.
+    const PROBE_STILL: f32 = 0.1;
 
     /// One flight, as the probe saw it launch.
     #[derive(Clone, Copy, Debug)]
+    #[allow(dead_code)]
     struct ProbeFlight {
         /// Seconds from the probe's epoch.
         at: f32,
@@ -12347,10 +20703,15 @@ mod tests {
         dur: f32,
         arc: f32,
         big: bool,
+        /// A CHOSEN jump: the flight left from the big door's gather
+        /// (`big_gather`), or is the second bound of one. Upstream carries no
+        /// `Flight::show` flag, so the probe reads the door instead.
+        show: bool,
     }
 
     /// The probe's world: a `cols`×24 pane at 10×20 px cells, an ink map the
     /// scenario paints by hand, and the recorder.
+    #[allow(dead_code)]
     struct Probe {
         pet: PetBrain,
         t: Instant,
@@ -12372,11 +20733,65 @@ mod tests {
         settled_since: Option<f32>,
         settle_at: Option<f32>,
         settle_where: (f32, f32, PetAction),
+        /// Judge every frame through [`lawful_tick`] (the sweep test) instead
+        /// of merely recording it (the ruler).
+        judge: bool,
+        /// The frame: the ruler's exact 60 fps, or the law's 16 ms.
+        frame_dur: Duration,
+        law: (f32, f32, u16, u16),
+        /// A dust puff was seen since the trigger.
+        dust: bool,
+        /// Airborne episodes (Leap onsets) since the trigger.
+        episodes: u32,
+        /// The LAST touchdown (a Leap ending) since the trigger, seconds
+        /// from the trigger.
+        touchdown: Option<f32>,
+        /// The butt-wiggle (the chosen show's gather) was worn since the
+        /// trigger.
+        wiggle: bool,
+        /// Every frame since the trigger, with its time from the trigger.
+        trace: Vec<(f32, PetFrame)>,
+        /// `needs_frames()` held on every frame since the trigger.
+        needs_always: bool,
+        /// HOME: the last frame of the REACTION (before the pet settles)
+        /// whose column moved more than [`PROBE_STILL`] — i.e. when the
+        /// TRAVEL ended, as against when the settle ladder's pose was
+        /// reached. Seconds from the trigger. See `report`.
+        ///
+        /// WHAT IT FOUND, worth writing down because it is the reason the
+        /// two readings still coincide on the at-rest scenarios: a big
+        /// landing's recovery slides the body under [`PROBE_STILL`] within
+        /// two frames of touchdown (S6, measured: 3.800 → 3.675 → 3.569 →
+        /// … → 3.095 over [`BIG_LAND_DUR`], i.e. 0.48, 0.13, 0.11 and then
+        /// nothing), so the travel really is over ~0.4 s before the settled
+        /// pose. But the frame that LEAVES the landing pops the column back
+        /// 0.20 cells in one frame (3.095 → 3.203) — the skid slid past the
+        /// station and the settle snaps it home. Well inside the per-frame
+        /// law, invisible to every existing test, and two pixels at a 10 px
+        /// cell; recorded here rather than fixed, because it wants its own
+        /// measurement of the skid's landing target rather than a nudge.
+        home_at: Option<f32>,
     }
 
+    #[allow(dead_code)]
     impl Probe {
         fn new(cols: u16) -> Self {
-            let t0 = Instant::now();
+            Self::at(cols, Instant::now())
+        }
+
+        /// A JUDGED probe: every frame through [`lawful_tick`], on that
+        /// law's own 16 ms frame (the ruler's 16.667 ms frame would read 4 %
+        /// over the law's per-frame budget on every lawful arc).
+        fn judged(cols: u16) -> Self {
+            let mut p = Self::new(cols);
+            p.judge = true;
+            p.frame_dur = Duration::from_millis(16);
+            p
+        }
+
+        /// A probe on a given epoch — two probes on one epoch replay one
+        /// script tick for tick.
+        fn at(cols: u16, t0: Instant) -> Self {
             Self {
                 pet: PetBrain::default(),
                 t: t0,
@@ -12395,7 +20810,32 @@ mod tests {
                 settled_since: None,
                 settle_at: None,
                 settle_where: (0.0, 0.0, PetAction::Sit),
+                judge: false,
+                frame_dur: PROBE_FRAME,
+                law: (0.0, 0.0, cols, PROBE_ROWS),
+                dust: false,
+                episodes: 0,
+                touchdown: None,
+                wiggle: false,
+                trace: Vec::new(),
+                needs_always: true,
+                home_at: None,
             }
+        }
+
+        /// Onsets of `a` since the trigger.
+        fn onsets(&self, a: PetAction) -> usize {
+            let tr = self.trigger.unwrap_or(f32::MAX);
+            self.actions
+                .iter()
+                .filter(|(at, x)| *at >= tr && *x == a)
+                .count()
+        }
+
+        /// The flights launched since the trigger.
+        fn launches(&self) -> Vec<&ProbeFlight> {
+            let tr = self.trigger.unwrap_or(f32::MAX);
+            self.flights.iter().filter(|f| f.at >= tr).collect()
         }
 
         fn now(&self) -> f32 {
@@ -12419,48 +20859,112 @@ mod tests {
             self.trigger = Some(self.now());
             self.at_trigger = self.last;
             self.max_dcol = (0.0, 0.0, PetAction::Sit);
+            self.home_at = None;
             self.max_drow = (0.0, 0.0, PetAction::Sit);
             self.settled_since = None;
             self.settle_at = None;
+            self.dust = false;
+            self.episodes = 0;
+            self.touchdown = None;
+            self.wiggle = false;
+            self.trace.clear();
+            self.needs_always = true;
+        }
+
+        /// Seconds from the trigger to the last touchdown — the paws are
+        /// down and stay down (`None` if nothing flew, or it is still up).
+        fn grounded_at(&self) -> Option<f32> {
+            if self.pet.flight.is_some() {
+                return None;
+            }
+            self.touchdown
         }
 
         /// One 60 fps frame with the caret at `caret`, recorded.
         fn frame(&mut self, caret: Option<(u16, u16)>) -> PetFrame {
-            self.t += PROBE_FRAME;
+            let s = self.sense_at(caret);
+            self.frame_with(s, caret)
+        }
+
+        /// One frame carrying THE EMULATOR'S WRAP FACT ([`PetSense::wrapped`]):
+        /// a real margin wrap happened on this frame and on no other. Only the
+        /// typed wrap (S4), the scrolled wrap (S5) and the log's seam frames
+        /// (S12/S12b) get it — an Enter, a prompt redraw or the shell's own
+        /// new line after a short command never do, which is the point of
+        /// measuring them separately.
+        fn frame_wrapped(&mut self, caret: Option<(u16, u16)>) -> PetFrame {
+            let mut s = self.sense_at(caret);
+            s.wrapped = true;
+            self.frame_with(s, caret)
+        }
+
+        /// One 60 fps frame with a hand-built sense (its `now` is
+        /// overwritten with the probe's clock), recorded.
+        fn frame_with(&mut self, mut s: PetSense, caret: Option<(u16, u16)>) -> PetFrame {
+            self.t += self.frame_dur;
             let now = self.now();
+            s.now = self.t;
             self.pet.sense_ink(0, &self.spans, self.live);
             let w = art_cols(10, 20);
             let pre_action = self.pet.action;
             let pre_hop = self.pet.hop_crouch;
+            let pre_gather = self.pet.big_gather;
             let pre_bound2 = self.pet.bound2.is_some();
             let pre_wall = self.pet.pending_wall_transit;
             let pre_play = self.pet.play_to.is_some();
             let pre_resume = self.pet.resume.is_some();
             let pre_flight = self.pet.flight;
-            let s = self.sense_at(caret);
-            let f = self.pet.tick(s);
+            let pre_on_ink = self.pet.ink_overlaps(self.pet.col, self.pet.row, w);
+            if self.last.is_none() {
+                // The seed frame is exempt from the per-frame law (nothing
+                // was on the glass to move); it seeds the judge instead.
+                let f = self.pet.tick(s);
+                self.law = (f.col, f.row, self.cols, PROBE_ROWS);
+                self.last = Some(f);
+                return f;
+            }
+            let f = if self.judge {
+                lawful_tick(&mut self.pet, s, &mut self.law)
+            } else {
+                let f = self.pet.tick(s);
+                self.law = (f.col, f.row, self.cols, PROBE_ROWS);
+                f
+            };
 
             // A NEW flight (none was live) or the one mid-air re-aim.
             if let Some(fl) = self.pet.flight {
                 let launched = pre_flight.is_none();
                 let reaimed = pre_flight.is_some_and(|p| (p.to_col - fl.to_col).abs() > 1e-6);
                 if (launched || reaimed) && now >= self.log_from {
+                    // Attributed to the DOOR that opened the flight; the
+                    // tier (hop or bound) is the `big` column.
                     let site = if reaimed {
-                        "mid-air re-aim (:3044 rebase)"
+                        "mid-air re-aim (rebase)"
+                    } else if fl.drop {
+                        "sleeper's drop (Waking + pending_drop)"
                     } else if fl.big && pre_action == PetAction::Land && pre_bound2 {
-                        "big bound 2 (:3109 bound2 -> begin_big_arc)"
+                        "bound 2 (bound2 -> begin_big_arc)"
+                    } else if pre_action == PetAction::Crouch && pre_gather {
+                        "big door (big_gather -> launch_big)"
                     } else if fl.big {
-                        "big bound (:3184 launch_big)"
+                        "big bound (launch_big)"
                     } else if pre_action == PetAction::Crouch && pre_hop {
-                        "row hop (:3407 hop_crouch -> :3193 begin_flight vertical)"
+                        "row hop door (hop_crouch -> begin_flight vertical)"
                     } else if pre_action == PetAction::Crouch && pre_play {
-                        "play (:3287)"
+                        "play (Crouch -> launch)"
                     } else if pre_action == PetAction::Crouch {
-                        "pounce (:3444 Crouch -> :3301 launch)"
+                        "pounce door (Crouch -> launch)"
                     } else if self.pet.resume.is_some() && !pre_resume {
-                        "ink re-anchor (:2912 begin_arc, flight_shape vertical)"
+                        "ink re-anchor (begin_arc, flight_shape vertical)"
+                    } else if pre_on_ink
+                        && matches!(
+                            pre_action,
+                            PetAction::Startle | PetAction::Frolic | PetAction::Perk
+                        )
+                    {
+                        "ink re-anchor (vertical; reaction consumed)"
                     } else if pre_wall {
-                        "wall transit (:3423 begin_arc WALL_HOP_DUR)"
+                        "wall transit (WALL_HOP_DUR arc, span-capped)"
                     } else {
                         "unknown"
                     };
@@ -12474,21 +20978,49 @@ mod tests {
                         dur: fl.dur,
                         arc: fl.arc,
                         big: fl.big,
+                        show: fl.show,
                     });
                 }
             }
             if now >= self.log_from && self.last.is_none_or(|l| l.action != f.action) {
                 self.actions.push((now, f.action));
             }
-            if let (Some(l), Some(_)) = (self.last, self.trigger) {
+            if let (Some(l), Some(tr)) = (self.last, self.trigger) {
                 let dc = (f.col - l.col).abs();
                 let dr = (f.row - l.row).abs();
                 if dc > self.max_dcol.0 {
                     self.max_dcol = (dc, now, f.action);
                 }
+                // The REACTION's travel only: once the pet is first inside
+                // its settle band, a later column move is the ordinary chase
+                // after a caret that kept typing, and that is not what the
+                // bar is about. (`settled_since`, not `settle_at` — the
+                // latter is only stamped after half a second of confirmation
+                // and the chase runs on through it.)
+                if dc > PROBE_STILL && self.settled_since.is_none() {
+                    self.home_at = Some(now - tr);
+                }
                 if dr > self.max_drow.0 {
                     self.max_drow = (dr, now, f.action);
                 }
+                if f.action == PetAction::Leap && l.action != PetAction::Leap {
+                    self.episodes += 1;
+                }
+                if f.action != PetAction::Leap && l.action == PetAction::Leap {
+                    self.touchdown = Some(now - tr);
+                }
+                if f.motes
+                    .iter()
+                    .flatten()
+                    .any(|m| m.kind == PetMoteKind::Dust)
+                {
+                    self.dust = true;
+                }
+                if f.pose == PetGlyphId::PetCrouchWiggle {
+                    self.wiggle = true;
+                }
+                self.trace.push((now - tr, f));
+                self.needs_always &= self.pet.needs_frames();
             }
             if self.trigger.is_some() && self.settle_at.is_none() {
                 let ok = caret.is_some_and(|c| {
@@ -12519,11 +21051,83 @@ mod tests {
         }
 
         fn hold(&mut self, caret: Option<(u16, u16)>, secs: f32) {
-            // Frames, not seconds: 60 fps is the host's cadence.
-            let n = (secs * 60.0).round();
+            // Frames, not seconds: the probe's own cadence (the host's 60
+            // fps, or the law's 16 ms when judged).
+            let n = (secs / self.frame_dur.as_secs_f32()).round();
             assert!((0.0..1e6).contains(&n), "probe: bad hold {secs}");
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             self.hold_frames(caret, n as u32);
+        }
+
+        /// A WRAPPING LOG on the last row for `frames` frames: every frame
+        /// the caret alternates between the end of a full line `(last, cols-1)`
+        /// (the row inked to it, the previous line scrolled up into the row
+        /// above) and the start of the next `(last, 0)` (the row blank) —
+        /// the b09x build log, faster than the frame rate. `burst` drives
+        /// `output_burst` too. The frames that land on col 0 are the ones the
+        /// emulator really wrapped on, so those and only those carry
+        /// [`PetSense::wrapped`].
+        fn log(&mut self, frames: u32, burst: bool) {
+            self.log_rows(frames, burst, true);
+        }
+
+        /// [`Self::log`], with the row ABOVE the last row inked (`above`) —
+        /// the scrolled previous line — or left blank (the ladder's rule 3
+        /// then seats the cat on it).
+        fn log_rows(&mut self, frames: u32, burst: bool, above: bool) {
+            let last = PROBE_ROWS - 1;
+            for k in 0..frames {
+                let at_end = k % 2 == 0;
+                if above {
+                    self.ink(last - 1, 0, self.cols);
+                }
+                if at_end {
+                    self.ink(last, 0, self.cols - 1);
+                } else {
+                    self.ink(last, 0, 0);
+                }
+                self.live = Some(last);
+                let caret = if at_end {
+                    (last, self.cols - 1)
+                } else {
+                    (last, 0)
+                };
+                let mut s = self.sense_at(Some(caret));
+                s.output_burst = burst;
+                // The seam frame — the caret came home to column 0 because
+                // the line wrapped and the pane scrolled.
+                s.wrapped = !at_end;
+                let _ = self.frame_with(s, Some(caret));
+            }
+        }
+
+        /// A wrapping log whose caret the host COALESCES: `cps` characters
+        /// a second onto `cols`-wide lines, sampled once a frame, so the
+        /// caret lands mid-line at an arbitrary column each frame (the
+        /// realistic `cat bigfile` shape: same-row jumps both ways, a wrap
+        /// shape only when a line boundary happens to fall on a frame).
+        /// `wrapped` is the emulator's truth here too: true on exactly the
+        /// frames where the running character count crossed a line boundary.
+        fn log_coalesced(&mut self, frames: u32, cps: f32, burst: bool) {
+            let last = PROBE_ROWS - 1;
+            let mut pos = 0.0f32;
+            for _ in 0..frames {
+                let was = pos;
+                pos += cps * self.frame_dur.as_secs_f32();
+                let width = f32::from(self.cols);
+                let wrapped = (pos / width).floor() > (was / width).floor();
+                let col = (pos % width).floor();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let col = (col.clamp(0.0, width - 1.0)) as u16;
+                self.ink(last - 1, 0, self.cols);
+                self.ink(last, 0, col);
+                self.live = Some(last);
+                let caret = (last, col);
+                let mut s = self.sense_at(Some(caret));
+                s.output_burst = burst;
+                s.wrapped = wrapped;
+                let _ = self.frame_with(s, Some(caret));
+            }
         }
 
         /// Type from `(row, from)` to `(row, to)`: one caret move per 100 ms
@@ -12573,7 +21177,7 @@ mod tests {
             for fl in &self.flights {
                 let span = (fl.to_col - fl.from_col).abs();
                 println!(
-                    "   flight @{:+.2}s [{}] ({:.2},r{:.0})->({:.2},r{:.0}) span={:.1} dur={:.3}s speed={:.1} c/s vspeed={:.1} r/s arc={:.2} big={}",
+                    "   flight @{:+.2}s [{}] ({:.2},r{:.0})->({:.2},r{:.0}) span={:.1} dur={:.3}s speed={:.1} c/s vspeed={:.1} r/s arc={:.2} big={} show={}",
                     fl.at - tr,
                     fl.site,
                     fl.from_col,
@@ -12585,7 +21189,8 @@ mod tests {
                     span / fl.dur,
                     (fl.to_row - fl.from_row).abs() / fl.dur,
                     fl.arc,
-                    fl.big
+                    fl.big,
+                    fl.show
                 );
             }
             println!(
@@ -12596,6 +21201,24 @@ mod tests {
                 self.max_drow.0,
                 self.max_drow.1 - tr,
                 self.max_drow.2
+            );
+            println!(
+                "   airborne episodes={} dust={} wiggle={} last touchdown={} stream={} \
+                 stream_run={} watch_heat={:.2}",
+                self.episodes,
+                self.dust,
+                self.wiggle,
+                self.touchdown
+                    .map_or("none".to_string(), |t| format!("{t:+.2}s")),
+                self.pet.stream,
+                self.pet.stream_run,
+                self.pet.watch_heat
+            );
+            println!(
+                "   home (travel over) {} — the settled reading below adds the \
+                 in-place landing recovery",
+                self.home_at
+                    .map_or("never moved".to_string(), |t| format!("{t:+.2}s"))
             );
             match self.settle_at {
                 Some(s) => println!(
@@ -12610,178 +21233,609 @@ mod tests {
         }
     }
 
+    // ── the variety wave's close: the seat's door, the purr's split, the
+    //    apex, and the two refusals it measured ──────────────────────────
+
+    /// THE LOOK IS THE WHOLE DOOR, and every side-on beat comes through it.
+    ///
+    /// A door was already here — the glance swaps the face-on frame for the
+    /// side-on `PetSit`, which is the ground these beats are drawn on — and
+    /// it was not enough, which was MEASURED: over 368 506 frames of five
+    /// realistic session shapes the tail's three frames, the yawn and both
+    /// ear frames registered ZERO onsets across the four ordinary sessions
+    /// while the wall-side control (`sit_front` false on 0.0 % of settled
+    /// frames) fired them 240 times in under seven minutes. Each was ALSO
+    /// phased shut behind the door, and each now has its own answer: the
+    /// tail deals off the glance's own clock face-on
+    /// ([`PetBrain::sit_tail`]), the yawn opens a look of its own
+    /// ([`PetBrain::sit_look`]), and the ear frame comes through the blink's
+    /// fit rule ([`PetBrain::side_on_holds`]).
+    ///
+    /// This test is the reachability claim itself: in the seat a working
+    /// developer actually has — face-on, the station one cell past the
+    /// caret — every one of those frames must appear.
     #[test]
-    #[ignore = "a ruler, not a law: run by hand with --ignored --nocapture"]
-    fn probe_newline_scenarios() {
-        // 1–3: Enter from col 10 / 40 / 78, settled first and mid-typing.
-        // The shell prints "$ " on the next row; the caret lands at (7, 2).
-        for (n, col0, label) in [
-            (1, 10u16, "col 10"),
-            (2, 40, "col 40"),
-            (3, 78, "col 78 (wall side)"),
-        ] {
-            for settled in [true, false] {
-                let mut p = Probe::new(80);
-                p.warm(6, col0);
-                if settled {
-                    p.hold(Some((6, col0)), 2.5);
+    fn the_seats_side_on_beats_come_through_the_look() {
+        let start = Instant::now();
+        let mut beats: Vec<PetGlyphId> = Vec::new();
+        /// Every seat beat in a pose walk, checked against the frame-rate
+        /// law on the way past.
+        fn collect(runs: &[(PetGlyphId, f32, u32)], seed: u8, beats: &mut Vec<PetGlyphId>) {
+            for (pose, _, ticks) in runs {
+                if seat_beat(*pose) && *pose != PetGlyphId::PetSit {
+                    assert!(
+                        *ticks >= 2,
+                        "hand {seed}: {pose:?} held {ticks} tick(s) — the frame-rate law"
+                    );
+                    if !beats.contains(pose) {
+                        beats.push(*pose);
+                    }
                 }
-                p.mark();
-                p.ink(7, 0, 2);
-                p.live = Some(7);
-                let _ = p.frame(Some((7, 2)));
-                p.hold(Some((7, 2)), 5.0);
-                let variant = if settled {
-                    "settled first"
+            }
+        }
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 4);
+            let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
+            let (t, f) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.05);
+            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
+            assert!(pet.sit_front, "fixture: the ordinary face-on seat");
+            pet.force_seed(seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 36), 3.4);
+            collect(&runs, seed, &mut beats);
+        }
+        // …and the EAR, whose trigger is a background line rather than the
+        // sit's own clock, so WHERE in the look it lands is the variable.
+        // A twitch that would be cut by the tail's excursion, or that would
+        // strand the blink behind it, keeps the procedural bob instead —
+        // so sweep the arrival time rather than asserting one.
+        for seed in 0..12u8 {
+            for step in 0..18u16 {
+                // Two fixtures, because `twitch_up` alternates on the mote
+                // serial and a single history pins its parity: one cat that
+                // has only just woken, one that has been following a line
+                // of typing. Both are the ordinary face-on seat.
+                let worked = step % 2 == 1;
+                let mut pet = PetBrain::default();
+                let t = awake(&mut pet, start, 4, 4);
+                let (t, caret) = if worked {
+                    let (t, _) = type_run(&mut pet, t, 4, 6, 30, 0.05);
+                    let (t, _) = idle(&mut pet, t, (4, 36), SIT_AFTER + 0.05);
+                    (t, (4u16, 36u16))
                 } else {
-                    "mid-typing"
+                    let (t, _) = idle(&mut pet, t, (4, 6), 0.05);
+                    (t, (4u16, 6u16))
                 };
-                p.report(
-                    &format!(
-                        "S{n}{} Enter from {label}, {variant}",
-                        if settled { "a" } else { "b" }
-                    ),
-                    &format!("80x24; row 6 ink 0..{col0}; Enter -> (7,2), row 7 ink 0..2"),
+                let (caret_row, caret_col) = caret;
+                let (row, col) = (caret_row, caret_col);
+                assert!(pet.sit_front, "fixture: face-on");
+                pet.force_seed(seed);
+                // Place the background line at a chosen point of the sit's
+                // own clock rather than after a fixed walk: the admissible
+                // window is bounded below by the tail's excursion and above
+                // by the look's remaining time, and it moves with the hand.
+                let want = SIT_AFTER + 0.80 + f32::from(step) * 0.05;
+                let lead = (want - pet.quiet).max(0.0);
+                let (t, _) = idle(&mut pet, t, (row, col), lead);
+                let mut t = t;
+                // TWO lines, because arming the twitch spends a mote serial
+                // and `twitch_up` reads its parity — so a second background
+                // line flicks the OTHER ear. (That alternation has its own
+                // test, `the_ear_that_flicks_alternates_by_serial`; here it
+                // is what makes both authored frames reachable face-on.)
+                //
+                // Driven by hand rather than through `pose_runs`, because
+                // the ear frame begins on the very tick after the burst and
+                // a walk boundary there would clip the run this test is
+                // measuring.
+                let mut runs: Vec<(PetGlyphId, f32, u32)> = Vec::new();
+                for _round in 0..4 {
+                    for i in 0..13 {
+                        t += Duration::from_millis(16);
+                        let mut sn = sense(t, Some((row, col)));
+                        sn.output_burst = i == 0;
+                        let f = pet.tick(sn);
+                        match runs.last_mut() {
+                            Some(r) if r.0 == f.pose => r.2 += 1,
+                            _ => runs.push((f.pose, pet.quiet, 1)),
+                        }
+                    }
+                }
+                // The first and last runs are clipped by the walk's own
+                // ends, not by the brain, so their tick counts are harness
+                // artefacts rather than beat lengths — the frame-rate law
+                // is checked on the continuous walk above.
+                let inner = runs.len().saturating_sub(1);
+                collect(runs.get(1..inner).unwrap_or(&[]), seed, &mut beats);
+            }
+        }
+        for want in [
+            PetGlyphId::PetSitBlink,
+            PetGlyphId::PetSitFlick,
+            PetGlyphId::PetSitTailBack,
+            PetGlyphId::PetSitTailLow,
+            PetGlyphId::PetYawn,
+            PetGlyphId::PetSitEar,
+            PetGlyphId::PetSitEarFar,
+        ] {
+            assert!(
+                beats.contains(&want),
+                "{want:?} must be reachable in the seat a cat that types has: {beats:?}"
+            );
+        }
+    }
+
+    /// NO SIDE-ON BEAT IS EVER CUT BY THE LOOK. The door's whole design is
+    /// that a gesture the look cannot CONTAIN never starts — a tail
+    /// excursion clipped at the moment eye contact returns would put the
+    /// tail on the other side of the cat between two frames, which is the
+    /// teleport this wave exists to remove. So face-on, every run of a
+    /// tail frame must be the authored length of the hand it belongs to,
+    /// never a prefix of it.
+    #[test]
+    fn no_seat_beat_is_ever_cut_by_the_look() {
+        let start = Instant::now();
+        let mut checked = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 4);
+            let (t, f) = idle(&mut pet, t, (4, 6), 0.05);
+            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
+            assert!(pet.sit_front, "fixture: face-on");
+            pet.force_seed(seed);
+            if pet.beat_deal(0, 3) == 0 {
+                continue; // this hand never looks away; nothing to cut
+            }
+            let hand = pet.beat_deal(0, 4);
+            let want = PetBrain::tail_hand_len(hand);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 6), 3.0);
+            // The whole excursion, from its first tail frame to its last.
+            let first = runs.iter().position(|(p, ..)| tail_frame(*p));
+            let Some(first) = first else {
+                // A hand the look cannot hold, or the silent hand: nothing
+                // may have played at all, and that is the point of the fit.
+                assert!(
+                    hand == 3 || want > pet.look_dur(),
+                    "hand {seed} (deal {hand}, {want} s) fits the {} s look and must play",
+                    pet.look_dur()
+                );
+                continue;
+            };
+            let last = runs
+                .iter()
+                .rposition(|(p, ..)| tail_frame(*p))
+                .expect("a first implies a last");
+            let ticks: u32 = runs[first..=last].iter().map(|(_, _, n)| *n).sum();
+            let secs = f32::from(u16::try_from(ticks).expect("short run")) * 0.016;
+            assert!(
+                (secs - want).abs() < 0.05,
+                "hand {seed} (deal {hand}): the excursion ran {secs:.3} s of its authored \
+                 {want:.3} s — a prefix is a cut"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "the fit must admit several hands or this proves nothing ({checked}/12)"
+        );
+    }
+
+    /// THE LONG LOOK IS ONLY DEALT TO A SEAT THAT CAN HOLD IT. The tail's
+    /// swing runs `7 · TAIL_SWING` = 0.77 s, longer than [`LOOK_DUR`], so
+    /// the seat's biggest gesture needs [`LOOK_DUR_LONG`] to come through
+    /// the door at all — and a look the sit cannot fit would either be cut
+    /// by the melt or leave no eye contact between it and the yawn. The
+    /// deal is therefore the arithmetic and not a hand.
+    #[test]
+    fn the_long_look_is_only_dealt_to_a_seat_that_can_hold_it() {
+        let mut long = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            pet.force_seed(seed);
+            let sit_len = pet.loaf_after() - SIT_AFTER;
+            let len = pet.look_dur();
+            if pet.beat_deal(0, 3) == 0 {
+                // The 1.4 s seat never glances at all — the deal and the
+                // period share `seed % 3`, so `beat_deal(0, 3)` is zero
+                // exactly on the hand whose sit is too short to hold a look.
+                assert_eq!(len, LOOK_DUR, "hand {seed}: and it keeps the short look");
+                assert!(sit_len < GLANCE_AT + LOOK_DUR + LOOK_RETURN_MIN);
+                continue;
+            }
+            assert!(
+                GLANCE_AT + len + LOOK_RETURN_MIN <= sit_len + 1e-6,
+                "hand {seed}: a {len} s look opening at {GLANCE_AT} leaves no return \
+                 inside a {sit_len} s sit"
+            );
+            if len == LOOK_DUR_LONG {
+                long += 1;
+                assert!(
+                    7.0 * TAIL_SWING <= len,
+                    "hand {seed}: the long look exists to hold the swing"
                 );
             }
         }
+        assert_eq!(long, 8, "two hands in three get the long look ({long}/12)");
+    }
 
-        // 4: the typed margin wrap — the caret falls off the right margin
-        // onto the next row and typing carries on there.
-        for cols in [80u16, 200] {
-            let mut p = Probe::new(cols);
-            p.warm(6, cols - 1);
-            p.mark();
-            p.live = Some(7);
-            p.ink(7, 0, 0);
-            let _ = p.frame(Some((7, 0)));
-            p.hold_frames(Some((7, 0)), 5);
-            p.type_to(7, 0, 5);
-            p.hold(Some((7, 5)), 4.0);
-            p.report(
-                &format!("S4 typed margin wrap, cols={cols}"),
-                &format!(
-                    "{cols}x24; typed to (6,{}); wrap -> (7,0), then (7,1)..(7,5) at 100 ms",
-                    cols - 1
-                ),
+    /// THE FACE-ON SEAT HAS ITS OWN BLINK. `pet_sit_front` is the most-worn
+    /// awake frame in the roster — measured, 9.0 % of every frame and 88.8 %
+    /// of settled frames — and the side-on `PetSitBlink` is drawn on the
+    /// side-on seat, so before `pet_sit_front_blink` the only way for a
+    /// face-on cat to break eye contact was to look away.
+    #[test]
+    fn the_face_on_seat_blinks_without_looking_away() {
+        let start = Instant::now();
+        let mut blinked = 0u32;
+        for seed in 0..12u8 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 4);
+            let (t, f) = idle(&mut pet, t, (4, 6), 0.05);
+            assert_eq!(f.action, PetAction::Sit, "fixture: seated");
+            assert!(pet.sit_front, "fixture: face-on");
+            pet.force_seed(seed);
+            let (_, runs) = pose_runs(&mut pet, t, (4, 6), 3.0);
+            let Some((_, _, ticks)) = runs
+                .iter()
+                .find(|(p, ..)| *p == PetGlyphId::PetSitFrontBlink)
+            else {
+                continue;
+            };
+            assert!(
+                *ticks >= 2,
+                "hand {seed}: a {ticks}-tick blink is under the frame-rate law"
             );
+            blinked += 1;
         }
+        // The FOUR hands in twelve that never look away: on the other
+        // eight the sit's one blink beat falls inside the look, so the
+        // side-on `PetSitBlink` plays there instead — which is the same
+        // gesture on the ground the cat is already wearing.
+        assert_eq!(
+            blinked, 4,
+            "the face-on seat blinks on every hand that keeps eye contact ({blinked}/12)"
+        );
 
-        // 5: the scrolled wrap on the LAST row: the caret comes back to col 0
-        // on the SAME row (23) and the line it left scrolls up to row 22.
-        {
-            let mut p = Probe::new(80);
-            p.warm(23, 79);
-            p.mark();
-            p.ink(22, 0, 80);
-            p.ink(23, 0, 0);
-            p.live = Some(23);
-            let _ = p.frame(Some((23, 0)));
-            p.hold_frames(Some((23, 0)), 5);
-            p.type_to(23, 0, 5);
-            p.hold(Some((23, 5)), 4.0);
-            p.report(
-                "S5 scrolled wrap on the last row",
-                "80x24; typed to (23,79); wrap -> (23,0) with row 22 = 0..80, then (23,1)..(23,5)",
-            );
-        }
-
-        // 6: the prompt redraw — ONE frame of hidden caret, then (7,2).
-        {
-            let mut p = Probe::new(80);
-            p.warm(6, 40);
-            p.hold(Some((6, 40)), 2.5);
-            p.mark();
-            let _ = p.frame(None);
-            p.ink(7, 0, 2);
-            p.live = Some(7);
-            let _ = p.frame(Some((7, 2)));
-            p.hold(Some((7, 2)), 5.0);
-            p.report(
-                "S6 prompt redraw (one None frame) from col 40",
-                "80x24; settled at (6,40); caret None for 1 frame; then (7,2) with row 7 ink 0..2",
-            );
-        }
-
-        // 7: Enter while asleep.
-        {
-            let mut p = Probe::new(80);
-            p.warm(6, 30);
-            p.hold(Some((6, 30)), 25.0);
-            p.mark();
-            p.ink(7, 0, 2);
-            p.live = Some(7);
-            let _ = p.frame(Some((7, 2)));
-            p.hold(Some((7, 2)), 5.0);
-            p.report(
-                "S7 Enter while asleep from col 30",
-                "80x24; 25 s quiet at (6,30); Enter -> (7,2), row 7 ink 0..2",
-            );
-        }
-
-        // 8: a three-line prompt.
-        {
-            let mut p = Probe::new(80);
-            p.warm(6, 30);
-            p.hold(Some((6, 30)), 2.5);
-            p.mark();
-            for r in 7..=9 {
-                p.ink(r, 0, 2);
+        // …AND IT NEEDS NO GLANCE. The old rule admitted the lids face-on
+        // only inside a look that outlasted them, because the lids had no
+        // face-on art; the frame is what retires that. Drive one hand and
+        // assert the blink plays with eye contact unbroken.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 4);
+        let (t, _) = idle(&mut pet, t, (4, 6), 0.05);
+        // A hand that keeps eye contact for the whole sit — `beat_deal(0, 3)`
+        // is zero on `seed % 3 == 0`.
+        pet.force_seed(3);
+        assert_eq!(pet.beat_deal(0, 3), 0, "fixture: this hand never glances");
+        let mut t = t;
+        let mut eye_contact_blinks = 0u32;
+        for _ in 0..180 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 6))));
+            if f.pose == PetGlyphId::PetSitFrontBlink {
+                assert!(!pet.sit_glance(), "the face-on blink never needs a look");
+                eye_contact_blinks += 1;
             }
-            p.live = Some(9);
-            let _ = p.frame(Some((9, 2)));
-            p.hold(Some((9, 2)), 5.0);
-            p.report(
-                "S8 Enter with a 3-line prompt from col 30",
-                "80x24; settled at (6,30); -> (9,2), rows 7..9 ink 0..2",
-            );
         }
+        assert!(
+            eye_contact_blinks >= 4,
+            "…and it happened ({eye_contact_blinks} frames)"
+        );
+    }
 
-        // 9: Home from col 70 — a genuine 70-cell retreat, for contrast.
-        {
-            let mut p = Probe::new(80);
-            p.warm(6, 70);
-            p.hold(Some((6, 70)), 2.5);
-            p.mark();
-            let _ = p.frame(Some((6, 0)));
-            p.hold(Some((6, 0)), 5.0);
-            p.report(
-                "S9 Home from col 70 (contrast)",
-                "80x24; settled at (6,70), row 6 ink 0..70; Home -> (6,0)",
-            );
-        }
+    /// A CONTENT CAT PURRS FROM THE MOMENT IT SITS DOWN. The purr's two
+    /// facts are independent ([`PetBrain::purring`]): the TELL rides the
+    /// whole settled dwell, the POSE waits for the long dwell so the seat
+    /// keeps its beats. Upstream had the first right and the second wrong;
+    /// our ladder had it the other way round.
+    #[test]
+    fn a_content_seat_purrs_before_it_wears_the_purr() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 3, 2);
+        let (t, _) = type_run(&mut pet, t, 3, 4, 40, 0.05);
+        let (t, f) = idle(&mut pet, t, (3, 44), SIT_AFTER + 0.1);
+        assert!(pet.content() >= PURR_GATE, "fixture: a cat that has worked");
+        assert_eq!(f.action, PetAction::Sit, "fixture: still the seat");
+        assert!(f.purr > 0.0, "the seat is already purring");
+        assert!(
+            f.pose != PetGlyphId::PetPurr,
+            "…and is not wearing the purr's pose"
+        );
 
-        // 10: a paste of +30 columns on the same row, for contrast.
-        {
-            let mut p = Probe::new(80);
-            p.warm(6, 10);
-            p.hold(Some((6, 10)), 2.5);
-            p.mark();
-            p.ink(6, 0, 40);
-            let _ = p.frame(Some((6, 40)));
-            p.hold(Some((6, 40)), 5.0);
-            p.report(
-                "S10 paste +30 on the same row (contrast)",
-                "80x24; settled at (6,10); paste -> (6,40), row 6 ink 0..40",
-            );
+        // The chest swell rides the seat too, on the same sine the purr's
+        // pose used to own alone.
+        let mut t = t;
+        let (mut lo, mut hi) = (1.0f32, 1.0f32);
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((3, 44))));
+            assert_eq!(f.action, PetAction::Sit, "still the seat");
+            lo = lo.min(f.scale_y);
+            hi = hi.max(f.scale_y);
         }
+        assert!(
+            hi - lo >= PURR_DEPTH,
+            "the seat's chest swells with the purr ({lo} .. {hi})"
+        );
 
-        // 11: the prompt redraw at the BOTTOM — the shell scrolled.
-        {
-            let mut p = Probe::new(80);
-            p.warm(23, 40);
-            p.hold(Some((23, 40)), 2.5);
-            p.mark();
-            let _ = p.frame(None);
-            p.ink(22, 0, 40);
-            p.ink(23, 0, 2);
-            p.live = Some(23);
-            let _ = p.frame(Some((23, 2)));
-            p.hold(Some((23, 2)), 5.0);
-            p.report(
-                "S11 prompt redraw at the bottom from (23,40)",
-                "80x24; settled at (23,40); caret None for 1 frame; then (23,2) with row 22 = 0..40, row 23 = 0..2",
+        // A COLD cat's seat does neither.
+        let mut cold = PetBrain::default();
+        let t = awake(&mut cold, start, 3, 40);
+        let (_, g) = idle(&mut cold, t, (3, 42), 0.6);
+        assert_eq!(g.action, PetAction::Sit);
+        assert_eq!(g.purr, 0.0, "contentment is bought with travel");
+    }
+
+    /// ONE LONG DWELL IN THREE LOAFS EVEN FOR A WORKING CAT — which is what
+    /// puts the loaf's OWN beats back within reach of someone who types.
+    /// `PetAction::Purr` is one static frame with a swell on it and no beats
+    /// at all, and it measured 14.0 % of every frame in a 368 506-frame
+    /// sample while `pet_loaf_ear` — whose trigger, a background line, fires
+    /// in the middle of every think-pause — measured ZERO onsets, because
+    /// the twitch always landed on a purring cat.
+    #[test]
+    fn one_dwell_in_three_loafs_and_the_loaf_keeps_its_ear() {
+        let start = Instant::now();
+        let mut eared = 0u32;
+        for seed in [0u8, 3, 6, 9] {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 3, 2);
+            let (t, _) = type_run(&mut pet, t, 3, 4, 40, 0.05);
+            let (t, _) = idle(&mut pet, t, (3, 44), SIT_AFTER + 0.1);
+            pet.force_seed(seed);
+            let (t, f) = idle(&mut pet, t, (3, 44), 3.6);
+            assert_eq!(
+                f.action,
+                PetAction::Loaf,
+                "hand {seed}: the dealt loaf, for a content cat"
             );
+            assert!(f.purr > 0.0, "hand {seed}: and it is still purring");
+            // A background line lands on the loaf: the authored ear frame.
+            let mut t = t;
+            for _ in 0..40 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((3, 44))));
+                if f.action != PetAction::Loaf {
+                    break;
+                }
+            }
+            pulse(&mut pet, t, (3, 44));
+            let (_, runs) = pose_runs(&mut pet, t, (3, 44), 0.4);
+            if let Some((_, _, ticks)) = runs.iter().find(|(p, ..)| *p == PetGlyphId::PetLoafEar) {
+                assert!(*ticks >= 2, "hand {seed}: the ear held {ticks} tick(s)");
+                eared += 1;
+            }
         }
+        assert!(
+            eared >= 3,
+            "the loaf's ear must be reachable for a content cat ({eared}/4)"
+        );
+    }
+
+    /// THE APEX BREAKS THE HANG. On a big bound the pose schedule holds the
+    /// hero frame for `dur − LEAP_RISE_T − LEAP_DESC_T` — up to 0.67 s at
+    /// [`BIG_FLIGHT_MAX`] — and nothing else moves through that window
+    /// either: [`PetBrain::flight_lift`]'s hang stays within 10 % of the
+    /// apex for 42 % of the flight and the asymmetric stretch is exactly
+    /// zero at the midpoint. Forty ticks of one bitmap at one height and one
+    /// scale, on the beat the complaint this wave answers actually named.
+    #[test]
+    fn the_apex_breaks_the_hang_on_a_bound() {
+        for dur in [BIG_FLIGHT_BASE, 0.6, BIG_FLIGHT_MAX] {
+            let mut f = Flight {
+                from_col: 0.0,
+                from_row: 4.0,
+                to_col: 60.0,
+                to_row: 4.0,
+                dur,
+                arc: 1.0,
+                t: 0.0,
+                reaimed: false,
+                big: true,
+                show: false,
+                hop: false,
+                coiled: false,
+                drop: false,
+                late_move: false,
+            };
+            let mut runs: Vec<(PetGlyphId, u32)> = Vec::new();
+            let mut t = 0.0f32;
+            while t <= dur {
+                let pose = PetBrain::flight_pose(&f);
+                match runs.last_mut() {
+                    Some(r) if r.0 == pose => r.1 += 1,
+                    _ => runs.push((pose, 1)),
+                }
+                t += 1.0 / 60.0;
+                f.t = t;
+            }
+            assert!(
+                runs.iter().any(|(p, _)| *p == PetGlyphId::PetApex),
+                "a {dur} s bound must reach its apex: {runs:?}"
+            );
+            for (pose, ticks) in &runs {
+                assert!(
+                    *ticks >= 2,
+                    "{dur} s: {pose:?} held {ticks} tick(s) — the frame-rate law"
+                );
+                assert!(
+                    *ticks <= 24,
+                    "{dur} s: {pose:?} held {ticks} ticks — the hang is frozen again"
+                );
+            }
+        }
+    }
+
+    /// …AND AN ORDINARY POUNCE KEEPS ITS THREE BEATS. The apex is confined
+    /// to `big` for a reason: a pounce's hero window is a fifth of a
+    /// bound's, and a fourth beat there would be a flicker rather than a
+    /// gesture. Across the whole pounce band the emitted sequence is
+    /// exactly rise → hero → descend, and no apex appears anywhere.
+    #[test]
+    fn an_ordinary_pounce_keeps_its_three_beats() {
+        let mut dur = FLIGHT_MIN;
+        while dur <= FLIGHT_MAX + 1e-4 {
+            let mut f = Flight {
+                from_col: 0.0,
+                from_row: 4.0,
+                to_col: 12.0,
+                to_row: 4.0,
+                dur,
+                arc: 0.6,
+                t: 0.0,
+                reaimed: false,
+                big: false,
+                show: false,
+                hop: false,
+                coiled: false,
+                drop: false,
+                late_move: false,
+            };
+            let mut seq: Vec<PetGlyphId> = Vec::new();
+            let mut t = 0.0f32;
+            while t <= dur {
+                let pose = PetBrain::flight_pose(&f);
+                if seq.last() != Some(&pose) {
+                    seq.push(pose);
+                }
+                t += 1.0 / 60.0;
+                f.t = t;
+            }
+            assert_eq!(
+                seq,
+                vec![
+                    PetGlyphId::PetLeapRise,
+                    PetGlyphId::PetLeap,
+                    PetGlyphId::PetLeapDescend
+                ],
+                "a {dur} s pounce keeps the three-beat schedule"
+            );
+            dur += 0.01;
+        }
+    }
+
+    /// THE GALLOP'S VERTICAL STAYS OUT OF THE PIXEL GRID. The motion design
+    /// doc specified a brain-side `RUN_BOB 0.05 · ramp` and refused it until
+    /// a pixel-domain test existed; that test was written in
+    /// `tests/pet_art_quality.rs`
+    /// (`the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height`)
+    /// and it KILLS the bob rather than admitting it — the host lands `lift`
+    /// through `body_px`'s `(lift · cell_h).round()`, which is identically
+    /// 0 px at `cell_h = 16` for every ramp below 0.67, two thirds of the
+    /// gallop band. The clearance lives in the art instead, where
+    /// `registration()` bakes it into the geometry sub-pixel.
+    ///
+    /// This is the refusal's own guard: a run frame carries NO lift, so
+    /// nobody can re-add the bob without re-deriving it.
+    #[test]
+    fn the_gallop_keeps_its_lift_out_of_the_pixel_grid() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 3, 2);
+        let mut caret = 4u16;
+        let mut ran = 0u32;
+        for i in 0..200 {
+            t += Duration::from_millis(16);
+            if i % 3 == 2 && caret < 78 {
+                caret += 1;
+            }
+            let f = pet.tick(sense(t, Some((3, caret))));
+            if f.action == PetAction::Run {
+                assert_eq!(
+                    f.lift, 0.0,
+                    "a gallop frame carries no lift — the vertical is the art's"
+                );
+                ran += 1;
+            }
+        }
+        assert!(ran >= 20, "fixture: the chase must gallop ({ran} frames)");
+    }
+
+    /// THE DRIFT-BRAKE'S GATE IS RARE BY CONSTRUCTION, and this is the
+    /// measurement the refusal rests on.
+    ///
+    /// The gate wants a follower step that CROSSES its station while the
+    /// paws are still over [`RUN_SPEED`]. `want` is `gap · gain`, so the
+    /// desired speed collapses as the gap closes, and the overshoot guard
+    /// clamps any step that would cross anyway — an eased follower has no
+    /// momentum to spend. Measured over 368 506 frames of five realistic
+    /// session shapes and 808 arrivals: the brake armed ZERO times.
+    ///
+    /// The obvious repair — admit an ARRIVAL AT SPEED, "the paws got there
+    /// this frame and the legs were still going" — was measured too, and it
+    /// is worse than the disease. Those frames exist, but they are a cat
+    /// TRACKING a caret that is still moving away: the gap is momentarily
+    /// inside one step's travel while the speed has not yet decayed, and
+    /// `leg_dist` is long precisely because the leg has not ended. Admitting
+    /// them puts a two-cell overshoot and a trot home in the MIDDLE of
+    /// ordinary fast typing, which is the tic law's exact prohibition. So
+    /// the gate stays as it is, and the beat stays rare.
+    ///
+    /// Both halves are asserted here. Goes red if the follower is ever
+    /// given real momentum — at which point the gate is worth re-opening,
+    /// and this test is the invitation.
+    #[test]
+    fn the_drift_brakes_gate_is_rare_by_construction() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 3, 2);
+        let mut caret = 4u16;
+        let mut galloped = false;
+        let mut armed = false;
+        // "The paws got there this frame, fast" — the candidate gate.
+        let mut hot_while_typing = 0u32;
+        let mut hot_at_rest = 0u32;
+        let mut worst_at_rest = 0.0f32;
+        for i in 0..600 {
+            t += Duration::from_millis(16);
+            // A long fast burst, then a dead stop — the shape a run-out
+            // would have to come out of.
+            let typing = i < 300;
+            if typing && i % 3 == 2 && caret < 78 {
+                caret += 1;
+            }
+            let before = pet.col;
+            let f = pet.tick(sense(t, Some((3, caret))));
+            galloped |= f.action == PetAction::Run;
+            armed |= pet.braking;
+            if pet.flight.is_some() || !matches!(f.action, PetAction::Walk | PetAction::Run) {
+                continue;
+            }
+            let target = PetBrain::station(caret, 100, art_cols(10, 20));
+            let step = (pet.col - before).abs();
+            if step > 0.0 && (target - pet.col).abs() <= step {
+                if pet.speed.abs() > 2.0 * RUN_SPEED {
+                    if typing {
+                        hot_while_typing += 1;
+                    } else {
+                        hot_at_rest += 1;
+                    }
+                }
+                if !typing {
+                    worst_at_rest = worst_at_rest.max(pet.speed.abs());
+                }
+            }
+        }
+        assert!(galloped, "fixture: the chase must reach a gallop");
+        assert!(
+            !armed,
+            "the shipped gate never arms from a caret chase — that is why the beat is rare"
+        );
+        assert!(
+            hot_while_typing >= 2,
+            "fixture: the candidate gate must fire mid-typing, or the refusal has no \
+             evidence ({hot_while_typing})"
+        );
+        assert_eq!(
+            hot_at_rest, 0,
+            "…and never once the caret came to rest, which is the ONLY place a run-out \
+             would read as one ({hot_at_rest})"
+        );
+        assert!(
+            worst_at_rest < RUN_SPEED,
+            "the follower reached its station at {worst_at_rest} c/s with the caret at \
+             rest — it has momentum now, so the drift-brake's gate is worth re-opening"
+        );
     }
 }

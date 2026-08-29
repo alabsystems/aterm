@@ -90,6 +90,25 @@ pub fn install_shim(
     install_shim_to(shim, &build_bin_dir.join(tool.exe_file()))
 }
 
+/// [`install_shim`] whose wrapper also EXPORTS `env` before it execs the target (design
+/// S7, [`crate::shim_env`]): `export NAME='VALUE'` lines ahead of the `exec` on Unix,
+/// `@set "NAME=VALUE"` lines ahead of the `@"<target>" %*` on Windows. With an empty
+/// `env` the shim is byte-identical to [`install_shim`]'s. Temp + rename like every shim.
+pub fn install_shim_env(
+    build_bin_dir: &Path,
+    tool: &crate::store::ToolName,
+    shim: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<()> {
+    install_shim_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
+}
+
+/// [`install_shim_to`] with the exported `env` — the `(shim path, target)` form of
+/// [`install_shim_env`], for the callers that already hold the target path.
+pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
+    install_shim_to_env(shim, target, &crate::shim_env::ShimEnv::NONE)
+}
+
 // ---------------------------------------------------------------------------
 // Pure `.cmd` shim formatting/parsing.
 //
@@ -102,13 +121,63 @@ pub fn install_shim(
 // ---------------------------------------------------------------------------
 
 /// The body of a Windows bin shim: `@"<target>" %*`, CRLF-terminated. `target` is
-/// the absolute path to the store/checkout executable the shim forwards to.
-#[cfg(any(windows, test))]
+/// the absolute path to the store/checkout executable the shim forwards to. The
+/// no-environment form of [`cmd_shim_content_env`], which the backend now writes
+/// through; kept for the tests that pin the plain shape.
+#[cfg(test)]
 pub(crate) fn cmd_shim_content(target: &Path) -> String {
-    let mut s = String::from("@\"");
+    cmd_shim_content_env(target, &crate::shim_env::ShimEnv::NONE)
+}
+
+/// [`cmd_shim_content`] with the shim's exported environment ahead of the forward
+/// line: one `@set "NAME=VALUE"` per entry (the quoted `set` form, so a value's
+/// trailing space or `&` is literal), then `@"<target>" %*`. The `@` keeps every line
+/// silent. An empty `env` is byte-identical to [`cmd_shim_content`].
+#[cfg(any(windows, test))]
+pub(crate) fn cmd_shim_content_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
+    let mut s = String::new();
+    for (name, value) in env.entries() {
+        s.push_str("@set \"");
+        s.push_str(name);
+        s.push('=');
+        s.push_str(value);
+        s.push_str("\"\r\n");
+    }
+    s.push_str("@\"");
     s.push_str(&target.to_string_lossy());
     s.push_str("\" %*\r\n");
     s
+}
+
+/// Whether every entry of `env` can sit inside `@set "NAME=VALUE"` without breaking
+/// out: no `"` (closes the quote), no `%` (batch expansion), no CR/LF/NUL (an extra
+/// line). [`crate::shim_env::ShimEnv::admit`] already refuses all of these, so this is
+/// the same defence in depth as [`cmd_target_is_injection_safe`]: the I/O site refuses
+/// rather than emit an injectable `.cmd`.
+#[cfg(any(windows, test))]
+pub(crate) fn cmd_env_is_injection_safe(env: &crate::shim_env::ShimEnv) -> bool {
+    env.entries().iter().all(|(n, v)| {
+        !n.chars()
+            .chain(v.chars())
+            .any(|c| matches!(c, '"' | '%' | '\r' | '\n' | '\0'))
+    })
+}
+
+/// The environment a Windows shim written by [`cmd_shim_content_env`] exports: its
+/// `@set "NAME=VALUE"` lines, re-admitted through the rule (fail-closed: a hand-edited
+/// line that breaks it reads as NONE). A tombstone or a plain shim reads as NONE.
+#[cfg(any(windows, test))]
+pub(crate) fn parse_cmd_shim_env(content: &str) -> crate::shim_env::ShimEnv {
+    let mut raw: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("@set \"")
+            && let Some(entry) = rest.strip_suffix('"')
+        {
+            raw.push(entry.to_string());
+        }
+    }
+    crate::shim_env::ShimEnv::admit(&raw).unwrap_or_default()
 }
 
 /// Whether `target` is safe to embed inside a `@"<target>" %*` shim WITHOUT breaking
@@ -199,14 +268,75 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
 ///
 /// `exec "<target>" "$@"` sets argv[0] to the target, which targo's brand detection
 /// reads: the stub is invisible to the tool it launches.
-#[cfg(any(unix, test))]
+///
+/// The no-environment form of [`sh_shim_content_env`], which the backend now writes
+/// through; kept for the tests that pin the plain shape.
+#[cfg(test)]
 pub(crate) fn sh_shim_content(target: &Path) -> String {
+    sh_shim_content_env(target, &crate::shim_env::ShimEnv::NONE)
+}
+
+/// The marker comment ahead of the `export` lines of a shim that carries an
+/// environment — a human reading `bin/claude` sees where the variables come from.
+#[cfg(any(unix, test))]
+const SH_SHIM_ENV_NOTE: &str =
+    "# shim_env from the signed manifest: only this managed copy runs with it.\n";
+
+/// [`sh_shim_content`] with the shim's exported environment ahead of the `exec`
+/// (design S7, [`crate::shim_env`]): the note, then one `export NAME='VALUE'` per entry
+/// — the value single-quoted by [`sh_shim_quote`]'s rule, so nothing in it is ever a
+/// word to `sh` — then the unchanged `exec '<target>' "$@"`. An empty `env` is
+/// byte-identical to [`sh_shim_content`]: every shim laid before the key existed.
+///
+/// `exec` keeps everything [`sh_shim_content`] promises (the tool authenticates at its
+/// real path; argv[0] is the target) — the exports are inherited by the exec'd image,
+/// which is the whole mechanism. `parse_sh_shim_target` reads the target off the exec
+/// line as before, so every sweep keyed on where a shim resolves is unchanged.
+#[cfg(any(unix, test))]
+pub(crate) fn sh_shim_content_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
     let mut s = String::from(
-        "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec ",
+        "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n",
     );
+    if !env.is_empty() {
+        s.push_str(SH_SHIM_ENV_NOTE);
+    }
+    for (name, value) in env.entries() {
+        s.push_str("export ");
+        s.push_str(name);
+        s.push('=');
+        s.push_str(&sh_quote_str(value));
+        s.push('\n');
+    }
+    s.push_str("exec ");
     s.push_str(&sh_shim_quote(target));
     s.push_str(" \"$@\"\n");
     s
+}
+
+/// The environment a Unix shim written by [`sh_shim_content_env`] exports: its
+/// `export NAME='VALUE'` lines, unquoted by the inverse of [`sh_quote_str`] and
+/// re-admitted through the rule (fail-closed: a hand-edited line that breaks it reads
+/// as NONE). A tombstone, a pending stub or a plain shim reads as NONE.
+#[cfg(any(unix, test))]
+pub(crate) fn parse_sh_shim_env(content: &str) -> crate::shim_env::ShimEnv {
+    let mut raw: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("export ") else {
+            continue;
+        };
+        let Some((name, quoted)) = rest.split_once("='") else {
+            continue;
+        };
+        let Some(value) = quoted.strip_suffix('\'') else {
+            continue;
+        };
+        let mut entry = String::from(name);
+        entry.push('=');
+        entry.push_str(&value.replace("'\\''", "'"));
+        raw.push(entry);
+    }
+    crate::shim_env::ShimEnv::admit(&raw).unwrap_or_default()
 }
 
 /// Single-quote a path for the `sh` stub, escaping embedded quotes POSIX-style. A
@@ -214,8 +344,15 @@ pub(crate) fn sh_shim_content(target: &Path) -> String {
 /// same posture the `.cmd` side takes.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_shim_quote(target: &Path) -> String {
+    sh_quote_str(&target.to_string_lossy())
+}
+
+/// [`sh_shim_quote`] over a string: the one quoting rule the shim body uses for its
+/// target AND its exported values.
+#[cfg(any(unix, test))]
+fn sh_quote_str(s: &str) -> String {
     let mut out = String::from("'");
-    for c in target.to_string_lossy().chars() {
+    for c in s.chars() {
         if c == '\'' {
             out.push_str("'\\''");
         } else {
@@ -261,6 +398,16 @@ pub(crate) fn read_cmd_shim_target(path: &Path) -> Option<PathBuf> {
     parse_cmd_shim_target(&content)
 }
 
+/// The environment the Windows `.cmd` shim at `path` exports ([`parse_cmd_shim_env`]),
+/// read through the same bounded, symlink-refusing seam; NONE for anything unreadable.
+#[cfg(any(windows, test))]
+pub(crate) fn read_cmd_shim_env(path: &Path) -> crate::shim_env::ShimEnv {
+    match crate::metadata_io::read_bounded_regular_utf8(path, MAX_CMD_SHIM_BYTES) {
+        Ok(content) => parse_cmd_shim_env(&content),
+        Err(_) => crate::shim_env::ShimEnv::NONE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +439,90 @@ mod tests {
         // A crafted tool name with cmd metacharacters must be inert inside echo.
         let esc = cmd_echo_escape("a&b|c>d<e^f%g\"h");
         assert_eq!(esc, "a^&b^|c^>d^<e^^f%%g^\"h");
+    }
+
+    /// THE WINDOWS WRAPPER WITH AN ENVIRONMENT (design S7), exact: one `@set "NAME=VALUE"`
+    /// per entry, then the unchanged forward line; the target still parses off the
+    /// forward line, the env parses back off the `@set` lines, an empty env is the plain
+    /// shim byte for byte, and the injection guard refuses what the manifest rule refuses.
+    #[test]
+    fn cmd_shim_with_env_sets_then_forwards_and_round_trips() {
+        let target = PathBuf::from("C:\\store\\claude\\2026082701\\bin\\claude.exe");
+        let env = crate::shim_env::ShimEnv::admit(&[
+            "DISABLE_AUTOUPDATER=1".to_string(),
+            "B=two words".to_string(),
+        ])
+        .unwrap();
+        let c = cmd_shim_content_env(&target, &env);
+        assert_eq!(
+            c,
+            "@set \"DISABLE_AUTOUPDATER=1\"\r\n@set \"B=two words\"\r\n\
+             @\"C:\\store\\claude\\2026082701\\bin\\claude.exe\" %*\r\n"
+        );
+        assert_eq!(parse_cmd_shim_target(&c), Some(target.clone()));
+        assert_eq!(parse_cmd_shim_env(&c), env);
+        assert_eq!(
+            cmd_shim_content_env(&target, &crate::shim_env::ShimEnv::NONE),
+            cmd_shim_content(&target),
+            "no env: the shim every manifest without the key gets"
+        );
+        assert_eq!(
+            parse_cmd_shim_env(&cmd_shim_content(&target)),
+            crate::shim_env::ShimEnv::NONE
+        );
+        // A tombstone carries no env either.
+        assert_eq!(
+            parse_cmd_shim_env(&cmd_tombstone_content("atpkg: x was yanked")),
+            crate::shim_env::ShimEnv::NONE
+        );
+        // A hand-edited `@set` the rule refuses reads as NONE, never as half an env.
+        assert_eq!(
+            parse_cmd_shim_env(
+                "@set \"DISABLE_AUTOUPDATER=1\"\r\n@set \"PATH=C:\\x\"\r\n@\"C:\\a.exe\" %*\r\n"
+            ),
+            crate::shim_env::ShimEnv::NONE
+        );
+        assert!(cmd_env_is_injection_safe(&env));
+        assert!(cmd_env_is_injection_safe(&crate::shim_env::ShimEnv::NONE));
+        // The reader goes through the bounded seam: a real file round-trips.
+        let root = std::env::temp_dir().join(format!("atpkg-cmd-shim-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude.cmd");
+        std::fs::write(&path, &c).unwrap();
+        assert_eq!(read_cmd_shim_env(&path), env);
+        assert_eq!(read_cmd_shim_target(&path), Some(target));
+        assert_eq!(
+            read_cmd_shim_env(&root.join("absent.cmd")),
+            crate::shim_env::ShimEnv::NONE
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// On a real Windows host the backend writes, resolves and reads the env-carrying
+    /// `.cmd` through its I/O primitives — the same file the pure test above pins.
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_lays_and_reads_an_env_shim() {
+        let root = std::env::temp_dir().join(format!("atpkg-win-env-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("claude.exe");
+        std::fs::write(&target, b"x").unwrap();
+        let shim = root.join("claude.cmd");
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        install_shim_to_env(&shim, &target, &env).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            cmd_shim_content_env(&target, &env)
+        );
+        assert_eq!(resolve_shim(&shim), Some(target.clone()));
+        assert_eq!(shim_env_of(&shim), env);
+        // Re-laid without an env: the plain shim, and nothing left of the exports.
+        install_shim_to(&shim, &target).unwrap();
+        assert_eq!(shim_env_of(&shim), crate::shim_env::ShimEnv::NONE);
+        assert_eq!(resolve_shim(&shim), Some(target));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -384,6 +615,93 @@ mod sh_shim_tests {
     fn a_tombstone_is_not_an_installed_shim() {
         let notice = "#!/bin/sh\necho 'atpkg: ay was yanked' 1>&2\nexit 70\n";
         assert_eq!(parse_sh_shim_target(notice), None);
+    }
+
+    /// THE WRAPPER WITH AN ENVIRONMENT (design S7), exact: the note, one
+    /// `export NAME='VALUE'` per entry, then the unchanged `exec` line. The target still
+    /// parses off the exec line (every sweep keyed on where a shim resolves is
+    /// unchanged), the env parses back off the exports, an empty env is the plain shim
+    /// byte for byte, and a quote in a value is POSIX-escaped both ways.
+    #[test]
+    fn the_sh_shim_with_env_exports_then_execs_and_round_trips() {
+        let target = Path::new("/prefix/store/claude/2026082701/bin/claude");
+        let env = crate::shim_env::ShimEnv::admit(&[
+            "DISABLE_AUTOUPDATER=1".to_string(),
+            "B=it's two words".to_string(),
+        ])
+        .unwrap();
+        let body = sh_shim_content_env(target, &env);
+        assert_eq!(
+            body,
+            "#!/bin/sh\n\
+             # atpkg shim — exec so the tool authenticates at its real path.\n\
+             # shim_env from the signed manifest: only this managed copy runs with it.\n\
+             export DISABLE_AUTOUPDATER='1'\n\
+             export B='it'\\''s two words'\n\
+             exec '/prefix/store/claude/2026082701/bin/claude' \"$@\"\n"
+        );
+        assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
+        assert_eq!(parse_sh_shim_env(&body), env);
+        assert_eq!(
+            sh_shim_content_env(target, &crate::shim_env::ShimEnv::NONE),
+            sh_shim_content(target),
+            "no env: the shim every manifest without the key gets, byte for byte"
+        );
+        assert_eq!(
+            parse_sh_shim_env(&sh_shim_content(target)),
+            crate::shim_env::ShimEnv::NONE
+        );
+        // A tombstone and a hand-edited export the rule refuses both read as NONE.
+        assert_eq!(
+            parse_sh_shim_env("#!/bin/sh\necho 'atpkg: ay was yanked' 1>&2\nexit 70\n"),
+            crate::shim_env::ShimEnv::NONE
+        );
+        assert_eq!(
+            parse_sh_shim_env(
+                "#!/bin/sh\nexport DISABLE_AUTOUPDATER='1'\nexport PATH='/x'\nexec '/a' \"$@\"\n"
+            ),
+            crate::shim_env::ShimEnv::NONE
+        );
+    }
+
+    /// The exports REACH the exec'd program: the backend lays the wrapper, the target is a
+    /// script that prints the variable, and running the shim prints the value — while a
+    /// plain re-lay of the same shim prints nothing. `resolve_shim` and `shim_env_of` read
+    /// both back.
+    #[cfg(unix)]
+    #[test]
+    fn the_laid_wrapper_exports_into_the_exec_d_program() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("atpkg-sh-env-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("claude");
+        std::fs::write(
+            &target,
+            b"#!/bin/sh\nprintf '%s|%s\\n' \"${DISABLE_AUTOUPDATER:-unset}\" \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shim = root.join("shim");
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        install_shim_to_env(&shim, &target, &env).unwrap();
+        assert_eq!(resolve_shim(&shim).as_deref(), Some(target.as_path()));
+        assert_eq!(shim_env_of(&shim), env);
+        let out = std::process::Command::new(&shim)
+            .arg("arg")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1|arg\n");
+        // The plain shim: no export, the program sees nothing, and nothing is read back.
+        install_shim_to(&shim, &target).unwrap();
+        assert_eq!(shim_env_of(&shim), crate::shim_env::ShimEnv::NONE);
+        let out = std::process::Command::new(&shim)
+            .arg("arg")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|arg\n");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Defence in depth: a path containing a quote cannot break out of the stub.

@@ -72,10 +72,12 @@
 //!   ratchet ceiling (`[OB-14]`).
 //!
 //!   IT IS RED TODAY, on purpose: `vendor/winit` ships without its provenance
-//!   files, its two `// LOCAL PATCH (aterm):` sites carry no Apache-2.0 §4(b)
-//!   header notice, and the Linux cell resolves an unpatched `winnow 1.0.3`
-//!   beside the fork that exists to fix an `offset_from` underflow. Every `✗`
-//!   line names its fix.
+//!   files and its two `// LOCAL PATCH (aterm):` sites carry no Apache-2.0
+//!   §4(b) header notice. (The third finding — the Linux cell resolving an
+//!   unpatched `winnow 1.0.3` beside aterm's `winnow 0.7.15` fork — is gone as
+//!   of 2026-08-27: retiring `toml_edit` for `aterm-toml` retired the fork, so
+//!   there is nothing left for the registry copy to shadow.) Every `✗` line
+//!   names its fix.
 //!
 //!   Implemented in `crates/aterm-forge` and shared VERBATIM with the
 //!   `cargo forge check` verb ([`aterm_forge::check::check_report`]) — the same
@@ -222,9 +224,8 @@
 //!   cheap and toolchain-free; `forge` costs four offline `cargo tree` resolves
 //!   plus a source walk of the whole third-party surface — 12s MEASURED here —
 //!   but it is RED on this tree today, so wiring it into verify.sh would stop
-//!   every merge until the winit provenance files and the shadowed `winnow` are
-//!   dealt with: the owner's call, not a default; `perf` belongs behind
-//!   `--full`).
+//!   every merge until the winit provenance files are dealt with: the owner's
+//!   call, not a default; `perf` belongs behind `--full`).
 //!
 //! THE NON-VACUITY OBLIGATION ([`NON_VACUITY_REGISTRY`]). Six times on
 //! 2026-07-31 a gate in this repo was found ASSERTING MORE THAN IT VERIFIED —
@@ -497,7 +498,7 @@ const NON_VACUITY_REGISTRY: &[RedFixture] = &[
             file: "crates/aterm-forge/tests/red_fixtures.rs",
             drives: "the VERB: check_report() — the exact symbol `gate_forge` calls — \
                      over a miniature aterm workspace built in CARGO_TARGET_TMPDIR \
-                     around a REAL copy of vendor/winnow. GREEN first (a fixture that \
+                     around a REAL copy of vendor/indexmap. GREEN first (a fixture that \
                      is red for an unrelated reason proves nothing), then RED once the \
                      module `vendor/forge.toml` records as CARVED is reinstated \
                      ([OB-13], naming the path and quoting the ledger's reason), then \
@@ -511,8 +512,8 @@ const NON_VACUITY_REGISTRY: &[RedFixture] = &[
                      proving the DELEGATED attest half reaches the verdict rather than \
                      being reported and dropped), and \
                      an_unpatched_sibling_version_reds_the_forge_verb ([OB-12] — the \
-                     live winnow shape synthesized, which cargo itself reports as \
-                     nothing at all). NOT COVERED: [OB-14], the ratchet ceiling. Its \
+                     unpatched-sibling shape synthesized, which cargo itself reports \
+                     as nothing at all). NOT COVERED: [OB-14], the ratchet ceiling. Its \
                      comparison is proven by aterm-forge's own budget unit tests, not \
                      through this verb, so a wiring slip that computed the ratchet \
                      verdict and dropped it would survive these four fixtures.",
@@ -2633,15 +2634,54 @@ fn tippy_failed_members(stderr: &str) -> Vec<String> {
     seen
 }
 
-/// The verdict lines `gate lint` prints. `.githooks/pre-push` DISCRIMINATES ON
-/// THESE STRINGS — an exit code alone cannot tell a finding from a lane that
-/// never ran, and the hook must say different things about the two, exactly as
-/// its temporal half discriminates on the freeze gate's own verdict marker.
-/// Changing the text here changes the hook's reading of it, so the hook greps
-/// for these same literals and `the_hook_greps_the_verdict_markers_this_gate_prints`
-/// pins that they still appear in the file.
+/// The verdict lines `gate lint` prints, and the ONLY strings a consumer may
+/// discriminate on — an exit code alone cannot tell a finding from a lane that
+/// never ran, so the words carry what the code cannot.
+///
+/// `.githooks/pre-push` used to grep them. It was demoted to ADVISORY on
+/// 2026-08-24 and greps nothing today, so the coupling is DORMANT rather than
+/// gone: `hook_stale_verdict_markers` states it conditionally — any
+/// `gate lint:` literal that appears in the hook must be one of these — which
+/// is vacuously true while the hook quotes none and arms itself the moment a
+/// future commit puts a grep back.
 const LINT_VERDICT_FAILED: &str = "gate lint: FAILED";
 const LINT_VERDICT_NO_VERDICT: &str = "gate lint: COULD NOT RUN";
+const LINT_VERDICT_GREEN: &str = "gate lint: GREEN";
+
+/// The shared prefix of every verdict line above. A hook (or any other reader)
+/// that quotes this prefix is discriminating on a verdict, so whatever follows
+/// it must be a verdict this file still prints.
+#[cfg(test)]
+const LINT_VERDICT_PREFIX: &str = "gate lint:";
+
+/// Every `gate lint:` literal in `text` that is NOT one this file prints.
+///
+/// The hook's failure mode was never "the marker is missing" — it was "the
+/// hook greps a marker the gate stopped printing", which silently degrades
+/// every failure into a finding. That is what this answers, over any text, so
+/// it can be driven by a fixture as well as by the real hook.
+///
+/// A GUARD, not a lane: nothing in the shipped verb path calls it, so it is
+/// `#[cfg(test)]` (the alternative is an `allow(dead_code)` that would also
+/// silence a genuinely orphaned helper later).
+#[cfg(test)]
+fn hook_stale_verdict_markers(text: &str) -> Vec<String> {
+    const PRINTED: [&str; 3] = [
+        LINT_VERDICT_FAILED,
+        LINT_VERDICT_NO_VERDICT,
+        LINT_VERDICT_GREEN,
+    ];
+    let mut stale = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(LINT_VERDICT_PREFIX) {
+        let tail = &rest[at..];
+        if !PRINTED.iter().any(|m| tail.starts_with(m)) {
+            stale.push(tail.lines().next().unwrap_or(tail).trim().to_string());
+        }
+        rest = &tail[LINT_VERDICT_PREFIX.len()..];
+    }
+    stale
+}
 
 /// The roster's view of the verb: every lane, nothing excluded. `gate all` runs
 /// this one, so the full-fat lint is what a bare `gate all` means.
@@ -2750,10 +2790,10 @@ fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
         return false;
     }
     if skipped.is_empty() {
-        eprintln!("gate lint: GREEN");
+        eprintln!("{LINT_VERDICT_GREEN}");
     } else {
         eprintln!(
-            "gate lint: GREEN — but NOT CHECKED: {}. Every lane that ran was clean.",
+            "{LINT_VERDICT_GREEN} — but NOT CHECKED: {}. Every lane that ran was clean.",
             skipped.join(", ")
         );
     }
@@ -3775,34 +3815,45 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         }
     }
 
-    /// The hook reads `gate lint`'s VERDICT LINES to tell a finding from a lane
-    /// that never ran — an exit code cannot carry that. This pins the coupling
-    /// from the gate's side: if the marker text changes here and not there, the
-    /// hook silently degrades to reporting every failure as a finding, which is
-    /// the mislabel this whole change removes.
+    /// What `.githooks/pre-push` owes `gate lint`, as it actually stands.
     ///
-    /// KNOWN RED, AND NOT BY THIS CHANGE. `.githooks/pre-push` was demoted to
-    /// ADVISORY on 2026-08-24 — it prints one line and exits 0 — so it greps
-    /// for nothing and the marker half of this test has been failing ever
-    /// since. Repairing that coupling means deciding what the hook is FOR, which
-    /// is a separate question from which formatter `gate lint` drives; it is
-    /// left alone here deliberately, red exactly as it was found, so that the
-    /// before/after of the fmt-lane arming is an exact comparison rather than a
-    /// fix smuggled in beside it.
+    /// THIS TEST USED TO DOCUMENT ITS OWN PERMANENT FAILURE. It required the
+    /// hook to CONTAIN `LINT_VERDICT_FAILED` and `LINT_VERDICT_NO_VERDICT`,
+    /// because the hook used to grep them to tell a finding from a lane that
+    /// never ran. The hook was demoted to ADVISORY on 2026-08-24 — it prints
+    /// one line and exits 0 — so it greps nothing, and the assertion has been
+    /// red every day since, with a doc comment saying so. A test whose comment
+    /// explains why it fails is not a test: it is a red that teaches everyone
+    /// reading the suite to skip a failure, which is the one thing the
+    /// tripwires in this file cannot survive.
     ///
-    /// The LAST assertion is this change's, and it is the reverse of what it
-    /// used to say. It used to require `--no-fmt` in the hook, on the ground
-    /// that "a push must not be blocked by formatting". That was the owner's
-    /// standing rule; the owner has reversed it, the tree has been formatted,
-    /// and the lane is armed — so the command this file teaches must be the one
-    /// that actually checks formatting.
+    /// So the obligation is restated as the thing that is actually true, and
+    /// it is the STRONGER of the two directions. The failure the markers exist
+    /// to prevent was never "the hook forgot to grep" — an ungrepping hook
+    /// simply enforces nothing, loudly, which is what advisory MEANS. It was
+    /// "the hook greps a marker the gate stopped printing", which silently
+    /// degrades every failure into a finding. `hook_stale_verdict_markers`
+    /// states exactly that, over the real file: every `gate lint:` literal the
+    /// hook quotes must be a verdict this gate still prints. Today it quotes
+    /// none, so the check passes with nothing to say — and the commit that
+    /// re-arms the hook re-arms this check in the same edit, with no second
+    /// edit to remember.
+    ///
+    /// A conditional obligation that is currently vacuous needs a control, or
+    /// it is indistinguishable from no obligation at all — see
+    /// `a_hook_quoting_a_retired_verdict_is_named`, which drives the same
+    /// function over a fixture that DOES quote a retired marker and requires
+    /// it to be named.
+    ///
+    /// The two unconditional halves are unchanged and still load-bearing: the
+    /// hook is now the only place that TEACHES the checks it stopped
+    /// enforcing, so it must name `gate lint`, and it must not name it with
+    /// `--no-fmt` (the fmt lane is armed; a documented command that opts out
+    /// of it by default re-creates the unchecked month that arming ended).
     #[test]
-    fn the_hook_greps_the_verdict_markers_this_gate_prints() {
+    fn the_hook_teaches_gate_lint_and_quotes_no_retired_verdict() {
         let hook = std::fs::read_to_string(workspace_root().join(".githooks/pre-push"))
             .expect("read .githooks/pre-push");
-        // FIRST, deliberately: the marker loop below is known-red (see the doc
-        // comment), and a panic there would make every assertion after it dead
-        // code. An assertion that cannot execute proves nothing.
         // Only the RUNNABLE lines. The prose above them recounts what the hook
         // used to run before its 2026-08-24 demotion — `gate lint --no-fmt` —
         // and that sentence is history, still true, and not this test's
@@ -3822,13 +3873,51 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
              armed, and a documented command that opts out of it by default \
              re-creates the unchecked month this change ended. Offending: {taught:?}"
         );
-        for marker in [LINT_VERDICT_FAILED, LINT_VERDICT_NO_VERDICT] {
-            assert!(
-                hook.contains(marker),
-                ".githooks/pre-push does not grep for {marker:?} — it cannot \
-                 distinguish a finding from a no-verdict without it"
-            );
-        }
+        let stale = hook_stale_verdict_markers(&hook);
+        assert!(
+            stale.is_empty(),
+            ".githooks/pre-push quotes verdict text `gate lint` no longer prints \
+             ({stale:?}). A hook discriminating on a retired marker reports every \
+             failure as a FINDING, including the ones that are really a lane that \
+             never ran — the exact mislabel these literals exist to prevent."
+        );
+    }
+
+    /// The control for the conditional coupling above: the hook quotes no
+    /// verdict today, so that assertion currently examines nothing. This one
+    /// drives the same function over a hook that DOES quote a retired marker
+    /// and requires it to be named — so the pair is a real obligation rather
+    /// than an empty loop that reads like one.
+    #[test]
+    fn a_hook_quoting_a_retired_verdict_is_named() {
+        // Every verdict this gate really prints is accepted, in the shapes the
+        // hook would actually write them (grep -q, a case arm, prose).
+        let live = format!(
+            "#!/usr/bin/env bash\n\
+             if grep -q '{LINT_VERDICT_FAILED}' \"$log\"; then exit 1; fi\n\
+             grep -q \"{LINT_VERDICT_NO_VERDICT}\" \"$log\" && exit 1\n\
+             # a clean run prints {LINT_VERDICT_GREEN} — but NOT CHECKED: …\n"
+        );
+        assert!(
+            hook_stale_verdict_markers(&live).is_empty(),
+            "the live verdicts must be accepted: {:?}",
+            hook_stale_verdict_markers(&live)
+        );
+        // The 2026-08 wording, retired: `gate lint` prints COULD NOT RUN now.
+        let retired = "grep -q 'gate lint: NO VERDICT' \"$log\" && exit 1\n";
+        assert_eq!(
+            hook_stale_verdict_markers(retired),
+            vec!["gate lint: NO VERDICT' \"$log\" && exit 1".to_string()],
+            "a retired marker must be named, not passed over"
+        );
+        // And the prefix alone, with nothing recognisable after it, is stale
+        // too — that is a hook grepping for a verdict word this file dropped.
+        assert_eq!(hook_stale_verdict_markers("gate lint:").len(), 1);
+        // Two stale quotes are two findings, so the report cannot stop at one.
+        assert_eq!(
+            hook_stale_verdict_markers("gate lint: OK\ngate lint: WARN\n").len(),
+            2
+        );
     }
 
     // The census walker's unit tests (parse_fn_def / guard_vars / term_hop_calls
@@ -3837,8 +3926,8 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     use super::{
         ALL_ROSTER, DORMANCY_REGISTRY, DormantWatch, NON_VACUITY_REGISTRY, RedFixture, RedProof,
         WITNESS_REGISTRY, certified_driver, counts_report, dormant_report, drift_report,
-        extract_call_string_args, fault_report, flag_was_rejected, impl_source_files,
-        is_ordinary_kani_proof_attr, judge_kernel_certification, needle_present,
+        extract_call_string_args, fault_report, flag_was_rejected, hook_stale_verdict_markers,
+        impl_source_files, is_ordinary_kani_proof_attr, judge_kernel_certification, needle_present,
         non_vacuity_violations, proof_inventory_is_valid, readme_asserts_proof_inventory,
         roster_names, run_repo_guards, test_fn_body,
     };

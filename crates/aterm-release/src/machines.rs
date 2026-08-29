@@ -111,7 +111,7 @@ impl MachineIdentity {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::new(format!("read {}: {e}", path.display())))?;
-        let identity: Self = toml::from_str(&text)
+        let identity: Self = aterm_toml::from_str(&text)
             .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
         if identity.id.is_empty() || identity.pubkey.is_empty() {
             return Err(Error::new(format!(
@@ -543,8 +543,12 @@ pub fn attribute(manifest: &mut Manifest, who: &Attribution) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as B64;
+    /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`), held
+    /// byte-identical to the retired `base64` package's `general_purpose::STANDARD`
+    /// by `crates/aterm-codec/tests/base64_oracle.rs`.
+    fn b64(raw: &[u8]) -> String {
+        aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
+    }
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     // Obviously synthetic seeds; they appear nowhere but here.
@@ -558,7 +562,7 @@ mod tests {
     }
 
     fn pk(seed: &[u8; 32]) -> String {
-        B64.encode(kp(seed).public_key().as_ref())
+        b64(kp(seed).public_key().as_ref())
     }
 
     /// A roster listing m3 and m11, with `revoked` under the caller's control.

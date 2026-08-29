@@ -51,6 +51,7 @@ impl Terminal {
             grid,
             parser: Parser::new(),
             modes: TerminalModes::new(),
+            configured_modes: super::state::ConfiguredModes::default(),
             style: CurrentStyle::default(),
             charset: CharacterSetState::new(),
             alt_grid: None,

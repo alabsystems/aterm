@@ -113,7 +113,10 @@ impl PreviewCursorStyle {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PreviewTrailStyle {
-    /// Unknown/malformed raw style. It fails closed exactly like the live host.
+    /// The defensive fail-closed state. No raw spelling produces it any more —
+    /// an unrecognized `cursor_trail_style` falls back to the default and a
+    /// malformed `pack:` resolves to [`Self::Custom`] with no pack — so it is
+    /// reachable only as a direct construction, and it keeps drawing nothing.
     Invalid,
     Off,
     Lumen,
@@ -279,6 +282,10 @@ impl CursorPreviewSpec {
     /// `CursorPreviewSpec { trail_style, ..Default::default() }` callers honest:
     /// changing the broad style without also changing its raw
     /// token must not accidentally retain the default rainbow-pet semantics.
+    ///
+    /// AUTHORED, not resolved: this is the text the badge shows and the cache
+    /// keys on, so it keeps the user's spelling and case. Ask
+    /// [`Self::effective_trail_style_token`] for what the trail actually draws.
     pub(crate) fn effective_trail_style_raw(&self) -> &str {
         let raw = self.trail_style_raw.trim();
         let empty = crate::app_config::TrailPackCatalog::default();
@@ -290,7 +297,28 @@ impl CursorPreviewSpec {
         }
     }
 
+    /// [`Self::effective_trail_style_raw`] as the RUNTIME resolves it — the
+    /// spelling the host's raw-token predicates would be asked about, so an
+    /// unrecognized value previews the default's companion and ribbon instead
+    /// of the geometry of a look nothing renders.
+    fn effective_trail_style_token(&self) -> &str {
+        crate::app_config::effective_trail_style_token(self.effective_trail_style_raw())
+    }
+
     fn resolved_trail_style(&self) -> crate::app_config::ResolvedTrailStyle {
+        if self.trail_style == PreviewTrailStyle::Invalid {
+            // The terminal defensive state, and the only way in is a direct
+            // construction: `from_resolution` no longer answers `Invalid` for
+            // anything, because an unrecognized spelling now falls back to the
+            // default rather than disabling the trail. A caller that asks for
+            // it explicitly still gets nothing drawn.
+            return crate::app_config::ResolvedTrailStyle {
+                canonical: None,
+                style: None,
+                pack: None,
+                issue: Some(crate::app_config::TrailStyleIssue::Unknown),
+            };
+        }
         if self.trail_style == PreviewTrailStyle::Custom {
             return crate::app_config::ResolvedTrailStyle {
                 canonical: None,
@@ -313,7 +341,7 @@ impl CursorPreviewSpec {
         if self.resolved_trail_style().style != Some(GlowStyle::RainbowKitty) {
             return PreviewTrailCompanion::None;
         }
-        let raw = self.effective_trail_style_raw();
+        let raw = self.effective_trail_style_token();
         if GlowStyle::style_names_any_pet(raw) {
             let species = if GlowStyle::style_names_dog_pet(raw) {
                 aterm_effects::kitty_pet::PetSpecies::Dog
@@ -4237,9 +4265,47 @@ mod tests {
         assert!(output.patches.is_empty());
     }
 
+    /// A TYPO PREVIEWS THE DEFAULT, not an empty box: `resolve_trail_style`
+    /// substitutes [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`] for an
+    /// unrecognized spelling, so the preview has to show the same trail — and
+    /// the same COMPANION, which is the half that reads the style token rather
+    /// than the resolved `GlowStyle`. The badge still quotes what was authored.
+    #[test]
+    fn unknown_style_previews_the_default_trail_and_companion() {
+        let cursor = CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::parse("phasr"),
+            trail_style_raw: Arc::from("phasr"),
+            ..CursorPreviewSpec::default()
+        };
+        let default_cursor = rainbow_cursor(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE);
+        assert_eq!(cursor.trail_style, default_cursor.trail_style);
+        assert_eq!(cursor.trail_companion(), default_cursor.trail_companion());
+        assert_eq!(
+            cursor.effective_trail_style_token(),
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE
+        );
+        assert_eq!(
+            cursor.effective_trail_style_raw(),
+            "phasr",
+            "the badge keeps the authored spelling"
+        );
+
+        let spec = SettingsPreviewSpec::cursor(cursor).with_phase(900);
+        assert_ne!(spec.animation(), PreviewAnimation::None);
+        assert!(!spec.audit_value().contains("fails closed"));
+        let grid = PreviewGrid::new(
+            LogicalRect::new(0.0, 0.0, 420.0, 150.0),
+            spec.font_px,
+            spec.line_height,
+            spec.baseline_adjust,
+        );
+        assert!(!spec.effects(grid, Theme::default()).glow.is_empty());
+    }
+
     #[test]
     fn malformed_styles_fail_closed_instead_of_previewing_lumen() {
-        for raw in ["phasr", "pack:"] {
+        for raw in ["pack:", "pack:missing"] {
             let style = PreviewTrailStyle::parse(raw);
             let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
                 blink: false,

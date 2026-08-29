@@ -24,6 +24,17 @@ pub(crate) enum PackagesBusy {
     Install,
     /// `atpkg uninstall --all` — remove the whole managed toolset, reclaiming its disk.
     Uninstall,
+    /// `atpkg install <name> --elevate=never` — one EXTRA, opted in by the Install
+    /// control on its Packages row. atpkg records the opt-in marker itself
+    /// (`<prefix>/optin/<name>`) before it installs, so the GUI never writes into the
+    /// store; `--elevate=never` keeps a windowed child from ever waiting on a sudo
+    /// prompt nobody can see (an extra needs no elevation anyway).
+    InstallExtra,
+    /// `atpkg install <name> --elevate=osascript`, one process per program in
+    /// dependency order — the GUI door for the `needs admin` rows (Apple's Command
+    /// Line Tools through `softwareupdate`, Homebrew's signed `.pkg`). macOS shows
+    /// its own administrator dialog; the GUI never sees a password.
+    InstallAdmin,
 }
 
 impl PackagesBusy {
@@ -32,6 +43,8 @@ impl PackagesBusy {
             Self::Check => "Package check completed",
             Self::Install => "ALab toolset install completed",
             Self::Uninstall => "ALab toolset removed",
+            Self::InstallExtra => "Extra install completed",
+            Self::InstallAdmin => "Admin install completed",
         }
     }
 
@@ -40,6 +53,8 @@ impl PackagesBusy {
             Self::Check => "Package check failed",
             Self::Install => "ALab toolset install failed",
             Self::Uninstall => "ALab toolset removal failed",
+            Self::InstallExtra => "Extra install failed",
+            Self::InstallAdmin => "Admin install failed",
         }
     }
 }
@@ -115,10 +130,411 @@ pub(crate) struct PackagesProgramRow {
     pub(crate) name: String,
     /// The active build number, if one is installed.
     pub(crate) installed_build: Option<u64>,
-    /// atpkg's free-text state line (`"active"`, `"tombstoned: …"`, …).
+    /// atpkg's state line, VERBATIM. For an index-listed program it is one of the
+    /// canonical spellings of `atpkg::state` (`managed <build> — pinned by index <N>`,
+    /// `system: <path> — not managed by aterm`, `managed <build> — SHADOWED by <path>`,
+    /// `extra — not installed (opt in: …)`, `installed via <protocol>: <path>`,
+    /// `needs admin — run: aterm pkg install <name>`, `unavailable on <target>: <hint>`,
+    /// `blocked by <dep>: <dep state>`); faults keep their prefixed free text. The row
+    /// paints this string as-is — the Packages page says exactly what the pass log,
+    /// `doctor` and `which` say (`docs/TOOLCHAIN-PACKAGE-MANAGER.md` §17.2).
     pub(crate) state: String,
+    /// The same line, parsed through `atpkg::state`'s own readers — never a second
+    /// spelling. Drives the grouping and the controls; the text above drives the paint.
+    pub(crate) kind: ProgramStateKind,
+    /// Which Packages group the row belongs to.
+    pub(crate) group: RowGroup,
+    /// Vendor / license / size for an extra, from atpkg's authored roster line
+    /// (`atpkg::stub::describe`). `None` for a default-set member or an extra this
+    /// binary was published before.
+    pub(crate) facts: Option<ExtraFacts>,
     /// Source annotation: `Some("dev-link → /path")` for a dev-linked checkout.
     pub(crate) annotation: Option<String>,
+}
+
+impl PackagesProgramRow {
+    fn from_status(name: &str, program: &atpkg::ProgramStatus) -> Self {
+        let kind = ProgramStateKind::parse(&program.state);
+        let group = RowGroup::of(name, &kind);
+        Self {
+            name: name.to_string(),
+            installed_build: program.installed_build,
+            state: program.state.clone(),
+            facts: (group == RowGroup::Extras)
+                .then(|| atpkg::stub::describe(name).map(ExtraFacts::parse))
+                .flatten(),
+            kind,
+            group,
+            annotation: None,
+        }
+    }
+
+    /// The extras Install control belongs on an extra that is waiting for consent
+    /// (`extra — not installed (opt in: aterm pkg install <name>)`) — never on one
+    /// already installed, system-satisfied or unavailable here.
+    pub(crate) fn offers_extra_install(&self) -> bool {
+        self.group == RowGroup::Extras && matches!(self.kind, ProgramStateKind::ExtraNotInstalled)
+    }
+}
+
+/// The three groups the Packages page renders (`docs/DESIGN-which-copy-runs-2026-08-27.md`
+/// S9: "Packages lists extras separately with vendor, license, size, and an Install
+/// control"; §17.8: the `needs admin` rows and the GUI door).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowGroup {
+    /// A default-set member (or any row the index does not mark as an extra).
+    Default,
+    /// An opt-in extra: listed and pinned, installed only after consent.
+    Extras,
+    /// A row waiting on an administrator: its own `needs admin` state, or `blocked by`
+    /// a dependency whose chain ends in one (Homebrew behind the Command Line Tools).
+    NeedsAdmin,
+}
+
+impl RowGroup {
+    fn of(name: &str, kind: &ProgramStateKind) -> Self {
+        if matches!(kind, ProgramStateKind::ExtraNotInstalled) || atpkg::stub::compiled_extra(name)
+        {
+            // Needs-admin membership is decided over the WHOLE row set (a blocked
+            // chain reaches other rows), in `PackagesStatusReport::from_parts`.
+            Self::Extras
+        } else if matches!(kind, ProgramStateKind::NeedsAdmin) {
+            Self::NeedsAdmin
+        } else {
+            Self::Default
+        }
+    }
+
+    pub(crate) fn heading(self) -> &'static str {
+        match self {
+            Self::Default => "DEFAULT SET",
+            Self::Extras => "EXTRAS",
+            Self::NeedsAdmin => "NEEDS ADMIN",
+        }
+    }
+}
+
+/// A `status.toml` state line read through `atpkg::state`'s parsers — the SAME
+/// readers `doctor` and `which` use, so this page cannot drift from what the pass
+/// wrote. `Other` keeps every fault/legacy line (`active`, `error: …`, `linked`) as
+/// a plain default-set row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramStateKind {
+    Managed {
+        build: u64,
+        index: u64,
+    },
+    Shadowed {
+        build: u64,
+        path: String,
+    },
+    System {
+        path: String,
+        retired: Option<String>,
+    },
+    ExtraNotInstalled,
+    InstalledVia {
+        protocol: String,
+        path: String,
+    },
+    NeedsAdmin,
+    Unavailable,
+    BlockedBy {
+        dep: String,
+        dep_state: String,
+    },
+    Other,
+}
+
+impl ProgramStateKind {
+    pub(crate) fn parse(state: &str) -> Self {
+        if let Some((build, index)) = atpkg::state::managed_pin(state) {
+            return Self::Managed { build, index };
+        }
+        if let Some((build, path)) = atpkg::state::shadowed_by(state) {
+            return Self::Shadowed {
+                build,
+                path: path.to_string(),
+            };
+        }
+        if let Some(path) = atpkg::state::system_path(state) {
+            return Self::System {
+                path: path.to_string(),
+                retired: atpkg::state::system_retired(state).map(str::to_string),
+            };
+        }
+        if state.starts_with(atpkg::state::EXTRA_PREFIX) {
+            return Self::ExtraNotInstalled;
+        }
+        if let Some((protocol, path)) = atpkg::state::installed_via_path(state) {
+            return Self::InstalledVia {
+                protocol: protocol.to_string(),
+                path: path.to_string(),
+            };
+        }
+        if state.starts_with(atpkg::state::NEEDS_ADMIN_PREFIX) {
+            return Self::NeedsAdmin;
+        }
+        if state.starts_with(atpkg::state::UNAVAILABLE_PREFIX) {
+            return Self::Unavailable;
+        }
+        if let Some((dep, dep_state)) = atpkg::state::blocked_by(state) {
+            return Self::BlockedBy {
+                dep: dep.to_string(),
+                dep_state: dep_state.to_string(),
+            };
+        }
+        Self::Other
+    }
+}
+
+/// What an extra's row says beside its state: the vendor, the license and the size,
+/// parsed from atpkg's one authored line per extra (`atpkg::stub::EXTRAS_STUB_NAMES`:
+/// `"<vendor product> — <license>, <size>, downloaded from <host>"`). A line that does
+/// not follow that grammar is kept whole as the vendor so nothing authored is lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtraFacts {
+    pub(crate) vendor: String,
+    pub(crate) license: Option<String>,
+    pub(crate) size: Option<String>,
+}
+
+impl ExtraFacts {
+    pub(crate) fn parse(line: &str) -> Self {
+        let line = line.trim();
+        let Some((vendor, rest)) = line.split_once(" \u{2014} ") else {
+            return Self {
+                vendor: line.to_string(),
+                license: None,
+                size: None,
+            };
+        };
+        let mut parts = rest.split(',').map(str::trim).filter(|p| !p.is_empty());
+        let license = parts.next().map(str::to_string);
+        let size = parts
+            .next()
+            .filter(|p| p.contains("MB") || p.contains("GB") || p.contains("KB"))
+            .map(str::to_string);
+        Self {
+            vendor: vendor.trim().to_string(),
+            license,
+            size,
+        }
+    }
+
+    /// `"<vendor>  ·  <license>  ·  <size>"`, whichever facts the line carried.
+    pub(crate) fn line(&self) -> String {
+        let mut out = self.vendor.clone();
+        for extra in [self.license.as_deref(), self.size.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            out.push_str("  \u{b7}  ");
+            out.push_str(extra);
+        }
+        out
+    }
+}
+
+/// The programs waiting on an administrator, in DEPENDENCY ORDER — the order the GUI
+/// door installs them in (§17.10: `clt` before `brew`, which `requires` it).
+///
+/// A program waits on admin when its own row is `needs admin — run: aterm pkg install
+/// <name>`, or when it is `blocked by <dep>: <dep state>` and following the `blocked by`
+/// chain (each tail is the dependency's own row, quoted verbatim) ends at a `needs
+/// admin` row. Dependencies come first (chain depth, then name); a cycle or a dangling
+/// chain is simply not admin-waiting. Pure: the notice thread, the Packages page and
+/// the tests all read the same rule.
+pub(crate) fn needs_admin_order(rows: &[(String, String)]) -> Vec<String> {
+    let states: std::collections::BTreeMap<&str, &str> = rows
+        .iter()
+        .map(|(name, state)| (name.as_str(), state.as_str()))
+        .collect();
+    let mut waiting: Vec<(usize, &str)> = Vec::new();
+    for (name, state) in &states {
+        // Walk the chain by NAME through the recorded rows, so the depth counts the
+        // programs the door has to install first; the quoted tail is the fallback
+        // when the dependency has no row of its own.
+        let mut depth = 0usize;
+        let mut current: String = (*state).to_string();
+        let mut seen: Vec<String> = vec![(*name).to_string()];
+        let admin = loop {
+            if current.starts_with(atpkg::state::NEEDS_ADMIN_PREFIX) {
+                break true;
+            }
+            let Some((dep, dep_state)) = atpkg::state::blocked_by(&current) else {
+                break false;
+            };
+            if seen.iter().any(|s| s == dep) || depth >= rows.len() {
+                break false;
+            }
+            seen.push(dep.to_string());
+            depth += 1;
+            current = states
+                .get(dep)
+                .map_or_else(|| dep_state.to_string(), |s| (*s).to_string());
+        };
+        if admin {
+            waiting.push((depth, name));
+        }
+    }
+    waiting.sort();
+    waiting
+        .into_iter()
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+/// The first-launch admin card's dismissal rule: "Not now" records the set of names it
+/// was shown for, and the card is not raised again until that set CHANGES. `marker` is
+/// the recorded text (`None` = never dismissed); the card shows for a non-empty set
+/// whose recorded form differs from the marker.
+pub(crate) fn admin_step_should_show(marker: Option<&str>, names: &[String]) -> bool {
+    !names.is_empty() && marker.map(str::trim) != Some(admin_step_marker_text(names).as_str())
+}
+
+/// The recorded form of a needs-admin set: one name per line, dependency order kept
+/// (the door's order is part of what the user declined).
+pub(crate) fn admin_step_marker_text(names: &[String]) -> String {
+    names.join("\n")
+}
+
+/// The dismissal marker beside `aterm.toml` (the config-dir latch idiom of
+/// `connections::first_use_notice_should_show`; never inside atpkg's store, which is
+/// atpkg's to write).
+pub(crate) const ADMIN_STEP_MARKER: &str = "packages-admin-step-dismissed";
+
+/// The most a marker may hold and still be a record: one program name per line, and
+/// atpkg refuses names past 64 bytes, so a legitimate set is a few hundred bytes. Same
+/// ceiling as atpkg's own prefix markers (`store::Layout::retired_date`); a bigger file
+/// is something else wearing the name and reads as "never dismissed" — the card shows,
+/// which errs toward disclosure.
+pub(crate) const MAX_ADMIN_STEP_MARKER_BYTES: usize = 4096;
+
+pub(crate) fn admin_step_marker_path(
+    config_path: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    config_path
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join(ADMIN_STEP_MARKER))
+}
+
+/// The marker's text, when a REGULAR, non-symlink file of at most
+/// [`MAX_ADMIN_STEP_MARKER_BYTES`] sits at `path` — the symlink-refusing, size-capped
+/// rule every other prefix marker follows (`atpkg::store::Layout::retired_date`,
+/// `optin_exists`). A planted link, a directory, an oversized or non-UTF-8 file is not a
+/// dismissal this machine recorded: `None`, and the card shows.
+pub(crate) fn read_admin_step_marker(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    // The handle is opened without following a final-component link and checked AS A
+    // HANDLE, not by a separate stat something could swap under: the same boundary the
+    // theme files use (`app_config::open_regular_theme_file`).
+    let file = crate::app_config::open_regular_theme_file(path).ok()?;
+    let mut bytes = Vec::with_capacity(256);
+    file.take((MAX_ADMIN_STEP_MARKER_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_ADMIN_STEP_MARKER_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Record "Not now" for `names`. Best-effort: an unwritable config dir means the card
+/// comes back next pass, which errs toward disclosure.
+///
+/// Never writes THROUGH anything already at the marker path: the text lands in a fresh
+/// sibling created exclusively (`create_new`, owner-only on unix) and is renamed over
+/// the marker — a rename replaces a planted link rather than following it — and a
+/// non-regular occupant (a link, a directory) fails closed and is left alone, exactly as
+/// atpkg's `record_retired`/`record_optin` refuse an occupied marker path.
+pub(crate) fn record_admin_step_dismissal(
+    config_path: Option<&std::path::Path>,
+    names: &[String],
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let Some(path) = admin_step_marker_path(config_path) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no config directory to record the dismissal in",
+        ));
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "dismissal marker path is occupied by something that is not a marker",
+            ));
+        }
+        Err(_) => {}
+    }
+    let text = admin_step_marker_text(names);
+    if text.len() > MAX_ADMIN_STEP_MARKER_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dismissal set is larger than a marker may hold",
+        ));
+    }
+    let tmp = path.with_file_name(format!("{ADMIN_STEP_MARKER}.tmp-{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Whether the admin card should be raised NOW for the rows `status.toml` carries —
+/// the off-thread half of the first-launch admin step. Reads the marker file (never on
+/// the UI thread: callers are the atpkg-update worker). Returns the names, in door
+/// order, when the card is due.
+pub(crate) fn admin_step_due(
+    status: &atpkg::Status,
+    config_path: Option<&std::path::Path>,
+) -> Option<Vec<String>> {
+    let rows: Vec<(String, String)> = status
+        .programs
+        .iter()
+        .map(|(name, program)| (name.clone(), program.state.clone()))
+        .collect();
+    let names = needs_admin_order(&rows);
+    let marker = admin_step_marker_path(config_path).and_then(|p| read_admin_step_marker(&p));
+    admin_step_should_show(marker.as_deref(), &names).then_some(names)
+}
+
+/// Who installs `name` and how — the honest sentence the admin card and the Needs-admin
+/// rows use. Spelled from the §17.8 protocols for the two shipped rows; anything newer
+/// says the generic truth (its own installer, through atpkg's door).
+pub(crate) fn admin_vendor_line(name: &str) -> String {
+    match name {
+        "clt" => "Apple Command Line Tools (Apple's installer, via softwareupdate)".to_string(),
+        "brew" => "Homebrew (its signed installer package)".to_string(),
+        other => format!("{other} (its own installer)"),
+    }
+}
+
+/// The admin card's caption, in the notice grammar `"<marker> <title> — <detail>"`:
+/// what is waiting, who installs it, and that macOS will ask for the password.
+pub(crate) fn admin_step_caption(names: &[String]) -> String {
+    let what: Vec<String> = names.iter().map(|n| admin_vendor_line(n)).collect();
+    let verb = if names.len() == 1 { "needs" } else { "need" };
+    format!(
+        "\u{2699} Admin step waiting \u{2014} {} {verb} an administrator; Install opens macOS's own password dialog",
+        what.join(", then ")
+    )
 }
 
 /// Facts about the co-located package manager, collected entirely OFF the
@@ -186,15 +602,21 @@ impl PackagesStatusReport {
                 status
                     .programs
                     .iter()
-                    .map(|(name, program)| PackagesProgramRow {
-                        name: name.clone(),
-                        installed_build: program.installed_build,
-                        state: program.state.clone(),
-                        annotation: None,
-                    })
+                    .map(|(name, program)| PackagesProgramRow::from_status(name, program))
                     .collect()
             })
             .unwrap_or_default();
+        // The Needs-admin group is a property of the WHOLE row set: Homebrew's row
+        // reads `blocked by clt: needs admin — …`, and it waits on the same door.
+        let admin_rows: Vec<(String, String)> = programs
+            .iter()
+            .map(|row| (row.name.clone(), row.state.clone()))
+            .collect();
+        for name in needs_admin_order(&admin_rows) {
+            if let Some(row) = programs.iter_mut().find(|row| row.name == name) {
+                row.group = RowGroup::NeedsAdmin;
+            }
+        }
         // Dev-linked programs are managed OUTSIDE the registry (update
         // hard-skips them); surface them in the same list, annotated, so the
         // page never claims a linked tool is registry-current.
@@ -214,6 +636,9 @@ impl PackagesStatusReport {
                     name: name.clone(),
                     installed_build: None,
                     state: "linked".to_string(),
+                    kind: ProgramStateKind::Other,
+                    group: RowGroup::Default,
+                    facts: None,
                     annotation,
                 });
             }
@@ -231,6 +656,36 @@ impl PackagesStatusReport {
             programs,
             collection_error: None,
         }
+    }
+}
+
+impl PackagesStatusReport {
+    /// Regroup rows whose names carry an opt-in marker as extras (an installed extra
+    /// otherwise reads exactly like a default-set member). A needs-admin row keeps its
+    /// group: the door outranks the roster.
+    pub(crate) fn mark_extras<S: AsRef<str>>(&mut self, optins: impl IntoIterator<Item = S>) {
+        for name in optins {
+            if let Some(row) = self
+                .programs
+                .iter_mut()
+                .find(|row| row.name == name.as_ref() && row.group == RowGroup::Default)
+            {
+                row.group = RowGroup::Extras;
+                if row.facts.is_none() {
+                    row.facts = atpkg::stub::describe(&row.name).map(ExtraFacts::parse);
+                }
+            }
+        }
+    }
+
+    /// The needs-admin names in door order (see [`needs_admin_order`]).
+    pub(crate) fn needs_admin(&self) -> Vec<String> {
+        let rows: Vec<(String, String)> = self
+            .programs
+            .iter()
+            .map(|row| (row.name.clone(), row.state.clone()))
+            .collect();
+        needs_admin_order(&rows)
     }
 }
 
@@ -314,6 +769,12 @@ fn collect_packages_status_from_layout(
         status.as_ref(),
         &links,
     );
+    // An extra the user opted in to and that is now installed reads `managed …`, the
+    // same words as a default-set member; the opt-in marker is what still says it is
+    // an extra. Read here (worker thread), applied to the grouping only.
+    if let Some(layout) = layout {
+        report.mark_extras(layout.optins());
+    }
     report.disabled_by_env = disabled_by_env;
     report.collection_error = collection_error_summary(errors, error_count);
     report
@@ -377,6 +838,8 @@ impl PackagesService {
             (true, Some(PackagesBusy::Check)) => 2,
             (true, Some(PackagesBusy::Install)) => 3,
             (true, Some(PackagesBusy::Uninstall)) => 4,
+            (true, Some(PackagesBusy::InstallExtra)) => 5,
+            (true, Some(PackagesBusy::InstallAdmin)) => 6,
         };
         let (last_operation, last_result) = match self.last_command.as_ref() {
             None => (0, 0),
@@ -385,6 +848,8 @@ impl PackagesService {
                     PackagesBusy::Check => 2,
                     PackagesBusy::Install => 3,
                     PackagesBusy::Uninstall => 4,
+                    PackagesBusy::InstallExtra => 5,
+                    PackagesBusy::InstallAdmin => 6,
                 },
                 1,
             ),
@@ -393,6 +858,8 @@ impl PackagesService {
                     PackagesBusy::Check => 2,
                     PackagesBusy::Install => 3,
                     PackagesBusy::Uninstall => 4,
+                    PackagesBusy::InstallExtra => 5,
+                    PackagesBusy::InstallAdmin => 6,
                 },
                 2,
             ),
@@ -570,6 +1037,10 @@ impl PackagesState {
                 PackagesBusy::Check => "Checking toolchain packages…".to_string(),
                 PackagesBusy::Install => "Installing the ALab toolset…".to_string(),
                 PackagesBusy::Uninstall => "Removing the ALab toolset…".to_string(),
+                PackagesBusy::InstallExtra => "Installing the extra…".to_string(),
+                PackagesBusy::InstallAdmin => {
+                    "Installing through macOS — the administrator dialog is open…".to_string()
+                }
             }
         } else if let Some(command) = self.last_command.as_ref() {
             command.headline().to_string()
@@ -673,6 +1144,8 @@ impl PackagesState {
             outcome: report.outcome.clone(),
             index_source: report.index_source.clone(),
             programs: report.programs.clone(),
+            needs_admin: report.needs_admin(),
+            admin_door: cfg!(target_os = "macos"),
             collection_error: report.collection_error.clone(),
             busy: self.busy,
             refreshing: self.inflight && self.busy.is_none(),
@@ -706,6 +1179,14 @@ pub(crate) struct PackagesProjection {
     pub(crate) outcome: String,
     pub(crate) index_source: String,
     pub(crate) programs: Vec<PackagesProgramRow>,
+    /// The programs waiting on an administrator, in the order the GUI door installs
+    /// them ([`needs_admin_order`]). The Install control on any of them runs the door
+    /// for that program AND everything before it in this list.
+    pub(crate) needs_admin: Vec<String>,
+    /// The osascript door exists on this platform (macOS). Elsewhere the Needs-admin
+    /// rows name the terminal command instead of offering a control that could only
+    /// record `needs admin` again.
+    pub(crate) admin_door: bool,
     pub(crate) collection_error: Option<String>,
     pub(crate) busy: Option<PackagesBusy>,
     /// A SILENT status-refresh worker is inflight (no `busy` label). Action
@@ -1055,6 +1536,434 @@ mod tests {
         assert_eq!(service.busy(), Some(PackagesBusy::Install));
         assert!(service.finish(sequence, succeeded(report, PackagesBusy::Install)));
         assert_eq!(service.busy(), None);
+    }
+
+    /// A `status.toml` fixture carrying every canonical §17.2 state: the rows parse
+    /// through `atpkg::state`'s own readers (never a second spelling), the text is
+    /// kept verbatim, and the grouping falls out — Default set, Extras (with the
+    /// authored vendor / license / size), and Needs admin, where Homebrew's
+    /// `blocked by clt: needs admin …` row waits on the same door as `clt`.
+    #[test]
+    fn rows_parse_every_canonical_state_and_group_by_it() {
+        let p = std::path::Path::new;
+        let fixture: Vec<(&str, String, Option<u64>)> = vec![
+            ("trust", atpkg::state::managed(6808, 41), Some(6808)),
+            (
+                "ay",
+                atpkg::state::shadowed(1971, p("/Users//dev/.local/bin/ay")),
+                Some(1971),
+            ),
+            (
+                "gh",
+                atpkg::state::system(p("/opt/homebrew/bin/gh"), Some("2026-08-27")),
+                None,
+            ),
+            ("codex", atpkg::state::extra_not_installed("codex"), None),
+            ("claude", atpkg::state::managed(2231, 41), Some(2231)),
+            ("clt", atpkg::state::needs_admin("clt"), None),
+            (
+                "brew",
+                atpkg::state::blocked("clt", &atpkg::state::needs_admin("clt")),
+                None,
+            ),
+            (
+                "emacs",
+                atpkg::state::unavailable("aarch64-pc-windows-msvc", "no Windows-on-ARM build"),
+                None,
+            ),
+            (
+                "xc",
+                atpkg::state::installed_via("pkg", p("/opt/homebrew/bin/xc")),
+                None,
+            ),
+            ("ny", "error: x".to_string(), None),
+        ];
+        let mut programs = std::collections::BTreeMap::new();
+        for (name, state, build) in &fixture {
+            programs.insert(
+                (*name).to_string(),
+                atpkg::ProgramStatus {
+                    installed_build: *build,
+                    state: state.clone(),
+                    tree_root: String::new(),
+                },
+            );
+        }
+        let status = atpkg::Status {
+            schema: 1,
+            updated_at: "2026-08-27T00:00:00Z".to_string(),
+            enabled: true,
+            index_source: "alabsystems/aterm".to_string(),
+            outcome: "up to date".to_string(),
+            programs,
+        };
+        let text = status.to_toml().unwrap();
+        let round: atpkg::Status = aterm_toml::from_str(&text).expect("the fixture is status.toml");
+        let report = PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&round), &[]);
+        let row = |name: &str| {
+            report
+                .programs
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name} row"))
+        };
+        // Verbatim text, every row.
+        for (name, state, _) in &fixture {
+            assert_eq!(
+                &row(name).state,
+                state,
+                "{name} keeps the canonical spelling"
+            );
+        }
+        assert_eq!(
+            row("trust").kind,
+            ProgramStateKind::Managed {
+                build: 6808,
+                index: 41
+            }
+        );
+        assert_eq!(
+            row("ay").kind,
+            ProgramStateKind::Shadowed {
+                build: 1971,
+                path: "/Users//dev/.local/bin/ay".into()
+            }
+        );
+        assert_eq!(
+            row("gh").kind,
+            ProgramStateKind::System {
+                path: "/opt/homebrew/bin/gh".into(),
+                retired: Some("2026-08-27".into())
+            }
+        );
+        assert_eq!(row("codex").kind, ProgramStateKind::ExtraNotInstalled);
+        assert_eq!(row("clt").kind, ProgramStateKind::NeedsAdmin);
+        assert_eq!(
+            row("brew").kind,
+            ProgramStateKind::BlockedBy {
+                dep: "clt".into(),
+                dep_state: "needs admin — run: aterm pkg install clt".into()
+            }
+        );
+        assert_eq!(row("emacs").kind, ProgramStateKind::Unavailable);
+        assert_eq!(
+            row("xc").kind,
+            ProgramStateKind::InstalledVia {
+                protocol: "pkg".into(),
+                path: "/opt/homebrew/bin/xc".into()
+            }
+        );
+        assert_eq!(row("ny").kind, ProgramStateKind::Other);
+
+        // Grouping.
+        for name in ["trust", "ay", "gh", "emacs", "xc", "ny"] {
+            assert_eq!(row(name).group, RowGroup::Default, "{name}");
+            assert!(row(name).facts.is_none(), "{name} carries no extra facts");
+            assert!(!row(name).offers_extra_install(), "{name}");
+        }
+        assert_eq!(row("codex").group, RowGroup::Extras);
+        assert!(row("codex").offers_extra_install());
+        assert_eq!(
+            row("claude").group,
+            RowGroup::Extras,
+            "an installed extra is still an extra (the compiled roster says so)"
+        );
+        assert!(
+            !row("claude").offers_extra_install(),
+            "an installed extra offers no Install"
+        );
+        assert_eq!(row("clt").group, RowGroup::NeedsAdmin);
+        assert_eq!(
+            row("brew").group,
+            RowGroup::NeedsAdmin,
+            "blocked behind a needs-admin dependency waits on the same door"
+        );
+        assert_eq!(
+            report.needs_admin(),
+            vec!["clt".to_string(), "brew".to_string()],
+            "door order: the dependency first"
+        );
+
+        // The authored extras facts.
+        let codex = row("codex").facts.clone().expect("codex facts");
+        assert_eq!(codex.vendor, "OpenAI Codex CLI");
+        assert_eq!(codex.license.as_deref(), Some("Apache-2.0"));
+        assert_eq!(codex.size.as_deref(), Some("~90 MB"));
+        assert_eq!(codex.line(), "OpenAI Codex CLI  ·  Apache-2.0  ·  ~90 MB");
+        let claude = row("claude").facts.clone().expect("claude facts");
+        assert_eq!(claude.vendor, "Anthropic Claude Code");
+        assert_eq!(claude.license.as_deref(), Some("proprietary"));
+        assert_eq!(claude.size.as_deref(), Some("~230 MB"));
+        let odd = ExtraFacts::parse("Some Tool without the grammar");
+        assert_eq!(odd.vendor, "Some Tool without the grammar");
+        assert_eq!(odd.license, None);
+        assert_eq!(odd.size, None);
+
+        // The projection carries the door order and the platform's door.
+        let mut service = PackagesService::new();
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(seq, refresh(report)));
+        let projection = service.state(true, true, true, false, true).projection();
+        assert_eq!(
+            projection.needs_admin,
+            vec!["clt".to_string(), "brew".to_string()]
+        );
+        assert_eq!(projection.admin_door, cfg!(target_os = "macos"));
+    }
+
+    /// An opt-in marker regroups an installed extra whose name the compiled roster
+    /// does not carry (a newer index) — and never touches a needs-admin row.
+    #[test]
+    fn opt_in_markers_regroup_installed_extras() {
+        let mut programs = std::collections::BTreeMap::new();
+        for (name, state) in [
+            ("newtool", atpkg::state::managed(5, 41)),
+            ("clt", atpkg::state::needs_admin("clt")),
+        ] {
+            programs.insert(
+                name.to_string(),
+                atpkg::ProgramStatus {
+                    installed_build: None,
+                    state,
+                    tree_root: String::new(),
+                },
+            );
+        }
+        let status = atpkg::Status {
+            schema: 1,
+            programs,
+            ..Default::default()
+        };
+        let mut report =
+            PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status), &[]);
+        assert_eq!(report.programs[1].group, RowGroup::Default);
+        report.mark_extras(["newtool", "clt", "absent"]);
+        let newtool = report
+            .programs
+            .iter()
+            .find(|r| r.name == "newtool")
+            .unwrap();
+        assert_eq!(newtool.group, RowGroup::Extras);
+        assert!(
+            newtool.facts.is_none(),
+            "no authored line for a name the binary predates"
+        );
+        let clt = report.programs.iter().find(|r| r.name == "clt").unwrap();
+        assert_eq!(
+            clt.group,
+            RowGroup::NeedsAdmin,
+            "the door outranks the roster"
+        );
+    }
+
+    /// The needs-admin order over chains: depth first, then name; a cycle, a dangling
+    /// chain and a chain that ends anywhere but `needs admin` are not admin-waiting.
+    #[test]
+    fn needs_admin_order_walks_blocked_chains_dependency_first() {
+        let s = |n: &str, st: String| (n.to_string(), st);
+        let na = atpkg::state::needs_admin;
+        let rows = vec![
+            s("brew", atpkg::state::blocked("clt", &na("clt"))),
+            s("clt", na("clt")),
+            s(
+                "cask",
+                atpkg::state::blocked("brew", &atpkg::state::blocked("clt", &na("clt"))),
+            ),
+            s(
+                "ay",
+                atpkg::state::blocked("codex", &atpkg::state::extra_not_installed("codex")),
+            ),
+            s("codex", atpkg::state::extra_not_installed("codex")),
+            s(
+                "loop-a",
+                atpkg::state::blocked("loop-b", "blocked by loop-a: x"),
+            ),
+            s(
+                "loop-b",
+                atpkg::state::blocked("loop-a", "blocked by loop-b: x"),
+            ),
+            s("dangling", atpkg::state::blocked("ghost", "not installed")),
+            s("apt-thing", na("apt-thing")),
+            s("trust", atpkg::state::managed(1, 1)),
+        ];
+        assert_eq!(
+            needs_admin_order(&rows),
+            vec![
+                "apt-thing".to_string(),
+                "clt".to_string(),
+                "brew".to_string(),
+                "cask".to_string()
+            ]
+        );
+        // A quoted tail stands in when the dependency has no row of its own.
+        let orphan = vec![s("brew", atpkg::state::blocked("clt", &na("clt")))];
+        assert_eq!(needs_admin_order(&orphan), vec!["brew".to_string()]);
+        assert!(needs_admin_order(&[]).is_empty());
+    }
+
+    /// The dismissal rule: never dismissed ⇒ show; the recorded set ⇒ silent; a
+    /// changed set (one more name, one fewer, a different order) ⇒ show again; an
+    /// empty set is never a card. The marker round-trips through the file helpers.
+    #[test]
+    fn the_admin_step_is_raised_once_per_distinct_set() {
+        let both = vec!["clt".to_string(), "brew".to_string()];
+        let only_clt = vec!["clt".to_string()];
+        assert!(admin_step_should_show(None, &both));
+        assert!(!admin_step_should_show(None, &[]));
+        let recorded = admin_step_marker_text(&both);
+        assert_eq!(recorded, "clt\nbrew");
+        assert!(!admin_step_should_show(Some(&recorded), &both));
+        assert!(
+            !admin_step_should_show(Some("clt\nbrew\n"), &both),
+            "a trailing newline is the same record"
+        );
+        assert!(admin_step_should_show(Some(&recorded), &only_clt));
+        assert!(admin_step_should_show(
+            Some(&admin_step_marker_text(&only_clt)),
+            &both
+        ));
+        assert!(
+            admin_step_should_show(Some("brew\nclt"), &both),
+            "order is part of the set"
+        );
+        assert!(!admin_step_should_show(Some(&recorded), &[]));
+
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-admin-step-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = dir.join("aterm.toml");
+        assert_eq!(
+            admin_step_marker_path(Some(&config)),
+            Some(dir.join(ADMIN_STEP_MARKER))
+        );
+        assert_eq!(admin_step_marker_path(None), None);
+        let mut programs = std::collections::BTreeMap::new();
+        for (name, state) in [
+            ("clt", atpkg::state::needs_admin("clt")),
+            (
+                "brew",
+                atpkg::state::blocked("clt", &atpkg::state::needs_admin("clt")),
+            ),
+            ("trust", atpkg::state::managed(1, 1)),
+        ] {
+            programs.insert(
+                name.to_string(),
+                atpkg::ProgramStatus {
+                    installed_build: None,
+                    state,
+                    tree_root: String::new(),
+                },
+            );
+        }
+        let status = atpkg::Status {
+            schema: 1,
+            programs,
+            ..Default::default()
+        };
+        assert_eq!(admin_step_due(&status, Some(&config)), Some(both.clone()));
+        record_admin_step_dismissal(Some(&config), &both).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(ADMIN_STEP_MARKER)).unwrap(),
+            "clt\nbrew"
+        );
+        assert_eq!(
+            admin_step_due(&status, Some(&config)),
+            None,
+            "declined: silent"
+        );
+        // clt installs; only brew still waits — a NEW set, so the card is due again.
+        let mut moved = status.clone();
+        moved.programs.get_mut("clt").unwrap().state =
+            atpkg::state::installed_via("softwareupdate", std::path::Path::new("/L/git"));
+        moved.programs.get_mut("brew").unwrap().state = atpkg::state::needs_admin("brew");
+        assert_eq!(
+            admin_step_due(&moved, Some(&config)),
+            Some(vec!["brew".to_string()])
+        );
+        // Nothing waits ⇒ nothing is due, marker or not.
+        let mut done = moved.clone();
+        done.programs.get_mut("brew").unwrap().state =
+            atpkg::state::installed_via("pkg", std::path::Path::new("/opt/homebrew/bin/brew"));
+        assert_eq!(admin_step_due(&done, Some(&config)), None);
+        assert!(record_admin_step_dismissal(None, &both).is_err());
+
+        // THE MARKER IS A PREFIX MARKER: a re-record replaces the regular file in place
+        // (no temp file left behind); an oversized file is not a record; a planted
+        // link is neither read nor written through and is left exactly as planted; a
+        // directory at the path fails the write closed.
+        let marker = dir.join(ADMIN_STEP_MARKER);
+        record_admin_step_dismissal(Some(&config), &only_clt).unwrap();
+        assert_eq!(read_admin_step_marker(&marker).as_deref(), Some("clt"));
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "the exclusive sibling is renamed away, never left beside the marker"
+        );
+        assert_eq!(admin_step_due(&status, Some(&config)), Some(both.clone()));
+        std::fs::write(&marker, "x".repeat(MAX_ADMIN_STEP_MARKER_BYTES + 1)).unwrap();
+        assert_eq!(
+            read_admin_step_marker(&marker),
+            None,
+            "oversized: not a record"
+        );
+        assert_eq!(admin_step_due(&status, Some(&config)), Some(both.clone()));
+        assert!(
+            record_admin_step_dismissal(Some(&config), &vec!["x".repeat(65); 80]).is_err(),
+            "a set too large for a marker is refused, not truncated"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        #[cfg(unix)]
+        {
+            let target = dir.join("planted-target");
+            std::fs::write(&target, admin_step_marker_text(&both)).unwrap();
+            std::os::unix::fs::symlink(&target, &marker).unwrap();
+            assert_eq!(
+                read_admin_step_marker(&marker),
+                None,
+                "a link whose target spells the set is still not a record"
+            );
+            assert_eq!(admin_step_due(&status, Some(&config)), Some(both.clone()));
+            let refused = record_admin_step_dismissal(Some(&config), &both).unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(
+                std::fs::symlink_metadata(&marker)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the planted link is left alone"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                admin_step_marker_text(&both),
+                "nothing was written through the link"
+            );
+            std::fs::remove_file(&marker).unwrap();
+            std::fs::remove_file(&target).unwrap();
+        }
+        std::fs::create_dir(&marker).unwrap();
+        assert_eq!(read_admin_step_marker(&marker), None);
+        assert!(record_admin_step_dismissal(Some(&config), &both).is_err());
+        assert!(std::fs::symlink_metadata(&marker).unwrap().is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The card's copy names the vendor and the admin prompt honestly, in the notice
+    /// grammar, in door order.
+    #[test]
+    fn the_admin_caption_names_the_vendors_and_the_prompt() {
+        let both = vec!["clt".to_string(), "brew".to_string()];
+        assert_eq!(
+            admin_step_caption(&both),
+            "\u{2699} Admin step waiting \u{2014} Apple Command Line Tools (Apple's installer, via softwareupdate), then Homebrew (its signed installer package) need an administrator; Install opens macOS's own password dialog"
+        );
+        assert_eq!(
+            admin_step_caption(&["clt".to_string()]),
+            "\u{2699} Admin step waiting \u{2014} Apple Command Line Tools (Apple's installer, via softwareupdate) needs an administrator; Install opens macOS's own password dialog"
+        );
+        assert_eq!(admin_vendor_line("newpkg"), "newpkg (its own installer)");
     }
 
     /// Dev-linked programs surface annotated — merged into an existing status

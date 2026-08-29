@@ -124,8 +124,13 @@ mod bench {
         std::os::unix::fs::symlink(&echo, &target).expect("target link");
 
         // The REAL shim writer — the product's own code path, not an imitation.
-        let refused =
-            atpkg::install_shims(&layout, &build_dir, &[TOOL.to_string()]).expect("install_shims");
+        let refused = atpkg::install_shims(
+            &layout,
+            &build_dir,
+            &[TOOL.to_string()],
+            atpkg::Aliases::Alab,
+        )
+        .expect("install_shims");
         assert!(refused.is_empty(), "the bench tool name must be admissible");
         let shim = layout.bin_dir().join(TOOL);
 

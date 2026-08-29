@@ -1065,6 +1065,28 @@ mod tests {
         }
     }
 
+    /// [`geom`] widened until the Body-sized provenance block fits at `scale`,
+    /// whatever this test binary's own `running` row says: S12 names the executable,
+    /// and under cargo that is a long target-dir path no fixed column count can
+    /// promise to hold. The fit ladder is then exercised only where a test asks for
+    /// it (`narrow_tray_steps_provenance_down_one_step`).
+    fn wide_geom(s: &AboutState, scale: f32) -> SettingsGeom {
+        let mut g = geom(s);
+        let base = BASE_PT * sane_scale(scale);
+        let px = TypeStep::Body.px(base).get();
+        let rows = s.rows.iter().filter(|(k, _)| AboutState::is_provenance(k));
+        let key_col = rows
+            .clone()
+            .map(|(k, _)| ui_text_width(k, px))
+            .fold(0.0, f32::max);
+        let val_col = rows.map(|(_, v)| text_w(v, px)).fold(0.0, f32::max);
+        // The ladder's own test, with its `gutter` (1.5u) + card pad (5u) + tray
+        // margin (u) — and a couple of columns to spare.
+        let need = key_col + val_col + 8.0 * 0.6 * base;
+        g.cols = g.cols.max((need / g.cw).ceil() as usize + 2);
+        g
+    }
+
     fn state_with_site() -> AboutState {
         let mut s = AboutState::new();
         s.add_test_site("example.test");
@@ -1147,8 +1169,9 @@ mod tests {
     #[test]
     fn text_size_tracks_display_scale_not_terminal_font() {
         let s = AboutState::new();
-        let g1 = geom(&s);
-        let mut g2 = geom(&s);
+        // Wide enough that the fit ladder stays on Body (see `wide_geom`).
+        let g1 = wide_geom(&s, 1.0);
+        let mut g2 = wide_geom(&s, 1.0);
         g2.font_px = 40.0; // a huge terminal font must not move the dialog's type
         let l1 = about_layout(&s, &g1, 1.0);
         let l2 = about_layout(&s, &g2, 1.0);
@@ -1160,8 +1183,7 @@ mod tests {
             "body text = Body step of the native base"
         );
         // 2× needs a tray wide enough that the fit ladder stays on Body.
-        let mut g2x = geom(&s);
-        g2x.cols = 220;
+        let g2x = wide_geom(&s, 2.0);
         let l2x = about_layout(&s, &g2x, 2.0);
         assert_eq!(
             sz(&l2x),
@@ -1557,9 +1579,9 @@ mod tests {
         );
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, pw, ph);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             let mut wr = enc.write_header().unwrap();
             wr.write_image_data(&buf).unwrap();
         }

@@ -545,7 +545,8 @@ fn interrupted_debris(layout: &Layout, claimed: &BTreeMap<String, BTreeSet<u64>>
         for entry in entries.flatten() {
             // Directories only. `DirEntry::file_type` does not follow symlinks, which is what
             // we want: `current` is a symlink (a junction on Windows) and is excluded here as
-            // well as by the name test below, and `<n>.ready` / `<n>.provenance` are files.
+            // well as by the name test below, and `<n>.ready` / `<n>.provenance` /
+            // `<n>.shim-env` are files.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
@@ -700,8 +701,8 @@ pub fn run_keeping_pinned_partials(
         // witness (an interrupted fresh install has no live build to produce one), and the
         // claim guard is already strictly stronger evidence of not-live than supersession —
         // nothing on disk points at this tree at all. `discard_build` also takes the sibling
-        // `<n>.ready` / `<n>.provenance`, so no stale sidecar outlives the tree and mis-marks
-        // a later reinstall of the same build number.
+        // `<n>.ready` / `<n>.provenance` / `<n>.shim-env`, so no stale sidecar outlives the
+        // tree and mis-marks a later reinstall of the same build number.
         crate::store::discard_build(&path);
         // Reported only when the tree actually went away — the same contract as the
         // scratch arm below. `discard_build` is best-effort and returns nothing, so
@@ -888,7 +889,13 @@ mod tests {
         )
         .unwrap();
         if shim {
-            install_shims(layout, &dir, &[program.to_string()]).unwrap();
+            install_shims(
+                layout,
+                &dir,
+                &[program.to_string()],
+                crate::activate::Aliases::Off,
+            )
+            .unwrap();
             activate_channel(layout, "stable", &dir).unwrap();
         }
         crate::store::mark_build_ready(&dir).unwrap();
@@ -1012,7 +1019,7 @@ mod tests {
         let b18 = seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, false);
         activate_channel(&l, "stable", &b19).unwrap();
-        install_shims(&l, &b19, &["ay".to_string()]).unwrap();
+        install_shims(&l, &b19, &["ay".to_string()], crate::activate::Aliases::Off).unwrap();
         // Written AFTER install_shims: the prune would otherwise remove it immediately.
         let aylint = tool("aylint");
         crate::platform::install_shim(&b18.join("bin"), &aylint, &l.shim(&aylint)).unwrap();
@@ -1092,7 +1099,7 @@ mod tests {
         let l = layout("no-channel");
         seed(&l, "ay", 17, false);
         let b18 = seed(&l, "ay", 18, false);
-        install_shims(&l, &b18, &["ay".to_string()]).unwrap(); // shims, but no activate
+        install_shims(&l, &b18, &["ay".to_string()], crate::activate::Aliases::Off).unwrap(); // shims, but no activate
 
         let report = run(&l);
         assert!(

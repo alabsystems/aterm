@@ -68,6 +68,22 @@ pub(crate) struct Program {
     pub(crate) start: usize,
     /// The prefilter, when one can be armed. See [`Prefilter`].
     pub(crate) first: Option<Prefilter>,
+    /// Every path out of `start` passes a `\A` before it can consume or accept,
+    /// so the pattern can only match at offset 0. See [`start_anchored`].
+    pub(crate) start_anchored: bool,
+    /// `classes[i]`'s membership over U+0000..U+007F, one bit per code point,
+    /// as a DENSE array parallel to `classes`.
+    ///
+    /// Parallel rather than a field on the set, for two reasons. Locality: the
+    /// hot loop touches only this array, sixteen bytes per class, instead of
+    /// reaching through a `ClassSet`'s two `Vec` headers. And staleness:
+    /// `ClassSet` is mutable while a pattern is being parsed — ranges are
+    /// added, case-folded, negated — so a bitmap living on it would have to be
+    /// invalidated correctly at every one of those points, and a missed
+    /// invalidation is a WRONG ANSWER rather than a slow one. Built here, at
+    /// the single moment the classes are frozen into a program, it cannot go
+    /// stale because there is nothing left to change.
+    pub(crate) class_ascii: Vec<u128>,
 }
 
 /// Compile `ast` into a program of at most `size_limit` bytes.
@@ -84,7 +100,36 @@ pub(crate) fn compile(ast: &Ast, size_limit: usize) -> Result<Program, Error> {
     let accept = c.push(Inst::Match)?;
     let start = c.emit(ast, accept)?;
     let first = first_set(&c.insts, &c.classes, start);
-    Ok(Program { insts: c.insts, classes: c.classes, start, first })
+    let anchored = start_anchored(&c.insts, start);
+    let class_ascii = c.classes.iter().map(ascii_bitmap).collect();
+    Ok(Program {
+        insts: c.insts,
+        classes: c.classes,
+        start,
+        first,
+        start_anchored: anchored,
+        class_ascii,
+    })
+}
+
+/// Membership of `set` over U+0000..U+007F, one bit per code point.
+///
+/// The whole answer, not a hint: negation and the perl classes are folded in
+/// here exactly as [`ClassSet::matches`] would fold them, so a set bit means
+/// "matches" outright and the caller needs no follow-up. That is the point —
+/// consulting the bitmap and then the set as well would cost more than the set
+/// alone.
+fn ascii_bitmap(set: &ClassSet) -> u128 {
+    let mut bits: u128 = 0;
+    for code in 0u32..128 {
+        let Some(c) = char::from_u32(code) else {
+            continue;
+        };
+        if set.matches(c) {
+            bits |= 1u128 << code;
+        }
+    }
+    bits
 }
 
 struct Compiler {
@@ -141,9 +186,12 @@ impl Compiler {
                 }
                 Ok(entry)
             }
-            Ast::Repeat { node, min, max, greedy } => {
-                self.emit_repeat(node, *min, *max, *greedy, next)
-            }
+            Ast::Repeat {
+                node,
+                min,
+                max,
+                greedy,
+            } => self.emit_repeat(node, *min, *max, *greedy, next),
         }
     }
 
@@ -289,6 +337,17 @@ fn split(body: usize, exit: usize, greedy: bool) -> Inst {
 pub(crate) struct Prefilter {
     pub(crate) pcs: Box<[usize]>,
     pub(crate) lead_bytes: [bool; 256],
+    /// The same marking for the code point AFTER the first, when the pattern
+    /// provably has one. `None` when it does not — a one-code-point pattern, or
+    /// one that can stop after its first.
+    ///
+    /// This is where the cost of a common lead byte goes. `lead_bytes` for
+    /// `(?i)ERROR` marks `E` and `e`, which are about a tenth of ordinary
+    /// terminal output, so the simulation is entered at a tenth of the
+    /// positions in the scrollback and rejects almost all of them on their
+    /// SECOND character. Testing that second byte first costs one more array
+    /// lookup and removes the entry entirely.
+    pub(crate) second_bytes: Option<[bool; 256]>,
 }
 
 /// Compute [`Program::first`]: what a match can begin with, if that is knowable.
@@ -304,12 +363,19 @@ pub(crate) struct Prefilter {
 /// so every position can begin a match and there is nothing to skip — and when
 /// the candidate set grows past the point where testing it beats running the
 /// simulation.
-fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefilter> {
-    /// Past this many alternatives the prefilter costs more than it saves.
-    const MAX_FIRST: usize = 16;
+/// Past this many alternatives a prefilter costs more than it saves.
+const MAX_FIRST: usize = 16;
 
+/// The consuming instructions reachable from `starts` without consuming
+/// anything: the epsilon closure, stopped at the first thing that eats a code
+/// point.
+///
+/// `None` when the closure reaches [`Inst::Match`] — the pattern can stop here,
+/// so there is no code point to filter on — or when it grows past
+/// [`MAX_FIRST`].
+fn consuming_closure(insts: &[Inst], starts: &[usize]) -> Option<Vec<usize>> {
     let mut seen = vec![false; insts.len()];
-    let mut stack = vec![start];
+    let mut stack: Vec<usize> = starts.to_vec();
     let mut out: Vec<usize> = Vec::new();
     while let Some(pc) = stack.pop() {
         let slot = seen.get_mut(pc)?;
@@ -332,9 +398,58 @@ fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefi
             Inst::Match => return None,
         }
     }
-    if out.is_empty() {
+    (!out.is_empty()).then_some(out)
+}
+
+/// Mark the leading UTF-8 byte of every code point `pcs` can consume.
+///
+/// A superset, never a subset — a class marks conservatively on the non-ASCII
+/// side — which is the entire safety argument for skipping on it.
+fn mark_leads(insts: &[Inst], classes: &[ClassSet], pcs: &[usize]) -> Option<[bool; 256]> {
+    let mut lead_bytes = [false; 256];
+    for &pc in pcs {
+        match insts.get(pc) {
+            Some(&Inst::Char { c, .. }) => {
+                let mut buf = [0u8; 4];
+                if let Some(&b) = c.encode_utf8(&mut buf).as_bytes().first() {
+                    lead_bytes[b as usize] = true;
+                }
+            }
+            Some(&Inst::Class { class, .. }) => {
+                classes.get(class)?.mark_lead_bytes(&mut lead_bytes);
+            }
+            _ => return None,
+        }
+    }
+    Some(lead_bytes)
+}
+
+/// What the code point AFTER the first can begin with, when the pattern
+/// provably has one.
+///
+/// The step from `first`'s instructions to their `next` is what makes this
+/// sound: reaching those means the first code point has been consumed, so
+/// anything the closure finds there must be consumed SECOND. If that closure
+/// can reach `Inst::Match`, the pattern is allowed to stop after one code point
+/// and there is no second byte to require — [`consuming_closure`] returns
+/// `None` and the filter stays disarmed.
+fn second_set(insts: &[Inst], classes: &[ClassSet], first_pcs: &[usize]) -> Option<[bool; 256]> {
+    let nexts: Vec<usize> = first_pcs
+        .iter()
+        .filter_map(|&pc| match insts.get(pc) {
+            Some(&Inst::Char { next, .. } | &Inst::Class { next, .. }) => Some(next),
+            _ => None,
+        })
+        .collect();
+    if nexts.len() != first_pcs.len() {
         return None;
     }
+    let out = consuming_closure(insts, &nexts)?;
+    mark_leads(insts, classes, &out)
+}
+
+fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefilter> {
+    let out = consuming_closure(insts, &[start])?;
     let mut lead_bytes = [false; 256];
     for &pc in &out {
         match insts.get(pc) {
@@ -351,7 +466,62 @@ fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefi
             _ => return None,
         }
     }
-    Some(Prefilter { pcs: out.into_boxed_slice(), lead_bytes })
+    let second_bytes = second_set(insts, classes, &out);
+    Some(Prefilter {
+        pcs: out.into_boxed_slice(),
+        lead_bytes,
+        second_bytes,
+    })
+}
+
+/// Compute [`Program::start_anchored`]: can this pattern match anywhere but 0?
+///
+/// The walk is the mirror image of [`first_set`]. That one walks *through*
+/// assertions because it is asking what a match can begin with, and an
+/// assertion consumes nothing. This one stops *at* `\A`, because it is asking
+/// something narrower: whether every way out of the start reaches a `\A` before
+/// it reaches anything that consumes a code point or accepts. If it does, a
+/// thread born anywhere but offset 0 dies on its first step, and the simulation
+/// has no reason to walk the rest of the haystack finding that out.
+///
+/// Deliberately [`Assertion::StartText`] alone. `(?m)^` compiles to
+/// [`Assertion::StartLine`], which holds after every newline and so anchors
+/// nothing; the analogous skip for it is a newline scan, and terminal rows hold
+/// no newlines to scan for.
+///
+/// Reaching [`Inst::Match`] is a failure, not a success: a program that can
+/// accept without passing `\A` — `^a|`, or the empty pattern — matches the
+/// empty string at every position, which is the opposite of anchored.
+fn start_anchored(insts: &[Inst], start: usize) -> bool {
+    let mut seen = vec![false; insts.len()];
+    let mut stack = vec![start];
+    while let Some(pc) = stack.pop() {
+        let Some(slot) = seen.get_mut(pc) else {
+            // Out of range: not a program this can reason about, so claim
+            // nothing. Same fail-open posture `first_set` takes.
+            return false;
+        };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        match insts.get(pc) {
+            // Anchored on this path. Whatever follows can only run at 0, so
+            // there is nothing further to check down it.
+            Some(&Inst::Assert {
+                kind: Assertion::StartText,
+                ..
+            }) => {}
+            Some(&Inst::Split { a, b }) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Some(&Inst::Jump { next } | &Inst::Assert { next, .. }) => stack.push(next),
+            // Consumes, or accepts, with no `\A` behind it.
+            Some(&Inst::Char { .. } | &Inst::Class { .. } | &Inst::Match) | None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -374,6 +544,162 @@ mod tests {
             size_of::<Inst>() + 2 * (size_of::<Thread>() + size_of::<u32>())
         );
         assert!(INST_COST >= size_of::<Inst>());
+    }
+
+    /// The second-byte filter EXCLUDES positions, so arming it for a pattern
+    /// that can match on one code point would lose matches. Pin both halves.
+    ///
+    /// Armed means "every path consumes a second code point"; disarmed means
+    /// some path can stop after the first, and the disarmed list is the
+    /// interesting one — each entry can end after one character by a different
+    /// route: it is one character long, its tail is optional, its tail is a
+    /// star, or one branch of an alternation is shorter than the other.
+    #[test]
+    fn the_second_byte_filter_arms_only_when_a_second_code_point_is_certain() {
+        let second = |pattern: &str| {
+            program(pattern)
+                .first
+                .and_then(|f| f.second_bytes)
+                .map(|bytes| {
+                    (0..256usize)
+                        .filter(|&b| bytes[b])
+                        .filter_map(|b| u8::try_from(b).ok())
+                        .map(char::from)
+                        .collect::<Vec<char>>()
+                })
+        };
+
+        assert_eq!(second("ERROR"), Some(vec!['R']));
+        assert_eq!(second("(?i)ERROR"), Some(vec!['R', 'r']));
+        assert_eq!(second("[ab]c"), Some(vec!['c']));
+        assert_eq!(second("ab|cd"), Some(vec!['b', 'd']));
+        // Assertions consume nothing, so the second code point is still `o`.
+        assert_eq!(second(r"c\bo"), Some(vec!['o']));
+
+        for pattern in [
+            "E",    // one code point, so there is no second
+            "Ex?",  // the tail is optional
+            "Ex*",  // the tail is a star
+            "E|Ex", // one branch stops after the first
+            "E.*",  // the star can take nothing
+            r"E\b", // only an assertion follows, which consumes nothing
+        ] {
+            assert_eq!(
+                second(pattern),
+                None,
+                "{pattern} can match on one code point, so the filter must stay disarmed",
+            );
+        }
+    }
+
+    /// The ASCII bitmap is consulted INSTEAD of the class it summarises, so any
+    /// disagreement between the two is a wrong answer that no amount of
+    /// searching would reveal. Pin them equal over the whole ASCII range.
+    ///
+    /// The spread is chosen for the ways a summary can be wrong: negation
+    /// (`[^abc]`), a perl class kept symbolic rather than expanded (`\w`,
+    /// `[^\s<>]`), case folding applied before the complement (`(?i)[^k]`, the
+    /// case that pins the fold/negate ORDER), a class whose members are all
+    /// above ASCII so the map must be empty, and one that spans the boundary.
+    #[test]
+    fn the_ascii_bitmap_agrees_with_the_class_it_stands_in_for() {
+        for pattern in [
+            r"[abc]",
+            r"[^abc]",
+            r"[a-z]",
+            r"[^a-z]",
+            r"\d",
+            r"\D",
+            r"\w",
+            r"\W",
+            r"\s",
+            r"\S",
+            r"[^\s<>]",
+            r"(?i)[^k]",
+            r"(?i)[a-z]",
+            r".",
+            r"(?s).",
+            r"[\x{100}-\x{200}]",
+            r"[\x{70}-\x{200}]",
+            r"[[:alpha:]]",
+            r"[[:^digit:]]",
+            r"[]a]",
+            r"[^]a]",
+        ] {
+            let prog = program(pattern);
+            assert_eq!(
+                prog.classes.len(),
+                prog.class_ascii.len(),
+                "{pattern}: the map must be parallel to the classes",
+            );
+            for (i, set) in prog.classes.iter().enumerate() {
+                let bits = prog.class_ascii[i];
+                for code in 0u32..128 {
+                    let c = char::from_u32(code).expect("ASCII is a valid scalar value");
+                    assert_eq!(
+                        bits >> code & 1 != 0,
+                        set.matches(c),
+                        "{pattern}: class {i} disagrees about {c:?} (U+{code:04X})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Program::start_anchored` is a licence for the search to stop walking, so
+    /// a false positive is a MISSED MATCH, not a slow one. Pin both sides.
+    ///
+    /// The negatives are the interesting half: every one of them contains a `^`
+    /// and is still not anchored, because some path out of the start reaches a
+    /// consuming instruction — or `Match` itself — without passing through one.
+    /// A walk that merely spotted the assertion would get all of these wrong.
+    #[test]
+    fn start_anchored_is_exact_about_which_patterns_can_only_match_at_zero() {
+        for pattern in [
+            r"^a",
+            r"^",
+            r"^$",
+            r"^a$",
+            r"\Aa",
+            r"\A\Aa",
+            r"^a*",
+            r"^a|^b",
+            r"^(?:a|b)",
+            r"^(?:a|ab)+$",
+            r"^\d+",
+            r"(?i)^ERROR",
+        ] {
+            assert!(
+                program(pattern).start_anchored,
+                "{pattern} can only match at offset 0",
+            );
+        }
+        for pattern in [
+            // An unanchored branch.
+            r"a|^b",
+            r"^a|b",
+            r"(^|x)y",
+            r"(?:^)|a",
+            // A loop or an option that can be skipped entirely, so `Match` is
+            // reachable without the assertion.
+            r"(^a)*",
+            r"(?:^a)?b",
+            // `(?m)^` is `StartLine`, satisfied after every newline.
+            r"(?m)^a",
+            r"(?m:^)a",
+            r"(?:(?m)^)a",
+            // No assertion at all, and the empty pattern, which matches
+            // everywhere — the opposite of anchored.
+            r"a",
+            r"\bcommit",
+            r"",
+            r"a$",
+        ] {
+            assert!(
+                !program(pattern).start_anchored,
+                "{pattern} can match somewhere other than offset 0",
+            );
+        }
     }
 
     /// One instruction per code point a pattern can consume — which is what
@@ -453,7 +779,10 @@ mod tests {
                 "{pattern:?} took {elapsed:?}: a body that emits nothing is \
                  being replayed instead of recognised as a fixed point"
             );
-            assert!(re.is_match(""), "{pattern:?} still matches the empty string");
+            assert!(
+                re.is_match(""),
+                "{pattern:?} still matches the empty string"
+            );
             assert!(re.is_match("abc"), "{pattern:?} still matches anywhere");
         }
 
@@ -476,15 +805,24 @@ mod tests {
         assert!(program("abc").first.is_some(), "a literal prefix");
         assert!(program("[a-z]+x").first.is_some());
         assert!(program("foo|bar").first.is_some(), "two alternatives");
-        assert!(program(r"\bfoo").first.is_some(), "an assertion consumes nothing");
+        assert!(
+            program(r"\bfoo").first.is_some(),
+            "an assertion consumes nothing"
+        );
         assert!(program("^foo").first.is_some());
         assert!(program(r"^\s*\bcommit\b").first.is_some());
-        assert!(program("a{0,3}b").first.is_some(), "the `b` is still required");
+        assert!(
+            program("a{0,3}b").first.is_some(),
+            "the `b` is still required"
+        );
 
         assert!(program("a*").first.is_none(), "matches empty");
         assert!(program("").first.is_none(), "matches empty");
         assert!(program("(?:)|a").first.is_none(), "an empty branch");
-        assert!(program(r"\b").first.is_none(), "an assertion alone matches empty");
+        assert!(
+            program(r"\b").first.is_none(),
+            "an assertion alone matches empty"
+        );
     }
 
     /// The byte map is the fast half of the prefilter, and its two invariants
@@ -495,8 +833,16 @@ mod tests {
     fn the_prefilter_byte_map_marks_lead_bytes_only() {
         let mut buf = [0u8; 4];
         for pattern in [
-            "abc", r"\bcommit", "[a-z]+x", "foo|bar", r"\d+z", r"[^\s]x",
-            "\u{4f60}\u{597d}", "(?i)Hello", r"[\w-]+@", ".x",
+            "abc",
+            r"\bcommit",
+            "[a-z]+x",
+            "foo|bar",
+            r"\d+z",
+            r"[^\s]x",
+            "\u{4f60}\u{597d}",
+            "(?i)Hello",
+            r"[\w-]+@",
+            ".x",
         ] {
             let prefilter = program(pattern).first.expect("armed");
             for b in 0x80..=0xbfu8 {
@@ -506,8 +852,18 @@ mod tests {
                 );
             }
             // Anything the pattern can start with must survive the byte test.
-            for cp in [0u32, b'a'.into(), b'Z'.into(), b'0'.into(), 0xe9, 0x4f60, 0x1f600] {
-                let Some(c) = char::from_u32(cp) else { continue };
+            for cp in [
+                0u32,
+                b'a'.into(),
+                b'Z'.into(),
+                b'0'.into(),
+                0xe9,
+                0x4f60,
+                0x1f600,
+            ] {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
                 let haystack = format!("{c}");
                 let re = crate::Regex::new(pattern).expect("compiles");
                 if re.is_match(&haystack)
@@ -543,9 +899,17 @@ mod tests {
                 .filter(|i| matches!(i, Inst::Split { .. }))
                 .count()
         };
-        assert_eq!(splits("a*"), 1, "a non-nullable body needs no separate entry");
+        assert_eq!(
+            splits("a*"),
+            1,
+            "a non-nullable body needs no separate entry"
+        );
         assert_eq!(splits(".*?"), 1);
-        assert_eq!(splits("a+"), 1, "the mandatory body already precedes the loop");
+        assert_eq!(
+            splits("a+"),
+            1,
+            "the mandatory body already precedes the loop"
+        );
         assert_eq!(splits("a?"), 1);
         assert_eq!(splits("a{2,}"), 1);
         // `(?:a?)` is nullable, so its star needs the entry split as well — and
@@ -557,9 +921,7 @@ mod tests {
     /// Nullability is what picks the shape, so pin the predicate itself.
     #[test]
     fn nullability_is_computed_over_the_whole_tree() {
-        let nullable = |p: &str| {
-            matches_empty(&parse(p, Flags::default()).expect("parses"))
-        };
+        let nullable = |p: &str| matches_empty(&parse(p, Flags::default()).expect("parses"));
         assert!(nullable("") && nullable("a*") && nullable("a{0,2}") && nullable("(?:)"));
         assert!(nullable(r"\b") && nullable("^") && nullable("a|") && nullable("a*b*"));
         assert!(!nullable("a") && !nullable("a+") && !nullable("[a-z]{2}"));

@@ -9,21 +9,24 @@
 
 use std::sync::{Arc, Mutex};
 
+use aterm_control::host::SessionPlacement;
 use aterm_core::terminal::Terminal;
 use aterm_session::{ConnectionKind, EdgeToken, Op, SessionId};
 use winit::event_loop::EventLoopProxy;
 
 use super::{Scope, json_ok, json_str_field, pct_encode};
 use crate::Wake;
+use crate::app_introspect::SessionWindowRow;
 use crate::session_edge_audit::{self, EdgeAction};
-use crate::session_store::Store;
+use crate::session_store::{ExitActor, SessionHandle, Store};
 use crate::session_timeline::{
     MetaEdit, MetaField, MetaWriteError, apply_meta_value, write_session_meta,
 };
 use crate::{SessionCtx, term_lock};
 
 /// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per
-/// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>`.
+/// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>
+/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|->`.
 /// On a single-session window this is exactly one line == the lone session (the
 /// zero-regression base case). The store snapshot is cloned out before formatting,
 /// so this never holds the registry lock across a `Terminal` lock.
@@ -34,19 +37,108 @@ use crate::{SessionCtx, term_lock};
 /// append: the title token before it is pct-encoded (never contains a space) and
 /// the one shipping parser (aterm-ctl `ls`) prints the line verbatim, keying only
 /// on the sid field — verified tolerant of trailing tokens.
-pub(crate) fn cmd_sessions(_self_ctx: &SessionCtx, store: &Store) -> String {
-    cmd_sessions_store(store)
+///
+/// `window=`/`active=`/`wfocus=` (F2: windows on the session verbs) come from ONE
+/// main-thread hop for the whole roster ([`Wake::ReadSessionWindows`]): the window
+/// the session is reported under (the `dims` rule — the front window when it shows
+/// the session, else the lowest id), whether it is on that window's active tab,
+/// and whether that window is front. `none` is the honest "no window hosts it";
+/// `-` is "the main thread could not be asked" (no event loop, or the hop timed
+/// out) — the line is still printed, because a roster with a column missing beats
+/// no roster. `detail=` (F5: who lives here) is the sanitized running command,
+/// the same [`crate::session_status::executing_detail`] the `status` record
+/// carries, read under a per-session `try_lock` (`-` when contended or idle).
+pub(crate) fn cmd_sessions(
+    _self_ctx: &SessionCtx,
+    store: &Store,
+    proxy: Option<&EventLoopProxy<Wake>>,
+) -> String {
+    cmd_sessions_store(store, proxy)
 }
 
 /// Context-free fleet projection used by Owner meta dispatch when no terminal
-/// exists. The wire bytes are identical to [`cmd_sessions`].
-pub(crate) fn cmd_sessions_store(store: &Store) -> String {
+/// exists. The wire bytes are identical to [`cmd_sessions`]. `proxy` is `None`
+/// only where there is no event loop to ask (a worker-thread test): the window
+/// columns then read `-`, never a guess.
+pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
     let snapshot = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         g.snapshot()
     };
+    // An empty roster needs no window rows; skipping the hop keeps `OK 0` as
+    // cheap as it was, and answerable before the event loop is up.
+    let rows = if snapshot.is_empty() {
+        Ok(Vec::new())
+    } else {
+        session_window_rows(proxy)
+    };
+    sessions_lines(&snapshot, rows.as_deref().map_err(|e| *e))
+}
+
+/// The placement hop's deadline: SHORT on purpose. `sessions`/`ls` is read by
+/// every discovery client under a 2 s per-peer budget (the menu-bar fleet scan;
+/// `aterm ctl ls`), so the hop must degrade to `window=-` well inside that
+/// rather than hold the 30 s `call_main` allowance and turn a live-but-busy
+/// instance into a false "could not reach". Half a second is far longer than a
+/// healthy event-loop turn (sub-millisecond) yet a quarter of the tightest
+/// client budget.
+const PLACEMENT_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The main-thread hop behind the roster's window columns: every hosted
+/// session's [`SessionWindowRow`], or why they could not be read. Bounded by
+/// [`PLACEMENT_HOP_TIMEOUT`] (not the 30 s default) so a busy main thread costs
+/// the roster its window columns, never the whole listing — the `Err` prints
+/// `window=- active=- wfocus=-` and every session still appears.
+pub(crate) fn session_window_rows(
+    proxy: Option<&EventLoopProxy<Wake>>,
+) -> Result<Vec<SessionWindowRow>, &'static str> {
+    let Some(proxy) = proxy else {
+        return Err("no event loop");
+    };
+    super::control_media::call_main_within(proxy, PLACEMENT_HOP_TIMEOUT, |reply| {
+        Wake::ReadSessionWindows { reply }
+    })
+}
+
+/// Where one rostered session lives and what it is doing, folded from the
+/// main-thread rows: the seam-level [`SessionPlacement`] the host trait
+/// projects and the roster line prints. A session with no row is DETACHED
+/// (`window: None`), which is a fact, not a failure — the hop's failure is the
+/// caller's `Err`, never a placement.
+pub(crate) fn placement_of(h: &SessionHandle, rows: &[SessionWindowRow]) -> SessionPlacement {
+    let row = rows.iter().find(|r| r.local == h.local_id);
+    SessionPlacement {
+        sid: h.local_id,
+        window: row.map(|r| r.window),
+        active_tab: row.is_some_and(|r| r.active_tab),
+        window_focused: row.is_some_and(|r| r.window_focused),
+        detail: session_detail(h),
+    }
+}
+
+/// The sanitized running command of `h`'s engine, `None` when idle or when the
+/// lock is contended — the roster runs on the control thread and must never
+/// park behind a PTY reader for a column.
+fn session_detail(h: &SessionHandle) -> Option<String> {
+    match h.term.try_lock() {
+        Ok(t) => crate::session_status::executing_detail(&t),
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            crate::session_status::executing_detail(&p.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The `sessions` wire body for `snapshot`: the store columns, then the
+/// placement columns from `rows` — or `-` for all three window columns when the
+/// rows could not be read (`Err`), with every line still printed. `detail=` is
+/// the engine's, so it is answered either way.
+pub(crate) fn sessions_lines(
+    snapshot: &[SessionHandle],
+    rows: Result<&[SessionWindowRow], &str>,
+) -> String {
     let mut out = format!("OK {}\n", snapshot.len());
-    for h in &snapshot {
+    for h in snapshot {
         let parent = h
             .parent
             .as_ref()
@@ -59,8 +151,29 @@ pub(crate) fn cmd_sessions_store(store: &Store) -> String {
                 .unwrap_or_else(|p| p.into_inner())
                 .any_set(),
         );
+        let (window, active, wfocus, detail) = match rows {
+            Ok(rows) => {
+                let p = placement_of(h, rows);
+                (
+                    p.window
+                        .map_or_else(|| "none".to_string(), |w| w.to_string()),
+                    u8::from(p.active_tab).to_string(),
+                    u8::from(p.window_focused).to_string(),
+                    p.detail,
+                )
+            }
+            Err(_) => (
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                session_detail(h),
+            ),
+        };
+        let detail = detail
+            .as_deref()
+            .map_or_else(|| "-".to_string(), pct_encode);
         out.push_str(&format!(
-            "{} {} {} {} {} meta={has_meta}\n",
+            "{} {} {} {} {} meta={has_meta} window={window} active={active} wfocus={wfocus} detail={detail}\n",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -810,13 +923,18 @@ pub(crate) struct TurnIo<'a> {
 }
 
 /// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>]
-/// [submit_window=<ms>] [presses=<n>] <text>` — one complete HUMAN TURN against
-/// the target session: type `<text>`, submit it with a real keypress, block until
-/// the app's response settles, and return the settled screen —
+/// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] <text>` — one complete HUMAN
+/// TURN against the target session: type `<text>`, submit it with a real keypress,
+/// block until the app's response settles, and return the settled screen —
 /// `OK <rows> turn submitted=<0|1> status=<settled|timeout> seq=<n> id=<n>
-/// dur_ms=<n> hash=<hex16>` then `<rows>` text rows (the same rows `text` prints).
-/// `hash` is the FNV-1a of the settled screen (the SAME value `history` reports for
-/// this `id`), so a driver can diff two turns' outputs inline without a second call.
+/// dur_ms=<n> hash=<hex16>[ trimmed=<k>]` then `<rows>` text rows (the same rows
+/// `text` prints). `hash` is the FNV-1a of the settled screen (the SAME value
+/// `history` reports for this `id`), so a driver can diff two turns' outputs inline
+/// without a second call. `trim=1` drops the settled screen's trailing all-blank
+/// rows exactly as `text trim` does — `<rows>` is then the count sent and
+/// `trimmed=<k>` closes the verdict — while `hash` stays over the UNTRIMMED screen:
+/// it names the screen, not the payload, so a trimmed and an untrimmed read of the
+/// same settled screen hash alike and `history` agrees with both.
 ///
 /// WHY A COMPOSITE VERB: driving one turn out of `paste` + `key enter` +
 /// `await idle` from a client is RACY at the submit seam — a TUI line editor
@@ -917,7 +1035,7 @@ pub(crate) fn cmd_turn_guarded(
     use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] <text>\n";
+    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] <text>\n";
     /// Echo-settle window: the paste burst has been ingested and painted.
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     /// Echo phase cap — a busy app (spinner mid-turn) may never go echo-quiet;
@@ -944,6 +1062,9 @@ pub(crate) fn cmd_turn_guarded(
     // `settle=match:<re>` keys phase-3 settle on a screen PATTERN instead of global
     // idle; None => the default idle settle. Compiled below, before any input.
     let mut settle_match: Option<String> = None;
+    // `trim=1` drops the settled screen's trailing blank rows from the reply (the
+    // `text trim` rule); off by default so a script that counts rows sees the grid.
+    let mut trim = false;
     let mut text = rest.trim_start();
     loop {
         let (tok, tail) = match text.split_once(char::is_whitespace) {
@@ -983,6 +1104,11 @@ pub(crate) fn cmd_turn_guarded(
             },
             "settle" => match v.strip_prefix("match:") {
                 Some(pat) if !pat.is_empty() => settle_match = Some(pat.to_string()),
+                _ => return USAGE.to_string(),
+            },
+            "trim" => match v {
+                "1" => trim = true,
+                "0" => trim = false,
                 _ => return USAGE.to_string(),
             },
             _ => break, // not an option: the message itself starts with `word=…`
@@ -1318,12 +1444,18 @@ pub(crate) fn cmd_turn_guarded(
             .unwrap_or_else(|p| p.into_inner())
             .notify(session);
     }
-    let mut out = format!(
-        "OK {rows} turn submitted={} status={status} seq={seq} id={turn_id} dur_ms={dur_ms} hash={screen_hash:016x}\n",
+    // `trim=1` drops the settled screen's trailing blank rows and closes the verdict
+    // with `trimmed=<k>` — the same rule and framing as `text trim`, through the one
+    // shared framer. `screen_hash` above was taken over the UNTRIMMED screen on
+    // purpose: it is the settled screen's IDENTITY — the value `history` reports for
+    // this id and the one a driver diffs across turns — not a checksum of the bytes
+    // sent, so the same settled screen hashes the same whether or not the caller
+    // asked for its blank tail.
+    let verdict = format!(
+        "turn submitted={} status={status} seq={seq} id={turn_id} dur_ms={dur_ms} hash={screen_hash:016x}",
         u8::from(submitted)
     );
-    out.push_str(&screen);
-    out
+    super::control_query::frame_rows_reply(&screen, rows, &verdict, trim)
 }
 
 /// `history [<n>] [since=<id>]` -> the session's TURN LEDGER, newest-last, framed
@@ -1623,8 +1755,10 @@ pub(crate) fn cmd_cast_frames(ctx: &SessionCtx, rest: &str) -> String {
     format!("OK {}\n{body}", body.lines().count())
 }
 
-/// `temporal [tick]` -> `OK <nbytes>\n` then the session's screen RECONSTRUCTED at
-/// logical `tick` (default: the latest recorded instant) — the read half of the
+/// `temporal [tick] [trim]` -> `OK <nbytes>[ trimmed=<k>]\n` then the session's
+/// screen RECONSTRUCTED at logical `tick` (default: the latest recorded instant) —
+/// with `trim`, minus its trailing all-blank rows (the `text trim` rule; the byte
+/// count on the header is the trimmed body's) — the read half of the
 /// hydratable temporal spine (design Addendum B / B.9), the endpoint the
 /// `TemporalRecorder` producer feeds. Replay seeds from the nearest retained
 /// keyframe `<= tick` and folds the recorded `RawIn`/`Resize` events forward
@@ -1642,11 +1776,19 @@ pub(crate) fn cmd_cast_frames(ctx: &SessionCtx, rest: &str) -> String {
 /// a wrong reconstruction). `<nbytes>` is the UTF-8 body length, matching the
 /// read-verb framing so the existing client reads the body without guessing.
 pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
+    const USAGE: &str = "ERR usage: temporal [status | <tick>] [trim]  (tick = µs since \
+                         session start; `temporal status` reports the reachable range)\n";
+    // `trim` is the LAST token of either form. `temporal status trim` has no rows
+    // to trim, so it is a usage error rather than a token that quietly vanishes.
+    let (rest, trim) = super::control_query::split_trim_tail(rest);
     // `temporal status` -> the reachable window + whether recording is on, so a
     // caller can DISCOVER a valid tick (µs since session start) and tell an OFF
     // recorder from an aged-out one without guessing. Additive subform; the bare
     // `temporal` / `temporal <tick>` wire shapes are unchanged.
-    if rest.trim() == "status" {
+    if rest == "status" {
+        if trim {
+            return USAGE.to_string();
+        }
         let rec = ctx.temporal.lock().unwrap_or_else(|p| p.into_inner());
         let enabled = rec.total_events() > 0;
         return format!(
@@ -1657,15 +1799,11 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
             rec.dropped_events(),
         );
     }
-    let at = match rest.trim() {
+    let at = match rest {
         "" => None,
         s => match s.parse::<u64>() {
             Ok(t) => Some(aterm_buffer::Ticks(t)),
-            Err(_) => {
-                return "ERR usage: temporal [status | <tick>]  (tick = µs since \
-                        session start; `temporal status` reports the reachable range)\n"
-                    .to_string();
-            }
+            Err(_) => return USAGE.to_string(),
         },
     };
     // An enabled recorder ALWAYS seeds a t0 keyframe at spawn, so `total_events()
@@ -1694,6 +1832,15 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
     for r in 0..rows {
         body.push_str(&super::visible_row(&term, r));
         body.push('\n');
+    }
+    if trim {
+        // Byte-framed, so the header's count is the TRIMMED body's length and the
+        // client's `byte_count` (first token only) reads it unchanged; `trimmed=<k>`
+        // closes the line as on the row-framed verbs.
+        let sent = super::control_query::trimmed_len(body.lines());
+        let keep: usize = body.split_inclusive('\n').take(sent).map(str::len).sum();
+        body.truncate(keep);
+        return format!("OK {} trimmed={}\n{}", body.len(), rows - sent, body);
     }
     format!("OK {}\n{}", body.len(), body)
 }
@@ -2026,6 +2173,110 @@ pub(crate) fn cmd_raise(
     }
 }
 
+const EXITS_USAGE: &str = "ERR usage: exits [<n>] [since=<id>]\n";
+
+/// `exits [<n>] [since=<id>]` -> the instance's EXIT LEDGER, oldest-first, framed
+/// `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…>
+/// exit_code=<n|-> by=<sid|human|->` line per session that LEFT the registry —
+/// the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps
+/// rows with id strictly greater) over the roster journal, whose seq is the
+/// row id. Owner-only, like `sessions`: it names every sid the instance ever
+/// hosted. This is the tale the dead could not tell: a driver whose peer
+/// answered `ERR no such session` asks here WHEN it went (`t=`, the timeline's
+/// clock), WHY (`reason=`), with what status (`exit_code=`, `-` when the child
+/// was hung up by a close, died by signal, was not ours to reap, or had not yet
+/// exited at either of the ledger's two non-blocking looks — see
+/// `App::shell_exit_code`) and BY WHOM (`by=`, the closing connection's sid,
+/// `human`, or `-`).
+/// Bounded like the journal it reads (drop-oldest): a row older than the
+/// retained window is gone, and `OK 0` means no exit is retained, not that
+/// none happened.
+pub(crate) fn cmd_exits(store: &Store, rest: &str) -> String {
+    let mut n = 0usize;
+    let mut since = 0u64;
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("since=") {
+            match v.parse::<u64>() {
+                Ok(id) => since = id,
+                Err(_) => return EXITS_USAGE.to_string(),
+            }
+        } else if let Ok(v) = tok.parse::<usize>() {
+            n = v;
+        } else {
+            return EXITS_USAGE.to_string();
+        }
+    }
+    // Formatted UNDER the read guard (the rows borrow the journal) and dropped
+    // before the reply is assembled — a short, allocation-only hold, never
+    // across a Terminal lock or a socket write.
+    let rows = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        exit_rows(g.roster_since(since), n)
+    };
+    let mut out = format!("OK {}\n", rows.len());
+    for row in rows {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
+}
+
+/// The pure half of [`cmd_exits`]: the `Exited` rows of a journal walk, oldest
+/// first, trimmed to the newest `n` when `n > 0`. One line per row, fields at
+/// the END additive and pct-encoded where free-form (`by=` may carry a sid).
+fn exit_rows<'a>(
+    records: impl Iterator<Item = &'a crate::session_store::RosterRecord>,
+    n: usize,
+) -> Vec<String> {
+    let mut rows: Vec<String> = records
+        .filter(|r| r.change == crate::session_store::RosterChange::Exited)
+        .map(|r| {
+            let exit_code = r
+                .exit_code
+                .map_or_else(|| "-".to_string(), |c| c.to_string());
+            format!(
+                "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={}",
+                r.seq,
+                r.t_ms,
+                r.sid,
+                r.local_id,
+                r.reason.as_str(),
+                pct_encode(r.actor.as_wire()),
+            )
+        })
+        .collect();
+    if n > 0 && rows.len() > n {
+        rows.drain(..rows.len() - n);
+    }
+    rows
+}
+
+/// The exit ledger's `by=` for a control-socket `close`: the CALLER's own sid,
+/// when the connection carries one. An edge-scoped connection does — its token
+/// was granted TO a session ([`aterm_session::EdgeTable::src_of`], read from the
+/// resolved target's table, the one that authorized this request), and that
+/// session is the caller. An owner-token connection is anonymous by
+/// construction: the per-instance token names the instance's owner, not a
+/// session, so it writes `Unknown` (`by=-`). NEVER the front tab (the sid a bare
+/// `whoami` answers): `spawn` makes the new session the front tab, so an
+/// `@<new> close` would name the closed session as its own closer, and an
+/// agent's pane is rarely the tab on screen anyway. `by=-` beside
+/// `reason=ctl-close` is the honest row: a control client did it, and which one
+/// was not on the wire.
+pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
+    match scope {
+        Scope::Owner => ExitActor::Unknown,
+        Scope::Edge(presented) => target
+            .edges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .src_of(&presented)
+            .map_or(ExitActor::Unknown, |src| {
+                ExitActor::Sid(src.as_str().to_string())
+            }),
+    }
+}
+
 /// `whoami` -> report this session's fabric id + nonce + the connection's EFFECTIVE
 /// scope against the session active RIGHT NOW. For an edge, the op is re-derived from
 /// the presented token via `authorize` (the same per-request authority the gate uses)
@@ -2044,4 +2295,451 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
         }
     };
     format!("OK {} {} {}\n", ctx.self_id.as_str(), ctx.nonce.to_hex(), s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aterm_session::{EdgeTable, LaunchNonce};
+
+    /// A registered handle over a bare engine (sentinel `master = -1`): the same
+    /// shape `control_host`'s roster tests build, so these lines are the real
+    /// store projection and not a fixture string.
+    fn handle(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
+        let sid = SessionId::generate();
+        let nonce = LaunchNonce::generate();
+        let ctx = Arc::new(crate::SessionCtx {
+            sink: Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+            edges: std::sync::Mutex::new(EdgeTable::new()),
+            turn_lease: std::sync::Mutex::new(None),
+            self_id: sid.clone(),
+            nonce,
+            cast: Arc::new(std::sync::Mutex::new(crate::cast::CastRecorder::new(
+                80, 24,
+            ))),
+            temporal: Arc::new(std::sync::Mutex::new(
+                crate::temporal::TemporalRecorder::new(),
+            )),
+            byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
+            turns: Arc::new(std::sync::Mutex::new(
+                crate::turn_ledger::TurnLedger::default(),
+            )),
+            meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
+            timeline: Arc::new(std::sync::Mutex::new(
+                crate::session_timeline::SessionTimeline::default(),
+            )),
+        });
+        SessionHandle {
+            sid,
+            nonce,
+            local_id,
+            parent: None,
+            state: crate::session_store::SessionState::Alive,
+            title: format!("tab-{local_id}"),
+            term: term.clone(),
+            master: -1,
+            ctx,
+        }
+    }
+
+    fn row(local: u64, window: u64, active_tab: bool, window_focused: bool) -> SessionWindowRow {
+        SessionWindowRow {
+            local,
+            window,
+            active_tab,
+            window_focused,
+        }
+    }
+
+    /// The tail every line carries, after the sid (which is minted per run).
+    fn tail(line: &str) -> String {
+        let mut f = line.splitn(3, ' ');
+        let local = f.next().unwrap();
+        let _sid = f.next().unwrap();
+        format!("{local} {}", f.next().unwrap())
+    }
+
+    /// With rows present, each line names its window, active-tab and front
+    /// bits; a session the rows do not mention is DETACHED (`window=none`),
+    /// not unknown. The store columns before `meta=` are unchanged.
+    #[test]
+    fn sessions_lines_carry_the_placement_columns_from_the_rows() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let t2 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let snapshot = vec![handle(0, &t0), handle(1, &t1), handle(2, &t2)];
+        let rows = vec![row(0, 0, true, false), row(1, 3, false, true)];
+        let out = sessions_lines(&snapshot, Ok(&rows));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "OK 3");
+        assert_eq!(
+            tail(lines[1]),
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=-"
+        );
+        assert_eq!(
+            tail(lines[2]),
+            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=-"
+        );
+        assert_eq!(
+            tail(lines[3]),
+            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=-"
+        );
+    }
+
+    /// A failed hop costs the window columns (`-`), never a line: the count and
+    /// every store column survive, and `detail=` — the engine's, not the window
+    /// layer's — is still answered.
+    #[test]
+    fn sessions_lines_keep_every_line_when_the_hop_fails() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        t1.lock()
+            .unwrap()
+            .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 30\n\x1b]133;C\x07");
+        let snapshot = vec![handle(0, &t0), handle(1, &t1)];
+        let out = sessions_lines(
+            &snapshot,
+            Err("main-thread reply did not arrive within 30s"),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "OK 2");
+        assert_eq!(
+            tail(lines[1]),
+            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=-"
+        );
+        assert_eq!(
+            tail(lines[2]),
+            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep"
+        );
+    }
+
+    /// `detail=` is the sanitized executing command (no arguments), `-` when
+    /// the block is not executing — and `-` when the engine lock is contended,
+    /// because the roster must never wait on a PTY reader for a column.
+    #[test]
+    fn sessions_lines_detail_is_the_running_command_or_a_dash() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        term.lock().unwrap().process(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07targo --unverified test -p aterm-gui\n\x1b]133;C\x07",
+        );
+        let snapshot = vec![handle(0, &term)];
+        let rows = vec![row(0, 0, true, true)];
+        let out = sessions_lines(&snapshot, Ok(&rows));
+        assert!(
+            out.ends_with(" window=0 active=1 wfocus=1 detail=targo%20test\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("aterm-gui"),
+            "arguments never reach the wire: {out}"
+        );
+
+        let held = term.lock().unwrap();
+        let out = sessions_lines(&snapshot, Ok(&rows));
+        assert!(out.ends_with(" detail=-\n"), "contended reads `-`: {out}");
+        drop(held);
+
+        term.lock().unwrap().process(b"done\n\x1b]133;D;0\x07");
+        let out = sessions_lines(&snapshot, Ok(&rows));
+        assert!(out.ends_with(" detail=-\n"), "complete reads `-`: {out}");
+    }
+
+    /// The verb over a real store with no event loop to ask: the roster prints
+    /// with the window columns unset, and an empty store is still `OK 0` (no
+    /// hop is attempted for nothing).
+    #[test]
+    fn cmd_sessions_store_without_an_event_loop_prints_dashes_not_guesses() {
+        let store = crate::session_store::new_store();
+        assert_eq!(cmd_sessions_store(&store, None), "OK 0\n");
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        store.write().unwrap().register(handle(4, &term));
+        let out = cmd_sessions_store(&store, None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "OK 1");
+        assert_eq!(
+            tail(lines[1]),
+            "4 - alive tab-4 meta=0 window=- active=- wfocus=- detail=-"
+        );
+        // The placement fold agrees with the line: no row is DETACHED.
+        let p = placement_of(&handle(4, &term), &[]);
+        assert_eq!(
+            p,
+            SessionPlacement {
+                sid: 4,
+                ..SessionPlacement::default()
+            }
+        );
+    }
+
+    /// A minimal `SessionCtx` for the `temporal` verb: only the recorder is
+    /// exercised, the rest is the same neutral shape [`handle`] builds.
+    fn temporal_ctx() -> crate::SessionCtx {
+        crate::SessionCtx {
+            sink: Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+            edges: std::sync::Mutex::new(EdgeTable::new()),
+            turn_lease: std::sync::Mutex::new(None),
+            self_id: SessionId::generate(),
+            nonce: LaunchNonce::generate(),
+            cast: Arc::new(std::sync::Mutex::new(crate::cast::CastRecorder::new(
+                80, 24,
+            ))),
+            temporal: Arc::new(std::sync::Mutex::new(
+                crate::temporal::TemporalRecorder::new(),
+            )),
+            byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
+            turns: Arc::new(std::sync::Mutex::new(
+                crate::turn_ledger::TurnLedger::default(),
+            )),
+            meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
+            timeline: Arc::new(std::sync::Mutex::new(
+                crate::session_timeline::SessionTimeline::default(),
+            )),
+        }
+    }
+
+    /// `temporal <tick> trim` (byte-framed `OK <nbytes> trimmed=<k>`) and the
+    /// `temporal status trim` usage rule had no test. Build a recorder with a
+    /// blank keyframe plus a couple of `RawIn` lines: the bare form serializes
+    /// the whole reconstructed grid; the `trim` form drops the trailing blank
+    /// rows and its header byte count is the TRIMMED body's own byte length
+    /// (the client reads the body by that count, so the two must agree). And
+    /// `temporal status trim` — status has no rows to trim — is a usage error,
+    /// never a silently-swallowed token.
+    #[test]
+    fn temporal_trim_byte_frames_the_trimmed_body_and_status_trim_is_usage() {
+        let ctx = temporal_ctx();
+        let rows: usize = 8;
+        {
+            let mut rec = ctx.temporal.lock().unwrap();
+            let mut t = aterm_core::terminal::Terminal::new(rows as u16, 20);
+            // A ground blank grid is the replay base; the two lines below fill
+            // only the first two of eight rows, so six trailing rows stay blank.
+            rec.record_keyframe(t.checkpoint());
+            let input = b"first line\r\nsecond line\r\n";
+            t.process(input);
+            rec.record_raw_in(input);
+        }
+
+        // Bare: the whole grid, one line per row (row-count framed).
+        let bare = cmd_temporal(&ctx, "");
+        assert!(bare.starts_with("OK "), "bare temporal: {bare:?}");
+
+        // Trim: `OK <nbytes> trimmed=<k>` then the trimmed body.
+        let trimmed = cmd_temporal(&ctx, "trim");
+        let (header, body) = trimmed
+            .split_once('\n')
+            .expect("a header line then the body");
+        let mut tok = header.split_whitespace();
+        assert_eq!(tok.next(), Some("OK"));
+        let nbytes: usize = tok
+            .next()
+            .expect("byte count")
+            .parse()
+            .expect("nbytes is a number");
+        assert_eq!(tok.next(), Some("trimmed=6"), "six blank rows dropped");
+        // The header's byte count IS the trimmed body's byte length.
+        assert_eq!(nbytes, body.len(), "header nbytes == body bytes");
+        // The trailing all-blank rows are gone: exactly the two written rows
+        // remain and the body ends on the last non-blank one.
+        assert_eq!(body.lines().count(), 2, "only the two written rows survive");
+        assert!(
+            body.trim_end_matches('\n').ends_with("second line"),
+            "body ends on the last non-blank row: {body:?}"
+        );
+
+        // `temporal status trim` has no rows to trim → usage, not a swallow.
+        let status_trim = cmd_temporal(&ctx, "status trim");
+        assert!(
+            status_trim.starts_with("ERR usage: temporal"),
+            "status trim is a usage error: {status_trim:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exits_tests {
+    use aterm_session::{EdgeToken, Op};
+
+    use super::{Scope, caller_actor, cmd_exits};
+    use crate::session_store::{ExitActor, ExitReason, RosterChange, new_store, test_handle};
+
+    /// `exits` on an instance that has lost nothing is `OK 0` — including one
+    /// whose journal holds only births (a `Created` row is not an exit).
+    #[test]
+    fn no_exits_is_ok_zero() {
+        let store = new_store();
+        assert_eq!(cmd_exits(&store, ""), "OK 0\n");
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(test_handle(1));
+        assert_eq!(cmd_exits(&store, ""), "OK 0\n", "a birth is not an exit");
+    }
+
+    /// Every reason token the ledger can hold renders on its own line in the
+    /// documented shape, with the actor and exit-code spellings for each of the
+    /// three actor kinds and both `exit_code` cases. Walks `ExitReason::ALL`, so
+    /// a reason added without a row here fails to compile past the array.
+    #[test]
+    fn formats_every_reason_actor_and_exit_code() {
+        let store = new_store();
+        let mut sids = Vec::new();
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            for (i, reason) in ExitReason::ALL.iter().enumerate() {
+                let local = i as u64 + 10;
+                let h = test_handle(local);
+                sids.push(h.sid.as_str().to_string());
+                g.register(h);
+                let actor = match i % 3 {
+                    0 => ExitActor::Sid(format!("s-driver{i}")),
+                    1 => ExitActor::Human,
+                    _ => ExitActor::Unknown,
+                };
+                if i % 2 == 0 {
+                    g.note_exit_code(local, Some(i32::try_from(i).unwrap()));
+                }
+                g.deregister_local_as(local, *reason, actor);
+            }
+        }
+        let reply = cmd_exits(&store, "");
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(lines[0], format!("OK {}", ExitReason::ALL.len()));
+        let ledger: Vec<(u64, u64)> = {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            g.roster_since(0)
+                .filter(|r| r.change == RosterChange::Exited)
+                .map(|r| (r.seq, r.t_ms))
+                .collect()
+        };
+        for (i, reason) in ExitReason::ALL.iter().enumerate() {
+            let (seq, t) = ledger[i];
+            let by = match i % 3 {
+                0 => format!("s-driver{i}"),
+                1 => "human".to_string(),
+                _ => "-".to_string(),
+            };
+            let code = if i % 2 == 0 {
+                i.to_string()
+            } else {
+                "-".to_string()
+            };
+            assert_eq!(
+                lines[i + 1],
+                format!(
+                    "exit {seq} t={t} sid={} local={} reason={} exit_code={code} by={by}",
+                    sids[i],
+                    i + 10,
+                    reason.as_str()
+                ),
+                "row for {reason:?}"
+            );
+        }
+    }
+
+    /// The `history`/`timeline` grammar: `<n>` keeps the newest n, `since=<id>`
+    /// keeps rows with id strictly greater (the seq the row itself prints, so a
+    /// reader pages with the last id it saw), and anything else is `ERR usage`
+    /// — never a silently ignored argument.
+    #[test]
+    fn window_cursor_and_usage() {
+        let store = new_store();
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            for local in 1..=3 {
+                g.register(test_handle(local));
+                g.deregister_local_as(local, ExitReason::UiClose, ExitActor::Human);
+            }
+        }
+        let all = cmd_exits(&store, "");
+        let ids: Vec<u64> = all
+            .lines()
+            .skip(1)
+            .map(|l| l.split(' ').nth(1).unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        // Newest one.
+        let last = cmd_exits(&store, "1");
+        assert!(last.starts_with("OK 1\n"), "{last:?}");
+        assert!(last.contains(&format!("exit {} ", ids[2])), "{last:?}");
+        // Strictly newer than the second.
+        let newer = cmd_exits(&store, &format!("since={}", ids[1]));
+        assert!(newer.starts_with("OK 1\n"), "{newer:?}");
+        assert!(newer.contains(&format!("exit {} ", ids[2])), "{newer:?}");
+        // Caught up.
+        assert_eq!(cmd_exits(&store, &format!("since={}", ids[2])), "OK 0\n");
+        // Both together.
+        let both = cmd_exits(&store, &format!("5 since={}", ids[0]));
+        assert!(both.starts_with("OK 2\n"), "{both:?}");
+        // Usage.
+        for bad in ["bogus", "since=x", "since=", "1 extra", "-1"] {
+            assert_eq!(
+                cmd_exits(&store, bad),
+                "ERR usage: exits [<n>] [since=<id>]\n",
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `by=` names the CALLER, never the closed session. An edge-scoped
+    /// connection's caller is the session its token was granted to (read from
+    /// the TARGET's table); an owner-token connection is anonymous and writes
+    /// `-`; a token the target's table does not know is `-` too. In no case is
+    /// it the closed session's own sid — the E2E twin drives a private instance
+    /// through `spawn` → `@<new> close` and checks the `exits` row agrees.
+    #[test]
+    fn caller_actor_is_the_edge_source_never_the_target_and_anonymous_for_owner() {
+        let store = new_store();
+        let caller = test_handle(1);
+        let target = test_handle(2);
+        let (caller_sid, target_sid) = (
+            caller.sid.as_str().to_string(),
+            target.sid.as_str().to_string(),
+        );
+        let tok = target
+            .ctx
+            .edges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .grant(
+                caller.sid.clone(),
+                target.sid.clone(),
+                Op::WriteInput,
+                target.ctx.nonce,
+            );
+        let by = caller_actor(Scope::Edge(tok), &target.ctx);
+        assert_eq!(by, ExitActor::Sid(caller_sid.clone()));
+        assert_ne!(
+            by.as_wire(),
+            target_sid,
+            "the closer is the token's source session, not the session being closed"
+        );
+        assert_eq!(
+            caller_actor(Scope::Owner, &target.ctx),
+            ExitActor::Unknown,
+            "an owner-token connection carries no session identity"
+        );
+        assert_eq!(
+            caller_actor(Scope::Edge(EdgeToken::generate()), &target.ctx),
+            ExitActor::Unknown,
+            "a token the target's table never issued names nobody"
+        );
+        // The row an edge-attributed close writes carries the caller's sid, and
+        // it differs from the sid of the row itself.
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            g.register(caller);
+            g.register(target);
+            g.deregister_local_as(2, ExitReason::CtlClose, by);
+        }
+        let reply = cmd_exits(&store, "");
+        let row = reply.lines().nth(1).expect("one exit row");
+        assert!(row.contains(&format!(" sid={target_sid} ")), "{row}");
+        assert!(
+            row.ends_with(&format!(" reason=ctl-close exit_code=- by={caller_sid}")),
+            "{row}"
+        );
+    }
 }

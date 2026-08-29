@@ -1563,7 +1563,7 @@ impl CatalogMemo {
         pinned_update_pubkeys: &[&str],
     ) -> Option<Self> {
         let raw = std::fs::read(path).ok()?;
-        let memo: Self = serde_json::from_slice(&raw).ok()?;
+        let memo: Self = aterm_json::from_slice(&raw).ok()?;
         if memo.schema != CATALOG_MEMO_SCHEMA
             || memo.owner != source.owner
             || memo.repo != source.repo
@@ -1617,7 +1617,7 @@ impl CatalogMemo {
             etags,
             selection: selection.map(MemoSelection::from_authoritative),
         };
-        let Ok(text) = serde_json::to_vec(&memo) else {
+        let Ok(text) = aterm_json::to_vec(&memo) else {
             return;
         };
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -1861,7 +1861,7 @@ fn walk_catalog(ctx: &mut ListContext<'_>) -> Result<Option<Catalog>, String> {
         }
         // Unparseable list JSON is the same `network` class (the LIST layer failed —
         // a proxy/portal mangling the response looks exactly like this).
-        let releases: Vec<Release> = match serde_json::from_slice(&body) {
+        let releases: Vec<Release> = match aterm_json::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("parse releases JSON: {e}");
@@ -2745,9 +2745,14 @@ mod tests {
     }
 
     use super::*;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as B64;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`), held
+    /// byte-identical to the retired `base64` package's `general_purpose::STANDARD`
+    /// by `crates/aterm-codec/tests/base64_oracle.rs`.
+    fn b64(raw: &[u8]) -> String {
+        aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
+    }
 
     const SIGNING_SEED: [u8; 32] = [19u8; 32];
 
@@ -3415,7 +3420,7 @@ mod tests {
         // A pinned channel projects the same action with exactly one subordinate
         // signature fetch, and still does not invoke either older release.
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
-        let public_key = B64.encode(keypair.public_key().as_ref());
+        let public_key = b64(keypair.public_key().as_ref());
         let manifest = manifest_bytes("0.10.0", 10, 0);
         let signature = keypair.sign(&manifest).as_ref().to_vec();
         let signed_base = [
@@ -3781,7 +3786,7 @@ mod tests {
     #[test]
     fn signed_authority_fetches_one_manifest_and_one_signature_only() {
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
-        let public_key = B64.encode(keypair.public_key().as_ref());
+        let public_key = b64(keypair.public_key().as_ref());
         let manifest = manifest_bytes("0.10.0", 10, 0);
         let signature = keypair.sign(&manifest).as_ref().to_vec();
         let releases = vec![
@@ -3902,7 +3907,7 @@ mod tests {
     #[test]
     fn unsigned_or_duplicate_signature_on_highest_never_falls_back() {
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
-        let public_key = B64.encode(keypair.public_key().as_ref());
+        let public_key = b64(keypair.public_key().as_ref());
         let lower = release_with_signed_appcast("v0.9.0", "lower-manifest", "lower-signature");
 
         let err = select_authoritative_release(
@@ -4100,7 +4105,7 @@ mod tests {
         // signature from a retired release (it is skipped before the signature
         // policy applies).
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
-        let public_key = B64.encode(keypair.public_key().as_ref());
+        let public_key = b64(keypair.public_key().as_ref());
         let selected = select_authoritative_release(
             vec![release_with_appcast("v0.61", "retired-unsigned")],
             &[public_key.as_str()],
@@ -4434,7 +4439,7 @@ mod tests {
              {"name": "aterm-appcast.toml", "url": "https://api.github.com/repos/o/r/releases/assets/3"}
           ]}
         ]"#;
-        let rels: Vec<Release> = serde_json::from_str(json).unwrap();
+        let rels: Vec<Release> = aterm_json::from_str(json).unwrap();
         assert_eq!(rels.len(), 2);
         assert_eq!(rels[0].tag_name, "v1.0.0");
         assert!(!rels[0].draft);
@@ -4816,8 +4821,8 @@ mod tests {
     fn a_release_signed_by_either_keyset_member_is_authoritative() {
         let outgoing = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
         let incoming = Ed25519KeyPair::from_seed_unchecked(&[42u8; 32]).unwrap();
-        let k_out = B64.encode(outgoing.public_key().as_ref());
-        let k_in = B64.encode(incoming.public_key().as_ref());
+        let k_out = b64(outgoing.public_key().as_ref());
+        let k_in = b64(incoming.public_key().as_ref());
         let manifest = manifest_bytes("0.10.0", 10, 0);
         // Head = incoming (post-promotion), outgoing still inside its window.
         let keyset = [k_in.as_str(), k_out.as_str()];
@@ -4853,7 +4858,7 @@ mod tests {
     fn a_retired_key_is_refused_once_dropped_from_the_keyset() {
         let retired = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
         let current = Ed25519KeyPair::from_seed_unchecked(&[42u8; 32]).unwrap();
-        let k_current = B64.encode(current.public_key().as_ref());
+        let k_current = b64(current.public_key().as_ref());
         let manifest = manifest_bytes("0.10.0", 10, 0);
         let signature = retired.sign(&manifest).as_ref().to_vec();
 
@@ -4942,7 +4947,7 @@ mod tests {
     fn roster_fixture(revoke_m3: bool) -> RosterFixture {
         let master = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE).unwrap();
         let m3 = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE).unwrap();
-        let machine_pub = B64.encode(m3.public_key().as_ref());
+        let machine_pub = b64(m3.public_key().as_ref());
         let seq = 4u64;
         let roster = aterm_update_core::roster::Roster {
             schema: 1,
@@ -4959,7 +4964,7 @@ mod tests {
         let roster_bytes = roster.to_toml().unwrap().into_bytes();
         let manifest = attributed_manifest("m3", seq);
         RosterFixture {
-            master_pub: B64.encode(master.public_key().as_ref()),
+            master_pub: b64(master.public_key().as_ref()),
             roster_sig: master.sign(&roster_bytes).as_ref().to_vec(),
             roster: roster_bytes,
             manifest_sig: m3.sign(&manifest).as_ref().to_vec(),
@@ -5189,7 +5194,7 @@ mod tests {
     fn a_release_whose_declared_machine_disagrees_with_the_signer_is_refused() {
         let master = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE).unwrap();
         let m3 = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE).unwrap();
-        let machine_pub = B64.encode(m3.public_key().as_ref());
+        let machine_pub = b64(m3.public_key().as_ref());
         let roster = aterm_update_core::roster::Roster {
             schema: 1,
             roster_seq: 4,
@@ -5209,7 +5214,7 @@ mod tests {
         let lying_sig = m3.sign(&lying).as_ref().to_vec();
 
         let keyset = [machine_pub.as_str()];
-        let master_pub = B64.encode(master.public_key().as_ref());
+        let master_pub = b64(master.public_key().as_ref());
         let masters = [master_pub.as_str()];
         let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
             .unwrap()
@@ -5295,12 +5300,10 @@ mod tests {
     }
 
     fn pub_b64(seed: &[u8; 32]) -> String {
-        B64.encode(
-            Ed25519KeyPair::from_seed_unchecked(seed)
-                .unwrap()
-                .public_key()
-                .as_ref(),
-        )
+        b64(Ed25519KeyPair::from_seed_unchecked(seed)
+            .unwrap()
+            .public_key()
+            .as_ref())
     }
 
     fn chain(
@@ -5331,7 +5334,7 @@ mod tests {
         let manifest = attributed_manifest(signer.0, claimed_seq);
         let signing = Ed25519KeyPair::from_seed_unchecked(&signer.1).unwrap();
         Chain {
-            master_pub: B64.encode(master.public_key().as_ref()),
+            master_pub: b64(master.public_key().as_ref()),
             roster_sig: master.sign(&roster_bytes).as_ref().to_vec(),
             roster: roster_bytes,
             manifest_sig: signing.sign(&manifest).as_ref().to_vec(),
@@ -6479,7 +6482,7 @@ mod tests {
         // a renamed appcast asset are each fatal to the memo.
         let mut memo = good.unwrap();
         let write = |memo: &CatalogMemo| {
-            std::fs::write(&path, serde_json::to_vec(memo).unwrap()).unwrap();
+            std::fs::write(&path, aterm_json::to_vec(memo).unwrap()).unwrap();
         };
         memo.schema = CATALOG_MEMO_SCHEMA + 1;
         write(&memo);

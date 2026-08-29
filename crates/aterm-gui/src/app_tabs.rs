@@ -293,6 +293,56 @@ fn remove_terminal_projection(ws: &mut WindowState, projection_index: usize) {
     }
 }
 
+/// Cancel a DEFERRED last-tab close on `ws`: drop the flag AND the attribution
+/// stashed beside it, because the two are one fact. A window whose
+/// `pending_close` is cleared without a teardown never reaches
+/// [`crate::App::close_window_logical`], the only consumer of
+/// [`crate::WindowState::pending_close_attribution`] — so an attribution left
+/// behind outlives the close that captured it and gets journalled on the
+/// window's NEXT scope-less close, which is how a cancelled ctl `close` could
+/// make a later shell exit read `reason=ctl-close`.
+///
+/// EXACTLY ONE production site calls this, and this names it rather than
+/// claiming every abandonment does: `App::open_settings_tab`, where installing
+/// or refocusing a real tab in a window parked behind `pending_close` revokes
+/// that parked teardown. `escalate_pending_close` is deliberately not a caller
+/// — it clears the flag in order to RUN the teardown that consumes the
+/// attribution — and the seam that leaves is bounded: `close_window` can return
+/// without tearing down, so the stash sits on a window carrying no flag. That
+/// is correct for the barriers that RE-DRIVE this same close (a coalesced
+/// update handoff replays `close_window` from `finish_update_handoff`; a
+/// document checkpoint resumes through `take_ready_document_shutdowns`), which
+/// still reach `close_window_logical` and consume the stash — clearing it here
+/// would strip the attribution off a close that is merely late. It is NOT
+/// correct for a barrier that abandons the close instead (a native reducer's
+/// `Blocked` verdict, answered by a recovery palette and a fresh human
+/// gesture): that attribution stays parked until the window's next close.
+pub(crate) fn cancel_pending_close(ws: &mut WindowState) {
+    ws.pending_close = false;
+    ws.pending_close_attribution = None;
+}
+
+/// How far [`App::close_session_by_id`] got — NOT the wire verdict. A last-tab
+/// close only FLAGS its window (`pending_close`); the teardown that retires the
+/// session, and journals its exit, runs on a caller holding an
+/// `ActiveEventLoop`. Reading the store between those two moments says the
+/// session is still registered, which is why the answer is
+/// [`App::close_session_verdict`] AFTER the escalation and never before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseProgress {
+    /// The session left the registry inside the close: nothing is pending.
+    Retired,
+    /// The close dropped window `.0`'s LAST tab, so THAT window's teardown was
+    /// deferred behind its `pending_close`. The id rides along because it is the
+    /// only thing that tells the deferred outcomes apart afterwards: a
+    /// teardown that never ran leaves the window (and its still-attached tab)
+    /// standing, while one that ran and left the session alive did so because
+    /// another viewer holds it (or, with no viewer left to name, the session
+    /// simply outlived it) — and the verdict must not report the first when
+    /// it is looking at the second.
+    Deferred(WindowId),
+}
+
 /// One canonical terminal-view occurrence.  `layouts` is deliberately absent:
 /// heterogeneous tabs have no terminal-only projection, so session lifecycle
 /// must resolve through stable tab/view identity first and consult the legacy
@@ -2228,7 +2278,8 @@ impl App {
         }
     }
 
-    /// `spawn` (control socket): open one new tab session in the frontmost window
+    /// `spawn` (control socket): open one new tab session in `window` (the AIMED
+    /// window, design S3; `None` = the frontmost window, the historical contract)
     /// and return its freshly minted sid. The newborn is found by REGISTRY DIFF —
     /// snapshot the sid set, run the exact `open_tab_in` path Cmd-T takes, and
     /// return the one sid that appeared — so this can never misattribute a
@@ -2247,10 +2298,11 @@ impl App {
     /// co-viewing window or an invisible 1x1 pane with a live shell behind it.
     pub(crate) fn spawn_tab_session(
         &mut self,
+        window: Option<WindowId>,
         cwd: Option<String>,
         split: Option<crate::pane::SplitDir>,
     ) -> Result<String, String> {
-        let Some(front) = self.frontmost_window else {
+        let Some(host) = window.or(self.frontmost_window) else {
             return Err("no window to host the session".to_string());
         };
         let before: std::collections::HashSet<aterm_session::SessionId> = {
@@ -2264,8 +2316,8 @@ impl App {
             // registry-diff's generic shrug. Nothing was spawned, so returning
             // here skips a diff that could only report the same emptiness with
             // less information.
-            Some(dir) => self.split_focused_pane_in(dir, cwd)?,
-            None => self.open_tab_in_cwd(front, cwd.as_deref()),
+            Some(dir) => self.split_focused_pane_in_window(host, dir, cwd)?,
+            None => self.open_tab_in_cwd(host, cwd.as_deref()),
         }
         let after = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -2595,7 +2647,7 @@ impl App {
                 }
                 // A TAB, never a split: the operator row stands up its own
                 // terminal, not a division of whatever pane happens to be focused.
-                match self.spawn_tab_session(None, None) {
+                match self.spawn_tab_session(None, None, None) {
                     Ok(sid) => {
                         // Stamp identity via user meta BEFORE the agent renames
                         // itself, then type the launch line through the sink —
@@ -2740,11 +2792,14 @@ impl App {
     /// `raise <sid>` (the `Wake::RaiseSession` body): the
     /// [`Self::dispatch_operator_action`] Show shape for an ARBITRARY session —
     /// find the window hosting it, select its tab, focus the window. `Err` when
-    /// no window shows the session (headless, or a view the strips dropped) so
-    /// the wire verb reports honestly instead of silently succeeding. ONE body
-    /// with the menu path ([`Self::focus_session_window`]) — a raise from the
-    /// wire and a raise from a menu row cannot drift, de-miniaturize belt
-    /// included.
+    /// no window shows the session (a view the strips dropped) so the wire verb
+    /// reports honestly instead of silently succeeding. On a headless instance
+    /// the one logical window DOES host the session, so this selects its tab and
+    /// the OS-focus half is simply a no-op (there is no surface to raise) — the
+    /// consistent twin of an aimed `spawn`/`tab`, which likewise resolve window
+    /// 0 there rather than refuse. ONE body with the menu path
+    /// ([`Self::focus_session_window`]) — a raise from the wire and a raise from
+    /// a menu row cannot drift, de-miniaturize belt included.
     ///
     /// SPEC (design §9: the window-routing obligations): this real seam IS the
     /// `WindowRouting.RaiseSession` action — a pure focus re-point of
@@ -2780,9 +2835,20 @@ impl App {
         }
     }
 
-    /// DIFF (like spawn): if the session is gone afterward it succeeded; if it
-    /// survives, the close was refused and we say so.
-    pub(crate) fn close_session_by_id(&mut self, session: u64) -> Result<(), String> {
+    /// Close the tab (or the single terminal leaf) showing `session`, reporting
+    /// how far the close got.
+    ///
+    /// DIFF (like spawn): the store is the evidence — if the session is gone
+    /// afterward the close happened; if it survives, the last-tab confirm
+    /// refused it and we say so. The one case that diff cannot read is a LAST-tab
+    /// close: it is DEFERRED (the window teardown that retires the session needs
+    /// an `ActiveEventLoop` the close paths do not hold), so the session is still
+    /// registered here through no fault of its own. That is
+    /// [`CloseProgress::Deferred`], not a refusal — answer it with
+    /// [`Self::close_session_verdict`] after running the escalation, or an idle
+    /// session gets `ERR close refused (a running job armed the last-tab
+    /// confirm)` for a close that had simply not happened yet.
+    pub(crate) fn close_session_by_id(&mut self, session: u64) -> Result<CloseProgress, String> {
         let found = self.windows.keys().find_map(|wid| {
             self.terminal_view_location(*wid, session)
                 .map(|location| (*wid, location))
@@ -2790,26 +2856,87 @@ impl App {
         let Some((wid, location)) = found else {
             return Err("no such session".to_string());
         };
+        let mut deferred = None;
         if location.terminal_only {
             if self.close_tab_at(wid, location.canonical_index)
                 && let Some(ws) = self.windows.get_mut(&wid)
             {
                 ws.pending_close = true; // last tab → the window closes with it
+                deferred = Some(wid);
             }
         } else if !self.close_heterogeneous_terminal_view(wid, location) {
             return Err("session view changed during close".to_string());
         }
-        let gone = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(session)
-            .is_none();
-        if gone {
-            Ok(())
+        if !self.session_registered(session) {
+            Ok(CloseProgress::Retired)
+        } else if let Some(wid) = deferred {
+            Ok(CloseProgress::Deferred(wid))
         } else {
             Err("close refused (a running job armed the last-tab confirm)".to_string())
         }
+    }
+
+    /// The wire verdict of a close whose [`CloseProgress`] is known, read AFTER
+    /// the caller ran the deferred teardown (`escalate_pending_close`). The
+    /// store is still the evidence: a `Deferred` close that retired its session
+    /// is `OK closed`, and one that did not says WHICH of the three deferred
+    /// outcomes it is looking at (see [`Self::deferred_close_reason`]) instead
+    /// of blaming the last-tab confirm, which never fired.
+    pub(crate) fn close_session_verdict(
+        &self,
+        session: u64,
+        progress: CloseProgress,
+    ) -> Result<(), String> {
+        match progress {
+            CloseProgress::Retired => Ok(()),
+            CloseProgress::Deferred(_) if !self.session_registered(session) => Ok(()),
+            CloseProgress::Deferred(window) => Err(self.deferred_close_reason(window, session)),
+        }
+    }
+
+    /// Why a DEFERRED close left `session` registered, worded from what this
+    /// process can actually SEE rather than from the one case that was first
+    /// implemented.
+    ///
+    /// The distinction is load-bearing because a Cmd-Shift-O co-viewed session
+    /// takes the SAME path as a stuck teardown: `close_session_by_id` aims at
+    /// the LOWEST window id holding the session, that window's teardown runs to
+    /// completion, and the session is STILL registered — `close_window_logical`
+    /// deregisters only when its `detach_session_view` dropped the last pool
+    /// view, and the other window's view is still attached. Answering "the
+    /// window teardown has not run" there states a falsehood about a teardown
+    /// that did run, and points the caller at a window that no longer exists.
+    ///
+    /// So: another window holding the session is the reason the close did not
+    /// take, whether or not the teardown is also outstanding — it is the one
+    /// that survives the escalation and the one the caller must act on. Failing
+    /// that, the deferred window still being here IS the outstanding teardown (a
+    /// native or document shutdown barrier held `close_window`). The last arm is
+    /// neither: the window is gone and no window shows the session, so a pool
+    /// view outlived every viewer — reported as what it is instead of borrowing
+    /// one of the other two explanations.
+    fn deferred_close_reason(&self, window: WindowId, session: u64) -> String {
+        if self
+            .windows
+            .keys()
+            .any(|wid| *wid != window && self.window_contains_session(*wid, session))
+        {
+            "close deferred (another window still displays this session)".to_string()
+        } else if self.windows.contains_key(&window) {
+            "close deferred (the window teardown has not run)".to_string()
+        } else {
+            "close deferred (the session outlived its window's teardown)".to_string()
+        }
+    }
+
+    /// Whether `session` is still in the process-wide registry — the diff both
+    /// close paths read to decide whether anything actually died.
+    fn session_registered(&self, session: u64) -> bool {
+        self.store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_local(session)
+            .is_some()
     }
 
     /// Open a new tab in window `owner` (window-aware: the tab-strip `+` of a
@@ -2982,6 +3109,14 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return;
         };
+        self.cycle_tab_in(wid, forward);
+    }
+
+    /// [`Self::cycle_tab`] on an explicit window — the aimed `@<sid> tab next|prev`
+    /// (design S3) cycles the window hosting the session, front or not. The same
+    /// deterministic wrap; re-mirrors like [`Self::switch_tab_in`] (the global
+    /// handles follow only when `wid` IS the front window).
+    pub(crate) fn cycle_tab_in(&mut self, wid: WindowId, forward: bool) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3001,7 +3136,11 @@ impl App {
         } else if let Some(index) = terminal_projection_index(&ws.tab_set, &self.view_store, next) {
             ws.tabs.switch_to(index);
         }
-        self.sync_active_session();
+        if self.frontmost_window == Some(wid) {
+            self.sync_active_session();
+        } else {
+            self.sync_window(wid);
+        }
         self.palette_sync_native_scope(wid);
     }
 
@@ -3013,47 +3152,60 @@ impl App {
     /// => [`Self::cycle_tab`] — so the verb adds no parallel tab logic. With no front
     /// window (impossible in a real run) it reports `(0, 0)`.
     pub(crate) fn apply_tab_cmd(&mut self, action: TabAction) -> (usize, usize) {
+        match self.frontmost_window {
+            Some(front) => self.apply_tab_cmd_in(front, action),
+            None => (0, 0),
+        }
+    }
+
+    /// [`Self::apply_tab_cmd`] on an explicit window — the aimed `@<sid> tab …`
+    /// (design S3) drives the window hosting the session, front or not. Each
+    /// action reuses the window-aware command path its front-window twin
+    /// delegates to (`open_tab_in` / `switch_tab_in` / `cycle_tab_in` /
+    /// `close_tab_via_verb` / `move_tab`), so the aimed verb adds no
+    /// parallel tab logic either; an unknown `wid` reports `(0, 0)`.
+    pub(crate) fn apply_tab_cmd_in(&mut self, wid: WindowId, action: TabAction) -> (usize, usize) {
         match action {
-            TabAction::New => self.open_tab(),
-            TabAction::Select(n) => self.switch_tab(n),
-            TabAction::Next => self.cycle_tab(true),
-            TabAction::Prev => self.cycle_tab(false),
-            TabAction::Close(which) => self.close_tab_via_verb(which),
-            TabAction::Move { from, to } => {
-                if let Some(front) = self.frontmost_window {
-                    self.move_tab(front, from, to);
-                }
-            }
+            TabAction::New => self.open_tab_in(wid),
+            TabAction::Select(n) => self.switch_tab_in(wid, n),
+            TabAction::Next => self.cycle_tab_in(wid, true),
+            TabAction::Prev => self.cycle_tab_in(wid, false),
+            TabAction::Close(which) => self.close_tab_via_verb(wid, which),
+            TabAction::Move { from, to } => self.move_tab(wid, from, to),
         }
         // Report the canonical mixed-tab state. The terminal-only `TabIndex` is a
         // compatibility projection and can have a different count/index whenever
         // native tabs are present.
-        self.front().map_or((0, 0), |ws| {
+        self.windows.get(&wid).map_or((0, 0), |ws| {
             (ws.tab_set.active_index().unwrap_or(0), ws.tab_set.len())
         })
     }
 
-    /// Close the front window's tab `which` (or its ACTIVE tab when `None`) for the
-    /// `tab close [N]` verb and the native × button's [`Wake::CloseTab`]. Reuses
-    /// [`Self::close_tab_at`] (the SAME whole-tab close the renderer strip's `✕` and
-    /// the tab-strip click take); if that was the window's LAST tab it flags
-    /// `pending_close` so the `Wake` handler's `escalate_pending_close(el)` tears the
-    /// window down (the verb / button paths have no `ActiveEventLoop`), exactly like a
-    /// tab-strip close.
-    pub(crate) fn close_tab_via_verb(&mut self, which: Option<usize>) {
-        let Some(front) = self.frontmost_window else {
-            return;
-        };
+    /// Close window `wid`'s tab `which` (or its ACTIVE tab when `None`) for the
+    /// `tab close [N]` verb and the native × button's [`Wake::CloseTab`]. `wid` is
+    /// the front window for the flagless verb and the window hosting `@<sid>` for
+    /// the aimed one (design S3). Reuses [`Self::close_tab_at`] (the SAME whole-tab
+    /// close the renderer strip's `✕` and the tab-strip click take); if that was
+    /// the window's LAST tab it flags THAT window's `pending_close` so the `Wake`
+    /// handler's `escalate_pending_close(el)` tears the window down (the verb /
+    /// button paths have no `ActiveEventLoop`), exactly like a tab-strip close.
+    pub(crate) fn close_tab_via_verb(&mut self, wid: WindowId, which: Option<usize>) {
+        // Exit-ledger attribution: a control-socket `tab close` (the wake carries
+        // no caller, so `by=-`); the native ✕'s `Wake::CloseTab` takes `close_tab_at`.
+        let _closing = session_store::CloseAttribution::enter(
+            session_store::ExitReason::CtlClose,
+            session_store::ExitActor::Unknown,
+        );
         let i = match which {
             Some(i) => i,
             None => self
                 .windows
-                .get(&front)
+                .get(&wid)
                 .and_then(|ws| ws.tab_set.active_index())
                 .unwrap_or(0),
         };
-        if self.close_tab_at(front, i)
-            && let Some(ws) = self.windows.get_mut(&front)
+        if self.close_tab_at(wid, i)
+            && let Some(ws) = self.windows.get_mut(&wid)
         {
             ws.pending_close = true;
         }
@@ -3327,6 +3479,11 @@ impl App {
     /// of a non-last tab closes the tab. Honors `--hold` ONLY for the implicit close
     /// on a session's own EOF (see `close_session`); an explicit Cmd-W always closes.
     pub(crate) fn close_active_tab(&mut self) -> Option<WindowId> {
+        // Exit-ledger attribution: Cmd-W / menu Close, by the human.
+        let _closing = session_store::CloseAttribution::enter(
+            session_store::ExitReason::UiClose,
+            session_store::ExitActor::Human,
+        );
         let window = self.frontmost_window?;
         let (stable_tab, stable_view) = self
             .windows
@@ -3386,6 +3543,13 @@ impl App {
         let closes_window = self.apply_close_outcome(window, tab, outcome);
         if collapsed && let Some(recovery) = recovery {
             self.retain_closed_view(recovery);
+        }
+        if closes_window {
+            // Same deferral as `close_tab_at`: the caller sets `pending_close`
+            // and the window tears down a later turn, so carry the Cmd-W / menu
+            // Close attribution (the live `CloseAttribution` scope opened at the
+            // top of this fn) onto the window for the deregister to re-enter.
+            self.stash_deferred_close_attribution(window);
         }
         closes_window.then_some(window)
     }
@@ -3802,6 +3966,11 @@ impl App {
             align_terminal_projection_to_active(ws, &self.view_store);
             (tab, was_last)
         };
+        if was_last {
+            // Deferred last-tab close (native/heterogeneous tab): carry the
+            // gesture's attribution for the later `close_window` teardown.
+            self.stash_deferred_close_attribution(wid);
+        }
         self.remove_tab_views(&tab);
         for session in terminal_sessions {
             self.teardown_session(session);
@@ -4115,6 +4284,8 @@ impl App {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .set_state(session, session_store::SessionState::Exited);
+        // The exit ledger takes the child's status now, before teardown discards it.
+        self.note_shell_exit_for_ledger(session);
         let mut owners = Vec::new();
         for (&window, state) in &self.windows {
             for tab in state.tab_set.tabs() {
@@ -4625,6 +4796,19 @@ impl App {
         }
     }
 
+    /// Stash the CURRENT close gesture's attribution on window `wid`, at the
+    /// moment a last-tab close is DEFERRED (the window's teardown, and the
+    /// exit-journalling deregistration, run a later turn with no
+    /// [`session_store::CloseAttribution`] scope open). Read back and re-entered
+    /// by [`crate::App::close_window_logical`]. A no-op if the window is already
+    /// gone. See [`crate::WindowState::pending_close_attribution`].
+    pub(crate) fn stash_deferred_close_attribution(&mut self, wid: WindowId) {
+        let attribution = session_store::current_close_attribution();
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.pending_close_attribution = Some(attribution);
+        }
+    }
+
     /// Close the ENTIRE tab at index `i` of window `wid` (every pane in it), as a
     /// unit — the tab strip's close `x` closes a whole tab, unlike Cmd-W which closes
     /// one pane. DRAINS each of the tab's panes' sessions and `pool.detach`es each
@@ -4645,6 +4829,12 @@ impl App {
         )
     )]
     pub(crate) fn close_tab_at(&mut self, wid: WindowId, i: usize) -> bool {
+        // Exit-ledger attribution for the gestures that reach here directly (tab
+        // ✕, native ✕, the tab menu); an outer scope (a control `close`) keeps its own.
+        let _closing = session_store::CloseAttribution::enter(
+            session_store::ExitReason::UiClose,
+            session_store::ExitActor::Human,
+        );
         let Some((tab_id, is_native, terminal_index, canonical_count)) =
             self.windows.get(&wid).and_then(|ws| {
                 let tab = ws.tab_set.tab_at(i)?;
@@ -4704,6 +4894,13 @@ impl App {
             if let Some(tab) = recovery {
                 self.retain_closed_tab(wid, i, tab);
             }
+            // The window's deregistration runs a LATER turn (the caller sets
+            // `pending_close`; `escalate_pending_close`/`close_window` tears it
+            // down), after this gesture's `CloseAttribution` scope has dropped.
+            // Carry the reason/actor on the window so `close_window_logical` can
+            // re-enter it around the deregister — otherwise the exit journals
+            // `reason=unknown by=-`.
+            self.stash_deferred_close_attribution(wid);
             return true;
         }
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -5041,11 +5238,13 @@ impl App {
     /// (not an `if let` scrutinee) so the store write guard is DROPPED before the
     /// sweep re-reads the registry for the survivors' tables.
     pub(crate) fn retire_session_registration(&mut self, id: u64) {
+        // The exit ledger's tale: the gesture that started this close said why.
+        let (reason, by) = session_store::current_close_attribution();
         let stable = self
             .store
             .write()
             .unwrap_or_else(|p| p.into_inner())
-            .deregister_local(id);
+            .deregister_local_as(id, reason, by);
         if let Some(stable) = stable {
             crate::proxy::unpublish_session(&stable);
             // Through the App's own store handle (the process singleton in a
@@ -5065,6 +5264,23 @@ impl App {
 #[cfg(test)]
 mod mixed_tab_tests {
     use super::*;
+
+    /// Address a real temp-dir file the way the SHIPPING code does.
+    ///
+    /// A hand-rolled `format!("file://{}", path.display())` is malformed on
+    /// Windows: `C:\Users\...` lands straight after the authority slashes, so
+    /// `C:` is parsed as the authority and the backslashes are never escaped.
+    /// The document host rejects that with "malformed file URI" before a single
+    /// byte is read, which is a fixture defect and not a product one — every
+    /// product seam that turns a path into a URI (the file picker in
+    /// `app_input::open_local_document_path`, the drag-and-drop seam in
+    /// `lib::drop_file`, the config editor in `app_documents`) already funnels
+    /// through this same encoder, which emits `file:///C:/Users//...` with
+    /// percent-escapes. Tests must use it too, or they test a URI no user can
+    /// ever produce.
+    fn file_uri(path: &std::path::Path) -> String {
+        crate::native_document_host::path_to_file_uri(path).unwrap()
+    }
 
     fn assert_terminal_fully_retired(app: &App, session: u64, view: crate::tab_model::ViewId) {
         assert!(app.pool.get(session).is_none(), "pool owner must be gone");
@@ -6149,7 +6365,7 @@ mod mixed_tab_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("document.md");
         std::fs::write(&path, "shared\n").unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = file_uri(&path);
 
         let mut app = App::headless_for_test();
         app.open_document_tab(crate::native_app::AppKind::Markdown, &uri)
@@ -6231,7 +6447,7 @@ mod mixed_tab_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shared.md");
         std::fs::write(&path, "shared\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy().replace(' ', "%20"));
+        let uri = file_uri(&path);
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -6278,7 +6494,7 @@ mod mixed_tab_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gone.md");
         std::fs::write(&path, "gone soon\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy().replace(' ', "%20"));
+        let uri = file_uri(&path);
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -7615,6 +7831,221 @@ mod connected_spawn_tests {
             assert_eq!(row.src, supervisor, "the newborn supervises the origin");
             assert_eq!(row.dst, origin);
         }
+    }
+}
+
+#[cfg(test)]
+mod exit_attribution_tests {
+    use super::*;
+    use crate::CloseOutcome;
+    use crate::session_store::{ExitReason, RosterChange};
+
+    /// The reason + actor (`by=`) of the sole `Exited` journal row — a fresh
+    /// headless instance hosts one session, so closing it writes exactly one.
+    fn sole_exit(app: &App) -> (ExitReason, String) {
+        let g = app.store.read().unwrap_or_else(|p| p.into_inner());
+        let rec = g
+            .roster_since(0)
+            .filter(|r| r.change == RosterChange::Exited)
+            .last()
+            .expect("one exit record after the close");
+        (rec.reason, rec.actor.as_wire().to_string())
+    }
+
+    /// A ctl `tab close` of a SINGLE-tab window defers the window teardown
+    /// (`close_tab_at`'s `exits_window` branch returns true without
+    /// deregistering; the caller flags `pending_close`), so the deregistration
+    /// runs a later turn — after the gesture's `CloseAttribution` scope has
+    /// dropped. The attribution is stashed on the window and re-entered by
+    /// `close_window_logical`, so the exit journals `reason=ctl-close`, not the
+    /// `reason=unknown by=-` it silently lost before this fix.
+    #[test]
+    fn a_last_tab_ctl_close_journals_ctl_close() {
+        let mut app = App::headless_for_test();
+        app.close_tab_via_verb(WindowId(0), None);
+        assert!(
+            app.windows[&WindowId(0)].pending_close,
+            "closing the only tab defers the window close"
+        );
+        // The deferred teardown (what `escalate_pending_close`/`close_window`
+        // reach on a later turn), driven directly since a unit test has no
+        // event loop.
+        assert_eq!(app.close_window_logical(WindowId(0)), CloseOutcome::Exit);
+        let (reason, _by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::CtlClose);
+    }
+
+    /// `@<sid> close` of a window's LAST tab: the tab close is DEFERRED (the
+    /// window teardown that retires the session needs an `ActiveEventLoop`), so
+    /// the store-diff the verb answers from cannot be read until the escalation
+    /// has run. It used to be read immediately, which made an idle last-tab
+    /// close answer `ERR close refused (a running job armed the last-tab
+    /// confirm)` — for a close that was not refused and had not yet happened —
+    /// and, because the `Wake::CloseSession` arm never escalated, never happen
+    /// at all: nothing was journalled and the tab stayed open. The progress is
+    /// `Deferred`, and the verdict is `OK` only once the teardown really ran.
+    #[test]
+    fn a_last_tab_ctl_close_is_deferred_not_refused_and_answers_after_the_teardown() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let session = 0; // the harness hosts session 0 as window 0's only tab
+        let progress = {
+            // The `Wake::CloseSession` scope, dropped at the end of that turn.
+            let _closing = session_store::CloseAttribution::enter(
+                session_store::ExitReason::CtlClose,
+                session_store::ExitActor::Unknown,
+            );
+            app.close_session_by_id(session)
+                .expect("the close proceeds")
+        };
+        assert_eq!(
+            progress,
+            CloseProgress::Deferred(wid),
+            "a last-tab close defers; it is not a refusal"
+        );
+        assert!(app.windows[&wid].pending_close, "the window is flagged");
+        assert_eq!(
+            app.close_session_verdict(session, progress),
+            Err("close deferred (the window teardown has not run)".to_string()),
+            "before the escalation the honest answer names the deferral"
+        );
+
+        // The escalation (`escalate_pending_close` -> `close_window`), driven
+        // directly since a unit test has no event loop.
+        assert_eq!(app.close_window_logical(wid), CloseOutcome::Exit);
+        assert_eq!(
+            app.close_session_verdict(session, progress),
+            Ok(()),
+            "the session is gone: the verb answers OK closed"
+        );
+        let (reason, _by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::CtlClose);
+    }
+
+    /// The SAME deferred shape, on a session a second window also displays
+    /// (Cmd-Shift-O): the two must not get the same answer. `close_session_by_id`
+    /// aims at the LOWEST window id holding the session, that window's teardown
+    /// runs in full, and the session is registered afterwards anyway — the other
+    /// window's pool view is still attached, so `close_window_logical` never
+    /// reached its deregister. Answering "the window teardown has not run" here
+    /// states a falsehood about a teardown that ran, and names a window that no
+    /// longer exists; the reply must name the co-viewer instead.
+    #[test]
+    fn a_deferred_close_of_a_co_viewed_session_names_the_other_window() {
+        let mut app = App::headless_for_test();
+        let session = 0; // the harness hosts session 0 as window 0's only tab
+        let second = app
+            .open_active_session_in_new_window_logical()
+            .expect("Cmd-Shift-O opens a second viewer");
+        assert!(app.window_contains_session(second, session));
+
+        let progress = {
+            // The `Wake::CloseSession` scope, dropped at the end of that turn.
+            let _closing = session_store::CloseAttribution::enter(
+                session_store::ExitReason::CtlClose,
+                session_store::ExitActor::Unknown,
+            );
+            app.close_session_by_id(session)
+                .expect("the close proceeds")
+        };
+        assert_eq!(
+            progress,
+            CloseProgress::Deferred(WindowId(0)),
+            "the close aims at the LOWEST window id holding the session"
+        );
+        // Both facts hold before the escalation — the teardown is outstanding AND
+        // a second window holds the session — and the co-viewer is the one that
+        // survives the teardown, so it is the one named. (The wire never reads
+        // here: `Wake::CloseSession` escalates before taking the verdict.)
+        assert_eq!(
+            app.close_session_verdict(session, progress),
+            Err("close deferred (another window still displays this session)".to_string()),
+            "the co-viewer is the reason the close cannot take, from the start"
+        );
+
+        // The escalation (`escalate_pending_close` -> `close_window`), driven
+        // directly since a unit test has no event loop. The second window
+        // survives it, so the app stays.
+        assert_eq!(app.close_window_logical(WindowId(0)), CloseOutcome::Stay);
+        assert!(!app.windows.contains_key(&WindowId(0)), "window 0 is gone");
+        assert!(
+            app.session_registered(session),
+            "the co-viewer's pool view keeps the session registered"
+        );
+        assert_eq!(
+            app.close_session_verdict(session, progress),
+            Err("close deferred (another window still displays this session)".to_string()),
+            "the teardown DID run: the co-viewer is why the session is still here"
+        );
+    }
+
+    /// A close that retires its session inside the call (a tab among several)
+    /// keeps the old, immediate answer: `Retired` is already the verdict, so the
+    /// escalation the caller runs afterwards cannot change it.
+    #[test]
+    fn a_close_that_retires_inside_the_call_answers_ok_without_waiting() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        assert_eq!(app.windows[&wid].tab_set.len(), 2);
+
+        let progress = app.close_session_by_id(second).expect("the close proceeds");
+        assert_eq!(progress, CloseProgress::Retired);
+        assert!(
+            !app.windows[&wid].pending_close,
+            "one tab of two never defers"
+        );
+        assert_eq!(app.close_session_verdict(second, progress), Ok(()));
+    }
+
+    /// A DEFERRED close that is then cancelled must not leave its attribution on
+    /// the window: `close_window_logical` is the only consumer, so a stash that
+    /// outlives its close is journalled on the window's NEXT scope-less close —
+    /// a cancelled `ctl-close` turning a later shell exit into `reason=ctl-close`.
+    /// `cancel_pending_close` ties the two to one lifetime.
+    #[test]
+    fn a_cancelled_deferred_close_drops_the_attribution_it_stashed() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.close_tab_via_verb(wid, None);
+        assert!(app.windows[&wid].pending_close);
+        assert!(app.windows[&wid].pending_close_attribution.is_some());
+
+        // The teardown never ran: a real tab was installed/refocused in this
+        // window first (the `app_settings` reopen race), which cancels it.
+        cancel_pending_close(app.windows.get_mut(&wid).expect("window 0"));
+        assert!(!app.windows[&wid].pending_close);
+        assert!(app.windows[&wid].pending_close_attribution.is_none());
+
+        // Later the shell ends on its own and the window goes with it, with no
+        // attribution scope open: the store's own `Exited` state is the only
+        // evidence, so the journal must read `shell-exit`.
+        app.store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_state(0, crate::session_store::SessionState::Exited);
+        assert_eq!(app.close_window_logical(wid), CloseOutcome::Exit);
+        let (reason, by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::ShellExit);
+        assert_eq!(by, "-");
+    }
+
+    /// A last-tab UI close (Cmd-W / menu Close, `close_active_tab`) is deferred
+    /// the same way (`apply_close_outcome`'s `LastPane` + `canonical_last`
+    /// returns true without deregistering), and its `ui-close by=human`
+    /// attribution likewise survives to the deferred deregistration.
+    #[test]
+    fn a_last_tab_ui_close_journals_ui_close_by_human() {
+        let mut app = App::headless_for_test();
+        let closed = app
+            .close_active_tab()
+            .expect("the frontmost's last tab closed");
+        assert_eq!(closed, WindowId(0));
+        assert_eq!(app.close_window_logical(WindowId(0)), CloseOutcome::Exit);
+        let (reason, by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::UiClose);
+        assert_eq!(by, "human");
     }
 }
 

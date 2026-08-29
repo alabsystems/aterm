@@ -93,15 +93,15 @@ mod imp {
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
 
-    use rustix::fd::OwnedFd;
+    use aterm_dirfd::OwnedFd;
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    use rustix::fs::linkat;
-    use rustix::fs::{
+    use aterm_dirfd::linkat;
+    use aterm_dirfd::{
         AtFlags, CWD, Dir, FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat, renameat,
         unlinkat,
     };
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-    use rustix::fs::{RenameFlags, renameat_with};
+    use aterm_dirfd::{RenameFlags, renameat_with};
 
     use super::{
         Component, OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
@@ -115,26 +115,26 @@ mod imp {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
     }
 
-    fn open_directory_at<Fd: rustix::fd::AsFd>(
+    fn open_directory_at<Fd: aterm_dirfd::AsFd>(
         parent: Fd,
-        name: impl rustix::path::Arg,
+        name: impl aterm_dirfd::Arg,
     ) -> io::Result<OwnedFd> {
         openat(parent, name, directory_flags(), Mode::empty()).map_err(Into::into)
     }
 
-    fn is_directory(fd: &impl rustix::fd::AsFd) -> bool {
+    fn is_directory(fd: &impl aterm_dirfd::AsFd) -> bool {
         fstat(fd)
             .ok()
             .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_dir())
     }
 
-    fn is_regular_file(fd: &impl rustix::fd::AsFd) -> bool {
+    fn is_regular_file(fd: &impl aterm_dirfd::AsFd) -> bool {
         fstat(fd)
             .ok()
             .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
     }
 
-    fn same_identity(left: &impl rustix::fd::AsFd, right: &impl rustix::fd::AsFd) -> bool {
+    fn same_identity(left: &impl aterm_dirfd::AsFd, right: &impl aterm_dirfd::AsFd) -> bool {
         let (Ok(left), Ok(right)) = (fstat(left), fstat(right)) else {
             return false;
         };
@@ -143,7 +143,7 @@ mod imp {
 
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     fn rename_no_replace_with_hook(
-        directory: &impl rustix::fd::AsFd,
+        directory: &impl aterm_dirfd::AsFd,
         from: &OsStr,
         to: &OsStr,
         after_publish: impl FnOnce(),
@@ -156,7 +156,7 @@ mod imp {
 
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     fn rename_no_replace_with_hook(
-        directory: &impl rustix::fd::AsFd,
+        directory: &impl aterm_dirfd::AsFd,
         from: &OsStr,
         to: &OsStr,
         after_publish: impl FnOnce(),
@@ -171,12 +171,12 @@ mod imp {
     }
 
     #[cfg(not(target_vendor = "apple"))]
-    fn directory_was_unlinked(directory: &impl rustix::fd::AsFd) -> bool {
+    fn directory_was_unlinked(directory: &impl aterm_dirfd::AsFd) -> bool {
         fstat(directory).ok().is_some_and(|stat| stat.st_nlink == 0)
     }
 
     #[cfg(target_vendor = "apple")]
-    fn directory_was_unlinked(directory: &impl rustix::fd::AsFd) -> bool {
+    fn directory_was_unlinked(directory: &impl aterm_dirfd::AsFd) -> bool {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -422,7 +422,7 @@ mod imp {
             same_identity(self.leaf(), other.leaf())
         }
 
-        pub(crate) fn same_directory_fd(&self, other: &impl rustix::fd::AsFd) -> bool {
+        pub(crate) fn same_directory_fd(&self, other: &impl aterm_dirfd::AsFd) -> bool {
             same_identity(self.leaf(), other)
         }
 
@@ -455,7 +455,7 @@ mod imp {
         }
 
         pub(crate) fn sync(&self) -> io::Result<()> {
-            rustix::fs::fsync(self.leaf()).map_err(Into::into)
+            aterm_dirfd::fsync(self.leaf()).map_err(Into::into)
         }
 
         pub(crate) fn child(&self, name: &OsStr) -> io::Result<Self> {
@@ -783,7 +783,7 @@ mod imp {
             validate_component(name)?;
             match unlinkat(self.leaf(), name, AtFlags::empty()) {
                 Ok(()) => Ok(()),
-                Err(rustix::io::Errno::NOENT) => Ok(()),
+                Err(aterm_dirfd::Errno::NOENT) => Ok(()),
                 Err(error) => Err(error.into()),
             }
         }
@@ -1750,7 +1750,32 @@ mod imp {
             validate_component(name)?;
             self.validate_path_identity()?;
             match open_disposable(&self.path.join(name)) {
-                Ok(file) => dispose_file_handle(&file),
+                Ok(file) => {
+                    // `open_disposable` carries FILE_FLAG_BACKUP_SEMANTICS so a
+                    // reparse point can be unlinked WITHOUT being followed —
+                    // which also lets a real directory open, and
+                    // `FileDispositionInfo` will happily delete an empty one.
+                    // Unix removes with `unlinkat` and NO `AT_REMOVEDIR`, so a
+                    // directory there answers EISDIR and survives. Two backends
+                    // of one abstraction stating different contracts is itself
+                    // the defect: a file-scoped cleanup must never destroy a
+                    // directory a same-uid actor parked on an artifact name, and
+                    // these callers are exactly the best-effort rollback paths
+                    // (`write_snapshot_artifacts`, video/image publication) that
+                    // run on names outside this process's control. A directory
+                    // SYMLINK/junction stays removable — that is a link, and
+                    // `unlinkat` removes it too.
+                    let metadata = file.metadata()?;
+                    if metadata.is_dir()
+                        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::IsADirectory,
+                            "artifact name is a directory, not a file",
+                        ));
+                    }
+                    dispose_file_handle(&file)
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             }
@@ -1941,6 +1966,122 @@ mod imp {
         }
     }
 
+    /// The exact `FILE_RENAME_INFO` request bytes for one destination, split out
+    /// so the payload's shape is directly assertable. `bytes` is the size handed
+    /// to `SetFileInformationByHandle`; `buffer` is `usize`-aligned backing store
+    /// at least that large.
+    pub(super) struct RenamePayload {
+        buffer: Vec<usize>,
+        bytes: usize,
+    }
+
+    impl RenamePayload {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.buffer.as_mut_ptr().cast()
+        }
+
+        /// The request bytes exactly as the kernel will read them.
+        #[cfg(test)]
+        #[must_use]
+        pub(super) fn request_bytes(&self) -> &[u8] {
+            // SAFETY: `buffer` owns at least `bytes` initialized bytes and
+            // `usize` may be read as its constituent bytes.
+            unsafe { std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), self.bytes) }
+        }
+
+        #[cfg(test)]
+        #[must_use]
+        pub(super) fn file_name_length(&self) -> u32 {
+            use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+            let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+            let mut raw = [0_u8; 4];
+            raw.copy_from_slice(&self.request_bytes()[header - 4..header]);
+            u32::from_ne_bytes(raw)
+        }
+
+        /// The UTF-16 units the kernel finds at `FileName`, terminator included.
+        #[cfg(test)]
+        #[must_use]
+        pub(super) fn file_name_units(&self) -> Vec<u16> {
+            use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+            let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+            self.request_bytes()[header..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                .collect()
+        }
+    }
+
+    /// Build the rename request for `destination`. Split out of
+    /// [`rename_file_handle`] so `windows_tests` can assert the payload's shape
+    /// without a live handle; see that function's doc comment for why the
+    /// terminator is load-bearing.
+    pub(super) fn rename_payload(destination: &Path, replace: bool) -> io::Result<RenamePayload> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+        // NUL-TERMINATE the destination, and let the buffer size cover the
+        // terminator. `FileNameLength` alone does NOT bound what
+        // `SetFileInformationByHandle` reads: the Win32 wrapper also walks the
+        // name as a wide C string. Without the terminator it ran off the end of
+        // this allocation, and the only thing that ever stopped it was the
+        // padding `vec![0_usize; words]` happens to leave — `bytes` is
+        // `offset_of(FileName) + 2 * len`, which is a multiple of
+        // `size_of::<usize>()` exactly when the destination's UTF-16 length is
+        // 2 mod 4, and in that case there is NO slack and no zero byte.
+        // Measured on Windows 11 (2026-08-27): every failing publication had
+        // zero slack, and the same path succeeded or answered os error 123
+        // (ERROR_INVALID_NAME) / os error 2 (ERROR_FILE_NOT_FOUND) from one run
+        // to the next purely on what followed the allocation. That made EVERY
+        // confined artifact write — snapshot, `image`/`window` capture, video
+        // frame — fail nondeterministically on a path-length parity nobody
+        // chose. `FileNameLength` stays the length of the NAME, excluding the
+        // terminator, which is what the structure documents.
+        let name_bytes = destination
+            .as_os_str()
+            .encode_wide()
+            .count()
+            .checked_mul(2)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename name is too long")
+            })?;
+        let wide = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let bytes = header
+            .checked_add(wide.len().checked_mul(2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename name is too long")
+            })?)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename size overflow"))?;
+        let words = bytes
+            .checked_add(std::mem::size_of::<usize>() - 1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename size overflow"))?
+            / std::mem::size_of::<usize>();
+        let mut buffer = vec![0_usize; words];
+        let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `Vec<usize>` provides at least pointer alignment and enough
+        // bytes for the header plus the UTF-16 payload INCLUDING its NUL
+        // terminator, so both a length-driven and a terminator-driven reader
+        // stay inside this allocation.
+        unsafe {
+            std::ptr::write(information, FILE_RENAME_INFO::default());
+            (*information).Anonymous.ReplaceIfExists = replace;
+            // RootDirectory stays NULL (from `default()`) — see the doc comment:
+            // `SetFileInformationByHandle` rejects any other value.
+            (*information).FileNameLength = u32::try_from(name_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename name too long"))?;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr(),
+                std::ptr::addr_of_mut!((*information).FileName).cast(),
+                wide.len(),
+            );
+        }
+        Ok(RenamePayload { buffer, bytes })
+    }
+
     /// Rename the file behind `file`'s HANDLE to `name` inside `parent_path`.
     ///
     /// `FILE_RENAME_INFO::RootDirectory` — the natural way to anchor the destination
@@ -1965,47 +2106,21 @@ mod imp {
         name: &OsStr,
         replace: bool,
     ) -> io::Result<()> {
-        use std::os::windows::ffi::OsStrExt as _;
         use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{
-            FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
-        };
+        use windows::Win32::Storage::FileSystem::{FileRenameInfo, SetFileInformationByHandle};
 
         validate_component(name)?;
-        let destination = parent_path.join(name);
-        let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
-        let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let bytes = header
-            .checked_add(wide.len().checked_mul(2).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "rename name is too long")
-            })?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename size overflow"))?;
-        let words = bytes
-            .checked_add(std::mem::size_of::<usize>() - 1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename size overflow"))?
-            / std::mem::size_of::<usize>();
-        let mut buffer = vec![0_usize; words];
-        let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // SAFETY: `Vec<usize>` provides at least pointer alignment and enough
-        // bytes for the header plus exact UTF-16 payload.
+        let mut payload = rename_payload(&parent_path.join(name), replace)?;
+        let bytes = u32::try_from(payload.bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename too large"))?;
+        // SAFETY: `payload` owns `bytes` initialized, `usize`-aligned bytes
+        // holding one FILE_RENAME_INFO plus its NUL-terminated destination.
         unsafe {
-            std::ptr::write(information, FILE_RENAME_INFO::default());
-            (*information).Anonymous.ReplaceIfExists = replace;
-            // RootDirectory stays NULL (from `default()`) — see the doc comment:
-            // `SetFileInformationByHandle` rejects any other value.
-            (*information).FileNameLength = u32::try_from(wide.len() * 2)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename name too long"))?;
-            std::ptr::copy_nonoverlapping(
-                wide.as_ptr(),
-                std::ptr::addr_of_mut!((*information).FileName).cast(),
-                wide.len(),
-            );
             SetFileInformationByHandle(
                 HANDLE(file.as_raw_handle()),
                 FileRenameInfo,
-                information.cast(),
-                u32::try_from(bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename too large"))?,
+                payload.as_mut_ptr().cast(),
+                bytes,
             )
             .map_err(windows_io_error)
         }
@@ -2014,9 +2129,128 @@ mod imp {
 
 pub(crate) use imp::{PinnedDir, PinnedFile};
 
+/// Contracts BOTH backends owe, asserted with one body so they cannot drift.
+#[cfg(test)]
+mod shared_backend_contract_tests {
+    use super::PinnedDir;
+
+    fn unique_dir(stem: &str) -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "aterm-pinned-shared-{stem}-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+    }
+
+    /// REGRESSION: `remove_file_if_exists` removes a FILE. A directory sitting on
+    /// an artifact name must survive it, on every backend.
+    ///
+    /// Unix removes with `unlinkat` and no `AT_REMOVEDIR`, so a directory there
+    /// answers EISDIR. Windows opens with `FILE_FLAG_BACKUP_SEMANTICS` (needed to
+    /// unlink a reparse point without following it), which also opens a real
+    /// directory, and `FileDispositionInfo` then deleted an empty one outright.
+    /// The callers are best-effort rollback paths — `write_snapshot_artifacts`
+    /// cleaning up after a failed payload write, video/image publication abort —
+    /// running on names this process does not control, so the Windows backend was
+    /// silently destroying a directory a same-uid actor had parked there while
+    /// the Unix backend left it alone.
+    #[test]
+    fn remove_file_if_exists_never_removes_a_directory() {
+        let root = unique_dir("remove-file-is-file-only");
+        std::fs::create_dir_all(&root).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+
+        let occupied = std::ffi::OsStr::new("snapshot.png.txt");
+        std::fs::create_dir(root.join(occupied)).unwrap();
+        let error = pinned
+            .remove_file_if_exists(occupied)
+            .expect_err("a directory is not a file this may remove");
+        assert!(
+            root.join(occupied).is_dir(),
+            "the directory on the artifact name must survive a file-scoped removal: {error}"
+        );
+
+        // The same call still removes an ordinary file, and still treats an
+        // absent name as success.
+        let file = std::ffi::OsStr::new("snapshot.png");
+        std::fs::write(root.join(file), b"payload").unwrap();
+        pinned.remove_file_if_exists(file).unwrap();
+        assert!(!root.join(file).exists());
+        pinned.remove_file_if_exists(file).unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::{PinnedDir, imp::test_link_count, windows_component_is_safe};
+    use super::{PinnedDir, imp::rename_payload, imp::test_link_count, windows_component_is_safe};
+
+    /// REGRESSION: the `FILE_RENAME_INFO` payload must carry a NUL terminator
+    /// INSIDE the request bytes, at every destination length.
+    ///
+    /// `FileNameLength` does not bound what `SetFileInformationByHandle` reads —
+    /// it also walks `FileName` as a wide C string. The payload buffer is
+    /// `usize`-granular, so `offset_of(FileName) + 2 * len` leaves zero slack
+    /// exactly when the destination's UTF-16 length is 2 mod 4. Without an
+    /// explicit terminator those lengths shipped an unterminated name and the
+    /// kernel read past the allocation, so a confined artifact publication
+    /// answered os error 123 / os error 2 / success depending only on the heap
+    /// byte that happened to follow. Sweeping four consecutive lengths always
+    /// covers the zero-slack case, so this fails without the terminator no
+    /// matter where the sweep starts.
+    #[test]
+    fn rename_payload_nul_terminates_its_destination_at_every_length() {
+        let mut zero_slack_seen = 0usize;
+        for extra in 0..4usize {
+            let destination = std::path::Path::new(r"\\?\C:\aterm-rename-payload")
+                .join("x".repeat(extra + 1))
+                .join("artifact.png");
+            let payload = rename_payload(&destination, true).expect("payload builds");
+            let expected = {
+                use std::os::windows::ffi::OsStrExt as _;
+                destination.as_os_str().encode_wide().collect::<Vec<_>>()
+            };
+
+            assert_eq!(
+                payload.file_name_length() as usize,
+                expected.len() * 2,
+                "FileNameLength states the NAME's bytes, excluding the terminator"
+            );
+
+            let units = payload.file_name_units();
+            assert!(
+                units.len() > expected.len(),
+                "the request bytes must hold one more unit than the name itself \
+                 (destination {} units, request {} units)",
+                expected.len(),
+                units.len()
+            );
+            assert_eq!(&units[..expected.len()], &expected[..], "name round-trips");
+            assert_eq!(
+                units[expected.len()],
+                0,
+                "the unit after the name must be the NUL the kernel stops on"
+            );
+
+            if (std::mem::offset_of!(
+                windows::Win32::Storage::FileSystem::FILE_RENAME_INFO,
+                FileName
+            ) + expected.len() * 2)
+                % std::mem::size_of::<usize>()
+                == 0
+            {
+                zero_slack_seen += 1;
+            }
+        }
+        assert!(
+            zero_slack_seen > 0,
+            "the sweep must cover the length where allocation padding supplies no zero byte"
+        );
+    }
 
     fn unique_dir(stem: &str) -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

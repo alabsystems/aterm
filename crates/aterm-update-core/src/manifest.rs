@@ -204,7 +204,7 @@ impl Manifest {
     // and every error path returns `Err`, never panics. Verify-only.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn parse(text: &str) -> Result<Self, String> {
-        let m: Manifest = toml::from_str(text).map_err(|e| format!("parse manifest: {e}"))?;
+        let m: Manifest = aterm_toml::from_str(text).map_err(|e| format!("parse manifest: {e}"))?;
         m.validate()?;
         Ok(m)
     }
@@ -274,7 +274,8 @@ impl Manifest {
         // delimiter then sits directly after the last character, which is valid).
         let mut head = self.clone();
         head.changelog = None;
-        let mut out = toml::to_string(&head).map_err(|e| format!("serialize manifest: {e}"))?;
+        let mut out =
+            aterm_toml::to_string(&head).map_err(|e| format!("serialize manifest: {e}"))?;
         if let Some(body) = &self.changelog {
             out.push_str("changelog = '''\n");
             out.push_str(body);

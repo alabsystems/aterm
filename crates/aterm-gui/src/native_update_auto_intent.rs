@@ -106,7 +106,8 @@ pub(crate) enum PollDecision {
     /// Apply this exact staged artifact now. `quiet` reports whether the
     /// machine was actually idle: `false` means the bounded preference window
     /// elapsed while it stayed busy, so the host must take the lane that does
-    /// not wait for — or let itself be revoked by — further activity.
+    /// not wait for further activity to go quiet. (It is still revoked BY
+    /// activity mid-flight — that guard is mode-blind on purpose.)
     Attempt {
         build: u64,
         quiet: bool,

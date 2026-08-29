@@ -1,0 +1,74 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the twenty-three
+# third-party consumers' `cfg-if = "1"` lines at this code the package must be
+# called `cfg-if` — nothing else works. The DIRECTORY keeps the `aterm-` prefix
+# so a `ls crates/` or a stack trace still reads as ours and nobody mistakes
+# this for a vendored upstream (those live under `vendor/`, which is where
+# genuinely-upstream source belongs).
+name = "cfg-if"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number: every requirement in the graph is
+# `^1.0` or `1` (getrandom 0.2/0.3/0.4, half, naga, parking_lot_core, ring,
+# wgpu, wgpu-hal, ahash, libloading, polling, async-io, async-process,
+# async-signal, tiny-skia, console_error_panic_hook, wasm-bindgen, crc32fast,
+# filetime, nix, sha2 …), and 1.0.4 is what the lock held before the swap, so
+# the lockfile's version line does not move.
+version = "1.0.4"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `cfg_if!` macro for aterm (replaces the crates.io cfg-if package)"
+
+# `cfg-if` is the PACKAGE; `cfg_if` is what every consumer writes — as a path
+# (`cfg_if::cfg_if!`), as an import (`use cfg_if::cfg_if;`) and as a macro_use
+# root (`#[macro_use] extern crate cfg_if;`). Cargo would derive `cfg_if` from
+# the package name on its own; it is declared so the two can never drift.
+[lib]
+name = "cfg_if"
+path = "src/lib.rs"
+
+[features]
+# Upstream declares exactly one feature, and it is unreachable here: features
+# resolve to `default` only on all four cells (re-check with
+# `cargo tree --workspace --target <cell> -e features -i cfg-if`).
+#
+# It is declared anyway, as a NO-OP, because it costs one line and removes a
+# whole class of "some transitive parent asked for `cfg-if/rustc-dep-of-std`"
+# resolution failures on a cell we cannot compile here. It is deliberately NOT
+# wired to upstream's optional `core = { package = "rustc-std-workspace-core" }`
+# dependency: adding that would put a package back INTO the graph, which is the
+# opposite of the point. See the DIVERGENCES section of src/lib.rs — this shim
+# cannot be used to build `std` itself, and nothing in aterm asks it to.
+rustc-dep-of-std = []
+# Upstream declares no `default` feature either; cargo synthesizes an empty one,
+# which is why `-e features` reports `default` for a package whose feature table
+# has no such key.
+
+# NO `[dev-dependencies]` ON THE UPSTREAM CRATE, AND THAT IS A DELIBERATE
+# DEPARTURE FROM THIS WAVE'S USUAL DIFFERENTIAL PATTERN.
+#
+# The pattern everywhere else in the repo — crates/aterm-grapheme keeps
+# `unicode-width`, crates/aterm-hash's oracle keeps its reference — works
+# because the reference crate is a DIFFERENT package that no patch touches.
+# Here the reference would be `cfg-if` itself, and `[patch.crates-io]` rewrites
+# EVERY crates-io edge in the workspace, dev edges included. Measured, not
+# guessed: with the patch entry in place, `cargo metadata` resolves
+#
+#     upstream-cfg-if = { package = "cfg-if", version = "1.0.4" }
+#
+# to `path+…/crates/aterm-cfg-if#cfg-if@1.0.4` — this crate. The differential
+# would compare the shim to itself, pass forever, and prove nothing, with no
+# error to notice. A test that cannot fail is worse than no test.
+#
+# `tests/differential.rs` therefore compares against a reference the patch
+# table cannot reach and that is in any case more authoritative than another
+# crate's macro: rustc's own `cfg!()`, which evaluates the very same predicates
+# this macro hands to `#[cfg]`. See that file's header.
+
+[lints]
+workspace = true

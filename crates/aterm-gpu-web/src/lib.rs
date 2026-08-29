@@ -4015,26 +4015,62 @@ mod tests {
         // instead of a splash following program output. Measured mechanism:
         // the same leap used to be this test's splash vehicle before
         // 201449c2 gated it.
+        //
+        // TWO CLAIMS, SEPARATED — they used to be one `&&` inside a 40-frame
+        // loop, and the pair failed for a reason neither of them is about.
+        //
+        //   * THE BAND goes dark IMMEDIATELY and stays dark. That is this
+        //     test's own subject (it is the spill export under judgment), it
+        //     is the half that answers "does a cold leap splash the chrome",
+        //     and it is checked on EVERY frame of the wait rather than only
+        //     on the one frame where both conditions happened to coincide.
+        //   * THE IN-GRID AURORA drains to nothing. It does — but it is the
+        //     EARNED light fading on its own configured envelope, not the
+        //     wake being retired, so it takes as long as that envelope takes.
+        //
+        // THE BUDGET IS WHY THIS WAS RED. 40 frames is 640 ms; the aurora
+        // configured above (`duration_ms = 400`, ring + bloom on, plus the
+        // spark tail) empties at frame 46 — 736 ms — MEASURED on this fixture
+        // by counting `cursor_glow_add` per frame: 120 quads at the leap, 4 by
+        // frame 20, 1 by frame 40, 0 at 46. The claim was right, the stopwatch
+        // was short by six frames, and a red like that teaches the reader that
+        // this file's reds are noise. The window is now 2 s — comfortably past
+        // any envelope these knobs can express, still instant to run — and the
+        // diagnostic reports how far the drain actually got, so a REAL
+        // regression (light that never retires) reads differently from a
+        // budget that has gone tight again.
         t.process(b"\x1b[1;30Hz");
-        let mut drained = false;
-        for _ in 0..40 {
+        const DRAIN_FRAMES: usize = 125; // 2 s at the 16 ms step above
+        let mut drained_at = None;
+        let mut last_quads = usize::MAX;
+        for i in 0..DRAIN_FRAMES {
             t.advance_effects(16.0);
             fill_frame(&mut t);
-            if t.frame_scratch.cursor_glow_add.is_empty()
-                && t.spill
-                    .rgba()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .all(|px| px[3] == 0)
-            {
-                drained = true;
+            let band_lit = t
+                .spill
+                .rgba()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|px| px[3] != 0)
+                .count();
+            assert_eq!(
+                band_lit, 0,
+                "frame {i} after an unwitnessed leap put {band_lit} lit pixels in the \
+                 band — cold program movement must not splash the chrome"
+            );
+            last_quads = t.frame_scratch.cursor_glow_add.len();
+            if last_quads == 0 {
+                drained_at = Some(i);
                 break;
             }
         }
         assert!(
-            drained,
-            "an unwitnessed leap retires the wake — cold movement stays dark"
+            drained_at.is_some(),
+            "the earned aurora still had {last_quads} quads after {DRAIN_FRAMES} frames \
+             ({} ms): an unwitnessed leap retires the wake and the remaining light must \
+             fade on its own envelope, not persist",
+            DRAIN_FRAMES * 16
         );
 
         // Pointer stability across an animating content frame.

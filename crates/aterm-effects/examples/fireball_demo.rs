@@ -60,9 +60,9 @@ fn fill_rect(img: &mut [u8], w: usize, x: usize, y: usize, rw: usize, rh: usize,
 
 fn write_png(path: &str, img: &[u8], w: usize, h: usize) {
     let file = std::fs::File::create(path).unwrap();
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(img).unwrap();
 }
 

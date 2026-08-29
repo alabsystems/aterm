@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "First-party HTTP/1.1 client for aterm (replaces `ureq` and the ureq-proto/http/bytes/httparse stack behind it)"
+
+[dependencies]
+# TLS 1.3/1.2 with the `ring` provider — the SAME pin aterm-net already ships,
+# so this crate adds no new crypto stack. rustls has other parents in the graph
+# (aterm-net), which is why retiring ureq does not remove it.
+rustls = { workspace = true }
+# Base64 for PEM certificate-bundle decoding (`src/pem.rs`). Already first-party
+# and already in the shipped graph; ureq used its own `ureq::tls::PemItem`.
+aterm-codec = { workspace = true }
+
+# THE TRUST MODEL, UNCHANGED — and now first-party. Server certificates are
+# still verified against the OPERATING SYSTEM's trust store and never against a
+# root set bundled into the binary; `src/verifier.rs` makes those OS calls
+# itself instead of routing them through `rustls-platform-verifier`. That
+# retired 4 packages / 19,534 lines from the mac-arm graph (10 / 29,722 across
+# the four measured cells) without changing the trust decision, because it is
+# the same OS making it. The crate stays below as a dev-dependency ORACLE.
+#
+# macOS/iOS need NO manifest entry: Security.framework and CoreFoundation are OS
+# dylibs, declared with `#[link(kind = "framework")]` in `src/verifier/apple.rs`.
+# Linux and the BSDs need none either: their arm is `rustls`'s own
+# `WebPkiServerVerifier` over `/etc/ssl/certs`, and `rustls-webpki` is already in
+# every cell via `rustls`.
+
+# Windows is the one arm that needs bindings for its OS calls
+# (`CertGetCertificateChain` + `CertVerifyCertificateChainPolicy`). This costs
+# ZERO packages: `windows-sys` 0.61.2 is already resolved in the win cell for
+# `softbuffer`, and the feature union there ALREADY includes
+# `Win32_Security_Cryptography` — asking for the same two features reproduces
+# the identical node.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+] }
+
+# ORACLE ONLY (never in a shipped build). `rustls-platform-verifier` was this
+# crate's platform verifier until `src/verifier.rs` replaced it, and it stays
+# here purely as the differential test's reference implementation:
+# `verifier::tests` drives both implementations over the same fixture chains,
+# with the same anchors and the same pinned instant, and asserts they agree on
+# accept/reject and on every error kind either of them maps. If it is ever
+# removed, `the_first_party_verifier_matches_its_recorded_expectations` still
+# holds the measured verdicts.
+#
+# `cargo forge` resolves each cell with `cargo tree --edges normal`
+# (crates/aterm-forge/src/resolve.rs:340), so a dev-dependency is outside every
+# cell figure. It does keep its ~7 entries in Cargo.lock, so the ratcheted
+# `lock third_party_packages` ceiling does NOT fall for this change.
+[dev-dependencies]
+rustls-platform-verifier = { workspace = true }
+
+[lints]
+workspace = true

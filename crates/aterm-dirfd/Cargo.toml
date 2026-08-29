@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-dirfd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Fd-relative POSIX directory operations for aterm's confined artifact paths (replaces `rustix`)"
+
+[dependencies]
+# The syscalls themselves. `libc` is already in the shipped graph (the
+# scrollback disk tier, the PTY layer, aterm-uds, atpkg-keys' mlock/setrlimit),
+# so this crate adds NO package to the build — it converts 72,832 lines of
+# third-party wrapper into ~700 lines of first-party wrapper over a dependency
+# that was already there.
+libc = { workspace = true }
+
+[dev-dependencies]
+# ORACLE ONLY — never in the shipped graph. The crate this one retires, pinned
+# to the exact version aterm-gui used, so `tests/oracle.rs` can drive both
+# implementations over the same real directory trees and require agreement on
+# every result, every errno, every stat field, every directory listing, and the
+# filesystem state left behind. This is security-relevant machinery — the whole
+# point of it is that a path is never re-resolved between check and use — so the
+# differential is the proof that the reimplementation kept that, not a formality.
+rustix = { version = "=1.1.4", features = ["fs"] }
+# The workspace's own temp-dir helper (first-party; it is what retired
+# `tempfile` from the tree). The oracle runs on REAL directories, not a mock:
+# the properties under test — TOCTOU windows, link counts, rename atomicity —
+# only exist on a real filesystem.
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

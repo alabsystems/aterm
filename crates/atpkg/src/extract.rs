@@ -1057,9 +1057,9 @@ pub(crate) fn extract_tar_zst_tree(
 }
 
 /// The `tar-gz` vendor lane: the SAME tar extraction as [`extract_tar_zst_tree`] behind
-/// a gzip decoder (`flate2`, pure-Rust `miniz_oxide` backend; multi-member, as `gzip -d`
-/// is). Every vet, cap and fold rule is inherited by construction — only the
-/// decompressor differs.
+/// a gzip decoder (first-party `aterm_codec::inflate::stream`; multi-member, as `gzip -d`
+/// is, and CRC/length-checked per member). Every vet, cap and fold rule is inherited by
+/// construction — only the decompressor differs.
 pub(crate) fn extract_tar_gz_tree(
     archive: &Path,
     dest_root: &Path,
@@ -1068,7 +1068,7 @@ pub(crate) fn extract_tar_gz_tree(
     opts: ExtractOptions,
 ) -> Result<TreeAccumulator, ExtractError> {
     let file = std::fs::File::open(archive)?;
-    let decoder = flate2::read::MultiGzDecoder::new(file);
+    let decoder = aterm_codec::inflate::stream::GzipReader::new(file);
     folded(extract_stream(
         decoder,
         dest_root,

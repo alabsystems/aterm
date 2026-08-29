@@ -84,9 +84,9 @@ fn composite(
         }
     }
     let file = std::fs::File::create(path).unwrap();
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(&img).unwrap();
     println!("wrote {path} ({} quads)", quads.len());
 }

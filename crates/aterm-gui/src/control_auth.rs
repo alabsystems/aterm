@@ -1442,10 +1442,10 @@ fn completed_recording(
     if !work.bytes(bytes.len()) {
         return CompletionProbe::Exhausted;
     }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
         return CompletionProbe::Invalid;
     };
-    let Some(frames) = value.get("frames").and_then(serde_json::Value::as_array) else {
+    let Some(frames) = value.get("frames").and_then(aterm_json::Value::as_array) else {
         return CompletionProbe::Invalid;
     };
     if frames.len() > VIDEO_FRAME_LIMIT {
@@ -1455,7 +1455,7 @@ fn completed_recording(
     files.push(marker);
     files.push(index);
     for frame in frames {
-        let Some(name) = frame.get("file").and_then(serde_json::Value::as_str) else {
+        let Some(name) = frame.get("file").and_then(aterm_json::Value::as_str) else {
             return CompletionProbe::Invalid;
         };
         if !work.file_open() {
@@ -3358,9 +3358,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let frame_entries = (0..8)
-            .map(|index| serde_json::json!({ "file": format!("frame-{index}.png") }))
+            .map(|index| aterm_json::json!({ "file": format!("frame-{index}.png") }))
             .collect::<Vec<_>>();
-        let index = serde_json::to_vec(&serde_json::json!({ "frames": frame_entries })).unwrap();
+        let index = aterm_json::to_vec(&aterm_json::json!({ "frames": frame_entries })).unwrap();
         for recording in 0..9 {
             let dir = root.join(format!("rec-{recording:020}-000"));
             std::fs::create_dir(&dir).unwrap();

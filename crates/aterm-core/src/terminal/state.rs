@@ -51,6 +51,50 @@ impl ContentScrollState {
     }
 }
 
+/// The host-configuration values LAST APPLIED for the three
+/// [`apply_config`](Terminal::apply_config) settings that an APPLICATION also
+/// owns over the wire: DECAWM (mode 7), focus reporting (mode 1004) and
+/// bracketed paste (mode 2004).
+///
+/// Everything else `apply_config` writes is host-only, so "the live value
+/// differs from the config" can be read as "the host changed its mind". For
+/// these three it usually means the opposite — the SHELL set the mode — and
+/// re-asserting the config value on every reload silently un-negotiates the
+/// running program's protocol state. Diffing a reload against the PREVIOUS
+/// CONFIG instead is what keeps a colour-scheme edit out of the wire protocol.
+///
+/// For bracketed paste that is a SAFETY property, not just tidiness: dropping
+/// the `ESC[200~`/`ESC[201~` guards while the shell still believes it is framing
+/// pastes turns an inert multi-line clipboard payload back into executed
+/// keystrokes — the exact pastejacking exposure mode 2004 exists to close.
+///
+/// The seed is the POWER-ON value, so a reset does not restore it: RIS and
+/// DECSTR return these modes to the DEC power-on state, which is already what
+/// [`TerminalModes::new`] and `handle_decstr` do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ConfiguredModes {
+    /// Host value last applied for DECAWM (mode 7).
+    pub(super) auto_wrap: bool,
+    /// Host value last applied for focus reporting (mode 1004).
+    pub(super) focus_reporting: bool,
+    /// Host value last applied for bracketed paste (mode 2004).
+    pub(super) bracketed_paste: bool,
+}
+
+impl Default for ConfiguredModes {
+    /// The DEC power-on values, which are also `TerminalConfig`'s defaults — so
+    /// a host that applies a default config over a fresh terminal writes
+    /// nothing, and a host that configures a non-default value still lands it
+    /// on the very first `apply_config`.
+    fn default() -> Self {
+        Self {
+            auto_wrap: true,
+            focus_reporting: false,
+            bracketed_paste: false,
+        }
+    }
+}
+
 /// Terminal emulator.
 ///
 /// Combines a [`Parser`] and a [`Grid`] to provide full terminal emulation.
@@ -61,6 +105,10 @@ pub struct Terminal {
     pub(super) parser: Parser,
     /// Terminal modes.
     pub(super) modes: TerminalModes,
+    /// Host config's last-applied values for the app-negotiated modes — see
+    /// [`ConfiguredModes`]. Session-only: never forwarded to the VT handler,
+    /// because no escape sequence may move a HOST setting.
+    pub(super) configured_modes: ConfiguredModes,
     /// Current text style.
     pub(super) style: CurrentStyle,
     /// Character set state (G0-G3, GL, single shift).
@@ -268,15 +316,12 @@ pub struct Terminal {
     /// per-state drop counter. See [`super::shell_integration_auth`]
     /// for the security model.
     pub(super) shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth,
-    /// Host-side authorization state for OSC 8 hyperlink URI acceptance.
-    /// See [`super::hyperlink_auth`] for the security model: the zero-sized
-    /// [`super::hyperlink_auth::HyperlinkCapability`] token is the **only**
-    /// way a handler can write to `transient.current_hyperlink` once the
-    /// refactor completes. Defaults to authorized (matches pre-refactor
-    /// behavior — OSC 8 has been a universally supported terminal feature
-    /// since xterm's 2017 patch). Hosts shipping a hardened profile can
-    /// revoke via [`super::Terminal::revoke_hyperlinks`]. Addresses CF-014
-    /// from `reports/2026-04-18-privilege-conflation-audit.md`.
+    /// The EXTRA OSC 8 URI schemes this host minted, accepted alongside the
+    /// built-in safe allowlist ([`super::Terminal::authorize_hyperlink_scheme`],
+    /// orca deep-links §7). See [`super::hyperlink_auth`] for the model: the
+    /// scheme set is the whole of the host's OSC 8 admission decision — there
+    /// is no separate "accept OSC 8 at all" switch, because what a click may
+    /// OPEN is decided in the host at press time, not here.
     pub(super) hyperlink_auth: super::hyperlink_auth::HyperlinkAuth,
     /// Host-side authorization state for raw DCS callback delivery
     /// (OSC P ... ST → registered `FnMut(&[u8], u8)`). See

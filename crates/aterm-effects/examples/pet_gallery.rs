@@ -246,9 +246,9 @@ fn blit_tile_onto(dst: &mut Tile, src: &Tile, x0: u32, y0: u32) {
 
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header()?
         .write_image_data(rgb)
         .map_err(std::io::Error::other)

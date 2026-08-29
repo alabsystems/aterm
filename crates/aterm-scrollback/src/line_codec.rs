@@ -124,6 +124,27 @@ impl Line {
     ///
     /// These limits are orders of magnitude larger than any realistic terminal line.
     /// Truncation would only occur with malformed or malicious input.
+    ///
+    /// # Inline images are NOT on the wire
+    ///
+    /// [`Line::images`] carries no wire section, deliberately, and this is the
+    /// scope line for how far a picture follows its text: an inline image is
+    /// retained for as long as its line lives in the IN-MEMORY hot tier (where
+    /// `Line` structs are held as-is and the payload `Arc` is shared by every
+    /// row of the footprint), and is dropped when the line is serialized for
+    /// the LZ4 warm tier, the zstd cold tier, or the disk-backed `.dtrm` store.
+    ///
+    /// The reason is per-line duplication: the wire format has no cross-line
+    /// dictionary, so a shared payload would be written once per COVERED ROW —
+    /// a 2 MiB screenshot across a 20-row footprint becomes 40 MiB of warm
+    /// blocks and then compresses that redundancy again on every tier
+    /// migration. Giving history the payload once needs a page-level payload
+    /// table in the block codec, which is a wire-format change with its own
+    /// compatibility and bounding story; until then the honest behaviour is
+    /// that a picture survives the scrollback boundary and the hot window, and
+    /// falls back to today's blank rows once its line is compressed. Nothing
+    /// about the existing bytes changes: a line with no image serializes
+    /// byte-identically to before the field existed.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         // The estimate is only a capacity hint (never affects the serialized
@@ -372,6 +393,9 @@ impl Line {
             flags,
             hyperlinks: hyperlinks.map(Box::new),
             underline_colors: underline_colors.map(Box::new),
+            // No wire section: an inline image lives only as long as its line
+            // stays in the in-memory hot tier (see `serialize`'s scope note).
+            images: None,
         })
     }
 
@@ -823,6 +847,7 @@ impl Line {
             flags,
             hyperlinks: None,
             underline_colors: None,
+            images: None,
         })
     }
 }

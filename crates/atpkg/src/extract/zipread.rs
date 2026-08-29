@@ -20,8 +20,9 @@
 //! This reader only PARSES. Every member is handed to the same [`super::Layer`] as the
 //! tar lanes with `(raw path, kind, mode, body)`, so the slip vet, `strip_components`,
 //! the byte and entry caps, the mode sanitizing, the in-root symlink rule and the
-//! `tree_root` fold are inherited by construction. Inflate is `flate2` (pure-Rust
-//! `miniz_oxide` backend), which is already in the pinned tree.
+//! `tree_root` fold are inherited by construction. Inflate is first-party
+//! (`aterm_codec::inflate::stream`), the streaming driver over the same engine the
+//! terminal's Kitty `o=z` path uses.
 //!
 //! # What it reads
 //!
@@ -433,7 +434,9 @@ fn open_body<'f>(
     if rec.method == METHOD_STORE {
         Ok(Box::new(raw))
     } else {
-        Ok(Box::new(flate2::read::DeflateDecoder::new(raw)))
+        Ok(Box::new(aterm_codec::inflate::stream::DeflateReader::new(
+            raw,
+        )))
     }
 }
 

@@ -48,10 +48,13 @@ pub fn plist_marks_dev_build(text: &str) -> bool {
 }
 
 /// Read the dev mark off a bundle on disk. Unreadable ⇒ false (see
-/// [`plist_marks_dev_build`] for why the failure direction is open).
-fn is_dev_marked(app_root: &Path) -> bool {
-    std::fs::read_to_string(app_root.join("Contents/Info.plist"))
-        .is_ok_and(|text| plist_marks_dev_build(&text))
+/// [`plist_marks_dev_build`] for why the failure direction is open). Bounded like
+/// every other small file the updater consults (`read_ledger_text`): a plist over
+/// the cap is "unreadable", never unbounded work — the S12 `which_copy` report asks
+/// this of the running bundle on every `--version` and About open.
+pub(crate) fn is_dev_marked(app_root: &Path) -> bool {
+    crate::read_ledger_text(&app_root.join("Contents/Info.plist"))
+        .is_some_and(|text| plist_marks_dev_build(&text))
 }
 
 /// Resolve the installed bundle the updater **may replace**, or `None` when it must
@@ -107,6 +110,14 @@ pub fn resolve_from(exe: &Path) -> Option<Bundle> {
     if s.contains("/AppTranslocation/") || s.starts_with("/Volumes/") {
         return None;
     }
+    layout_of(exe)
+}
+
+/// The `…/<X>.app/Contents/MacOS/<exe>` SHAPE alone — no translocation, volume or
+/// dev-mark gate. For NAMING the bundle a process runs from (`which_copy`: a DMG
+/// launch is still "running: /Volumes/aterm/aterm.app"), never for acting on it —
+/// every acquiring path goes through [`resolve`] / [`resolve_from`].
+pub(crate) fn layout_of(exe: &Path) -> Option<Bundle> {
     // Require exactly  …/<X>.app/Contents/MacOS/<exe>.
     let macos = exe.parent()?; // …/Contents/MacOS
     if macos.file_name()?.to_str()? != "MacOS" {

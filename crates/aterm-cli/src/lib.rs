@@ -4,12 +4,19 @@
 //! `aterm` — a transparent, introspecting terminal (U1).
 //!
 //! It spawns your `$SHELL` in a PTY and passes I/O through **unchanged**, so it
-//! looks and behaves exactly like your shell — while feeding every output byte
-//! into the aterm VT engine, which builds a live model of the screen. No
-//! re-rendering: the host terminal draws the bytes; the engine runs alongside.
-//! This passthrough binary keeps that model IN-PROCESS and serves NO control
-//! socket; the out-of-process, introspectable surface an AI reads and drives
-//! (via `aterm ctl`) is the WINDOW mode of the one binary — `aterm --window`,
+//! looks and behaves exactly like your shell. It does NOT model the screen by
+//! default: the host terminal draws the bytes and NOTHING in this process reads
+//! them back. The VT engine is DEMAND-DRIVEN — `$ATERM_SESSION_MODEL` builds a
+//! [`Terminal`] and feeds it every output byte; unarmed (the default) the model
+//! is never constructed, so there is no VT parse, no grid mutation and no
+//! scrollback growth on the passthrough path. See [`session_model_armed`].
+//! The arming path is kept, not deleted, for the ONE consumer on the books:
+//! `apply_policy_engine` on the CLI engine (docs/HARDCORE_BACKLOG.md §4 P0,
+//! deferred sub-item). Until that lands, an armed model is a model nothing in
+//! the process can read — aterm-cli links no control, uds or session crate.
+//! This passthrough binary serves NO control socket either way; the
+//! out-of-process, introspectable surface an AI reads and drives (via
+//! `aterm ctl`) is the WINDOW mode of the one binary — `aterm --window`,
 //! or `--headless` for an engine + socket with no window.
 //!
 //! A thin platform driver (raw mode + passthrough loop: `poll(2)`/termios in
@@ -18,8 +25,10 @@
 //! `setrlimit`-bounded, fail-closed fork/exec, and OS-sandbox-wrapped when the
 //! containment mode demands it (P0) — exactly like `aterm-gui`, NOT raw
 //! `forkpty`/`execvp`. Daily-driver essentials are handled: window resize is
-//! forwarded (SIGWINCH / console resize event -> PTY + engine), the loop is
-//! signal-robust (EINTR), and aterm exits with the shell's own status.
+//! forwarded (SIGWINCH / console resize event -> PTY, and the engine too when
+//! one is armed — the PTY half is unconditional, so a full-screen app reflows
+//! identically with the model off), the loop is signal-robust (EINTR), and
+//! aterm exits with the shell's own status.
 //!
 //! Containment mode is launcher-owned (`ATERM_CONTAINMENT_MODE`, ATERM_DESIGN §5):
 //! the default is `User` — no OS sandbox, so the daily-driver shell keeps full
@@ -44,12 +53,13 @@ mod driver;
 // what aterm is, how to drive it, and every tool in the toolchain.
 mod manual;
 
-// The coding-agent primer installer behind `aterm agents` — manages the 3-line,
-// self-gating aterm primer in agents' global context files (~/.claude/CLAUDE.md,
-// ~/.codex/AGENTS.md, ...), the one channel that reliably reaches an agent's
-// context in every project. The delivery half of the manual: `manual` is what an
-// agent reads once it knows to run `aterm help`; `primer` is how it learns to.
-mod primer;
+// The coding-agent primer installer behind `aterm agents` lives in the
+// `aterm-primer` crate — it manages the 3-line, self-gating aterm primer in
+// agents' global context files (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ...),
+// the one channel that reliably reaches an agent's context in every project. The
+// delivery half of the manual: `manual` is what an agent reads once it knows to
+// run `aterm help`; the primer is how it learns to. A crate rather than a module
+// here because the GUI runs the same installer itself on every session it opens.
 
 // The wt-shaped WINDOWING grammar (`new-tab` / `new-window` / `split-pane`) and
 // the `windowing_behavior` routing policy behind them. Pure parse + pure
@@ -70,10 +80,11 @@ const HELP_HEAD: &str = concat!(
     "aterm — a transparent, introspecting terminal\n",
     "\n",
     "Spawns your $SHELL in a PTY and passes I/O through unchanged, so it looks and\n",
-    "behaves exactly like your shell — while feeding every output byte into the aterm\n",
-    "VT engine. The shell runs through the PROTECTED spawn seam: cap-gated,\n",
-    "setrlimit-bounded, fail-closed, and OS-sandbox-wrapped when the containment mode\n",
-    "demands it.\n",
+    "behaves exactly like your shell. The output is NOT modelled: the host terminal\n",
+    "draws the bytes and this process keeps no screen state (ATERM_SESSION_MODEL=1\n",
+    "builds the in-process VT model anyway — see ENVIRONMENT). The shell runs through\n",
+    "the PROTECTED spawn seam: cap-gated, setrlimit-bounded, fail-closed, and\n",
+    "OS-sandbox-wrapped when the containment mode demands it.\n",
     "\n",
     "A SESSION serves NO control socket — it is not itself introspectable from the\n",
     "outside. The live, introspectable model an AI can read and drive is the WINDOW\n",
@@ -304,7 +315,8 @@ impl Verb {
             Verb::Agents => &[
                 "Make coding agents aterm-aware: manage the 3-line aterm",
                 "primer in their global context files (status | install |",
-                "remove | primer). Run once per machine.",
+                "remove | primer). aterm also keeps it installed for every",
+                "detected agent each time it opens a session.",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",
@@ -380,7 +392,15 @@ const HELP_TAIL: &str = concat!(
     "                              consulted when no --containment flag is given.\n",
     "                              A malformed value fails CLOSED to containment.\n",
     "    ATERM_VERBOSE             If set, print a one-line session summary (bytes\n",
-    "                              processed by the VT core) to stderr on exit.\n",
+    "                              passed through, and whether the session model was\n",
+    "                              armed) to stderr on exit.\n",
+    "    ATERM_SESSION_MODEL       Arm the in-process VT model of the session: every\n",
+    "                              output byte is ALSO fed to the aterm engine, which\n",
+    "                              costs an O(bytes) VT parse plus O(scrollback) memory.\n",
+    "                              OFF by default, and 0/off/empty do not arm it. The\n",
+    "                              model is in-process only — a SESSION serves no control\n",
+    "                              socket, so nothing outside can read it; arm it only\n",
+    "                              for an in-process consumer of the engine.\n",
     "\n",
     "EXAMPLES:\n",
     "    aterm                              Start an interactive shell (mode: user).\n",
@@ -488,6 +508,19 @@ fn show_config_report() -> String {
             "off"
         }
     ));
+    // The session model is OFF unless armed, and "is the engine running?" is
+    // exactly the kind of question a `show-config` exists to answer without a
+    // source dive — the more so because the answer changes what a session COSTS
+    // (an O(bytes) VT parse and O(scrollback) memory) while changing nothing a
+    // user can see.
+    out.push_str(&format!(
+        "session_model={}\n",
+        if session_model_armed_from_env() {
+            "on"
+        } else {
+            "off"
+        }
+    ));
     out
 }
 
@@ -546,6 +579,10 @@ fn explain_config_report() -> String {
         "  ATERM_CONTAINMENT_MODE  containment mode when no --containment flag is given.\n",
     );
     out.push_str("  ATERM_VERBOSE           print a one-line session summary to stderr on exit.\n");
+    out.push_str(
+        "  ATERM_SESSION_MODEL     arm the in-process VT model of the session; default OFF,\n",
+    );
+    out.push_str("                          and 0/off/empty do not arm it.\n");
     out
 }
 
@@ -702,9 +739,10 @@ enum CliAction {
     /// WITHOUT spawning a shell. `topic` is the optional deep-dive selector; `None`
     /// prints the front page (or, inside an aterm session, the agent brief).
     Manual { topic: Option<String> },
-    /// `agents [<cmd> [<agent>…]]`: manage the coding-agent primer (via [`primer`])
-    /// and exit WITHOUT spawning a shell. `rest` is everything after the word
-    /// `agents` (subcommand + optional agent names), parsed by the module itself.
+    /// `agents [<cmd> [<agent>…]]`: manage the coding-agent primer (via the
+    /// `aterm-primer` crate) and exit WITHOUT spawning a shell. `rest` is everything
+    /// after the word `agents` (subcommand + optional agent names), parsed by the
+    /// crate itself.
     Agents { rest: Vec<String> },
     /// A usage error (unknown option, missing `--containment` value): the message
     /// is already framed for stderr; exit 2 without launching a shell.
@@ -750,8 +788,8 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
         return CliAction::Manual { topic: args.next() };
     }
     // `aterm agents …` dispatches the same way, git-style: the primer installer is
-    // the first operand, everything after it belongs to the `primer` module's own
-    // little parser (subcommand + agent names). Prints and exits, no shell spawned.
+    // the first operand, everything after it belongs to the `aterm-primer` crate's
+    // own little parser (subcommand + agent names). Prints and exits, no shell spawned.
     if args.peek().map(String::as_str) == Some("agents") {
         let _ = args.next();
         return CliAction::Agents {
@@ -823,6 +861,25 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     CliAction::Run { containment, quiet }
 }
 
+/// The `-V`/`--version` text. Line one is the identity, `aterm <version>` — the
+/// self-identification `tools/install.sh` greps (`^aterm `), unchanged. Then WHICH
+/// COPY runs (S12 of `docs/DESIGN-which-copy-runs-2026-08-27.md`): `running: <path>`
+/// (the `.app` on macOS, the executable elsewhere) and, per other `aterm.app` in the
+/// usual places, `another copy: <path> (<version>) — not the one running; the updater
+/// updates only this one` — the lines `aterm_update::which_copy` spells, so Settings ▸
+/// About says the same words. `None` (no executable path at all) prints identity only.
+#[must_use]
+pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
+    let mut out = format!("aterm {}\n", aterm_types::version::APP_VERSION);
+    if let Some(copy) = copy {
+        for line in copy.lines() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Dependency-free argument parser for the daily-driver CLI — the effectful shell
 /// around [`decide_args`]: prints help/version and exits 0, prints a usage error and
 /// exits 2, or normalizes the containment selection onto `$ATERM_CONTAINMENT_MODE`
@@ -841,7 +898,10 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
             std::process::exit(0);
         }
         CliAction::Version => {
-            println!("aterm {}", aterm_types::version::APP_VERSION);
+            print!(
+                "{}",
+                version_text(aterm_update::which_copy::observe().as_ref())
+            );
             std::process::exit(0);
         }
         CliAction::Diag { cmd, arg } => {
@@ -880,7 +940,7 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
         CliAction::Agents { rest } => {
             // Same print/exit discipline as the diag path: success to stdout, a
             // failure/usage report to stderr with its code, so it scripts.
-            let Some(home) = primer::home_dir() else {
+            let Some(home) = aterm_primer::home_dir() else {
                 eprintln!(
                     "aterm agents: cannot resolve the home directory ({} is unset)",
                     if cfg!(windows) {
@@ -891,7 +951,7 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
                 );
                 std::process::exit(1);
             };
-            let (out, code) = primer::agents_report(&home, &rest);
+            let (out, code) = aterm_primer::agents_report(&home, &rest);
             if code == 0 {
                 print!("{out}");
             } else {
@@ -973,6 +1033,46 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
     }
 }
 
+/// The environment knob that ARMS the in-process VT model of a session.
+///
+/// DEMAND-DRIVEN, DEFAULT OFF. A session is a passthrough: `write_all(stdout)`
+/// runs BEFORE the engine ever sees a byte, and this crate depends on no
+/// control, uds or session crate — so a model built here is readable by
+/// NOTHING, in this process or outside it, while costing the daily driver an
+/// O(bytes) VT parse plus O(scrollback) resident memory for no reader. The
+/// engine is therefore only constructed when this variable asks for it.
+///
+/// The arming path is deliberately KEPT rather than deleted: `apply_policy_engine`
+/// on the CLI engine is the one consumer on the books (docs/HARDCORE_BACKLOG.md
+/// section 4, P0 "Remaining sub-item"). When that lands it wants exactly this
+/// engine — constructed here, fed in the driver loop — so the wiring stays
+/// usable instead of having to be reinvented.
+const SESSION_MODEL_ENV: &str = "ATERM_SESSION_MODEL";
+
+/// Whether a raw `$ATERM_SESSION_MODEL` value arms the session model
+/// (`None` = unset). Pure, so the rule is testable without a process
+/// environment.
+///
+/// Presence is NOT enough — `0`, `off` (any case) and the empty string leave it
+/// off. That is the same reading `aterm-gui`'s `headless_arming` gives
+/// `$ATERM_HEADLESS`, and one workspace should have ONE answer to "what does
+/// this switch-shaped variable mean"; a knob that armed on `=0` would be a trap
+/// for exactly the scripts that set it explicitly to turn the thing off.
+fn session_model_armed(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off")),
+    }
+}
+
+/// [`session_model_armed`] over the live environment. A non-UTF-8 value is read
+/// lossily rather than dropped, so `ATERM_SESSION_MODEL=<garbage>` arms (it is not
+/// one of the three disabling spellings) instead of silently reading as unset.
+fn session_model_armed_from_env() -> bool {
+    let raw = std::env::var_os(SESSION_MODEL_ENV);
+    session_model_armed(raw.as_ref().map(|v| v.to_string_lossy()).as_deref())
+}
+
 /// The whole transparent SESSION as a callable: containment init, the single
 /// root-authority mint, the protected shell spawn, and the passthrough driver
 /// loop — never returns. The ONE `aterm` binary calls this after routing
@@ -993,7 +1093,7 @@ pub fn session_main(quiet: bool) -> ! {
         if !quiet && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
             eprintln!(
                 "aterm {} — transparent session started (start with `aterm help` · your shell \
-                 runs unchanged while the engine models it · `exit` leaves · `--quiet` silences)",
+                 runs unchanged, byte for byte · `exit` leaves · `--quiet` silences)",
                 aterm_types::version::APP_VERSION
             );
         }
@@ -1108,25 +1208,85 @@ pub fn session_main(quiet: bool) -> ! {
         std::process::exit(1);
     });
 
+    // THE SESSION MODEL — demand-driven, and OFF unless `$ATERM_SESSION_MODEL`
+    // asks for it (see [`SESSION_MODEL_ENV`]). Unarmed, the `Terminal` is never
+    // CONSTRUCTED, which is the whole point: `None` cannot be parsed into, cannot
+    // grow a grid, and cannot accumulate scrollback, so the passthrough pays for
+    // exactly what a passthrough does. Byte-transparency is untouched either way —
+    // both drivers write the bytes to stdout BEFORE the engine is offered them.
+    //
+    // An armed launch SAYS SO on stderr, before the shell spawns and outside the
+    // PTY stream. Arming is an explicit act by whoever set the variable, and the
+    // one thing they cannot check from the outside is whether it took: a session
+    // serves no control socket, so an armed model looks exactly like an unarmed
+    // one from every other vantage point.
+    let mut engine = if session_model_armed_from_env() {
+        eprintln!(
+            "aterm: session model ARMED (${SESSION_MODEL_ENV}) — every output byte is also \
+             fed to the in-process VT engine (O(bytes) parse + O(scrollback) memory). \
+             Nothing outside this process can read it; a session serves no control socket."
+        );
+        Some(Terminal::new(rows, cols))
+    } else {
+        None
+    };
+
     // PARENT: the platform driver owns raw mode, the passthrough loop, resize
     // forwarding, terminal restore, and the reap — and returns the shell's own
-    // exit status (non-exit → 1).
-    let mut engine = Terminal::new(rows, cols);
+    // exit status (non-exit → 1). Resize forwarding to the PTY is the driver's
+    // job and is NOT conditional on the model: `None` here means nothing models
+    // the new geometry, not that anything reports a stale one.
     let verbose = std::env::var_os("ATERM_VERBOSE").is_some();
-    let code = driver::run(shell, &mut engine, verbose);
+    let code = driver::run(shell, engine.as_mut(), verbose);
     std::process::exit(code);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAction, DIAG_COMMANDS, VERB_BLURB_COLUMN, Verb, decide_args, diag_report, doctor_checks,
-        explain_config_report, help_text, is_tool_candidate, list_fonts_report, list_themes_report,
-        prepend_path, show_face_report, validate_containment_value, verb_help_block,
+        CliAction, DIAG_COMMANDS, SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb, decide_args,
+        diag_report, doctor_checks, explain_config_report, help_text, is_tool_candidate,
+        list_fonts_report, list_themes_report, prepend_path, session_model_armed, show_face_report,
+        validate_containment_value, verb_help_block, version_text,
     };
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
+    }
+
+    /// THE default: an unset `$ATERM_SESSION_MODEL` leaves the session model
+    /// OFF. This is the whole point of the demand-driven change — a daily-driver
+    /// session must not pay an O(bytes) VT parse and O(scrollback) memory for a
+    /// model nothing in the process can read — so it is pinned rather than left
+    /// to a code reading.
+    #[test]
+    fn the_session_model_is_off_unless_asked_for() {
+        assert!(!session_model_armed(None));
+    }
+
+    /// The disabling spellings are `aterm-gui`'s (`headless_arming`): presence is
+    /// not arming. A knob that armed on `=0` would ambush exactly the operator who
+    /// set it to turn the engine off.
+    #[test]
+    fn zero_off_and_empty_do_not_arm_the_session_model() {
+        for v in ["0", "off", "OFF", "Off", ""] {
+            assert!(
+                !session_model_armed(Some(v)),
+                "{SESSION_MODEL_ENV}={v:?} must NOT arm the session model"
+            );
+        }
+    }
+
+    /// Anything else arms it — the `=1` an operator writes, and the other truthy
+    /// spellings people reach for.
+    #[test]
+    fn ordinary_truthy_values_arm_the_session_model() {
+        for v in ["1", "yes", "true", "on", "policy"] {
+            assert!(
+                session_model_armed(Some(v)),
+                "{SESSION_MODEL_ENV}={v:?} must arm the session model"
+            );
+        }
     }
 
     fn diag(cmd: &str, arg: Option<&str>) -> CliAction {
@@ -1236,7 +1396,7 @@ mod tests {
     #[test]
     fn agents_word_routes_to_the_primer_installer_and_is_advertised() {
         // `aterm agents …` parses like `help`: a git-style leading operand, dispatched
-        // before flag parsing / shell spawn; everything after it belongs to `primer`.
+        // before flag parsing / shell spawn; everything after it belongs to aterm-primer.
         assert_eq!(decide(&["agents"]), CliAction::Agents { rest: vec![] });
         assert_eq!(
             decide(&["agents", "install", "claude"]),
@@ -1645,6 +1805,32 @@ mod tests {
         for a in [["-V"], ["--version"]] {
             assert_eq!(decide(&a), CliAction::Version);
         }
+    }
+
+    /// `--version` keeps its identity line first (install.sh greps `^aterm `) and then
+    /// says which copy runs — the updater's own S12 lines, verbatim.
+    #[test]
+    fn version_text_names_the_running_copy_and_any_other() {
+        use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
+        let identity = format!("aterm {}\n", aterm_types::version::APP_VERSION);
+        assert_eq!(version_text(None), identity);
+        let copy = WhichCopy {
+            running: std::path::PathBuf::from("/Applications/aterm.app"),
+            kind: Running::InstalledApp,
+            others: vec![OtherCopy {
+                path: std::path::PathBuf::from("/Users//ana/Applications/aterm.app"),
+                version: Some("0.60.0".to_string()),
+            }],
+        };
+        assert_eq!(
+            version_text(Some(&copy)),
+            format!(
+                "{identity}running: /Applications/aterm.app\nanother copy: \
+                 /Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one running; the \
+                 updater updates only this one\n"
+            )
+        );
+        assert!(version_text(Some(&copy)).starts_with("aterm "));
     }
 
     #[test]

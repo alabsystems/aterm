@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-png"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "First-party PNG decode/encode for aterm (replaces `png` and the flate2/miniz_oxide compression stack behind it)"
+
+[dependencies]
+# The DEFLATE decompressor was ALREADY first-party and already in the shipped
+# graph — the OSC-1337 / kitty image paths and the update manifest reader use
+# it. Reusing it is the whole reason this crate is small: `png` dragged in an
+# entire second compression stack (flate2 + miniz_oxide + fdeflate +
+# simd-adler32 + adler2) for an inflate aterm already owned. The compressor
+# half, which nothing in the tree had, lives in `src/deflate.rs`.
+aterm-codec = { workspace = true }
+
+[dev-dependencies]
+# ORACLE ONLY — never in the shipped graph. The crate this one retires, kept so
+# `tests/oracle.rs` can prove decoded pixel buffers are BYTE-IDENTICAL over the
+# repository's own PNG corpus and over a synthesized matrix of every
+# (colour type x bit depth x interlace x tRNS) combination the format allows,
+# and that each implementation reads what the other writes. Exactly the pattern
+# `crates/aterm-toml` uses for `toml`/`toml_edit` and `crates/aterm-digest` for
+# `sha2`/`hmac`. Pinned HERE rather than inherited from [workspace.dependencies]:
+# the point of this crate is that no shipped member declares it any more.
+png = "0.17"
+criterion = "0.5"
+
+# The crate shipped with no bench target, so the decoder behind every inline
+# image in the terminal was never measured — which is how a byte-at-a-time CRC
+# came to walk every chunk one serial load-use chain at a time.
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true

@@ -159,6 +159,15 @@ pub enum TxnOutcome {
     /// staged or flipped. Constructed by [`crate::flow`]'s group apply directly —
     /// [`transact`] never returns it.
     Pinned(Vec<String>),
+    /// The group is held on its current builds because one of its `requires` is NOT met
+    /// (§17.10): `dep` is not installed, dev-linked, system-satisfied or installed through
+    /// its protocol, and `dep_state` is the dependency's own canonical row — the two
+    /// halves of the `blocked by <dep>: <dep state>` state the caller records. A DEFERRAL,
+    /// never a failure: nothing was resolved, downloaded, staged or flipped, and the next
+    /// pass retries. Constructed by [`crate::flow`]'s group transaction directly (the
+    /// requirement gate, [`crate::requires::unmet_requirement`]) — [`transact`] never
+    /// returns it.
+    Blocked { dep: String, dep_state: String },
     /// A member failed; the whole group was aborted. `during_flip` distinguishes a
     /// stage-phase abort (nothing was flipped) from a flip-phase abort (already-flipped
     /// members were rolled back).

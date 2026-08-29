@@ -84,9 +84,14 @@ pub struct TargetStreams {
     /// The lifecycle DIGEST: `EVENT <sid> block-complete <id> exit=<code>` on
     /// OSC 133 D, `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>`
     /// on each completed `turn` (scanned from the session TURN LEDGER), `EVENT <sid>
-    /// title <pct>` when the window title changes (OSC 0/2 — often the cwd/command
-    /// via shell integration), `EVENT <sid> bell total=<n>` on a BEL/alert, and
-    /// `EVENT <sid> exited` once when the session closes.
+    /// meta field=<f> value=<pct|->` on a `meta set`/`clear` (the session EVENT
+    /// TIMELINE's `meta-change` row), `EVENT <sid> title <pct>` when the window
+    /// title changes (OSC 0/2 — often the cwd/command via shell integration),
+    /// `EVENT <sid> bell total=<n>` on a BEL/alert, and — as the session is
+    /// retired — `EVENT <sid> closing reason=<token> by=<sid|human|->` (the exit
+    /// ledger's row, read from the timeline's `closing` record by the one wire
+    /// path that still holds that timeline once the sid no longer resolves)
+    /// followed once by `EVENT <sid> exited`.
     /// One low-rate stream an orchestrator watches for N sessions on one fd, pulling
     /// `screen`/`image` only when an event says something happened.
     pub events: bool,
@@ -98,6 +103,15 @@ pub struct TargetStreams {
     /// live, byte-lossless, every-frame channel (Item 2). Unlike screen/cells this
     /// never coalesces: the per-subscriber queue holds every burst between wakes.
     pub bytes: bool,
+    /// The `trim` MODIFIER (not a frame source): a `screen` DELTA stops after the
+    /// last non-blank row — `DELTA <sid> seq=<n> screen <nrows>` with `<nrows>` the
+    /// count actually sent — by the same rule as `text trim`
+    /// ([`crate::control::trimmed_len`]), so a poller and a subscriber agree on the
+    /// row count. It rides here rather than in [`PushOptions`] because it shapes ONE
+    /// per-target frame, and it carries no authority: it only shortens a frame the
+    /// gate already authorized. Inert without `screen` (as `every-frame` is without
+    /// `cells`); alone it names no source, so a `trim`-only list fails closed.
+    pub trim: bool,
 }
 
 impl TargetStreams {
@@ -105,6 +119,14 @@ impl TargetStreams {
     #[must_use]
     fn wants_content(self) -> bool {
         self.screen || self.cursor || self.cells
+    }
+
+    /// Whether any per-target FRAME SOURCE is requested. `trim` is a modifier and
+    /// does not count — comparing against `Default` would let `trim` alone pass the
+    /// "names at least one source" check and ack a stream that never emits.
+    #[must_use]
+    fn any_frame_source(self) -> bool {
+        self.screen || self.cursor || self.events || self.cells || self.bytes
     }
 }
 
@@ -115,8 +137,9 @@ impl TargetStreams {
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct RequestedInstance {
     /// The INSTANCE-lifecycle stream (not per-target): emit `EVENT * session-created
-    /// <sid>` when a session is spawned (by anyone) and `EVENT * session-exited <sid>`
-    /// when one closes — so a fleet supervisor watching `@.` learns of SIBLING
+    /// <sid>` when a session is spawned (by anyone) and `EVENT * session-exited <sid>
+    /// reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown>` when one
+    /// closes — so a fleet supervisor watching `@.` learns of SIBLING
     /// sessions it is not watching, without polling `ls`/`instances`. The `*` tag
     /// marks an instance-level (not per-channel) event.
     ///
@@ -231,11 +254,12 @@ impl Requested {
                 "cells" => out.targets.cells = true,
                 "bytes" => out.targets.bytes = true,
                 "timestamps" | "ts" => out.timestamps = true,
+                "trim" => out.targets.trim = true,
                 "sessions" => out.instance.sessions = true,
                 _ => return None,
             }
         }
-        let any_source = out.targets != TargetStreams::default() || out.instance.sessions;
+        let any_source = out.targets.any_frame_source() || out.instance.sessions;
         any_source.then_some(out)
     }
 }
@@ -940,16 +964,29 @@ fn drain_title_event(
     Some(title.to_string())
 }
 
-/// Scan the target's EVENT TIMELINE and emit `EVENT <sid> meta <payload>` for
-/// every `meta-change` record with id strictly greater than `last_id` — the push
-/// face of the `meta` verb, next to the title emitter (a fleet supervisor learns
-/// a sibling was renamed/annotated without polling `meta`). The payload is the
-/// record's own pre-pct-encoded `field=<f> value=<pct|->` tail. The returned
-/// watermark advances to the timeline HIGH (not just the last meta record), so
-/// non-meta lifecycle records are scanned once, never re-walked every wake. Small
-/// payload strings are cloned OUT under the lock; the lock is never held across
-/// a write.
-fn drain_meta_events(
+/// Scan the target's EVENT TIMELINE and push the record kinds the wire carries,
+/// for every record with id strictly greater than `last_id`:
+///
+/// * `EVENT <sid> meta <payload>` for a `meta-change` — the push face of the
+///   `meta` verb, next to the title emitter (a fleet supervisor learns a sibling
+///   was renamed/annotated without polling `meta`); the payload is the record's
+///   own pre-pct-encoded `field=<f> value=<pct|->` tail.
+/// * `EVENT <sid> closing <payload>` for the `closing` row the store writes as
+///   it retires the session — the `reason=<token> by=<sid|human|->` the `exits`
+///   ledger holds. This watch's own `Arc` is the ONLY wire path that can still
+///   read that row: the `timeline` verb resolves its target through the
+///   registry, and the sid stops resolving in the same store write that records
+///   it. It lands in the dying watch's final pass ([`Closing::drain`]), so it
+///   always precedes `EVENT <sid> exited`.
+///
+/// Every other kind (`spawned`, `state-change`, `title-change`, `cwd-change`) is
+/// skipped: title has its own emitter and lifecycle state is what `exited`
+/// says. [`timeline_wire_kind`] is the one table both the filter and the frame
+/// name come from. The returned watermark advances to the timeline HIGH (not
+/// just the last pushed record), so skipped records are scanned once, never
+/// re-walked every wake. Small payload strings are cloned OUT under the lock;
+/// the lock is never held across a write.
+fn drain_timeline_events(
     timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     sid: &str,
     last_id: Option<u64>,
@@ -969,19 +1006,32 @@ fn drain_meta_events(
             Some(hi) => {
                 // `since` now SEEKS (partition_point) instead of filtering the
                 // whole retained ring, so this costs O(log n + matched).
-                let fresh: Vec<String> = tl
+                let fresh: Vec<(&'static str, String)> = tl
                     .since(last_id)
-                    .filter(|e| e.kind == "meta-change")
-                    .map(|e| e.payload.clone())
+                    .filter_map(|e| timeline_wire_kind(e.kind).map(|k| (k, e.payload.clone())))
                     .collect();
                 (fresh, Some(hi))
             }
         }
     };
-    for payload in fresh {
-        out.push_str(&format!("EVENT {sid} meta {payload}\n"));
+    for (kind, payload) in fresh {
+        out.push_str(&format!("EVENT {sid} {kind} {payload}\n"));
     }
     high
+}
+
+/// The `EVENT <sid> <kind>` token a timeline record is pushed under on the
+/// `events` digest, or `None` for a kind the digest does not carry. ONE table,
+/// so the drain's filter and the frame it formats cannot disagree about which
+/// rows leave the process: the `closing` row first shipped recorded-but-never-
+/// pushed, because the filter named `meta-change` and nothing else, and the
+/// verb table claimed a watch could read it — the drift this table forecloses.
+fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "meta-change" => Some("meta"),
+        "closing" => Some("closing"),
+        _ => None,
+    }
 }
 
 /// Emit `EVENT <sid> bell total=<n>` when the monotonic fired-bell count advanced
@@ -1015,7 +1065,7 @@ struct RosterCursor {
     known: std::collections::HashSet<String>,
 }
 
-/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid>` for
+/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid> reason=<…>` for
 /// every roster change since the cursor's watermark — the INSTANCE lifecycle
 /// stream (`*` = instance-level, not a per-channel event). Surfaces a SIBLING
 /// spawn/exit a fleet supervisor is not watching, so it need not poll `ls`.
@@ -1072,7 +1122,15 @@ fn drain_session_events(store: &Store, cursor: &mut RosterCursor) -> Vec<Frame> 
                             cursor.known.insert(rec.sid.clone());
                         }
                         crate::session_store::RosterChange::Exited => {
-                            out.push_str(&format!("EVENT * session-exited {}\n", rec.sid));
+                            // `reason=` is a TRAILING additive token (old clients
+                            // key on the sid and ignore the tail): the journal row
+                            // knows why the session went, so the push says so —
+                            // the one thing a driver could never ask afterwards.
+                            out.push_str(&format!(
+                                "EVENT * session-exited {} reason={}\n",
+                                rec.sid,
+                                rec.reason.as_str()
+                            ));
                             cursor.known.remove(&rec.sid);
                         }
                     }
@@ -1098,7 +1156,8 @@ fn drain_session_events(store: &Store, cursor: &mut RosterCursor) -> Vec<Frame> 
 }
 
 /// The pure set-diff half of [`drain_session_events`] (store-free, unit-testable):
-/// `session-created` for sids newly live, `session-exited` for sids gone.
+/// `session-created` for sids newly live, `session-exited … reason=unknown` for sids
+/// gone (a set diff knows THAT a session went, never why).
 fn diff_session_events(
     live: &std::collections::HashSet<String>,
     known: &std::collections::HashSet<String>,
@@ -1108,7 +1167,14 @@ fn diff_session_events(
         out.push_str(&format!("EVENT * session-created {sid}\n"));
     }
     for sid in known.difference(live) {
-        out.push_str(&format!("EVENT * session-exited {sid}\n"));
+        // The set diff has no journal row to read a reason from: it reports the
+        // NET change between two instants, and the row that said why was
+        // evicted. `unknown` is the honest token, and it keeps the frame shape
+        // identical to the journal path's so a parser sees one grammar.
+        out.push_str(&format!(
+            "EVENT * session-exited {sid} reason={}\n",
+            crate::session_store::ExitReason::Unknown.as_str()
+        ));
     }
 }
 
@@ -1343,7 +1409,15 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             // will send cells (content changed OR an every-frame re-emit).
             let rows: Option<Vec<String>> = (content_change && streams.screen).then(|| {
                 let n = t.rows() as usize;
-                (0..n).map(|r| crate::control::visible_row(&t, r)).collect()
+                let mut rows: Vec<String> =
+                    (0..n).map(|r| crate::control::visible_row(&t, r)).collect();
+                // `trim`: the pushed twin of `text trim` — the frame stops after the
+                // last non-blank row by the ONE shared rule, so a subscriber and a
+                // poller agree on the row count. One O(rows) scan, no allocation.
+                if streams.trim {
+                    rows.truncate(crate::control::trimmed_len(rows.iter().map(String::as_str)));
+                }
+                rows
             });
             let styled = ((content_change || every_frame) && streams.cells)
                 .then(|| crate::control::gather_styled_frame(&t));
@@ -1426,21 +1500,22 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
         // + three integer compares, where it used to be three lock acquisitions
         // and a walk over ~2000 retained records per target.
         //
-        // EMISSION ORDER IS UNCHANGED — blocks, turns, meta, title, bell — which
-        // is the only order the wire has ever promised. What did move is the
-        // SAMPLING INSTANT of title and bell: they are now read at the top of the
-        // events pass instead of the bottom. Each of the five sources carries its
-        // own independent watermark and none is derived from another, so the only
-        // effect is which side of a 250 ms tick boundary a title/bell change that
-        // races the pass lands on — the same one-tick skew the old order had in
-        // the opposite direction, and a skew every watermark-driven stream here
+        // EMISSION ORDER IS UNCHANGED — blocks, turns, timeline (meta, then the
+        // closing row), title, bell — which is the only order the wire has ever
+        // promised. What did move is the SAMPLING INSTANT of title and bell:
+        // they are now read at the top of the events pass instead of the
+        // bottom. Each of the five sources carries its own independent
+        // watermark and none is derived from another, so the only effect is
+        // which side of a 250 ms tick boundary a title/bell change that races
+        // the pass lands on — the same one-tick skew the old order had in the
+        // opposite direction, and a skew every watermark-driven stream here
         // already tolerates by construction.
         let engine = sample_engine_events(&watch.term, watch.last_block_id);
         watch.last_block_id =
             drain_block_events(&sid, &engine.blocks, watch.last_block_id, &mut out);
         watch.last_turn_id = drain_turn_events(&watch.turns, &sid, watch.last_turn_id, &mut out);
         watch.last_timeline_id =
-            drain_meta_events(&watch.timeline, &sid, watch.last_timeline_id, &mut out);
+            drain_timeline_events(&watch.timeline, &sid, watch.last_timeline_id, &mut out);
         watch.last_title =
             drain_title_event(&sid, &engine.title, watch.last_title.take(), &mut out);
         watch.last_bell = drain_bell_event(&sid, engine.bell, watch.last_bell, &mut out);
@@ -1868,8 +1943,9 @@ fn initial_turn_watermark(turns: &Arc<Mutex<TurnLedger>>, streams: TargetStreams
     turns.lock().unwrap_or_else(|p| p.into_inner()).high_id()
 }
 
-/// The timeline twin of [`initial_turn_watermark`]: seed the meta-event scan to
-/// the CURRENT timeline high so only post-subscription changes push.
+/// The timeline twin of [`initial_turn_watermark`]: seed the timeline scan to the
+/// CURRENT timeline high so only post-subscription records (a `meta-change`, the
+/// `closing` row) push — never the `spawned` history.
 fn initial_timeline_watermark(
     timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     streams: TargetStreams,
@@ -2019,7 +2095,11 @@ impl Closing {
     /// and sound: `Watch.term` is an independent `Arc` clone taken at subscribe time,
     /// and [`crate::session_store`] records the death mark BEFORE the handle leaves
     /// the registry precisely so a holder that kept the handle — naming "a live
-    /// subscribe watch" — still reads an honest final event.
+    /// subscribe watch" — still reads an honest final event. That final event is
+    /// the `closing reason= by=` row, and the events pass here is the only path
+    /// that delivers it (`EVENT <sid> closing …`, then the `exited` marker below):
+    /// the `timeline` verb cannot resolve a deregistered sid, so a driver that was
+    /// not already subscribed asks `exits` instead.
     ///
     /// `woke = false`: this pass exists to deliver state the client has not SEEN, not
     /// to re-emit. An `every-frame` re-emit at an unchanged seq would only append a
@@ -2721,6 +2801,40 @@ mod tests {
         );
     }
 
+    /// `trim` is a MODIFIER inside the stream list: beside a frame source it parses
+    /// and lands on the per-target set (it shapes the `screen` frame); alone, or
+    /// with only other modifiers, it names no source and fails closed like `ts`.
+    /// A `trim` AFTER the list is not this parser's business — the handler's
+    /// unknown-arg rule refuses it, exactly as it refuses a trailing `ts`.
+    #[test]
+    fn trim_modifier_parses_inside_the_stream_list_and_never_alone() {
+        assert_eq!(
+            Requested::parse("screen,trim"),
+            Some(Requested {
+                targets: TargetStreams {
+                    screen: true,
+                    trim: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            Requested::parse("trim screen ts"),
+            Some(Requested {
+                targets: TargetStreams {
+                    screen: true,
+                    trim: true,
+                    ..Default::default()
+                },
+                timestamps: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(Requested::parse("trim"), None, "bare modifier");
+        assert_eq!(Requested::parse("trim,ts"), None, "only modifiers");
+    }
+
     /// A list of MODIFIERS ONLY parses every token yet names no frame source. It
     /// must fail closed: otherwise the connection acks `OK subscribe 1`, flips to
     /// push-only, and then stays silent forever — indistinguishable from a hang.
@@ -2813,6 +2927,49 @@ mod tests {
         assert!(
             w.last_sent_seq > seq_after_write,
             "seq advanced on real content"
+        );
+    }
+
+    /// `trim` shortens a screen DELTA to the rows up to the last non-blank one, and
+    /// `screen <nrows>` on the header is the count actually sent — the pushed face
+    /// of `text trim`, by the same rule (interior blanks kept). Without it the frame
+    /// is the whole grid, byte-identical to the pre-`trim` wire.
+    #[test]
+    fn trim_modifier_shortens_screen_delta_to_last_nonblank_row() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        crate::term_lock(&term).process(b"one\r\n\r\nthree");
+        let full = wake_text(
+            &mut watch_on(1, &term),
+            TargetStreams {
+                screen: true,
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            full.starts_with("DELTA 1 seq=")
+                && full.lines().next().unwrap_or("").ends_with(" screen 24"),
+            "untrimmed frame carries the whole grid: {full:?}"
+        );
+        let trimmed = wake_text(
+            &mut watch_on(2, &term),
+            TargetStreams {
+                screen: true,
+                trim: true,
+                ..Default::default()
+            },
+            true,
+        );
+        let header = trimmed.lines().next().unwrap_or("");
+        assert!(
+            header.starts_with("DELTA 2 seq=") && header.ends_with(" screen 3"),
+            "trimmed header counts the rows sent: {header:?}"
+        );
+        let rows: Vec<&str> = trimmed.lines().skip(1).collect();
+        assert_eq!(
+            rows,
+            ["one", "", "three"],
+            "interior blank kept, tail dropped"
         );
     }
 
@@ -3373,10 +3530,11 @@ mod tests {
 
     /// SESSION-METADATA stage 1 — the events digest pushes `EVENT <sid> meta
     /// <payload>` for each `meta-change` timeline record past the watermark,
-    /// SKIPS non-meta lifecycle records, and advances the watermark to the
-    /// timeline HIGH so nothing double-emits and non-meta records are never
-    /// re-walked. A seeded watermark (subscription-time high) means only
-    /// post-subscription changes push — a live stream, not a replay.
+    /// SKIPS the lifecycle records the wire does not carry (`spawned`,
+    /// `state-change`), and advances the watermark to the timeline HIGH so
+    /// nothing double-emits and skipped records are never re-walked. A seeded
+    /// watermark (subscription-time high) means only post-subscription changes
+    /// push — a live stream, not a replay.
     #[test]
     fn meta_change_drains_as_a_meta_event_and_watermark_advances() {
         let timeline = std::sync::Arc::new(std::sync::Mutex::new(
@@ -3402,7 +3560,7 @@ mod tests {
 
         // Nothing new: no frames, watermark stays.
         let mut out = String::new();
-        let wm = drain_meta_events(&timeline, "7", seeded, &mut out);
+        let wm = drain_timeline_events(&timeline, "7", seeded, &mut out);
         assert!(
             out.is_empty(),
             "no replay of pre-subscription history: {out}"
@@ -3420,7 +3578,7 @@ mod tests {
             .unwrap()
             .record("state-change", "state=exited".to_string());
         let mut out = String::new();
-        let wm = drain_meta_events(&timeline, "7", wm, &mut out);
+        let wm = drain_timeline_events(&timeline, "7", wm, &mut out);
         assert_eq!(
             out, "EVENT 7 meta field=title value=build%20agent\n",
             "exactly the meta record, verbatim payload"
@@ -3428,9 +3586,136 @@ mod tests {
         assert_eq!(wm, Some(4), "watermark passes the non-meta record too");
         // Drained again: silence (no double emit).
         let mut out = String::new();
-        let wm2 = drain_meta_events(&timeline, "7", wm, &mut out);
+        let wm2 = drain_timeline_events(&timeline, "7", wm, &mut out);
         assert!(out.is_empty());
         assert_eq!(wm2, Some(4));
+    }
+
+    /// THE EXIT LEDGER ON THE WIRE — the deterministic half. A `subscribe … events`
+    /// watch seeded exactly as [`push_loop`] seeds it ([`new_watch`], at the live
+    /// timeline high, so the `spawned` row is history) is pruned by the shipping
+    /// liveness verdict after a control-socket `close` deregisters its session, and
+    /// its final pass ([`Closing::drain`]) is BYTE-EXACTLY the `closing` row the
+    /// store wrote — `reason=ctl-close by=<caller>` — followed by `exited`. Nothing
+    /// else: the `state-change state=closed` written beside it is not a wire kind
+    /// (`exited` is that fact), and equality, not `contains`, is what proves it.
+    #[test]
+    fn a_ctl_close_reaches_a_live_events_watch_as_closing_then_exited() {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(7);
+        let target: ResolvedTarget = (
+            7,
+            h.term.clone(),
+            h.ctx.byte_fanout.clone(),
+            h.ctx.turns.clone(),
+            h.ctx.timeline.clone(),
+        );
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let mut watches = vec![new_watch(&target, streams, &PushOptions::default())];
+        // Live and idle: a wake pushes nothing (the seed hides `spawned`), and the
+        // liveness verdict keeps the watch.
+        assert!(
+            frames_for_watch(&mut watches[0], streams, true).is_empty(),
+            "a fresh watch replays no history"
+        );
+        assert!(
+            prune_closed(&store, &mut watches).is_empty(),
+            "alive: nothing to prune"
+        );
+
+        // The `close` verb's deregistration, as `retire_session_registration`
+        // performs it under the attribution the `Wake::CloseSession` arm opens.
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .deregister_local_as(
+                7,
+                crate::session_store::ExitReason::CtlClose,
+                crate::session_store::ExitActor::Sid("s-boss".into()),
+            );
+
+        let mut closing = prune_closed(&store, &mut watches);
+        assert!(watches.is_empty(), "the dead watch left the live set");
+        let out = text(
+            &closing
+                .pop()
+                .expect("handed back, not dropped")
+                .drain(streams),
+        );
+        assert_eq!(
+            out, "EVENT 7 closing reason=ctl-close by=s-boss\nEVENT 7 exited\n",
+            "why, then that: the ledger row precedes the end-of-stream marker, and \
+             nothing else leaks"
+        );
+    }
+
+    /// The same fact through the shipping [`push_loop`], end to end, with the close
+    /// landing AFTER the loop has seeded and caught up. The peer probe is the one
+    /// hook the loop calls on its own thread strictly after the catch-up wake, so
+    /// deregistering from inside it is race-free where a feeder thread would have
+    /// to guess at the seeding instant. A `closing` row written after subscription
+    /// is a push; one written earlier would be history and this test would
+    /// (rightly) see nothing — so it also pins that the row is written AT
+    /// deregistration, not before.
+    #[test]
+    fn push_loop_delivers_closing_before_exited_for_a_ctl_close() {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(9);
+        let target: ResolvedTarget = (
+            9,
+            h.term.clone(),
+            h.ctx.byte_fanout.clone(),
+            h.ctx.turns.clone(),
+            h.ctx.timeline.clone(),
+        );
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let registry = new_registry();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut closed = false;
+        let close_once = || {
+            if !closed {
+                closed = true;
+                store
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .deregister_local_as(
+                        9,
+                        crate::session_store::ExitReason::CtlClose,
+                        crate::session_store::ExitActor::Sid("s-boss".into()),
+                    );
+            }
+            false
+        };
+        push_loop_with_peer_probe(
+            &registry,
+            &store,
+            &[target],
+            PushScopes {
+                streams,
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
+            PushOptions::default(),
+            &mut sink,
+            close_once,
+        );
+        assert!(
+            closed,
+            "the probe ran: the loop reached its first real wake"
+        );
+        let out = String::from_utf8_lossy(&sink).into_owned();
+        assert_eq!(
+            out, "EVENT 9 closing reason=ctl-close by=s-boss\nEVENT 9 exited\n",
+            "the whole stream after subscription is the ledger row, then the end marker"
+        );
     }
 
     /// The `bytes` stream drains EVERY burst byte-exactly (incl. non-UTF-8) as
@@ -3591,8 +3876,8 @@ mod tests {
             "created: {out:?}"
         );
         assert!(
-            out.contains("EVENT * session-exited s-bbb\n"),
-            "exited: {out:?}"
+            out.contains("EVENT * session-exited s-bbb reason=unknown\n"),
+            "exited (a set diff cannot know why, and says so): {out:?}"
         );
         assert!(
             !out.contains("s-aaa"),
@@ -3635,7 +3920,11 @@ mod tests {
         {
             let mut g = store.write().unwrap_or_else(|p| p.into_inner());
             g.register(h);
-            g.deregister_local(7);
+            g.deregister_local_as(
+                7,
+                crate::session_store::ExitReason::CtlClose,
+                crate::session_store::ExitActor::Sid("s-boss".into()),
+            );
         }
 
         // NEGATIVE CONTROL: the pre-journal snapshot diff, on the same instants.
@@ -3654,8 +3943,8 @@ mod tests {
             "the spawn must surface: {got:?}"
         );
         assert!(
-            got.contains(&format!("EVENT * session-exited {sid}\n")),
-            "the exit must surface: {got:?}"
+            got.contains(&format!("EVENT * session-exited {sid} reason=ctl-close\n")),
+            "the exit must surface, WITH the journalled reason as the trailing token: {got:?}"
         );
         assert!(
             got.find("session-created") < got.find("session-exited"),

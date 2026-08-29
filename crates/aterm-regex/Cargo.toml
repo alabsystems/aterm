@@ -26,6 +26,16 @@ description = "aterm's first-party regular-expression engine: a bounded Pike VM 
 # Pinned here rather than inherited from [workspace.dependencies]: once the call
 # sites migrate, no shipped member declares `regex` any more.
 regex = "1"
+criterion = "0.5"
+
+# The crate shipped with no bench target, so nothing in the tree reached the
+# Pike VM under measurement — which is how an anchored pattern came to walk the
+# whole scrollback to prove it could only match at offset 0. The corpus is the
+# shipped 100_000-row default, and the lanes are two-sided: three reach the
+# anchor fast path, three provably do not.
+[[bench]]
+name = "anchored_scan"
+harness = false
 
 [lints]
 workspace = true

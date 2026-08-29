@@ -2369,7 +2369,7 @@ install_linux_app() {
 	# STORE_DIR and BIN_DIR were pre-flighted (created + writability-checked)
 	# before any download.
 	place_store_binary "$TMP/extract/aterm"
-	echo "install.sh: installed the released ONE binary -> $STORE_DIR ($("$BIN_DIR/aterm" --version))"
+	echo "install.sh: installed the released ONE binary -> $STORE_DIR ($("$BIN_DIR/aterm" --version | head -n 1))"
 	echo "  ONE command on PATH: $BIN_DIR/aterm — the terminal, the window (--window), and every verb"
 	echo "  updates: re-run this installer — the in-app self-updater is macOS-only today"
 	INSTALLED_ANY=1
@@ -2427,7 +2427,7 @@ install_cli() {
 		# `aterm` alone — a symlink at the bundle's one binary (or, against a
 		# previous-generation bundle, its aterm-cli front door).
 		ln -sfn "$target" "$BIN_DIR/aterm"
-		echo "install.sh: linked $("$BIN_DIR/aterm" --version) -> $BIN_DIR/aterm"
+		echo "install.sh: linked $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm"
 		echo "  a symlink into ${target%/Contents/MacOS/*} — it follows the app's silent auto-updates."
 		if [[ "$target" == */MacOS/aterm ]]; then
 			echo "  ONE command: \`aterm\` is the terminal, the window (--window), and every verb (aterm help / ctl / pkg / fleet / drive)"
@@ -2485,7 +2485,7 @@ install_cli_from_source() {
 	fi
 	# STORE_DIR was pre-flighted (created + writability-checked) before the build.
 	place_store_binary "$rel/aterm"
-	echo "install.sh: installed the ONE binary -> $STORE_DIR ($("$BIN_DIR/aterm" --version))"
+	echo "install.sh: installed the ONE binary -> $STORE_DIR ($("$BIN_DIR/aterm" --version | head -n 1))"
 	echo "  ONE command on PATH: $BIN_DIR/aterm — the terminal, the window (--window), and every verb"
 }
 

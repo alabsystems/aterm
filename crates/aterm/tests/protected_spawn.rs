@@ -7,6 +7,13 @@
 //! exits with the shell's status. Complements the static guard `A6` (no
 //! `libc::forkpty` in `aterm-cli/src`) with a behavioral check that the protected
 //! spawn actually works end-to-end.
+//!
+//! It also carries the SESSION-MODEL arming regression, which shares this file's
+//! bounded-wait harness and drives the same binary down the same session path:
+//! the in-process VT model is demand-driven and must stay OFF unless
+//! `$ATERM_SESSION_MODEL` asks for it. The unit tests in `aterm-cli` pin the
+//! arming RULE; only running the real binary can pin that `session_main`
+//! consults it.
 
 // The tests drive a POSIX `/bin/sh` through the binary; a `#[cfg(windows)]`
 // twin (echo via cmd.exe) is the follow-up once the ConPTY seam lands.
@@ -134,6 +141,68 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
         out.status.success(),
         "aterm must exit with the shell's success status; got {:?}",
         out.status
+    );
+}
+
+/// THE DEFAULT: a session builds NO VT model. The daily driver used to construct
+/// a full `Terminal` and feed it every PTY byte — an O(bytes) parse and
+/// O(scrollback) memory — for a model nothing in the process could read, and a
+/// change that quietly restores that default would be invisible in every other
+/// test in this repo. The `$ATERM_VERBOSE` epilogue is the one place the session
+/// states which of the two it was, so it is what this pins, in BOTH directions:
+/// unset means unarmed, and `=1` means armed (a test that only checked the
+/// default would pass just as well against a binary that could never arm at all).
+#[cfg(unix)]
+#[test]
+fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
+    let run = |model: Option<&str>| -> String {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        cmd.arg("--session")
+            .env("SHELL", "/bin/sh")
+            .env("ATERM_VERBOSE", "1") // the epilogue is the observable
+            .env_remove("ATERM_CONTAINMENT_MODE")
+            .env_remove("ATERM_SESSION_MODEL")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(v) = model {
+            cmd.env("ATERM_SESSION_MODEL", v);
+        }
+        let mut child = cmd.spawn().expect("spawn the aterm CLI binary");
+        child
+            .stdin
+            .take()
+            .expect("aterm stdin")
+            .write_all(b"exit\n")
+            .expect("write to aterm stdin");
+        String::from_utf8_lossy(&wait_with_output_bounded(child).stderr).into_owned()
+    };
+
+    let unarmed = run(None);
+    assert!(
+        unarmed.contains("session model off"),
+        "an ordinary session must build NO VT model; stderr={unarmed:?}"
+    );
+    assert!(
+        !unarmed.contains("ARMED"),
+        "an unarmed session must not announce a model; stderr={unarmed:?}"
+    );
+
+    let armed = run(Some("1"));
+    assert!(
+        armed.contains("session model ARMED"),
+        "$ATERM_SESSION_MODEL=1 must arm the model and say so; stderr={armed:?}"
+    );
+    assert!(
+        armed.contains("into the armed VT core"),
+        "an armed session's summary must say the bytes reached the engine; stderr={armed:?}"
+    );
+
+    // The disabling spelling is the default, not an arming: `=0` must read as OFF.
+    let refused = run(Some("0"));
+    assert!(
+        refused.contains("session model off"),
+        "$ATERM_SESSION_MODEL=0 must leave the model OFF; stderr={refused:?}"
     );
 }
 

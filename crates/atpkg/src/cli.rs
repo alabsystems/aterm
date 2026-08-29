@@ -656,12 +656,24 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
             return PendingNext::Done;
         }
     }
-    (io.say)(
+    // BUMP FIRST, THEN SAY WHAT THAT MEANS — the order the `Queued` arm above
+    // already uses, and for the same reason. Advising "run: aterm pkg update"
+    // and THEN recording the wish told the user to do by hand the very thing
+    // the wish had just arranged: an open aterm window stats this file every
+    // 5 s and turns a fresh bump into an immediate pass, so the honest sentence
+    // depends on whether the bump was actually recorded.
+    let bumped = crate::progress::append_bump(layout, &tn).is_ok();
+    (io.say)(if bumped {
+        format!(
+            "atpkg: nothing is installing right now — {name} is recorded, and an open \
+             aterm window starts a pass within seconds (at most one every 5 minutes). \
+             No window open? Open aterm, or run: aterm pkg update"
+        )
+    } else {
         "atpkg: nothing is installing right now — fix: open aterm (it provisions the \
          toolset on launch), or run: aterm pkg update"
-            .to_string(),
-    );
-    let _ = crate::progress::append_bump(layout, &tn);
+            .to_string()
+    });
     PendingNext::Done
 }
 
@@ -1022,21 +1034,33 @@ fn which_line(
         if let Some(shadow) =
             crate::vendor::shadowing_binary_on_path(&layout.prefix, tool, path_var)
         {
-            return Ok(format!(
-                "{tool} → {} — {}",
-                shadow.display(),
-                crate::state::shadowed(build, &shadow)
-            ));
+            // The canonical state, then the alias fix-line as a separate sentence when
+            // `alab-<tool>` is laid: the copy that runs, and the name that runs ours.
+            let state = crate::state::shadowed(build, &shadow);
+            return Ok(match alias_fix(layout, &tn, &program, path_var) {
+                Some(fix) => format!("{tool} → {} — {state} — {fix}", shadow.display()),
+                None => format!("{tool} → {} — {state}", shadow.display()),
+            });
         }
         let index = row_of(&program)
             .and_then(|r| crate::state::managed_pin(&r.state))
             .map_or_else(|| build_floor(layout).index_build, |(_, i)| i);
-        return Ok(format!(
-            "{tool} → {} → {} — {}",
-            shim.display(),
-            target.display(),
-            crate::state::managed(build, index)
-        ));
+        // The canonical state, then — as a separate trailing sentence, never inside it —
+        // what the managed copy runs with when its shim exports an environment (design
+        // S7: `self-update off (DISABLE_AUTOUPDATER=1)`). Read off the shim that runs.
+        let state = crate::state::managed(build, index);
+        return Ok(match shim_env_fix(&shim) {
+            Some(fix) => format!(
+                "{tool} → {} → {} — {state} — {fix}",
+                shim.display(),
+                target.display()
+            ),
+            None => format!(
+                "{tool} → {} → {} — {state}",
+                shim.display(),
+                target.display()
+            ),
+        });
     }
     // 2. A system copy on PATH outside the prefix: it runs, and atpkg does not manage it.
     //    With a PENDING STUB in the managed bin/ (an extra's consent stub, a default-set
@@ -1097,7 +1121,61 @@ fn which_line(
             return Ok(format!("{tool} → (nothing runs) — {st}"));
         }
     }
+    // 5. An `alab-<x>` that nothing answers to: say honestly WHY there is no alias rather
+    //    than promising `aterm pkg install alab-x` (no such program). The alias exists only
+    //    for ALab's own tools, so a vendor extra or a system-satisfiable member never has
+    //    one — the cached index says which, offline; an ALab tool that is simply not
+    //    installed (or whose alias the next pass lays) gets the plain name's fix.
+    if let Some(base) = tn.alias_base() {
+        return Err(no_alias_line(layout, tool, base.as_str()));
+    }
     Err(not_installed_fix(tool))
+}
+
+/// The one-line answer for `alias` (`alab-<base>`) when no such shim is laid — the reverse
+/// of [`alias_fix`]. Reads the §14 cached index (offline; absent ⇒ the base is unknown).
+fn no_alias_line(layout: &crate::store::Layout, alias: &str, base: &str) -> String {
+    let index = cached_index(layout);
+    no_alias_line_for(
+        layout,
+        alias,
+        base,
+        index.as_ref().and_then(|i| i.program(base)),
+    )
+}
+
+/// [`no_alias_line`] over an already-looked-up index `entry` for `base` (`None` ⇒ not
+/// listed, or nothing cached).
+fn no_alias_line_for(
+    layout: &crate::store::Layout,
+    alias: &str,
+    base: &str,
+    entry: Option<&crate::manifest::Program>,
+) -> String {
+    match entry {
+        Some(p) if p.system.is_some() => format!(
+            "atpkg: no alias {alias} — {base} is not one of ALab's own tools (a system copy \
+             may satisfy it: system = \"{}\"); type {base}",
+            p.system.as_deref().unwrap_or(base)
+        ),
+        Some(p) if p.extra => format!(
+            "atpkg: no alias {alias} — {base} is not one of ALab's own tools (an extra, a \
+             vendor's); type {base}"
+        ),
+        Some(_) if crate::which(layout, base).is_some() => format!(
+            "atpkg: {alias} is not laid yet — the next pass lays it beside {base} (now: aterm \
+             pkg update)"
+        ),
+        Some(_) => format!(
+            "atpkg: {alias} names nothing yet — {}",
+            not_installed_fix(base)
+        ),
+        None if crate::which(layout, base).is_some() => format!(
+            "atpkg: no alias {alias} — {base} is not one of ALab's own tools, or the next \
+             pass lays it (aterm pkg update); type {base}"
+        ),
+        None => format!("atpkg: no alias {alias} — {}", not_installed_fix(base)),
+    }
 }
 
 /// `atpkg run <tool> [--] [args…]` — run a pinned, installed tool from the store, replacing
@@ -2618,7 +2696,8 @@ fn reconcile_protocol_members(
             .program(name)
             .map(|p| p.requires.clone())
             .unwrap_or_default();
-        if let Some((dep, dep_state)) = unmet_requirement(layout, index, &requires) {
+        if let Some((dep, dep_state)) = crate::requires::unmet_requirement(layout, index, &requires)
+        {
             record_state_if_changed(layout, name, crate::state::blocked(&dep, &dep_state));
             handled.push(name.clone());
             continue;
@@ -2647,60 +2726,6 @@ fn reconcile_protocol_members(
         }
     }
     (handled, failures)
-}
-
-/// The first of `requires` (in order) NOT met on this machine, with the DEPENDENCY's own
-/// canonical state — the two halves of a `blocked by <dep>: <dep state>` row
-/// ([`crate::state::blocked`]). A requirement is met when the dependency is installed (an
-/// active build), dev-linked, satisfied by a system copy whose recorded path still
-/// exists, or installed through its protocol at a `provides` path that still exists.
-/// Reads the store and the record only — never the network — and re-reads the active
-/// builds, since the pass installs as it goes. The dependency's state is its recorded
-/// row (`needs admin — …`, `unavailable on …`, `error: …`); with no usable row, an extra
-/// not opted in reads `extra — not installed (opt in: …)` and anything else `not
-/// installed`. `None` ⇒ every requirement is met (or there are none).
-fn unmet_requirement(
-    layout: &crate::store::Layout,
-    index: &crate::manifest::Index,
-    requires: &[String],
-) -> Option<(String, String)> {
-    if requires.is_empty() {
-        return None;
-    }
-    let active = crate::active_builds(layout);
-    let status = crate::status::read(layout);
-    let is_file = |p: &str| std::fs::metadata(p).is_ok_and(|m| m.is_file());
-    for dep in requires {
-        if active.contains_key(dep) || crate::linkmode::is_linked(layout, dep) {
-            continue;
-        }
-        let row = status
-            .as_ref()
-            .and_then(|s| s.programs.get(dep))
-            .map(|r| r.state.clone())
-            .unwrap_or_default();
-        if crate::state::system_path(&row).is_some_and(is_file) {
-            continue;
-        }
-        if crate::state::installed_via_path(&row).is_some_and(|(_, p)| is_file(p)) {
-            continue;
-        }
-        // A row that CLAIMS presence but is not backed by the store or the path any
-        // more says nothing about the dependency's state now.
-        let stale = row.is_empty()
-            || crate::state::is_managed(&row)
-            || crate::state::system_path(&row).is_some()
-            || crate::state::installed_via_path(&row).is_some();
-        let dep_state = if !stale {
-            row
-        } else if index.is_extra(dep) && !layout.optin_exists(dep) {
-            crate::state::extra_not_installed(dep)
-        } else {
-            String::from("not installed")
-        };
-        return Some((dep.clone(), dep_state));
-    }
-    None
 }
 
 /// Expand the admitted bump list with each bumped program's UNMET requirements still in
@@ -2969,6 +2994,67 @@ fn today_ymd() -> String {
     stamp.get(..10).map(str::to_string).unwrap_or_default()
 }
 
+/// The fix-line for a managed shim that EXPORTS an environment before it execs (design
+/// S7, [`crate::shim_env::ShimEnv::fix_line`]): `self-update off (DISABLE_AUTOUPDATER=1)`,
+/// or `runs with NAME=VALUE` for an env naming no self-update switch. Read off the shim
+/// AS LAID — the thing that actually runs — never off a manifest or a record; `None` for
+/// a plain shim. Never part of the recorded state: the surfaces that speak to a person
+/// (`which`, `doctor`) append it after the canonical row as a separate sentence.
+pub(crate) fn shim_env_fix(shim: &std::path::Path) -> Option<String> {
+    crate::platform::shim_env_of(shim).fix_line()
+}
+
+/// The fix-line for a SHADOWED `tool` of `program`: `type alab-<tool> for the managed one`
+/// ([`crate::state::alias_hint`]) — printed ONLY when typing the alias really runs the
+/// managed copy: `alab-<tool>` is laid, resolves into THIS prefix's `store/<program>/`
+/// (the anchored containment, never the unanchored parse a hand-made link into a checkout
+/// could satisfy), and is not itself shadowed by a foreign `alab-<tool>` earlier on
+/// `path_var` than the managed `bin/`. `None` for a vendor tool or a system-satisfiable
+/// member (no alias by policy), for a tool that is its own alias, for an install a
+/// pre-alias client laid that the pass has not reconciled yet, and for an alias that
+/// would itself run someone else's copy. Never part of the recorded state.
+pub(crate) fn alias_fix(
+    layout: &crate::store::Layout,
+    tool: &crate::store::ToolName,
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    let alias = tool.alias()?;
+    let target = crate::which(layout, alias.as_str())?;
+    let (owner, _) = crate::ops::store_build_of(&layout.prefix, &target)?;
+    if owner != program {
+        return None;
+    }
+    if crate::vendor::shadowing_binary_on_path(&layout.prefix, alias.as_str(), path_var).is_some() {
+        return None;
+    }
+    Some(crate::state::alias_hint(alias.as_str()))
+}
+
+/// ALIAS reconcile (owner decision 2026-08-27): for every installed, non-dev-linked
+/// program, bring its `alab-<tool>` aliases in line with the signed index's verdict on
+/// whether it is ALab's own ([`crate::activate::Aliases::for_program`]) — laid when
+/// missing (an install a pre-alias client made, and which the pipeline short-circuits as
+/// up to date forever after), swept when the entry says the program is not ALab's. The
+/// primaries are never rewritten, so the silent tick touches nothing once the aliases
+/// stand. Best-effort per program: an unwritable `bin/` is the install lane's problem to
+/// report, not this pass's to fail on.
+fn reconcile_aliases(layout: &crate::store::Layout, index: &crate::manifest::Index) {
+    for (program, build) in crate::active_builds(layout) {
+        if crate::linkmode::is_linked(layout, &program) {
+            continue;
+        }
+        let tools = crate::ops::active_tools(layout, &program, build);
+        let aliases = crate::activate::Aliases::for_program(index.program(&program));
+        let _ = crate::activate::reconcile_aliases(
+            layout,
+            &layout.build_dir(&program, build),
+            &tools,
+            aliases,
+        );
+    }
+}
+
 /// SHADOW reconcile (design S5): for every MANAGED member — no `system` key, or one whose
 /// managed copy is present — and every tool it exposes, a foreign executable of that name
 /// EARLIER on `PATH` than the managed `bin/` is what actually runs. Record the canonical
@@ -2976,6 +3062,8 @@ fn today_ymd() -> String {
 /// `PATH` or the foreign copy: it is a warning the user owns, not a fault atpkg fixes. A
 /// member whose row read SHADOWED last pass and is no longer is put back to `managed
 /// <build> — pinned by index <N>`. Returns the shadowed programs, for the caller's log.
+/// The log line carries the alias fix-line after the state when the alias is laid
+/// ([`alias_fix`]); the recorded row never does.
 fn reconcile_shadowed(
     layout: &crate::store::Layout,
     index_build: u64,
@@ -2995,6 +3083,7 @@ fn reconcile_shadowed(
             .into_iter()
             .find_map(|tool| {
                 crate::vendor::shadowing_binary_on_path(&layout.prefix, tool.as_str(), path_var)
+                    .map(|path| (tool, path))
             });
         let was = recorded
             .as_ref()
@@ -3002,9 +3091,14 @@ fn reconcile_shadowed(
             .map(|r| r.state.clone())
             .unwrap_or_default();
         let state = match shadow {
-            Some(path) => {
+            Some((tool, path)) => {
                 let state = crate::state::shadowed(build, &path);
-                println!("atpkg: {program}: {state}");
+                // The canonical row, then — as a SEPARATE sentence, never recorded — the
+                // way out when the alias is laid: `type alab-<tool> for the managed one`.
+                match alias_fix(layout, &tool, &program, path_var) {
+                    Some(fix) => println!("atpkg: {program}: {state} — {fix}"),
+                    None => println!("atpkg: {program}: {state}"),
+                }
                 shadowed.push(program.clone());
                 state
             }
@@ -3852,9 +3946,14 @@ fn cmd_update_all() -> ExitCode {
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
         }
-        // The set-completion lane below runs its own shadow reconcile at its end; a
-        // pass that only applies runs it here, so every pass says who is SHADOWED.
+        // The set-completion lane below runs its own alias + shadow reconcile at its
+        // end; a pass that only applies runs them here, so every pass lays the aliases
+        // of what it keeps (offline, from the index this pass just verified and cached)
+        // and says who is SHADOWED.
         if !complete_the_set {
+            if let Some(index) = cached_index(&layout) {
+                reconcile_aliases(&layout, &index);
+            }
             reconcile_shadowed(
                 &layout,
                 report.index_build,
@@ -4505,7 +4604,9 @@ fn install_default_set_inner(
         // line names whose act unblocks it — a DEFERRED state retried every pass, never
         // a failure; `record_state_if_changed` keeps the six-hourly tick silent.
         let requires = crate::apply::group_requires(&index, group);
-        if let Some((dep, dep_state)) = unmet_requirement(layout, &index, &requires) {
+        if let Some((dep, dep_state)) =
+            crate::requires::unmet_requirement(layout, &index, &requires)
+        {
             let state = crate::state::blocked(&dep, &dep_state);
             for m in &missing {
                 record_state_if_changed(layout, m, state.clone());
@@ -4560,9 +4661,14 @@ fn install_default_set_inner(
         &crate::active_builds(layout),
         &requires_of,
     );
+    // ALIAS reconcile over what is live NOW: every ALab program's `alab-<tool>` names
+    // stand beside its shims (an install a pre-alias client made gets them here), and a
+    // program the signed index no longer calls ALab's own loses them.
+    reconcile_aliases(layout, &index);
     // SHADOW reconcile (design S5), over what is live NOW: a managed member whose
     // exposed name a foreign copy precedes on PATH is recorded as SHADOWED — said, never
-    // fixed.
+    // fixed — with `type alab-<tool> for the managed one` on the log line when the alias
+    // just reconciled is what answers.
     reconcile_shadowed(
         layout,
         index.index_build,
@@ -4712,6 +4818,17 @@ fn bootstrap_group(
             println!("atpkg: coherence group '{g}' held by local pin {held:?} — skipped");
             for m in missing {
                 note_finished(m, crate::progress::Phase::Skipped, None);
+            }
+            0
+        }
+        Ok((crate::TxnOutcome::Blocked { dep, dep_state }, _)) => {
+            // Unreachable in practice — this caller's own gate held the group before
+            // it got here — but the transaction body applies the one rule too, so the
+            // arm says the same words rather than nothing.
+            let state = crate::state::blocked(&dep, &dep_state);
+            for m in missing {
+                record_state_if_changed(layout, m, state.clone());
+                note_finished(m, crate::progress::Phase::Skipped, Some(state.clone()));
             }
             0
         }
@@ -6230,6 +6347,16 @@ fn report_channel_apply(
 ) -> u32 {
     // Post-apply ACTIVE builds (shim-derived), for accurate per-program status.
     let post: std::collections::BTreeMap<String, u64> = crate::active_builds(layout);
+    // The rows as they stood BEFORE this pass wrote any — what the UpToDate arm reads to
+    // lift a `blocked by` row the requirement gate no longer holds.
+    let before: std::collections::BTreeMap<String, String> = crate::status::read(layout)
+        .map(|s| s.programs.into_iter().map(|(n, r)| (n, r.state)).collect())
+        .unwrap_or_default();
+    let was_blocked = |prog: &str| {
+        before
+            .get(prog)
+            .is_some_and(|s| crate::state::blocked_by(s).is_some())
+    };
     let mut failures = 0u32;
     for (group, outcome) in &report.groups {
         let label = group
@@ -6237,7 +6364,34 @@ fn report_channel_apply(
             .clone()
             .unwrap_or_else(|| group.members.join("+"));
         match outcome {
-            crate::TxnOutcome::UpToDate => println!("atpkg: {label} up to date"),
+            crate::TxnOutcome::UpToDate => {
+                println!("atpkg: {label} up to date");
+                // THE GATE LIFTS ITS OWN ROW. A member the `Blocked` arm below recorded
+                // `blocked by <dep>: …` whose dependency has since come back — and whose
+                // pin has not moved — is UpToDate: nothing flips, so no other arm would
+                // rewrite the row, and the block would outlive the fact it stated.
+                // Restore the canonical managed row, build and attestation kept.
+                for prog in &group.members {
+                    let Some(build) = post.get(prog).copied() else {
+                        continue;
+                    };
+                    if !was_blocked(prog) {
+                        continue;
+                    }
+                    let state = crate::state::managed(build, report.index_build);
+                    println!("atpkg: {prog}: {state} (no longer blocked)");
+                    record_status(
+                        layout,
+                        prog,
+                        crate::ProgramStatus {
+                            installed_build: Some(build),
+                            state,
+                            tree_root: effective_tree_root(layout, prog, ""),
+                        },
+                        format!("group {label}: up to date"),
+                    );
+                }
+            }
             crate::TxnOutcome::Applied(members) => {
                 println!("atpkg: {label} updated ({})", members.join(", "));
                 for prog in &group.members {
@@ -6307,6 +6461,30 @@ fn report_channel_apply(
                             tree_root: effective_tree_root(layout, prog, ""),
                         },
                         format!("group {label}: held by pin"),
+                    );
+                }
+            }
+            crate::TxnOutcome::Blocked { dep, dep_state } => {
+                // THE REQUIREMENT GATE'S ROW on the update lane (§17.10): the group is
+                // held on its current builds because `dep` is not installed, dev-linked,
+                // system-satisfied or installed through its protocol. The same words the
+                // set-completion lane records, and the same doctrine as the held and
+                // tombstoned arms above: the bytes did not move, so the build and the
+                // signed root stay on the record. Deferred, never a failure — the next
+                // pass retries, and the UpToDate arm lifts the row once the dependency
+                // is back.
+                let state = crate::state::blocked(dep, dep_state);
+                println!("atpkg: {label} NOT updated — {state}");
+                for prog in &group.members {
+                    record_status(
+                        layout,
+                        prog,
+                        crate::ProgramStatus {
+                            installed_build: installed.get(prog).copied(),
+                            state: state.clone(),
+                            tree_root: effective_tree_root(layout, prog, ""),
+                        },
+                        format!("group {label}: {state}"),
                     );
                 }
             }
@@ -6689,8 +6867,30 @@ fn restore_installed_shims(
     if tools.is_empty() {
         return Ok(0);
     }
-    crate::activate::install_tools(layout, &build_dir, &tools)?;
+    // The alias policy, offline: the §14 cached index's verdict when one is cached, else
+    // what is on disk — a dev link takes over the PLAIN names only and the aliases kept
+    // naming the store copy throughout, so the restore must neither sweep those aliases
+    // nor invent any for a vendor tool.
+    let aliases = alias_policy_offline(layout, program);
+    // The store build's own `shim_env` (its sidecar, design S7): the dev link took the
+    // plain names over with plain shims, and the restore lays them back as the signed
+    // manifest declared them.
+    let env = crate::shim_env::read_sidecar(&build_dir);
+    crate::activate::install_tools_env(layout, &build_dir, &tools, aliases, &env)?;
     Ok(tools.len())
+}
+
+/// The `alab-<tool>` alias policy for `program` on a verb that fetches no index: the §14
+/// cached index's signed entry decides ([`crate::activate::Aliases::for_program`]) when
+/// one is cached; with nothing cached, the aliases already laid on disk are the policy
+/// ([`crate::activate::Aliases::laid_for`]) — so a vendor tool never grows an alias on
+/// this path unless a signed entry said it was ALab's, and an ALab tool a pre-alias client
+/// installed keeps whatever the pass has laid so far.
+fn alias_policy_offline(layout: &crate::store::Layout, program: &str) -> crate::activate::Aliases {
+    match cached_index(layout) {
+        Some(index) => crate::activate::Aliases::for_program(index.program(program)),
+        None => crate::activate::Aliases::laid_for(layout, program),
+    }
 }
 
 /// `atpkg refresh [program…]` (§13) — re-assert dev links from their markers (picking up
@@ -6862,10 +7062,24 @@ mod tests {
     /// removed it (2026-08-20 round-8 audit).
     #[test]
     fn a_removed_program_is_read_from_the_layout_by_every_lane() {
-        let root = std::env::temp_dir().join(format!("atpkg-removed-{}", std::process::id()));
+        // The prefix goes through the REAL `store::resolve`, so it must be one the
+        // chain check admits: strictly under the home directory, a private (0700) real
+        // directory. The process temp dir (`/var/folders/…` on macOS) is neither under
+        // the home directory nor root-owned, so `vet_prefix` fell back to the DEFAULT
+        // prefix — and this test then wrote `trust` into the real store's removed
+        // record where that prefix existed, or died on a missing directory where it
+        // did not.
+        let home = aterm_types::dirs::home_dir().expect("a home directory");
+        let root = home.join(format!(".atpkg-test-removed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let layout = crate::store::resolve(Some(&root)).expect("layout");
+        assert_eq!(
+            layout.prefix, root,
+            "PRECONDITION: the vet admits the configured prefix — a fallback here would \
+             aim this test at the real store"
+        );
         std::fs::write(layout.removed(), "# deliberate\ntrust\n\n").unwrap();
         let removed = layout.removed_programs();
         assert!(
@@ -7312,7 +7526,13 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        crate::activate::install_shims(&layout, &build, &["trust".to_string()]).unwrap();
+        crate::activate::install_shims(
+            &layout,
+            &build,
+            &["trust".to_string()],
+            crate::activate::Aliases::Alab,
+        )
+        .unwrap();
         record_status(
             &layout,
             "trust",
@@ -7349,11 +7569,96 @@ mod tests {
         }
         let ahead = std::env::join_paths([local.clone(), layout.bin_dir()]).unwrap();
         let shadowed = crate::state::shadowed(6808, &local.join("trust"));
+        // trust is ALab's own, so its alias is laid: the answer carries the ONE trailing
+        // fix-line after the canonical state (the p11-kit `trust` story, §17.11).
         assert_eq!(
             which_line(&layout, "trust", Some(&ahead)).unwrap(),
-            format!("trust → {} — {shadowed}", local.join("trust").display())
+            format!(
+                "trust → {} — {shadowed} — type alab-trust for the managed one",
+                local.join("trust").display()
+            )
         );
-        // The pass records it, and un-records it when PATH changes back.
+        assert_eq!(
+            alias_fix(
+                &layout,
+                &crate::store::ToolName::new("trust").unwrap(),
+                "trust",
+                Some(&ahead)
+            )
+            .as_deref(),
+            Some("type alab-trust for the managed one"),
+            "the pass log composes the same sentence after the same state"
+        );
+        // A foreign `alab-trust` AHEAD of the managed bin/ too: the alias would not run
+        // the managed copy either, so the fix-line is withheld (never a promise that does
+        // not answer) and `which alab-trust` reports the alias as SHADOWED itself.
+        {
+            let foreign_alias = local.join("alab-trust");
+            std::fs::write(&foreign_alias, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&foreign_alias, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert_eq!(
+                alias_fix(
+                    &layout,
+                    &crate::store::ToolName::new("trust").unwrap(),
+                    "trust",
+                    Some(&ahead)
+                ),
+                None,
+                "no fix-line when the alias is shadowed too"
+            );
+            assert_eq!(
+                which_line(&layout, "trust", Some(&ahead)).unwrap(),
+                format!("trust → {} — {shadowed}", local.join("trust").display())
+            );
+            assert_eq!(
+                which_line(&layout, "alab-trust", Some(&ahead)).unwrap(),
+                format!(
+                    "alab-trust → {} — {}",
+                    foreign_alias.display(),
+                    crate::state::shadowed(6808, &foreign_alias)
+                )
+            );
+            std::fs::remove_file(&foreign_alias).unwrap();
+        }
+        // The containment is ANCHORED: an `alab-<x>` that resolves into a `store/<x>/…`
+        // tail OUTSIDE this prefix (a hand-made link into a checkout) earns no fix-line.
+        {
+            let checkout = local.join("store").join("trust").join("1").join("bin");
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::write(checkout.join("trust"), b"#!/bin/sh\nexit 0\n").unwrap();
+            let alias_shim = layout.shim(&crate::store::ToolName::new("alab-trust").unwrap());
+            let managed_target = crate::platform::resolve_shim(&alias_shim).unwrap();
+            std::fs::remove_file(&alias_shim).unwrap();
+            std::os::unix::fs::symlink(checkout.join("trust"), &alias_shim).unwrap();
+            assert_eq!(
+                alias_fix(
+                    &layout,
+                    &crate::store::ToolName::new("trust").unwrap(),
+                    "trust",
+                    Some(&ahead)
+                ),
+                None,
+                "a link outside the prefix is not the managed copy"
+            );
+            std::fs::remove_file(&alias_shim).unwrap();
+            std::os::unix::fs::symlink(&managed_target, &alias_shim).unwrap();
+        }
+        // The alias itself resolves the managed copy, in the same canonical words as the
+        // plain name — whatever PATH holds ahead of the managed bin/.
+        let alias_shim = layout
+            .shim(&crate::store::ToolName::new("alab-trust").unwrap())
+            .display()
+            .to_string();
+        assert_eq!(
+            which_line(&layout, "alab-trust", Some(&ahead)).unwrap(),
+            format!(
+                "alab-trust → {alias_shim} → {} — managed 6808 — pinned by index 41",
+                crate::which(&layout, "trust").unwrap().display()
+            )
+        );
+        // The pass records it — the CANONICAL row, never the fix-line — and un-records
+        // it when PATH changes back.
         assert_eq!(
             reconcile_shadowed(&layout, 41, Some(&ahead)),
             vec!["trust".to_string()]
@@ -7361,6 +7666,12 @@ mod tests {
         assert_eq!(
             crate::status::read(&layout).unwrap().programs["trust"].state,
             shadowed
+        );
+        assert!(
+            !crate::status::read(&layout).unwrap().programs["trust"]
+                .state
+                .contains("alab-"),
+            "the recorded state is exactly the canonical spelling"
         );
         assert!(
             crate::which(&layout, "trust").is_some() && local.join("trust").exists(),
@@ -7437,7 +7748,13 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        crate::activate::install_shims(&layout, &cbuild, &["codex".to_string()]).unwrap();
+        crate::activate::install_shims(
+            &layout,
+            &cbuild,
+            &["codex".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
         assert_eq!(
             which_line(&layout, "codex", Some(&ahead)).unwrap(),
             format!(
@@ -7470,7 +7787,137 @@ mod tests {
             which_line(&layout, "nothing", Some(&managed_only)).unwrap_err(),
             not_installed_fix("nothing")
         );
+        // The REVERSE case, honestly: an `alab-<x>` nothing answers to says why there is
+        // no alias instead of promising `aterm pkg install alab-x`. codex is installed
+        // above with the policy Off (a vendor extra); with no cached index the line can
+        // only say the tool is installed and not aliased. An unknown base gets the plain
+        // name's fix line.
+        let err = which_line(&layout, "alab-codex", Some(&managed_only)).unwrap_err();
+        assert!(err.starts_with("atpkg: no alias alab-codex — "), "{err}");
+        assert!(err.ends_with("type codex"), "{err}");
+        assert_eq!(
+            which_line(&layout, "alab-nothing", Some(&managed_only)).unwrap_err(),
+            format!(
+                "atpkg: no alias alab-nothing — {}",
+                not_installed_fix("nothing")
+            )
+        );
+        // The cached-index arms, driven directly: a system-satisfiable member and an
+        // extra never alias; an ALab tool that is not installed gets its own fix line.
+        let index = index_of(&[
+            ("ay", false, None),
+            ("gh", false, Some("gh")),
+            ("codex", true, None),
+        ]);
+        assert_eq!(
+            no_alias_line_for(&layout, "alab-gh", "gh", index.program("gh")),
+            "atpkg: no alias alab-gh — gh is not one of ALab's own tools (a system copy may \
+             satisfy it: system = \"gh\"); type gh"
+        );
+        assert_eq!(
+            no_alias_line_for(&layout, "alab-codex", "codex", index.program("codex")),
+            "atpkg: no alias alab-codex — codex is not one of ALab's own tools (an extra, a \
+             vendor's); type codex"
+        );
+        assert_eq!(
+            no_alias_line_for(&layout, "alab-ay", "ay", index.program("ay")),
+            format!(
+                "atpkg: alab-ay names nothing yet — {}",
+                not_installed_fix("ay")
+            )
+        );
+        assert!(which_line(&layout, "alab-sudo", Some(&managed_only)).is_err());
         assert!(which_line(&layout, "../x", Some(&managed_only)).is_err());
+        let _ = std::fs::remove_dir_all(&local);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// DESIGN S7 on the `which` surface: a managed shim that exports its manifest's
+    /// `shim_env` answers with the canonical state and ONE trailing sentence —
+    /// `self-update off (DISABLE_AUTOUPDATER=1)` — never inside the state; a foreign copy
+    /// ahead on PATH runs WITHOUT the env, so the SHADOWED answer carries no such line;
+    /// and a plain shim never earns it.
+    #[cfg(unix)]
+    #[test]
+    fn which_names_the_self_update_switch_as_a_trailing_fix_line() {
+        let layout = temp_layout("which-env");
+        let build = layout.build_dir("claude", 2026082701);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin/claude"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            build.join("bin/claude"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        crate::activate::install_tools_env(
+            &layout,
+            &build,
+            &[crate::store::ToolName::new("claude").unwrap()],
+            crate::activate::Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        record_status(
+            &layout,
+            "claude",
+            crate::ProgramStatus {
+                installed_build: Some(2026082701),
+                state: crate::state::managed(2026082701, 41),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+        let shim = layout.shim(&crate::store::ToolName::new("claude").unwrap());
+        let managed_only = std::env::join_paths([layout.bin_dir()]).unwrap();
+        assert_eq!(
+            which_line(&layout, "claude", Some(&managed_only)).unwrap(),
+            format!(
+                "claude → {} → {} — managed 2026082701 — pinned by index 41 — self-update off \
+                 (DISABLE_AUTOUPDATER=1)",
+                shim.display(),
+                crate::which(&layout, "claude").unwrap().display()
+            )
+        );
+        assert_eq!(
+            shim_env_fix(&shim).as_deref(),
+            Some("self-update off (DISABLE_AUTOUPDATER=1)")
+        );
+        // A foreign copy ahead on PATH: it runs, without the env — no fix-line about it.
+        let local = layout
+            .prefix
+            .parent()
+            .unwrap()
+            .join(format!("atpkg-main-which-env-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        let exe = local.join("claude");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ahead = std::env::join_paths([local.clone(), layout.bin_dir()]).unwrap();
+        assert_eq!(
+            which_line(&layout, "claude", Some(&ahead)).unwrap(),
+            format!(
+                "claude → {} — {}",
+                exe.display(),
+                crate::state::shadowed(2026082701, &exe)
+            ),
+            "the system copy runs without the env: nothing to say about self-update"
+        );
+        // A plain shim (no env declared) earns no fix-line.
+        crate::activate::install_tools(
+            &layout,
+            &build,
+            &[crate::store::ToolName::new("claude").unwrap()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        assert_eq!(shim_env_fix(&shim), None);
+        assert!(
+            !which_line(&layout, "claude", Some(&managed_only))
+                .unwrap()
+                .contains("self-update")
+        );
         let _ = std::fs::remove_dir_all(&local);
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
@@ -7518,7 +7965,13 @@ mod tests {
         std::fs::write(build.join("bin/gh"), b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(build.join("bin/gh"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        crate::activate::install_shims(&layout, &build, &["gh".to_string()]).unwrap();
+        crate::activate::install_shims(
+            &layout,
+            &build,
+            &["gh".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
         let mut installed = crate::active_builds(&layout);
         assert_eq!(
             installed.get("gh"),
@@ -7783,7 +8236,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let t = crate::store::ToolName::new(program).unwrap();
         std::fs::write(dir.join("bin").join(t.exe_file()), b"#!/bin/true\n").unwrap();
-        crate::activate::install_shims(layout, &dir, &[program.to_string()]).unwrap();
+        crate::activate::install_shims(
+            layout,
+            &dir,
+            &[program.to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
         crate::activate::activate_channel(layout, "stable", &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
     }
@@ -8801,8 +9260,6 @@ mod tests {
     // root-signed index, release-signed pkg manifests) but laid out as a DIR
     // REGISTRY so the production `DirFetcher` serves them (§14).
 
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
@@ -8842,7 +9299,7 @@ mod tests {
         Ed25519KeyPair::from_seed_unchecked(seed).unwrap()
     }
     fn pk(seed: &[u8; 32]) -> String {
-        STANDARD.encode(kp(seed).public_key().as_ref())
+        aterm_codec::base64::encode(kp(seed).public_key().as_ref()).expect("32-byte key")
     }
     fn sign(seed: &[u8; 32], msg: &[u8]) -> Vec<u8> {
         kp(seed).sign(msg).as_ref().to_vec()
@@ -9271,6 +9728,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unmet_requirement_reads_the_store_and_the_record_in_order() {
+        use crate::requires::unmet_requirement;
         let layout = temp_layout("unmet");
         let index = index_of(&[
             ("ay", false, None),
@@ -9341,6 +9799,257 @@ mod tests {
             "opted in but not yet installed"
         );
         let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A two-program registry for the update-lane gate: `ay` (`requires = ["gh"]`,
+    /// pinned at 18 with a real pkg) and `gh` (`system = "gh"`, pinned, its pkg
+    /// deliberately ABSENT — a system-satisfied requirement is never fetched, and the
+    /// update lane never fetches for a member that is not installed).
+    fn write_registry_requiring_system(dir: &Path) {
+        let index_body = format!(
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+             machine_id = \"{id}\"\nroster_seq = {seq}\n\
+             [programs.ay]\nrepo = \"ay\"\nrequires = [\"gh\"]\n\
+             [programs.gh]\nrepo = \"gh\"\nsystem = \"gh\"\n\
+             [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
+             pin = {{ ay = 18, gh = 3 }}\n",
+            id = testkit::MACHINE_ID,
+            seq = testkit::SEQ
+        );
+        std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
+        std::fs::write(
+            dir.join("index.toml.sig"),
+            sign(&RELEASE_SEED, index_body.as_bytes()),
+        )
+        .unwrap();
+        write_roster(dir);
+        write_pkg(dir, "ay", 18);
+    }
+
+    /// One update pass over `layout`, exactly as `cmd_update_all` runs it — the channel
+    /// apply over the live builds, then the per-group report that writes the rows —
+    /// returning the report and its failure count.
+    fn update_pass(
+        layout: &crate::store::Layout,
+        fetcher: &crate::DirFetcher,
+    ) -> (crate::ChannelApplyReport, u32) {
+        let installed = crate::active_builds(layout);
+        let report = crate::apply_channel(
+            fetcher,
+            layout,
+            &test_anchor(),
+            "stable",
+            current_triple(),
+            &installed,
+            &[],
+            build_floor(layout),
+            0,
+        )
+        .expect("the channel applies");
+        let failures = report_channel_apply(layout, &installed, &report);
+        (report, failures)
+    }
+
+    /// The outcome the report carries for `program`'s group.
+    fn outcome_of<'a>(
+        report: &'a crate::ChannelApplyReport,
+        program: &str,
+    ) -> &'a crate::TxnOutcome {
+        &report
+            .groups
+            .iter()
+            .find(|(g, _)| g.members.iter().any(|m| m == program))
+            .unwrap_or_else(|| panic!("{program}'s group is in the report: {:?}", report.groups))
+            .1
+    }
+
+    /// THE UPDATE LANE HONOURS THE REQUIREMENT GATE (§17.10): `ay` (installed at 17,
+    /// pinned at 18) requires `xc`, which was opted in, installed, and then uninstalled.
+    /// The pass holds ay on 17 — `blocked by xc: not installed`, its build and signed
+    /// root kept on the row, no failure, no doctor fault, not a byte staged — and moves
+    /// it to 18 the pass after xc is back. Blocked again later (xc gone a second time),
+    /// ay stays on 18 with the row saying so; xc back with nothing left to move, the
+    /// UpToDate pass lifts the row to the ordinary managed state.
+    #[test]
+    fn the_update_pass_holds_an_installed_dependent_whose_dependency_was_uninstalled() {
+        let dir = scratch("update-blocked");
+        write_registry_with_requires(&dir);
+        let layout = temp_layout("update-blocked");
+        let fetcher = crate::DirFetcher::new(dir.clone());
+        make_live(&layout, "ay", 17);
+        record_status(
+            &layout,
+            "ay",
+            crate::ProgramStatus {
+                installed_build: Some(17),
+                state: crate::state::managed(17, 40),
+                tree_root: "root17".into(),
+            },
+            "up to date".into(),
+        );
+        // xc: opted in and once installed — its stale row still says so — but gone from
+        // the store.
+        layout.record_optin("xc").unwrap();
+        record_status(
+            &layout,
+            "xc",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::managed(9, 40),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0, "a block is a deferral, never a failure");
+        let blocked_by_xc = crate::TxnOutcome::Blocked {
+            dep: "xc".into(),
+            dep_state: "not installed".into(),
+        };
+        assert_eq!(*outcome_of(&report, "ay"), blocked_by_xc);
+        assert!(
+            report
+                .groups
+                .iter()
+                .all(|(g, _)| !g.members.iter().any(|m| m == "xc")),
+            "the update lane never installs a missing dependency: {:?}",
+            report.groups
+        );
+        assert_eq!(
+            crate::active_builds(&layout).get("ay").copied(),
+            Some(17),
+            "held on its current build"
+        );
+        assert!(
+            !layout.build_dir("ay", 18).exists() && !layout.staging_dir("ay").exists(),
+            "not a byte staged"
+        );
+        assert!(
+            !report.resolved_assets.contains_key("ay"),
+            "…and no artifact resolved"
+        );
+        let blocked = crate::state::blocked("xc", "not installed");
+        let status = crate::status::read(&layout).expect("recorded");
+        assert_eq!(status.programs["ay"].state, blocked);
+        assert_eq!(
+            status.programs["ay"].installed_build,
+            Some(17),
+            "the build stays on the row"
+        );
+        assert_eq!(
+            status.programs["ay"].tree_root, "root17",
+            "the attestation stays on the row"
+        );
+        assert!(
+            crate::doctor::recorded_problems(Some(&status)).is_empty(),
+            "a blocked row is never a doctor fault: {:?}",
+            crate::doctor::recorded_problems(Some(&status))
+        );
+
+        // xc back: the next pass moves ay to its pin.
+        make_live(&layout, "xc", 9);
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert_eq!(
+            *outcome_of(&report, "ay"),
+            crate::TxnOutcome::Applied(vec!["ay".into()])
+        );
+        assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
+        let status = crate::status::read(&layout).unwrap();
+        assert_eq!(status.programs["ay"].state, crate::state::managed(18, 41));
+        let root18 = status.programs["ay"].tree_root.clone();
+        assert!(
+            !root18.is_empty(),
+            "the applied build's signed root is recorded"
+        );
+
+        // xc gone again: ay is held on 18, the row says why, the root survives.
+        std::fs::remove_file(layout.shim(&crate::store::ToolName::new("xc").unwrap())).unwrap();
+        assert!(!crate::active_builds(&layout).contains_key("xc"));
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert_eq!(*outcome_of(&report, "ay"), blocked_by_xc);
+        let status = crate::status::read(&layout).unwrap();
+        assert_eq!(status.programs["ay"].state, blocked);
+        assert_eq!(status.programs["ay"].installed_build, Some(18));
+        assert_eq!(status.programs["ay"].tree_root, root18);
+
+        // xc back and ay already on its pin: the UpToDate pass lifts the row.
+        make_live(&layout, "xc", 9);
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert_eq!(*outcome_of(&report, "ay"), crate::TxnOutcome::UpToDate);
+        let status = crate::status::read(&layout).unwrap();
+        assert_eq!(
+            status.programs["ay"].state,
+            crate::state::managed(18, 41),
+            "the block lifts with nothing left to move"
+        );
+        assert_eq!(status.programs["ay"].installed_build, Some(18));
+        assert_eq!(status.programs["ay"].tree_root, root18);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SYSTEM-SATISFIED DEPENDENCY COUNTS on the update lane (rule 2 on the `requires`
+    /// path): `ay` requires `gh`, and gh's row says the user's own copy satisfies it — ay
+    /// updates, and gh is never fetched. When that copy is gone (the row's path no
+    /// longer exists) the same row no longer counts, and ay is held on its build with
+    /// `blocked by gh: not installed`.
+    #[test]
+    fn the_update_pass_counts_a_system_satisfied_dependency() {
+        let dir = scratch("update-system-dep");
+        write_registry_requiring_system(&dir);
+        let layout = temp_layout("update-system-dep");
+        let fetcher = crate::DirFetcher::new(dir.clone());
+        make_live(&layout, "ay", 17);
+        let gh = layout.prefix.join("opt-homebrew-bin-gh");
+        std::fs::write(&gh, "gh").unwrap();
+        record_status(
+            &layout,
+            "gh",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::system(&gh, None),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert_eq!(
+            *outcome_of(&report, "ay"),
+            crate::TxnOutcome::Applied(vec!["ay".into()])
+        );
+        assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
+        assert!(
+            report
+                .groups
+                .iter()
+                .all(|(g, _)| !g.members.iter().any(|m| m == "gh")),
+            "a system-satisfied member is never an update: {:?}",
+            report.groups
+        );
+        // The user's copy gone: the row still says `system:`, but it no longer counts.
+        std::fs::remove_file(&gh).unwrap();
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert_eq!(
+            *outcome_of(&report, "ay"),
+            crate::TxnOutcome::Blocked {
+                dep: "gh".into(),
+                dep_state: "not installed".into()
+            }
+        );
+        let status = crate::status::read(&layout).unwrap();
+        assert_eq!(
+            status.programs["ay"].state,
+            crate::state::blocked("gh", "not installed")
+        );
+        assert_eq!(status.programs["ay"].installed_build, Some(18));
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `dependents_of` is the reverse relation, in index order — what the uninstall

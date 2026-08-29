@@ -695,8 +695,9 @@ impl EffectsPipeline {
             wake_persist_s: self.glow_cfg.wake_persist_s,
             // The ribbon's presentation is a SPELLING of the style (like the
             // pet companions), so it re-derives from the raw string on every
-            // reconfigure: `rainbow kitty tall` opts into the banding-era tall
-            // body, everything else gets the default 0.43 underline strip.
+            // reconfigure: the `… tall` spellings opt into the v0.43 full-height
+            // body, everything else gets the default post-v0.43
+            // highlighter-plus-under-baseline mark.
             ribbon_tall: crate::cursor_glow::GlowStyle::style_names_tall_ribbon(style),
         };
         if !enabled {
@@ -3401,6 +3402,7 @@ mod tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         };
         for row in &mut input.cells {
             row.clear();

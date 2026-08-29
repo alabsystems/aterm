@@ -2105,7 +2105,6 @@ pub(crate) fn write_credentials_profile(
     roster: &Path,
     identity_sha1: Option<&str>,
 ) -> Result<Option<PathBuf>, String> {
-    use base64::Engine as _;
     use std::os::unix::fs::OpenOptionsExt;
 
     let Some(home) = std::env::var_os("HOME") else {
@@ -2118,7 +2117,8 @@ pub(crate) fn write_credentials_profile(
     }
     let key_bytes = std::fs::read(aterm.join("machine.key"))
         .map_err(|e| format!("cannot read this machine's key: {e}"))?;
-    let signing_key = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+    let signing_key = aterm_codec::base64::encode(&key_bytes)
+        .map_err(|_| "this machine's key is too large to encode".to_string())?;
 
     let mut body = String::new();
     body.push_str("# Written by `cargo ship provision --id ");

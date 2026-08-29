@@ -242,7 +242,7 @@ fn viewbox_aspect(id: &str) -> f32 {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return 1.0;
     };
-    let Ok(doc) = text.parse::<toml::Value>() else {
+    let Ok(doc) = text.parse::<aterm_toml::Value>() else {
         return 1.0;
     };
     let Some(vb) = doc.get("viewbox").and_then(|v| v.as_array()) else {
@@ -251,7 +251,7 @@ fn viewbox_aspect(id: &str) -> f32 {
     if vb.len() != 2 {
         return 1.0;
     }
-    let n = |v: &toml::Value| {
+    let n = |v: &aterm_toml::Value| {
         v.as_integer()
             .map(|i| i as f32)
             .or_else(|| v.as_float().map(|f| f as f32))
@@ -450,9 +450,9 @@ fn blit_tile_onto(dst: &mut Tile, src: &Tile, x0: u32, y0: u32) {
 
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header()?
         .write_image_data(rgb)
         .map_err(std::io::Error::other)

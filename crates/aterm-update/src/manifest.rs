@@ -210,12 +210,12 @@ impl Ready {
     /// unparseable marker; `.ok()?` maps it to `None`.)
     pub fn read(path: &Path) -> Option<Self> {
         let text = crate::read_ledger_text(path)?;
-        toml::from_str(&text).ok()
+        aterm_toml::from_str(&text).ok()
     }
 
     /// Serialize to TOML text.
     pub fn to_toml(&self) -> Result<String, String> {
-        toml::to_string(self).map_err(|e| format!("serialize ready marker: {e}"))
+        aterm_toml::to_string(self).map_err(|e| format!("serialize ready marker: {e}"))
     }
 
     /// Cheap structural identity gate shared by apply and status surfaces. A
@@ -332,7 +332,7 @@ impl InstalledReceipt {
     /// Read a well-formed receipt. Missing, oversized, malformed, or non-canonical
     /// data fails closed as no proof.
     pub(crate) fn read(path: &Path) -> Option<Self> {
-        let parsed: Self = toml::from_str(&crate::read_ledger_text(path)?).ok()?;
+        let parsed: Self = aterm_toml::from_str(&crate::read_ledger_text(path)?).ok()?;
         Self::canonical(parsed.build_number, &parsed.git_commit, &parsed.dmg_sha256)
     }
 
@@ -355,7 +355,7 @@ impl InstalledReceipt {
     ) -> Result<(), String> {
         let receipt = Self::canonical(build_number, git_commit, dmg_sha256)
             .ok_or_else(|| "installed receipt identity is malformed".to_string())?;
-        let text = toml::to_string(&receipt)
+        let text = aterm_toml::to_string(&receipt)
             .map_err(|error| format!("serialize installed receipt: {error}"))?;
         write_durable(path, &text, "installed receipt")
     }
@@ -435,7 +435,7 @@ impl Floor {
     /// (permissive) default since both fields are lower bounds.
     pub fn read(path: &Path) -> Self {
         crate::read_ledger_text(path)
-            .and_then(|t| toml::from_str(&t).ok())
+            .and_then(|t| aterm_toml::from_str(&t).ok())
             .unwrap_or_default()
     }
 
@@ -517,7 +517,8 @@ impl Floor {
         if next == cur {
             return Ok(());
         }
-        let text = toml::to_string(&next).map_err(|error| format!("encode floor: {error}"))?;
+        let text =
+            aterm_toml::to_string(&next).map_err(|error| format!("encode floor: {error}"))?;
         // DURABLE, like every other trust record in this module (receipt, marker,
         // quarantine). A plain write+rename left the ratchet inside APFS's data
         // writeback window: a panic/power cut after an advance could surface a
@@ -623,7 +624,7 @@ impl FailedMark {
     /// just-quarantined build be re-downloaded and re-applied (2026-08-19 round-4
     /// skeptics). Treated as ABSENT.
     pub fn read(path: &Path) -> Option<Self> {
-        let parsed: Self = toml::from_str(&crate::read_ledger_text(path)?).ok()?;
+        let parsed: Self = aterm_toml::from_str(&crate::read_ledger_text(path)?).ok()?;
         (parsed.build_number != 0 || !parsed.sha256.is_empty()).then_some(parsed)
     }
 
@@ -729,7 +730,7 @@ impl FailedMark {
             quarantined: true,
             install_root: None,
         };
-        let Ok(text) = toml::to_string(&m) else {
+        let Ok(text) = aterm_toml::to_string(&m) else {
             return;
         };
         let _ = write_durable(path, &text, "artifact quarantine");
@@ -755,7 +756,7 @@ impl FailedMark {
             quarantined: false,
             install_root: None,
         };
-        let Ok(text) = toml::to_string(&m) else {
+        let Ok(text) = aterm_toml::to_string(&m) else {
             return;
         };
         // NOT durable, deliberately: losing a backoff memo costs one redundant
@@ -789,8 +790,8 @@ impl FailedMark {
             quarantined: false,
             install_root: install_root.map(|root| root.to_string_lossy().into_owned()),
         };
-        let text =
-            toml::to_string(&m).map_err(|error| format!("serialize artifact marker: {error}"))?;
+        let text = aterm_toml::to_string(&m)
+            .map_err(|error| format!("serialize artifact marker: {error}"))?;
         write_durable(path, &text, "artifact marker")
     }
 
@@ -929,7 +930,7 @@ mod tests {
     /// rather than inheriting the old forever-skip.
     #[test]
     fn a_pre_budget_marker_parses_and_becomes_retryable() {
-        let m: FailedMark = toml::from_str("build_number = 9\nsha256 = \"ff\"\n").unwrap();
+        let m: FailedMark = aterm_toml::from_str("build_number = 9\nsha256 = \"ff\"\n").unwrap();
         assert_eq!(m.attempts, 0);
         assert_eq!(m.retry_after, 0);
         assert!(m.matches(9, "ff"));
@@ -1191,7 +1192,7 @@ changelog = '''
             machine_id: Some("m3".into()),
             roster_seq: Some(2),
         };
-        let parsed: Ready = toml::from_str(&r.to_toml().unwrap()).unwrap();
+        let parsed: Ready = aterm_toml::from_str(&r.to_toml().unwrap()).unwrap();
         assert_eq!(parsed.build_number, 9);
         assert_eq!(parsed.version, "0.3.0");
         assert_eq!(parsed.commit.as_deref(), Some("deadbeefcafe"));

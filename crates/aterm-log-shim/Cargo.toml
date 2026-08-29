@@ -1,0 +1,152 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, and here the directory
+# also had to grow a suffix.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the twenty
+# third-party consumers' `log = "0.4.x"` lines at this code the package must be
+# called `log` — nothing else works. The DIRECTORY keeps the `aterm-` prefix so
+# a `ls crates/` or a stack trace still reads as ours and nobody mistakes this
+# for a vendored upstream (those live under `vendor/`, which is where genuinely
+# upstream source belongs).
+#
+# The `-shim` suffix is forced: `crates/aterm-log` is ALREADY TAKEN by aterm's
+# real logging facade — the one 15 workspace crates depend on by that name and
+# whose global level `crates/aterm/src/main.rs` and
+# `crates/aterm-gui/src/watchdog.rs` actually set. The two must be separate
+# packages, not one; see this crate's `src/lib.rs` module docs for the four
+# measured reasons, of which the sharpest is that merging them would switch on
+# Vulkan validation severities that are off today.
+name = "log"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number. Measured requirements across the
+# twenty consumers, all four cells (`cargo tree -e all --workspace --target
+# <cell> --depth 2 -i 'https://github.com/rust-lang/crates.io-index#log@0.4.32'`,
+# then each parent's manifest — the source-qualified spec is REQUIRED now that a
+# second package named `log` is a workspace member; see src/lib.rs for why the
+# bare `-i log` silently prints nothing):
+#   ^0.4.29 — naga, wgpu, wgpu-core, wgpu-hal, wgpu-types  (the strictest)
+#   ^0.4.22 — rustybuzz
+#   ^0.4.17 — vte
+#   ^0.4    — the other thirteen
+# 0.4.32 satisfies all four requirements and is what the graph resolved to
+# before the swap, so the lockfile's version line does not move when the
+# `[patch.crates-io]` row eventually lands.
+#
+# Until it does, Cargo.lock carries TWO `log 0.4.32` entries — this path member
+# (no `source` key) and the registry copy every consumer still resolves to. That
+# is the correct intermediate state and is what makes this crate INERT: adding
+# it changes nothing about the shipped graph. The patch row collapses the pair
+# back to one.
+version = "0.4.32"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party no-op `log` facade for aterm (package `log`; replaces the crates.io log 0.4.32 for its twenty third-party consumers)"
+
+[dependencies]
+# NONE, and the absence is deliberate rather than incidental.
+#
+# The obvious edge — `aterm-log`, the first-party logger this repository already
+# ships — is NOT taken. Four measured reasons, argued in full in src/lib.rs:
+#   1. `max_level()`. aterm-log's global IS set (Info in crates/aterm/src/main.rs,
+#      Trace in crates/aterm-gui/src/watchdog.rs); crates.io `log`'s is `Off`
+#      forever. wgpu-hal reads `log::max_level()` four times to gate REAL WORK.
+#   2. `Display for Level`. aterm-log writes `f.write_str("WARN")`; upstream
+#      writes `fmt.pad(self.as_str())`, which honours `{:>7}`.
+#   3. `LevelFilter::parse`. aterm-log has an inherent `parse` that trims its
+#      input; upstream has `FromStr`, which does not. Re-exporting the type
+#      exports the inherent method too, under the name `log::LevelFilter::parse`.
+#   4. `no_std`. aterm-log is std-only (`std::sync::OnceLock`, `std::env`);
+#      seven consumers are `#![no_std]` and none enables `log/std`.
+# Reasons 2 and 3 are cases where DELEGATING WOULD SHIP A WRONG API, not merely
+# an inelegant one — so the exception swallows the rule for this target.
+
+[features]
+# Upstream's feature table, reproduced by NAME. Only the implicit, empty
+# `default` is reachable from aterm's graph — measured on all four cells with
+# `cargo tree -e features --workspace --target <cell> -i
+# 'https://github.com/rust-lang/crates.io-index#log@0.4.32'`, which prints
+# exactly `log feature "default"` and nothing else — and `default` is left
+# IMPLICIT here precisely because upstream declares no `default` key either.
+#
+# The unreachable entries are declared anyway because they cost one line each
+# and they remove a whole class of "some transitive crate asked for `log/std`"
+# resolution failures that would otherwise surface as a broken build on a cell
+# we cannot compile here. They are all no-ops: there is no `kv` module, no
+# `serde` impls, and no compile-time level filtering, because there is nothing
+# to filter.
+#
+# THE OPTIONAL-DEPENDENCY NAMES ARE HERE TOO (`value-bag`, `sval`, `sval_ref`,
+# `serde_core`). Upstream declares those as optional deps, which makes cargo
+# synthesize a feature of the same name; a consumer writing
+# `log = { features = ["value-bag"] }` therefore resolves against the real crate
+# and would fail against this one if the name were missing. Declaring them empty
+# keeps the resolvable name set a superset of upstream's while keeping the
+# EXPORTED ITEM set a strict subset (see the glob-collision note in src/lib.rs).
+std = []
+kv = []
+kv_std = ["std", "kv"]
+kv_sval = ["kv", "sval", "sval_ref"]
+kv_serde = ["kv_std", "serde"]
+kv_unstable = ["kv", "value-bag"]
+kv_unstable_std = ["kv_std", "kv_unstable"]
+kv_unstable_sval = ["kv_sval", "kv_unstable"]
+kv_unstable_serde = ["kv_serde", "kv_unstable_std"]
+serde = ["serde_core"]
+max_level_off = []
+max_level_error = []
+max_level_warn = []
+max_level_info = []
+max_level_debug = []
+max_level_trace = []
+release_max_level_off = []
+release_max_level_error = []
+release_max_level_warn = []
+release_max_level_info = []
+release_max_level_debug = []
+release_max_level_trace = []
+# Synthesized by cargo upstream from `[dependencies.<name>] optional = true`.
+# Empty here; see the paragraph above.
+value-bag = []
+sval = []
+sval_ref = []
+serde_core = []
+
+[dev-dependencies]
+# NONE, and this is the one place where the established in-repo oracle pattern
+# is UNAVAILABLE rather than declined.
+#
+# `crates/aterm-digest` keeps sha2/hmac, `crates/aterm-regex` keeps regex and
+# `crates/aterm-grapheme` keeps unicode-width as differential dev-dependencies:
+# the crate they replace, kept out of the shipped graph, asserted equal. That
+# cannot be done here, and the reason is structural, not lazy. This package IS
+# the `[patch.crates-io]` target for the name `log`, so a dev-dependency on
+# crates.io `log` — under any rename, since patch matches on package name — is
+# redirected straight back at this package.
+#
+# MEASURED, not assumed. A throwaway two-member workspace with
+# `[patch.crates-io] log = { path = "shim" }` and
+# `[dev-dependencies] upstream-log = { package = "log", version = "0.4.32" }`
+# inside the shim resolves without error and then fails to compile the test with
+#   error[E0433]: failed to resolve: use of unresolved module `upstream_log`
+# because the edge collapses into a self-dependency and the extern crate name
+# never appears. Adding it would therefore either be VACUOUS (comparing the shim
+# to itself) or would break the day the patch row lands — and a test that
+# quietly becomes vacuous is worse than no test at all.
+#
+# What replaces it is a TRANSCRIBED table oracle in tests/consumer_forms.rs:
+# every constant this crate reproduces (the two enums' discriminants,
+# LOG_LEVEL_NAMES, the `fmt.pad` padding behaviour, the FromStr accept/reject
+# sets, the initial value of MAX_LOG_LEVEL_FILTER) is asserted against the value
+# read out of log-0.4.32's own source, cited by file and line. That is
+# transcription checked by a human, not co-execution, and the test file says so.
+# The only route to a live differential is a SEPARATE workspace that does not
+# inherit the root patch table (`tools/freeze-safety-gate` is the existing
+# precedent); it was judged disproportionate for a facade that computes a
+# six-element lattice.
+
+[lints]
+workspace = true

@@ -27,7 +27,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::activate::{activate_channel, install_tombstone_shim, install_tools};
+#[cfg(test)]
+use crate::activate::install_tools;
+use crate::activate::{Aliases, activate_channel, install_tombstone_shim, install_tools_env};
 use crate::apply::{Group, TxnOutcome, plan_groups, transact};
 use crate::gate::{ApplyDecision, decide};
 use crate::install::{StageError, verify_and_stage};
@@ -359,6 +361,10 @@ pub enum FlowError {
     /// split that replaced it ([`crate::Reject::RetiredKind`]) so the refusal names the
     /// fix.
     RetiredKind(&'static str),
+    /// The per-build manifest's `shim_env` breaks the rule a shim can honour
+    /// ([`crate::Reject::ShimEnv`], design S7); carries the entry and the reason, like
+    /// `RetiredKind`, so the authoring machine's own install names the fix.
+    ShimEnv(String),
     /// The signed `program`/`build_number` did not match the request (anti-replay).
     Mismatch,
     /// No artifact for the target triple (a clean skip, §6).
@@ -459,6 +465,10 @@ impl std::fmt::Display for FlowError {
             FlowError::PkgVerify => f.write_str("manifest signature did not verify"),
             FlowError::PkgParse => f.write_str("manifest malformed or newer schema"),
             FlowError::RetiredKind(why) => {
+                f.write_str("manifest refused: ")?;
+                f.write_str(why)
+            }
+            FlowError::ShimEnv(why) => {
                 f.write_str("manifest refused: ")?;
                 f.write_str(why)
             }
@@ -694,6 +704,8 @@ fn install_inner(
         // one parse refusal whose words reach the authoring machine, so the fix is
         // spelled rather than read as a bare "malformed".
         crate::Reject::RetiredKind(why) => FlowError::RetiredKind(why),
+        // So does a `shim_env` the rule refuses (design S7): the entry and the reason.
+        crate::Reject::ShimEnv(why) => FlowError::ShimEnv(why),
         _ => FlowError::PkgParse,
     })?;
     if !pkg.is_for(program) || pkg.build_number != pinned {
@@ -985,6 +997,17 @@ fn install_inner(
     // The verify→extract boundary lives inside `verify_and_stage`; the extract scope
     // credits `write_capped`'s loop to this program, and the first written byte flips
     // the phase label honestly (see `progress::extract_scope`).
+    // The shim environment the signed manifest declares (design S7) is recorded BESIDE
+    // the build (`<build>.shim-env`) before the tree is staged: the verbs that hold no
+    // manifest — the transaction's rollback, `rollback`, `unlink`'s restore — re-lay this
+    // build's shims from it. Before the stage, so a build the sidecar could not be
+    // written for is never marked ready with shims that would lack their environment.
+    if let Err(e) = crate::shim_env::write_sidecar(&build_dir, &pkg.shim_env()) {
+        let _ = std::fs::remove_file(&dl);
+        let mut why = String::from("shim_env sidecar: ");
+        why.push_str(&e.to_string());
+        return Err(FlowError::Activate(why));
+    }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
     let staged = verify_and_stage(artifact, &dl, &build_dir);
     drop(extract_scope);
@@ -1016,6 +1039,9 @@ fn install_inner(
     // prints 'already current' with nothing working (the wedge `flip_member` rolls
     // back on the transactional path). Capture the same rollback input here so both
     // error arms below unwind identically. (audit: resolve-failure left-active wedge.)
+    // ALab's own tools get their `alab-<tool>` aliases; a vendor extra or a
+    // system-satisfiable member does not (`activate.rs` module doc).
+    let aliases = Aliases::for_program(index.program(program));
     let staged = Staged {
         build: pinned,
         build_dir: build_dir.clone(),
@@ -1024,8 +1050,11 @@ fn install_inner(
         was_live,
         reloc: None,
         tree_root: String::new(),
+        aliases,
     };
-    if let Err(e) = install_tools(layout, &build_dir, &tools) {
+    // The shims export the signed manifest's `shim_env` (design S7) — a managed vendor
+    // tool runs with its own updater off; a system copy never runs through a shim.
+    if let Err(e) = install_tools_env(layout, &build_dir, &tools, aliases, &pkg.shim_env()) {
         abort_activated_install(layout, channel, program, &staged);
         return Err(FlowError::Activate(e.to_string()));
     }
@@ -1340,8 +1369,13 @@ fn fetch_artifact(
 /// `active_tools` hands back [`crate::store::ToolName`]s, which only exist for admitted names.
 fn install_tombstone_shims(layout: &Layout, program: &str, installed: Option<u64>) {
     if let Some(cur) = installed {
-        for tool in crate::ops::active_tools(layout, program, cur) {
-            let _ = install_tombstone_shim(layout, &tool);
+        // The `alab-<tool>` aliases forward to the same revoked executable, so they are
+        // disabled with their primaries — a revoked build must not stay runnable under
+        // its other name.
+        let tools = crate::ops::active_tools(layout, program, cur);
+        let aliases = crate::ops::active_aliases(layout, program, cur);
+        for tool in tools.iter().chain(&aliases) {
+            let _ = install_tombstone_shim(layout, tool);
         }
     }
 }
@@ -1443,6 +1477,12 @@ struct Staged {
     /// The SIGNED `tree_root` of the staged build, surfaced in [`ChannelApplyReport::applied`]
     /// so the CLI can record it for `atpkg verify` after an update flip.
     tree_root: String,
+    /// Whether the member's tools get their `alab-<tool>` aliases — read off the signed
+    /// index entry ([`Aliases::for_program`]) when it is staged, or off the disk
+    /// ([`Aliases::laid_for`]) by the rollback verb, which holds no index. The flip lays
+    /// them with the primaries and the rollback re-points or removes them with the
+    /// primaries.
+    aliases: Aliases,
 }
 
 /// The result of a whole-channel transactional update.
@@ -1801,9 +1841,10 @@ pub fn group_missing_triple(
 }
 
 /// The transaction body shared by [`apply_group`] (update: installed groups only) and
-/// [`bootstrap_group`] (§11 fresh install): decide-first, the local-pin hold, the group-
-/// aggregated disk preflight, then stage-all → flip-all → rollback via [`transact`], with
-/// the abort discard, tombstone-shim disable, and applied `tree_root` capture.
+/// [`bootstrap_group`] (§11 fresh install): decide-first, the requirement gate
+/// ([`TxnOutcome::Blocked`], §17.10), the local-pin hold, the group-aggregated disk
+/// preflight, then stage-all → flip-all → rollback via [`transact`], with the abort
+/// discard, tombstone-shim disable, and applied `tree_root` capture.
 #[allow(
     clippy::too_many_arguments,
     reason = "the per-group apply needs the same irreducible inputs as apply_channel: the \
@@ -1828,11 +1869,44 @@ fn apply_group_txn(
         .map(|m| (m.clone(), decide(ch, m, installed.get(m).copied())))
         .collect();
 
-    // LOCAL PIN GATE — strictly AFTER decide(), suppression-only, coherence-preserving.
     let any_tombstone = decisions
         .iter()
         .any(|(_, d)| *d == ApplyDecision::Tombstone);
     let wants_upgrade = decisions.iter().any(|(_, d)| *d == ApplyDecision::Install);
+    // Whether every installed member's CURRENT build is itself still gate-valid — the
+    // guard BOTH holds below must pass. If any current build is yanked or below the
+    // floor, decide() returned Install to force-upgrade OFF it (not Tombstone), and a
+    // hold would keep a revoked/below-floor build running; revocation outranks every
+    // consumer gate, so the tuple force-upgrades to the valid pin instead.
+    let all_current_valid = group
+        .members
+        .iter()
+        .all(|m| crate::gate::current_build_ok(ch, m, installed.get(m).copied()));
+
+    // THE REQUIREMENT GATE (§17.10) — strictly AFTER decide(), suppression-only,
+    // coherence-preserving, and the ONE rule ([`crate::requires::unmet_requirement`])
+    // the set-completion pass and the OS-installed reconcile apply before a member
+    // starts: the group is held on its current builds while one of its `requires` (a
+    // tuple's: the union of its members', minus the tuple) is not installed, dev-linked,
+    // system-satisfied or installed through its protocol. Running here, in the body the
+    // update lane shares with the bootstrap lane, is what makes `apply_channel` and
+    // `apply_program` honour it too: an already-installed dependent whose dependency
+    // was uninstalled is NOT moved to a newer pin, and nothing is resolved or downloaded
+    // for it — `Blocked` names the dependency and quotes its row, the caller records
+    // `blocked by <dep>: <dep state>` with the build and attestation kept, and the next
+    // pass retries. Never over a Tombstone (transact tombstones the group — a revoked
+    // build never keeps running) and never over a force-upgrade off a revoked current
+    // build, exactly like the pin below. The plan is dependency-first, so a requirement
+    // this pass could satisfy has already had its turn.
+    if !any_tombstone && all_current_valid {
+        let requires = crate::apply::group_requires(index, group);
+        if let Some((dep, dep_state)) = crate::requires::unmet_requirement(layout, index, &requires)
+        {
+            return (TxnOutcome::Blocked { dep, dep_state }, BTreeMap::new());
+        }
+    }
+
+    // LOCAL PIN GATE — strictly AFTER decide(), suppression-only, coherence-preserving.
     if !any_tombstone && wants_upgrade {
         // If ANY member is tombstoned the pin is IGNORED (transact tombstones the group — a
         // revoked build never keeps running). One pinned member freezes the WHOLE tuple on
@@ -1844,15 +1918,10 @@ fn apply_group_txn(
             .cloned()
             .collect();
         // CRITICAL: a hold freezes EVERY member on its current build, so it is only safe when
-        // every installed member's current build is itself still gate-valid. If any current
-        // build is yanked or below the floor, decide() returned Install to force-upgrade OFF
-        // it (not Tombstone) — honoring the pin here would keep a revoked/below-floor build
-        // running via a purely local pin. In that case the pin is IGNORED and the tuple
-        // force-upgrades to the valid pin.
-        let all_current_valid = group
-            .members
-            .iter()
-            .all(|m| crate::gate::current_build_ok(ch, m, installed.get(m).copied()));
+        // every installed member's current build is itself still gate-valid
+        // (`all_current_valid` above) — honoring the pin otherwise would keep a
+        // revoked/below-floor build running via a purely local pin. In that case the pin
+        // is IGNORED and the tuple force-upgrades to the valid pin.
         if !held.is_empty() && all_current_valid {
             return (TxnOutcome::Pinned(held), BTreeMap::new());
         }
@@ -2365,6 +2434,11 @@ pub fn rollback(
         was_live: true,
         reloc: None,
         tree_root: String::new(),
+        // The SIGNED index just verified above is the policy, exactly as at install: an
+        // ALab program keeps its aliases across the rollback, a vendor extra or a
+        // system-satisfiable member grows none — whatever a hand-made `alab-*` link in
+        // bin/ might suggest.
+        aliases: Aliases::for_program(index.program(program)),
     };
     rollback_member(layout, channel, program, &staged);
     Ok(RollbackReport {
@@ -2679,6 +2753,12 @@ fn stage_member(
     // Reclaim the compressed asset on EVERY exit, not just the happy one: a group member
     // that fails to stage otherwise strands its archive in `staging/` forever, and nothing
     // else ever sweeps that directory (`gc::interrupted_debris` walks `store/` only).
+    // The signed `shim_env` rides beside the build (design S7) so the flip — and a
+    // rollback that has no manifest in hand — lays this build's shims with it.
+    if crate::shim_env::write_sidecar(&build_dir, &pkg.shim_env()).is_err() {
+        let _ = std::fs::remove_file(&dl);
+        return None;
+    }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
     let staged = verify_and_stage(artifact, &dl, &build_dir);
     drop(extract_scope);
@@ -2702,6 +2782,7 @@ fn stage_member(
         was_live,
         reloc,
         tree_root: artifact.tree_root.clone(),
+        aliases: Aliases::for_program(index.program(program)),
     })
 }
 
@@ -2738,7 +2819,10 @@ fn flip_member(layout: &Layout, channel: &str, program: &str, s: &Staged) -> boo
         }
         return false;
     }
-    if install_tools(layout, &s.build_dir, &s.exposes).is_err() {
+    // The build's own `shim_env` (its sidecar, written from the signed manifest when
+    // it was staged) rides on every shim the flip lays — design S7.
+    let env = crate::shim_env::read_sidecar(&s.build_dir);
+    if install_tools_env(layout, &s.build_dir, &s.exposes, s.aliases, &env).is_err() {
         rollback_member(layout, channel, program, s);
         return false;
     }
@@ -2790,18 +2874,38 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
                     }
                 }
             }
+            // The PRIOR build's shims export the PRIOR build's `shim_env` — its sidecar,
+            // written from its own signed manifest when it was staged (design S7). A
+            // build staged before the sidecar existed has none, and reads as none.
+            let env = crate::shim_env::read_sidecar(&prior_dir);
             for tool in &restore {
                 let target = prior_dir.join("bin").join(tool.exe_file());
+                // The alias goes where the primary goes: re-pointed at the prior build
+                // beside it, or dropped with it. `None` when the policy is Off (the alias
+                // was never laid) or the tool is its own alias.
+                let alias = (s.aliases == Aliases::Alab).then(|| tool.alias()).flatten();
                 if target.exists() {
-                    let _ = crate::platform::install_shim(
+                    let _ = crate::platform::install_shim_env(
                         &prior_dir.join("bin"),
                         tool,
                         &layout.shim(tool),
+                        &env,
                     );
+                    if let Some(alias) = &alias {
+                        let _ = crate::platform::install_shim_env(
+                            &prior_dir.join("bin"),
+                            tool,
+                            &layout.shim(alias),
+                            &env,
+                        );
+                    }
                 } else {
                     // A binary the new build added but the prior build lacks — drop the shim
                     // rather than leave it dangling at a nonexistent prior-build path.
                     let _ = std::fs::remove_file(layout.shim(tool));
+                    if let Some(alias) = &alias {
+                        let _ = std::fs::remove_file(layout.shim(alias));
+                    }
                 }
             }
             let _ = activate_channel(layout, channel, &prior_dir);
@@ -2810,6 +2914,11 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
         None => {
             for tool in &s.exposes {
                 let _ = std::fs::remove_file(layout.shim(tool));
+                if s.aliases == Aliases::Alab
+                    && let Some(alias) = tool.alias()
+                {
+                    let _ = std::fs::remove_file(layout.shim(&alias));
+                }
             }
             // A fresh install has no prior link to re-point, but `flip_member`'s
             // `activate_channel` DID write `store/<program>/current` — and the abort
@@ -2923,8 +3032,6 @@ pub(crate) fn rfc3339_to_unix(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::collections::HashMap;
     use std::io::Write;
@@ -2979,7 +3086,7 @@ mod tests {
         Ed25519KeyPair::from_seed_unchecked(seed).unwrap()
     }
     fn pk(seed: &[u8; 32]) -> String {
-        STANDARD.encode(kp(seed).public_key().as_ref())
+        aterm_codec::base64::encode(kp(seed).public_key().as_ref()).expect("32-byte key")
     }
     fn sign(seed: &[u8; 32], msg: &[u8]) -> Vec<u8> {
         kp(seed).sign(msg).as_ref().to_vec()
@@ -3297,7 +3404,7 @@ mod tests {
         }
         crate::progress::end_pass();
         let file: crate::progress::ProgressFile =
-            serde_json::from_str(&std::fs::read_to_string(&progress).unwrap()).unwrap();
+            aterm_json::from_str(&std::fs::read_to_string(&progress).unwrap()).unwrap();
         assert_eq!(file.pass, "net");
         assert_eq!(file.pid, None, "the pass ended — no live pid claim");
         assert!(file.ended_unix.is_some());
@@ -3800,6 +3907,166 @@ mod tests {
         for d in [rdir, hdir, ndir, vdir] {
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    /// DESIGN S7, end to end through the real flow: a manifest declaring
+    /// `shim_env = ["DISABLE_AUTOUPDATER=1"]` installs like any vendor row, and the shim
+    /// it lays EXPORTS that variable before it execs — read back off the shim, recorded
+    /// beside the build in its `<build>.shim-env` sidecar (so the verbs that hold no
+    /// manifest re-lay it the same way), and still a shim `which` resolves. A manifest
+    /// whose `shim_env` breaks the rule is refused at PARSE as `ShimEnv` naming the entry,
+    /// before any byte moves.
+    #[test]
+    fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
+        struct VendorFake {
+            inner: Fake,
+            served: PathBuf,
+        }
+        impl Fetcher for VendorFake {
+            fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+                self.inner.index_candidates()
+            }
+            fn pkg_manifest(&self, r: &str, p: &str, b: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+                self.inner.pkg_manifest(r, p, b)
+            }
+            fn download(&self, _: &str, asset: &str, _: &Path) -> Result<(), String> {
+                panic!("a vendor row must never reach the slug lane (asked for {asset})");
+            }
+            fn download_url(&self, _: &str, dest: &Path, _: u64) -> Result<(), String> {
+                std::fs::copy(&self.served, dest)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+        }
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        // `fixture_vendor` appends `row` INSIDE the artifact table; a top-level key has to
+        // come before it, so re-head the signed body: the same bytes with `shim_env` after
+        // `exposes`, re-signed.
+        let with_env = |dir: &Path, list: &str| {
+            let mut fake = fixture_vendor(dir, VENDOR_ROW);
+            let (body, _) = fake.pkg.remove(&("ay".to_string(), 18u64)).unwrap();
+            let body = String::from_utf8(body).unwrap().replacen(
+                "exposes = [\"ay\", \"git\"]\n",
+                &format!("exposes = [\"ay\", \"git\"]\nshim_env = {list}\n"),
+                1,
+            );
+            fake.pkg.insert(
+                ("ay".to_string(), 18u64),
+                (
+                    body.clone().into_bytes(),
+                    sign(&RELEASE_SEED, body.as_bytes()),
+                ),
+            );
+            fake
+        };
+        let dir = scratch("shim-env-lane");
+        let inner = with_env(&dir, "[\"DISABLE_AUTOUPDATER=1\"]");
+        let served = inner.archives["ay-18.tar.zst"].clone();
+        let vendor = VendorFake { inner, served };
+        let l = layout(&dir);
+        let report = install(&vendor, &l, &anchor(), &req, fl(0), 0).unwrap();
+        assert_eq!(report.build, 18);
+        let shim = l.shim(&tool("ay"));
+        assert_eq!(
+            crate::ops::which(&l, "ay").unwrap(),
+            tool_bin(&l.build_dir("ay", 18), "ay"),
+            "still a shim that resolves"
+        );
+        let env = crate::platform::shim_env_of(&shim);
+        assert_eq!(
+            env.spelled(),
+            "DISABLE_AUTOUPDATER=1",
+            "the shim exports it"
+        );
+        assert_eq!(
+            env.fix_line().as_deref(),
+            Some("self-update off (DISABLE_AUTOUPDATER=1)")
+        );
+        assert_eq!(
+            crate::shim_env::read_sidecar(&l.build_dir("ay", 18)),
+            env,
+            "recorded beside the build for the verbs that hold no manifest"
+        );
+        #[cfg(unix)]
+        {
+            let body = std::fs::read_to_string(&shim).unwrap();
+            assert!(
+                body.contains("\nexport DISABLE_AUTOUPDATER='1'\nexec '"),
+                "the export precedes the exec: {body}"
+            );
+        }
+        // The rollback verb's path re-lays the PRIOR build's shims from ITS sidecar: a
+        // newer build without the key flips live, then rolls back — the env returns.
+        let b19 = bare_build(&l, "ay", 19, &["ay"]);
+        crate::shim_env::write_sidecar(&b19, &crate::shim_env::ShimEnv::NONE).unwrap();
+        activate_channel(&l, "stable", &b19).unwrap();
+        install_tools(&l, &b19, &[tool("ay")], Aliases::Off).unwrap();
+        assert_eq!(
+            crate::platform::shim_env_of(&shim),
+            crate::shim_env::ShimEnv::NONE,
+            "19 declares no env"
+        );
+        let staged = Staged {
+            build: 19,
+            build_dir: b19,
+            exposes: vec![tool("ay")],
+            prior_build: Some(18),
+            was_live: false,
+            reloc: None,
+            tree_root: String::new(),
+            aliases: Aliases::Off,
+        };
+        rollback_member(&l, "stable", "ay", &staged);
+        assert!(
+            crate::platform::resolve_shim(&shim)
+                .is_some_and(|t| t.starts_with(l.build_dir("ay", 18)))
+        );
+        assert_eq!(
+            crate::platform::shim_env_of(&shim).spelled(),
+            "DISABLE_AUTOUPDATER=1",
+            "the prior build's env, from its sidecar"
+        );
+        // The sidecar goes with the tree.
+        crate::store::discard_build(&l.build_dir("ay", 18));
+        assert_eq!(
+            crate::shim_env::read_sidecar(&l.build_dir("ay", 18)),
+            crate::shim_env::ShimEnv::NONE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A `shim_env` the rule refuses: refused at parse, by name, nothing staged.
+        let bdir = scratch("shim-env-refused");
+        let bad = with_env(&bdir, "[\"PATH=/evil\"]");
+        let served = bad.archives["ay-18.tar.zst"].clone();
+        let bl = layout(&bdir);
+        let err = install(
+            &VendorFake { inner: bad, served },
+            &bl,
+            &anchor(),
+            &req,
+            fl(0),
+            0,
+        )
+        .unwrap_err();
+        match &err {
+            FlowError::ShimEnv(why) => assert!(why.contains("PATH=/evil"), "{why}"),
+            other => panic!("expected ShimEnv, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("manifest refused: shim_env entry"),
+            "{err}"
+        );
+        assert!(
+            !bl.staging_dir("ay").exists(),
+            "refused before any byte moved"
+        );
+        assert!(crate::ops::which(&bl, "ay").is_none());
+        let _ = std::fs::remove_dir_all(&bdir);
     }
 
     /// The retired `kind = "vendor-fetch"` spelling is refused at PARSE — the flow sees
@@ -5569,9 +5836,13 @@ mod tests {
             "PRECONDITION: ay@18 is installed and complete"
         );
 
-        // 2. `atpkg unlink`-shaped state: ay's shim is gone, so the SHIM view is silent for
-        //    ay — while the authority link still names ay@18 as live.
+        // 2. `atpkg unlink`-shaped state: ay's shims are gone — the primary AND the
+        //    `alab-ay` alias the flip laid beside it (ay is ALab's own in this index), since
+        //    the alias resolves into the same build and would keep the shim view talking —
+        //    so the SHIM view is silent for ay while the authority link still names ay@18
+        //    as live.
         std::fs::remove_file(layout.shim(&tool("ay"))).unwrap();
+        std::fs::remove_file(layout.shim(&tool("alab-ay"))).unwrap();
         assert!(
             !crate::ops::active_builds(&layout).contains_key("ay"),
             "PRECONDITION: the shim view no longer knows ay — `decide` will re-Install 18"
@@ -5644,7 +5915,13 @@ mod tests {
         )
         .unwrap();
         if activate {
-            crate::activate::install_shims(layout, &dir, &[program.to_string()]).unwrap();
+            crate::activate::install_shims(
+                layout,
+                &dir,
+                &[program.to_string()],
+                crate::activate::Aliases::Off,
+            )
+            .unwrap();
             activate_channel(layout, "stable", &dir).unwrap();
         }
         crate::store::mark_build_ready(&dir).unwrap();
@@ -6088,6 +6365,15 @@ mod tests {
             std::fs::read_link(layout.channel_current("stable")).unwrap(),
             layout.build_dir("ay", 17)
         );
+        // The rollback VERB reads the alias policy off the index it just verified — ay is
+        // listed with no `system` and no `extra`, so `alab-ay` stands beside the restored
+        // `ay`, pointing where it points (the fixture seeded 18 without one; the pass
+        // would have laid it since).
+        assert_eq!(
+            crate::ops::which(&layout, "alab-ay"),
+            crate::ops::which(&layout, "ay"),
+            "the alias is restored with its primary"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6283,6 +6569,100 @@ mod tests {
         }
     }
 
+    /// THE UPDATE LANE IS GATED TOO (§17.10): `ay` requires `ny`; ay is installed at an
+    /// old build and ny is not installed at all (uninstalled, or never there). The pass
+    /// holds ay on its current build — `TxnOutcome::Blocked` naming ny and quoting its
+    /// state — and resolves nothing for it: no artifact selected, no byte staged. Once ny
+    /// is live, the same pass shape moves ay to its pin. The update lane never installs a
+    /// MISSING dependency itself (that is the set-completion pass's job), so ny's own
+    /// group is simply not an update.
+    #[test]
+    fn apply_channel_holds_an_installed_dependent_whose_requirement_is_unmet() {
+        let dir = scratch("update-gate");
+        // The edge rides the INDEX (`[programs.ay].requires`) — the relation the plan
+        // and the gate read, known before any manifest is fetched — not the pkg
+        // manifest's own `requires`, which `install` unions in at install time.
+        let fake = requires_fixture(&dir, &[], &[], &[]);
+        let index_body = String::from_utf8(fake.index.clone()).unwrap().replace(
+            "[programs.ay]\nrepo = \"ay\"\n",
+            "[programs.ay]\nrepo = \"ay\"\nrequires = [\"ny\"]\n",
+        );
+        assert!(index_body.contains("requires = [\"ny\"]"), "{index_body}");
+        let fake = Fake {
+            index: index_body.clone().into_bytes(),
+            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
+            pkg: fake.pkg,
+            archives: fake.archives,
+        };
+        let layout = layout(&dir);
+        seed_build(&layout, "ay", 17, true);
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            report.groups.len(),
+            1,
+            "ny is not installed, so it is not an update: {:?}",
+            report.groups
+        );
+        let (group, outcome) = &report.groups[0];
+        assert_eq!(group.members, vec!["ay".to_string()]);
+        assert_eq!(
+            *outcome,
+            TxnOutcome::Blocked {
+                dep: "ny".into(),
+                dep_state: "not installed".into()
+            }
+        );
+        assert!(report.applied.is_empty(), "nothing flipped");
+        assert!(
+            !report.resolved_assets.contains_key("ay"),
+            "nothing resolved for a held group"
+        );
+        assert!(!layout.build_dir("ay", 18).exists(), "nothing staged");
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("ay").copied(),
+            Some(17),
+            "held on its current build"
+        );
+        // The requirement met: the dependent moves.
+        seed_build(&layout, "ny", 9, true);
+        let installed = crate::ops::active_builds(&layout);
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        let ay = report
+            .groups
+            .iter()
+            .find(|(g, _)| g.members == vec!["ay".to_string()])
+            .expect("ay's group");
+        assert_eq!(ay.1, TxnOutcome::Applied(vec!["ay".into()]));
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("ay").copied(),
+            Some(18)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn requires_pulls_in_missing_dep() {
         let dir = scratch("req-pull");
@@ -6367,6 +6747,19 @@ mod tests {
             report.dependencies
         );
         assert!(crate::ops::which(&layout, "ny").is_some());
+        // The alias policy through the REAL pipeline (§17.11): ay is ALab's own (no
+        // `system`, not an extra) and gets `alab-ay` beside `ay`; ny is a vendor EXTRA
+        // and never gets one — even though it is installed through the same lane.
+        assert!(
+            crate::ops::which(&layout, "alab-ay")
+                .is_some_and(|t| t.starts_with(layout.build_dir("ay", 18))),
+            "an ALab program's alias is laid by the install"
+        );
+        assert!(
+            std::fs::symlink_metadata(layout.shim(&tool("alab-ny"))).is_err(),
+            "no alias for a vendor extra"
+        );
+        assert_eq!(Aliases::laid_for(&layout, "ny"), Aliases::Off);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7032,9 +7425,9 @@ mod tests {
         let b19 = bare_build(&l, "ay", 19, &["ay"]);
         // 18 live with both tools, then the flip to 19 prunes aylint's stale shim.
         activate_channel(&l, "stable", &b18).unwrap();
-        install_tools(&l, &b18, &[tool("ay"), tool("aylint")]).unwrap();
+        install_tools(&l, &b18, &[tool("ay"), tool("aylint")], Aliases::Off).unwrap();
         activate_channel(&l, "stable", &b19).unwrap();
-        install_tools(&l, &b19, &[tool("ay")]).unwrap();
+        install_tools(&l, &b19, &[tool("ay")], Aliases::Off).unwrap();
         assert!(
             crate::platform::resolve_shim(&l.shim(&tool("aylint"))).is_none(),
             "fixture: the prune removed the dropped tool's shim"
@@ -7047,6 +7440,7 @@ mod tests {
             prior_build: Some(18),
             was_live: false,
             reloc: None,
+            aliases: Aliases::Off,
             tree_root: String::new(),
         };
         rollback_member(&l, "stable", "ay", &staged);
@@ -7058,6 +7452,90 @@ mod tests {
                 target.starts_with(&b18),
                 "{t} points into the prior build: {}",
                 target.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ALIASES RIDE WITH THEIR PRIMARY through the transaction's other exits: a rollback
+    /// re-points `alab-<tool>` at the prior build beside `<tool>` (and drops the alias of
+    /// a tool the prior build lacks), a fresh-install rollback removes it, and a
+    /// tombstone disables it — a revoked build must not stay runnable under its other
+    /// name.
+    #[test]
+    fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
+        let dir = scratch("rb-alias");
+        let l = layout(&dir);
+        let b18 = bare_build(&l, "ay", 18, &["ay"]);
+        let b19 = bare_build(&l, "ay", 19, &["ay", "aynew"]);
+        activate_channel(&l, "stable", &b18).unwrap();
+        install_tools(&l, &b18, &[tool("ay")], Aliases::Alab).unwrap();
+        activate_channel(&l, "stable", &b19).unwrap();
+        install_tools(&l, &b19, &[tool("ay"), tool("aynew")], Aliases::Alab).unwrap();
+        for t in ["ay", "aynew", "alab-ay", "alab-aynew"] {
+            assert!(
+                crate::platform::resolve_shim(&l.shim(&tool(t)))
+                    .is_some_and(|p| p.starts_with(&b19)),
+                "fixture: {t} points into 19"
+            );
+        }
+        let staged = Staged {
+            build: 19,
+            build_dir: b19.clone(),
+            exposes: vec![tool("ay"), tool("aynew")],
+            prior_build: Some(18),
+            was_live: false,
+            reloc: None,
+            tree_root: String::new(),
+            aliases: Aliases::Alab,
+        };
+        rollback_member(&l, "stable", "ay", &staged);
+        for t in ["ay", "alab-ay"] {
+            let target = crate::platform::resolve_shim(&l.shim(&tool(t)))
+                .unwrap_or_else(|| panic!("{t} is restored by the rollback"));
+            assert!(target.starts_with(&b18), "{t} points into the prior build");
+        }
+        assert_eq!(
+            crate::platform::resolve_shim(&l.shim(&tool("alab-ay"))),
+            crate::platform::resolve_shim(&l.shim(&tool("ay"))),
+            "the alias and its primary agree"
+        );
+        for t in ["aynew", "alab-aynew"] {
+            assert!(
+                std::fs::symlink_metadata(l.shim(&tool(t))).is_err(),
+                "{t}: a tool the prior build lacks loses its shim AND its alias"
+            );
+        }
+        // The rollback VERB reads the policy off the disk: aliases laid ⇒ kept.
+        assert_eq!(Aliases::laid_for(&l, "ay"), Aliases::Alab);
+
+        // A fresh install's rollback removes the alias with the primary.
+        let fresh = Staged {
+            build: 19,
+            build_dir: b19,
+            exposes: vec![tool("ay")],
+            prior_build: None,
+            was_live: false,
+            reloc: None,
+            tree_root: String::new(),
+            aliases: Aliases::Alab,
+        };
+        rollback_member(&l, "stable", "ay", &fresh);
+        assert!(std::fs::symlink_metadata(l.shim(&tool("ay"))).is_err());
+        assert!(std::fs::symlink_metadata(l.shim(&tool("alab-ay"))).is_err());
+
+        // Tombstoning a revoked build disables the alias too.
+        install_tools(&l, &b18, &[tool("ay")], Aliases::Alab).unwrap();
+        install_tombstone_shims(&l, "ay", Some(18));
+        for t in ["ay", "alab-ay"] {
+            let shim = l.shim(&tool(t));
+            assert!(
+                std::fs::symlink_metadata(&shim).is_ok_and(|m| m.file_type().is_file()),
+                "{t} is a tombstone file"
+            );
+            assert!(
+                crate::platform::resolve_shim(&shim).is_none(),
+                "{t} no longer forwards anywhere"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -7076,7 +7554,7 @@ mod tests {
         let b18 = bare_build(&l, "ay", 18, &["ay"]);
         let b19 = bare_build(&l, "ay", 19, &["ay"]);
         activate_channel(&l, "stable", &b18).unwrap();
-        install_tools(&l, &b18, &[tool("ay")]).unwrap();
+        install_tools(&l, &b18, &[tool("ay")], Aliases::Off).unwrap();
         // Make the CHANNEL half fail strictly after the witness half: a regular FILE where
         // the channel DIRECTORY must go, so `ensure_private_dir(channels/beta)` errs.
         std::fs::create_dir_all(l.prefix.join("channels")).unwrap();
@@ -7089,6 +7567,7 @@ mod tests {
             prior_build: Some(18),
             was_live: false,
             reloc: None,
+            aliases: Aliases::Off,
             tree_root: String::new(),
         };
         assert!(
@@ -7121,6 +7600,7 @@ mod tests {
             prior_build: None,
             was_live: false,
             reloc: None,
+            aliases: Aliases::Off,
             tree_root: String::new(),
         };
         assert!(!flip_member(&l, "beta", "ay", &staged));

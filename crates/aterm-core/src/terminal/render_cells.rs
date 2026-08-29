@@ -113,10 +113,24 @@ pub struct RenderCell {
     pub underline: UnderlineStyle,
     /// Strikethrough (SGR 9): a line through the cell middle, in `fg`.
     pub strikethrough: bool,
-    /// Overline (SGR 53): a line along the cell top, in `fg`.
+    /// Overline (SGR 53): a line along the cell top, drawn in
+    /// [`overline_color`](RenderCell::overline_color) (or [`fg`](RenderCell::fg)).
     pub overline: bool,
     /// SGR 58 underline colour, when set; otherwise the underline uses `fg`.
     pub underline_color: Option<[u8; 3]>,
+    /// Overline colour, when set; otherwise the overline uses `fg`.
+    ///
+    /// A CHROME-ONLY channel, and deliberately so: ECMA-48 assigns 53/55 for
+    /// the overline itself and NOTHING for its colour, and the one colour
+    /// extension the terminal world actually agreed on — SGR 58/59 — is the
+    /// UNDERLINE's (kitty's, adopted by VTE/iTerm2/Windows Terminal). Inventing
+    /// an escape for this would mint a private sequence no other terminal
+    /// answers to, so nothing in the SGR path or the grid's cell storage feeds
+    /// this field: [`Terminal::render_row`] always leaves it `None`. What it
+    /// exists for is aterm's OWN row builders (the chrome bands), where an
+    /// overline is a structural SEAM rather than a rendition — a rule that must
+    /// hold one tone across a row whose cells carry different inks.
+    pub overline_color: Option<[u8; 3]>,
 }
 
 /// A blank cell in the DOCUMENTED empty shape — `ch` is `' '`, not the `'\0'`
@@ -140,6 +154,7 @@ impl Default for RenderCell {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 }
@@ -177,6 +192,7 @@ impl Terminal {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 
@@ -451,6 +467,10 @@ impl Terminal {
                 strikethrough,
                 overline,
                 underline_color,
+                // No escape sequence can set this: the overline colour channel
+                // is aterm's own chrome seam, never a rendition a program may
+                // ask for (see `RenderCell::overline_color`).
+                overline_color: None,
             });
 
             // Emoji-cluster / combining-mark extraction, folded in from
@@ -635,16 +655,45 @@ impl Terminal {
             return;
         };
         let grid = self.grid();
+        let offset = grid.display_offset();
+        if usize::from(visible_row) < offset {
+            // SCROLLED-BACK row: the picture is no longer in the live extras map
+            // — it left with its row and now rides the history line's image
+            // spans, which the materializer expands back into per-cell
+            // `ImageRef`s. Read it there, or a scrolled-back image is a hole.
+            //
+            // Kitty Unicode PLACEHOLDER cells are deliberately not resolved for
+            // a history row (same rule as the batch fill, which this is the
+            // parity oracle for): `placeholder_image_ref` reads the LIVE grid's
+            // `resolved_char`, which is not this row's.
+            if let aterm_grid::VisibleRowView::History { mat } = grid.visible_row_view(visible_row)
+            {
+                let cols = grid.cols();
+                for (col, extra) in mat.extras_iter() {
+                    if col < cols
+                        && let Some(image) = extra.image()
+                    {
+                        out.push((col as usize, image.clone()));
+                    }
+                }
+                out.sort_unstable_by_key(|&(col, _)| col);
+            }
+            return;
+        }
         // Fast path: with no extras anywhere there are no image cells, so the
         // common case (plain text) pays a single bool check.
         if grid.extras().is_empty() {
             return;
         }
+        // The live extras map is keyed by the SCREEN row; at a scrolled viewport
+        // the live rows sit `display_offset` slots lower on screen. Identity
+        // when not scrolled.
+        let screen_row = visible_row.saturating_sub(u16::try_from(offset).unwrap_or(u16::MAX));
         // Scan the FULL grid width, not `grid_row.len()`: an image cell carries
         // only an extra (no glyph), so the row may not be materialized to full
         // width — `Row::len()` can be 0 while the image extras live in the extras
         // map. `cell_extra` reads that map directly, independent of materialization.
-        if visible_row >= grid.rows() {
+        if screen_row >= grid.rows() {
             return;
         }
         // A Kitty Unicode placeholder can only resolve to a stored image, and
@@ -655,13 +704,13 @@ impl Terminal {
         // behaviour-identical.
         let has_kitty = !self.transient.kitty_images.is_empty();
         for col in 0..grid.cols() {
-            let Some(extra) = grid.cell_extra(visible_row, col) else {
+            let Some(extra) = grid.cell_extra(screen_row, col) else {
                 continue;
             };
             if let Some(image) = extra.image() {
                 out.push((col as usize, image.clone()));
             } else if has_kitty
-                && let Some(iref) = self.placeholder_image_ref(visible_row, col, extra)
+                && let Some(iref) = self.placeholder_image_ref(screen_row, col, extra)
             {
                 // Kitty Unicode placeholder cell: synthesize an ImageRef so it rides
                 // the same (pixel-tested) render path as a direct placement.
@@ -695,15 +744,48 @@ impl Terminal {
             row.clear();
         }
         let grid = self.grid();
-        // Fast path: with no extras anywhere there are no image cells, so the
-        // common case (plain text) pays a single bool check.
+        let offset = grid.display_offset();
+        // SCROLLED-BACK rows first: viewport rows `0..display_offset` are
+        // history, and their pictures are no longer in the live extras map —
+        // they left with their rows and now ride the history lines' image spans.
+        // Each row's materialization is memoized (`viewport_row_cache`), and
+        // `extras_iter` costs the entries that exist rather than `cols` probes.
+        //
+        // Kitty Unicode PLACEHOLDER cells are deliberately not resolved here:
+        // `placeholder_image_ref` reads the live grid's `resolved_char`, which is
+        // not the history row's, and the placeholder protocol has its own
+        // history story. Direct placements — OSC 1337 and sixel — are what this
+        // path restores.
+        for r in 0..rows.min(offset) {
+            let Ok(visible_row) = u16::try_from(r) else {
+                break;
+            };
+            if let aterm_grid::VisibleRowView::History { mat } = grid.visible_row_view(visible_row)
+            {
+                let cols = grid.cols();
+                for (col, extra) in mat.extras_iter() {
+                    if col < cols
+                        && let Some(image) = extra.image()
+                    {
+                        images[r].push((usize::from(col), image.clone()));
+                    }
+                }
+            }
+        }
+        // Fast path: with no extras anywhere there are no LIVE image cells, so
+        // the common case (plain text) pays a single bool check.
         if grid.extras().is_empty() {
+            for row in images.iter_mut() {
+                row.sort_unstable_by_key(|&(col, _)| col);
+            }
             return;
         }
         // `iter()` yields external coordinates with stale (scrolled-off)
-        // entries already filtered; clamp to both the caller's `rows` and the
-        // grid's own extent (they can differ during a resize).
-        let max_row = rows.min(usize::from(grid.rows()));
+        // entries already filtered; clamp the SCREEN row to the grid's extent
+        // and the VIEWPORT row to the caller's `rows` (they can differ during a
+        // resize, and by `display_offset` while scrolled back). The two bounds
+        // coincide when the viewport is at the bottom.
+        let max_screen_row = usize::from(grid.rows());
         // With no transmitted Kitty images, `placeholder_image_ref` is provably
         // `None` for every entry (its only `Some` return threads through
         // `self.transient.kitty_images.get(&image_id)?`), so the whole
@@ -714,8 +796,12 @@ impl Terminal {
         // this borrow is live, so the emitted rows are byte-identical.
         let has_kitty = !self.transient.kitty_images.is_empty();
         for (coord, extra) in grid.extras().iter() {
-            let r = usize::from(coord.row);
-            if r >= max_row || coord.col >= grid.cols() {
+            // The map is keyed by SCREEN row; at a scrolled viewport a live row
+            // sits `display_offset` slots lower on screen (identity at 0).
+            let Some(r) = usize::from(coord.row).checked_add(offset) else {
+                continue;
+            };
+            if usize::from(coord.row) >= max_screen_row || r >= rows || coord.col >= grid.cols() {
                 continue;
             }
             if let Some(image) = extra.image() {
@@ -1308,6 +1394,11 @@ impl Terminal {
         // cell write bumps `snapshot_seq` alone and thereby disowns the lane.
         scratch.row_shift = 0;
         scratch.shifted_fill_seq = scratch.snapshot_seq;
+        // K2: an engine fill is the one thing a COMPOSITE is not — these cells
+        // came from one terminal's grid, not from a compositor's pane
+        // rectangles — so a retention ledger describing a previous composed
+        // frame in this reused buffer is disowned here, unconditionally.
+        scratch.composed_fill_seq = 0;
 
         // D-2 PER-ROW REVISION LANE. The grid already knows which rows changed;
         // publish that fact instead of letting every consumer re-derive it by
@@ -1740,6 +1831,51 @@ mod tests {
             total += got.len();
         }
         assert!(total > 0, "the frame must actually contain image cells");
+    }
+
+    /// The same batch-vs-per-row parity, with the viewport SCROLLED BACK over
+    /// the image. The two readers take different routes for a history row — the
+    /// batch loop walks the materialized row's sparse extras, the per-row
+    /// accessor probes it — and a divergence there is a picture that appears in
+    /// one code path and not the other.
+    #[test]
+    fn images_frame_into_matches_per_row_while_scrolled_back() {
+        let mut term = Terminal::new(8, 20);
+        let b64 = aterm_codec::base64::encode(b"not-a-real-png").expect("encode");
+        let mut seq = b"\x1b]1337;File=inline=1;width=3;height=2:".to_vec();
+        seq.extend_from_slice(b64.as_bytes());
+        seq.extend_from_slice(b"\x1b\\");
+        term.process(&seq);
+        for i in 0..30 {
+            term.process(format!("f{i}\r\n").as_bytes());
+        }
+        term.scroll_to_top();
+
+        let rows = usize::from(term.grid().rows());
+        let mut batch: Vec<Vec<(usize, aterm_grid::ImageRef)>> = Vec::new();
+        term.images_frame_into(&mut batch, rows);
+        let mut total = 0usize;
+        for (r, got) in batch.iter().enumerate() {
+            let want = term.images_row(r);
+            assert_eq!(got.len(), want.len(), "row {r} entry count");
+            for ((gc, gi), (wc, wi)) in got.iter().zip(&want) {
+                assert_eq!(gc, wc, "row {r} column order");
+                assert!(
+                    std::sync::Arc::ptr_eq(&gi.image, &wi.image),
+                    "row {r} image identity"
+                );
+                assert_eq!(
+                    (gi.cell_row, gi.cell_col),
+                    (wi.cell_row, wi.cell_col),
+                    "row {r} tile coordinates"
+                );
+            }
+            total += got.len();
+        }
+        assert_eq!(
+            total, 6,
+            "the scrolled-back 3x2 footprint must be fully present in BOTH readers"
+        );
     }
 
     #[test]

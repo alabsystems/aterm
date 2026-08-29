@@ -63,7 +63,9 @@ mod control_query;
 // Re-export the two query serializers that out-of-module callers reach through
 // the stable `crate::control::NAME` path (`crate::subscribe`), so the path keeps
 // resolving after the move.
-pub(crate) use control_query::{gather_styled_frame, serialize_styled_frame, visible_row};
+pub(crate) use control_query::{
+    gather_styled_frame, serialize_styled_frame, trimmed_len, visible_row,
+};
 // The shared full-history search (the GUI ⌘F find + the `search` verb both call it) and
 // its config-driven index depth cap, reached through the stable `crate::control::NAME`
 // path from `app_search`/`app_config`/`main`.
@@ -162,6 +164,10 @@ pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_get_owned, primar
 /// points at it.
 #[path = "control_media.rs"]
 mod control_media;
+/// The aimed-spawn target (design S3) crosses the module seam: the control
+/// thread builds it in `control_media::cmd_spawn`, the event loop carries it
+/// in `Wake::SpawnSession`, so the root needs the name.
+pub(crate) use control_media::SpawnAim;
 // Re-export `image_payload`: `control_query::styled_image_json` reaches it through
 // `super::image_payload`, which now resolves to this sibling module's serializer.
 pub(crate) use control_media::image_payload;
@@ -401,6 +407,59 @@ fn sessionless_front_paste_event(
             NativeControlDecision::ResolveSession
             | NativeControlDecision::NoActiveTerminal
             | NativeControlDecision::NoSuchSession => Err("ERR invalid control target\n"),
+        },
+    )
+}
+
+/// The lane an AIMED `spawn`/`tab` takes (`@<sid> spawn …`, `@<sid> tab …`,
+/// design S3). `None` = not an aimed spawn/tab: the flagless and `@.` forms
+/// keep the ordinary App lane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AimedAppLane {
+    /// Owner: the selector survives to the session resolver, which hands the
+    /// resolved session to `handle`'s arms (`cmd_spawn(.., Some(session))` /
+    /// `cmd_tab_aimed`). A dead sid still answers `ERR no such session`, from
+    /// there.
+    ResolveSession,
+    /// Edge: `ERR denied`, BEFORE the sid is looked up — an unauthorised
+    /// caller learns nothing about which sessions exist.
+    Denied,
+}
+
+/// Classify an aimed `spawn`/`tab`. The selector is the verb's ARGUMENT — "the
+/// window hosting `<sid>`" — not instance routing, so for an Owner it must
+/// survive to the session resolver: the ordinary App lane validates every
+/// selector as live and then DROPS it (`WithoutSession`), and the aimed forms
+/// silently degraded to the flagless ones (measured on a headless instance:
+/// `@<sid> spawn` answered `OK` where `ERR headless` was owed).
+///
+/// The authority verdict does NOT travel with the routing. An Edge is refused
+/// here by the same [`native_control_decision`] App verdict every other
+/// App-target selector gets (Tier-1 pins `edge_app_allowed = 0`), not by a
+/// parallel control-only allowlist. Letting the selector through unjudged
+/// handed the request to the session resolver, whose only remaining gate is
+/// the verb's op — `WriteInput` — so an edge holding a write-input grant on
+/// ONE session could mint a fresh shell tab in, or `tab close <N>` any tab of,
+/// the window hosting that session: tabs it holds no authority over
+/// (measured: `TOKEN <hex> @0 spawn raise=maybe` answered the usage line, i.e.
+/// the handler ran under Edge scope, where `TOKEN <hex> @0 hover on` answered
+/// `ERR denied`). The non-App verdicts cannot arise for `App`; they fail
+/// closed.
+fn aimed_app_lane(
+    verb: &str,
+    selector: Option<&Selector>,
+    principal: NativeControlPrincipal,
+) -> Option<AimedAppLane> {
+    if !matches!(verb, "spawn" | "tab") || matches!(selector, None | Some(Selector::SelfTok)) {
+        return None;
+    }
+    Some(
+        match native_control_decision(false, true, principal, NativeControlTarget::App) {
+            NativeControlDecision::WithoutSession => AimedAppLane::ResolveSession,
+            NativeControlDecision::Denied
+            | NativeControlDecision::ResolveSession
+            | NativeControlDecision::NoActiveTerminal
+            | NativeControlDecision::NoSuchSession => AimedAppLane::Denied,
         },
     )
 }
@@ -663,13 +722,70 @@ fn scope_holds_escalation(scope: Scope, need: Escalation, ctx: &SessionCtx) -> b
 /// inert, so this reports `enabled=false`. The source is `Source::resolve(None, None)`
 /// (env + compiled default); a GUI `[update]` owner/repo override is not applied to a
 /// manual check.
-/// `help` / `verbs` — the self-describing protocol catalog: a server-authoritative
-/// list of every verb this BUILD supports, its args, and the reply framing, so an AI
-/// (or human) can discover the whole introspection interface from a running instance
-/// without external docs. Non-sensitive global provenance like `version`, answered for
-/// any authenticated scope before target resolution. Keep in sync with the dispatch
-/// match + `aterm-ctl --help`.
-fn cmd_help() -> String {
+/// `help [<verb> | --full]` (alias `verbs`) — the self-describing protocol catalog,
+/// a server-authoritative list of every verb this BUILD supports, its args, and the
+/// reply framing, so an AI (or human) can discover the whole introspection interface
+/// from a running instance without external docs. Non-sensitive global provenance
+/// like `version`, answered for any authenticated scope before target resolution.
+///
+/// Three forms, all generated from the one VERBS table in aterm-types so none can
+/// drift from the protocol. Bare: the SHORT catalog — a three-line header and one
+/// first-sentence row per verb, under `SHORT_CATALOG_MAX_BYTES`, because with one
+/// form an agent paid the whole `image`/`video`/`metrics` detail on every cold start
+/// just to find `text`. `help <verb>`: that verb's full entry, wrapped. `help --full`:
+/// the complete catalog under the full protocol header, pinned byte-for-byte to a
+/// generated golden for anyone piping it: the header and every row read as the bare
+/// form printed before the split, except the six rows (`help`, `verbs`, `status`,
+/// `turn`, `lease`, `trail`) deliberately reworded so their first sentence fits a
+/// summary — same content, regenerated on purpose.
+/// Anything else is `ERR usage` — a `help` that ignored its argument is exactly how
+/// `help image` came back as the whole catalog.
+fn cmd_help(rest: &str) -> String {
+    use aterm_types::control_verbs::{JSON_CAPABLE_VERBS, catalog_lines, spec};
+    let tail = rest.trim();
+    if tail == "--full" {
+        return cmd_help_full();
+    }
+    if tail.starts_with('-') || tail.contains(char::is_whitespace) {
+        return "ERR usage: help [<verb> | --full]\n".to_string();
+    }
+    if !tail.is_empty() {
+        return match spec(tail) {
+            Some(s) => {
+                let lines = s.entry_lines();
+                let mut body = format!("OK {}\n", lines.len());
+                for line in lines {
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+                body
+            }
+            None => format!("ERR unknown verb '{tail}' (help lists them)\n"),
+        };
+    }
+    // The short form: framing (so EMPTY content is read as no data, never an error),
+    // the `--json` set (generated, like the full header's — a retyped list drifts),
+    // the way to the other two forms, then one summary row per verb.
+    let json_verbs = JSON_CAPABLE_VERBS.join("/");
+    let mut body = format!(
+        "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines; \
+         EMPTY content = no data, never an error\n\
+         # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = run it on that session\n\
+         # help <verb> = the full entry · help --full = the complete catalog\n"
+    );
+    for line in catalog_lines() {
+        body.push_str(&line);
+        body.push('\n');
+    }
+    let n = body.lines().count();
+    format!("OK {n} aterm introspection protocol v1\n{body}")
+}
+
+/// `help --full`: the complete catalog under the full protocol header — the bare
+/// `help` reply's shape from before the short form existed (header verbatim, every
+/// row's full entry), pinned to a golden so a pipeline built on it sees a change
+/// only when a row is reworded on purpose.
+fn cmd_help_full() -> String {
     // Emitted as "OK <count> …\n" + <count> body lines so aterm-ctl STREAMS the whole
     // catalog like other list verbs (controls/edges/sessions), not just the header.
     // Raw string: contains no `"#` sequence. One entry per line so it is greppable.
@@ -723,7 +839,7 @@ fn cmd_help() -> String {
 "#
     );
     let mut body = String::from(header);
-    for line in aterm_types::control_verbs::catalog_lines() {
+    for line in aterm_types::control_verbs::catalog_lines_full() {
         body.push_str(&line);
         body.push('\n');
     }
@@ -733,9 +849,14 @@ fn cmd_help() -> String {
 
 #[cfg(test)]
 mod help_tests {
+    use aterm_types::control_verbs::{
+        CATALOG_TEXT_COLUMN, ENTRY_WRAP_COLUMNS, SHORT_CATALOG_MAX_BYTES, VERBS, catalog_lines,
+        spec,
+    };
+
     #[test]
     fn help_catalog_is_well_formed_and_lists_core_verbs() {
-        let h = super::cmd_help();
+        let h = super::cmd_help("");
         assert!(h.starts_with("OK "), "help must be an OK status reply");
         for v in [
             "version", "update", "help", "text", "screen", "cell", "cursor", "image", "window",
@@ -755,6 +876,9 @@ mod help_tests {
             h.contains("resize <r> <c>") && !h.contains("resize <c> <r>"),
             "resize catalog axis order must be rows-first (match parse_resize + dims + cell)"
         );
+        // The native tab-app entry points live in the FULL header (the short form
+        // points at `help --full` for them).
+        let h = super::cmd_help("--full");
         assert!(
             h.contains("open app settings /about")
                 && h.contains("open app settings /updates")
@@ -764,6 +888,148 @@ mod help_tests {
                 && h.contains("act app/v1 view <id> <key> <action> [value]"),
             "help must make every native tab-app entry point discoverable"
         );
+    }
+
+    /// The short form is what a cold-start agent reads to find its verb: bounded in
+    /// bytes (computed, not recalled), three `#` header lines that name the other two
+    /// forms, then exactly the table's summary rows — nothing hand-typed to drift.
+    #[test]
+    fn help_short_form_is_bounded_and_is_the_summary_catalog() {
+        let h = super::cmd_help("");
+        assert!(
+            h.len() <= SHORT_CATALOG_MAX_BYTES,
+            "short help is {} bytes, over the {SHORT_CATALOG_MAX_BYTES} budget",
+            h.len()
+        );
+        let mut lines = h.lines();
+        let status = lines.next().unwrap();
+        assert_eq!(
+            status,
+            format!("OK {} aterm introspection protocol v1", VERBS.len() + 3)
+        );
+        let header: Vec<&str> = lines.clone().take(3).collect();
+        assert!(header.iter().all(|l| l.starts_with("# ")), "{header:?}");
+        assert!(header[0].contains("EMPTY"), "framing line: {}", header[0]);
+        assert!(header[1].contains("--json"), "json line: {}", header[1]);
+        assert_eq!(
+            header[2],
+            "# help <verb> = the full entry · help --full = the complete catalog"
+        );
+        let rows: Vec<&str> = lines.skip(3).collect();
+        let want: Vec<String> = catalog_lines().collect();
+        assert_eq!(rows, want, "the rows are exactly the table's summary rows");
+        // No row carries the detail: the short form must not quietly grow back.
+        assert!(
+            !h.contains("image --meta"),
+            "a full entry leaked into the short form"
+        );
+        // Same reply for the alias tail spellings the dispatch hands over.
+        assert_eq!(super::cmd_help("  "), h);
+    }
+
+    /// `help <verb>`: `OK <n>` + that verb's full entry, wrapped at the entry width
+    /// with every continuation row indented to the text column — deterministic, and
+    /// lossless against the verb's `help_line`. Whitespace around the name is
+    /// tolerated; a one-row verb is exactly its full-catalog row.
+    #[test]
+    fn help_verb_form_is_the_wrapped_full_entry() {
+        let h = super::cmd_help("image");
+        let mut lines = h.lines();
+        let status = lines.next().unwrap();
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(status, format!("OK {}", rows.len()));
+        assert!(rows.len() > 5, "image's entry must wrap into several rows");
+        assert!(rows[0].starts_with("image                        image [path] : "));
+        let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
+        for row in &rows[1..] {
+            assert!(
+                row.starts_with(&gutter),
+                "continuation row not indented: {row:?}"
+            );
+        }
+        for row in &rows {
+            assert!(
+                row.chars().count() <= ENTRY_WRAP_COLUMNS,
+                "row wider than {ENTRY_WRAP_COLUMNS}: {row:?}"
+            );
+        }
+        let joined: Vec<&str> = std::iter::once(&rows[0][CATALOG_TEXT_COLUMN..])
+            .chain(rows[1..].iter().map(|r| &r[CATALOG_TEXT_COLUMN..]))
+            .collect();
+        assert_eq!(joined.join(" "), spec("image").unwrap().help_line());
+        assert_eq!(super::cmd_help(" image "), h, "the tail is trimmed");
+        assert_eq!(super::cmd_help("image"), h, "deterministic");
+        assert_eq!(
+            super::cmd_help("lines"),
+            "OK 1\nlines                        OK <scrollback-line-count>\n"
+        );
+        // The table's own rows describe the three forms.
+        let own = super::cmd_help("help");
+        assert!(
+            own.contains("help <verb>") && own.contains("help --full"),
+            "{own}"
+        );
+    }
+
+    /// An unknown verb is named back (with the way to the list); a flag other than
+    /// `--full`, or more than one token, is a usage error spelling the synopsis —
+    /// never silently the whole catalog, which is what `help image` used to get.
+    #[test]
+    fn help_rejects_unknown_verbs_and_bad_tails() {
+        assert_eq!(
+            super::cmd_help("nosuch"),
+            "ERR unknown verb 'nosuch' (help lists them)\n"
+        );
+        for tail in ["--json", "-h", "image --full", "--full image", "a b"] {
+            assert_eq!(
+                super::cmd_help(tail),
+                "ERR usage: help [<verb> | --full]\n",
+                "tail {tail:?}"
+            );
+        }
+    }
+
+    /// `help --full` is a wire surface people pipe, pinned byte-for-byte to a
+    /// GENERATED fixture: first captured from `cmd_help()` BEFORE the catalog grew
+    /// its short/verb forms, then regenerated ON PURPOSE once the split reworded
+    /// six rows (`help`, `verbs`, `status`, `turn`, `lease`, `trail`) so their first
+    /// sentence fits a summary — the header and every other row are that capture
+    /// verbatim. Lives beside the aterm-types catalog golden (the protocol's home).
+    const CTL_HELP_FULL_GOLDEN: &str =
+        include_str!("../../aterm-types/tests/fixtures/ctl_help_full.txt");
+
+    #[test]
+    fn help_full_is_byte_identical_to_the_generated_golden() {
+        let got = super::cmd_help("--full");
+        assert_eq!(super::cmd_help(" --full "), got, "the tail is trimmed");
+        assert!(
+            !CTL_HELP_FULL_GOLDEN.is_empty(),
+            "the golden fixture is empty — it was never generated"
+        );
+        for (i, (g, w)) in got.lines().zip(CTL_HELP_FULL_GOLDEN.lines()).enumerate() {
+            assert_eq!(
+                g,
+                w,
+                "help --full line {} drifted from the golden (regenerate on purpose with \
+                 `targo --unverified test -p aterm-gui --lib -- --ignored regen_ctl_help_golden`)",
+                i + 1
+            );
+        }
+        assert_eq!(
+            got, CTL_HELP_FULL_GOLDEN,
+            "help --full and the golden differ in length"
+        );
+    }
+
+    /// Writes the golden. Ignored so a routine run can never rewrite the pin.
+    #[test]
+    #[ignore = "rewrites aterm-types/tests/fixtures/ctl_help_full.txt; run by name on purpose"]
+    fn regen_ctl_help_golden() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aterm-types/tests/fixtures/ctl_help_full.txt"
+        );
+        std::fs::write(path, super::cmd_help("--full")).expect("write the golden fixture");
     }
 }
 
@@ -2474,7 +2740,7 @@ fn dispatch_meta_verb(
     match verb {
         "version" => Some(crate::build_info::control_line()),
         "update" => Some(cmd_update(rest, scope, proxy)),
-        "help" | "verbs" => Some(cmd_help()),
+        "help" | "verbs" => Some(cmd_help(rest)),
         _ => None,
     }
 }
@@ -2511,7 +2777,8 @@ fn dispatch_app_verb(
         "rain" => control_media::cmd_rain(proxy, rest),
         "tone" => control_media::cmd_tone(proxy, rest),
         "trail" => control_media::cmd_trail(proxy, rest),
-        "spawn" => control_media::cmd_spawn(proxy, rest),
+        // No selector on this path, so no `@<sid>` aim; `window=` still aims.
+        "spawn" => control_media::cmd_spawn(proxy, rest, None),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
         "tab" => control_input::cmd_tab(proxy, rest),
         "hover" => control_input::cmd_hover(proxy, rest),
@@ -2585,8 +2852,11 @@ fn dispatch_before_session(
             return Some("ERR denied\n".into());
         }
         return match verb {
-            "sessions" => Some(control_session::cmd_sessions_store(store)),
+            "sessions" => Some(control_session::cmd_sessions_store(store, Some(proxy))),
             "who" => Some(control_session::cmd_who(store, subscribers)),
+            // The exit ledger is a store read like `sessions` — the instance's
+            // past stays answerable with no terminal at all.
+            "exits" => Some(control_session::cmd_exits(store, rest)),
             "dial-list" => Some(cmd_dial_list()),
             "dial-token" => Some(cmd_dial_token(rest)),
             _ => None,
@@ -2639,6 +2909,17 @@ fn dispatch_before_session(
         && rest.split_whitespace().next() != Some("read")
     {
         return Some(control_media::cmd_image(proxy, queue, rest, sock_dir, None));
+    }
+
+    // An AIMED `spawn`/`tab` (`@<sid> spawn …`, `@<sid> tab …`, design S3): the
+    // selector is the verb's ARGUMENT and must survive to the session resolver
+    // — for an OWNER. The App authority verdict stays exactly where every other
+    // App-target selector meets it (see `aimed_app_lane` for the widening this
+    // prevents).
+    match aimed_app_lane(verb, selector.as_ref(), principal) {
+        Some(AimedAppLane::ResolveSession) => return None,
+        Some(AimedAppLane::Denied) => return Some("ERR denied\n".into()),
+        None => {}
     }
 
     if spec.target != Target::App {
@@ -3636,7 +3917,7 @@ struct OperatorProposal {
 }
 
 fn decode_operator_proposal(payload: &[u8]) -> Result<OperatorProposal, String> {
-    let wire: OperatorProposalWire = serde_json::from_slice(payload)
+    let wire: OperatorProposalWire = aterm_json::from_slice(payload)
         .map_err(|error| format!("invalid proposal JSON: {error}"))?;
     if wire.schema != 1 {
         return Err("unsupported proposal schema".to_string());
@@ -4638,7 +4919,8 @@ fn read_exact_authenticated_until(
 ///
 /// Grammar: `subscribe @<sel>[,<sel>...] <streams> [since=<seq>]` where `<streams>`
 /// is a comma/space list ⊆ {screen,cursor,events,cells,bytes,sessions} plus the
-/// `timestamps`/`ts` modifier.
+/// `timestamps`/`ts` and `trim` modifiers (`trim` drops the trailing all-blank rows
+/// of every `screen` DELTA, the same rule as `text trim`).
 ///
 /// TWO authority checks, because the request names streams at two different SCOPES.
 /// The per-TARGET streams are gated once per `@<sel>`, exactly like a read verb:
@@ -4804,7 +5086,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
 
     let Some(req) = Requested::parse(stream_tok) else {
         let _ = writer
-            .write_all(b"ERR usage: streams are a subset of screen,cursor,events,cells,bytes,sessions,timestamps(ts) and must name at least one frame source\n");
+            .write_all(b"ERR usage: streams are a subset of screen,cursor,events,cells,bytes,sessions,timestamps(ts),trim and must name at least one frame source\n");
         let _ = writer.flush();
         return;
     };
@@ -5844,8 +6126,9 @@ fn handle(
             // (may block for tens of seconds on network + disk).
             "update" => cmd_update(rest, scope, proxy),
             // The self-describing protocol catalog — discover every verb this build
-            // supports from a running instance (`verbs` is the alias).
-            "help" | "verbs" => cmd_help(),
+            // supports from a running instance (`verbs` is the alias); `rest` picks
+            // the short catalog, one verb's full entry, or the complete catalog.
+            "help" | "verbs" => cmd_help(rest),
             // The AnyScopeMeta set is pinned by the table test
             // `access_exceptions_are_exactly_the_declared_sets`, so every member has a
             // handler above.
@@ -5873,8 +6156,10 @@ fn handle(
             // Production intercepts these before generic dispatch because it owns
             // the durable handle and (for propose) the following binary frame.
             "operator" | "operator-propose-bin" => "ERR operator unavailable\n".to_string(),
-            "sessions" => control_session::cmd_sessions(self_ctx, store),
+            "sessions" => control_session::cmd_sessions(self_ctx, store, Some(proxy)),
             "who" => control_session::cmd_who(store, subscribers),
+            // `exits`: the roster journal's `Exited` rows — `sessions`' past.
+            "exits" => control_session::cmd_exits(store, rest),
             // The op-level authority primitives and their connection-grain twins
             // (design §6) share the repaint poke: a successful act moves the §4
             // tab marks, which no funnel epoch would otherwise notice.
@@ -6051,7 +6336,12 @@ fn handle(
         && let (true, body) = take_json_flag(rest)
     {
         let json = match verb {
-            "text" => Some(control_query::cmd_text_json(term)),
+            // `text --json [trim]`: the tail is parsed, never dropped — an unknown
+            // token is `ERR usage: text [trim]`, the same answer as the text form.
+            "text" => Some(match control_query::text_trim_arg(&body) {
+                Ok(trim) => control_query::cmd_text_json_opt(term, trim),
+                Err(usage) => usage,
+            }),
             // `screen` is ALWAYS styled JSON; accept `screen --json` for symmetry.
             "screen" => Some(control_query::cmd_screen_styled_json(term)),
             "cursor" => Some(control_query::cmd_cursor_json(term)),
@@ -6126,7 +6416,14 @@ fn handle(
     }
 
     let resp = match verb {
-        "text" => control_query::cmd_text(term),
+        // `text [trim]`: the arm RECEIVES its argument tail. It used to call the
+        // bare emitter and drop `rest` on the floor, so `text trim` (or any guessed
+        // modifier) returned the full grid with no `ERR usage` — an agent could not
+        // tell a wrong guess from a no-op (F4's sub-finding).
+        "text" => match control_query::text_trim_arg(rest) {
+            Ok(trim) => control_query::cmd_text_opt(term, trim),
+            Err(usage) => usage,
+        },
         // The LOSSLESS styled-screen read (keystone): full per-cell colour +
         // resolved decorations + cursor + dims + seq as one JSON frame. Always
         // styled-JSON (no plaintext variant) — `--json` is implied.
@@ -6435,19 +6732,49 @@ fn handle(
         // `spawn`: mint ONE new tab session and reply `OK <sid>` — birth as a
         // socket primitive. The sid is immediately addressable (`@<sid> turn …`),
         // so fleet provisioning is a loop of spawn calls, no exec'ing binaries.
-        "spawn" => control_media::cmd_spawn(proxy, rest),
+        // Cross-session (`@<sid> spawn`, design S3): the newborn lands in the
+        // window HOSTING the resolved session — `App::window_of_session`, the
+        // window whose pane trees hold it on ANY tab. A wider rule than
+        // `@<sid> image`'s, which needs the session on a window's ACTIVE tab
+        // (a background tab is `ERR no window displays the target session`):
+        // where both answer they name the same window, and spawn also reaches
+        // a session `image` cannot see. An aimed spawn does not raise that
+        // window by default (`raise=` wins). Only an Owner reaches this arm
+        // with a selector (`aimed_app_lane`).
+        "spawn" => control_media::cmd_spawn(proxy, rest, is_cross.then_some(session)),
         // `@<sid> close`: retire the RESOLVED session by id (self with no selector).
         // The dispatch already resolved `session`/`ctx` from the selector, so close
         // acts on exactly the addressed session — the death half of `spawn`.
-        "close" => control_media::cmd_close(proxy, session, ctx.self_id.as_str()),
+        // The CALLER rides along as the exit ledger's `by=`: the target's ctx
+        // knows who died, not who asked. An edge-scoped connection's caller is
+        // the session its token was granted to; an owner-token connection is
+        // anonymous (`by=-`). Never `self_ctx` (the dispatch already resolved
+        // it to the target) and never the front tab (`spawn` makes the new
+        // session the front tab, so `@<new> close` would name the closed
+        // session as its own closer).
+        // `close` takes NO argument, and says so BEFORE retiring anything —
+        // see [`control_media::close_no_arg`] for the guess that used to cost a
+        // tab.
+        "close" => match control_media::close_no_arg(rest) {
+            Ok(()) => control_media::cmd_close(
+                proxy,
+                session,
+                ctx.self_id.as_str(),
+                control_session::caller_actor(scope, ctx),
+            ),
+            Err(usage) => usage,
+        },
         // `settings [open|close|toggle]` drives the CROSS-PLATFORM native Settings tab
         // (`open settings` is the same compatibility alias), so a driver can open it
         // then read its current native route with `controls settings` or capture the
         // real frame with `image` on any platform.
         // App-level UI on the MAIN thread (write-class); `@<sid>` routes to the instance.
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
-        // `tab`: drive the resolved instance's front-window tabs (app-level; `@<sid>`
-        // routes to the instance).
+        // `tab`: cross-session (`@<sid> tab …`, design S3) drives the tabs of the
+        // window HOSTING the resolved session — the same aim `@<sid> spawn` takes,
+        // so an agent in a background window can walk its own window's tabs
+        // without touching the human's. Flagless stays the FRONT window.
+        "tab" if is_cross => control_media::cmd_tab_aimed(proxy, rest, session),
         "tab" => control_input::cmd_tab(proxy, rest),
         // Toggle the drop-target highlight on the FRONT window (testing/automation
         // of the drag-and-drop affordance; a real drag drives the same flag). Always
@@ -6483,7 +6810,12 @@ fn handle(
         "title" => control_query::cmd_title(term),
         "cwd" => control_query::cmd_cwd(term),
         "blocks" => control_selection::cmd_blocks(&host, session, rest),
-        "blocktext" => control_selection::cmd_blocktext(&host, session, rest),
+        // `blocktext <id> [trim]`: the grammar is checked in the arm's helper and
+        // only `<id>` reaches the shared emitter; `trim` drops the block output's
+        // trailing blank rows through the same rule `text trim` uses.
+        "blocktext" => control_query::cmd_blocktext_args(rest, |id| {
+            control_selection::cmd_blocktext(&host, session, id)
+        }),
         "wait" => control_selection::cmd_wait(&host, session, rest),
         "colors" => control_query::cmd_colors(term),
         "select" => control_selection::cmd_select(&host, session, rest),
@@ -9501,7 +9833,7 @@ mod tests {
         let subscribers = crate::subscribe::new_registry();
         assert!(resolve_active(&active).is_none());
         assert_eq!(
-            control_session::cmd_sessions_store(&store),
+            control_session::cmd_sessions_store(&store, None),
             "OK 0\n",
             "Owner fleet meta remains truthful with an empty SessionStore"
         );
@@ -9579,6 +9911,75 @@ mod tests {
                 NativeControlPrincipal::Edge,
             ),
             Some(Err("ERR denied\n")),
+        );
+    }
+
+    /// REGRESSION (authority widening, design S3 review): an AIMED `spawn`/`tab`
+    /// (`@<sid> spawn …`, `@<sid> tab …`) keeps the App verdict every other
+    /// App-target selector gets. Letting the selector through to the session
+    /// resolver unjudged left the verb's op (`WriteInput`) as the only gate, so
+    /// an edge holding a write-input grant on ONE session could mint a tab in,
+    /// or `tab close <N>` any tab of, the window hosting that session (measured
+    /// on a headless build: `TOKEN <hex> @0 spawn raise=maybe` answered the
+    /// usage line — the handler RAN under Edge scope — where `TOKEN <hex> @0
+    /// hover on` answered `ERR denied`). The main-thread hop needs an event
+    /// loop, so the lane verdict is the unit here: `ResolveSession` is the
+    /// `return None` that carries the Owner's selector into `dispatch_request`
+    /// -> `handle`, whose arms are `cmd_spawn(.., is_cross.then_some(session))`
+    /// and `"tab" if is_cross => cmd_tab_aimed(..)`.
+    #[test]
+    fn an_aimed_spawn_or_tab_is_owner_only_and_the_owner_keeps_the_selector() {
+        use super::{AimedAppLane, aimed_app_lane, request_head};
+        // Every aimed spelling, both selector forms (local id, stable sid), with
+        // a well-formed and a malformed tail: the verdict precedes the parse.
+        for line in [
+            "@0 spawn",
+            "@0 spawn raise=maybe",
+            "@s-abc spawn cwd=/w split=v",
+            "@0 tab next",
+            "@0 tab prev",
+            "@0 tab 1",
+            "@0 tab new",
+            "@0 tab close 0",
+            "@s-abc tab move 0 1",
+        ] {
+            let (selector, verb, _) = request_head(line);
+            assert_eq!(
+                aimed_app_lane(verb, selector.as_ref(), NativeControlPrincipal::Edge),
+                Some(AimedAppLane::Denied),
+                "an Edge is refused {line:?} before the sid is looked up",
+            );
+            assert_eq!(
+                aimed_app_lane(verb, selector.as_ref(), NativeControlPrincipal::Owner),
+                Some(AimedAppLane::ResolveSession),
+                "an Owner's selector survives to the resolver for {line:?}",
+            );
+        }
+        // The flagless and `@.` forms are NOT the aimed lane: they keep the
+        // ordinary App path (Owner: `WithoutSession` -> the front-window verb;
+        // Edge: the `ERR denied` that path has always given).
+        for line in [
+            "spawn",
+            "spawn window=1 raise=false",
+            "@. spawn",
+            "tab next",
+            "@. tab close",
+        ] {
+            let (selector, verb, _) = request_head(line);
+            for principal in [NativeControlPrincipal::Owner, NativeControlPrincipal::Edge] {
+                assert_eq!(
+                    aimed_app_lane(verb, selector.as_ref(), principal),
+                    None,
+                    "{line:?} is not aimed ({principal:?})",
+                );
+            }
+        }
+        // Nor is any OTHER selector-bearing App verb: `@0 hover on` keeps the
+        // lane it always had (this lane is exactly spawn/tab).
+        let (selector, verb, _) = request_head("@0 hover on");
+        assert_eq!(
+            aimed_app_lane(verb, selector.as_ref(), NativeControlPrincipal::Edge),
+            None
         );
     }
 
@@ -10408,17 +10809,22 @@ mod tests {
     /// drifted (`metrics` was missing), so it is now generated — this pins that.
     #[test]
     fn help_header_names_every_json_capable_verb() {
-        let help = cmd_help();
-        for v in aterm_types::control_verbs::JSON_CAPABLE_VERBS {
+        // Both headers carry a generated `--json` sentence; check each on its own
+        // header (a verb ROW would satisfy `contains` for free).
+        for form in ["", "--full"] {
+            let help = cmd_help(form);
+            let header: String = help.lines().filter(|l| l.starts_with('#')).collect();
+            for v in aterm_types::control_verbs::JSON_CAPABLE_VERBS {
+                assert!(
+                    header.contains(v),
+                    "help {form:?} header omits json-capable verb {v:?} — the --json sentence drifted"
+                );
+            }
             assert!(
-                help.contains(v),
-                "help header omits json-capable verb {v:?} — the --json sentence drifted"
+                header.contains("metrics"),
+                "non-vacuity: the regression verb must appear"
             );
         }
-        assert!(
-            help.contains("metrics"),
-            "non-vacuity: the regression verb must appear"
-        );
     }
 
     /// SINGLE SOURCE OF TRUTH, part 1b: some verbs are INTERCEPTED in the serve
@@ -10467,8 +10873,13 @@ mod tests {
     /// two bound projections).
     #[test]
     fn catalog_and_verb_table_agree() {
+        for form in ["", "--full"] {
+            catalog_form_and_verb_table_agree(&super::cmd_help(form));
+        }
+    }
+
+    fn catalog_form_and_verb_table_agree(catalog: &str) {
         use aterm_types::control_verbs::{OpClass, VERBS};
-        let catalog = super::cmd_help();
         let known: std::collections::HashSet<&str> = VERBS.iter().map(|s| s.name).collect();
         // Every catalog body line's leading token is a known verb (skip comments,
         // the header, and blank/continuation lines).
@@ -10642,6 +11053,8 @@ mod tests {
                 "operator",
                 "operator-propose-bin",
                 "sessions",
+                // The exit ledger: `sessions`' past, Owner-gated with it.
+                "exits",
                 "whoami",
                 "grant",
                 "revoke",
@@ -10660,9 +11073,10 @@ mod tests {
         );
 
         // EXHAUSTIVE: the pinned partitions cover the WHOLE table (no verb left
-        // unclassified). 39 read + 21 write + 1 signal + 1 config + 1 clip + 11 none
-        // = 74 — but the NUMBERS here are prose; the machine-checked truth is the
-        // set-equality assertions below plus `pinned == VERBS.len()`.
+        // unclassified). No per-class sizes are written here on purpose — a
+        // hand-typed sum went stale the first time a verb was added; the
+        // machine-checked truth is the set-equality assertions below plus
+        // `pinned == VERBS.len()`.
         let pinned = by_op(Some(Op::ReadScreen)).len()
             + by_op(Some(Op::WriteInput)).len()
             + by_op(Some(Op::Signal)).len()
@@ -12379,7 +12793,7 @@ mod tests {
         store.write().unwrap().register(root.clone());
 
         // Base case: one session, one data line.
-        let one = cmd_sessions(&root_ctx, &store);
+        let one = cmd_sessions(&root_ctx, &store, None);
         let mut lines = one.lines();
         assert_eq!(lines.next(), Some("OK 1"), "header counts one session");
         let only = lines.next().expect("one data line");
@@ -12392,7 +12806,7 @@ mod tests {
         let mut child = registered_session(1, -1, b"");
         child.parent = Some(root.sid.clone());
         store.write().unwrap().register(child.clone());
-        let two = cmd_sessions(&root_ctx, &store);
+        let two = cmd_sessions(&root_ctx, &store, None);
         let mut l = two.lines();
         assert_eq!(l.next(), Some("OK 2"));
         assert!(l.next().unwrap().starts_with("0 "), "root first");
@@ -12429,11 +12843,11 @@ mod tests {
         assert!(read0.contains(" attention=- "), "unset reads -: {read0}");
         assert!(read0.trim_end().ends_with(" state=alive"), "{read0}");
         assert!(
-            cmd_sessions(&h.ctx, &store)
+            cmd_sessions(&h.ctx, &store, None)
                 .lines()
                 .nth(1)
                 .unwrap()
-                .ends_with("meta=0"),
+                .contains(" meta=0 "),
             "no user metadata yet -> meta=0"
         );
 
@@ -12475,11 +12889,11 @@ mod tests {
         )));
         assert!(read2.contains(&format!(" icon={} ", pct_encode("🚀"))));
         assert!(
-            cmd_sessions(&h.ctx, &store)
+            cmd_sessions(&h.ctx, &store, None)
                 .lines()
                 .nth(1)
                 .unwrap()
-                .ends_with("meta=1"),
+                .contains(" meta=1 "),
             "user metadata present -> meta=1"
         );
 
@@ -15891,9 +16305,11 @@ mod tests {
         // The help spells the row as one backticked run beginning `trail
         // style=`; take it from the shipped spec so this reads the same bytes
         // `ctl help` prints.
+        // `help_line()` — summary + detail — is the same bytes `help --full`
+        // and `help trail` print, which is what this fixture is checking.
         let help = aterm_types::control_verbs::spec("trail")
             .expect("the trail verb ships")
-            .help;
+            .help_line();
         let run = help
             .split_once("`trail style=")
             .and_then(|(_, rest)| rest.split_once('`'))

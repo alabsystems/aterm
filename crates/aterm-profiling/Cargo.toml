@@ -1,0 +1,73 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so redirecting the three
+# third-party consumers' `profiling = "1.0.1"` lines — wgpu, wgpu-core and
+# wgpu-hal, all at 29.0.3 — at this code requires the package to be called
+# `profiling`; nothing else works. The DIRECTORY keeps the `aterm-` prefix so a
+# `ls crates/` or a stack trace still reads as ours and nobody mistakes this for
+# vendored upstream source (that lives under `vendor/`, which is where genuinely
+# upstream code belongs). crates/aterm-tracing is the precedent for the pair.
+name = "profiling"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number: wgpu 29.0.3, wgpu-core 29.0.3 and
+# wgpu-hal 29.0.3 each declare `profiling = "1.0.1"`, i.e. ^1.0.1 → >=1.0.1,
+# <2.0.0. 1.0.18 is what the graph resolved to before the swap, so the
+# Cargo.lock version line does not move; a version outside that range makes
+# cargo reject the patch outright.
+version = "1.0.18"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party no-op `profiling` shim for aterm (replaces the profiling crate behind wgpu / wgpu-core / wgpu-hal)"
+
+[dependencies]
+# NONE, and the emptiness is the point. Upstream's `default = ["procmacros"]`
+# pulls `profiling-procmacros`, and each `profile-with-*` pulls an entire
+# profiler (puffin / optick / superluminal-perf / tracing / tracy-client).
+# Putting any crates.io package back into the graph is precisely what this
+# patch exists to prevent, so every feature below is empty — see [features].
+
+[features]
+# Upstream's feature table, reproduced by NAME and emptied of EFFECT.
+#
+# Measured on all four cells, aterm enables zero of these today:
+#
+#   cargo tree --workspace --target <cell> -e features -i profiling \
+#     | grep -c 'profiling feature'          # => 0 on all four
+#
+# All three consumers take the crate `default-features = false` (wgpu
+# Cargo.toml:178-180, wgpu-core:162-164, wgpu-hal:223-226) and no package in the
+# graph forwards a `profiling/*` feature. wgpu-hal's four `dep:profiling`
+# entries are optional-dependency activations, not feature forwards.
+#
+# The names are declared anyway because the two failure modes are not
+# symmetric. Omitting a name that some future dependency asks for is a HARD
+# RESOLVE ERROR on a cell we cannot build here; declaring a name nothing asks
+# for costs one line. None of them may ever grow a `dep:` — that would undo the
+# patch.
+#
+# `default` is the ONE deliberate divergence from upstream's table, which reads
+# `default = ["procmacros"]`. This shim does not implement the three attribute
+# macros that feature stands for (`function`, `all_functions`, `skip`; they need
+# a proc-macro crate, and the graph contains zero uses — `grep -c
+# '#\[profiling::' ` over all three consumer trees is 0, and
+# `grep -cE '^name = "profiling-procmacros"$' Cargo.lock` is 0). Advertising
+# them through `default` would be a claim that does not hold; leaving `default`
+# empty says only what is true. `procmacros` still EXISTS as a name so an
+# explicit `features = ["procmacros"]` resolves. See the crate docs for what to
+# do the day something actually writes `#[profiling::function]`.
+default = []
+procmacros = []
+profile-with-optick = []
+profile-with-puffin = []
+profile-with-superluminal = []
+profile-with-tracing = []
+profile-with-tracy = []
+type-check = []
+
+[lints]
+workspace = true

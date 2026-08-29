@@ -49,7 +49,12 @@ harness = false
 # atpkg does not rely on rustls keeping those features enabled.
 ring = { version = "0.17.14", default-features = false }
 # Decode the base64 root + release Ed25519 public keys (32 raw bytes each).
-base64 = "0.22.1"
+# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
+# to the retired `base64` package's `general_purpose::STANDARD` engine by
+# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
+# point every trust path uses: canonical padding REQUIRED and no trailing bits,
+# so a pinned key has exactly one spelling.
+aterm-codec = { workspace = true }
 # getuid() for the 0600, owned-by-uid durable high-water floor file (mirrors
 # aterm-update-core's privatedir hardening). Already a workspace dependency.
 libc = { workspace = true }
@@ -66,15 +71,18 @@ aterm-types = { workspace = true }
 aterm-update-core = { workspace = true }
 # Parse index.toml / pkg-*.toml — but ONLY after signature verification. The parsers
 # take `&sig::VerifiedBytes` (no public constructor), so an unverified-bytes parse does
-# not type-check; serde derives the schema structs and the real `toml` parser replaces
+# not type-check; serde derives the schema structs and the real `aterm-toml` parser replaces
 # Phase 1's [keys] line-scanner, getting table-scoping + duplicate-key rejection for
 # free (docs/TOOLCHAIN-PACKAGE-MANAGER.md §4/§5). reject-newer via SUPPORTED_SCHEMA.
 serde = { workspace = true }
-toml = { workspace = true }
+aterm-toml = { workspace = true }
 # Parse the GitHub Releases API JSON when wiring the production network Fetcher (the
 # release listing + per-asset url/name). Scoped to the net adapter; the verify/parse
 # core never touches JSON. Already a workspace dependency (aterm-update uses it too).
-serde_json = { workspace = true }
+# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
+# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
+# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+aterm-json = { workspace = true }
 # In-process SHA-256 for the apply-time `tree_root` re-verify (§4.2/§8): hash every
 # extracted file's content + the sorted (relpath, mode, sha) list. Streamed, so a
 # multi-GB sysroot is never buffered whole. First-party and dependency-free, so it
@@ -90,19 +98,18 @@ aterm-digest = { workspace = true }
 # a writer. Per-entry extraction is still driven manually so EVERY entry is vetted before
 # a byte is written, modes are sanitized, and a single escape aborts the whole stage.
 zstd = { workspace = true }
-# The `https` protocol lane's OTHER compressors: gzip for `tar-gz` payloads (Codex ships
-# `codex-package-<triple>.tar.gz`, gh ships `.tar.gz` too) and raw deflate inside `.zip`
-# members (the first-party zip reader in `src/extract/zipread.rs`). flate2 was ALREADY in
-# the pinned tree transitively (via `png`, the GUI's image decoder) at exactly this
-# version, so this promotes an existing edge rather than admitting a new package; the
-# `deny.toml` floor pins it the way `ring`/`tar` are pinned. `default-features = false` +
-# `rust_backend` = the pure-Rust `miniz_oxide` inflate (also already in the tree) and
-# NOTHING else — no zlib-sys, no C. The container parsing on both sides of it stays
-# first-party (`src/tarread.rs`, `src/extract/zipread.rs`): flate2 only turns bytes into
-# bytes; every path/mode/link decision is ours, made before a byte is written.
-flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
+# ORACLE ONLY — never in the shipped graph. The retired compressor, kept so the
+# extraction tests keep building their `tar-gz` and `zip` fixtures with the very
+# encoder the first-party reader replaced: `src/extract.rs`'s `gzip_bytes` /
+# `deflate_bytes` helpers emit real `flate2` streams, and every extraction test
+# in this crate then reads them back through
+# `aterm_codec::inflate::stream`. Agreement on the DECODER side (bytes, and
+# accept-or-reject on corrupt input) is asserted in
+# `crates/aterm-codec/tests/inflate_stream_oracle.rs`; this entry is what keeps
+# the fixtures on this side honest rather than self-generated.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 # ORACLE ONLY — never in the shipped graph. The retired reader, kept so
 # `tests/tar_oracle.rs` can prove `src/tarread.rs` agrees with it on
 # accept-or-reject and on every field the extractor reads, over hand-built

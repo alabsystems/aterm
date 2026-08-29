@@ -6,10 +6,10 @@
 //! child, and terminating the process aterm itself spawned.
 
 use super::model_store::{AttestedManagedModel, attest_managed_model};
-use super::transport::{RequestWriteAuthority, build_agent, loopback_socket};
+use super::transport::{RequestWriteAuthority, build_client, loopback_socket};
 use super::{
-    EndpointOrigin, Job, MAX_RESPONSE_BYTES, TitleSummaryLocality, cancelled_error,
-    job_is_authorized,
+    EndpointOrigin, Job, TitleSummaryLocality, cancelled_error, job_is_authorized,
+    max_response_bytes,
 };
 // Both are consumed only inside macOS-gated regions in SOME compile targets —
 // gating the imports breaks the targets that do use them, so allow instead.
@@ -855,13 +855,9 @@ fn warm_managed_model(
     if !job_is_authorized(job, authority_epoch) {
         return Err(cancelled_error());
     }
-    let agent = build_agent(
-        &job.settings,
-        endpoint,
-        Some(process),
-        RequestWriteAuthority::for_job(job, authority_epoch.clone()),
-    )?;
-    let body = serde_json::json!({
+    let authority = RequestWriteAuthority::for_job(job, authority_epoch.clone());
+    let client = build_client(&job.settings, endpoint, Some(process), authority.clone())?;
+    let body = aterm_json::json!({
         "model": job.settings.model,
         "messages": [
             {"role": "system", "content": "Reply with READY."},
@@ -873,16 +869,16 @@ fn warm_managed_model(
         "keep_alive": -1,
         "options": {"temperature": 0, "num_predict": 4, "num_ctx": 256}
     });
-    let mut response = agent
+    let encoded = aterm_json::to_vec(&body)
+        .map_err(|error| format!("could not encode the warm-up body: {error}"))?;
+    let response = client
         .post(endpoint)
+        .guard(Arc::new(authority))
+        .limit(max_response_bytes())
         .header("Content-Type", "application/json")
-        .send_json(&body)
+        .send(&encoded)
         .map_err(|error| format!("managed model warm-up failed: {error}"))?;
-    let _: serde_json::Value = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_RESPONSE_BYTES)
-        .read_json()
+    let _: aterm_json::Value = aterm_json::from_slice(response.body())
         .map_err(|error| format!("managed model warm-up returned invalid JSON: {error}"))?;
     if !job_is_authorized(job, authority_epoch) {
         return Err(cancelled_error());
@@ -1035,8 +1031,38 @@ pub(super) fn configure_dedicated_process_session(command: &mut std::process::Co
     }
 }
 
+/// The environment surface [`configure_managed_ollama_environment`] writes
+/// through: a real [`std::process::Command`] in production.
+///
+/// The indirection exists because the minimal set has TWO halves and
+/// `std::process::Command` only exposes one of them.
+/// [`std::process::Command::get_envs`] reports the explicit *changes* staged on
+/// the command and can never tell you whether the inherited environment was
+/// dropped — yet dropping it is the entire point (no terminal/session secrets,
+/// no proxy overrides, no injection variables reach the model daemon). The old
+/// proof for that half spawned `/usr/bin/env` and read the child's real
+/// environment back, which made a platform-neutral law testable only on POSIX.
+/// Writing through this trait lets the same law be observed exactly, on every
+/// host, with no child process at all.
+pub(super) trait ChildEnvironment {
+    /// Drop everything this process would otherwise pass down.
+    fn clear_inherited(&mut self);
+    /// Set one variable in the child.
+    fn set(&mut self, key: &str, value: &std::ffi::OsStr);
+}
+
+impl ChildEnvironment for std::process::Command {
+    fn clear_inherited(&mut self) {
+        self.env_clear();
+    }
+
+    fn set(&mut self, key: &str, value: &std::ffi::OsStr) {
+        self.env(key, value);
+    }
+}
+
 pub(super) fn configure_managed_ollama_environment(
-    command: &mut std::process::Command,
+    environment: &mut impl ChildEnvironment,
     bind: &str,
     models: &std::path::Path,
     home: &std::path::Path,
@@ -1044,13 +1070,12 @@ pub(super) fn configure_managed_ollama_environment(
     // Never pass terminal/session secrets, proxy overrides, DYLD injection, or
     // credential-helper variables into the model daemon. Ollama requires HOME; its
     // private managed root is sufficient and keeps any runtime files in scope.
-    command
-        .env_clear()
-        .env("HOME", home)
-        .env("OLLAMA_HOST", bind)
-        .env("OLLAMA_MODELS", models)
-        .env("OLLAMA_NO_CLOUD", "1")
-        .env("OLLAMA_NOHISTORY", "1");
+    environment.clear_inherited();
+    environment.set("HOME", home.as_os_str());
+    environment.set("OLLAMA_HOST", bind.as_ref());
+    environment.set("OLLAMA_MODELS", models.as_os_str());
+    environment.set("OLLAMA_NO_CLOUD", "1".as_ref());
+    environment.set("OLLAMA_NOHISTORY", "1".as_ref());
 }
 
 pub(super) struct AttestedManagedOllama {

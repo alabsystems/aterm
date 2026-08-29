@@ -400,7 +400,7 @@ fn read_marker_for_program(layout: &Layout, program: &str) -> std::io::Result<Li
 
 fn read_marker(path: &Path) -> std::io::Result<LinkMarker> {
     let text = crate::metadata_io::read_bounded_regular_utf8(path, MAX_LINK_MARKER_BYTES)?;
-    let marker: LinkMarker = toml::from_str(&text).map_err(|error| {
+    let marker: LinkMarker = aterm_toml::from_str(&text).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("link marker is invalid: {error}"),
@@ -434,7 +434,7 @@ fn serialize_marker(marker: &LinkMarker) -> std::io::Result<String> {
             ),
         ));
     }
-    let text = toml::to_string(marker)
+    let text = aterm_toml::to_string(marker)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     if text.len() > MAX_LINK_MARKER_BYTES {
         return Err(std::io::Error::new(
@@ -696,7 +696,7 @@ mod tests {
         let first = l.prefix.join("first.toml");
         let second = l.prefix.join("second.toml");
         let marker_text = |checkout: &str| {
-            toml::to_string(&LinkMarker {
+            aterm_toml::to_string(&LinkMarker {
                 schema: 1,
                 program: "ay".to_string(),
                 checkout: checkout.to_string(),

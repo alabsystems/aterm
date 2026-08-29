@@ -273,8 +273,8 @@ fn cell_pixels(
 /// cells are SPACES, so the decoration is the ONLY ink in them. Col 2 (solid
 /// underline → pass 3) and col 4 (undercurl → pass 3b) must each change when
 /// char_fg lands; col 0 carries an explicit SGR 58 underline colour and must
-/// NOT move, because `effective_deco_color`'s `Some(_)` arms ignore the
-/// substituted operand entirely.
+/// NOT move, because `deco_inks`'s explicit arms ignore the substituted
+/// operand entirely.
 #[test]
 fn char_fg_follows_into_line_decorations() {
     let Some(mut rend) = renderer() else {

@@ -2,10 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `ArrayVec<T, N>`: fixed-capacity inline-only storage.
+//!
+//! The implementation names only `core` items (never `std`), so this module
+//! compiles unchanged in a `#![no_std]` crate. That matters because
+//! `crates/aterm-arrayvec` republishes this type under the package name
+//! `arrayvec`, and three of the six third-party consumers of that package
+//! (`naga`, `tiny-skia`, `vte`) are `no_std`-capable and take it with
+//! `default-features = false`. Re-check with
+//! `grep -n 'std::' crates/aterm-alloc/src/array_vec.rs` — every hit other than
+//! this sentence must be inside the `#[cfg(test)]` module at the bottom (17
+//! hits today: this line and 16 in the tests).
 
-use std::fmt;
-use std::mem::MaybeUninit;
-use std::ops::{Deref, DerefMut};
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::mem::{ManuallyDrop, MaybeUninit};
+use core::ops::{Bound, Deref, DerefMut, RangeBounds};
 
 /// A fixed-capacity vector stored entirely on the stack.
 ///
@@ -82,6 +93,13 @@ impl<T, const N: usize> ArrayVec<T, N> {
         trust_verify,
         trust::contract_panic(message_contains = "ArrayVec overflow")
     )]
+    // `#[track_caller]` so a capacity panic names the CALLER's line, not this
+    // file's. Upstream `arrayvec` marks `push`/`insert`/`extend`/`from_iter`
+    // the same way, and the shim inherits the attribute through the re-export:
+    // without it every overflow in the patched graph would report
+    // `crates/aterm-alloc/src/array_vec.rs:<line>` and read as an aterm bug
+    // rather than the wgpu/naga limit violation it is.
+    #[track_caller]
     pub fn push(&mut self, value: T) {
         // Guard on a LOCAL copy of `len`: the verifier is a modular open-model
         // checker that reloads `self.len` at every field read, so only a local
@@ -103,8 +121,18 @@ impl<T, const N: usize> ArrayVec<T, N> {
         }
     }
 
-    /// Try to push an element. Returns `Err(value)` if full.
-    pub fn try_push(&mut self, value: T) -> Result<(), T> {
+    /// Try to push an element. Returns `Err(CapacityError(value))` if full.
+    ///
+    /// # Errors
+    ///
+    /// Returns the element back inside a [`CapacityError`] when `len == N`.
+    ///
+    /// The error type is `CapacityError<T>` rather than a bare `T` so that the
+    /// signature is upstream `arrayvec`'s to the letter — see the module docs
+    /// of `crates/aterm-arrayvec`. No caller in this workspace or in the
+    /// patched graph used the old `Result<(), T>` form, so the change is
+    /// source-compatible with everything that exists.
+    pub fn try_push(&mut self, value: T) -> Result<(), CapacityError<T>> {
         // Same local-copy idiom as `push` (above): the open-model verifier
         // reloads `self.len` at every field read, so only a local carries the
         // `len < N` fact to the index and the increment. Behavior-identical.
@@ -117,7 +145,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
             self.len = len.wrapping_add(1);
             Ok(())
         } else {
-            Err(value)
+            Err(CapacityError::new(value))
         }
     }
 
@@ -193,15 +221,25 @@ impl<T, const N: usize> ArrayVec<T, N> {
         // holds), then iterate the clamped subslice: the single slice operation
         // carries the `n <= N` proof and the loop has no per-index obligation.
         let n = if self.len < N { self.len } else { N };
+        // LENGTH FIRST, AND THAT ORDER IS A SAFETY REQUIREMENT, not a style.
+        // If an element's `Drop` PANICS partway through the loop below, unwinding
+        // runs `Drop for ArrayVec`, which calls this same `clear`. With `len`
+        // still describing the old contents, that second pass re-drops every
+        // slot the first pass already dropped — a double free. Zeroing `len`
+        // before any destructor runs makes the re-entrant call a no-op.
+        // The cost is that the not-yet-dropped tail LEAKS when a destructor
+        // panics; leaking is safe and double-dropping is not, which is the
+        // trade upstream `arrayvec` makes for the same reason.
+        self.len = 0;
         for slot in &mut self.buf[..n] {
-            // SAFETY: elements `0..len` were initialized when pushed and
-            // `n <= len`, so every slot in the subslice holds a live value;
-            // each is dropped exactly once.
+            // SAFETY: elements `0..n` were initialized when pushed and
+            // `n <= len` as it was on entry, so every slot in the subslice held
+            // a live value; `len` is already 0, so no other path can reach them
+            // and each is dropped exactly once.
             unsafe {
                 slot.assume_init_drop();
             }
         }
-        self.len = 0;
     }
 
     /// Truncate to the given length.
@@ -218,15 +256,21 @@ impl<T, const N: usize> ArrayVec<T, N> {
             // `start <= end <= N` proof and the loop has no per-index obligation.
             let end = if self.len < N { self.len } else { N };
             let start = if new_len < end { new_len } else { end };
+            // LENGTH FIRST — same panic-safety requirement as `clear` above: a
+            // destructor that panics inside the loop unwinds into
+            // `Drop for ArrayVec` -> `clear`, which would re-drop this range if
+            // `len` still covered it.
+            self.len = new_len;
             for slot in &mut self.buf[start..end] {
-                // SAFETY: elements `new_len..len` were initialized when pushed
-                // (`end <= len`), so every slot in the subslice holds a live
-                // value; each is dropped exactly once.
+                // SAFETY: elements `start..end` were initialized when pushed
+                // (`end <= len` as it was on entry), so every slot in the
+                // subslice held a live value; `len` is already `new_len <=
+                // start`, so no other path can reach them and each is dropped
+                // exactly once.
                 unsafe {
                     slot.assume_init_drop();
                 }
             }
-            self.len = new_len;
         }
     }
 
@@ -247,7 +291,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
         // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the pointer and
         // length come from the same in-bounds subslice `init`, and elements
         // `0..len` are initialized (`n <= len`), so reading them as `T` is sound.
-        unsafe { std::slice::from_raw_parts(init.as_ptr().cast::<T>(), init.len()) }
+        unsafe { core::slice::from_raw_parts(init.as_ptr().cast::<T>(), init.len()) }
     }
 
     /// View as a mutable slice.
@@ -263,16 +307,16 @@ impl<T, const N: usize> ArrayVec<T, N> {
         // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the pointer and
         // length come from the same in-bounds subslice `init`, and elements
         // `0..len` are initialized (`n <= len`), so reading them as `T` is sound.
-        unsafe { std::slice::from_raw_parts_mut(init.as_mut_ptr().cast::<T>(), init.len()) }
+        unsafe { core::slice::from_raw_parts_mut(init.as_mut_ptr().cast::<T>(), init.len()) }
     }
 
     /// An iterator over references.
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+    pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.as_slice().iter()
     }
 
     /// An iterator over mutable references.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
+    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, T> {
         self.as_mut_slice().iter_mut()
     }
 
@@ -286,6 +330,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     // sep model cannot see the shifted region's bounds across the raw ops).
     // Same audited len-invariant; droppable with theirs.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
         assert!(
             index <= self.len,
@@ -300,8 +345,8 @@ impl<T, const N: usize> ArrayVec<T, N> {
         // SAFETY: we checked bounds and capacity above
         unsafe {
             let ptr = self.buf.as_mut_ptr().cast::<T>();
-            std::ptr::copy(ptr.add(index), ptr.add(index + 1), self.len - index);
-            std::ptr::write(ptr.add(index), value);
+            core::ptr::copy(ptr.add(index), ptr.add(index + 1), self.len - index);
+            core::ptr::write(ptr.add(index), value);
         }
         self.len += 1;
     }
@@ -316,6 +361,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     // the shifted region's bounds across the raw ops). Same audited
     // len-invariant; droppable with theirs.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[track_caller]
     pub fn remove(&mut self, index: usize) -> T {
         assert!(
             index < self.len,
@@ -326,8 +372,8 @@ impl<T, const N: usize> ArrayVec<T, N> {
         // SAFETY: element at index is initialized
         unsafe {
             let ptr = self.buf.as_mut_ptr().cast::<T>();
-            let value = std::ptr::read(ptr.add(index));
-            std::ptr::copy(ptr.add(index + 1), ptr.add(index), self.len - index - 1);
+            let value = core::ptr::read(ptr.add(index));
+            core::ptr::copy(ptr.add(index + 1), ptr.add(index), self.len - index - 1);
             self.len -= 1;
             value
         }
@@ -337,11 +383,16 @@ impl<T, const N: usize> ArrayVec<T, N> {
     ///
     /// Panic-safe: if the predicate panics, all elements that have already
     /// been processed are in a valid state and will be dropped correctly.
+    ///
+    /// The predicate takes `&mut T`, matching upstream `arrayvec`'s
+    /// `retain<F>(&mut self, f: F) where F: FnMut(&mut T) -> bool`. A closure
+    /// that only reads still infers the right argument type, so every
+    /// `retain(|x| …)` spelling keeps compiling.
     // Skip: the compaction's raw element shift joins insert/remove's
     // init/provenance classification; `F: FnMut` is caller-chosen code
     // besides (the user-T dispatch class). Same audited len-invariant.
     #[cfg_attr(trust_verify, trust::skip)]
-    pub fn retain<F: FnMut(&T) -> bool>(&mut self, mut f: F) {
+    pub fn retain<F: FnMut(&mut T) -> bool>(&mut self, mut f: F) {
         let original_len = self.len;
         // Set len to 0 so that if we panic, Drop only drops elements
         // that we've already moved into the write region.
@@ -391,7 +442,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
         while guard.read < original_len {
             let read = guard.read;
             // SAFETY: element at `read` is initialized (read < original_len)
-            let keep = unsafe { f(&*guard.av.buf[read].as_ptr()) };
+            let keep = unsafe { f(&mut *guard.av.buf[read].as_mut_ptr()) };
             guard.read += 1;
             if keep {
                 if guard.write != read {
@@ -415,6 +466,142 @@ impl<T, const N: usize> ArrayVec<T, N> {
         guard.original_len = guard.read; // no unprocessed elements remain
         drop(guard);
         self.len = final_len;
+    }
+
+    /// Set the length without dropping or initializing elements.
+    ///
+    /// # Safety
+    ///
+    /// `len` must be `<= N` and the first `len` slots must be initialized.
+    /// This is upstream `arrayvec`'s `set_len` signature and contract.
+    pub const unsafe fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= N, "ArrayVec::set_len past capacity");
+        self.len = len;
+    }
+
+    /// Append every element of `other`, cloning each.
+    ///
+    /// A deliberate SUPERSET: upstream `arrayvec` keeps its `extend_from_slice`
+    /// `pub(crate)` (arrayvec-0.7.6/src/arrayvec.rs:1116) and exposes only
+    /// [`try_extend_from_slice`](Self::try_extend_from_slice). This one is
+    /// public because `clone_from` and the shim's tests want the panicking
+    /// form by name; behaviourally it is upstream's `extend` over a slice, and
+    /// `crates/aterm-alloc/tests/arrayvec_differential.rs` asserts exactly that.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slice does not fit in the remaining capacity — the same
+    /// contract as [`push`](Self::push), and the same contract as upstream
+    /// `arrayvec::ArrayVec::extend_from_slice`.
+    // AUDITED CONTRACT PANIC (T9): delegates to `push`, whose overflow panic is
+    // the documented ArrayVec capacity contract; `try_extend_from_slice` is the
+    // non-panicking form.
+    #[cfg_attr(
+        trust_verify,
+        trust::contract_panic(message_contains = "ArrayVec overflow")
+    )]
+    #[track_caller]
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        for value in other {
+            self.push(value.clone());
+        }
+    }
+
+    /// Append every element of `other`, cloning each, or return the slice's
+    /// length as an error if it does not fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityError`] and appends NOTHING when
+    /// `other.len() > remaining_capacity()` — the all-or-nothing behaviour of
+    /// upstream `arrayvec::ArrayVec::try_extend_from_slice`.
+    pub fn try_extend_from_slice(&mut self, other: &[T]) -> Result<(), CapacityError>
+    where
+        T: Clone,
+    {
+        if other.len() > self.remaining_capacity() {
+            return Err(CapacityError::new(()));
+        }
+        self.extend_from_slice(other);
+        Ok(())
+    }
+
+    /// Return the inner fixed-size array, but only if the vec is FULL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` when `len < N`. The polarity is upstream's and it
+    /// is load-bearing: `naga`'s constant evaluator spells this
+    /// `.into_inner().unwrap()` and relies on the panic to reject a
+    /// short vector component list. Returning an `Ok` with a default-filled
+    /// tail would compile everywhere and emit shaders built from garbage.
+    // Skip: `into_inner_unchecked` below carries the memory-model obligation;
+    // this arm is a pure `len` comparison.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn into_inner(self) -> Result<[T; N], Self> {
+        if self.len < N {
+            Err(self)
+        } else {
+            // SAFETY: `len >= N` and the invariant gives `len <= N`, so the
+            // vec is exactly full and every slot is initialized.
+            Ok(unsafe { self.into_inner_unchecked() })
+        }
+    }
+
+    /// Return the inner fixed-size array without checking that it is full.
+    ///
+    /// # Safety
+    ///
+    /// Sound if and only if `len == N`.
+    // Skip (the pop/clear/as_slice init-tracking family): proving every slot
+    // is INITIALIZED before the whole-array `ptr::read` needs the per-slot
+    // memory-model producer. Same audited invariant — `len` counts exactly the
+    // initialized prefix — plus the caller's `len == N` obligation.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub unsafe fn into_inner_unchecked(self) -> [T; N] {
+        debug_assert_eq!(self.len, N, "into_inner_unchecked on a non-full ArrayVec");
+        // `ManuallyDrop` first: the array is moved out wholesale, so `Drop for
+        // ArrayVec` must NOT also run over the same slots.
+        let me = ManuallyDrop::new(self);
+        // SAFETY: `[MaybeUninit<T>; N]` has the same layout as `[T; N]`, the
+        // caller guarantees all `N` slots are initialized, and `me` will not be
+        // dropped, so the elements are moved (not copied) exactly once.
+        unsafe { core::ptr::read(me.buf.as_ptr().cast::<[T; N]>()) }
+    }
+
+    /// Remove `range` from the vec and yield the removed elements.
+    ///
+    /// The tail is closed up as the iterator runs, so the vec is in a valid,
+    /// correctly-shortened state at every point — including if the [`Drain`]
+    /// is dropped early, and including if it is `mem::forget`ten (see the
+    /// divergence note on [`Drain`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range's start is past its end, or its end past `len`.
+    #[track_caller]
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T, N> {
+        let len = self.len;
+        let start = match range.start_bound() {
+            Bound::Unbounded => 0,
+            Bound::Included(&i) => i,
+            Bound::Excluded(&i) => i.saturating_add(1),
+        };
+        let end = match range.end_bound() {
+            Bound::Unbounded => len,
+            Bound::Included(&j) => j.saturating_add(1),
+            Bound::Excluded(&j) => j,
+        };
+        assert!(start <= end, "ArrayVec::drain: start {start} > end {end}");
+        assert!(end <= len, "ArrayVec::drain: end {end} > len {len}");
+        Drain {
+            vec: self,
+            start,
+            remaining: end - start,
+        }
     }
 }
 
@@ -447,6 +634,27 @@ impl<T: Clone, const N: usize> Clone for ArrayVec<T, N> {
             new.push(item.clone());
         }
         new
+    }
+
+    /// Overridden (the trait default would `drop` every existing element and
+    /// rebuild) so that the common prefix is `clone_from`-ed in place, exactly
+    /// as upstream `arrayvec` does. The observable result is identical; what
+    /// changes is the per-call cost, and `wgpu-hal`'s GLES backend calls this
+    /// on every pipeline bind (`gles/command.rs:238`).
+    fn clone_from(&mut self, source: &Self) {
+        let prefix = if self.len < source.len {
+            self.len
+        } else {
+            source.len
+        };
+        self.as_mut_slice()[..prefix].clone_from_slice(&source.as_slice()[..prefix]);
+        if prefix < self.len {
+            // `source` was shorter: drop our surplus tail.
+            self.truncate(prefix);
+        } else {
+            // `source` was longer (or equal): clone the difference in.
+            self.extend_from_slice(&source.as_slice()[prefix..]);
+        }
     }
 }
 
@@ -483,6 +691,283 @@ impl<T, const N: usize> FromIterator<T> for ArrayVec<T, N> {
             av.push(item);
         }
         av
+    }
+}
+
+// ── Capacity error ──────────────────────────────────────────────────────────
+
+/// The element did not fit.
+///
+/// Upstream `arrayvec`'s error type, reproduced so that
+/// [`ArrayVec::try_push`] and [`ArrayVec::try_extend_from_slice`] have
+/// upstream's exact signatures. `Debug` and `Display` are hand-written and do
+/// NOT require `T: Debug`, matching upstream: the payload is deliberately not
+/// printed, because it is frequently a value whose `Debug` is enormous.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CapacityError<T = ()> {
+    element: T,
+}
+
+impl<T> CapacityError<T> {
+    /// Wrap the element that did not fit.
+    #[must_use]
+    pub const fn new(element: T) -> Self {
+        Self { element }
+    }
+
+    /// Take the element back out.
+    #[must_use]
+    pub fn element(self) -> T {
+        self.element
+    }
+
+    /// Drop the payload, keeping only the "it did not fit" fact.
+    #[must_use]
+    pub fn simplify(self) -> CapacityError {
+        CapacityError { element: () }
+    }
+}
+
+/// The one message, shared by `Display` and `Debug` — upstream's wording.
+const CAPACITY_ERROR_MESSAGE: &str = "insufficient capacity";
+
+impl<T> fmt::Display for CapacityError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(CAPACITY_ERROR_MESSAGE)
+    }
+}
+
+impl<T> fmt::Debug for CapacityError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CapacityError: {CAPACITY_ERROR_MESSAGE}")
+    }
+}
+
+// DIVERGENCE, deliberate and a strict superset: upstream gates this impl on its
+// `std` feature, because `Error` lived only in `std` when 0.7.6 was written.
+// `core::error::Error` is stable now, so the impl is unconditional here. Every
+// program that compiled against upstream's still compiles; programs that would
+// have failed under `default-features = false` now succeed. The `T: Any` bound
+// is upstream's, kept so the two impls select identically.
+impl<T: core::any::Any> core::error::Error for CapacityError<T> {}
+
+// ── Hash ────────────────────────────────────────────────────────────────────
+
+// DELEGATES TO THE SLICE, and that is the whole point. `&**self` is exactly
+// `len` elements; hashing the backing `[MaybeUninit<T>; N]` would read
+// uninitialized memory while still satisfying the Hash/Eq contract within a
+// single process — i.e. it would pass every test and be UB. `wgpu-hal`'s
+// `ProgramCacheKey`, `RenderPassKey` and `FramebufferKey` and `wgpu-core`'s
+// `AttachmentData` are all `HashMap` keys that reach here through
+// `#[derive(Hash)]`.
+impl<T: Hash, const N: usize> Hash for ArrayVec<T, N> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Hash::hash(&**self, state);
+    }
+}
+
+// ── Extend ──────────────────────────────────────────────────────────────────
+
+/// PANICS on overflow; it does not truncate.
+///
+/// This is the single most consequential line in the file. A fixed-capacity
+/// `extend` that quietly stopped at capacity would compile everywhere and never
+/// fire: `wgpu-hal`'s DXC path (`dx12/shader_compilation.rs:388`) would drop
+/// compiler arguments and silently change how every HLSL shader is built, and
+/// `wgpu-core`'s texture-to-texture copy (`command/transfer.rs:1462`) would
+/// drop the destination barrier and race the GPU. Upstream panics; so does
+/// this, via `push`.
+impl<T, const N: usize> Extend<T> for ArrayVec<T, N> {
+    // AUDITED CONTRACT PANIC (T9): the overflow panic is `push`'s documented
+    // capacity contract, reached through caller-chosen `I: IntoIterator` code
+    // (the user-T dispatch class, as in `FromIterator` above).
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[track_caller]
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for item in iter {
+            self.push(item);
+        }
+    }
+}
+
+// ── Iteration ───────────────────────────────────────────────────────────────
+
+// `for x in &av` and `for x in &mut av` need these EXPLICITLY: trait selection
+// happens before autoderef, so `Deref<Target = [T]>` does not satisfy either
+// loop. Both bound the walk by `len` (through `as_slice`/`as_mut_slice`), never
+// by `N` — `tiny-skia`'s `pipeline/mod.rs:407` writes through every element it
+// visits, so a `0..N` walk would write into uninitialized slots.
+impl<'a, T, const N: usize> IntoIterator for &'a ArrayVec<T, N> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a mut ArrayVec<T, N> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T, const N: usize> IntoIterator for ArrayVec<T, N> {
+    type Item = T;
+    type IntoIter = IntoIter<T, N>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { vec: self }
+    }
+}
+
+/// By-value iterator for [`ArrayVec`], produced by `IntoIterator`.
+///
+/// # Why this owns an `ArrayVec` and moves elements out with `remove(0)`
+///
+/// The dangerous way to write this type is an index cursor plus a hand-rolled
+/// `Drop` that drops the un-yielded remainder. Get that `Drop` wrong in one
+/// direction and every early `return` out of a `for ra in self.render_attachments`
+/// (`wgpu-core/src/command/render.rs:1532`) leaks an `Arc<Texture>` — no panic,
+/// no failing test, just VRAM that never comes back. Get it wrong in the other
+/// direction and it double-frees.
+///
+/// Holding the `ArrayVec` itself removes the failure mode instead of testing
+/// for it: the un-yielded elements are exactly the elements still in the vec,
+/// so `ArrayVec`'s own already-audited `Drop` drops each of them exactly once
+/// and there is no second drop path to get wrong. There is no `impl Drop` on
+/// this type at all, and no `unsafe` in it.
+///
+/// The cost is that forward iteration is O(n²) in element moves rather than
+/// O(n), because each `next` shifts the tail down by one. The largest capacity
+/// anywhere in the patched graph is 32 and these sites are pipeline/attachment
+/// setup, not per-frame work, so the shifts are bounded by a few hundred
+/// register-sized moves per call. That trade is deliberate.
+pub struct IntoIter<T, const N: usize> {
+    vec: ArrayVec<T, N>,
+}
+
+impl<T, const N: usize> IntoIter<T, N> {
+    /// The not-yet-yielded elements, in order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        self.vec.as_slice()
+    }
+
+    /// The not-yet-yielded elements, in order, mutably.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.vec.as_mut_slice()
+    }
+}
+
+impl<T, const N: usize> Iterator for IntoIter<T, N> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.vec.is_empty() {
+            None
+        } else {
+            Some(self.vec.remove(0))
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.vec.len();
+        (len, Some(len))
+    }
+}
+
+impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
+    fn next_back(&mut self) -> Option<T> {
+        self.vec.pop()
+    }
+}
+
+impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {}
+
+impl<T: Clone, const N: usize> Clone for IntoIter<T, N> {
+    fn clone(&self) -> Self {
+        Self {
+            vec: self.vec.clone(),
+        }
+    }
+}
+
+impl<T: fmt::Debug, const N: usize> fmt::Debug for IntoIter<T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.vec.as_slice()).finish()
+    }
+}
+
+/// A draining iterator for [`ArrayVec`], produced by [`ArrayVec::drain`].
+///
+/// # Why the tail closes up as it goes
+///
+/// `wgpu-hal`'s GLES backend empties `resolve_attachments` exactly once per
+/// pass, with `drain(..)` at `gles/command.rs:698`. A `drain` that yielded the
+/// elements but left `len` alone would make every later pass re-emit the
+/// previous pass's MSAA resolves against stale `TextureView`s — wrong pixels,
+/// never a panic. So the removal has to be real, and it has to happen whether
+/// or not the caller runs the iterator to the end.
+///
+/// This type therefore removes each element from the vec as it yields it
+/// (`ArrayVec::remove`, which shifts the tail down), and its `Drop` simply
+/// drains whatever is left. Like [`IntoIter`], it contains no `unsafe`.
+///
+/// DIVERGENCE from upstream, in the safe direction: upstream shortens the vec
+/// up front and restores the tail in `Drop`, so `mem::forget`ting an upstream
+/// `Drain` loses the un-drained tail. Forgetting this one leaves those elements
+/// in the vec instead. Nothing in the patched graph forgets a `Drain`, and
+/// "keeps the elements" is the safer of the two answers.
+pub struct Drain<'a, T, const N: usize> {
+    vec: &'a mut ArrayVec<T, N>,
+    /// Index in `vec` of the next element to yield from the FRONT.
+    start: usize,
+    /// How many of the requested range have not been yielded yet.
+    remaining: usize,
+}
+
+impl<T, const N: usize> Iterator for Drain<'_, T, N> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.remaining == 0 {
+            None
+        } else {
+            self.remaining -= 1;
+            Some(self.vec.remove(self.start))
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<T, const N: usize> DoubleEndedIterator for Drain<'_, T, N> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.remaining == 0 {
+            None
+        } else {
+            self.remaining -= 1;
+            // After the decrement, `start + remaining` is the last index of the
+            // range still to be drained.
+            Some(self.vec.remove(self.start + self.remaining))
+        }
+    }
+}
+
+impl<T, const N: usize> ExactSizeIterator for Drain<'_, T, N> {}
+
+impl<T, const N: usize> Drop for Drain<'_, T, N> {
+    fn drop(&mut self) {
+        // Removing each remaining element both drops it and closes the tail up,
+        // so an early-dropped `Drain` leaves exactly the same vec an exhausted
+        // one would.
+        while self.next().is_some() {}
     }
 }
 
@@ -534,7 +1019,9 @@ mod tests {
         let mut av: ArrayVec<i32, 2> = ArrayVec::new();
         assert!(av.try_push(1).is_ok());
         assert!(av.try_push(2).is_ok());
-        assert_eq!(av.try_push(3), Err(3));
+        assert_eq!(av.try_push(3), Err(CapacityError::new(3)));
+        // …and the element comes back out.
+        assert_eq!(av.try_push(4).unwrap_err().element(), 4);
     }
 
     #[test]
@@ -587,7 +1074,7 @@ mod tests {
         av.push(3);
         av.push(4);
         av.push(5);
-        av.retain(|x| x % 2 == 0);
+        av.retain(|x| *x % 2 == 0);
         assert_eq!(av.as_slice(), &[2, 4]);
     }
 
@@ -690,6 +1177,269 @@ mod tests {
         // All 5 elements must be dropped exactly once (no leak, no double-free).
         assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 5);
     }
+
+    // ── The surface added for the `arrayvec` shim ───────────────────────────
+
+    #[test]
+    fn test_into_inner_full_and_short() {
+        let mut av: ArrayVec<i32, 3> = ArrayVec::new();
+        av.push(1);
+        av.push(2);
+        // Short: Err, and the vec comes back untouched.
+        let mut av = av.into_inner().unwrap_err();
+        assert_eq!(av.as_slice(), &[1, 2]);
+        av.push(3);
+        // Full: Ok, in order.
+        assert_eq!(av.into_inner().unwrap(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_into_inner_moves_without_double_drop() {
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+        struct Bomb(std::rc::Rc<std::cell::Cell<usize>>);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let mut av: ArrayVec<Bomb, 2> = ArrayVec::new();
+        av.push(Bomb(std::rc::Rc::clone(&counter)));
+        av.push(Bomb(std::rc::Rc::clone(&counter)));
+        let arr = av.into_inner().unwrap_or_else(|_| unreachable!());
+        assert_eq!(counter.get(), 0, "into_inner must not drop");
+        drop(arr);
+        assert_eq!(counter.get(), 2, "each element dropped exactly once");
+    }
+
+    #[test]
+    fn test_hash_matches_slice_and_ignores_capacity() {
+        use std::collections::hash_map::DefaultHasher;
+        fn h<T: Hash + ?Sized>(v: &T) -> u64 {
+            let mut s = DefaultHasher::new();
+            v.hash(&mut s);
+            s.finish()
+        }
+        let mut a: ArrayVec<u8, 4> = ArrayVec::new();
+        let mut b: ArrayVec<u8, 32> = ArrayVec::new();
+        for v in [1u8, 2, 3] {
+            a.push(v);
+            b.push(v);
+        }
+        // Same elements, different N: the hash must not see the capacity, and
+        // it must equal the slice's own hash.
+        assert_eq!(h(&a), h(&b));
+        assert_eq!(h(&a), h(&[1u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn test_extend_and_collect_panic_rather_than_truncate() {
+        let mut av: ArrayVec<i32, 3> = ArrayVec::new();
+        av.extend([1, 2, 3]);
+        assert_eq!(av.as_slice(), &[1, 2, 3]);
+
+        // CONTROL for the tripwires below: the same call one element smaller
+        // must NOT panic, so a passing "it panicked" assertion cannot be an
+        // artifact of `extend` panicking unconditionally.
+        let control = std::panic::catch_unwind(|| {
+            let mut av: ArrayVec<i32, 3> = ArrayVec::new();
+            av.extend([1, 2]);
+            av.len()
+        });
+        assert_eq!(
+            control.ok(),
+            Some(2),
+            "control: a fitting extend must not panic"
+        );
+
+        let overflow = std::panic::catch_unwind(|| {
+            let mut av: ArrayVec<i32, 3> = ArrayVec::new();
+            av.extend([1, 2, 3, 4]);
+        });
+        assert!(overflow.is_err(), "extend must panic, never truncate");
+
+        let collected = std::panic::catch_unwind(|| {
+            let _: ArrayVec<i32, 3> = (1..=4).collect();
+        });
+        assert!(collected.is_err(), "collect must panic, never truncate");
+    }
+
+    #[test]
+    fn test_into_iter_by_value_order_and_drop_of_remainder() {
+        let mut av: ArrayVec<i32, 4> = ArrayVec::new();
+        av.extend([1, 2, 3, 4]);
+        assert_eq!(av.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+        struct Bomb(std::rc::Rc<std::cell::Cell<usize>>);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let mut av: ArrayVec<Bomb, 4> = ArrayVec::new();
+        for _ in 0..4 {
+            av.push(Bomb(std::rc::Rc::clone(&counter)));
+        }
+        {
+            let mut it = av.into_iter();
+            let first = it.next().unwrap();
+            drop(first);
+            assert_eq!(counter.get(), 1);
+            // `it` is dropped here with three elements un-yielded.
+        }
+        assert_eq!(
+            counter.get(),
+            4,
+            "the un-yielded remainder is dropped exactly once"
+        );
+    }
+
+    #[test]
+    fn test_into_iter_double_ended_and_as_slice() {
+        let mut av: ArrayVec<i32, 5> = ArrayVec::new();
+        av.extend([1, 2, 3, 4, 5]);
+        let mut it = av.into_iter();
+        assert_eq!(it.next(), Some(1));
+        assert_eq!(it.next_back(), Some(5));
+        assert_eq!(it.as_slice(), &[2, 3, 4]);
+        assert_eq!(it.len(), 3);
+        assert_eq!(it.collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_iter_by_ref_and_by_mut_are_bounded_by_len() {
+        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
+        av.extend([1, 2, 3]);
+        let mut seen = Vec::new();
+        for v in &av {
+            seen.push(*v);
+        }
+        assert_eq!(seen, vec![1, 2, 3], "&ArrayVec walks 0..len, not 0..N");
+        for v in &mut av {
+            *v *= 10;
+        }
+        assert_eq!(av.as_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_drain_removes_and_closes_the_tail() {
+        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
+        av.extend([1, 2, 3, 4, 5]);
+        let taken: Vec<_> = av.drain(1..3).collect();
+        assert_eq!(taken, vec![2, 3]);
+        assert_eq!(av.as_slice(), &[1, 4, 5]);
+
+        // `drain(..)` — the form `wgpu-hal` uses — must EMPTY the vec.
+        let taken: Vec<_> = av.drain(..).collect();
+        assert_eq!(taken, vec![1, 4, 5]);
+        assert!(av.is_empty(), "drain(..) must leave the vec empty");
+    }
+
+    #[test]
+    fn test_drain_dropped_early_still_removes_and_drops_once() {
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+        struct Bomb(u32, std::rc::Rc<std::cell::Cell<usize>>);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.1.set(self.1.get() + 1);
+            }
+        }
+        let mut av: ArrayVec<Bomb, 8> = ArrayVec::new();
+        for i in 0..5 {
+            av.push(Bomb(i, std::rc::Rc::clone(&counter)));
+        }
+        {
+            let mut d = av.drain(1..4);
+            drop(d.next().unwrap());
+            assert_eq!(counter.get(), 1);
+            // dropped here with two of the three un-yielded
+        }
+        assert_eq!(counter.get(), 3, "the whole drained range is dropped once");
+        assert_eq!(av.len(), 2, "the tail closed up");
+        assert_eq!(av[0].0, 0);
+        assert_eq!(av[1].0, 4);
+    }
+
+    #[test]
+    fn test_drain_double_ended() {
+        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
+        av.extend([1, 2, 3, 4, 5]);
+        {
+            let mut d = av.drain(1..4);
+            assert_eq!(d.next_back(), Some(4));
+            assert_eq!(d.next(), Some(2));
+            assert_eq!(d.next(), Some(3));
+            assert_eq!(d.next(), None);
+        }
+        assert_eq!(av.as_slice(), &[1, 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "ArrayVec::drain: end")]
+    fn test_drain_past_len_panics() {
+        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
+        av.extend([1, 2]);
+        let _ = av.drain(0..3);
+    }
+
+    #[test]
+    fn test_clone_from_reuses_prefix_and_matches_clone() {
+        let mut dst: ArrayVec<String, 4> = ArrayVec::new();
+        dst.extend(["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        // Shorter source: truncates.
+        let mut src: ArrayVec<String, 4> = ArrayVec::new();
+        src.extend(["x".to_string()]);
+        dst.clone_from(&src);
+        assert_eq!(dst.as_slice(), src.as_slice());
+
+        // Longer source: extends.
+        let mut src: ArrayVec<String, 4> = ArrayVec::new();
+        src.extend([
+            "p".to_string(),
+            "q".to_string(),
+            "r".to_string(),
+            "s".to_string(),
+        ]);
+        dst.clone_from(&src);
+        assert_eq!(dst.as_slice(), src.as_slice());
+        assert_eq!(dst, src.clone());
+    }
+
+    #[test]
+    fn test_capacity_error_shape() {
+        let e = CapacityError::new(7u8);
+        assert_eq!(format!("{e}"), "insufficient capacity");
+        assert_eq!(format!("{e:?}"), "CapacityError: insufficient capacity");
+        assert_eq!(e.simplify(), CapacityError::new(()));
+        assert_eq!(e.element(), 7);
+    }
+
+    #[test]
+    fn test_retain_can_mutate_through_the_predicate() {
+        let mut av: ArrayVec<i32, 8> = ArrayVec::new();
+        av.extend([1, 2, 3, 4]);
+        // Upstream's bound is `FnMut(&mut T) -> bool`; this closure could not
+        // compile against the old `FnMut(&T) -> bool`.
+        av.retain(|v| {
+            *v += 100;
+            *v % 2 == 1
+        });
+        assert_eq!(av.as_slice(), &[101, 103]);
+    }
+
+    #[test]
+    fn test_extend_from_slice_and_try_form() {
+        let mut av: ArrayVec<u8, 4> = ArrayVec::new();
+        av.extend_from_slice(&[1, 2]);
+        assert!(av.try_extend_from_slice(&[3, 4]).is_ok());
+        assert_eq!(av.as_slice(), &[1, 2, 3, 4]);
+        // All-or-nothing: the vec is untouched when the slice does not fit.
+        let mut av: ArrayVec<u8, 4> = ArrayVec::new();
+        av.extend_from_slice(&[1, 2, 3]);
+        assert!(av.try_extend_from_slice(&[4, 5]).is_err());
+        assert_eq!(av.as_slice(), &[1, 2, 3]);
+    }
 }
 
 // ── Kani proofs ────────────────────────────────────────────────────────────
@@ -747,7 +1497,7 @@ mod kani_proofs {
         av.push(3);
 
         // Retain elements strictly less than the symbolic threshold.
-        av.retain(|&x| x < threshold);
+        av.retain(|x| *x < threshold);
 
         // The number of values in 0..4 that are < threshold is exactly
         // min(threshold, 4).

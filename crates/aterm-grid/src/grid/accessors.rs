@@ -13,7 +13,7 @@ use aterm_types::index::Dimensions;
 use super::Grid;
 use crate::Damage;
 use crate::extra_collection::CellRenderData;
-use crate::{CellExtra, CellExtras};
+use crate::{CellCoord, CellExtra, CellExtras};
 use crate::{ExtendedStyle, Style, StyleId, StyleTable};
 
 /// Bridge-compatible grid dimensions (#3828).
@@ -554,6 +554,21 @@ impl Grid {
     #[inline]
     pub fn cell_extra_mut(&mut self, row: u16, col: u16) -> &mut CellExtra {
         self.storage.cell_extra_mut(row, col)
+    }
+
+    /// Attach an inline-image ref to a cell (iTerm2 OSC 1337 / sixel / Kitty).
+    ///
+    /// Goes through `CellExtras::set_image` rather than
+    /// `cell_extra_mut(..).set_image(..)` so the collection's scroll-off scan
+    /// gate is armed by the same call that places the picture — an image the
+    /// gate never heard about is one that vanishes at the top of the screen.
+    #[inline]
+    pub fn set_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
+        // Set the HAS_EXTRAS bit first (the cell-level flag the render fast
+        // paths gate on), exactly as `cell_extra_mut` would.
+        self.storage.cell_extra_mut(row, col);
+        let coord = CellCoord::new(row, col);
+        self.storage.extras_mut().set_image(coord, image);
     }
 
     /// Get or create extras for a cell whose HAS_EXTRAS flag is already set.

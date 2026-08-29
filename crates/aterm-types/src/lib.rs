@@ -62,8 +62,13 @@ mod color_palette;
 pub mod control_socket;
 pub mod control_verbs;
 pub mod fs_restricted;
+// The inline-image payload: shared vocabulary because the live grid and the
+// history line model must hold the SAME `Arc`, and neither of those crates can
+// see the other's types (see the module docs).
+mod inline_image;
 pub mod scheme;
 mod x11_colors;
+pub use inline_image::{ImageData, ImageFormat};
 // Re-export cursor style at crate root (was inline, extracted for file size).
 pub use cursor::CursorStyle;
 // Re-export color palette at crate root (extracted for file size, Part of #5332).

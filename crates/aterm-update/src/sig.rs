@@ -17,8 +17,6 @@
 //! here: `ring`'s `UnparsedPublicKey::new(&ED25519, pk).verify(msg, sig)`, cheapest
 //! gate first (empty-pin → key length → sig length → the crypto), fail-closed.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
 /// Why a manifest signature was rejected. Every crypto failure collapses to
@@ -88,7 +86,8 @@ pub fn verify_detached(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), S
     if pubkey_b64.is_empty() {
         return Err(SigReject::Disabled);
     }
-    let pk = STANDARD.decode(pubkey_b64).map_err(|_| SigReject::BadKey)?;
+    let pk =
+        aterm_codec::base64::decode_strict(pubkey_b64.as_bytes()).map_err(|_| SigReject::BadKey)?;
     if pk.len() != 32 {
         return Err(SigReject::BadKey);
     }
@@ -103,8 +102,14 @@ pub fn verify_detached(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD as B64;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`), held
+    /// byte-identical to the retired `base64` package's `general_purpose::STANDARD`
+    /// by `crates/aterm-codec/tests/base64_oracle.rs`.
+    fn b64(raw: &[u8]) -> String {
+        aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
+    }
 
     const SEED: [u8; 32] = [7u8; 32];
 
@@ -115,7 +120,7 @@ mod tests {
     #[test]
     fn accepts_a_valid_signature_rejects_tamper_and_wrong_key() {
         let kp = keypair();
-        let pk = B64.encode(kp.public_key().as_ref());
+        let pk = b64(kp.public_key().as_ref());
         let msg = b"schema = 1\nbuild_number = 42\n";
         let sig = kp.sign(msg);
 
@@ -130,12 +135,10 @@ mod tests {
             Err(SigReject::Verify)
         );
         // a different key ⇒ Verify.
-        let other = B64.encode(
-            Ed25519KeyPair::from_seed_unchecked(&[9u8; 32])
-                .unwrap()
-                .public_key()
-                .as_ref(),
-        );
+        let other = b64(Ed25519KeyPair::from_seed_unchecked(&[9u8; 32])
+            .unwrap()
+            .public_key()
+            .as_ref());
         assert_eq!(
             verify_detached(&other, msg, sig.as_ref()),
             Err(SigReject::Verify)
@@ -145,7 +148,7 @@ mod tests {
     #[test]
     fn fails_closed_on_empty_key_bad_key_and_bad_sig() {
         let kp = keypair();
-        let pk = B64.encode(kp.public_key().as_ref());
+        let pk = b64(kp.public_key().as_ref());
         let sig = kp.sign(b"m");
         assert_eq!(
             verify_detached("", b"m", sig.as_ref()),
@@ -156,7 +159,7 @@ mod tests {
             Err(SigReject::BadKey)
         );
         assert_eq!(
-            verify_detached(&B64.encode([0u8; 16]), b"m", sig.as_ref()),
+            verify_detached(&b64(&[0u8; 16]), b"m", sig.as_ref()),
             Err(SigReject::BadKey)
         );
         assert_eq!(
@@ -171,8 +174,8 @@ mod tests {
     fn accepts_any_member_of_the_keyset() {
         let k1 = keypair();
         let k2 = Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).unwrap();
-        let p1 = B64.encode(k1.public_key().as_ref());
-        let p2 = B64.encode(k2.public_key().as_ref());
+        let p1 = b64(k1.public_key().as_ref());
+        let p2 = b64(k2.public_key().as_ref());
         let msg = b"appcast bytes";
         let s1 = k1.sign(msg);
         let s2 = k2.sign(msg);
@@ -192,7 +195,7 @@ mod tests {
     fn a_key_outside_the_keyset_is_refused() {
         let k1 = keypair();
         let retired = Ed25519KeyPair::from_seed_unchecked(&[3u8; 32]).unwrap();
-        let p1 = B64.encode(k1.public_key().as_ref());
+        let p1 = b64(k1.public_key().as_ref());
         let msg = b"appcast bytes";
         let sig = retired.sign(msg);
         assert_eq!(
@@ -225,7 +228,7 @@ mod tests {
     #[test]
     fn a_malformed_member_can_neither_grant_nor_deny() {
         let kp = keypair();
-        let pk = B64.encode(kp.public_key().as_ref());
+        let pk = b64(kp.public_key().as_ref());
         let msg = b"m";
         let sig = kp.sign(msg);
         assert_eq!(
@@ -234,7 +237,7 @@ mod tests {
         );
         assert_eq!(verify_detached_any(&["", &pk], msg, sig.as_ref()), Ok(1));
         assert_eq!(
-            verify_detached_any(&[&B64.encode([0u8; 16]), &pk], msg, sig.as_ref()),
+            verify_detached_any(&[&b64(&[0u8; 16]), &pk], msg, sig.as_ref()),
             Ok(1)
         );
     }
@@ -244,7 +247,7 @@ mod tests {
     #[test]
     fn signature_length_is_checked_before_any_member() {
         let kp = keypair();
-        let pk = B64.encode(kp.public_key().as_ref());
+        let pk = b64(kp.public_key().as_ref());
         assert_eq!(
             verify_detached_any(&[&pk, &pk], b"m", &[0u8; 10]),
             Err(SigReject::BadSig)

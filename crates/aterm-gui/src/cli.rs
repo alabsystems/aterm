@@ -436,7 +436,7 @@ const STARTER_CONFIG: &str = "\
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
-# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; a smooth full-height continuous rainbow with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (explicit thin/highlighter alternate) | rainbow kitty tall (explicit spelling of the default full-height geometry; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | off
+# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the highlighter behind your text joined to a flat strip in the leading, with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (an explicit spelling of that default geometry) | rainbow kitty tall (the v0.43 full-height body — letters inside the light; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
@@ -1459,7 +1459,7 @@ mod tests {
         // Every commented top-level `key = value` line the `--write-config` starter
         // ships must, when uncommented, deserialize into `Config`. A TYPE-mismatched
         // example (e.g. the old `bidi = false` against an `Option<String>` field)
-        // aborts the WHOLE `toml::from_str::<Config>` at load, so `load_config` falls
+        // aborts the WHOLE `aterm_toml::from_str::<Config>` at load, so `load_config` falls
         // back to `Config::default()` and silently discards the user's entire config.
         // This gate makes the discoverability surface honest: an uncommentable line
         // can never reach the starter again.
@@ -1490,7 +1490,7 @@ mod tests {
                 && let Some(key) = key
             {
                 assert!(
-                    toml::from_str::<Config>(rest).is_ok(),
+                    aterm_toml::from_str::<Config>(rest).is_ok(),
                     "STARTER_CONFIG ships an uncommentable key — uncommenting it would \
                      abort the config load and revert to defaults:\n  {rest}"
                 );
@@ -1573,7 +1573,7 @@ mod tests {
                 block.push('\n');
             }
         }
-        let parsed: Config = toml::from_str(&block).unwrap_or_else(|e| {
+        let parsed: Config = aterm_toml::from_str(&block).unwrap_or_else(|e| {
             panic!(
                 "STARTER_CONFIG ships an uncommentable [matrix_rain] line — \
                  uncommenting the block would abort the config load:\n{block}\n{e}"

@@ -336,7 +336,10 @@ mod tests {
     #[test]
     fn row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget() {
         let pattern = "(?:x?){1020}z";
-        assert!(pattern.len() <= MAX_REGEX_PATTERN_LEN, "under the length gate");
+        assert!(
+            pattern.len() <= MAX_REGEX_PATTERN_LEN,
+            "under the length gate"
+        );
         let matcher = row_matcher(pattern).expect("compiles: the size ceiling admits this one");
         let concrete = RegexRowMatch {
             re: aterm_regex::RegexBuilder::new(pattern)
@@ -349,7 +352,10 @@ mod tests {
         let before = regex_budget_exhaustions();
         let row = "x".repeat(4096);
         let started = std::time::Instant::now();
-        assert!(!matcher.matches(&row), "an unfinishable row is a non-match, never a latch");
+        assert!(
+            !matcher.matches(&row),
+            "an unfinishable row is a non-match, never a latch"
+        );
         assert!(
             started.elapsed().as_secs() < 2,
             "the row took {:?}; the step budget is not bounding the scan",
@@ -360,9 +366,15 @@ mod tests {
             "failing closed must be counted, or an `await` that never latches is unexplainable"
         );
 
-        assert!(!concrete.budget_exhausted(), "a fresh matcher has nothing to report");
+        assert!(
+            !concrete.budget_exhausted(),
+            "a fresh matcher has nothing to report"
+        );
         assert!(!concrete.matches(&row));
-        assert!(concrete.budget_exhausted(), "and a refused row is on its record");
+        assert!(
+            concrete.budget_exhausted(),
+            "and a refused row is on its record"
+        );
 
         // A row it CAN finish still answers normally — the budget refuses the
         // expensive input, not the pattern.
@@ -374,9 +386,17 @@ mod tests {
     fn ordinary_patterns_never_reach_the_scan_budget() {
         let before = regex_budget_exhaustions();
         let row = "PROMPT-READY 66390b5c8f user@example.com 192.168.0.1 ERROR ".repeat(70);
-        for pattern in [r"PROMPT-READY", r"\b[0-9a-f]{7,40}\b", r"\S+@\S+", r"(?i)error|warn"] {
+        for pattern in [
+            r"PROMPT-READY",
+            r"\b[0-9a-f]{7,40}\b",
+            r"\S+@\S+",
+            r"(?i)error|warn",
+        ] {
             let m = row_matcher(pattern).expect("compiles");
-            assert!(m.matches(&row), "{pattern:?} must match a full-width row of its own content");
+            assert!(
+                m.matches(&row),
+                "{pattern:?} must match a full-width row of its own content"
+            );
         }
         assert_eq!(
             regex_budget_exhaustions(),

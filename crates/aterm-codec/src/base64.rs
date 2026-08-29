@@ -37,6 +37,13 @@ pub enum DecodeError {
     InvalidLength(usize),
     /// The input exceeds [`crate::MAX_INPUT_LEN`] (DoS guard); value is the actual length.
     InputTooLarge(usize),
+    /// Strict decode only: the padding is not canonical — the input length is
+    /// not an exact multiple of four. Value is the input length.
+    InvalidPadding(usize),
+    /// Strict decode only: the final data symbol carries bits the decode would
+    /// discard, so the input is a NON-CANONICAL spelling of its own output
+    /// (`"Zh=="` and `"Zg=="` both mean `b"f"`). Position + the offending byte.
+    InvalidLastSymbol(usize, u8),
 }
 
 impl fmt::Display for DecodeError {
@@ -61,6 +68,18 @@ impl fmt::Display for DecodeError {
                 crate::write_usize_decimal(f, *len)?;
                 f.write_str(" exceeds maximum ")?;
                 crate::write_usize_decimal(f, crate::MAX_INPUT_LEN)
+            }
+            Self::InvalidPadding(len) => {
+                f.write_str("base64 input is not canonically padded: length ")?;
+                crate::write_usize_decimal(f, *len)?;
+                f.write_str(" is not a multiple of 4")
+            }
+            Self::InvalidLastSymbol(pos, byte) => {
+                f.write_str("non-canonical base64: symbol 0x")?;
+                crate::write_hex_byte_upper(f, *byte)?;
+                f.write_str(" at position ")?;
+                crate::write_usize_decimal(f, *pos)?;
+                f.write_str(" has bits the decode discards")
             }
         }
     }
@@ -141,13 +160,60 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     decode_with_table(input.as_bytes(), &STANDARD_DECODE)
 }
 
-/// Decode URL-safe Base64 (without padding).
+/// Decode URL-safe Base64 without padding, under STRICT RFC 4648
+/// canonicalisation — the exact acceptance set of `base64`'s
+/// `URL_SAFE_NO_PAD` engine.
+///
+/// It used to be the LENIENT decoder wearing this name: it delegated to the
+/// same body [`decode`] does, which strips trailing `=` and ignores the bits a
+/// truncated quad discards. Measured over 200,000 random candidates against the
+/// retired engine, that was 12,538 disagreements — every one of them
+/// ours-accepts / oracle-refuses (`"B1"`, `"1b="`, a bare `"="`). Nothing in
+/// the tree called it, so this is a trap closed before the next caller finds
+/// it, not a behaviour change under anyone.
+///
+/// Concretely, and unlike [`decode`]:
+///
+/// * `=` is never accepted — the URL-safe no-pad form has no padding, so the
+///   pad byte is simply outside the alphabet;
+/// * the low bits of the final symbol that the decode discards must be zero, so
+///   exactly ONE spelling maps to any given byte string.
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError`] if the input contains invalid characters.
+/// Returns [`DecodeError`] if the input is over [`crate::MAX_INPUT_LEN`],
+/// contains a byte outside the URL-safe alphabet (`=` included), has a length
+/// that leaves a one-symbol tail, or is a non-canonical spelling of its output.
 pub fn decode_url_safe_no_pad(input: &str) -> Result<Vec<u8>, DecodeError> {
-    decode_with_table(input.as_bytes(), &URL_SAFE_DECODE)
+    decode_strict_no_pad_with_table(input.as_bytes(), &URL_SAFE_DECODE)
+}
+
+/// Decode standard Base64 under STRICT RFC 4648 canonicalisation.
+///
+/// This is the acceptance set every trust-critical decode in the tree needs,
+/// and it is deliberately NARROWER than [`decode`]:
+///
+/// * the input length must be an exact multiple of four — canonical padding is
+///   REQUIRED, where [`decode`] happily accepts an unpadded tail;
+/// * `=` may appear only as the last one or two bytes of the final quad;
+/// * the low bits of the final data symbol that the decode discards must be
+///   zero, so exactly ONE Base64 spelling maps to any given byte string.
+///
+/// That last rule is the reason this entry point exists. Under [`decode`] both
+/// `"Zg=="` and `"Zh=="` yield `b"f"`, so a pinned Ed25519 key would have
+/// textual aliases that compare unequal as strings yet verify identically —
+/// and the release pipeline compares those keys AS TEXT
+/// (`aterm_release::publish::canonical_update_pubkey`). Signature, roster and
+/// pinned-key paths therefore call `decode_strict`; [`decode`] stays lenient
+/// for terminal payloads (OSC 52, OSC 1337) where real emitters omit padding.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] if the input is over [`crate::MAX_INPUT_LEN`],
+/// contains a byte outside the standard alphabet, is not canonically padded, or
+/// is a non-canonical spelling of its output.
+pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    decode_strict_with_table(input, &STANDARD_DECODE)
 }
 
 // ── Internal ────────────────────────────────────────────────────────────────
@@ -306,6 +372,169 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
             out.push(((n >> 8) & 0xFF) as u8);
         }
         _ => {}
+    }
+
+    Ok(out)
+}
+
+/// The unpadded counterpart of [`decode_strict_with_table`]: no `=` anywhere,
+/// a tail of two or three symbols instead of a pad-filled quad, and the same
+/// refusal of discarded bits that are not zero.
+fn decode_strict_no_pad_with_table(
+    input: &[u8],
+    table: &[u8; 256],
+) -> Result<Vec<u8>, DecodeError> {
+    // Dominating DoS guard, identical in placement and effect to the two
+    // decoders above: bound the input before any work, so the `with_capacity`
+    // below is provably under the verifier's allocation ceiling.
+    if input.len() > crate::MAX_INPUT_LEN {
+        return Err(DecodeError::InputTooLarge(input.len()));
+    }
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A one-symbol tail carries six bits, which is less than a byte, so it can
+    // never be the truncation of any encoding.
+    if input.len() % 4 == 1 {
+        return Err(DecodeError::InvalidLength(input.len()));
+    }
+
+    // At most 3 output bytes per 4 input bytes, so the decoded length never
+    // exceeds the (already guarded) input length. `.min` restates the dominating
+    // guard as a local fact for the verifier; identical value on every path.
+    let cap = input.len().min(crate::MAX_INPUT_LEN);
+    let mut out = Vec::with_capacity(cap);
+
+    // `=` is outside the URL-safe alphabet, so `decode_byte` refuses it in any
+    // position — which is the whole difference from the lenient body.
+    let (chunks, rem) = input.as_chunks::<4>();
+    let mut i: usize = 0;
+    for chunk in chunks {
+        let &[c0, c1, c2, c3] = chunk;
+        let a = decode_byte(table, c0, i)?;
+        let b = decode_byte(table, c1, i.saturating_add(1))?;
+        let c = decode_byte(table, c2, i.saturating_add(2))?;
+        let d = decode_byte(table, c3, i.saturating_add(3))?;
+        let n = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+        out.push(((n >> 16) & 0xFF) as u8);
+        out.push(((n >> 8) & 0xFF) as u8);
+        out.push((n & 0xFF) as u8);
+        i = i.saturating_add(4);
+    }
+
+    match *rem {
+        [r0, r1] => {
+            // 12 bits carried, 8 consumed: the low 4 bits of the second symbol
+            // are discarded and must therefore be zero.
+            let a = decode_byte(table, r0, i)?;
+            let b = decode_byte(table, r1, i.saturating_add(1))?;
+            if b & 0x0F != 0 {
+                return Err(DecodeError::InvalidLastSymbol(i.saturating_add(1), r1));
+            }
+            let n = (u32::from(a) << 18) | (u32::from(b) << 12);
+            out.push(((n >> 16) & 0xFF) as u8);
+        }
+        [r0, r1, r2] => {
+            // 18 bits carried, 16 consumed: the low 2 bits of the third symbol
+            // are discarded and must therefore be zero.
+            let a = decode_byte(table, r0, i)?;
+            let b = decode_byte(table, r1, i.saturating_add(1))?;
+            let c = decode_byte(table, r2, i.saturating_add(2))?;
+            if c & 0x03 != 0 {
+                return Err(DecodeError::InvalidLastSymbol(i.saturating_add(2), r2));
+            }
+            let n = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6);
+            out.push(((n >> 16) & 0xFF) as u8);
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        _ => {}
+    }
+
+    Ok(out)
+}
+
+fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeError> {
+    // Dominating DoS guard, identical in placement and effect to
+    // `decode_with_table`: bound the input before any work, so the
+    // `with_capacity` below is provably under the verifier's allocation ceiling.
+    if input.len() > crate::MAX_INPUT_LEN {
+        return Err(DecodeError::InputTooLarge(input.len()));
+    }
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Canonical padding: the encoded form of `n` bytes is always a whole number
+    // of quads. A remainder of 1 can never be a truncated quad (six bits is less
+    // than a byte) and is reported as a length error; any other remainder is an
+    // input that dropped its `=` padding.
+    let remainder = input.len() % 4;
+    if remainder != 0 {
+        return Err(if remainder == 1 {
+            DecodeError::InvalidLength(input.len())
+        } else {
+            DecodeError::InvalidPadding(input.len())
+        });
+    }
+
+    // At most 3 output bytes per 4 input bytes, so the decoded length never
+    // exceeds the (already guarded) input length. `.min` restates the dominating
+    // guard as a local fact for the verifier; identical value on every path.
+    let cap = input.len().min(crate::MAX_INPUT_LEN);
+    let mut out = Vec::with_capacity(cap);
+
+    // `input.len() % 4 == 0` and `input` is non-empty, so `as_chunks::<4>()`
+    // yields at least one `&[u8; 4]` and an EMPTY remainder — every byte of the
+    // input is covered by the loop below, and each index is bounded at compile
+    // time by the array pattern.
+    let (chunks, _rem) = input.as_chunks::<4>();
+    let last = chunks.len().saturating_sub(1);
+    let mut i: usize = 0;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let &[c0, c1, c2, c3] = chunk;
+        // Padding is legal ONLY in the final quad. In every other quad `=` is
+        // just a byte outside the alphabet and `decode_byte` rejects it, which
+        // is what makes `"Zg==Zg=="` an error rather than two concatenated
+        // decodes.
+        if idx == last && c3 == b'=' {
+            if c2 == b'=' {
+                // `XX==` — 12 bits carried, 8 consumed; the low 4 bits of the
+                // second symbol are discarded and must therefore be zero.
+                let a = decode_byte(table, c0, i)?;
+                let b = decode_byte(table, c1, i.saturating_add(1))?;
+                if b & 0x0F != 0 {
+                    return Err(DecodeError::InvalidLastSymbol(i.saturating_add(1), c1));
+                }
+                let n = (u32::from(a) << 18) | (u32::from(b) << 12);
+                out.push(((n >> 16) & 0xFF) as u8);
+            } else {
+                // `XXX=` — 18 bits carried, 16 consumed; the low 2 bits of the
+                // third symbol are discarded and must therefore be zero.
+                let a = decode_byte(table, c0, i)?;
+                let b = decode_byte(table, c1, i.saturating_add(1))?;
+                let c = decode_byte(table, c2, i.saturating_add(2))?;
+                if c & 0x03 != 0 {
+                    return Err(DecodeError::InvalidLastSymbol(i.saturating_add(2), c2));
+                }
+                let n = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6);
+                out.push(((n >> 16) & 0xFF) as u8);
+                out.push(((n >> 8) & 0xFF) as u8);
+            }
+        } else {
+            let a = decode_byte(table, c0, i)?;
+            let b = decode_byte(table, c1, i.saturating_add(1))?;
+            let c = decode_byte(table, c2, i.saturating_add(2))?;
+            let d = decode_byte(table, c3, i.saturating_add(3))?;
+            let n =
+                (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+            out.push(((n >> 16) & 0xFF) as u8);
+            out.push(((n >> 8) & 0xFF) as u8);
+            out.push((n & 0xFF) as u8);
+        }
+        // Advances by 4 per consumed quad and never exceeds `input.len()`, so
+        // the saturation never actually engages; it only makes the bound local.
+        i = i.saturating_add(4);
     }
 
     Ok(out)

@@ -63,7 +63,7 @@ struct Asset {
     id: String,
     viewbox: (f32, f32),
     anchor: (f32, f32, f32),
-    layers: Vec<toml::Value>,
+    layers: Vec<aterm_toml::Value>,
 }
 
 fn asset_path(id: &str) -> PathBuf {
@@ -72,7 +72,7 @@ fn asset_path(id: &str) -> PathBuf {
         .join(format!("{id}.toml"))
 }
 
-fn number(value: &toml::Value) -> f32 {
+fn number(value: &aterm_toml::Value) -> f32 {
     value
         .as_float()
         .map(|v| v as f32)
@@ -82,7 +82,7 @@ fn number(value: &toml::Value) -> f32 {
 
 fn load(id: &str) -> Asset {
     let source = std::fs::read_to_string(asset_path(id)).expect("read hero cat asset");
-    let doc: toml::Value = source.parse().expect("parse hero cat asset");
+    let doc: aterm_toml::Value = source.parse().expect("parse hero cat asset");
     let viewbox = doc["viewbox"].as_array().expect("viewbox array");
     let anchor = doc["anchor"].as_table().expect("anchor table");
     Asset {
@@ -97,11 +97,11 @@ fn load(id: &str) -> Asset {
     }
 }
 
-fn role(layer: &toml::Value) -> &str {
+fn role(layer: &aterm_toml::Value) -> &str {
     layer["role"].as_str().expect("semantic layer role")
 }
 
-fn role_layer<'a>(asset: &'a Asset, wanted: &str) -> &'a toml::Value {
+fn role_layer<'a>(asset: &'a Asset, wanted: &str) -> &'a aterm_toml::Value {
     asset
         .layers
         .iter()
@@ -109,7 +109,7 @@ fn role_layer<'a>(asset: &'a Asset, wanted: &str) -> &'a toml::Value {
         .unwrap_or_else(|| panic!("{} is missing `{wanted}`", asset.id))
 }
 
-fn parsed_paths(layer: &toml::Value) -> Vec<Vec<PathCmd>> {
+fn parsed_paths(layer: &aterm_toml::Value) -> Vec<Vec<PathCmd>> {
     layer["paths"]
         .as_array()
         .expect("paths array")
@@ -207,7 +207,7 @@ fn hex_rgb(value: &str) -> [f32; 3] {
     ]
 }
 
-fn luma(layer: &toml::Value) -> f32 {
+fn luma(layer: &aterm_toml::Value) -> f32 {
     let [r, g, b] = hex_rgb(layer["ref_fill"].as_str().expect("ref_fill"));
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
@@ -229,9 +229,10 @@ fn write_preview(path: &std::path::Path, tile: &Tile, dark: bool) {
         }
     }
     let file = std::fs::File::create(path).expect("create preview PNG");
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), tile.width(), tile.height());
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
+    let mut encoder =
+        aterm_png::Encoder::new(std::io::BufWriter::new(file), tile.width(), tile.height());
+    encoder.set_color(aterm_png::ColorType::Rgb);
+    encoder.set_depth(aterm_png::BitDepth::Eight);
     encoder
         .write_header()
         .expect("write PNG header")

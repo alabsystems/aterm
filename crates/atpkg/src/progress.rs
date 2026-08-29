@@ -592,7 +592,7 @@ fn write_now(s: &mut SinkState) {
         }
         _ => {}
     }
-    let Ok(text) = serde_json::to_string(&s.file) else {
+    let Ok(text) = aterm_json::to_string(&s.file) else {
         return;
     };
     // Manual concat, mirroring status.rs's temp naming (same Trust-gate rationale).
@@ -884,7 +884,7 @@ impl Drop for DownloadWatch {
 pub fn read_progress(layout: &crate::store::Layout) -> Option<ProgressFile> {
     let cap = usize::try_from(PROGRESS_READ_CAP).unwrap_or(usize::MAX);
     let text = crate::metadata_io::read_bounded_regular_utf8(&layout.progress_file(), cap).ok()?;
-    serde_json::from_str(&text).ok()
+    aterm_json::from_str(&text).ok()
 }
 
 /// Whether `file` was written by an installer that is RUNNING NOW: a fresh heartbeat
@@ -1028,7 +1028,7 @@ mod tests {
              "queue":["trust","robi"],
              "programs":{"trust":{"phase":"download","bytes_done":4300800,"bytes_total":30104576,
                                   "build":210,"bumped":true,"error":null}}}"#;
-        let parsed: ProgressFile = serde_json::from_str(json).unwrap();
+        let parsed: ProgressFile = aterm_json::from_str(json).unwrap();
         assert_eq!(parsed.v, PROGRESS_VERSION);
         assert_eq!(parsed.pid, Some(41234));
         assert_eq!(parsed.pass, "net");
@@ -1041,7 +1041,7 @@ mod tests {
         assert!(trust.bumped && trust.error.is_none());
         // Round-trip: serialize → parse → identical.
         let reparsed: ProgressFile =
-            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+            aterm_json::from_str(&aterm_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(reparsed, parsed);
     }
 
@@ -1059,8 +1059,8 @@ mod tests {
             (Phase::Failed, "\"failed\""),
             (Phase::Skipped, "\"skipped\""),
         ] {
-            assert_eq!(serde_json::to_string(&phase).unwrap(), wire);
-            assert_eq!(serde_json::from_str::<Phase>(wire).unwrap(), phase);
+            assert_eq!(aterm_json::to_string(&phase).unwrap(), wire);
+            assert_eq!(aterm_json::from_str::<Phase>(wire).unwrap(), phase);
         }
     }
 
@@ -1071,7 +1071,7 @@ mod tests {
     fn unknown_fields_are_ignored_and_missing_fields_fail_safe() {
         let future = r#"{"v":1, "hologram":true,
              "programs":{"trust":{"phase":"done","shiny_new_meter":9000}}}"#;
-        let parsed: ProgressFile = serde_json::from_str(future).unwrap();
+        let parsed: ProgressFile = aterm_json::from_str(future).unwrap();
         assert_eq!(parsed.pid, None, "no pid claim without a pid field");
         assert_eq!(
             parsed.heartbeat_unix, 0,
@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(parsed.programs["trust"].phase, Phase::Done);
         // An unknown VERSION still parses the envelope — the reader's job is then to
         // render the generic line, not to guess at v2 field meanings.
-        let v2: ProgressFile = serde_json::from_str(r#"{"v":2}"#).unwrap();
+        let v2: ProgressFile = aterm_json::from_str(r#"{"v":2}"#).unwrap();
         assert_ne!(v2.v, PROGRESS_VERSION);
     }
 
@@ -1112,7 +1112,7 @@ mod writer_tests {
     }
 
     fn read_file(path: &std::path::Path) -> ProgressFile {
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        aterm_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
     /// The writer's landing is atomic (temp+rename — no temp survives) and the pass
@@ -1229,7 +1229,7 @@ mod writer_tests {
     #[test]
     fn snapshot_running_applies_the_heartbeat_window() {
         let now = 1_000_000u64;
-        let mut file: ProgressFile = serde_json::from_str(r#"{"v":1}"#).unwrap();
+        let mut file: ProgressFile = aterm_json::from_str(r#"{"v":1}"#).unwrap();
         file.pid = Some(std::process::id()); // this test process: provably alive
         file.heartbeat_unix = now;
         assert!(snapshot_running(&file, now));
@@ -1269,7 +1269,7 @@ mod writer_tests {
         let Ok(dead_pid) = dead else {
             return; // cannot build the fixture on this host — skip, don't lie
         };
-        let mut file: ProgressFile = serde_json::from_str(r#"{"v":1}"#).unwrap();
+        let mut file: ProgressFile = aterm_json::from_str(r#"{"v":1}"#).unwrap();
         file.pid = Some(dead_pid);
         file.heartbeat_unix = 1_000_000;
         assert!(

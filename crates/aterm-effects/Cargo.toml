@@ -27,11 +27,11 @@ aterm-render = { path = "../aterm-render", default-features = false }
 # Multilingual whole-word matching for the sparkle-words rescan.
 aterm-lexicon = { workspace = true }
 # v3 §6 spec framework: the FxHashMap override table (same hasher the lexicon
-# keys with) + serde/toml for the `[[sparkle_words.custom]]` fragment both the
+# keys with) + serde/aterm-toml for the `[[sparkle_words.custom]]` fragment both the
 # native resolver and the web `set_sparkle_custom_specs` surface parse.
 aterm-hash = { workspace = true }
 serde = { workspace = true }
-toml = { workspace = true }
+aterm-toml = { workspace = true }
 # Deterministic kinematics kit (mix_rgb/smoothstep) + the procedural Tile the
 # cat baker draws with. Pure/dependency-free (no `bridge` feature needed here).
 aterm-scene = { workspace = true }
@@ -59,7 +59,7 @@ font8x8 = { workspace = true }
 # The ty models the sparkle tests run (identity episodes, flash limiter).
 aterm-spec = { workspace = true }
 # Atlas PNG dumps for visual iteration (gated behind ATERM_CAT_DUMP); dev-only.
-png = "0.17"
+aterm-png = { workspace = true }
 # The per-frame effect benchmarks. Until these landed the crate had NO bench
 # target at all — 130k lines on the frame path with no instrument, which is how
 # four unmeasured "optimizations" once shipped a 1.83% engine regression.

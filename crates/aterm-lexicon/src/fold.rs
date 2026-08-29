@@ -78,6 +78,12 @@ pub fn fold_into(s: &str, out: &mut String) {
 /// (its accented letters are distinct phonemes, not decorations).
 #[must_use]
 fn base_letter(c: char) -> Option<char> {
+    // Every arm below matches an ACCENTED letter, all of them above ASCII (the
+    // ASCII letters in this table are the results, not the patterns). So an
+    // ASCII input has no accent to fold and needs none of the walk.
+    if c.is_ascii() {
+        return None;
+    }
     let b = match c {
         'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' | 'ǎ' => 'a',
         'ç' | 'ć' | 'č' | 'ċ' | 'ĉ' => 'c',
@@ -117,6 +123,13 @@ fn base_letter(c: char) -> Option<char> {
 /// which are part of the syllable.
 #[must_use]
 fn is_strippable_mark(c: char) -> bool {
+    // ASCII cannot be a combining mark, and the ranges below say so: the lowest
+    // starts at U+0300. Terminal text is overwhelmingly ASCII and this runs per
+    // character of every folded token, so the whole list was being walked to
+    // return `false`.
+    if c.is_ascii() {
+        return false;
+    }
     matches!(c as u32,
         0x0300..=0x036F   // Combining Diacritical Marks (Latin)
         | 0x0483..=0x0489 // Cyrillic combining
@@ -150,6 +163,12 @@ fn is_strippable_mark(c: char) -> bool {
 /// the resolver emits it as a `cjk = true` entry instead).
 #[must_use]
 pub fn is_no_space_script(c: char) -> bool {
+    // No ASCII scalar is in a no-space script — the lowest range here starts at
+    // U+0E00 (Thai). This predicate opens `is_token_char`, so it is the FIRST
+    // thing every scanned character meets.
+    if c.is_ascii() {
+        return false;
+    }
     matches!(c as u32,
         0x3040..=0x30FF   // Hiragana + Katakana
         | 0x31F0..=0x31FF // Katakana phonetic extensions
@@ -175,6 +194,14 @@ pub fn is_no_space_script(c: char) -> bool {
 /// a re-implemented look-alike would drift.
 #[must_use]
 pub fn is_token_char(c: char) -> bool {
+    // The ASCII answer in one branch. For an ASCII scalar `is_no_space_script`,
+    // `is_strippable_mark` and `is_kept_mark` are all provably false (their
+    // lowest ranges are U+0E00, U+0300 and U+0900), and `char::is_alphanumeric`
+    // — a Unicode table lookup — agrees exactly with `is_ascii_alphanumeric`
+    // over ASCII. So the whole predicate collapses to two comparisons.
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
     if is_no_space_script(c) {
         return false;
     }
@@ -184,6 +211,10 @@ pub fn is_token_char(c: char) -> bool {
 /// A spacing/combining mark we KEEP (Indic / Thai etc.) — these are part of the
 /// token but are not stripped by `fold`.
 fn is_kept_mark(c: char) -> bool {
+    // Same argument, one range further up: the lowest here is U+0900.
+    if c.is_ascii() {
+        return false;
+    }
     matches!(c as u32,
         0x0900..=0x097F   // Devanagari (matras, virama)
         | 0x0980..=0x09FF // Bengali
@@ -268,5 +299,52 @@ mod tests {
         assert!(is_no_space_script('ね'));
         assert!(is_no_space_script('고'));
         assert!(!is_no_space_script('a'));
+    }
+
+    /// THE EARLY-OUTS ARE ONLY SOUND WHILE THE TABLES STAY ABOVE ASCII, and the
+    /// hazard is not today — it is the day someone adds an ASCII codepoint to
+    /// one of these tables and the early-out silently shadows it.
+    ///
+    /// Asserting "every ASCII scalar answers false" would be CIRCULAR: the
+    /// early-out is what makes it true. So this reads the source of the three
+    /// range tables instead and pins the structural fact the fast paths rest
+    /// on — no scalar below U+0080 is named in any of them. A table that grows
+    /// an ASCII entry fails here rather than going quietly unreachable.
+    #[test]
+    fn every_range_the_ascii_early_outs_skip_lies_above_ascii() {
+        let src = include_str!("fold.rs");
+        for name in [
+            "fn is_strippable_mark",
+            "fn is_kept_mark",
+            "pub fn is_no_space_script",
+        ] {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} moved or was renamed"));
+            let body = &src[start..];
+            let end = body.find("\n}").expect("function has a closing brace");
+            let body = &body[..end];
+            let mut seen = 0usize;
+            let mut rest = body;
+            while let Some(at) = rest.find("0x") {
+                rest = &rest[at + 2..];
+                let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+                if hex.is_empty() {
+                    continue;
+                }
+                let cp = u32::from_str_radix(&hex, 16).expect("hex literal parses");
+                assert!(
+                    cp >= 0x80,
+                    "{name} names U+{cp:04X}, which is ASCII — the `c.is_ascii()` \
+                     early-out would skip it and this predicate would silently \
+                     stop matching it",
+                );
+                seen += 1;
+            }
+            assert!(
+                seen >= 5,
+                "{name}: found only {seen} codepoints — did the scan break?"
+            );
+        }
     }
 }

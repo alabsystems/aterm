@@ -1137,6 +1137,21 @@ pub struct CellExtras {
     /// and is erased the next time the cold path runs. `clear()` resets it to 0
     /// because it replaces the whole map.
     hyperlink_upper_bound: usize,
+    /// STICKY: an inline image has been placed into this collection at some
+    /// point. Never cleared except by [`Self::clear`], which replaces the map.
+    ///
+    /// The scroll-off path has to look for image refs over the FULL physical row
+    /// width, because `place_image` writes no glyph — an image-only row has
+    /// `Row::len() == 0`, so the text-driven extraction walk cannot reach the
+    /// cells that carry the picture. Without a gate that scan would run for
+    /// every scrolled row of every session whose map is merely non-empty (one
+    /// hyperlink or one combining mark anywhere on screen is enough), inside the
+    /// PTY reader's `term_lock` hold. This is the same shape as the
+    /// `complex_ring`/`rgb_ring` gates: sticky and conservative, so a session
+    /// that never draws a picture pays exactly one bool test per scrolled row,
+    /// and one that draws a single picture pays a bit-test scan it would have
+    /// paid anyway while the image was live.
+    any_image: bool,
 }
 
 impl CellExtras {
@@ -1153,6 +1168,7 @@ impl CellExtras {
             // never sees an OSC 8 link never pays a byte for it.
             hyperlink_scratch: Vec::new(),
             hyperlink_upper_bound: 0,
+            any_image: false,
         }
     }
 
@@ -1508,6 +1524,31 @@ impl CellExtras {
         extra
     }
 
+    /// Whether an inline image has EVER been placed here (see
+    /// [`any_image`](Self::any_image) field docs).
+    ///
+    /// The scroll-off image extraction consults this before scanning a row, so
+    /// a session with no picture in it never pays for the scan. `false` proves
+    /// no cell carries an image ref; `true` merely permits the scan.
+    #[must_use]
+    #[inline]
+    pub fn any_image(&self) -> bool {
+        self.any_image
+    }
+
+    /// Attach an inline-image ref to a cell, arming the scroll-off scan gate.
+    ///
+    /// The one entry point for placing a picture, so the gate cannot be missed:
+    /// `CellExtra::set_image` on a `&mut` handed out by `get_or_create` would
+    /// store the ref with no way to tell the collection about it, and the ref
+    /// would then be invisible to the scroll-off extraction that must carry it
+    /// into history.
+    #[inline]
+    pub fn set_image(&mut self, coord: CellCoord, image: crate::extra::ImageRef) {
+        self.any_image = true;
+        self.get_or_create(coord).set_image(Some(image));
+    }
+
     /// Set extras for a cell.
     ///
     /// If the extra has no data, removes the entry to save memory.
@@ -1520,6 +1561,12 @@ impl CellExtras {
             // link-free extras through here and must not inflate the bound.
             if extra.hyperlink().is_some() {
                 self.hyperlink_upper_bound += 1;
+            }
+            // Arm the scroll-off image scan for the bulk path too: checkpoint
+            // restore and DECCRA's rect copy both re-enter whole `CellExtra`
+            // values here, and one of them may carry a picture.
+            if extra.image().is_some() {
+                self.any_image = true;
             }
             self.data.insert(internal, extra);
         } else {
@@ -1855,6 +1902,9 @@ impl CellExtras {
         // Exact, not conservative: the map is gone, so the hyperlink population
         // is zero. ESC[2J therefore hands the guard a clean slate.
         self.hyperlink_upper_bound = 0;
+        // Same reasoning for the image gate: every image ref lived in the map
+        // that was just replaced, so there is provably none left to scan for.
+        self.any_image = false;
         if let Some(ring) = &mut self.complex_ring {
             ring.clear();
         }

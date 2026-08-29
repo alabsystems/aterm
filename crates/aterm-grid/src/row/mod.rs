@@ -411,6 +411,37 @@ impl Row {
     }
 
     /// Recalculate the len field by scanning up to `end`.
+    /// Settle `len` after a BULK wide-char run written through
+    /// [`Row::write_wide_char_packed_no_fixup`].
+    ///
+    /// The checked single-glyph writer does this per glyph, and it is not only a
+    /// grow. Its else arm SHRINKS: a wide write can orphan a pre-existing wide
+    /// char's continuation, the fixup clears that cell, and if it was the row's
+    /// last content then `len` is left stale-high and a phantom trailing space
+    /// surfaces in `row_text`, search and scrollback — the #7522 len class,
+    /// closed on the write path. [`Row::update_len`] is grow-only and cannot
+    /// close it, so a run lane that only calls `update_len` reopens it.
+    ///
+    /// Once per run is equivalent to once per glyph. The glyphs advance left to
+    /// right over cells the run itself owns, so only the final state can decide
+    /// `len`; and `recalculate_len_up_to` RESCANS rather than adjusting, so it
+    /// reaches the same answer from that end state as it would have from the
+    /// intermediate one.
+    ///
+    /// This is the WIDE-run half of a rule [`Row::cells_mut_with_fixup`] already
+    /// carries for the narrow one, in the same shape and for the same stated
+    /// reason ("bulk callers only GROW len via `update_len()` and never see that
+    /// past-range clear"). The narrow bulk writers were safe because they go
+    /// through that helper; the wide run lanes call `fixup_wide_chars_in_range`
+    /// directly and so bypassed the obligation with it.
+    pub fn settle_len_after_wide_run(&mut self, end_col: u16) {
+        self.update_len(end_col);
+        let len = self.len as usize;
+        if len > 0 && self.cells.get(len - 1).is_some_and(Cell::is_empty) {
+            self.recalculate_len_up_to(len);
+        }
+    }
+
     fn recalculate_len_up_to(&mut self, end: usize) {
         let end = end.min(self.cells.len());
         self.len = self

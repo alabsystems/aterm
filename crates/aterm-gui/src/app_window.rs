@@ -2235,6 +2235,22 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return CloseOutcome::Stay; // stale/unknown id → no-op
         }
+        // A single-tab window's close was DEFERRED: the gesture that started it
+        // (✕, Cmd-W, ctl `close`/`tab close`) captured its attribution on the
+        // window (`stash_deferred_close_attribution`) because THIS teardown — and
+        // the deregistration below that journals the exit — runs a later turn,
+        // after that gesture's `CloseAttribution` scope has dropped. Re-enter it
+        // now so `deregister_local_as` writes `reason=ctl-close`/`ui-close`
+        // instead of `reason=unknown by=-`. `enter` is outermost-wins, so a
+        // still-live scope (a red-button close that owns its own) takes
+        // precedence and this is inert; the stash is taken either way so it never
+        // outlives its close.
+        let deferred_attribution = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.pending_close_attribution.take());
+        let _deferred_close = deferred_attribution
+            .map(|(reason, actor)| crate::session_store::CloseAttribution::enter(reason, actor));
         // The recording owns this WindowState's tap and a pre-created output
         // directory. Abort while the tap is still reachable, before structural
         // removal can strand the client until its old deadline.

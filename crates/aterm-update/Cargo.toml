@@ -18,11 +18,14 @@ spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
 # Manifest (aterm-appcast.toml) + the on-disk `ready.toml` staging marker.
-toml = { workspace = true }
+aterm-toml = { workspace = true }
 serde = { workspace = true }
 # GitHub Releases API response is JSON; parse it (scoped to this crate only — the
 # core engine crates stay JSON-free).
-serde_json = { workspace = true }
+# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
+# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
+# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+aterm-json = { workspace = true }
 # renamex_np(RENAME_SWAP) for the atomic bundle swap (the .app-only syscall that
 # stays here). Already a workspace dependency (used by the control socket).
 libc = { workspace = true }
@@ -41,7 +44,12 @@ aterm-log = { workspace = true }
 # default (no pinned pubkey) tier needs no crypto — it stays sha256 + repo-trust.
 ring = { version = "0.17.14", default-features = false }
 # Decode the base64-pinned Ed25519 public key (32 raw bytes), same as atpkg.
-base64 = "0.22.1"
+# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
+# to the retired `base64` package's `general_purpose::STANDARD` engine by
+# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
+# point every trust path uses: canonical padding REQUIRED and no trailing bits,
+# so a pinned key has exactly one spelling.
+aterm-codec = { workspace = true }
 # Shipping introspection fingerprints the decoded compile-time update key. This
 # reports the key the verifier actually consumes, independent of optimizer/lipo
 # treatment of the source base64 literal.

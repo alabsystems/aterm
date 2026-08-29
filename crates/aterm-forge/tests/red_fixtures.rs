@@ -15,7 +15,7 @@
 //! Every test constructs a MINIATURE ATERM WORKSPACE in its own directory under
 //! the cargo target tmpdir (never in the repository, never in `/tmp`): a
 //! `crates/aterm` root package so the four cells have something to resolve, a
-//! REAL copy of `vendor/winnow` so the provenance obligations have real
+//! REAL copy of `vendor/indexmap` so the provenance obligations have real
 //! provenance files to find, the repository's own `deny.toml`, a `NOTICE`
 //! naming exactly the forks present, and a generated `Cargo.lock`.
 //!
@@ -25,7 +25,7 @@
 //!     under `vendor/` is swallowed by an ignore rule. A fixture under
 //!     `target/` inherits THIS repository's `.gitignore`, whose `target` rule
 //!     matches every path in it — MEASURED: `git check-ignore -v --no-index --
-//!     vendor/winnow` prints `.gitignore:4:target` and exits 0. Without its own
+//!     vendor/indexmap` prints `.gitignore:4:target` and exits 0. Without its own
 //!     repository the fixture would be RED before any violation was planted,
 //!     and every test below would pass vacuously in the worst way: by being
 //!     unable to be green.
@@ -53,7 +53,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// The GREEN baseline: one reviewed, fully-provenanced fork (`winnow`),
+    /// The GREEN baseline: one reviewed, fully-provenanced fork (`indexmap`),
     /// live in every cell, named in NOTICE, with no carve ledger and no
     /// ratchet file yet.
     fn baseline(name: &str) -> Self {
@@ -63,8 +63,8 @@ impl Fixture {
         let fx = Self { root };
 
         copy_tree(
-            &repo_root().join("vendor/winnow"),
-            &fx.path("vendor/winnow"),
+            &repo_root().join("vendor/indexmap"),
+            &fx.path("vendor/indexmap"),
         );
         std::fs::copy(repo_root().join("deny.toml"), fx.path("deny.toml"))
             .expect("the real deny.toml is the license policy under test");
@@ -77,7 +77,7 @@ impl Fixture {
              resolver = \"2\"\n\
              \n\
              [patch.crates-io]\n\
-             winnow = { path = \"vendor/winnow\" }\n",
+             indexmap = { path = \"vendor/indexmap\" }\n",
         );
         fx.write(
             "crates/aterm/Cargo.toml",
@@ -88,13 +88,13 @@ impl Fixture {
              publish = false\n\
              \n\
              [dependencies]\n\
-             winnow = { path = \"../../vendor/winnow\" }\n",
+             indexmap = { path = \"../../vendor/indexmap\" }\n",
         );
         fx.write(
             "crates/aterm/src/lib.rs",
             "// SPDX-License-Identifier: Apache-2.0\n",
         );
-        fx.write_notice(&[("winnow", "0.7.15", "MIT")]);
+        fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
 
         // See the module docs: without its own repository, this fixture lives
         // inside the aterm checkout's ignored `target/` and attest's [OB-10]
@@ -234,19 +234,20 @@ fn copy_tree(from: &Path, to: &Path) {
 /// `[OB-13]` — the carve ledger. A path the ledger records as DELETED is
 /// present again: GREEN before, RED after, GREEN again once it is removed.
 ///
-/// The carved path is `vendor/winnow/src/_topic`, a real module of the real
-/// fork, so the reinstatement is a real one rather than a placeholder file.
+/// The carved path is `vendor/indexmap/src/rayon`, a real module of the real
+/// fork — feature-gated behind `rayon`, which no aterm build enables — so the
+/// reinstatement is a real one rather than a placeholder file.
 #[test]
 fn a_reinstated_carved_module_reds_the_forge_verb() {
     let fx = Fixture::baseline("carve-ledger");
-    fx.remove("vendor/winnow/src/_topic");
+    fx.remove("vendor/indexmap/src/rayon");
     fx.write(
         "vendor/forge.toml",
         "# The carve ledger: paths this repository has deleted and undertakes to\n\
          # keep deleted.\n\
          [[carved]]\n\
-         path = \"vendor/winnow/src/_topic\"\n\
-         reason = \"documentation-only module; no shipped code reaches it\"\n",
+         path = \"vendor/indexmap/src/rayon\"\n\
+         reason = \"feature-gated rayon integration; no aterm build enables it\"\n",
     );
 
     let (ok, log) = check_report(fx.root());
@@ -255,12 +256,15 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
     assert!(
-        log.contains("✓ vendor/winnow/src/_topic still absent"),
+        log.contains("✓ vendor/indexmap/src/rayon still absent"),
         "{log}"
     );
 
     // Plant the violation: the carved module is back.
-    fx.write("vendor/winnow/src/_topic/mod.rs", "// reinstated by hand\n");
+    fx.write(
+        "vendor/indexmap/src/rayon/mod.rs",
+        "// reinstated by hand\n",
+    );
 
     let (ok, log) = check_report(fx.root());
     assert!(
@@ -272,11 +276,11 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
         "the RED must be the carve-ledger obligation:\n{log}"
     );
     assert!(
-        log.contains("vendor/winnow/src/_topic") && log.contains("EXISTS again"),
+        log.contains("vendor/indexmap/src/rayon") && log.contains("EXISTS again"),
         "the refusal must name the reinstated path:\n{log}"
     );
     assert!(
-        log.contains("documentation-only module"),
+        log.contains("feature-gated rayon integration"),
         "the refusal must quote the ledger's reason:\n{log}"
     );
     assert!(
@@ -285,7 +289,7 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
     );
 
     // And it goes green again the moment the tree agrees with the ledger.
-    fx.remove("vendor/winnow/src/_topic");
+    fx.remove("vendor/indexmap/src/rayon");
     let (ok, log) = check_report(fx.root());
     assert!(
         ok,
@@ -314,7 +318,7 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     // that no reviewed row names it.
     fx.add_wellformed_fork("forge_fixture_fork", "0.1.0");
     fx.write_notice(&[
-        ("winnow", "0.7.15", "MIT"),
+        ("indexmap", "2.14.0", "Apache-2.0 OR MIT"),
         ("forge_fixture_fork", "0.1.0", "MIT"),
     ]);
     fx.write(
@@ -325,7 +329,7 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
          resolver = \"2\"\n\
          \n\
          [patch.crates-io]\n\
-         winnow = { path = \"vendor/winnow\" }\n\
+         indexmap = { path = \"vendor/indexmap\" }\n\
          forge_fixture_fork = { path = \"vendor/forge_fixture_fork\" }\n",
     );
     fx.write(
@@ -337,7 +341,7 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
          publish = false\n\
          \n\
          [dependencies]\n\
-         winnow = { path = \"../../vendor/winnow\" }\n\
+         indexmap = { path = \"../../vendor/indexmap\" }\n\
          forge_fixture_fork = { path = \"../../vendor/forge_fixture_fork\" }\n",
     );
     fx.regen_lock();
@@ -384,7 +388,7 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
         "a NOTICE that omits a shipped fork must turn the forge verb RED:\n{log}"
     );
     assert!(
-        log.contains("[OB-6]") && log.contains("NOTICE does not list fork `winnow`"),
+        log.contains("[OB-6]") && log.contains("NOTICE does not list fork `indexmap`"),
         "the RED must be the NOTICE-agreement obligation, naming the fork:\n{log}"
     );
     assert!(
@@ -393,19 +397,21 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     );
 
     // Restoring the line restores GREEN: the fixture is not stuck red.
-    fx.write_notice(&[("winnow", "0.7.15", "MIT")]);
+    fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
     let (ok, log) = check_report(fx.root());
     assert!(ok, "restoring the NOTICE line must restore GREEN:\n{log}");
 }
 
-/// `[OB-12]` — patch liveness, the obligation that justifies this gate. THE
-/// WINNOW SHAPE, synthesized: a second, UNPATCHED copy of a patched crate
-/// resolving beside the fork.
+/// `[OB-12]` — patch liveness, the obligation that justifies this gate. A
+/// second, UNPATCHED copy of a patched crate resolving beside the fork.
 ///
-/// This is the defect the real tree carries today on Linux (`winnow 1.0.3` via
-/// `accesskit_winit → … → toml_edit 0.25`), reduced to two path packages so it
-/// can be planted and removed. cargo reports the shape as nothing at all: the
-/// build is green and `cargo metadata` says the patch is in force.
+/// This is the shape the real tree carried on Linux until 2026-08-27: `winnow
+/// 1.0.3` from the registry beside the `winnow 0.7.15` aterm forked, reached
+/// through `accesskit_winit → … → toml_edit 0.25`. Retiring `toml_edit` for the
+/// first-party `aterm-toml` retired the fork, so the live instance is gone —
+/// which is exactly why it is synthesized here, reduced to two path packages
+/// that can be planted and removed. cargo reports the shape as nothing at all:
+/// the build is green and `cargo metadata` says the patch is in force.
 #[test]
 fn an_unpatched_sibling_version_reds_the_forge_verb() {
     let fx = Fixture::baseline("unpatched-sibling");
@@ -415,22 +421,22 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
-    assert!(log.contains("✓ winnow live in all 4 cell(s)"), "{log}");
+    assert!(log.contains("✓ indexmap live in all 4 cell(s)"), "{log}");
 
     // Plant the violation: an intermediate dependency drags in a second
-    // `winnow` at another major, exactly as toml_edit 0.25 does on Linux.
+    // `indexmap` at another major, exactly as toml_edit 0.25 did for winnow.
     fx.write(
-        "other/winnow/Cargo.toml",
+        "other/indexmap/Cargo.toml",
         "[package]\n\
-         name = \"winnow\"\n\
-         version = \"1.0.3\"\n\
+         name = \"indexmap\"\n\
+         version = \"3.0.0\"\n\
          edition = \"2021\"\n\
          license = \"MIT\"\n\
          \n\
          [workspace]\n",
     );
     fx.write(
-        "other/winnow/src/lib.rs",
+        "other/indexmap/src/lib.rs",
         "// the unpatched upstream copy\n",
     );
     fx.write(
@@ -442,7 +448,7 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          publish = false\n\
          \n\
          [dependencies]\n\
-         winnow = { path = \"../../other/winnow\" }\n",
+         indexmap = { path = \"../../other/indexmap\" }\n",
     );
     fx.write(
         "crates/dep_b/src/lib.rs",
@@ -457,7 +463,7 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          publish = false\n\
          \n\
          [dependencies]\n\
-         winnow = { path = \"../../vendor/winnow\" }\n\
+         indexmap = { path = \"../../vendor/indexmap\" }\n\
          dep_b = { path = \"../dep_b\" }\n",
     );
     fx.write(
@@ -468,7 +474,7 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          resolver = \"2\"\n\
          \n\
          [patch.crates-io]\n\
-         winnow = { path = \"vendor/winnow\" }\n",
+         indexmap = { path = \"vendor/indexmap\" }\n",
     );
     fx.regen_lock();
 
@@ -482,11 +488,11 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         "the RED must be the patch-liveness obligation:\n{log}"
     );
     assert!(
-        log.contains("UNPATCHED `winnow`") && log.contains("winnow@1.0.3"),
+        log.contains("UNPATCHED `indexmap`") && log.contains("indexmap@3.0.0"),
         "the refusal must name the crate and the sibling version:\n{log}"
     );
     assert!(
-        log.contains("cargo tree --target") && log.contains("-i winnow@1.0.3"),
+        log.contains("cargo tree --target") && log.contains("-i indexmap@3.0.0"),
         "the refusal must name the command that finds the requiring edge:\n{log}"
     );
     // Every cell, not just one: the fork is patched for all four.

@@ -681,7 +681,7 @@ pub fn compile_trail_pack_toml(source: &str) -> Result<CompiledTrailPack, TrailP
             source.len()
         )));
     }
-    let raw: RawTrailPackDoc = toml::from_str(source)
+    let raw: RawTrailPackDoc = aterm_toml::from_str(source)
         .map_err(|e| TrailPackError::one(format!("TOML schema error: {e}")))?;
     let mut diag = Vec::new();
 

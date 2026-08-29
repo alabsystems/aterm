@@ -46,7 +46,6 @@
 //!     runtime preflights (pure, fixture-tested in tests/signconf.rs), submit
 //!     --wait, staple, validate, spctl assessment.
 
-use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -277,7 +276,8 @@ impl ReleaseCredentials {
         })?;
         let pubkey_b64 = {
             use ring::signature::KeyPair as _;
-            base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_ref())
+            aterm_codec::base64::encode(keypair.public_key().as_ref())
+                .map_err(|_| "public key too large to encode".to_string())?
         };
         // machine_id stays None here: `machines::declared_machine_id` already reads
         // `~/.aterm/machine.toml` as its fallback, and a second reader would be a
@@ -307,9 +307,8 @@ impl ReleaseCredentials {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         let encoded = credentials_signing_key(&text)?;
-        let pkcs8 = base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim())
-            .map_err(|_| {
+        let pkcs8 =
+            aterm_codec::base64::decode_strict(encoded.trim().as_bytes()).map_err(|_| {
                 format!(
                     "{}: signing_key is not valid base64. Minted machine keys are BINARY \
                      PKCS#8 — base64-encode those bytes rather than pasting them",
@@ -324,7 +323,8 @@ impl ReleaseCredentials {
         })?;
         let pubkey_b64 = {
             use ring::signature::KeyPair as _;
-            base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_ref())
+            aterm_codec::base64::encode(keypair.public_key().as_ref())
+                .map_err(|_| "public key too large to encode".to_string())?
         };
         let notary =
             credentials_notary_auth(&text).map_err(|e| format!("{}: {e}", path.display()))?;

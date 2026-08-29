@@ -842,6 +842,7 @@ mod tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 

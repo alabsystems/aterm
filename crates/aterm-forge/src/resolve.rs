@@ -459,13 +459,13 @@ mod tests {
     fn the_dedupe_marker_is_recognised_alone_and_after_a_path() {
         let bare = parse_line("3serde v1.0.228 (*)").unwrap().unwrap();
         assert!(bare.deduped && bare.path.is_none());
-        let pathed = parse_line("4winnow v0.7.15 (/Users//example/aterm/vendor/winnow) (*)")
+        let pathed = parse_line("4indexmap v2.14.0 (/Users//example/aterm/vendor/indexmap) (*)")
             .unwrap()
             .unwrap();
         assert!(pathed.deduped);
         assert_eq!(
             pathed.path.as_deref(),
-            Some(Path::new("/Users//example/aterm/vendor/winnow"))
+            Some(Path::new("/Users//example/aterm/vendor/indexmap"))
         );
     }
 

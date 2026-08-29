@@ -23,8 +23,8 @@
 //! `every_topic_renders_and_is_listed_on_the_front_page` binding test are both derived
 //! from it, so a topic can never ship listed-but-empty or unlisted. The `introspection`
 //! topic is special: its verb list is GENERATED from
-//! [`aterm_types::control_verbs::catalog_lines`], the same table the control server
-//! answers `help` from — so it never drifts from the real protocol.
+//! [`aterm_types::control_verbs::catalog_lines_full`], the same table the control
+//! server answers `help` from — so it never drifts from the real protocol.
 
 use std::fmt::Write as _;
 
@@ -60,13 +60,16 @@ const TOPICS: &[Topic] = &[
 
 WHAT IT IS
   `aterm` spawns your $SHELL in a PTY and passes I/O through UNCHANGED — it looks and
-  behaves exactly like your shell — while feeding every byte into the aterm VT engine
-  (an in-process model of the screen). The shell runs through a protected spawn seam
-  (capability-gated, setrlimit-bounded, fail-closed, OS-sandbox-wrapped on demand), not
-  raw forkpty/execvp. This passthrough CLI serves NO control socket of its own; the live,
-  introspectable surface an AI reads and drives (via `aterm ctl`) is exposed by the
-  WINDOW mode of the same binary — `aterm --window`, or `aterm --headless`
-  (ATERM_HEADLESS=1). See `aterm help introspection`.
+  behaves exactly like your shell. It does NOT model the screen: the host terminal draws
+  the bytes and the session keeps no grid and no scrollback. (The in-process VT model is
+  demand-driven and OFF by default; ATERM_SESSION_MODEL=1 arms it for an in-process
+  consumer of the engine, and 0/off/empty do not. It is not readable from outside either
+  way.) The shell runs through a protected spawn seam (capability-gated,
+  setrlimit-bounded, fail-closed, OS-sandbox-wrapped on demand), not raw forkpty/execvp.
+  This passthrough CLI serves NO control socket of its own; the live, introspectable
+  surface an AI reads and drives (via `aterm ctl`) is exposed by the WINDOW mode of the
+  same binary — `aterm --window`, or `aterm --headless` (ATERM_HEADLESS=1).
+  See `aterm help introspection`.
 
 KEY USAGE
   aterm                      start an interactive $SHELL (the default; no args)
@@ -181,10 +184,13 @@ KEY USAGE
   aterm agents primer        print the block — paste into any project AGENTS.md/CLAUDE.md
 
 WHEN TO REACH FOR IT
-  Once per machine, and again after installing a new coding agent: run
-  `aterm agents install` so any agent launched inside aterm knows what aterm is and how
-  to go deeper. A screen banner cannot do this job — an agent's context never sees the
-  terminal's output, which is exactly why the primer rides in the agent's own files.
+  Usually never: aterm runs this installer itself, in the background, each time it opens
+  a session — every DETECTED agent gets the current primer and skills, and nothing is
+  written for an agent whose config dir does not exist (`agents_auto_prime = false` in
+  aterm.toml turns the pass off; `aterm agents status` names the knob). Run
+  `aterm agents install` to do the same on demand, `aterm agents` to check. A screen
+  banner cannot do this job — an agent's context never sees the terminal's output, which
+  is exactly why the primer rides in the agent's own files.
 
 GOTCHAS
   * IDEMPOTENT and surgical: the block lives between `<!-- aterm primer ... -->` markers;
@@ -377,7 +383,8 @@ WHAT IT IS
   jobs: SMT -> `ay`, bounded model checking -> trust-mc, NN-verification runtime -> ny
   (clean only hosts proofs ABOUT those algorithms).
 
-KEY USAGE  (not on PATH here — run `targo --unverified run --locked -p clean --bin clean -- <SUB>`)
+KEY USAGE  (`aterm pkg install clean` — a signed prebuilt SHIPS; an aterm shell puts the
+            managed bin/ on PATH, or use `aterm pkg run clean -- <SUB>`)
   clean features [--search X]    discover the real CLI (registered feature descriptors)
   clean check <file.lean> [--json]   parse -> elaborate -> trusted kernel; accept/reject
   clean export-cert / kernel cert verify   emit / re-check a .cleancert proof bundle
@@ -391,7 +398,8 @@ WHEN TO REACH FOR IT
   raw SMT (ay), BMC (trust-mc), or NN runtime (ny).
 
 GOTCHAS
-  * Path-depends on ../ay — if that sibling checkout is missing, no cargo command runs.
+  * SOURCE CHECKOUT ONLY: path-depends on ../ay — if that sibling is missing, no cargo
+    command runs in a dev tree. The installed program carries no such dependency.
   * Always pass `--locked`. NO CI/hooks — enforcement is local (`just ci`, `clean audit`).
   * HONESTY: only say "proved" when the theorem's axiom closure ⊆ the foundational
     axioms; a Theorem wrapping an Axiom is a restatement, not a proof."#,
@@ -411,7 +419,8 @@ WHAT IT IS
   symbolic (BMC/IC3/PDR via `ay`) and hardware (AIGER/BTOR2) backends. Soundness-first:
   when uncertain it abstains rather than emit a wrong verdict.
 
-KEY USAGE  (not on PATH — `targo --unverified build --release -p tla-cli` -> ./target/release/ty)
+KEY USAGE  (`aterm pkg install ty` — a signed prebuilt SHIPS; an aterm shell puts the
+            managed bin/ on PATH, or use `aterm pkg run ty -- <SUB>`)
   ty check Spec.tla --config Spec.cfg [--workers N] [--output json]
                                  explicit-state model checking (the TLC replacement)
   ty prove Spec.tla [--theorem NAME]   deductive proving (discharge THEOREM obligations)
@@ -426,8 +435,9 @@ WHEN TO REACH FOR IT
   for hardware. Drop to `ay` only for raw SAT/SMT/CHC that ty already wraps.
 
 GOTCHAS
-  * No published binaries — build from source. On macOS install GNU m4 first
-    (`brew install m4`) — a transitive build dep needs it.
+  * INSTALL: a signed prebuilt SHIPS — `aterm pkg install ty`, or the whole toolset with
+    `aterm pkg install --default-set`. Only if you build from source instead: on macOS
+    install GNU m4 first (`brew install m4`) — a transitive build dep needs it.
   * The symbolic/hardware surfaces exist only when compiled `--features ay`.
   * Do not assume ty is faster than TLC — use `ty supremacy compare` for real evidence."#,
         ),
@@ -484,7 +494,8 @@ WHAT IT IS
   rounding) — what my/nn call "gamma-crown". On eligible nets it ships an exact-rational,
   machine-checkable `<model>.cert.json` proof sidecar.
 
-KEY USAGE  (not on PATH — `targo --unverified run --release -p ny-cli -- <SUB>`)
+KEY USAGE  (`aterm pkg install ny` — a signed prebuilt SHIPS; an aterm shell puts the
+            managed bin/ on PATH, or use `aterm pkg run ny -- <SUB>`)
   ny verify model.onnx -p prop.vnnlib --method alpha [--require-sound] [--json]
                                fast sound over-approximation (may say unknown)
   ny beta-crown model.onnx -p prop.vnnlib [--timeout N]
@@ -560,7 +571,8 @@ WHAT IT IS
   (types -> ny bounds -> ay SMT) on top of compiled Metal inference. Same convert/compile/
   run/optimize CLI shape as `my`, one version behind.
 
-KEY USAGE  (not on PATH — `targo --unverified run -p nn-cli -- <SUB>`; macOS + Metal required)
+KEY USAGE  (`aterm pkg install nn` — a signed prebuilt SHIPS; an aterm shell puts the
+            managed bin/ on PATH, or `aterm pkg run nn -- <SUB>`; macOS + Metal required)
   nn convert graph.json weights.safetensors [--optimize ...] [--verify bounds|full]
                                compile pre-exported artifacts -> Metal model + ConvertReport
   nn compile ... --output model.nnc    persist a .nnc plan (+ report)
@@ -620,7 +632,7 @@ fn overview_page() -> String {
         ),
         (
             "agents [<cmd>]",
-            "make coding agents aterm-aware (install the 3-line primer; run once)",
+            "make coding agents aterm-aware (the primer; aterm also installs it itself)",
         ),
     ];
     // Column width across the verb signatures and the topic names.
@@ -690,7 +702,12 @@ HOW TO USE IT
 THE FULL, ALWAYS-CURRENT VERB CATALOG (generated from the protocol table):",
     );
     s.push('\n');
-    for line in aterm_types::control_verbs::catalog_lines() {
+    // The manual is the one place the FULL entries are always in reach without a live
+    // instance; the live server's bare `help` is the short form (this line says so).
+    s.push_str(
+        "`aterm ctl help` prints the short catalog; `aterm ctl help <verb>` the full entry for one verb.\n",
+    );
+    for line in aterm_types::control_verbs::catalog_lines_full() {
         s.push_str("  ");
         s.push_str(&line);
         s.push('\n');
@@ -698,7 +715,7 @@ THE FULL, ALWAYS-CURRENT VERB CATALOG (generated from the protocol table):",
     s.push_str(
         "\nThis catalog is generated from the one typed verb table the control server answers\n\
          `help` from — so it is always exactly the protocol this build speaks. Run\n\
-         `aterm ctl help` against a live session for the same list from the server itself.\n",
+         `aterm ctl help --full` against a live session for the same list from the server itself.\n",
     );
     s
 }
@@ -728,9 +745,12 @@ fn agent_page(sid: Option<&str>) -> String {
         let _ = write!(
             s,
             "\n\n  Your session: {id}\n  \
-             See yourself:   aterm ctl @{id} text\n  \
+             See yourself:   aterm ctl @{id} text trim   (trim drops the trailing blank rows)\n  \
              Drive yourself: aterm ctl @{id} turn 'message'   (rarely needed — you ARE the shell)\n  \
-             Find peers:     aterm ctl ls        (then drive any peer with @<its-sid>)",
+             Find peers:     aterm ctl windows  AND  aterm ctl ls\n  \
+             \x20               windows: one row per window, which sids sit on its active tab;\n  \
+             \x20               ls: every session, with its window= and detail= (the program it is\n  \
+             \x20               running; * marks you). Then drive any peer with @<its-sid>.",
         );
     }
     s.push_str(
@@ -740,7 +760,13 @@ fn agent_page(sid: Option<&str>) -> String {
          reply); wait without polling via `@sid await idle <ms>` / `await match <re>`; watch a\n  \
          whole fleet on one descriptor with `subscribe @a,@b events`. Humans can interject at\n  \
          any time — the input path is the human's, and a per-session turn lease arbitrates so\n  \
-         two drivers never clobber each other. Full detail: `aterm help introspection`.\n",
+         two drivers never clobber each other. Full detail: `aterm help introspection`.\n  \
+         Cheaper reads: `text trim` / `turn trim=1` drop the trailing blank rows (`OK <n>\n  \
+         trimmed=<k>`). Place work: `spawn window=<id>` opens a tab in that window WITHOUT\n  \
+         raising it (ids from `windows`); `@<sid> spawn` means the window hosting <sid>.\n  \
+         A vanished session: `exits [since=<id>]` says when it went, why, and by whom.\n  \
+         If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
+         unreadable token) — act on the reason; it never means \"empty\" unless it says so.\n",
     );
     s.push_str(
         "\nENV HYGIENE (why your agent context vars may be missing)\n  \
@@ -759,6 +785,9 @@ fn agent_page(sid: Option<&str>) -> String {
     );
     s.push_str(
         "\nHOUSE RULES (this toolchain is honesty-first)\n  \
+         * Peers may be agents. Before you `turn` or `send` into a peer, read its `status`\n    \
+         (detail= names the running program: claude, codex, ...) and its `meta role=`; never\n    \
+         type into another agent's prompt unless the human named the session AND the message.\n  \
          * Never claim a prover/compiler ran or 'proved' something that didn't — an empty or\n    \
          zero-obligation report is not a proof. Say what actually executed.\n  \
          * No git hooks and no CI anywhere in this toolchain, by owner mandate — gating is\n    \
@@ -771,11 +800,12 @@ fn agent_page(sid: Option<&str>) -> String {
     );
     s.push_str("  aterm help <topic>         a deep dive on any tool\n");
     s.push_str(
-        "  aterm ctl help             the live control-verb catalog from a running session\n",
+        "  aterm ctl help             the short verb catalog from a running session;\n\
+         \x20                            `help <verb>` one full entry, `help --full` everything\n",
     );
     s.push_str(
-        "  aterm agents               keep the coding-agent primer installed — how an agent\n\
-         \x20                            like you learns aterm exists (see `aterm help agents`)\n",
+        "  aterm agents               the coding-agent primer — how an agent like you learns\n\
+         \x20                            aterm exists; aterm installs it itself (see `aterm help agents`)\n",
     );
     s
 }
@@ -878,11 +908,19 @@ mod tests {
     fn introspection_topic_is_generated_from_the_live_verb_catalog() {
         let (page, code) = render(Some("introspection"), None);
         assert_eq!(code, 0);
-        // A representative verb from the real catalog must appear, proving the page is
-        // wired to `catalog_lines()` and not a hand-copied list.
-        let catalog: String = aterm_types::control_verbs::catalog_lines().collect();
-        let sample = catalog.split_whitespace().next().unwrap_or("subscribe");
-        assert!(page.contains(sample) || page.contains("subscribe"));
+        // EVERY full catalog row must appear (it is the manual: the FULL entries, not
+        // the short form the live server's bare `help` answers), proving the page is
+        // wired to `catalog_lines_full()` and not a hand-copied or summary list.
+        for line in aterm_types::control_verbs::catalog_lines_full() {
+            assert!(
+                page.contains(&line),
+                "manual is missing the full row {line:?}"
+            );
+        }
+        assert!(
+            page.contains("`aterm ctl help` prints the short catalog; `aterm ctl help <verb>` the full entry for one verb."),
+            "the manual must say where the short and per-verb forms live"
+        );
     }
 
     #[test]
@@ -1078,5 +1116,58 @@ mod tests {
         // feature is undiscoverable and its status is a source-only claim.
         assert!(page.contains("EXPERIMENTAL"), "{page}");
         assert!(page.contains("ATERM_OPERATOR=1"), "{page}");
+    }
+
+    /// The brief is the first thing an agent reads inside aterm, so it must name
+    /// the moves the agent-experience report found missing (docs/AGENT-EXPERIENCE-
+    /// 2026-08-26.md §7): the window listing beside `ls`, the trimmed reads, the
+    /// aimed spawn, the exit ledger, the per-verb help — and the one rule that keeps
+    /// an agent out of another agent's prompt. It must ALSO stay a brief: the whole
+    /// point of `help <verb>` was that the first read is cheap.
+    #[test]
+    fn agent_brief_teaches_windows_trim_exits_help_and_the_peer_rule() {
+        let (agent, code) = render(None, Some("s-abc123"));
+        assert_eq!(code, 0);
+        for needle in [
+            "aterm ctl windows",
+            "aterm ctl ls",
+            "text trim",
+            "turn trim=1",
+            "spawn window=<id>",
+            "exits [since=<id>]",
+            "`help <verb>`",
+            "`help --full`",
+            "detail=",
+            "meta role=",
+            "never\n    type into another agent's prompt",
+            "it says WHY",
+        ] {
+            assert!(
+                agent.contains(needle),
+                "brief must say {needle:?}:\n{agent}"
+            );
+        }
+        // Length discipline: a few added lines, not a manual. `help introspection`
+        // and `help <verb>` are where the depth lives.
+        assert!(
+            agent.lines().count() <= 90 && agent.len() <= 7_000,
+            "the brief grew into a manual: {} lines, {} bytes",
+            agent.lines().count(),
+            agent.len()
+        );
+        // The sid-less brief carries the same rule and the same help pointers.
+        let (generic, _) = render(Some("agent"), None);
+        assert!(generic.contains("meta role=") && generic.contains("`help <verb>`"));
+    }
+
+    /// The `agents` topic no longer tells a human to run the installer once per
+    /// machine: aterm runs it itself, and the topic names the knob that stops it.
+    #[test]
+    fn agents_topic_says_aterm_primes_agents_itself_and_names_the_knob() {
+        let (page, code) = render(Some("agents"), None);
+        assert_eq!(code, 0);
+        assert!(page.contains("aterm runs this installer itself"), "{page}");
+        assert!(page.contains("agents_auto_prime = false"), "{page}");
+        assert!(!page.contains("Once per machine"), "{page}");
     }
 }

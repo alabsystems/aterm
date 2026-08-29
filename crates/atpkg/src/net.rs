@@ -152,7 +152,7 @@ pub fn find_pair<'a>(assets: &'a [Asset], name: &str) -> Option<(&'a str, &'a st
 
 /// Parse the GitHub `…/releases` JSON body into [`Release`]s.
 pub fn parse_releases(body: &[u8]) -> Result<Vec<Release>, String> {
-    serde_json::from_slice(body).map_err(|e| {
+    aterm_json::from_slice(body).map_err(|e| {
         // Manual concat of the previous `format!("parse releases JSON: {e}")` —
         // byte-identical (`{e}` is `Display`, which is what `to_string` renders):
         // the `format!` expansion embeds `fmt::Arguments` construction (with

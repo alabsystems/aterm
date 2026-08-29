@@ -27,7 +27,7 @@ use super::{
 fn hardened_roundtrips_through_toml() {
     let original = profiles::hardened();
     let ser = original.to_toml().expect("hardened serializes");
-    let parsed: Policy = toml::from_str(&ser).expect("hardened parses");
+    let parsed: Policy = aterm_toml::from_str(&ser).expect("hardened parses");
     assert_eq!(
         original, parsed,
         "hardened policy round-trip must be lossless"
@@ -38,7 +38,7 @@ fn hardened_roundtrips_through_toml() {
 fn standard_roundtrips_through_toml() {
     let original = profiles::standard();
     let ser = original.to_toml().expect("standard serializes");
-    let parsed: Policy = toml::from_str(&ser).expect("standard parses");
+    let parsed: Policy = aterm_toml::from_str(&ser).expect("standard parses");
     assert_eq!(original, parsed);
 }
 
@@ -46,7 +46,7 @@ fn standard_roundtrips_through_toml() {
 fn permissive_roundtrips_through_toml() {
     let original = profiles::permissive();
     let ser = original.to_toml().expect("permissive serializes");
-    let parsed: Policy = toml::from_str(&ser).expect("permissive parses");
+    let parsed: Policy = aterm_toml::from_str(&ser).expect("permissive parses");
     assert_eq!(original, parsed);
 }
 
@@ -349,7 +349,7 @@ fn manually_built_policy_roundtrips() {
     };
 
     let ser = p.to_toml().expect("serialize");
-    let back: Policy = toml::from_str(&ser).expect("parse");
+    let back: Policy = aterm_toml::from_str(&ser).expect("parse");
     assert_eq!(p, back);
 }
 
@@ -607,7 +607,7 @@ fn mirror_rules_survive_toml_roundtrip() {
 
     let snap_before = eng.mirror_snapshot();
     let ser = eng.policy().to_toml().expect("serialize");
-    let parsed: Policy = toml::from_str(&ser).expect("parse");
+    let parsed: Policy = aterm_toml::from_str(&ser).expect("parse");
     let reloaded = PolicyEngine::new(parsed);
     assert_eq!(reloaded.mirror_snapshot(), snap_before);
 }

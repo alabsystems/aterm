@@ -285,7 +285,7 @@ pub struct ScanScratch {
 #[derive(Debug)]
 pub enum LexError {
     /// A TOML document failed to parse.
-    Toml(toml::de::Error),
+    Toml(aterm_toml::de::Error),
 }
 
 impl std::fmt::Display for LexError {
@@ -517,10 +517,11 @@ impl Lexicon {
         langs: &[&str],
         extra_toml: Option<&str>,
     ) -> Result<Lexicon, LexError> {
-        let mut raw: RawLexicon = toml::from_str(BUILTIN_LEXICON).map_err(LexError::Toml)?;
-        let raw_exc: RawExceptions = toml::from_str(BUILTIN_EXCEPTIONS).map_err(LexError::Toml)?;
+        let mut raw: RawLexicon = aterm_toml::from_str(BUILTIN_LEXICON).map_err(LexError::Toml)?;
+        let raw_exc: RawExceptions =
+            aterm_toml::from_str(BUILTIN_EXCEPTIONS).map_err(LexError::Toml)?;
         if let Some(t) = extra_toml {
-            let user: RawLexicon = toml::from_str(t).map_err(LexError::Toml)?;
+            let user: RawLexicon = aterm_toml::from_str(t).map_err(LexError::Toml)?;
             // v3 §6: user entries are marked so their surfaces land in the
             // `user_surfaces` set (the short-emphasis-guard exemption).
             raw.entry.extend(user.entry.into_iter().map(|mut e| {
@@ -538,8 +539,9 @@ impl Lexicon {
         exceptions_toml: &str,
         langs: &[&str],
     ) -> Result<Lexicon, LexError> {
-        let raw: RawLexicon = toml::from_str(lexicon_toml).map_err(LexError::Toml)?;
-        let raw_exc: RawExceptions = toml::from_str(exceptions_toml).map_err(LexError::Toml)?;
+        let raw: RawLexicon = aterm_toml::from_str(lexicon_toml).map_err(LexError::Toml)?;
+        let raw_exc: RawExceptions =
+            aterm_toml::from_str(exceptions_toml).map_err(LexError::Toml)?;
         Ok(Self::build(raw, raw_exc, &Langs::new(langs)))
     }
 

@@ -1,0 +1,96 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the six
+# third-party consumers' `arrayvec = "0.7.x"` lines at this code the package
+# must be called `arrayvec` — nothing else works, and in particular pointing
+# them at `aterm-alloc` (which is where the implementation actually lives)
+# cannot work: the name does not match and `0.63.0` satisfies none of the
+# requirements below. The DIRECTORY keeps the `aterm-` prefix so a `ls crates/`
+# or a stack trace still reads as ours and nobody mistakes this for a vendored
+# upstream (those live under `vendor/`, which is where genuinely-upstream source
+# belongs).
+name = "arrayvec"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number: naga 29.0.3, wgpu 29.0.3, wgpu-core
+# 29.0.3 and wgpu-hal 29.0.3 ask for ^0.7.1, tiny-skia 0.11.4 for ^0.7, and vte
+# 0.15.0 for ^0.7.2. 0.7.8 satisfies all six.
+#
+# IT MUST ALSO BE THE HIGHEST `0.7.x` CANDIDATE IN THE GRAPH, and that half was
+# learned the expensive way: this crate shipped as 0.7.6 and the
+# `[patch.crates-io]` row SILENTLY DID NOTHING. `[patch]` does not delete the
+# other registry versions — it hides only the one at the patch's own version and
+# adds itself as a candidate — so when the differential oracle on `aterm-alloc`
+# pinned `=0.7.8`, cargo had to activate a real 0.7.8 for that edge, and then
+# satisfied every `^0.7.1` consumer from it too rather than carrying two
+# semver-compatible copies. `cargo tree -p aterm -e normal -i arrayvec` printed
+# `arrayvec v0.7.8` with no path, under naga, and CARGO warned about none of it
+# (`cargo forge check` DID -- see the correction below). MEASURED
+# both ways: with the shim at 0.7.6 the consumers resolve to the registry copy;
+# at 0.7.8 (patch hides registry 0.7.8, oracle drops to `=0.7.7`) they resolve
+# here and the oracle keeps its own node. The rule to keep: THE SHIM'S VERSION
+# MUST BE >= EVERY OTHER `0.7.x` THIS WORKSPACE FORCES INTO THE GRAPH. The
+# oracle's pin is the only such force today, and its manifest says so.
+version = "0.7.8"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `arrayvec` replacement for aterm (re-exports aterm_alloc::ArrayVec under upstream's package name)"
+
+[dependencies]
+# The ONLY dependency, and the whole point: `ArrayVec` is already written,
+# already used by aterm's VT parser on every byte of terminal output, and
+# already carries the workspace's Trust annotations. This crate adds no
+# implementation — see src/lib.rs for what "no implementation" is allowed to
+# mean and where the two surfaces still differ.
+aterm-alloc = { workspace = true }
+
+[dev-dependencies]
+# NONE, deliberately, and the deliberation is the point.
+#
+# The differential oracle for this crate is the real crates.io `arrayvec`, and
+# it is declared on `aterm-alloc` (see that manifest for the full argument and
+# the two probes behind it): a dev-dep on the registry `arrayvec` declared HERE,
+# by the package that is itself named `arrayvec`, makes `cargo test -p arrayvec`
+# die with "specification `arrayvec` is ambiguous". The differential therefore
+# lives at `crates/aterm-alloc/tests/arrayvec_differential.rs`, which is also
+# where the implementation it exercises lives. The whole re-check is
+#
+#     cargo test -p arrayvec        # the consumer forms
+#     cargo test -p aterm-alloc     # the differential
+#
+# (or `cargo test -p arrayvec@0.7.8 -p aterm-alloc` in one go — bare
+# `-p arrayvec` alone resolves fine, but bare `-p arrayvec -p aterm-alloc` is
+# ambiguous while the oracle keeps a second `arrayvec` in the graph).
+
+[features]
+# Upstream's feature table, reproduced. `serde` IS MANDATORY even though nobody
+# turns it on: wgpu-core-29.0.3/Cargo.toml:79 declares
+# `serde = [ …, "arrayvec/serde", … ]`, and cargo rejects a feature edge naming
+# a feature the target package does not declare at RESOLUTION time, whether or
+# not the feature is ever activated ("package `a` depends on `b` with feature
+# `serde` but `b` does not have that feature"). The resolver reports this
+# package with an EMPTY feature set on all four cells — every consumer writes
+# `default-features = false` — so `default`/`std` exist only to make that
+# spelling a no-op rather than an error.
+default = ["std"]
+# Accepted and ignored: this crate is `#![no_std]` either way (see src/lib.rs
+# for what still links std today, and why).
+std = []
+# DELIBERATE EMPTY STUBS, and the failure mode is worth knowing. Upstream
+# spells these `serde = ["dep:serde"]` etc. and each pulls in a trait impl.
+# Here they resolve and do nothing. Nothing in aterm's graph activates any of
+# them today; if something ever does, the error will be a missing
+# `Serialize`/`BorshSerialize`/`Zeroize` impl at the CONSUMER's derive rather
+# than a feature-resolution error naming arrayvec — silent about its cause, not
+# silently wrong. The fix then is to implement the trait here, or to retire the
+# patch row for that build.
+serde = []
+borsh = []
+zeroize = []
+
+[lints]
+workspace = true

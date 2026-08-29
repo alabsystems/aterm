@@ -60,15 +60,21 @@
 //! * **Userinfo cannot masquerade as the host**: `https://google.com@evil.example/`
 //!   emphasizes `evil.example`, because the host is what follows the LAST `@`.
 //!
-//! # One ink, because the seam has no ink of its own
+//! # The seam has an ink of its own, so the caption may have two
 //!
-//! The band's content-facing edge is an OVERLINE, and an overline is painted in
-//! its own cell's `fg` on both backends — `effective_deco_color`'s explicit
-//! channel exists for the SGR 58 underline and for nothing else. So a row that
-//! changes ink under the rule changes the rule: a band whose top edge brightens
-//! for the twelve cells above the domain reads as a highlighter dash floating
-//! over it, not as a boundary. The whole band therefore paints in one tone and
-//! the hierarchy is carried by WEIGHT, which costs the rule nothing.
+//! The band's content-facing edge is an OVERLINE, and a rule that changes ink
+//! under the words it passes beneath stops reading as a boundary: a top edge
+//! that brightens for the twelve cells above the domain is a highlighter dash
+//! floating over them. The seam therefore paints from its OWN channel
+//! (`RenderCell::overline_color`, resolved for both backends by
+//! `aterm_render::deco_inks`) instead of from each cell's `fg`, so every cell of
+//! the row stamps the same edge tone whatever ink it carries.
+//!
+//! That is what lets the caption answer in BRIGHTNESS as well as weight. The
+//! destination host is the one thing a reader came to this row for, so it takes
+//! the band's full-contrast tone while the gesture hint, the scheme and the path
+//! recede to the secondary one — the ordinary hierarchy of every other chrome
+//! band here, which a single-toned row could only imitate with bold.
 
 use std::ops::Range;
 
@@ -362,10 +368,11 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
 
 /// PURE row builder: exactly `cols` cells, so the splice overwrites one frame
 /// row in place. The lead-in names the gesture, the site's own labels are the
-/// one emphasized run, and everything else recedes — hierarchy the flat string
-/// could not express, exactly as `notice::caption_parts` argues for its own
-/// caption grammar. ONE INK for the whole band, weight alone carrying the
-/// hierarchy, because the seam has no ink of its own (see the module header).
+/// one emphasized run — full contrast and bold — and everything else recedes to
+/// the secondary tone: hierarchy the flat string could not express, exactly as
+/// `notice::caption_parts` argues for its own caption grammar. The seam is
+/// painted from its own channel rather than from the cells' inks, which is what
+/// lets the row carry two of them (see the module header).
 ///
 /// `seam` draws the band's content-facing top edge (a bottom-anchored caption
 /// wants it; a caption flipped to the top row is already under the strip's own
@@ -407,8 +414,10 @@ pub(crate) fn caption_row(
     write_str(&mut row, cols, url_col, &cap.text, c.label, c.bar_bg, false);
     // Re-stamp the emphasized run over the text just written: one `write_str`
     // per role keeps the layout in ONE place, so the emphasis can never land on
-    // a different span than the text it is emphasizing. Same ink, heavier
-    // weight — the whole band is one tone so its seam is one tone.
+    // a different span than the text it is emphasizing. The band's FULL-CONTRAST
+    // tone and heavier weight — the destination is the answer this row exists to
+    // give, and a reader who takes one thing from a status band takes the
+    // brightest thing on it.
     let emphasis = cap.emphasis();
     if !emphasis.is_empty() {
         write_str(
@@ -416,22 +425,23 @@ pub(crate) fn caption_row(
             cols,
             url_col + emphasis.start,
             &cap.slice(&emphasis),
-            c.label,
+            c.value,
             c.bar_bg,
             true,
         );
     }
-    // THE SEAM IS THE WHOLE EDGE. `write_str` builds each cell it writes from
-    // scratch and no chrome text carries an overline of its own, so a seam
-    // stamped only by `blank_row` survives exactly where the band happens to
-    // have no text: a rule broken into stubs by the words on top of it reads as
-    // debris rather than as the band's boundary. Drawn across the finished row,
-    // after every write, so no future field can chip it again — and every write
-    // above uses the one ink, so the rule it re-stamps is one tone as well as
-    // one line (see the module header).
+    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE. `write_str` builds each cell it
+    // writes from scratch and no chrome text carries an overline of its own, so
+    // a seam stamped only by `blank_row` survives exactly where the band happens
+    // to have no text: a rule broken into stubs by the words on top of it reads
+    // as debris rather than as the band's boundary. Drawn across the finished
+    // row, after every write, so no future field can chip it again — and given
+    // the seam's OWN ink, so the rule stays one tone across a row whose text
+    // deliberately carries two (see the module header).
     if seam {
         for cell in &mut row {
             cell.overline = true;
+            cell.overline_color = Some(c.label);
         }
     }
     Some(row)
@@ -684,20 +694,77 @@ mod tests {
                 .map(|(col, _)| col)
                 .collect::<Vec<_>>()
         );
-        // AND IT IS ONE TONE. An overline paints in its own cell's `fg`, so the
-        // rule's colour is the row's ink: a second ink anywhere under it puts a
-        // brighter dash over exactly those cells. Asserted on the `fg` the rule
-        // is drawn from, because `overline` alone is blind to it.
-        let inks: std::collections::BTreeSet<[u8; 3]> = row.iter().map(|cell| cell.fg).collect();
+        // AND IT IS ONE TONE, stated where the seam is actually drawn from. The
+        // row deliberately carries TWO inks (the host is brighter than the rest),
+        // so a seam left to each cell's `fg` would put a brighter dash over
+        // exactly the cells above the domain — the whole reason the edge has a
+        // colour channel of its own.
+        let seams: std::collections::BTreeSet<Option<[u8; 3]>> =
+            row.iter().map(|cell| cell.overline_color).collect();
         assert_eq!(
-            inks.len(),
+            seams.len(),
             1,
-            "the rule takes as many tones as the band has inks: {inks:?}"
+            "the rule takes as many tones as the band has inks: {seams:?}"
+        );
+        assert!(
+            seams.iter().all(Option::is_some),
+            "an uncoloured seam falls back to its cell's ink: {seams:?}"
+        );
+        let inks: std::collections::BTreeSet<[u8; 3]> = row.iter().map(|cell| cell.fg).collect();
+        assert!(
+            inks.len() > 1,
+            "the band is meant to carry hierarchy in ink, so this proof is not vacuous: {inks:?}"
         );
         // A caption flipped to the top row sits under the tab strip's own rule,
         // so it asks for no second one anywhere.
         let row = caption_row("https://evil.example/steal", 80, theme, false).expect("a wide band");
         assert!(row.iter().all(|cell| !cell.overline));
+    }
+
+    /// THE DESTINATION IS THE BRIGHTEST THING ON THE ROW, on every theme the
+    /// product ships. Weight is a hierarchy a glance can miss — a bold run in a
+    /// dim tone still reads as part of the dim sentence around it — and the one
+    /// question this band answers is WHICH SITE. So the site's own labels take
+    /// the band's full-contrast ink and everything else stays secondary, while
+    /// the seam underneath is unaffected either way.
+    #[test]
+    fn the_sites_own_labels_are_the_only_run_at_full_contrast() {
+        for name in aterm_types::scheme::builtin_names() {
+            let parts = aterm_types::scheme::builtin(name)
+                .expect("listed scheme exists")
+                .to_theme_parts();
+            let theme = Theme {
+                fg: parts.fg,
+                bg: parts.bg,
+                cursor: parts.cursor,
+                selection: parts.selection,
+            };
+            let c = chrome_band::band_colors(theme);
+            assert_ne!(
+                c.value, c.label,
+                "{name}: two tones or there is no hierarchy to assert"
+            );
+            let row = caption_row("https://google.com@evil.example/steal", 80, theme, true)
+                .expect("a wide band");
+            let bright: String = row
+                .iter()
+                .filter(|cell| cell.fg == c.value)
+                .map(|cell| cell.ch)
+                .collect();
+            assert_eq!(
+                bright, "evil.example",
+                "{name}: the full-contrast run must be the site and nothing else"
+            );
+            assert!(
+                row.iter()
+                    .all(|cell| cell.fg == c.value || cell.fg == c.label),
+                "{name}: the band speaks in exactly two tones"
+            );
+            assert!(
+                row.iter().all(|cell| cell.overline_color == Some(c.label)),
+                "{name}: the seam keeps the secondary tone under the bright run"
+            );
+        }
     }
 
     /// THE ATTACK THE MODULE EXISTS FOR, at the presentation end. When the

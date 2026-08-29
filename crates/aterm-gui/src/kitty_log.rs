@@ -415,7 +415,7 @@ impl KittyLog {
     /// yields the same empty default).
     pub(crate) fn read(path: &Path) -> Self {
         let mut log: Self = read_kitty_ledger_text(path)
-            .and_then(|t| toml::from_str(&t).ok())
+            .and_then(|t| aterm_toml::from_str(&t).ok())
             .unwrap_or_default();
         log.normalize_collectibles();
         log
@@ -465,7 +465,7 @@ impl KittyLog {
 
     fn read_collectible_store(path: &Path) -> Option<KittyCollectibleStore> {
         let mut store: KittyCollectibleStore =
-            read_kitty_ledger_text(path).and_then(|text| toml::from_str(&text).ok())?;
+            read_kitty_ledger_text(path).and_then(|text| aterm_toml::from_str(&text).ok())?;
         store.collectibles = Self::normalized_collectibles(store.collectibles);
         store.legacy_mirror = store.legacy_mirror.map(Self::normalized_collectibles);
         Some(store)
@@ -948,7 +948,7 @@ fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
     if !ledger_destination_is_safe(path) {
         return false;
     }
-    let Ok(text) = toml::to_string(value) else {
+    let Ok(text) = aterm_toml::to_string(value) else {
         return false;
     };
     if text.len() > MAX_KITTY_LEDGER_BYTES {
@@ -2016,8 +2016,11 @@ mod tests {
     }
 
     fn write_transitional_embedded(path: &Path, log: &KittyLog) {
-        std::fs::write(path, toml::to_string(log).expect("serialize legacy ledger"))
-            .expect("write transitional ledger");
+        std::fs::write(
+            path,
+            aterm_toml::to_string(log).expect("serialize legacy ledger"),
+        )
+        .expect("write transitional ledger");
     }
 
     fn write_precollectibles_rewrite(path: &Path, log: &KittyLog) {
@@ -2462,7 +2465,7 @@ mod tests {
         let mut seeded = KittyLog::default();
         seeded.record(&sighting(1), lex, "2026-07-01T00:00:00Z");
         let sidecar_victim_text =
-            toml::to_string(&KittyCollectibleStore::mirrored(&seeded.collectibles))
+            aterm_toml::to_string(&KittyCollectibleStore::mirrored(&seeded.collectibles))
                 .expect("serialize sidecar victim");
         std::fs::write(&sidecar_victim, &sidecar_victim_text).expect("write sidecar victim");
         symlink(&sidecar_victim, &sidecar).expect("plant sidecar final symlink");

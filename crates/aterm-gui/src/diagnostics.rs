@@ -33,6 +33,11 @@ pub(crate) struct DiagInfo {
     /// while the advertised row stays checked, and that split is the fact a
     /// "command not found on the ALab tools" report needs surfaced.
     pub shell_integration_runtime: String,
+    /// The coding-agent primer's state per registry agent under the real
+    /// `$HOME`, plus whether this configuration auto-primes on every fresh spawn
+    /// — the F1 diagnosable fact ("every agent row absent") beside the knob
+    /// that governs it, on one line.
+    pub agent_primer: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
     pub config_path: String,
@@ -64,6 +69,7 @@ impl DiagInfo {
         let _ = writeln!(s, "update-pin-sha256: {}", self.update_pin_sha256);
         let _ = writeln!(s, "renderer:  {}", self.renderer_default);
         let _ = writeln!(s, "shell-int: {}", self.shell_integration_runtime);
+        let _ = writeln!(s, "primer:    {}", self.agent_primer);
         let _ = writeln!(
             s,
             "config:    {} [{}]",
@@ -175,6 +181,23 @@ fn shell_integration_runtime(config: &crate::app_config::Config) -> String {
     }
 }
 
+/// The `primer:` line: every registry agent's primer state under the real
+/// `$HOME` — READ-ONLY, `--diagnose` never installs anything — and the
+/// `agents_auto_prime` knob as this configuration resolves it, so "why is the
+/// primer absent" and "why does it keep coming back" both answer here.
+fn agent_primer_line(config: &crate::app_config::Config) -> String {
+    let status = aterm_primer::home_dir().map_or_else(
+        || "(no HOME — nowhere to look)".to_string(),
+        |home| aterm_primer::status_line(&home),
+    );
+    let auto = if config.agents_auto_prime_or_default() {
+        "on"
+    } else {
+        "off"
+    };
+    format!("{status} — auto-prime: {auto} (agents_auto_prime)")
+}
+
 /// Collect diagnostics from the live build + environment.
 pub(crate) fn collect() -> DiagInfo {
     let config = crate::app_config::load_config();
@@ -213,6 +236,7 @@ pub(crate) fn collect() -> DiagInfo {
         update_pin_sha256: aterm_update::compiled_update_pin_sha256(),
         renderer_default,
         shell_integration_runtime: shell_integration_runtime(&config),
+        agent_primer: agent_primer_line(&config),
         features: vec![
             ("sixel", cfg!(feature = "sixel")),
             ("a11y-appkit", cfg!(feature = "a11y-appkit")),
@@ -1737,7 +1761,8 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
             crate::native_config_service::MAX_CONFIG_FILE_BYTES
         ));
     }
-    let config = toml::from_str::<crate::app_config::Config>(text).map_err(|e| e.to_string())?;
+    let config =
+        aterm_toml::from_str::<crate::app_config::Config>(text).map_err(|e| e.to_string())?;
     let mut warnings = config_semantic_warnings(&config)
         .into_iter()
         .map(|warning| warning.message)
@@ -2141,7 +2166,7 @@ mod tests {
     use super::*;
 
     fn parsed(source: &str) -> crate::app_config::Config {
-        toml::from_str(source).expect("test config")
+        aterm_toml::from_str(source).expect("test config")
     }
 
     #[test]
@@ -2642,7 +2667,7 @@ ink = "rainbow"
             return;
         }
 
-        let authored: crate::app_config::Config = toml::from_str("columns = 80\n").unwrap();
+        let authored: crate::app_config::Config = aterm_toml::from_str("columns = 80\n").unwrap();
         let warnings = config_host_semantic_warnings(&authored);
         assert!(warnings.iter().any(|warning| {
             warning.key == "columns"
@@ -3146,10 +3171,10 @@ ink = "rainbow"
         );
     }
 
-    /// An unknown `cursor_trail_style` silently disables the WHOLE cursor
-    /// effect at load (the `glow_config` gate), so `--validate-config` must
-    /// flag it — while every canonical spelling AND every documented alias
-    /// (rainbow/ember/ocean/…) validates green, since those genuinely render.
+    /// An unknown `cursor_trail_style` silently draws the DEFAULT style at
+    /// runtime, so `--validate-config` must flag it — while every canonical
+    /// spelling AND every documented alias (rainbow/ember/ocean/…) validates
+    /// green, since those genuinely select what they name.
     #[test]
     fn validate_flags_unknown_cursor_trail_style() {
         let joined = validate_config_text("cursor_trail_style = \"phasr\"\n")
@@ -3211,6 +3236,9 @@ ink = "rainbow"
                 .into(),
             renderer_default: "cpu",
             shell_integration_runtime: "active (Zsh loader prepared)".into(),
+            agent_primer: "claude installed, codex not detected — auto-prime: on \
+                           (agents_auto_prime)"
+                .into(),
             features: vec![("sixel", true), ("accessibility", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
@@ -3240,6 +3268,49 @@ ink = "rainbow"
         assert!(
             r.contains("shell-int: active (Zsh loader prepared)"),
             "runtime shell-integration outcome line"
+        );
+        // The agent-primer line rides in the same style, right below it.
+        assert!(
+            r.contains("primer:    claude installed, codex not detected — auto-prime: on"),
+            "agent primer state + knob line"
+        );
+    }
+
+    /// `collect` reads the REAL home read-only and the real config's knob: the
+    /// line always names every registry agent and states the knob either way.
+    #[test]
+    fn collect_reports_agent_primer_state_and_the_knob() {
+        let d = collect();
+        assert!(
+            d.agent_primer
+                .ends_with("auto-prime: on (agents_auto_prime)")
+                || d.agent_primer
+                    .ends_with("auto-prime: off (agents_auto_prime)"),
+            "the knob is always stated: {}",
+            d.agent_primer
+        );
+        for agent in ["claude", "codex", "gemini", "opencode"] {
+            assert!(
+                d.agent_primer.contains(agent),
+                "{agent} missing: {}",
+                d.agent_primer
+            );
+        }
+    }
+
+    /// The knob half of the line follows the config, not a constant.
+    #[test]
+    fn agent_primer_line_states_the_knob_as_configured() {
+        let on = agent_primer_line(&crate::app_config::Config::default());
+        assert!(on.ends_with("— auto-prime: on (agents_auto_prime)"), "{on}");
+        let config = crate::app_config::Config {
+            agents_auto_prime: Some(false),
+            ..crate::app_config::Config::default()
+        };
+        let off = agent_primer_line(&config);
+        assert!(
+            off.ends_with("— auto-prime: off (agents_auto_prime)"),
+            "{off}"
         );
     }
 

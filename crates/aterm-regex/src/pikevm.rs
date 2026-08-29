@@ -149,7 +149,11 @@ pub(crate) fn search(
     earliest: bool,
     step_limit: u64,
 ) -> Result<Option<(usize, usize)>, StepLimitExceeded> {
-    let Cache { clist, nlist, stack } = cache;
+    let Cache {
+        clist,
+        nlist,
+        stack,
+    } = cache;
     clist.resize(prog.insts.len());
     nlist.resize(prog.insts.len());
 
@@ -158,13 +162,29 @@ pub(crate) fn search(
     // wrapping back under the limit if one ever were.
     let mut steps: u64 = 0;
     let mut matched: Option<(usize, usize)> = None;
+    // `\A` holds at offset 0 of the text and nowhere else, so a start-anchored
+    // program asked to search from any later offset has already been answered.
+    // This is the case `find_iter` walks into: having taken the match at 0, it
+    // asks again from its end, and every such ask used to re-scan the row.
+    if prog.start_anchored && start > 0 {
+        return Ok(None);
+    }
     let mut pos = start;
     loop {
         // One unit for arriving at this position at all, so a haystack that
         // keeps no thread alive is still charged for being walked.
         steps = steps.saturating_add(1);
         if matched.is_none() {
-            if clist.dense.is_empty()
+            if prog.start_anchored {
+                // An anchored program starts threads at offset 0 and nowhere
+                // else. Once the list empties, nothing can revive it, and the
+                // prefilter — whose whole job is to find the next place a match
+                // could *begin* — has nowhere left to look. Walking the rest of
+                // the row is work spent proving what is already known.
+                if pos > 0 && clist.dense.is_empty() {
+                    return Ok(None);
+                }
+            } else if clist.dense.is_empty()
                 && let Some(first) = prog.first.as_ref()
             {
                 let skipped = skip_to_candidate(prog, first, text, pos);
@@ -173,8 +193,7 @@ pub(crate) fn search(
                     // it is charged by the byte: cheap per unit, but not free,
                     // and a 3 MB haystack of nothing but skipped bytes is real
                     // work the budget has to see.
-                    steps = steps
-                        .saturating_add(u64::try_from(skipped - pos).unwrap_or(u64::MAX));
+                    steps = steps.saturating_add(u64::try_from(skipped - pos).unwrap_or(u64::MAX));
                     pos = skipped;
                     // The list's visited marks describe the closure at the
                     // position we just left. Empty of threads it may be, but a
@@ -187,8 +206,7 @@ pub(crate) fn search(
                     clist.begin();
                 }
             }
-            steps = steps
-                .saturating_add(add(clist, stack, prog, prog.start, pos, pos, text));
+            steps = steps.saturating_add(add(clist, stack, prog, prog.start, pos, pos, text));
         }
         let ch = text.get(pos..).and_then(|rest| rest.chars().next());
         nlist.begin();
@@ -202,17 +220,17 @@ pub(crate) fn search(
                 Some(&Inst::Char { c, next }) => {
                     if Some(c) == ch {
                         let at = pos + c.len_utf8();
-                        steps = steps
-                            .saturating_add(add(nlist, stack, prog, next, t.start, at, text));
+                        steps =
+                            steps.saturating_add(add(nlist, stack, prog, next, t.start, at, text));
                     }
                 }
                 Some(&Inst::Class { class, next }) => {
                     if let Some(c) = ch
-                        && prog.classes.get(class).is_some_and(|set| set.matches(c))
+                        && class_matches(prog, class, c)
                     {
                         let at = pos + c.len_utf8();
-                        steps = steps
-                            .saturating_add(add(nlist, stack, prog, next, t.start, at, text));
+                        steps =
+                            steps.saturating_add(add(nlist, stack, prog, next, t.start, at, text));
                     }
                 }
                 Some(&Inst::Match) => {
@@ -248,6 +266,32 @@ pub(crate) fn search(
     Ok(matched)
 }
 
+/// Does code point `c` belong to `prog.classes[class]`?
+///
+/// Below U+0080 the answer is one bit of a dense array — a shift and a test,
+/// touching sixteen bytes and no heap. Above it, the general path: reach
+/// through the `ClassSet`'s `Vec` header, binary search its ranges, then walk
+/// its perl classes.
+///
+/// The split earns its keep because of what this engine is FOR. Terminal rows
+/// are overwhelmingly ASCII, and the patterns that cost the most are the ones
+/// made entirely of classes — `(?i)ERROR` compiles to five `Inst::Class`, one
+/// per letter, where the case-sensitive form compiles to five `Inst::Char` that
+/// need no set at all. So the case-insensitive search, which is the find bar's
+/// default, is exactly the one paying per code point for a lookup structure
+/// built to answer questions about the whole of Unicode.
+#[inline]
+fn class_matches(prog: &Program, class: usize, c: char) -> bool {
+    let code = c as u32;
+    if code < 128 {
+        return prog
+            .class_ascii
+            .get(class)
+            .is_some_and(|bits| bits >> code & 1 != 0);
+    }
+    prog.classes.get(class).is_some_and(|set| set.matches(c))
+}
+
 /// Advance past bytes that cannot begin a match.
 ///
 /// Sound only because the caller checks the thread list is empty first: with no
@@ -265,6 +309,29 @@ fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usi
     let bytes = text.as_bytes();
     while let Some(&b) = bytes.get(pos) {
         if first.lead_bytes[b as usize] {
+            // THE SECOND BYTE FIRST, when the byte here is ASCII. Everything
+            // below this needs the decoded code point — the viability walk over
+            // `pcs` compares whole `char`s — and a decode plus that walk is far
+            // more than an array lookup. An ASCII lead byte IS its whole code
+            // point, so the next one starts at `pos + 1` and can be tested
+            // without decoding anything.
+            //
+            // Which matters because of what the lead-byte filter leaves behind:
+            // for `(?i)ERROR` it marks `E` and `e`, about a tenth of ordinary
+            // terminal output, and the second-byte test rejects the
+            // overwhelming majority of those. Doing it after the decode meant
+            // paying the decode on every one of them to reject almost all.
+            if b < 0x80
+                && let Some(second) = first.second_bytes.as_ref()
+                && let Some(&next_byte) = bytes.get(pos + 1)
+                && !second[next_byte as usize]
+            {
+                // Same resume rule as below: past this code point, not past the
+                // byte that failed — that byte is itself a position a match may
+                // begin at.
+                pos += 1;
+                continue;
+            }
             // A marked byte only means "some candidate might start here". Confirm
             // against the instructions themselves before handing back a position.
             let Some(c) = text.get(pos..).and_then(|rest| rest.chars().next()) else {
@@ -272,12 +339,33 @@ fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usi
             };
             let viable = first.pcs.iter().any(|&pc| match prog.insts.get(pc) {
                 Some(&Inst::Char { c: want, .. }) => want == c,
-                Some(&Inst::Class { class, .. }) => {
-                    prog.classes.get(class).is_some_and(|set| set.matches(c))
-                }
+                Some(&Inst::Class { class, .. }) => class_matches(prog, class, c),
                 _ => true,
             });
             if viable {
+                // One more byte of evidence, when the pattern provably has a
+                // second code point. This is what makes a common lead byte
+                // affordable: `(?i)ERROR` marks `E` and `e`, roughly a tenth
+                // of ordinary terminal output, and almost every one of those
+                // positions dies on the second character — after the
+                // simulation has been entered, a thread added and a step
+                // charged. One array lookup answers it instead.
+                if let Some(second) = first.second_bytes.as_ref() {
+                    let after = pos + c.len_utf8();
+                    // No byte to test means the text ends here, and a pattern
+                    // needing a second code point cannot match at `pos` — but
+                    // saying so is the simulation's job, not the filter's. The
+                    // filter only ever excludes on POSITIVE evidence.
+                    if let Some(&next_byte) = bytes.get(after)
+                        && !second[next_byte as usize]
+                    {
+                        // Nothing can start at `pos`. Resume at the code point
+                        // after it — NOT after the second byte, which is
+                        // itself a position a match may begin at.
+                        pos = after;
+                        continue;
+                    }
+                }
                 break;
             }
             pos += c.len_utf8();
@@ -329,7 +417,10 @@ fn add(
                 }
             }
             Some(&(Inst::Char { .. } | Inst::Class { .. } | Inst::Match)) => {
-                list.dense.push(Thread { pc, start: thread_start });
+                list.dense.push(Thread {
+                    pc,
+                    start: thread_start,
+                });
             }
             None => {}
         }
@@ -374,7 +465,9 @@ mod tests {
     fn assertions_read_the_surrounding_code_points() {
         let text = "ab cd";
         let positions = |kind: Assertion| -> Vec<usize> {
-            (0..=text.len()).filter(|&at| satisfied(kind, text, at)).collect()
+            (0..=text.len())
+                .filter(|&at| satisfied(kind, text, at))
+                .collect()
         };
         assert_eq!(positions(Assertion::StartText), vec![0]);
         assert_eq!(positions(Assertion::EndText), vec![5]);
@@ -395,7 +488,9 @@ mod tests {
         // `a` + U+0301.
         let marked = "a\u{301}b c";
         let bounds: Vec<usize> = (0..=marked.len())
-            .filter(|&at| marked.is_char_boundary(at) && satisfied(Assertion::WordBoundary, marked, at))
+            .filter(|&at| {
+                marked.is_char_boundary(at) && satisfied(Assertion::WordBoundary, marked, at)
+            })
             .collect();
         assert_eq!(bounds, vec![0, 4, 5, 6]);
     }
@@ -416,7 +511,11 @@ mod tests {
     fn an_earlier_start_always_wins() {
         assert_eq!(find("ab|b", "ab", 0), Some((0, 2)));
         assert_eq!(find("b|ab", "ab", 0), Some((0, 2)));
-        assert_eq!(find("a*", "bbaa", 0), Some((0, 0)), "the empty match at 0 is leftmost");
+        assert_eq!(
+            find("a*", "bbaa", 0),
+            Some((0, 0)),
+            "the empty match at 0 is leftmost"
+        );
     }
 
     /// `start` resumes the search without changing what the assertions see: the
@@ -457,7 +556,10 @@ mod tests {
     fn the_prefilter_never_skips_a_match() {
         let ast = parse("needle", Flags::default()).expect("parses");
         let prog = compile(&ast, usize::MAX).expect("compiles");
-        assert!(prog.first.is_some(), "this pattern should arm the prefilter");
+        assert!(
+            prog.first.is_some(),
+            "this pattern should arm the prefilter"
+        );
         let mut cache = Cache::new();
         for pad in 0..40usize {
             let text = format!("{}needle{}", "x".repeat(pad), "y".repeat(pad));
@@ -478,7 +580,10 @@ mod tests {
     fn skipping_ahead_retires_the_marks_it_leaves_behind() {
         // `\-?\B\d`: the `-` at 2 is consumed, `\B` fails at 3 leaving marks and
         // no threads, and the prefilter then skips to the `0` at 8.
-        assert_eq!(find(r"\-?\B\d", "\u{e9}-bx\u{4f60}0\u{4f60}", 0), Some((8, 9)));
+        assert_eq!(
+            find(r"\-?\B\d", "\u{e9}-bx\u{4f60}0\u{4f60}", 0),
+            Some((8, 9))
+        );
         assert_eq!(find(r"ab\Bc", "abxabc", 0), Some((3, 6)));
         assert_eq!(find(r"a\bz|q", "ab qz", 0), Some((3, 4)));
         assert_eq!(find(r"x\B\d", "xy x1", 0), Some((3, 5)));
@@ -488,15 +593,24 @@ mod tests {
     /// stale marks between runs.
     #[test]
     fn a_cache_survives_being_resized_between_programs() {
-        let small = compile(&parse("a", Flags::default()).expect("parses"), usize::MAX)
-            .expect("compiles");
-        let large = compile(&parse("(?:abc){20}", Flags::default()).expect("parses"), usize::MAX)
-            .expect("compiles");
+        let small =
+            compile(&parse("a", Flags::default()).expect("parses"), usize::MAX).expect("compiles");
+        let large = compile(
+            &parse("(?:abc){20}", Flags::default()).expect("parses"),
+            usize::MAX,
+        )
+        .expect("compiles");
         let mut cache = Cache::new();
         let big = "abc".repeat(20);
         for _ in 0..50 {
-            assert_eq!(search(&small, &mut cache, "zza", 0, false, u64::MAX), Ok(Some((2, 3))));
-            assert_eq!(search(&large, &mut cache, &big, 0, false, u64::MAX), Ok(Some((0, 60))));
+            assert_eq!(
+                search(&small, &mut cache, "zza", 0, false, u64::MAX),
+                Ok(Some((2, 3)))
+            );
+            assert_eq!(
+                search(&large, &mut cache, &big, 0, false, u64::MAX),
+                Ok(Some((0, 60)))
+            );
             assert_eq!(search(&small, &mut cache, "", 0, false, u64::MAX), Ok(None));
         }
     }
@@ -550,7 +664,10 @@ mod tests {
             Err(StepLimitExceeded::new(1_000)),
             "100,000 skipped bytes are 100,000 units of real work"
         );
-        assert_eq!(search(&prog, &mut cache, &text, 0, false, u64::MAX), Ok(None));
+        assert_eq!(
+            search(&prog, &mut cache, &text, 0, false, u64::MAX),
+            Ok(None)
+        );
     }
 
     /// The generation stamp wraps rather than growing without bound, and a wrap
@@ -563,9 +680,15 @@ mod tests {
         list.visited.fill(u32::MAX);
         list.begin();
         assert_eq!(list.generation, 1);
-        assert!(!list.mark(0), "a wrapped generation must not report stale marks");
+        assert!(
+            !list.mark(0),
+            "a wrapped generation must not report stale marks"
+        );
         assert!(list.mark(0), "and must still deduplicate");
         assert!(!list.mark(3));
-        assert!(list.mark(9), "an out-of-range pc is treated as already seen");
+        assert!(
+            list.mark(9),
+            "an out-of-range pc is treated as already seen"
+        );
     }
 }

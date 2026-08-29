@@ -35,6 +35,7 @@ use aterm_session::SessionId;
 use aterm_session::sink::SinkWriter;
 use winit::event_loop::EventLoopProxy;
 
+use super::control_session;
 use crate::session_store::Store;
 use crate::subscribe::{SubscriberSet, Subscribers, Subscription};
 use crate::{Wake, term_lock};
@@ -173,6 +174,27 @@ impl SessionHost for GuiHost<'_> {
                     .any_set(),
             })
             .collect()
+    }
+
+    /// The roster's window membership + running command, through the SAME hop
+    /// and sanitizer the shipped `sessions` verb uses
+    /// ([`control_session::placement_of`]), so the seam and the wire cannot
+    /// disagree about where a session lives. `None` without a registry (no
+    /// roster to place) or without an event loop (no window layer to ask), and
+    /// when the hop fails — each "could not look", never "detached".
+    fn placements(&self) -> Option<Vec<aterm_control::host::SessionPlacement>> {
+        let store = self.store?;
+        let rows = control_session::session_window_rows(self.proxy).ok()?;
+        let snapshot = {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            g.snapshot()
+        };
+        Some(
+            snapshot
+                .iter()
+                .map(|h| control_session::placement_of(h, &rows))
+                .collect(),
+        )
     }
 
     fn resolve(&self, selector: Selector<'_>) -> Option<u64> {
@@ -520,6 +542,12 @@ mod tests {
         assert_eq!(scoped.resolve(Selector::Local(0)), None);
         // Still SERVES its session: no index is not no session.
         assert!(cmd_selection(&scoped, 0).starts_with("OK "));
+
+        // Placements need the window layer: with no event loop to ask, BOTH
+        // hosts answer "could not look" (`None`) — never an empty or detached
+        // batch that would print as `window=none`.
+        assert_eq!(host.placements(), None);
+        assert_eq!(scoped.placements(), None);
     }
 
     /// Bytes for the served sid reach the target's REAL `SinkWriter` — the half

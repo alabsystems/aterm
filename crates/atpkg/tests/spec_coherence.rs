@@ -634,7 +634,7 @@ fn roadmap_names_cannot_vanish_from_the_spec_notes() {
 #[test]
 fn workspace_metadata_pins_the_shipped_surface_and_public_account() {
     let root = repo_root();
-    let manifest: toml::Value = read(&root, "Cargo.toml")
+    let manifest: aterm_toml::Value = read(&root, "Cargo.toml")
         .parse()
         .expect("root Cargo.toml parses as TOML");
     let meta = manifest
@@ -651,8 +651,8 @@ fn workspace_metadata_pins_the_shipped_surface_and_public_account() {
         });
     let expose: Vec<&str> = meta
         .get("expose")
-        .and_then(toml::Value::as_array)
-        .map(|a| a.iter().filter_map(toml::Value::as_str).collect())
+        .and_then(aterm_toml::Value::as_array)
+        .map(|a| a.iter().filter_map(aterm_toml::Value::as_str).collect())
         .unwrap_or_default();
     assert_eq!(
         expose,
@@ -662,7 +662,7 @@ fn workspace_metadata_pins_the_shipped_surface_and_public_account() {
          contract (ctl/pkg/fleet/drive are in-process verbs; siblings ride as \
          argv0 symlinks). Restore `expose = [\"aterm\"]`"
     );
-    let account = meta.get("account").and_then(toml::Value::as_str);
+    let account = meta.get("account").and_then(aterm_toml::Value::as_str);
     assert_eq!(
         account,
         Some("alabsystems"),
@@ -888,6 +888,78 @@ impl SpecRow {
         let line = line.trim().trim_start_matches('#');
         line.split_whitespace().nth(1).unwrap_or("").to_string()
     }
+}
+
+/// (h3) The AUTHORING side's `shim_env` rule equals the CLIENT's (design S7): the
+/// entry cap (`ATPKG_SHIM_ENV_MAX` = `shim_env::MAX_SHIM_ENV`), the entry length
+/// (`ATPKG_SHIM_ENV_ENTRY_MAX` = `shim_env::MAX_ENTRY_BYTES`) and the names a shim
+/// never sets (`ATPKG_SHIM_ENV_NEVER` = `shim_env::NEVER_SET`,
+/// `ATPKG_SHIM_ENV_NEVER_PREFIXES` = `shim_env::NEVER_SET_PREFIXES`). The client's
+/// rule is the authority — a manifest breaking it is refused whole at parse;
+/// atpkg-publish-lib.sh's copy only lets the ceremony refuse the list before it is
+/// signed.
+#[test]
+fn shim_env_rule_matches_the_client() {
+    let root = repo_root();
+    let lib = read(&root, "tools/atpkg-publish-lib.sh");
+    let max = lib
+        .lines()
+        .map(str::trim_start)
+        .find_map(|l| l.strip_prefix("ATPKG_SHIM_ENV_MAX="))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .expect("tools/atpkg-publish-lib.sh carries an `ATPKG_SHIM_ENV_MAX=<n>` line");
+    assert_eq!(
+        max,
+        atpkg::shim_env::MAX_SHIM_ENV,
+        "tools/atpkg-publish-lib.sh ATPKG_SHIM_ENV_MAX must equal \
+         crates/atpkg/src/shim_env.rs MAX_SHIM_ENV"
+    );
+    let entry_max = lib
+        .lines()
+        .map(str::trim_start)
+        .find_map(|l| l.strip_prefix("ATPKG_SHIM_ENV_ENTRY_MAX="))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .expect("tools/atpkg-publish-lib.sh carries an `ATPKG_SHIM_ENV_ENTRY_MAX=<n>` line");
+    assert_eq!(
+        entry_max,
+        atpkg::shim_env::MAX_ENTRY_BYTES,
+        "tools/atpkg-publish-lib.sh ATPKG_SHIM_ENV_ENTRY_MAX must equal \
+         crates/atpkg/src/shim_env.rs MAX_ENTRY_BYTES"
+    );
+    let never = shell_list(&lib, "ATPKG_SHIM_ENV_NEVER", "tools/atpkg-publish-lib.sh");
+    let client: BTreeSet<String> = atpkg::shim_env::NEVER_SET
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    assert_eq!(
+        never, client,
+        "tools/atpkg-publish-lib.sh ATPKG_SHIM_ENV_NEVER must equal shim_env::NEVER_SET"
+    );
+    let prefixes = shell_list(
+        &lib,
+        "ATPKG_SHIM_ENV_NEVER_PREFIXES",
+        "tools/atpkg-publish-lib.sh",
+    );
+    let client_prefixes: BTreeSet<String> = atpkg::shim_env::NEVER_SET_PREFIXES
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    assert_eq!(
+        prefixes, client_prefixes,
+        "tools/atpkg-publish-lib.sh ATPKG_SHIM_ENV_NEVER_PREFIXES must equal \
+         shim_env::NEVER_SET_PREFIXES"
+    );
+    // The authored claude row's entry is one the client admits, and the fix-line it
+    // earns is the self-update one — the whole point of the key.
+    let env = atpkg::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+    assert_eq!(
+        env.fix_line().as_deref(),
+        Some("self-update off (DISABLE_AUTOUPDATER=1)")
+    );
+    assert!(
+        read(&root, "tools/atpkg-author-vendor.sh").contains("SHIM_ENV=\"DISABLE_AUTOUPDATER=1\""),
+        "tools/atpkg-author-vendor.sh authors claude with SHIM_ENV=DISABLE_AUTOUPDATER=1"
+    );
 }
 
 /// (h2) The AUTHORING side's manager table equals the CLIENT's: the names

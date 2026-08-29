@@ -30,7 +30,7 @@ use crate::{ApplyOutcome, bundle, verify};
 /// 0; the first launch observes 1; the revert fires when attempts reach this. A
 /// healthy build clears the sentinel via [`confirm_boot_health`] on its first boot,
 /// so this only bites a build that never reaches the health checkpoint.
-const MAX_BOOT_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
 
 /// How long a LAUNCH waits for the apply lock before giving up and starting on
 /// the installed build.
@@ -367,9 +367,12 @@ fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
     }
 }
 
-/// Path equality for install roots, tolerant of a canonicalizable spelling.
+/// Path equality for install roots, tolerant of a canonicalizable spelling. The one
+/// "is this the same copy of aterm.app?" test — the trial-ownership rule above and
+/// the S12 `which_copy` report both ask it, so a symlinked spelling of the running
+/// bundle can never read as a second copy on one surface and not the other.
 #[must_use]
-fn same_install_root(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_install_root(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
@@ -685,6 +688,7 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
     crate::health::Health::record_apply_failure(
         &staging.health(),
         current_build,
+        armed_build,
         &format!(
             "update trial for build {armed_build} was unrecoverable across {MAX_BOOT_ATTEMPTS} \
              launches of build {current_build}; disarmed the boot sentinel to keep updates \
@@ -2975,6 +2979,9 @@ fn check_boot_health(
                 crate::health::Health::record_apply_failure(
                     &staging.health(),
                     current_build,
+                    // The trial under recovery IS this build: the sentinel is armed
+                    // for `current_build` and every arm above revalidated it.
+                    current_build,
                     &format!(
                         "trial recovery proof failed {MAX_BOOT_ATTEMPTS}x ({error}); disarmed \
                          the boot sentinel to keep updates possible"
@@ -3663,7 +3670,7 @@ dmg_sha256 = "abcd"
 team_id = "T"
 staged_at = "2026-08-17T00:00:00Z"
 "#;
-        let ready: Ready = toml::from_str(legacy).expect("pre-attribution marker parses");
+        let ready: Ready = aterm_toml::from_str(legacy).expect("pre-attribution marker parses");
         assert_eq!(ready.build_number, 42);
         assert_eq!(ready.machine_id, None);
         assert_eq!(ready.roster_seq, None);
@@ -3835,13 +3842,16 @@ staged_at = "2026-08-17T00:00:00Z"
         record_activating_status(&s, &ready);
 
         let text = std::fs::read_to_string(&s.status).expect("activation status written");
-        let value: toml::Value = toml::from_str(&text).expect("activation status parses");
+        let value: aterm_toml::Value =
+            aterm_toml::from_str(&text).expect("activation status parses");
         assert_eq!(
-            value.get("current_build").and_then(toml::Value::as_integer),
+            value
+                .get("current_build")
+                .and_then(aterm_toml::Value::as_integer),
             Some(54)
         );
         assert_eq!(
-            value.get("outcome").and_then(toml::Value::as_str),
+            value.get("outcome").and_then(aterm_toml::Value::as_str),
             Some("installed 0.0.54 (build 54); activating now")
         );
         assert!(

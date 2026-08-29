@@ -19,6 +19,7 @@ use aterm_render::Theme;
 use crate::settings::{Roles, SettingsGeom, text_w};
 use crate::tray_raster::{row_baseline, ui_text_width};
 use crate::type_scale::TypeStep;
+use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
 /// Transient per-window state for the Software Update overlay (mirrors `AboutState`'s slot).
@@ -48,7 +49,33 @@ pub(crate) struct UpdateState {
     /// Consecutive APPLY failures. `>= PERSISTENT_AFTER` is the exact statement
     /// "the staged build will not start", independent of which class happened to
     /// fail last (2026-08-19 round-4 skeptics).
+    ///
+    /// ANY NON-ZERO VALUE IS ALREADY NEWS. The escalation threshold decides how
+    /// LOUDLY the machine complains; it was never meant to decide whether the person
+    /// gets told at all. On the owner's machine (2026-08-21) this sat at 2 — one
+    /// short of `PERSISTENT_AFTER` — for hours, so every surface keyed on the
+    /// threshold went on painting a plain "Update ready" over an engine that had
+    /// tried twice and watched the successor die both times.
     failing_applies: u32,
+    /// WHY those applies failed: the ledger's `last_apply_error`, the same prose the
+    /// control socket prints as `apply_failure=`. Rendered into human words by
+    /// [`ApplyTrouble`]; never shown raw.
+    apply_failure: String,
+    /// WHICH ARTIFACT [`Self::apply_failure`] is about (0 when unknown), and how many
+    /// consecutive attempts on THAT artifact are behind it — the ledger's
+    /// `last_apply_failure_target_build` / `apply_failures_for_target`.
+    ///
+    /// [`Self::failing_applies`] cannot stand in: it expires on the RUNNING build, so
+    /// a stage that failed twice hands its count and its reason to whatever newer
+    /// artifact replaces it, and the page would decorate a never-attempted download
+    /// with someone else's failures.
+    apply_failure_build: u64,
+    /// See [`Self::apply_failure_build`].
+    apply_attempts_for_stage: u32,
+    /// Whether the automatic lane still intends to retry this artifact by itself.
+    /// Event-loop state (`App::automatic_apply_retry_scheduled`), not ledger state —
+    /// and the half of the story that decides whether the reader has to act.
+    apply_retry: ApplyRetry,
     /// This launch has a bundle the updater could replace at all.
     installable: bool,
     /// The STRANDED verdict: checks complete but the release channel cannot be
@@ -79,7 +106,25 @@ pub(crate) struct UpdateProjection {
     /// …and specifically in the APPLY class: the staged build will not start. An
     /// acquisition class (`manifest`, `pipeline`, …) says nothing about the stage
     /// in hand, so the "not applying" wording is reserved for this.
+    ///
+    /// This is the ESCALATION verdict — the loud one — and it is no longer what the
+    /// wording keys on: [`Self::apply_trouble`] is, because a person is entitled to
+    /// know about the FIRST failed apply and this field cannot report it. Retained
+    /// because "the streak crossed `PERSISTENT_AFTER`" remains a distinct and useful
+    /// fact (it is what earns the log pointer in the detail line), and because a
+    /// surface that wanted to style the escalated case differently would need it.
     pub(crate) apply_is_failing: bool,
+    /// The apply lane's STANDING trouble for the staged build, when there is any:
+    /// how many attempts failed, why, and whether the lane will try again unaided.
+    ///
+    /// Distinct from [`Self::apply_is_failing`], which is the ESCALATION verdict
+    /// (`>= PERSISTENT_AFTER`) and therefore silent about the first two failures.
+    /// This is `Some` from the FIRST one, because "aterm tried once and the new
+    /// version did not finish starting" is already something the person looking at
+    /// an "update available" affordance is entitled to know. `None` for a stage that
+    /// has simply not been attempted yet — a deferral or a block records a refusal
+    /// and advances no streak, and that state must keep reading as ready.
+    pub(crate) apply_trouble: Option<ApplyTrouble>,
     /// Whether a replacement could be installed here AT ALL — false for a copy run
     /// from the mounted disk image, a Gatekeeper-translocated download, or a
     /// dev-marked build. EVERY surface on the page has to read it. Round five gave
@@ -104,9 +149,16 @@ impl UpdateState {
     /// path: it is deliberately memory-only so opening Settings, querying
     /// introspection, and repainting can never parse a ledger or launch a bundle
     /// metadata probe on the event-loop thread.
+    ///
+    /// `apply_retry` is the ONE fact the reducer cannot supply: whether the automatic
+    /// lane still intends this artifact at all
+    /// (`App::automatic_apply_retry_scheduled`). It is passed rather than defaulted
+    /// because guessing it wrong is worse than not saying: telling somebody an update
+    /// will retry itself when it will not is how a machine sits un-updated for hours.
     pub(crate) fn from_service(
         snapshot: &crate::native_updater_service::UpdaterSnapshot,
         checking: bool,
+        apply_retry: ApplyRetry,
     ) -> Self {
         let staged = snapshot.staged.as_ref().and_then(|staged| {
             (snapshot.enabled && staged.build > snapshot.current_build)
@@ -136,6 +188,10 @@ impl UpdateState {
             failing_persistent: snapshot.failing_persistent,
             failing_kind: snapshot.failing_kind.clone(),
             failing_applies: snapshot.failing_applies,
+            apply_failure: snapshot.apply_failure.clone(),
+            apply_failure_build: snapshot.apply_failure_build,
+            apply_attempts_for_stage: snapshot.apply_failures_for_target,
+            apply_retry,
             installable: snapshot.installable,
             channel_unreadable: snapshot.channel_unreadable,
             checking,
@@ -186,6 +242,16 @@ impl UpdateState {
             failing_persistent: status.is_some_and(|s| s.enabled && s.is_failing_persistently()),
             failing_kind: status.map(|s| s.failing_kind.clone()).unwrap_or_default(),
             failing_applies: status.map_or(0, |s| s.failing_applies),
+            // `aterm_update::UpdateStatus` is the CHECK lane's projection and
+            // deliberately carries no apply-lane prose; the shipping path reads it
+            // beside the status (`app_native::durable_update_status`). Tests that
+            // want a cause attach one with [`Self::with_apply_lane`].
+            apply_failure: String::new(),
+            apply_failure_build: 0,
+            apply_attempts_for_stage: 0,
+            // The conservative default: claiming a retry that is not scheduled is the
+            // one error that costs the reader real time.
+            apply_retry: ApplyRetry::ManualOnly,
             installable: status.is_none_or(|s| s.installable),
             channel_unreadable: status.is_some_and(|s| s.enabled && s.channel_unreadable),
             checking,
@@ -221,6 +287,50 @@ impl UpdateState {
         self
     }
 
+    /// Attach the apply lane's own facts to a `from_status` fixture: the ledger
+    /// reason behind the streak, and whether the loop still intends to retry.
+    ///
+    /// Only tests need this. The shipping constructor takes both from the reducer
+    /// snapshot and the event loop, which is where they actually live.
+    #[cfg(test)]
+    pub(crate) fn with_apply_lane(mut self, reason: &str, retry: ApplyRetry) -> Self {
+        self.apply_failure = reason.to_string();
+        self.apply_retry = retry;
+        // The artifact-scoped pair the shipping constructor copies out of the ledger.
+        // A fixture that set the reason but left the target at 0 would silently
+        // produce NO trouble, so it is derived from the fixture's own stage rather
+        // than left to the caller to remember.
+        self.apply_failure_build = self.staged.as_ref().map_or(0, |(build, _)| *build);
+        self.apply_attempts_for_stage = self.failing_applies;
+        self
+    }
+
+    /// The apply lane's standing trouble for the STAGED build, in the form every
+    /// surface renders.
+    ///
+    /// Gated on `staged` because trouble is only ever about a build actually on
+    /// offer: with nothing staged there is no affordance to qualify, and a leftover
+    /// streak would be describing a stage the user cannot see. Gated on `enabled` for
+    /// the same reason the failure headlines are — a disabled updater's ledger is
+    /// history, not a live report.
+    pub(crate) fn apply_trouble(&self) -> Option<ApplyTrouble> {
+        if !self.enabled {
+            return None;
+        }
+        // Only the artifact the failures were actually ABOUT may wear them; see
+        // [`Self::apply_failure_build`]. This also subsumes the old `staged.is_none()`
+        // guard — with nothing on offer there is no build to match.
+        let (staged_build, _) = self.staged.as_ref()?;
+        if self.apply_failure_build != *staged_build {
+            return None;
+        }
+        ApplyTrouble::new(
+            self.apply_attempts_for_stage,
+            &self.apply_failure,
+            self.apply_retry,
+        )
+    }
+
     /// Snapshot the exact state the existing update card paints for native tab
     /// presentation and semantic introspection.
     pub(crate) fn projection(&self) -> UpdateProjection {
@@ -234,6 +344,10 @@ impl UpdateState {
             checking: self.checking,
             failing_persistent: self.failing_persistent && self.enabled && !self.checking,
             apply_is_failing: self.apply_is_failing() && self.enabled && !self.checking,
+            // Suppressed mid-check for the same reason `apply_is_failing` is: a check
+            // in flight owns the surface, and a verdict from before it started must
+            // not argue with the "Checking…" the user is looking at.
+            apply_trouble: (!self.checking).then(|| self.apply_trouble()).flatten(),
             installable: self.installable,
             channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
             headline: self.headline(),
@@ -274,6 +388,14 @@ impl UpdateState {
         self.enabled.hash(&mut h);
         self.outcome.hash(&mut h);
         self.channel_unreadable.hash(&mut h);
+        // The apply lane is part of what the card SAYS now, so it is part of what
+        // decides a repaint. A second failed attempt that changed no other field
+        // would otherwise rewrite the headline into a frame nobody asked for.
+        self.failing_applies.hash(&mut h);
+        self.apply_failure.hash(&mut h);
+        self.apply_failure_build.hash(&mut h);
+        self.apply_attempts_for_stage.hash(&mut h);
+        self.apply_retry.hash(&mut h);
         self.checking.hash(&mut h);
         h.finish() | 1
     }
@@ -303,6 +425,15 @@ impl UpdateState {
             // about ACQUIRING the NEXT build and says nothing about the stage in
             // hand, which is verified and will install (round-4 audit).
             "Update ready, but it keeps failing to apply.".to_string()
+        } else if self.apply_trouble().is_some() {
+            // BELOW THE ESCALATION THRESHOLD IS STILL NOT "READY". `PERSISTENT_AFTER`
+            // decides when the machine complains LOUDLY; it was never meant to decide
+            // whether the person is told at all, and treating it that way is the
+            // defect this arm closes. Measured on the owner's machine (2026-08-21):
+            // `failing_applies=2` for hours under a plain "Update ready", while the
+            // engine had watched the successor die twice. The count and the cause
+            // ride the detail line below.
+            "Update ready, but applying it failed.".to_string()
         } else if self.staged.is_some() {
             "Update ready".to_string()
         } else if !self.installable {
@@ -347,7 +478,43 @@ impl UpdateState {
             // Not the ledger `outcome`: the check lane rewrites that every cycle with
             // the healthy "staged … ready to apply" sentence while a stage is held.
             // The durable fact is the class that is failing.
-            if self.enabled && self.apply_is_failing() {
+            // "every attempt to start it has failed" named neither HOW MANY attempts
+            // nor WHY, so a reader could not tell a starved child from a successor
+            // that refuses to boot — which on 2026-08-21 was exactly the difference
+            // that mattered: the same builds applied unaided once the machine's load
+            // dropped. The trouble sentence carries both, plus whether anything is
+            // still scheduled to happen without the user.
+            // `!self.checking` for the same reason `headline()` has it, and for the
+            // reason `projection()` suppresses `apply_trouble` mid-check: a check in
+            // flight owns the surface. Without it the three fields of ONE projection
+            // contradicted each other — `apply_trouble: None`, headline "Checking for
+            // updates…", and this line still explaining a failure from before the
+            // check started.
+            if let Some(trouble) = self.apply_trouble().filter(|_| !self.checking) {
+                // The log pointer earns its characters in exactly two states: the
+                // ESCALATED one (the full attempt history is worth chasing), and the
+                // one where this program could not NAME the cause — there the
+                // untranslated ledger reason exists only in the log, and dropping the
+                // pointer would be dropping the only explanation the machine has.
+                let tail = if self.apply_is_failing() || !trouble.cause_is_named() {
+                    " See aterm.log."
+                } else {
+                    ""
+                };
+                return Some(format!(
+                    "Version {v} \u{00b7} build {b} \u{00b7} {}{tail}",
+                    trouble.sentence()
+                ));
+            }
+            if self.enabled && !self.checking && self.apply_is_failing() {
+                // THE ESCALATION WITHOUT AN ARTIFACT TO PIN IT TO. `apply_is_failing`
+                // reads the running-build-scoped streak, which outlives the artifact
+                // it was recorded against; the trouble sentence above needs the
+                // ledger to NAME this build and a ledger written before that field
+                // existed does not. Losing the count and the cause there is a real
+                // loss, but silently falling through to the acquisition wording below
+                // ("update CHECKS are failing") would have been a lie about which
+                // lane is broken.
                 return Some(format!(
                     "Version {v} \u{00b7} build {b} \u{00b7} every attempt to start it has \
                      failed; see aterm.log"
@@ -1106,7 +1273,10 @@ mod tests {
         st.failing_kind = "apply".to_string();
         st.failing_persistent = true;
         st.outcome = "staged 0.5.15 (build 830) — verified and ready to apply".to_string();
-        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false);
+        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false).with_apply_lane(
+            "overlap handoff failed safely: handoff proof ended ChildDied",
+            ApplyRetry::ManualOnly,
+        );
         let p = s.projection();
         assert!(
             p.failing_persistent,
@@ -1115,12 +1285,16 @@ mod tests {
         assert_eq!(p.headline, "Update ready, but it keeps failing to apply.");
         let detail = p.detail.expect("detail");
         assert!(
-            detail.contains("build 830") && detail.contains("failed"),
-            "{detail}"
+            detail.contains("build 830") && detail.contains("3 times"),
+            "the escalated detail names how many attempts died: {detail}"
         );
         assert!(
             !detail.contains("ready to apply"),
             "not the ledger's healthy sentence: {detail}"
+        );
+        assert!(
+            detail.contains("aterm.log"),
+            "the escalated case keeps its pointer at the full history: {detail}"
         );
 
         // AN ACQUISITION-CLASS streak is a different statement: the stage in hand is
@@ -1137,6 +1311,135 @@ mod tests {
         assert!(
             detail.contains("CHECKS are failing") && detail.contains("manifest"),
             "{detail}"
+        );
+    }
+
+    /// THE DEFECT, ON THE SURFACE THAT HID IT (owner's machine, 2026-08-21).
+    ///
+    /// `aterm ctl update status` was reporting `staged_version=0.56.0
+    /// relaunch_ready=true failing_applies=2 apply_failure="overlap handoff failed
+    /// safely: handoff proof ended ChildDied"`, and the window said "Update ready"
+    /// for hours. TWO is below `PERSISTENT_AFTER`, so every surface keyed on the
+    /// escalation verdict stayed silent through exactly the window in which a person
+    /// would have wanted to know — and a person who did not know could not tell
+    /// "downloaded, waiting for you" from "tried twice, the handoff died both times".
+    ///
+    /// So the assertion is on the SURFACED STRING, and on both halves of it: the
+    /// number of attempts, and a cause in words rather than the proof-outcome enum
+    /// name. (What actually happened that night: the machine was 8x-oversubscribed,
+    /// the child was STARVED rather than broken, and the identical builds applied
+    /// unaided once the load dropped — which a reader can only reason about if the
+    /// window tells them the successor kept dying.)
+    #[test]
+    fn a_stage_that_already_failed_twice_names_the_count_and_a_human_cause() {
+        let mut st = staged_status();
+        st.failing_applies = 2;
+        // The check lane keeps rewriting its healthy sentence while a stage is held;
+        // that is precisely why it cannot be the only thing on the page.
+        st.outcome = "staged 0.5.15 (build 830) \u{2014} verified and ready to apply".to_string();
+        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false)
+            .with_apply_lane(
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+                ApplyRetry::Scheduled,
+            )
+            .projection();
+
+        assert!(
+            !p.apply_is_failing,
+            "two failures is BELOW the escalation threshold — which is exactly the \
+             window in which the old surface said nothing at all"
+        );
+        assert!(
+            p.apply_trouble.is_some(),
+            "…and exactly the window this projection now has to speak in"
+        );
+        assert_ne!(
+            p.headline, "Update ready",
+            "a build the engine has already failed to start twice is not simply ready"
+        );
+
+        let detail = p.detail.expect("a staged build always has a detail line");
+        assert!(
+            detail.contains("twice"),
+            "the surfaced string must name the ATTEMPT COUNT: {detail}"
+        );
+        assert!(
+            detail.contains("did not finish starting"),
+            "…and the CAUSE in human words: {detail}"
+        );
+        assert!(
+            !detail.contains("ChildDied"),
+            "\"handoff proof ended ChildDied\" is the register of a log line, not of a \
+             window: {detail}"
+        );
+        assert!(
+            detail.contains("try again by itself"),
+            "…and whether the person has to do anything: {detail}"
+        );
+    }
+
+    /// A STAGED UPDATE WAITING FOR A QUIET WINDOW IS A DIFFERENT SENTENCE.
+    ///
+    /// Deferrals and blocks are recorded as REFUSALS and advance no streak, so a
+    /// patient updater carries `failing_applies == 0` — and must read exactly as it
+    /// did before this work. The stale reason below is deliberate: the ledger's
+    /// `last_apply_error` slot is not expiry-bound the way the streak is, so "a
+    /// reason with no attempts behind it" is a genuinely reachable state and must
+    /// produce no failure wording anywhere.
+    #[test]
+    fn a_clean_staged_update_does_not_read_as_a_failure() {
+        let st = staged_status();
+        assert_eq!(st.failing_applies, 0, "the fixture is a clean stage");
+        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false)
+            .with_apply_lane(
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+                ApplyRetry::Scheduled,
+            )
+            .projection();
+
+        assert!(
+            p.apply_trouble.is_none(),
+            "a reason with no attempts behind it is not an attempt"
+        );
+        assert_eq!(p.headline, "Update ready");
+        let detail = p.detail.expect("detail");
+        assert_eq!(detail, "Version 0.5.15 \u{00b7} build 830");
+        for alarming in ["tried", "failed", "did not", "retry"] {
+            assert!(
+                !detail.contains(alarming),
+                "a stage that has simply not been attempted must not read as a \
+                 failure ({alarming:?} in {detail:?})"
+            );
+        }
+    }
+
+    /// "IT WILL FIX ITSELF" AND "IT WILL NOT" ARE DIFFERENT SITUATIONS FOR THE READER.
+    ///
+    /// One of them resolves while they keep working and the other never will, so the
+    /// manual-only latch has to reach the words. Same failure, same count, same
+    /// cause — only the scheduling state differs, and the surfaced string must differ
+    /// with it.
+    #[test]
+    fn the_surface_says_whether_the_update_will_retry_without_the_user() {
+        let mut st = staged_status();
+        st.failing_applies = 2;
+        let detail_for = |retry| {
+            UpdateState::from_status(828, "0.5.14", Some(&st), false)
+                .with_apply_lane("handoff proof ended ChildDied", retry)
+                .projection()
+                .detail
+                .expect("detail")
+        };
+        let scheduled = detail_for(ApplyRetry::Scheduled);
+        let manual = detail_for(ApplyRetry::ManualOnly);
+        assert_ne!(scheduled, manual);
+        assert!(
+            scheduled.contains("try again by itself"),
+            "a scheduled retry tells the reader to do nothing: {scheduled}"
+        );
+        assert!(
+            manual.contains("not try again until you ask"),
+            "a latched lane tells the reader it is now up to them: {manual}"
         );
     }
 
@@ -1383,9 +1686,9 @@ mod tests {
         );
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, pw, ph);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             let mut wr = enc.write_header().unwrap();
             wr.write_image_data(&buf).unwrap();
         }

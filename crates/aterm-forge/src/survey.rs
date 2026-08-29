@@ -140,7 +140,22 @@ fn preamble(out: &mut String, root: &Path, surveys: &[CellSurvey]) {
     let _ = writeln!(out, "{}", "=".repeat(W_LINE));
     let _ = writeln!(out, "FORGE SURVEY — aterm's third-party surface");
     let _ = writeln!(out, "{}", "=".repeat(W_LINE));
-    let _ = writeln!(out, "  root    {}", root.display());
+    // ELIDED FROM THE LEFT, because this report promises every line fits a
+    // 100-column terminal and a checkout path is unbounded. A worktree under
+    // /private/tmp/... already produced a 110-column line, i.e. the contract was
+    // broken by where the repo happened to sit. The tail is the informative
+    // half — the leaf directory names the checkout — so the head is what goes.
+    let root_text = root.display().to_string();
+    let root_line = if root_text.chars().count() > 88 {
+        let tail: String = root_text
+            .chars()
+            .skip(root_text.chars().count() - 85)
+            .collect();
+        format!("...{tail}")
+    } else {
+        root_text
+    };
+    let _ = writeln!(out, "  root    {root_line}");
     let _ = writeln!(out, "  cells   {}", names.join(", "));
     let _ = writeln!(
         out,

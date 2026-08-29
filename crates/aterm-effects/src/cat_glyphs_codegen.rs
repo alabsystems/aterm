@@ -202,7 +202,7 @@ fn load_glyphs(dir: &Path) -> Result<Vec<Glyph>, String> {
     for path in &files {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let text = std::fs::read_to_string(path).map_err(|e| format!("read {name}: {e}"))?;
-        let doc: toml::Value = text.parse().map_err(|e| format!("parse {name}: {e}"))?;
+        let doc: aterm_toml::Value = text.parse().map_err(|e| format!("parse {name}: {e}"))?;
         if let Some(g) = glyph_from_doc(&doc, name)? {
             glyphs.push(g);
         }
@@ -228,18 +228,18 @@ fn load_glyphs(dir: &Path) -> Result<Vec<Glyph>, String> {
 
 /// Parse one asset doc into a [`Glyph`], or `Ok(None)` if it is not a roster glyph
 /// (wrong kind, or `excluded = true`).
-fn glyph_from_doc(doc: &toml::Value, name: &str) -> Result<Option<Glyph>, String> {
-    if doc.get("excluded").and_then(toml::Value::as_bool) == Some(true) {
+fn glyph_from_doc(doc: &aterm_toml::Value, name: &str) -> Result<Option<Glyph>, String> {
+    if doc.get("excluded").and_then(aterm_toml::Value::as_bool) == Some(true) {
         return Ok(None);
     }
     let id = doc
         .get("id")
-        .and_then(toml::Value::as_str)
+        .and_then(aterm_toml::Value::as_str)
         .ok_or_else(|| format!("{name}: missing `id`"))?
         .to_string();
     let kind_str = doc
         .get("kind")
-        .and_then(toml::Value::as_str)
+        .and_then(aterm_toml::Value::as_str)
         .ok_or_else(|| format!("{name}: missing `kind`"))?;
     let Some(kind_rank) = INCLUDED_KINDS.iter().position(|k| *k == kind_str) else {
         // Not a roster kind (prop / unknown / …): held out, not an error.
@@ -251,7 +251,7 @@ fn glyph_from_doc(doc: &toml::Value, name: &str) -> Result<Option<Glyph>, String
 
     let vb = doc
         .get("viewbox")
-        .and_then(toml::Value::as_array)
+        .and_then(aterm_toml::Value::as_array)
         .filter(|a| a.len() == 2)
         .ok_or_else(|| format!("{name}: missing `viewbox = [w, h]`"))?;
     let (vw, vh) = (num(&vb[0]), num(&vb[1]));
@@ -277,7 +277,7 @@ fn glyph_from_doc(doc: &toml::Value, name: &str) -> Result<Option<Glyph>, String
     let mut layers = Vec::new();
     for (li, layer) in doc
         .get("layer")
-        .and_then(toml::Value::as_array)
+        .and_then(aterm_toml::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[])
         .iter()
@@ -286,27 +286,27 @@ fn glyph_from_doc(doc: &toml::Value, name: &str) -> Result<Option<Glyph>, String
         reject_unknown_keys(layer, LAYER_KEYS, name, &format!("layer {li}"))?;
         let role_str = layer
             .get("role")
-            .and_then(toml::Value::as_str)
+            .and_then(aterm_toml::Value::as_str)
             .ok_or_else(|| format!("{name}: layer {li} missing `role`"))?;
         let role = lookup(ROLE_VOCAB, role_str)
             .ok_or_else(|| format!("{name}: layer {li} role `{role_str}` not in ROLE_VOCAB"))?;
         let recolor_str = layer
             .get("recolor")
-            .and_then(toml::Value::as_str)
+            .and_then(aterm_toml::Value::as_str)
             .ok_or_else(|| format!("{name}: layer {li} missing `recolor`"))?;
         let recolor = lookup(RECOLOR_VOCAB, recolor_str).ok_or_else(|| {
             format!("{name}: layer {li} recolor `{recolor_str}` not in RECOLOR_VOCAB")
         })?;
         let fill = layer
             .get("ref_fill")
-            .and_then(toml::Value::as_str)
+            .and_then(aterm_toml::Value::as_str)
             .and_then(parse_hex_rgb)
             .ok_or_else(|| format!("{name}: layer {li} missing/invalid `ref_fill`"))?;
 
         let mut paths = Vec::new();
         for (pi, p) in layer
             .get("paths")
-            .and_then(toml::Value::as_array)
+            .and_then(aterm_toml::Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[])
             .iter()
@@ -346,7 +346,7 @@ fn glyph_from_doc(doc: &toml::Value, name: &str) -> Result<Option<Glyph>, String
 }
 
 fn reject_unknown_keys(
-    value: &toml::Value,
+    value: &aterm_toml::Value,
     allowed: &[&str],
     name: &str,
     scope: &str,
@@ -431,7 +431,7 @@ fn parse_hex_rgb(s: &str) -> Option<u32> {
     u32::from_str_radix(h, 16).ok()
 }
 
-fn num(v: &toml::Value) -> f32 {
+fn num(v: &aterm_toml::Value) -> f32 {
     v.as_float()
         .map(|f| f as f32)
         .or_else(|| v.as_integer().map(|i| i as f32))
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(variant_name("acc_bow"), "AccBow");
     }
 
-    fn roster_doc(extra: &str) -> toml::Value {
+    fn roster_doc(extra: &str) -> aterm_toml::Value {
         format!(
             r##"
 id = "head_schema_test"

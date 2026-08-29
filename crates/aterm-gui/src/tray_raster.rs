@@ -2216,9 +2216,9 @@ impl Canvas {
     fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, self.w, self.h);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, self.w, self.h);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             if let Ok(mut wr) = enc.write_header() {
                 let _ = wr.write_image_data(&self.px);
             }

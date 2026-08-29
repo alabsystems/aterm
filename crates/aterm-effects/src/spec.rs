@@ -575,7 +575,7 @@ pub fn parse_custom_toml(fragment: &str) -> Result<Vec<RawCustomEntry>, String> 
     struct Root {
         sparkle_words: SparkleWords,
     }
-    let root: Root = toml::from_str(fragment).map_err(|e| e.to_string())?;
+    let root: Root = aterm_toml::from_str(fragment).map_err(|e| e.to_string())?;
     Ok(root.sparkle_words.custom)
 }
 
@@ -774,8 +774,8 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
             source.len()
         )));
     }
-    let raw: RawToyPackDocument =
-        toml::from_str(source).map_err(|e| ToyPackError::one(format!("TOML schema error: {e}")))?;
+    let raw: RawToyPackDocument = aterm_toml::from_str(source)
+        .map_err(|e| ToyPackError::one(format!("TOML schema error: {e}")))?;
     let mut diagnostics = Vec::new();
 
     if raw.schema != TOY_PACK_SCHEMA_V1 {

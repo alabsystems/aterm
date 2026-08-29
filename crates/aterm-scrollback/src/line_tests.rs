@@ -1176,3 +1176,132 @@ fn record_is_valid_agrees_with_deserialize_on_malformed_records() {
         );
     }
 }
+
+// ── Inline images in history ────────────────────────────────────────────────
+//
+// The property under test is that `Line` now HAS somewhere to keep a picture,
+// and that keeping it does not lie to the memory budget. The end-to-end
+// "scroll it off, scroll back, the tiles are there" test lives in aterm-core
+// (`tests/image_survives_scrollback.rs`); these pin the storage contract.
+
+/// A `rows`-tall placement whose raster is `payload` bytes.
+fn test_image(rows: u16, cols: u16, payload: usize) -> Arc<aterm_types::ImageData> {
+    Arc::new(aterm_types::ImageData {
+        bytes: vec![0u8; payload],
+        format: aterm_types::ImageFormat::Png,
+        cols,
+        rows,
+        z_index: 0,
+        band_lift_px: 0,
+    })
+}
+
+#[test]
+fn a_line_reports_the_footprint_tile_each_of_its_columns_paints() {
+    let image = test_image(3, 4, 64);
+    let mut line = Line::new();
+    // Footprint row 1, columns 0..4 of the row, starting at the image's own
+    // left edge.
+    line.set_images(vec![ImageSpan::new(0, 4, 1, 0, image)]);
+    assert!(line.has_images());
+    assert_eq!(line.image_count(), 1);
+    let span = line.get_image(2).expect("column 2 is covered");
+    assert_eq!(span.tile_at(0), Some((1, 0)));
+    assert_eq!(span.tile_at(3), Some((1, 3)));
+    assert_eq!(span.tile_at(4), None, "end_col is exclusive");
+    assert!(line.get_image(4).is_none(), "past the footprint");
+}
+
+#[test]
+fn a_span_starting_mid_footprint_keeps_its_tile_offsets() {
+    // The right half of a footprint row, e.g. after an overwrite ate the left.
+    let image = test_image(2, 6, 32);
+    let mut line = Line::new();
+    line.set_images(vec![ImageSpan::new(10, 13, 0, 3, image)]);
+    let span = line.get_image(10).expect("covered");
+    assert_eq!(span.tile_at(10), Some((0, 3)));
+    assert_eq!(span.tile_at(12), Some((0, 5)));
+}
+
+#[test]
+fn the_rows_of_one_footprint_together_charge_the_payload_exactly_once() {
+    // The accounting the byte budget depends on: a shared payload must not be
+    // billed once per covered row (which would report a 1 MiB picture as
+    // `rows` MiB and evict history that is not resident), nor billed to nobody.
+    const PAYLOAD: usize = 90_000;
+    const ROWS: u16 = 9;
+    let image = test_image(ROWS, 4, PAYLOAD);
+    let bare = Line::new().memory_used();
+    let mut total_image_bytes = 0usize;
+    for r in 0..ROWS {
+        let mut line = Line::new();
+        line.set_images(vec![ImageSpan::new(0, 4, r, 0, Arc::clone(&image))]);
+        total_image_bytes += line.memory_used() - bare;
+    }
+    assert!(
+        total_image_bytes >= PAYLOAD,
+        "the whole footprint under-charges the payload: {total_image_bytes} < {PAYLOAD}"
+    );
+    // Struct overhead is the only slack: nine spans plus nine boxed SmallVecs,
+    // and up to one byte per row lost to the share's integer division.
+    let slack = usize::from(ROWS)
+        * (std::mem::size_of::<ImageSpan>() + std::mem::size_of::<SmallVec<ImageSpan, 1>>() + 1);
+    assert!(
+        total_image_bytes <= PAYLOAD + slack,
+        "the footprint is billed per row instead of per share: \
+         {total_image_bytes} > {PAYLOAD} + {slack}"
+    );
+}
+
+#[test]
+fn dropping_one_line_of_a_footprint_drops_exactly_its_share() {
+    let image = test_image(4, 4, 40_000);
+    let bare = Line::new().memory_used();
+    let mut line = Line::new();
+    line.set_images(vec![ImageSpan::new(0, 4, 2, 0, image)]);
+    let with_image = line.memory_used();
+    // One row of a four-row footprint carries a quarter of the raster.
+    assert!(
+        (with_image - bare) >= 10_000,
+        "a covered row must carry its share of the raster"
+    );
+    assert!(
+        (with_image - bare) < 20_000,
+        "a covered row must not carry the whole raster"
+    );
+}
+
+#[test]
+fn a_line_with_no_image_serializes_exactly_as_it_did_before_images_existed() {
+    // The wire format is untouched: the image field adds no section and no
+    // version bump, so ordinary history bytes are unchanged.
+    let rle: Rle<CellAttrs> = Rle::new();
+    let plain = Line::with_hyperlinks("no picture here", rle, Vec::new());
+    let bytes = plain.serialize();
+    assert_eq!(bytes[0], 3, "an image-free line stays v3");
+    let back = Line::deserialize(&bytes).expect("round trip");
+    assert_eq!(back.as_str(), Some("no picture here"));
+    assert!(!back.has_images());
+}
+
+#[test]
+fn serialization_drops_the_image_and_keeps_everything_else() {
+    // THE SCOPE LINE, pinned so it cannot move silently in either direction: a
+    // picture survives in the in-memory hot tier and is dropped when its line
+    // is compressed for the warm/cold/disk tiers. If a future change gives the
+    // block codec a payload table, this test is what says so.
+    let rle: Rle<CellAttrs> = Rle::new();
+    let mut line = Line::with_hyperlinks("under the image", rle, Vec::new());
+    line.set_images(vec![ImageSpan::new(0, 4, 0, 0, test_image(1, 4, 128))]);
+    assert!(line.has_images());
+    let back = Line::deserialize(&line.serialize()).expect("round trip");
+    assert_eq!(
+        back.as_str(),
+        Some("under the image"),
+        "the text still round-trips"
+    );
+    assert!(
+        !back.has_images(),
+        "images are deliberately not on the wire — see Line::serialize"
+    );
+}

@@ -171,6 +171,10 @@ pub use hyperlink_span::HyperlinkSpan;
 mod underline_color_span;
 pub use underline_color_span::UnderlineColorSpan;
 
+#[path = "image_span.rs"]
+mod image_span;
+pub use image_span::ImageSpan;
+
 /// A scrollback line.
 ///
 /// Contains the text content, RLE-compressed attributes, and metadata.
@@ -213,6 +217,19 @@ pub struct Line {
     /// colour is rare enough that the per-styled-run cost of widening every
     /// attr run would not pay for itself.
     underline_colors: Option<Box<SmallVec<UnderlineColorSpan, 2>>>,
+    /// Inline-image spans (iTerm2 OSC 1337 `File=` and the sixel path that
+    /// reuses the same placement): one span per contiguous run of columns
+    /// painting one footprint row, each holding the SHARED payload `Arc`.
+    /// `None` for every line that carries no image — same boxed-niche rationale
+    /// as `hyperlinks`.
+    ///
+    /// This field is why a picture survives the scrollback boundary at all: the
+    /// live grid stores an `ImageRef` per covered CELL in a side table the row
+    /// leaves behind when it scrolls off, so a line with nowhere to keep one
+    /// loses the picture at the top of the screen and shows a hole where it was.
+    /// One inline slot: a line carries the row of ONE placement in every case
+    /// that is not an overwrite.
+    images: Option<Box<SmallVec<ImageSpan, 1>>>,
 }
 
 impl Clone for Line {
@@ -234,6 +251,7 @@ impl Clone for Line {
             flags: self.flags,
             hyperlinks: self.hyperlinks.clone(),
             underline_colors: self.underline_colors.clone(),
+            images: self.images.clone(),
         }
     }
 }
@@ -276,6 +294,7 @@ impl Line {
             flags: LineFlags::empty(),
             hyperlinks: None,
             underline_colors: None,
+            images: None,
         }
     }
 
@@ -313,6 +332,7 @@ impl Line {
             flags: LineFlags::empty(),
             hyperlinks,
             underline_colors: None,
+            images: None,
         }
     }
 
@@ -545,6 +565,68 @@ impl Line {
         }
     }
 
+    /// Get the inline-image spans, if any.
+    #[must_use]
+    #[inline]
+    pub fn images(&self) -> Option<&[ImageSpan]> {
+        self.images.as_deref().map(SmallVec::as_slice)
+    }
+
+    /// Set the inline-image spans, preserving a placement when this line scrolls
+    /// into (and back out of) scrollback. Empty input stores `None` so the
+    /// overwhelming common case — a line with no picture on it — keeps its niche
+    /// pointer and serializes exactly as it did before images existed.
+    // Skip: the residual row is drop glue for the replaced Option<Box<SmallVec>>
+    // sidecar (std/alloc internals through SmallVec — the drop-glue lane).
+    // Field replacement only; unit-tested round-trip.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn set_images(&mut self, spans: Vec<ImageSpan>) {
+        self.images = if spans.is_empty() {
+            None
+        } else {
+            Some(Box::new(SmallVec::from_vec(spans)))
+        };
+    }
+
+    /// Get the inline-image span covering a column, if any.
+    #[must_use]
+    #[allow(
+        clippy::manual_find,
+        reason = "explicit slice loop is the lowerable form for the strict Trust gate; the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
+    )]
+    pub fn get_image(&self, col: u16) -> Option<&ImageSpan> {
+        // Explicit slice loop for the same strict-gate reason as
+        // `get_hyperlink` (identical result to `.iter().find(..)`).
+        for span in self.images()? {
+            if span.contains(col) {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    /// Check if this line carries any inline image.
+    #[must_use]
+    #[inline]
+    pub fn has_images(&self) -> bool {
+        // Closure-free match over the plain slice (see `has_hyperlinks`).
+        match self.images() {
+            Some(spans) => !spans.is_empty(),
+            None => false,
+        }
+    }
+
+    /// Get the number of inline-image spans.
+    #[must_use]
+    #[inline]
+    pub fn image_count(&self) -> usize {
+        // Closure-free match over the plain slice (see `hyperlink_count`).
+        match self.images() {
+            Some(spans) => spans.len(),
+            None => 0,
+        }
+    }
+
     /// Get the content as bytes.
     #[must_use]
     #[inline]
@@ -694,10 +776,31 @@ impl Line {
             }
             None => 0,
         };
+        // Inline images: the boxed SmallVec plus, per span, the struct and THIS
+        // ROW's share of the shared payload (`ImageSpan::memory_used`). The
+        // share is the whole point — a footprint's rows all hold the same `Arc`,
+        // so charging each of them the full raster would tell the byte budget a
+        // 1 MiB picture costs `rows` MiB and evict history that is not resident,
+        // while charging none of them would hide a wall of images from the very
+        // budget that bounds scrollback memory. Summed over a retained
+        // footprint the shares recover the payload exactly once, so dropping a
+        // line drops exactly its share.
+        let images_mem = match self.images() {
+            Some(spans) => {
+                let boxed = std::mem::size_of::<SmallVec<ImageSpan, 1>>();
+                let mut payload = 0usize;
+                for s in spans {
+                    payload = payload.saturating_add(s.memory_used());
+                }
+                boxed.saturating_add(payload)
+            }
+            None => 0,
+        };
         base.saturating_add(content_mem)
             .saturating_add(attrs_mem)
             .saturating_add(hyperlinks_mem)
             .saturating_add(underline_colors_mem)
+            .saturating_add(images_mem)
     }
 
     /// Calculate the number of attribute runs (for compression stats).
@@ -756,6 +859,7 @@ impl From<&str> for Line {
             flags: LineFlags::empty(),
             hyperlinks: None,
             underline_colors: None,
+            images: None,
         }
     }
 }

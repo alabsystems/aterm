@@ -474,9 +474,9 @@ fn capture(scene: &str, out_path: &str) -> (usize, usize) {
     }
     let file = std::fs::File::create(out_path).expect("create png");
     let w = std::io::BufWriter::new(file);
-    let mut encoder = png::Encoder::new(w, width as u32, height as u32);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
+    let mut encoder = aterm_png::Encoder::new(w, width as u32, height as u32);
+    encoder.set_color(aterm_png::ColorType::Rgb);
+    encoder.set_depth(aterm_png::BitDepth::Eight);
     encoder
         .write_header()
         .expect("png header")

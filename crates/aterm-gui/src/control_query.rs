@@ -48,7 +48,141 @@ pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
     out
 }
 
-/// `text` -> `OK <nrows>\n` then each visible row (trailing spaces trimmed).
+/// How many leading rows a reply keeps once its trailing all-blank rows are dropped:
+/// the index of the last row that is not blank (blank = empty after trimming
+/// spaces) plus one, and 0 when every row is blank. Interior blank rows are KEPT —
+/// only the tail goes — so row `i` of a trimmed reply is still screen row `i`, and
+/// the `line`/`cell`/`search` coordinates an agent reads off it stay valid. THE one
+/// trim rule: `text trim`, `text --json trim`, `turn … trim=1`, `blocktext … trim`,
+/// `temporal … trim` and the `subscribe … screen,trim` DELTA all route here, so the
+/// polled and pushed faces cannot disagree about what a trailing blank is. (F4: a
+/// 55-row grid with 48 blank rows cost ~7.6 KB per read and a `grep -v` on every
+/// reply; the count on a trimmed header is the count of rows actually sent.)
+pub(crate) fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
+    rows.enumerate()
+        .filter(|(_, r)| !r.trim_matches(' ').is_empty())
+        .map(|(i, _)| i + 1)
+        .last()
+        .unwrap_or(0)
+}
+
+/// The `text` / `text --json` argument tail: empty for the whole grid, `trim` to
+/// drop the trailing blank rows. ANYTHING else is `ERR usage: text [trim]` — the
+/// dispatch used to drop this tail on the floor, so an agent guessing a modifier
+/// (`text trim`, `text compact`) got the full grid back with no signal that it had
+/// guessed wrong (F4's sub-finding). The usage line is the `Err` so both arms answer
+/// with the same bytes.
+pub(crate) fn text_trim_arg(rest: &str) -> Result<bool, String> {
+    match rest.trim() {
+        "" => Ok(false),
+        "trim" => Ok(true),
+        _ => Err("ERR usage: text [trim]\n".to_string()),
+    }
+}
+
+/// Split a trailing `trim` token off a positional grammar's argument tail:
+/// `(<tail without it>, true)` when the LAST whitespace-separated token is `trim`,
+/// else `(<tail>, false)`. Shared by `blocktext <id> [trim]` and `temporal
+/// [status|<tick>] [trim]`, whose own argument comes first — each verb still
+/// validates what is left, so `trim` alone or a stray token stays a usage error.
+pub(crate) fn split_trim_tail(rest: &str) -> (&str, bool) {
+    let rest = rest.trim();
+    match rest.strip_suffix("trim") {
+        Some(head) if head.is_empty() || head.ends_with(char::is_whitespace) => {
+            (head.trim_end(), true)
+        }
+        _ => (rest, false),
+    }
+}
+
+/// `blocktext <id> [trim]`: the grammar is validated HERE, and only `<id>` reaches
+/// the shared block-output emitter (`emit`). `trim` drops the block's trailing blank
+/// rows through [`trim_lines_reply`]; a non-numeric id or any other tail is the
+/// usage line rather than a token that vanishes (the `text` hole, on a second verb).
+pub(crate) fn cmd_blocktext_args(rest: &str, emit: impl FnOnce(&str) -> String) -> String {
+    let (id, trim) = split_trim_tail(rest);
+    if id.parse::<u64>().is_err() {
+        return "ERR usage: blocktext <id> [trim]\n".to_string();
+    }
+    let reply = emit(id);
+    if trim {
+        trim_lines_reply(&reply)
+    } else {
+        reply
+    }
+}
+
+/// Re-frame a line-framed `OK <n>[ <marker…>]\n` + n rows reply with its trailing
+/// blank rows dropped: `OK <sent>[ <marker…>] trimmed=<k>\n` + the first `sent` rows,
+/// `sent` per [`trimmed_len`]. Header tokens after the count survive in place and
+/// `trimmed=` closes the line (reply fields are additive, new ones go LAST). Any
+/// other reply — an `ERR`, a status line — passes through untouched: there is
+/// nothing to trim and the error must reach the caller as it was.
+pub(crate) fn trim_lines_reply(reply: &str) -> String {
+    let Some((header, body)) = reply.split_once('\n') else {
+        return reply.to_string();
+    };
+    let mut toks = header.split_whitespace();
+    if toks.next() != Some("OK") {
+        return reply.to_string();
+    }
+    let Some(n) = toks.next().and_then(|t| t.parse::<usize>().ok()) else {
+        return reply.to_string();
+    };
+    let sent = trimmed_len(body.lines().take(n));
+    let mut out = format!("OK {sent}");
+    for tok in toks {
+        out.push(' ');
+        out.push_str(tok);
+    }
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, " trimmed={}", n.saturating_sub(sent));
+    }
+    for row in body.split_inclusive('\n').take(sent) {
+        out.push_str(row);
+    }
+    out
+}
+
+/// Frame a gathered screen `body` (`rows` newline-terminated rows, already out from
+/// under the terminal lock) as a line-framed reply: `OK <n>[ <verdict>]\n` + all
+/// `rows` rows, or with `trim`, `OK <sent>[ <verdict>] trimmed=<k>\n` + the first
+/// `sent` rows ([`trimmed_len`]). `verdict` is `turn`'s `turn submitted=… hash=…`
+/// run (empty for `text`); `trimmed=` always closes the header, so a client that
+/// keys on the `turn` token at position two, or reads the count at position one,
+/// sees exactly what it did before. Off by default: an untrimmed reply is
+/// byte-identical to the pre-`trim` wire, because scripts count rows.
+pub(crate) fn frame_rows_reply(body: &str, rows: usize, verdict: &str, trim: bool) -> String {
+    let sent = if trim {
+        trimmed_len(body.lines())
+    } else {
+        rows
+    };
+    let mut out = String::with_capacity(body.len() + verdict.len() + 32);
+    {
+        use std::fmt::Write as _;
+        let _ = write!(out, "OK {sent}");
+        if !verdict.is_empty() {
+            let _ = write!(out, " {verdict}");
+        }
+        if trim {
+            let _ = write!(out, " trimmed={}", rows.saturating_sub(sent));
+        }
+        out.push('\n');
+    }
+    if sent == rows {
+        out.push_str(body);
+    } else {
+        for row in body.split_inclusive('\n').take(sent) {
+            out.push_str(row);
+        }
+    }
+    out
+}
+
+/// `text` -> `OK <nrows>\n` then each visible row (trailing spaces trimmed). The
+/// bare form of [`cmd_text_opt`], kept for the callers that read the whole grid.
 ///
 /// FIDELITY (I-1): each row is extracted through the engine's combining-aware
 /// `get_line_text` — the SAME path `selection_to_string`/`copy` and the
@@ -58,22 +192,38 @@ pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
 /// saw the resolved base char and silently dropped combining marks / clusters,
 /// corrupting the AI's primary screen-read.) Control chars still collapse to
 /// spaces via the extraction's NUL→space rule plus an explicit visible map.
+///
+/// Test-only since the dispatch started passing its tail through [`cmd_text_opt`]:
+/// the fidelity tests read the whole grid by this name and nothing in the lib does.
+#[cfg(test)]
 pub(crate) fn cmd_text(term: &Arc<Mutex<Terminal>>) -> String {
-    let t = term_lock(term);
-    let rows = t.rows() as usize;
-    // Sized for the whole reply up front (header + one full row + newline each)
-    // so the row loop never reallocates-and-copies the accumulated screen while
-    // holding the terminal lock.
-    let mut out = String::with_capacity(rows * (t.cols() as usize + 1) + 16);
-    {
-        use std::fmt::Write as _;
-        let _ = writeln!(out, "OK {rows}");
-    }
-    for r in 0..rows {
-        out.push_str(&visible_row(&t, r));
-        out.push('\n');
-    }
-    out
+    cmd_text_opt(term, false)
+}
+
+/// `text [trim]` -> `OK <n>[ trimmed=<k>]\n` then `<n>` visible rows. Bare, `n` is
+/// the grid's row count. With `trim`, the rows after the last non-blank one are
+/// dropped ([`trimmed_len`]), `n` is the count ACTUALLY SENT and `trimmed=<k>` says
+/// how many went — the header stays honest for a client that frames the body by its
+/// count, and every reader in the workspace takes only the first token (`aterm-ctl`'s
+/// `stream_count`, `aterm-agent`'s `read_text`, nest's reader), so the marker is
+/// additive. The rows themselves are the same [`visible_row`] text as ever.
+pub(crate) fn cmd_text_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> String {
+    // The body is gathered into ONE buffer sized up front (one full row + newline
+    // each) so the row loop never reallocates-and-copies the accumulated screen
+    // while holding the terminal lock. The header is written AFTER the lock is
+    // released — a trimmed count is only known once every row has been read — and
+    // the one memcpy that costs is paid with the PTY reader unblocked.
+    let (rows, body) = {
+        let t = term_lock(term);
+        let rows = t.rows() as usize;
+        let mut body = String::with_capacity(rows * (t.cols() as usize + 1));
+        for r in 0..rows {
+            body.push_str(&visible_row(&t, r));
+            body.push('\n');
+        }
+        (rows, body)
+    };
+    frame_rows_reply(&body, rows, "", trim)
 }
 
 /// `cursor` -> `OK <row> <col> <visible:0|1> <style>\n` (0-based). `<style>`
@@ -2826,7 +2976,21 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// The rows are the SAME grapheme-faithful, control-collapsed, tail-trimmed lines
 /// `cmd_text` emits, the cursor/dims mirror the `cursor`/`dims` verbs, and `seq`
 /// is the engine `content_seq` (so an agent can diff frames without re-reading).
+/// The bare form of [`cmd_text_json_opt`] — test-only, like [`cmd_text`], since the
+/// dispatch passes its tail through the `_opt` form (the name stays so the
+/// `json_ok_sites_match_the_json_capable_verbs` scrape still binds `text`).
+#[cfg(test)]
 pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
+    cmd_text_json_opt(term, false)
+}
+
+/// `text --json [trim]`: [`cmd_text_json`], and with `trim` the `rows` array stops
+/// after the last non-blank row ([`trimmed_len`]) and the object closes with
+/// `"trimmed":k` — the JSON twin of the text header's `trimmed=<k>`. `dims.rows`
+/// stays the GRID's row count, so `rows.len()` says what was sent and `dims` what
+/// the screen is; the field is only written when trimming was asked for, keeping
+/// the bare reply byte-identical.
+pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
     // styled frame already uses. Every field is read inside the single hold, so the
     // reply still describes one instant; the escaping and JSON assembly are pure
@@ -2851,10 +3015,15 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
     // times (the `join`, the outer `format!`, and `json_ok`'s own `format!`).
     // Byte-identical: `json_escape` is `json_escape_into` into a fresh String, and
     // `json_ok` is exactly this `"OK 1\n"` prefix + `"\n"` suffix.
+    let sent = if trim {
+        trimmed_len(rows_text.iter().map(String::as_str))
+    } else {
+        rows
+    };
     let mut out = String::with_capacity(rows * (cols as usize + 8) + 128);
     out.push_str("OK 1\n");
     out.push_str("{\"rows\":[");
-    for (i, row) in rows_text.iter().enumerate() {
+    for (i, row) in rows_text.iter().take(sent).enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -2867,11 +3036,15 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
         let _ = write!(
             out,
             "],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
-             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq}}}",
+             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq}",
             c.row,
             c.col,
             json_str_field("style", style),
         );
+        if trim {
+            let _ = write!(out, ",\"trimmed\":{}", rows.saturating_sub(sent));
+        }
+        out.push('}');
     }
     out.push('\n');
     out
@@ -3478,6 +3651,10 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         // Host composition state, not the terminal model a wire frame reports.
         row_shift: _,
         shifted_fill_seq: _,
+        // K2 composed-frame provenance: the same law again — it says whether a
+        // COMPOSITOR's last write is still intact in a host scratch buffer,
+        // which is not a fact about the terminal model.
+        composed_fill_seq: _,
     } = ri;
 }
 
@@ -4570,7 +4747,7 @@ mod tests {
             .strip_prefix("OK 1\n")
             .expect("status frame")
             .trim_end();
-        let value: serde_json::Value = serde_json::from_str(body).expect("valid metrics JSON");
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
         for key in [
             "redraw_attempts",
             "redraw_early_outs",
@@ -4661,7 +4838,7 @@ mod tests {
 
         let pct = super::cmd_metrics_json(None, "percentiles");
         let pct_body = pct.strip_prefix("OK 1\n").unwrap().trim_end();
-        let pct_value: serde_json::Value = serde_json::from_str(pct_body).unwrap();
+        let pct_value: aterm_json::Value = aterm_json::from_str(pct_body).unwrap();
         for key in [
             "n_input",
             "input_p99_ms",
@@ -4742,7 +4919,7 @@ mod tests {
             .strip_prefix("OK 1\n")
             .expect("status frame")
             .trim_end();
-        let value: serde_json::Value = serde_json::from_str(body).expect("valid metrics JSON");
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
         let arms = value
             .get("deadline_arms_by_owner")
             .expect("the per-owner ledger is published");
@@ -4755,14 +4932,14 @@ mod tests {
             assert!(
                 entry
                     .get("arms")
-                    .and_then(serde_json::Value::as_u64)
+                    .and_then(aterm_json::Value::as_u64)
                     .is_some(),
                 "{owner} publishes its arm count"
             );
             assert!(
                 entry
                     .get("past")
-                    .and_then(serde_json::Value::as_u64)
+                    .and_then(aterm_json::Value::as_u64)
                     .is_some(),
                 "{owner} publishes its PAST arm count — the spin signature"
             );
@@ -4821,7 +4998,7 @@ mod tests {
             .strip_prefix("OK 1\n")
             .expect("status frame")
             .trim_end();
-        let value: serde_json::Value = serde_json::from_str(body).expect("valid metrics JSON");
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
         let causes = value
             .get("frame_refill_full_causes")
             .expect("the per-cause attribution is published");
@@ -4889,7 +5066,7 @@ mod tests {
 
         let reply = super::cmd_metrics_json(Some(&term), "");
         let body = reply.strip_prefix("OK 1\n").unwrap().trim_end();
-        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let value: aterm_json::Value = aterm_json::from_str(body).unwrap();
         assert!(value["rows"].is_null());
         assert!(value["cols"].is_null());
         assert!(value.get("redraw_attempts").is_some());
@@ -5184,5 +5361,182 @@ mod tests {
             "the zero-width-straddling match on the zero-width line (abs row 1) \
              must survive narrowing"
         );
+    }
+}
+
+/// The `trim` family: the ONE trailing-blank rule and the verbs that route through
+/// it. Kept as its own module so the helpers stay testable as pure transforms.
+#[cfg(test)]
+mod trim_tests {
+    use std::sync::{Arc, Mutex};
+
+    use aterm_core::terminal::Terminal;
+
+    use super::{
+        cmd_blocktext_args, cmd_text, cmd_text_json, cmd_text_json_opt, cmd_text_opt,
+        frame_rows_reply, split_trim_tail, text_trim_arg, trim_lines_reply, trimmed_len,
+    };
+
+    /// `trimmed_len` is `last non-blank index + 1`: all blank → 0; no blank → n;
+    /// interior blanks are preserved because only the TAIL is measured.
+    #[test]
+    fn trimmed_len_is_last_nonblank_plus_one() {
+        assert_eq!(trimmed_len(["", "", ""].into_iter()), 0, "all blank");
+        assert_eq!(trimmed_len(["   ", " "].into_iter()), 0, "spaces are blank");
+        assert_eq!(trimmed_len(std::iter::empty()), 0, "no rows");
+        assert_eq!(trimmed_len(["a", "b", "c"].into_iter()), 3, "no blank → n");
+        assert_eq!(
+            trimmed_len(["a", "", "", "b", "", ""].into_iter()),
+            4,
+            "interior blanks kept, trailing dropped"
+        );
+        assert_eq!(trimmed_len(["", "x"].into_iter()), 2, "leading blank kept");
+    }
+
+    /// The `text` tail: empty and `trim` parse; anything else is the usage line.
+    #[test]
+    fn text_trim_arg_accepts_only_trim() {
+        assert_eq!(text_trim_arg(""), Ok(false));
+        assert_eq!(text_trim_arg("  "), Ok(false));
+        assert_eq!(text_trim_arg("trim"), Ok(true));
+        assert_eq!(text_trim_arg(" trim "), Ok(true));
+        for bad in ["foo", "trim extra", "TRIM", "trim=1", "--trim"] {
+            assert_eq!(
+                text_trim_arg(bad),
+                Err("ERR usage: text [trim]\n".to_string()),
+                "{bad:?} is rejected, never silently ignored"
+            );
+        }
+    }
+
+    /// A trailing `trim` token is split off a positional tail; a `trim` glued to
+    /// the argument, or one that is not last, is left for the verb to reject.
+    #[test]
+    fn split_trim_tail_takes_only_a_trailing_token() {
+        assert_eq!(split_trim_tail("7 trim"), ("7", true));
+        assert_eq!(split_trim_tail("trim"), ("", true));
+        assert_eq!(split_trim_tail("  status   trim "), ("status", true));
+        assert_eq!(split_trim_tail("7"), ("7", false));
+        assert_eq!(split_trim_tail(""), ("", false));
+        assert_eq!(
+            split_trim_tail("7trim"),
+            ("7trim", false),
+            "glued is not a token"
+        );
+        assert_eq!(split_trim_tail("trim 7"), ("trim 7", false), "not last");
+    }
+
+    fn term_with(rows: u16, seed: &[u8]) -> Arc<Mutex<Terminal>> {
+        let mut t = Terminal::new(rows, 40);
+        t.process(seed);
+        Arc::new(Mutex::new(t))
+    }
+
+    /// `text trim` sends the rows up to the last non-blank one and says so on the
+    /// header; the bare form is unchanged (the grid, counted honestly).
+    #[test]
+    fn text_trim_drops_trailing_blank_rows_and_counts_what_it_sent() {
+        let term = term_with(6, b"one\r\n\r\nthree");
+        let bare = cmd_text(&term);
+        assert_eq!(bare, "OK 6\none\n\nthree\n\n\n\n", "bare = the grid");
+        assert_eq!(
+            bare,
+            cmd_text_opt(&term, false),
+            "cmd_text is the untrimmed form"
+        );
+        assert_eq!(
+            cmd_text_opt(&term, true),
+            "OK 3 trimmed=3\none\n\nthree\n",
+            "trimmed = rows sent, interior blank kept, k = rows dropped"
+        );
+        // An all-blank screen trims to nothing and says so.
+        let blank = term_with(3, b"");
+        assert_eq!(cmd_text_opt(&blank, true), "OK 0 trimmed=3\n");
+        assert_eq!(cmd_text_opt(&blank, false), "OK 3\n\n\n\n");
+    }
+
+    /// `text --json trim`: `rows` stops at the last non-blank row and the object
+    /// carries `"trimmed":k`; `dims.rows` stays the grid. The bare JSON is unchanged.
+    #[test]
+    fn text_json_trim_carries_trimmed_and_keeps_grid_dims() {
+        let term = term_with(6, b"one\r\n\r\nthree");
+        let bare = cmd_text_json(&term);
+        assert!(bare.starts_with("OK 1\n{\"rows\":[\"one\",\"\",\"three\",\"\",\"\",\"\"],"));
+        assert!(
+            !bare.contains("trimmed"),
+            "bare JSON carries no trimmed field"
+        );
+        assert_eq!(bare, cmd_text_json_opt(&term, false));
+        let trimmed = cmd_text_json_opt(&term, true);
+        assert!(
+            trimmed.starts_with("OK 1\n{\"rows\":[\"one\",\"\",\"three\"],"),
+            "{trimmed}"
+        );
+        assert!(
+            trimmed.contains("\"dims\":{\"rows\":6,\"cols\":40}"),
+            "{trimmed}"
+        );
+        assert!(trimmed.ends_with(",\"trimmed\":3}\n"), "{trimmed}");
+    }
+
+    /// The shared framer: `OK <n>[ <verdict>][ trimmed=<k>]` + rows — the `turn`
+    /// verdict token lands AFTER the verdict, so a client keying on `turn` at token
+    /// two or the count at token one is undisturbed; untrimmed is byte-identical to
+    /// the pre-`trim` wire.
+    #[test]
+    fn frame_rows_reply_places_the_verdict_then_trimmed() {
+        let body = "a\n\nb\n\n\n";
+        assert_eq!(frame_rows_reply(body, 5, "", false), "OK 5\na\n\nb\n\n\n");
+        assert_eq!(
+            frame_rows_reply(body, 5, "", true),
+            "OK 3 trimmed=2\na\n\nb\n"
+        );
+        let v = "turn submitted=1 status=settled seq=9 id=2 dur_ms=3 hash=00000000000000ab";
+        assert_eq!(
+            frame_rows_reply(body, 5, v, false),
+            format!("OK 5 {v}\na\n\nb\n\n\n")
+        );
+        assert_eq!(
+            frame_rows_reply(body, 5, v, true),
+            format!("OK 3 {v} trimmed=2\na\n\nb\n")
+        );
+        assert_eq!(
+            frame_rows_reply("\n\n", 2, v, true),
+            format!("OK 0 {v} trimmed=2\n")
+        );
+    }
+
+    /// `blocktext <id> [trim]`: the id alone reaches the emitter; `trim` re-frames
+    /// the emitter's reply; anything else is the arm's usage line. An `ERR` from the
+    /// emitter passes through untouched.
+    #[test]
+    fn blocktext_args_validate_grammar_and_trim_the_reply() {
+        let emit = |id: &str| {
+            assert_eq!(id, "7", "only the id reaches the emitter");
+            "OK 4 marker\nout\n\n\n\n".to_string()
+        };
+        assert_eq!(cmd_blocktext_args("7", emit), "OK 4 marker\nout\n\n\n\n");
+        assert_eq!(
+            cmd_blocktext_args("7 trim", emit),
+            "OK 1 marker trimmed=3\nout\n"
+        );
+        for bad in ["", "trim", "x", "7 foo", "7 trim foo", "7trim"] {
+            assert_eq!(
+                cmd_blocktext_args(bad, |_| unreachable!("usage errors never emit")),
+                "ERR usage: blocktext <id> [trim]\n",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            cmd_blocktext_args("7 trim", |_| "ERR no such block\n".to_string()),
+            "ERR no such block\n",
+            "an emitter error is not re-framed"
+        );
+        assert_eq!(
+            trim_lines_reply("OK\n"),
+            "OK\n",
+            "a countless header passes through"
+        );
+        assert_eq!(trim_lines_reply("OK 0\n"), "OK 0 trimmed=0\n");
     }
 }

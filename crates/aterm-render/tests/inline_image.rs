@@ -18,9 +18,9 @@ fn solid_rgba_png(w: u32, h: u32, rgba_pixel: [u8; 4]) -> Vec<u8> {
     }
     let mut out = Vec::new();
     {
-        let mut enc = png::Encoder::new(&mut out, w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
+        let mut enc = aterm_png::Encoder::new(&mut out, w, h);
+        enc.set_color(aterm_png::ColorType::Rgba);
+        enc.set_depth(aterm_png::BitDepth::Eight);
         let mut writer = enc.write_header().expect("png header");
         writer.write_image_data(&rgba).expect("png data");
     }

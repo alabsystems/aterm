@@ -70,6 +70,25 @@ pub(crate) fn fill_row_into(
                 ));
         }
     }
+    // Inline images stay in SPAN form (a `ScrolledRowExtras` carries them
+    // coalesced, unlike the per-column underline colours below): clipping the
+    // end column to the new width is the whole conversion, and it matches what
+    // a live footprint does at a narrower window — the tail tiles clip at the
+    // right margin rather than wrapping onto a row nobody placed them on.
+    if let Some(spans) = line.images() {
+        for span in spans {
+            if span.start_col >= cols {
+                continue;
+            }
+            extras.images.push(aterm_scrollback::ImageSpan::new(
+                span.start_col,
+                span.end_col.min(cols),
+                span.image_row,
+                span.first_cell_col,
+                Arc::clone(&span.image),
+            ));
+        }
+    }
     // Expand SGR 58 underline-colour spans back to the per-column form a
     // `ScrolledRowExtras` carries (row_to_line re-coalesces on the next scroll).
     // O(cols) budget guards against crafted overlapping spans, as elsewhere.
@@ -229,6 +248,52 @@ impl Grid {
                             break 'ul_flag;
                         }
                         if let Some(cell) = r.get_mut(ucol) {
+                            cell.set_has_extras(true);
+                        }
+                        budget -= 1;
+                    }
+                }
+            }
+        }
+
+        // Restore inline images from the scrollback Line into CellExtras, back
+        // to the one-ref-per-covered-cell form a live placement has, so an
+        // unscrolled picture takes the same draw path as one that never left.
+        // Same O(cols) budget rationale as the two restores above; the payload
+        // `Arc` is cloned, never the raster.
+        if let Some(spans) = line.images() {
+            let mut any_image = false;
+            let mut budget = cols;
+            'img_fill: for span in spans {
+                for icol in span.start_col..span.end_col.min(cols) {
+                    if budget == 0 {
+                        break 'img_fill;
+                    }
+                    if let Some((cell_row, cell_col)) = span.tile_at(icol) {
+                        self.storage.extras.set_image(
+                            CellCoord::new(row_idx, icol),
+                            crate::ImageRef {
+                                image: Arc::clone(&span.image),
+                                cell_row,
+                                cell_col,
+                            },
+                        );
+                        any_image = true;
+                    }
+                    budget -= 1;
+                }
+            }
+            if any_image
+                && let Some(idx) = self.storage.row_index(row_idx)
+                && let Some(r) = self.storage.rows.get_mut(idx)
+            {
+                let mut budget = cols;
+                'img_flag: for span in spans {
+                    for icol in span.start_col..span.end_col.min(cols) {
+                        if budget == 0 {
+                            break 'img_flag;
+                        }
+                        if let Some(cell) = r.get_mut(icol) {
                             cell.set_has_extras(true);
                         }
                         budget -= 1;

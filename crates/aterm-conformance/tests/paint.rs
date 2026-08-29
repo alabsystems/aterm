@@ -284,7 +284,29 @@ enum Expect {
 /// [`probe_with`] for the rest.
 #[cfg(target_os = "macos")]
 fn probe(shape: &str, keys: &str, expect: Expect) {
-    probe_with(shape, keys, expect, Capture::PinnedVideo);
+    // TRAIL rows run on the COMPANION-FREE head, not on `classic`.
+    //
+    // `classic` spells `rainbow kitty`, which was a companion-free ribbon until
+    // 2026-08-26 and has been a RESIDENT ANIMAL since. `scan.py`'s rainbow predicate
+    // (>=15 deg of hue separation among changed saturated pixels in one raster row)
+    // cannot tell live fur from ribbon, and the resident fades in AFTER the frame-0
+    // baseline, so its body is "changed" in every later frame. Roughly seven of
+    // `COAT_RAMP`'s sixteen coats clear the saturation floor and `mint_launch_seed`
+    // draws a fresh one per launch — so these rows became a COIN FLIP on the cat,
+    // measured red 3 of 5 and 3 of 4 on an unmodified tree. A 15/15 green here was
+    // luck, not evidence.
+    //
+    // `flying` is the same trail with no resident on glass, which is what these rows
+    // were written to measure. Rows that JUDGE the resident pin their own style, are
+    // untouched, and use the instrument that can separate a cat from a ribbon (paired
+    // `ctl trail status` morphology) rather than pixels alone.
+    probe_styled(shape, keys, expect, Capture::PinnedVideo, "flying");
+}
+
+/// [`probe`] with the style named outright.
+#[cfg(target_os = "macos")]
+fn probe_styled(shape: &str, keys: &str, expect: Expect, capture: Capture, style: &str) {
+    probe_with_companion_style(shape, keys, expect, capture, None, Some(style));
 }
 
 /// How the take is captured — and therefore WHAT THE INSTRUMENT PERTURBS.
@@ -515,8 +537,9 @@ fn alt_screen_cold_spinner_paints_zero_ink() {
 /// 145 the same underline decayed to fewer hues. Nothing blacked out.
 ///
 /// BLIND: with the effect switched OFF entirely (an unknown
-/// `cursor_trail_style`, which resolves Unknown and disables the effect), the
-/// same term reads ZERO — a take with no sustained two-frame rainbow anywhere
+/// `cursor_trail_style`, which at the time resolved Unknown and disabled the
+/// effect — since 2026-08-29 it falls back to the default, so a blind control
+/// spells `off`), the same term reads ZERO — a take with no sustained two-frame rainbow anywhere
 /// gives `sustained_rainbow_bounds` nothing to bound, so the gap is vacuously
 /// zero. The term read 0 on a dead effect and 26 on a live one. Raising the
 /// threshold could only have traded one blindness for more, which is why the

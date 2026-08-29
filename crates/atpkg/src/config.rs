@@ -283,7 +283,7 @@ struct RootConfig {
 /// bootstrap/links, never widen anything).
 #[must_use]
 pub fn parse_packages(text: &str) -> PackagesConfig {
-    match toml::from_str::<RootConfig>(text) {
+    match aterm_toml::from_str::<RootConfig>(text) {
         Ok(root) => root.packages.unwrap_or_default(),
         Err(e) => {
             eprintln!("atpkg: ignoring malformed aterm.toml [packages] config: {e}");

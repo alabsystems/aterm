@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-primer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — the coding-agent primer installer: the marked, self-gating aterm primer block in each agent's global context file plus the bundled skill files, behind `aterm agents` AND the auto-prime every aterm session runs. Std-only leaf so the CLI and the GUI share one installer."
+
+# Deliberately dependency-free: the installer is pure string transforms over
+# std::fs, and it runs on a detached thread inside every GUI process, so the
+# whole thing stays auditable in one small crate with nothing to drag in.
+[dependencies]
+
+[dev-dependencies]
+# Scratch home directories for the installer tests.
+aterm-tempfile = { workspace = true }
+# The env-hygiene sentence in the primer must name every deny prefix the real
+# sanitizer strips; the test pins it against `aterm_types::domain::ENV_DENY_PREFIXES`.
+aterm-types = { workspace = true }
+
+[lints]
+workspace = true

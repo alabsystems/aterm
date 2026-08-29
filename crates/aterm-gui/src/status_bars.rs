@@ -178,6 +178,37 @@ impl StatusBars {
             .chain(self.update.iter().map(|b| (Lane::Update, b)))
     }
 
+    /// One SPOKEN line per live bar, top to bottom — what an assistive
+    /// technology should hear where a sighted user sees a row of chrome.
+    ///
+    /// The glyph is dropped (it is a pictogram, and "⇣" reads as nothing useful),
+    /// and the pieces are joined into one sentence rather than announced as
+    /// separate fields, because a screen-reader user wants "Installing the ALab
+    /// toolchain, trust — extracting 120 MB / 900 MB, 3 of 10" in the order a
+    /// reader's eye takes them. The meter is deliberately absent: it encodes the
+    /// same fraction the figures already state, and a row of block characters is
+    /// noise in speech.
+    ///
+    /// `cfg(a11y_tree)`: its one reader is `App::push_a11y_tree`, which carries
+    /// the same gate (AccessKit is a platform fact on Linux and an opt-in
+    /// feature elsewhere). Without it this would be dead code under the
+    /// workspace's `-D warnings`.
+    #[cfg(a11y_tree)]
+    pub(crate) fn spoken_lines(&self) -> Vec<String> {
+        self.bars()
+            .map(|(_, bar)| {
+                let mut line = bar.text.title.clone();
+                for part in [bar.text.detail.as_str(), bar.text.stats.as_str()] {
+                    if !part.is_empty() {
+                        line.push_str(", ");
+                        line.push_str(part);
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+
     /// Which lane occupies bar row `index` (0 = topmost), if any.
     pub(crate) fn lane_at(&self, index: usize) -> Option<Lane> {
         self.bars().nth(index).map(|(lane, _)| lane)

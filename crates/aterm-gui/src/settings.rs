@@ -1304,13 +1304,33 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
 }
 
 /// The canonical current option spelling for compatibility projection and shared stepping.
-/// It resolves annotated defaults and documented aliases before defensively falling back
-/// to the first option for a genuinely unrecognized spelling.
+/// It resolves annotated defaults and documented aliases before falling back for a
+/// genuinely unrecognized spelling.
+///
+/// THE FALLBACK MUST BE WHAT THE RUNTIME DRAWS, not `options[0]`. This overlay is the
+/// ONLY Settings surface on Linux and Windows, and its consumers claim to describe the
+/// live effect: a segmented row's chip, the Enter/Space cycle anchor, and
+/// [`demo_style`]'s animated lane on the Cursor Kitty page. For `cursor_trail_style` the
+/// live consumer is that lane — the row carries too many options for the segmented
+/// paint, so its own chip and its ←/→ stepping run through [`popup_current_label`] /
+/// [`popup_current_index`], which preserve the authored spelling verbatim rather than
+/// consulting this (a `pack:<id>` is unrecognized here too, and that is the arm which
+/// keeps it intact). An unrecognized spelling resolves to
+/// [`prefs::DEFAULT_CURSOR_TRAIL_STYLE`] and RENDERS (`app_config::resolve_trail_style`),
+/// so `options[0]` — "phaser" — would animate an effect the engine is not playing. Every
+/// other Enum row keeps the defensive first-option fallback; that is what `cursor_style`
+/// pins.
 pub(crate) fn enum_current(f: &EditField) -> &'static str {
     let EditKind::Enum { options } = f.kind else {
         return "";
     };
-    enum_recognized(f).unwrap_or_else(|| options.first().copied().unwrap_or(""))
+    enum_recognized(f).unwrap_or_else(|| {
+        if f.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE
+        } else {
+            options.first().copied().unwrap_or("")
+        }
+    })
 }
 
 /// The canonical option an Enum row's configured value RESOLVES to (directly or via the
@@ -6389,9 +6409,20 @@ mod tests {
         assert_eq!(enum_current(&trail("embers")), "fire");
         assert_eq!(enum_current(&trail("ocean")), "water");
         assert_eq!(enum_current(&trail("light-beam")), "beam");
-        // An unknown spelling still falls back to the first option here (the
-        // popup's verbatim-preserve arm lives in `popup_options`).
-        assert_eq!(enum_current(&trail("plasma")), "phaser");
+        // An unknown spelling falls back to what the RUNTIME draws for it, not
+        // to options[0]: `app_config::resolve_trail_style` substitutes the
+        // default style and renders, so the chip, the cycle anchor and the demo
+        // lane all name the trail that is actually on screen. (The popup's
+        // verbatim-preserve arm lives in `popup_options`.)
+        assert_eq!(
+            enum_current(&trail("plasma")),
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE
+        );
+        assert_ne!(
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            crate::prefs::CURSOR_TRAIL_STYLES[0],
+            "the assertion above is vacuous if the default IS options[0]"
+        );
     }
 
     #[test]
@@ -7191,9 +7222,9 @@ mod tests {
         );
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, pw, ph);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             let mut wr = enc.write_header().unwrap();
             wr.write_image_data(&rgba).unwrap();
         }
@@ -7415,6 +7446,68 @@ mod tests {
             .unwrap();
         assert!(f.seed.is_none());
         assert_eq!(enum_current(f), crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE);
+    }
+
+    /// A TYPO'D STYLE DEMOS THE TRAIL THAT IS ACTUALLY DRAWN. This overlay is the
+    /// only Settings surface on Linux and Windows, so its animated demo lane and
+    /// its Enter/Space cycle anchor have to agree with
+    /// `app_config::resolve_trail_style`, which substitutes
+    /// [`prefs::DEFAULT_CURSOR_TRAIL_STYLE`] and RENDERS. `options[0]` is "phaser",
+    /// a wholly different look, and animating it here would have made the panel
+    /// contradict the glass.
+    #[test]
+    fn an_unknown_trail_style_demos_the_runtime_fallback() {
+        let typo = "plasma";
+        assert_eq!(
+            crate::prefs::cursor_trail_style_canonical(typo),
+            None,
+            "the probe value must really be unrecognized"
+        );
+        assert_eq!(
+            crate::app_config::effective_trail_style_token(typo),
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            "the runtime draws the default for it"
+        );
+        let mut s = SettingsState::from_config(&Config {
+            cursor_trail_style: Some(typo.to_string()),
+            ..Config::default()
+        });
+        let idx = s
+            .fields
+            .iter()
+            .position(|f| f.key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
+            .expect("trail-style row");
+        assert_eq!(s.fields[idx].seed.as_deref(), Some(typo));
+        assert_eq!(
+            enum_current(&s.fields[idx]),
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE
+        );
+        // The animated demo lane reads the same seam.
+        s.pane = SettingsPane::Content;
+        s.set_category(prefs::Section::CursorKitty);
+        s.selected = idx;
+        assert_eq!(
+            demo_style(&s),
+            Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+            "the demo lane must play the fallback, not options[0]"
+        );
+        // `cycle_edit` shares the same seam, so it steps from the fallback
+        // rather than from "phaser". This row never takes that path in the
+        // shipping UI — it is a popup row, and activating it opens the menu on
+        // the preserved spelling — so this pins the shared helper, not this
+        // row's behaviour.
+        let i = CURSOR_TRAIL_STYLES
+            .iter()
+            .position(|o| *o == crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+            .unwrap();
+        assert_eq!(
+            cycle_edit(&s.fields[idx]).unwrap().1.as_deref(),
+            Some(CURSOR_TRAIL_STYLES[(i + 1) % CURSOR_TRAIL_STYLES.len()])
+        );
+        // The popup chip still preserves the authored spelling verbatim — that
+        // arm is what lets the user step away from a typo without it being
+        // clobbered, and it is unchanged.
+        assert_eq!(popup_current_label(&s.fields[idx]), typo);
     }
 
     #[test]

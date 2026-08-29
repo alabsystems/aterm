@@ -27,7 +27,7 @@ aterm-log = { workspace = true }
 # publisher (crates/aterm-release) and the updater client both compile against,
 # so field agreement is compiler-enforced rather than hand-synced.
 serde = { workspace = true }
-toml = { workspace = true }
+aterm-toml = { workspace = true }
 # Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
 # lives here rather than in aterm-update because BOTH sides need it: the client verifies
 # it, and the owner-side minting tool emits and signs it through the very same type. Two
@@ -39,7 +39,12 @@ toml = { workspace = true }
 # crate — and the `deny.toml` version floor already covers it.
 ring = { version = "0.17.14", default-features = false }
 # Decode the base64 master + machine Ed25519 public keys (32 raw bytes each).
-base64 = "0.22.1"
+# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
+# to the retired `base64` package's `general_purpose::STANDARD` engine by
+# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
+# point every trust path uses: canonical padding REQUIRED and no trailing bits,
+# so a pinned key has exactly one spelling.
+aterm-codec = { workspace = true }
 
 # flock(2) for the apply/stage critical sections + getuid(2) for the private-dir
 # ownership check. The two narrow syscalls with no safe std wrapper (POSIX-only;

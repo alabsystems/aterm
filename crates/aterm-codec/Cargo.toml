@@ -14,6 +14,24 @@ description = "Base64 and hex encoding/decoding for aterm: zero external depende
 
 [dev-dependencies]
 criterion = "0.5"
+# THE ORACLE for `base64::decode_strict` / `base64::encode`. Retiring the `base64`
+# package moved six crates' trust-critical decodes (pinned Ed25519 anchors, the
+# machine roster, the signed atpkg index cache) onto this crate; every one of them
+# was written against `general_purpose::STANDARD`, so agreement with that exact
+# engine — same acceptance set, same bytes — is the property that has to hold.
+# tests/base64_oracle.rs asserts it differentially over the repo's own bytes plus
+# an exhaustive short-string enumeration. DEV-ONLY: `base64` is in no shipped
+# dependency graph.
+base64 = "0.22.1"
+# THE ORACLE for `inflate::stream`. Retiring `flate2` (and `miniz_oxide` behind
+# it) moved atpkg's `tar-gz` and `zip` install lanes onto the streaming reader in
+# `src/inflate/stream.rs`; those lanes decompress SIGNED archives, so agreement
+# with the engine they used to run — output bytes, and accept-or-reject on
+# corrupt input — is the property that has to hold. tests/inflate_stream_oracle.rs
+# asserts it over the repo's own bytes at every compression level, at read and
+# refill granularities down to one byte, and over mutated streams. DEV-ONLY:
+# `flate2` is in no shipped dependency graph.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 
 # The only target in the tree that reaches `inflate` at all. gpu_frame.rs /
 # image_diff.rs feed their inline image once during setup, outside `b.iter`, and

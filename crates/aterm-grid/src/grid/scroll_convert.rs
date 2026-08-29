@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use aterm_alloc::SmallVec;
 use aterm_rle::Rle;
-use aterm_scrollback::{CellAttrs, HyperlinkSpan, Line, UnderlineColorSpan};
+use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
 
 use super::Grid;
 use crate::Cell;
@@ -208,8 +208,12 @@ impl DeferredLine {
     /// `ring_extras` convention in `Grid::memory_used`.
     pub(crate) fn heap_memory_used(&self) -> usize {
         let mut total = self.cells.capacity() * std::mem::size_of::<Cell>();
-        if self.extras.is_some() {
+        if let Some(extras) = self.extras.as_deref() {
             total += std::mem::size_of::<ScrolledRowExtras>();
+            // …plus this row's share of any inline-image payload it staged: the
+            // shallow convention would hide a whole screenshot from the ring
+            // byte watermark for as long as the buffer goes undrained.
+            total += extras.image_bytes();
         }
         if let Some(line) = self.cached.get() {
             total += line.memory_used();
@@ -267,6 +271,7 @@ impl DeferredLine {
             if self.wrapped {
                 line.set_wrapped(true);
             }
+            attach_image_spans(&mut line, extras);
             return (line, body);
         }
         let cells = &body[..len];
@@ -291,6 +296,7 @@ impl DeferredLine {
             if self.wrapped {
                 line.set_wrapped(true);
             }
+            attach_image_spans(&mut line, extras);
             return line;
         }
 
@@ -375,6 +381,7 @@ impl DeferredLine {
         if !extras.underline_colors.is_empty() {
             line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
         }
+        attach_image_spans(&mut line, extras);
         if wrapped {
             line.set_wrapped(true);
         }
@@ -672,6 +679,20 @@ impl Default for LazyBuffer {
     }
 }
 
+/// Attach a row's coalesced inline-image spans to the [`Line`] it produced.
+///
+/// Called from EVERY line-producing site, the zero-length short circuits
+/// included: `place_image` writes no glyph, so an image-only row has
+/// `len == 0` and takes those short circuits — skipping one is precisely how a
+/// picture goes missing between the ring tier and the tiered store.
+///
+/// The clone is one refcount bump per span; the raster is never copied.
+fn attach_image_spans(line: &mut Line, extras: &ScrolledRowExtras) {
+    if !extras.images.is_empty() {
+        line.set_images(extras.images.clone());
+    }
+}
+
 /// Preserved CellExtras data for a ring buffer scrollback row.
 ///
 /// When rows scroll from the visible grid into ring buffer scrollback,
@@ -702,6 +723,15 @@ pub struct ScrolledRowExtras {
     /// against the live palette at render time, matching the live cell. Rare
     /// (SGR 58 is seldom used), so this is empty for essentially all rows.
     pub underline_colors: Vec<(u16, u32)>,
+    /// Inline-image spans (iTerm2 OSC 1337 / sixel), already coalesced into one
+    /// span per contiguous run of columns painting one footprint row.
+    ///
+    /// Coalesced HERE rather than kept per column (the shape `underline_colors`
+    /// uses) because an image covers a RECTANGLE: a full-width footprint row
+    /// would otherwise cost one `Arc` bump plus a tuple per column, per row, for
+    /// geometry a single span states exactly. Empty for every row that carries
+    /// no picture, which is essentially all of them.
+    pub images: Vec<ImageSpan>,
 }
 
 impl ScrolledRowExtras {
@@ -717,6 +747,25 @@ impl ScrolledRowExtras {
             && self.rgb_fg.is_empty()
             && self.rgb_bg.is_empty()
             && self.underline_colors.is_empty()
+            && self.images.is_empty()
+    }
+
+    /// This row's share of the inline-image payloads it holds.
+    ///
+    /// The rest of a `ScrolledRowExtras` is accounted SHALLOW by its holders
+    /// (`Grid::memory_used`'s `ring_extras` walk, `DeferredLine`), which is fine
+    /// for the tens of bytes a hyperlink or a combining mark adds — and wrong by
+    /// megabytes for a screenshot. This is the same per-row share
+    /// [`ImageSpan::memory_used`] charges a `Line`, so a footprint sitting in
+    /// the ring or staged in the lazy buffer costs the byte watermark exactly
+    /// what it will cost once it reaches the tiered store.
+    #[must_use]
+    pub(crate) fn image_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for span in &self.images {
+            total = total.saturating_add(span.memory_used());
+        }
+        total
     }
 
     /// Clear all fields, retaining `Vec` capacities so the struct can be
@@ -729,6 +778,7 @@ impl ScrolledRowExtras {
         self.rgb_fg.clear();
         self.rgb_bg.clear();
         self.underline_colors.clear();
+        self.images.clear();
     }
 }
 
@@ -788,6 +838,7 @@ impl Grid {
             if row.is_wrapped() {
                 line.set_wrapped(true);
             }
+            attach_image_spans(&mut line, extras);
             return line;
         }
 
@@ -847,6 +898,7 @@ impl Grid {
         if !extras.underline_colors.is_empty() {
             line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
         }
+        attach_image_spans(&mut line, extras);
         if row.is_wrapped() {
             line.set_wrapped(true);
         }
@@ -919,11 +971,22 @@ impl Grid {
         // text-only serialize_ansi). OSC-8 hyperlink spans are STILL collected
         // (a cheap hyperlink-only pass) so links that scroll off-screen remain
         // recoverable from scrollback. The visible grid is untouched, so
-        // visible_sha and the differential oracle are unaffected.
+        // visible_sha and the differential oracle are unaffected. Inline images
+        // are NOT collected in this mode, for the same reason colours are not:
+        // an embedding that reads scrollback as text has no use for a raster,
+        // and carrying one would be the single largest thing this mode drags
+        // through the lock.
         if scrollback_text_only() {
             Self::extract_hyperlinks_only_into(result, row, extras, row_idx);
             return;
         }
+        // INLINE IMAGES FIRST, and over the full physical width — every gate
+        // below is driven by `row.len()`, the write high-water mark, and
+        // `place_image` writes no glyph, so a row that carries nothing but a
+        // picture has `len == 0` and would fall out of this function before any
+        // of its image cells were looked at. That is exactly how the image used
+        // to die at the top of the screen.
+        Self::extract_image_spans_into(result, row, extras, row_idx);
         let len = row.len() as usize;
         if len == 0 {
             return;
@@ -1147,6 +1210,104 @@ impl Grid {
             result
                 .hyperlinks
                 .push(HyperlinkSpan::with_id(start, end_col, url, id));
+        }
+    }
+
+    /// Coalesce this row's inline-image cells into [`ImageSpan`]s, so a
+    /// placement survives the row's trip into scrollback.
+    ///
+    /// Scans the FULL physical width (`Row::cols`), not `Row::len()`: an image
+    /// cell carries only a `CellExtra` — `place_image` writes no glyph — so the
+    /// picture lives at columns the length-bounded text walk never visits, and
+    /// on an image-only row `len` is 0. This is the same reason
+    /// `Terminal::images_row_into` scans `0..grid.cols()` on the render side.
+    ///
+    /// Two gates keep the scan off every other row: the collection's sticky
+    /// [`CellExtras::any_image`] flag (false for any session that has never
+    /// drawn a picture — one bool per scrolled row), and then the cell's own
+    /// `HAS_EXTRAS` bit, so the map is probed only where an extra exists at all.
+    ///
+    /// Cells are coalesced left to right while they stay on the SAME placement
+    /// (`Arc::ptr_eq`), the same footprint row, and consecutive footprint
+    /// columns — so one span per footprint row in the ordinary case, and a break
+    /// wherever an overwrite or a clipped edge really did interrupt the picture.
+    fn extract_image_spans_into(
+        result: &mut ScrolledRowExtras,
+        row: &Row,
+        extras: &CellExtras,
+        row_idx: u16,
+    ) {
+        if !extras.any_image() {
+            return;
+        }
+        let cells = row.as_slice();
+        // Open run: (start_col, image_row, first_cell_col, next expected
+        // footprint column, payload).
+        let mut open: Option<(u16, u16, u16, u16, Arc<aterm_types::ImageData>)> = None;
+        for (physical_col, cell) in cells.iter().enumerate() {
+            let Ok(col_u16) = u16::try_from(physical_col) else {
+                break;
+            };
+            // The image ref lives in the map, and the map is only ever probed
+            // for a cell whose own flag says it has an entry.
+            let found = if cell.has_extras() {
+                extras
+                    .get(CellCoord::new(row_idx, col_u16))
+                    .and_then(|e| e.image())
+            } else {
+                None
+            };
+            match (&open, found) {
+                (Some((start, img_row, first, next_cell_col, payload)), Some(iref))
+                    if Arc::ptr_eq(payload, &iref.image)
+                        && iref.cell_row == *img_row
+                        && iref.cell_col == *next_cell_col =>
+                {
+                    // Contiguous continuation of the run: extend by rebuilding
+                    // the tuple with the next expected footprint column.
+                    open = Some((
+                        *start,
+                        *img_row,
+                        *first,
+                        next_cell_col.saturating_add(1),
+                        Arc::clone(payload),
+                    ));
+                }
+                (Some((start, img_row, first, _, payload)), next) => {
+                    result.images.push(ImageSpan::new(
+                        *start,
+                        col_u16,
+                        *img_row,
+                        *first,
+                        Arc::clone(payload),
+                    ));
+                    open = next.map(|iref| {
+                        (
+                            col_u16,
+                            iref.cell_row,
+                            iref.cell_col,
+                            iref.cell_col.saturating_add(1),
+                            Arc::clone(&iref.image),
+                        )
+                    });
+                }
+                (None, Some(iref)) => {
+                    open = Some((
+                        col_u16,
+                        iref.cell_row,
+                        iref.cell_col,
+                        iref.cell_col.saturating_add(1),
+                        Arc::clone(&iref.image),
+                    ));
+                }
+                (None, None) => {}
+            }
+        }
+        if let Some((start, img_row, first, _, payload)) = open {
+            let end_col = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+            result
+                .images
+                .push(ImageSpan::new(start, end_col, img_row, first, payload));
         }
     }
 

@@ -218,6 +218,13 @@ pub(crate) struct PaletteLive {
     /// A strictly-newer `(build, version)` is STAGED (the `App.relaunch` nudge): the
     /// Version section shows the one-click "↑ Update to v<staged> — restart now" row.
     pub staged: Option<(u64, String)>,
+    /// The apply lane's STANDING failure for that staged build, when there is one
+    /// (`App::apply_trouble_for`). It replaces the row's "restart now" tail with the
+    /// attempt count, the cause in human words, and whether the automatic lane is
+    /// still going to try — the palette twin of the Version menu's row, kept in
+    /// lockstep by construction because both render the same value through
+    /// [`crate::menu::staged_apply_label`].
+    pub staged_trouble: Option<crate::update_apply_trouble::ApplyTrouble>,
     /// The post-update REALIZED arrow is live: `(new version, its spawn instant)` — the
     /// Version section shows the TIME-FADED "↑ Updated to v<new>" row (alpha decays over
     /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). Ignored while `staged` is `Some`
@@ -406,7 +413,10 @@ impl PaletteState {
         // `↑`, not the colour emoji — this is own-rendered text with no emoji face.
         let dynamic_label: Option<Cow<'static, str>> = if let Some((build, v)) = &live.staged {
             Some(Cow::Owned(crate::menu::staged_apply_label(
-                "\u{2191}", *build, v,
+                "\u{2191}",
+                *build,
+                v,
+                live.staged_trouble.as_ref(),
             )))
         } else if let Some((v, since)) = &live.realized {
             self.realized_since = Some(*since);
@@ -2628,9 +2638,9 @@ mod tests {
         );
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, pw, ph);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             let mut wr = enc.write_header().unwrap();
             wr.write_image_data(&buf).unwrap();
         }

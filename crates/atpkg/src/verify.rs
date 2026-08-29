@@ -164,7 +164,13 @@ mod tests {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin").join(program), b"#!/bin/true\n").unwrap();
-        install_shims(layout, &dir, &[program.to_string()]).unwrap();
+        install_shims(
+            layout,
+            &dir,
+            &[program.to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
         activate_channel(layout, "stable", &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
         dir

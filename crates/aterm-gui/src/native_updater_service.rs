@@ -82,6 +82,31 @@ pub(crate) struct DurableUpdateStatus {
     /// escalated but whose last failure was a network blip records `network`
     /// (2026-08-19 round-4 skeptics).
     pub(crate) failing_applies: u32,
+    /// WHY the applies in [`Self::failing_applies`] failed: the health ledger's
+    /// `last_apply_error`, the same prose `aterm ctl update status` prints as
+    /// `apply_failure=`.
+    ///
+    /// The count alone cannot be rendered into a sentence a person can act on, and
+    /// the count alone is all any window had. Measured on the owner's machine
+    /// (2026-08-21): `failing_applies=2 apply_failure="overlap handoff failed
+    /// safely: handoff proof ended ChildDied"` on the control socket, beside a
+    /// Version menu offering "Update to v0.56.0 — restart now" with no hint that
+    /// two attempts had already died. Read from `aterm_update::apply_lane_report`
+    /// on the same worker thread that reads the status, never on the event loop.
+    pub(crate) apply_failure: String,
+    /// The build [`Self::apply_failure`] was TRYING TO REACH (0 when unknown), with
+    /// [`Self::apply_failures_for_target`] the number of consecutive attempts on
+    /// that exact artifact — the ledger's `last_apply_failure_target_build` /
+    /// `apply_failures_for_target`.
+    ///
+    /// [`Self::failing_applies`] cannot answer "has THIS build been tried?": it is
+    /// expiry-bound to the RUNNING build, so it survives a newer download intact and
+    /// a fresh stage inherits both the count and the reason of the artifact it
+    /// replaced. A surface that decorated a never-attempted build with "tried twice,
+    /// the new version didn't start" would be a new lie in place of the old one.
+    pub(crate) apply_failure_build: u64,
+    /// See [`Self::apply_failure_build`].
+    pub(crate) apply_failures_for_target: u32,
     /// This launch has a bundle the updater could REPLACE. `false` for a run from
     /// the mounted DMG, a Gatekeeper-translocated copy, or a dev-marked install —
     /// states in which no check thread ever starts, so every ledger field is the
@@ -289,6 +314,16 @@ pub(crate) struct UpdaterSnapshot {
     /// Consecutive APPLY failures from the ledger — the exact "the staged build
     /// will not start" signal (`failing_kind` is only the most recent class).
     pub(crate) failing_applies: u32,
+    /// See [`DurableUpdateStatus::apply_failure`]: the reason behind
+    /// `failing_applies`, carried so an "update available" affordance can say what
+    /// went wrong instead of only that something did.
+    pub(crate) apply_failure: String,
+    /// See [`DurableUpdateStatus::apply_failure_build`]: which artifact
+    /// [`Self::apply_failure`] is about, and how many attempts on THAT artifact are
+    /// behind it.
+    pub(crate) apply_failure_build: u64,
+    /// See [`Self::apply_failure_build`].
+    pub(crate) apply_failures_for_target: u32,
     /// See [`DurableUpdateStatus::installable`].
     pub(crate) installable: bool,
     /// See [`DurableUpdateStatus::channel_unreadable`].
@@ -350,7 +385,7 @@ pub(crate) enum ApplyMode {
     Automatic,
     /// Background policy whose bounded idle-preference window has closed. Exact
     /// stage authority is unchanged and every safety gate still applies; only
-    /// the idle wait — and the activity revocation that mirrors it — is
+    /// the idle WAIT is
     /// dropped, so a machine that is never quiet still gets the update instead
     /// of deferring until the user clicks Install. Distinct from `Immediate`
     /// because no user asked for this one, so the log/notification wording and
@@ -680,6 +715,9 @@ impl NativeUpdaterService {
                 failing_persistent: false,
                 failing_kind: String::new(),
                 failing_applies: 0,
+                apply_failure: String::new(),
+                apply_failure_build: 0,
+                apply_failures_for_target: 0,
                 installable: true,
                 channel_unreadable: false,
             },
@@ -831,20 +869,106 @@ impl NativeUpdaterService {
         } else {
             String::new()
         };
+        // The apply REASON moves with the apply COUNT, always. Comparing only the
+        // count would let a fresh observation that kept `failing_applies` at 2 while
+        // the cause changed (a `TimedOut` streak that turns into `ChildDied`) return
+        // "nothing changed" and leave every affordance explaining the wrong failure.
+        let apply_failure = bounded(status.apply_failure.clone(), MAX_SHORT_TEXT_BYTES);
         if self.snapshot.failing_persistent == now_persistent
             && self.snapshot.failing_kind == kind
             && self.snapshot.failing_applies == status.failing_applies
+            && self.snapshot.apply_failure == apply_failure
+            && self.snapshot.apply_failure_build == status.apply_failure_build
+            && self.snapshot.apply_failures_for_target == status.apply_failures_for_target
             && self.snapshot.channel_unreadable == status.channel_unreadable
         {
             return false;
         }
+        // A RECONCILE MUST NOT ERASE A FAILURE IT IS SIMPLY OLDER THAN.
+        //
+        // These facts were read off disk on the worker; `note_apply_failure` writes the
+        // same fields from the main thread at the instant the apply fails, inside the
+        // lock that recorded it. Nothing orders the two, so a reconcile whose read
+        // STARTED before that write lands afterwards carrying the pre-failure state —
+        // and puts "restart now" back on the Version menu seconds after the failure was
+        // surfaced. Appearing and then vanishing is worse than never appearing: it reads
+        // as a glitch rather than as news.
+        //
+        // A stale read and a genuine reset both look like "no failure", so the
+        // discriminator is DIRECTION FOR A GIVEN TARGET. Within one process the
+        // artifact-scoped count only ever climbs: a success does not lower it, it
+        // `exec`s this process away. So a report that lowers the count for the SAME
+        // target build is older than what we hold, and only the apply-lane fields are
+        // held back — the check-lane fields it also carries are still fresh.
+        let stale_apply_lane = status.apply_failure_build == self.snapshot.apply_failure_build
+            && status.apply_failures_for_target < self.snapshot.apply_failures_for_target;
         let was_persistent = self.snapshot.failing_persistent;
+        self.snapshot.channel_unreadable = status.channel_unreadable;
+        if stale_apply_lane {
+            self.publish();
+            return true;
+        }
         self.snapshot.failing_persistent = now_persistent;
         self.snapshot.failing_kind = kind;
         self.snapshot.failing_applies = status.failing_applies;
-        self.snapshot.channel_unreadable = status.channel_unreadable;
+        self.snapshot.apply_failure = apply_failure;
+        self.snapshot.apply_failure_build = status.apply_failure_build;
+        self.snapshot.apply_failures_for_target = status.apply_failures_for_target;
         self.publish();
         if now_persistent && !was_persistent {
+            self.snapshot.attention_revision = Some(self.snapshot.revision);
+        }
+        true
+    }
+
+    /// Absorb an apply failure THE HOST JUST WROTE, without waiting for a disk
+    /// re-read.
+    ///
+    /// THE FIRST FAILURE IS THE ONE THIS WHOLE MODULE EXISTS FOR, and it was the one
+    /// that could not arrive. The ledger write happens on the event loop
+    /// (`App::record_apply_outcome_in_ledger`), but every path that carries apply
+    /// facts BACK into this reducer is a worker observation — and the handoff
+    /// worker gathers its reconcile facts before the main thread has written
+    /// anything, so `failing_applies` reached the window only when some later,
+    /// unrelated reconcile happened to land. Settings self-healed on open; the
+    /// Version menu and the palette row went on saying "restart now".
+    ///
+    /// `attempts_for_target` / `target_build` come from
+    /// [`aterm_update::RecordedApplyFailure`], read back inside the same lock scope
+    /// that wrote them, so this cannot disagree with the file. Returns whether
+    /// anything changed — the caller republishes on `true`.
+    pub(crate) fn note_apply_failure(
+        &mut self,
+        recorded: &aterm_update::RecordedApplyFailure,
+    ) -> bool {
+        if !self.snapshot.enabled {
+            return false;
+        }
+        let reason = bounded(recorded.reason.clone(), MAX_SHORT_TEXT_BYTES);
+        let kind = if recorded.persistent {
+            // The class IS `apply`: this write is the apply lane's own.
+            "apply".to_string()
+        } else {
+            String::new()
+        };
+        if self.snapshot.failing_applies == recorded.apply_failures
+            && self.snapshot.apply_failure == reason
+            && self.snapshot.apply_failure_build == recorded.target_build
+            && self.snapshot.apply_failures_for_target == recorded.failures_for_target
+            && self.snapshot.failing_persistent == recorded.persistent
+            && self.snapshot.failing_kind == kind
+        {
+            return false;
+        }
+        let was_persistent = self.snapshot.failing_persistent;
+        self.snapshot.failing_applies = recorded.apply_failures;
+        self.snapshot.apply_failure = reason;
+        self.snapshot.apply_failure_build = recorded.target_build;
+        self.snapshot.apply_failures_for_target = recorded.failures_for_target;
+        self.snapshot.failing_persistent = recorded.persistent;
+        self.snapshot.failing_kind = kind;
+        self.publish();
+        if recorded.persistent && !was_persistent {
             self.snapshot.attention_revision = Some(self.snapshot.revision);
         }
         true
@@ -875,6 +999,9 @@ impl NativeUpdaterService {
             String::new()
         };
         self.snapshot.failing_applies = status.failing_applies;
+        self.snapshot.apply_failure = bounded(status.apply_failure.clone(), MAX_SHORT_TEXT_BYTES);
+        self.snapshot.apply_failure_build = status.apply_failure_build;
+        self.snapshot.apply_failures_for_target = status.apply_failures_for_target;
         self.snapshot.installable = status.installable;
         // The stranded verdict rides every reduced check exactly like the
         // persistent-failure one: it is what stops the update screen from
@@ -1542,6 +1669,59 @@ mod tests {
     const TEST_DIGEST: &str = "abababababababababababababababababababababababababababababababab";
     const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    /// A RECONCILE THAT IS MERELY OLDER MUST NOT ERASE A JUST-SURFACED FAILURE.
+    ///
+    /// `note_apply_failure` writes these fields from the main thread at the instant the
+    /// apply fails, inside the lock that recorded it. `absorb_failure_state` writes the
+    /// same fields from facts a worker read off disk. Nothing orders the two, so a
+    /// reconcile whose read STARTED before that write lands afterwards carrying the
+    /// pre-failure state — and put "restart now" back on the Version menu seconds after
+    /// the trouble was surfaced.
+    ///
+    /// That is worse than never surfacing it: a message that appears and then vanishes
+    /// reads as a glitch, and teaches the reader to distrust the affordance.
+    ///
+    /// A stale read and a genuine reset both look like "no failure", so the
+    /// discriminator is DIRECTION FOR ONE TARGET: within a process the artifact-scoped
+    /// count only climbs, because a success `exec`s this process away rather than
+    /// lowering it.
+    #[test]
+    fn a_reconcile_older_than_the_failure_cannot_lower_the_apply_lane() {
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        let _ = service.absorb_failure_state(&status(Some(11)));
+
+        let recorded = aterm_update::RecordedApplyFailure {
+            apply_failures: 1,
+            failures_for_target: 1,
+            target_build: 11,
+            reason: "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
+            persistent: false,
+        };
+        assert!(
+            service.note_apply_failure(&recorded),
+            "precondition: the failure is recorded and published"
+        );
+        assert_eq!(service.snapshot().apply_failures_for_target, 1);
+
+        // The stale reconcile: same target, a count read from BEFORE the write.
+        let mut stale = status(Some(11));
+        stale.apply_failure_build = 11;
+        stale.apply_failures_for_target = 0;
+        stale.failing_applies = 0;
+        stale.apply_failure = String::new();
+        service.absorb_failure_state(&stale);
+
+        assert_eq!(
+            service.snapshot().apply_failures_for_target,
+            1,
+            "a reconcile older than the failure lowered the artifact-scoped count"
+        );
+        assert!(
+            !service.snapshot().apply_failure.is_empty(),
+            "a reconcile older than the failure erased the reason the surfaces render"
+        );
+    }
+
     fn status(staged_build: Option<u64>) -> DurableUpdateStatus {
         DurableUpdateStatus {
             enabled: true,
@@ -1560,6 +1740,9 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            apply_failure: String::new(),
+            apply_failure_build: 0,
+            apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
         }
@@ -1859,6 +2042,9 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            apply_failure: String::new(),
+            apply_failure_build: 0,
+            apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
         };
@@ -1892,6 +2078,9 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            apply_failure: String::new(),
+            apply_failure_build: 0,
+            apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
         };

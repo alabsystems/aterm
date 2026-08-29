@@ -2249,7 +2249,6 @@ fn now_unix() -> Result<u64> {
 mod tests {
     use super::*;
     use aterm_update_core::roster::{Machine, SUPPORTED_SCHEMA};
-    use base64::Engine as _;
 
     /// A synthetic paper phrase, built at runtime so no phrase-shaped literal exists in
     /// this file (grep_guard B7 scans it).
@@ -2261,7 +2260,7 @@ mod tests {
     }
 
     fn pubkey_of(byte: u8) -> String {
-        base64::engine::general_purpose::STANDARD.encode([byte; 32])
+        aterm_codec::base64::encode(&[byte; 32]).expect("32-byte key")
     }
 
     fn roster_with(seq: u64, machines: Vec<Machine>, revoked: Vec<String>) -> Roster {
@@ -2438,10 +2437,10 @@ mod tests {
         let rng = ring::rand::SystemRandom::new();
         let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("keypair");
         let pair = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).expect("keypair");
-        let b64 = base64::engine::general_purpose::STANDARD;
+
         (
-            b64.encode(doc.as_ref()),
-            b64.encode(pair.public_key().as_ref()),
+            aterm_codec::base64::encode(doc.as_ref()).expect("pkcs8"),
+            aterm_codec::base64::encode(pair.public_key().as_ref()).expect("32-byte key"),
         )
     }
 

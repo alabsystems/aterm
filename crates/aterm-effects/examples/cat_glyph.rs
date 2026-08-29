@@ -45,7 +45,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let doc: toml::Value = match toml_text.parse() {
+    let doc: aterm_toml::Value = match toml_text.parse() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("parse {asset}: {e}");
@@ -147,7 +147,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-fn num(v: &toml::Value) -> f32 {
+fn num(v: &aterm_toml::Value) -> f32 {
     v.as_float()
         .map(|f| f as f32)
         .or_else(|| v.as_integer().map(|i| i as f32))
@@ -167,9 +167,9 @@ fn hex_rgb(s: &str) -> Option<(f32, f32, f32)> {
 
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header()?
         .write_image_data(rgb)
         .map_err(std::io::Error::other)

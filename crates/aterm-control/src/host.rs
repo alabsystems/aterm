@@ -73,6 +73,31 @@ pub struct SessionEntry {
     pub has_meta: bool,
 }
 
+/// Where a rostered session LIVES and what it is DOING — the trailing `window=`
+/// `active=` `wfocus=` `detail=` columns of a `sessions`/`ls` line, keyed by the
+/// [`SessionEntry::sid`] they extend.
+///
+/// A sibling of [`SessionEntry`] rather than four more fields on it, because the
+/// two come from different places at different costs: the roster is a registry
+/// read any thread can take, while placement needs the WINDOW layer (one
+/// main-thread turn for the whole batch) and `detail` needs each engine's lock.
+/// A host answers them together ([`SessionHost::placements`]) or not at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionPlacement {
+    /// The process-local id this placement extends.
+    pub sid: u64,
+    /// The window the session is reported under (the front window when it shows
+    /// the session, else the lowest window id), `None` when no window hosts it.
+    pub window: Option<u64>,
+    /// On that window's ACTIVE tab.
+    pub active_tab: bool,
+    /// That window is the front window.
+    pub window_focused: bool,
+    /// The sanitized RUNNING command (program + allow-listed subcommand, never
+    /// an argument), `None` when idle or when the engine lock was contended.
+    pub detail: Option<String>,
+}
+
 /// A wire `@<selector>` target the ROSTER can answer.
 ///
 /// `@`/`@.` (self) is deliberately absent: self is the CONNECTION's own session,
@@ -151,6 +176,28 @@ pub trait SessionHost {
     /// empty.
     fn sessions(&self) -> Vec<SessionEntry>;
 
+    /// The roster's placements ([`SessionPlacement`]) — window membership and
+    /// running command for every rostered session, in roster order. `None` means
+    /// this host COULD NOT LOOK (no window layer to ask, or it did not answer),
+    /// which the wire prints as `window=-`; a session that IS detached comes back
+    /// inside `Some` with `window: None` (`window=none`). The two must never
+    /// collapse into one answer — a listing that says "no window" when it means
+    /// "could not ask" is the F8 lesson again. Defaults to `None`: a host with no
+    /// window layer has nothing to report, and says so.
+    ///
+    /// A SEAM, not the wire's source of truth: the shipped `sessions` line is
+    /// written by the GUI's own verb from the same rows and sanitizer, and the
+    /// GUI host's implementation mirrors that so the two cannot disagree. No
+    /// production path consumes this method yet, and nothing in this crate
+    /// does either — `conformance.rs` never calls it. Its only callers are the
+    /// GUI host's own unit tests (`aterm-gui/src/control_host.rs`), which pin
+    /// that both the full and the scoped host answer `None` without an event
+    /// loop. It exists so a host other than the GUI can answer placement
+    /// through the trait when one needs to.
+    fn placements(&self) -> Option<Vec<SessionPlacement>> {
+        None
+    }
+
     /// Resolve a `@<selector>` against the ROSTER; `None` when it holds no such
     /// session (fail closed — the caller answers `ERR no such session` rather
     /// than falling back to some other session), and `None` for EVERY selector on
@@ -216,6 +263,20 @@ mod tests {
         // Too big for a u64 local id ⇒ a stable id, never a silent wrap.
         let huge = "99999999999999999999";
         assert_eq!(Selector::parse(huge), Some(Selector::Id(huge)));
+    }
+
+    /// A placement's default is the DETACHED shape, so a host that looked and
+    /// found no window can answer `Some(vec![default with sid])` and be read as
+    /// `window=none` — distinct from the trait's `None` ("could not look").
+    #[test]
+    fn a_default_placement_is_detached_not_unknown() {
+        let p = SessionPlacement {
+            sid: 7,
+            ..SessionPlacement::default()
+        };
+        assert_eq!(p.window, None);
+        assert!(!p.active_tab && !p.window_focused);
+        assert_eq!(p.detail, None);
     }
 
     /// The state tokens are wire bytes; a host maps onto them, it does not coin

@@ -212,7 +212,7 @@ pub fn binary_signature() -> &'static str {
 /// replaces the macOS-only native panel).
 #[must_use]
 pub fn about_fields() -> Vec<(&'static str, String)> {
-    vec![
+    let mut fields = vec![
         (
             "tagline",
             "a fast, hardened, AI-introspectable terminal".to_string(),
@@ -230,7 +230,37 @@ pub fn about_fields() -> Vec<(&'static str, String)> {
         ("arch", std::env::consts::ARCH.to_string()),
         ("compiler", compiler_summary()),
         ("signature", binary_signature().to_string()),
-    ]
+    ];
+    // WHICH COPY runs (S12): a few stats and at most one small plist read per other
+    // copy — observed fresh on every open, so a copy installed since launch shows.
+    if let Some(copy) = aterm_update::which_copy::observe() {
+        fields.extend(which_copy_rows(&copy));
+    }
+    fields
+}
+
+/// The S12 About rows (`docs/DESIGN-which-copy-runs-2026-08-27.md`): `running` — the
+/// path of the running bundle (the executable off macOS) — and, when another
+/// `aterm.app` sits in one of the usual places, `another copy` carrying the one
+/// sentence `aterm --version` prints: `<path> (<version>) — not the one running; the
+/// updater updates only this one`. Both values are spelled by
+/// `aterm_update::which_copy`, so the two surfaces cannot drift. Several other copies
+/// share the one row, ` · `-separated — the metadata card wraps at exactly that.
+#[must_use]
+pub(crate) fn which_copy_rows(
+    copy: &aterm_update::which_copy::WhichCopy,
+) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("running", copy.running_detail())];
+    if !copy.others.is_empty() {
+        let others = copy
+            .others
+            .iter()
+            .map(|other| copy.other_detail(other))
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ");
+        rows.push(("another copy", others));
+    }
+    rows
 }
 
 /// The control-socket (`aterm-ctl version`) response line: a stable, greppable
@@ -321,6 +351,80 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&ATERM_UPDATE_PIN_RECORD),
             Ok(EMBEDDED_UPDATE_PIN_SHA256)
+        );
+    }
+
+    /// The S12 rows, pinned: `running` carries the running copy's path; `another copy`
+    /// appears only when there is one and carries THE sentence, verbatim — several
+    /// copies share the row at ` · ` (the card's wrap point).
+    #[test]
+    fn which_copy_rows_pin_the_s12_sentences() {
+        use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
+        let alone = WhichCopy {
+            running: std::path::PathBuf::from("/Applications/aterm.app"),
+            kind: Running::InstalledApp,
+            others: Vec::new(),
+        };
+        assert_eq!(
+            which_copy_rows(&alone),
+            vec![("running", "/Applications/aterm.app".to_string())]
+        );
+        let other = |path: &str, version: Option<&str>| OtherCopy {
+            path: std::path::PathBuf::from(path),
+            version: version.map(str::to_string),
+        };
+        let two = WhichCopy {
+            others: vec![
+                other("/Users//ana/Applications/aterm.app", Some("0.60.0")),
+                other("/opt/homebrew/Caskroom/aterm/0.59.0/aterm.app", None),
+            ],
+            ..alone.clone()
+        };
+        assert_eq!(
+            which_copy_rows(&two),
+            vec![
+                ("running", "/Applications/aterm.app".to_string()),
+                (
+                    "another copy",
+                    "/Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one running; \
+                     the updater updates only this one \u{00b7} \
+                     /opt/homebrew/Caskroom/aterm/0.59.0/aterm.app (version unknown) \u{2014} \
+                     not the one running; the updater updates only this one"
+                        .to_string()
+                ),
+            ]
+        );
+        // A bare binary (every test run) names its path and promises nothing.
+        let binary = WhichCopy {
+            running: std::path::PathBuf::from("/Users//ana/aterm/target/release/aterm"),
+            kind: Running::Binary,
+            others: vec![other("/Applications/aterm.app", Some("0.60.0"))],
+        };
+        assert_eq!(
+            which_copy_rows(&binary),
+            vec![
+                (
+                    "running",
+                    "/Users//ana/aterm/target/release/aterm".to_string()
+                ),
+                (
+                    "another copy",
+                    "/Applications/aterm.app (0.60.0) \u{2014} not the one running".to_string()
+                ),
+            ]
+        );
+        // And the live About carries the `running` row for THIS process.
+        let fields = about_fields();
+        let running = fields
+            .iter()
+            .filter(|(k, _)| *k == "running")
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(running.len(), 1, "exactly one running row: {fields:?}");
+        assert!(
+            std::path::Path::new(running[0]).is_absolute(),
+            "names a path: {}",
+            running[0]
         );
     }
 

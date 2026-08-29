@@ -29,13 +29,20 @@ aterm-hash = { workspace = true }
 aterm-log = { workspace = true }
 aterm-grapheme = { workspace = true }
 aterm-regex = { workspace = true, optional = true }
-memchr = { workspace = true }
 # Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
 # feature (the anchor macros emit `::aterm_spec::inventory::submit!`). Still a
 # dev-dependency below for aterm-search's own test build.
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
+# ORACLE ONLY — never in the shipped graph. The crate `src/bytesearch.rs`
+# replaces, kept so the four entry points that were used (`memchr`, `memchr2`,
+# `memmem::find`, `memmem::rfind`) are proved to give the same answers: the
+# differential run in that module is EXHAUSTIVE over every haystack and needle
+# up to a length bound in a two- and three-letter alphabet, which is where a
+# Two-Way bug would hide, plus the repository's own bytes.
+memchr = "2"
+criterion = "0.5"
 # The `#[cfg_attr(any(test, feature = "spec-anchors"), …)]` anchors expand in the
 # unit-test build, and the Tier-1 lockstep (tests/conformance_streaming.rs)
 # drives the derived StreamingSearch model + tiered transition validation.
@@ -54,3 +61,11 @@ aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+# The first bench over this crate. `src/bytesearch.rs` replaced `memchr`'s
+# vector scanners with a word-at-a-time implementation on a hot path, and this
+# is the number that says what that cost — measured at the public seam, so it
+# tracks the work the terminal actually does rather than a scanner microbench.
+[[bench]]
+name = "literal_scan"
+harness = false

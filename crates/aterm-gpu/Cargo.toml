@@ -81,7 +81,7 @@ criterion = "0.5"
 # `set_var`. Dependency-free leaf, already linked transitively.
 aterm-log = { workspace = true }
 # Inline-image (OSC 1337) parity tests: encode test PNGs + base64 payloads.
-png = "0.17"
+aterm-png = { workspace = true }
 aterm-codec = { workspace = true }
 # Test-only: enable the engine's `sixel` feature in aterm-gpu's TEST build so the
 # RawRgba8 CPU/GPU parity gate (tests/inline_image_parity.rs

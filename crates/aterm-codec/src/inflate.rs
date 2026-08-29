@@ -34,6 +34,11 @@ pub enum InflateError {
     BadChecksum,
 }
 
+/// Streaming decompression over `std::io::Read` — the archive-shaped half of
+/// this module. It drives the decoders below incrementally instead of over a
+/// whole slice; see the submodule for why an archive cannot use `inflate`.
+pub mod stream;
+
 const MAXBITS: usize = 15;
 
 // RFC 1951 §3.2.5 — length codes 257..285.
@@ -898,6 +903,23 @@ fn block_loop<const TABLE: bool>(
 /// Returns an [`InflateError`] for any malformed input or if the decompressed
 /// size would exceed `max_output` (decompression-bomb guard). Never panics.
 pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError> {
+    inflate_prefix(input, max_output).map(|(out, _)| out)
+}
+
+/// Decompress a raw DEFLATE (RFC 1951) stream, bounded by `max_output` bytes,
+/// reporting how many INPUT bytes the stream occupied.
+///
+/// A DEFLATE stream ends at its final block, not at the end of the buffer it
+/// was handed, and a caller that has to find something AFTER it — a zlib
+/// Adler-32 trailer, say — cannot recover that position from the output length.
+/// The count returned is the number of bytes the decoder touched: the final
+/// block may end mid-byte, and that partly-consumed byte counts, because
+/// whatever follows the stream starts at the next byte boundary.
+///
+/// # Errors
+/// Returns an [`InflateError`] for any malformed input or if the decompressed
+/// size would exceed `max_output` (decompression-bomb guard). Never panics.
+pub fn inflate_prefix(input: &[u8], max_output: usize) -> Result<(Vec<u8>, usize), InflateError> {
     let mut br = BitReader::new(input);
     let mut out: Vec<u8> = Vec::new();
     // The fixed-Huffman tables are pure constants, so build them at most once per
@@ -926,7 +948,13 @@ pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError>
             _ => return Err(InflateError::BadBlockType),
         }
         if bfinal == 1 {
-            return Ok(out);
+            // `byte_pos` counts bytes pulled INTO the accumulator, which runs
+            // ahead of what has been consumed by the whole bytes still sitting
+            // in it. A partly-consumed byte is consumed: the next thing in the
+            // buffer starts at the following byte boundary.
+            let unread_whole_bytes = (br.bits_in_buffer / 8) as usize;
+            let used = br.byte_pos.saturating_sub(unread_whole_bytes);
+            return Ok((out, used));
         }
     }
 }
@@ -996,6 +1024,52 @@ pub fn zlib_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>, Infla
     Ok(out)
 }
 
+/// Decompress a zlib (RFC 1950) stream that is a PREFIX of `input`, verifying
+/// the header and the trailing Adler-32 AT THE STREAM'S OWN END, and reporting
+/// how many bytes of `input` the stream occupied.
+///
+/// [`zlib_decompress`] takes the last four bytes of its input to be the
+/// Adler-32, which is right for a buffer holding exactly one stream and wrong
+/// for anything else. A PNG's concatenated `IDAT` payload is the case that
+/// forces the distinction: an encoder that pads the last `IDAT` leaves bytes
+/// after the stream, and reading the checksum from the end of the buffer then
+/// compares against padding and reports a perfectly good image as corrupt.
+///
+/// # Errors
+/// Returns an [`InflateError`] for a bad header, malformed DEFLATE data, a size
+/// over `max_output`, an input that ends before the checksum, or an Adler-32
+/// mismatch. Never panics.
+pub fn zlib_decompress_prefix(
+    input: &[u8],
+    max_output: usize,
+) -> Result<(Vec<u8>, usize), InflateError> {
+    // 2-byte header + at least an empty deflate stream + 4-byte Adler-32.
+    if input.len() < 6 {
+        return Err(InflateError::Truncated);
+    }
+    let cmf = input[0];
+    let flg = input[1];
+    if (cmf & 0x0f) != 8 {
+        return Err(InflateError::BadZlibHeader); // CM must be 8 (DEFLATE)
+    }
+    if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
+        return Err(InflateError::BadZlibHeader); // FCHECK
+    }
+    if (flg & 0x20) != 0 {
+        return Err(InflateError::BadZlibHeader); // preset dictionary unsupported
+    }
+    let (out, used) = inflate_prefix(&input[2..], max_output)?;
+    let end = used.saturating_add(2);
+    let trailer = input
+        .get(end..end.saturating_add(4))
+        .ok_or(InflateError::Truncated)?;
+    let expected = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    if adler32(&out) != expected {
+        return Err(InflateError::BadChecksum);
+    }
+    Ok((out, end.saturating_add(4)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,6 +1099,51 @@ mod tests {
         0x9e, 0xc9, 0x6e, 0xbf, 0x9f, 0xcd, 0xd8, 0x8c, 0xcd, 0xd8, 0x8c, 0xcd, 0xf8, 0x73, 0xc6,
         0x17, 0xc1, 0xd0, 0x5c, 0x27,
     ];
+
+    /// The prefix form finds the Adler-32 at the STREAM'S end, not the buffer's,
+    /// so bytes after the stream are simply not its problem — and it reports
+    /// exactly where the stream ended.
+    #[test]
+    fn prefix_form_tolerates_bytes_after_the_stream() {
+        for vector in [EMPTY, HELLO, STORED, BACKREFS, DYNAMIC] {
+            let (plain, used) = zlib_decompress_prefix(vector, 1 << 20).unwrap();
+            assert_eq!(used, vector.len(), "a bare stream consumes all of itself");
+            assert_eq!(plain, zlib_decompress(vector, 1 << 20).unwrap());
+            for pad in [1usize, 4, 64, 65, 1024] {
+                let mut padded = vector.to_vec();
+                padded.extend(std::iter::repeat_n(0xABu8, pad));
+                let (got, used) = zlib_decompress_prefix(&padded, 1 << 20)
+                    .unwrap_or_else(|e| panic!("{pad} bytes of padding: {e:?}"));
+                assert_eq!(got, plain, "{pad} bytes of padding changed the output");
+                assert_eq!(used, vector.len(), "{pad} bytes of padding moved the end");
+                // ...which is exactly what the whole-buffer form cannot do.
+                assert!(
+                    zlib_decompress(&padded, 1 << 20).is_err(),
+                    "the whole-buffer form is expected to read the padding as the checksum",
+                );
+            }
+        }
+    }
+
+    /// A corrupt checksum is still caught in the prefix form, and a stream that
+    /// ends before its own trailer is truncated, not silently accepted.
+    #[test]
+    fn prefix_form_still_checks_the_adler_and_the_length() {
+        let mut bad = HELLO.to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        assert_eq!(
+            zlib_decompress_prefix(&bad, 1 << 20),
+            Err(InflateError::BadChecksum),
+        );
+        // Everything but the last checksum byte: the stream parses, the trailer
+        // does not fit.
+        let short = &HELLO[..HELLO.len() - 1];
+        assert_eq!(
+            zlib_decompress_prefix(short, 1 << 20),
+            Err(InflateError::Truncated),
+        );
+    }
 
     #[test]
     fn empty_stream() {

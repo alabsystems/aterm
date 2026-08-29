@@ -74,6 +74,20 @@ const HAYSTACKS: &[&str] = &[
     "",
     " ",
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    // NEWLINE-BEARING. The corpus carried `(?m)^a`, `(?m)a$`, `(?m)^` and
+    // `(?m)$` from the start and not one haystack above holds a `\n`, so on
+    // every one of them `(?m)^` is indistinguishable from `^` and the multiline
+    // half of the corpus was agreeing about nothing. These are what tell
+    // `StartText` and `StartLine` apart — and what a scrollback export, a
+    // pasted diff or a bracketed-paste payload actually looks like.
+    "a\nb\nc",
+    "ERROR one\nERROR two\nok three",
+    "\nleading",
+    "trailing\n",
+    "\n",
+    "\n\n",
+    "one\r\ntwo\r\n",
+    "  indented\n\tTabbed\n",
 ];
 
 /// A pattern's `find_iter` spans, or `None` when it does not compile.
@@ -91,10 +105,9 @@ fn spans_oracle(p: &str, h: &str) -> Option<Vec<(usize, usize)>> {
 /// `is_match`.
 #[track_caller]
 fn agree(p: &str, h: &str) {
-    let mine = aterm_regex::Regex::new(p)
-        .unwrap_or_else(|e| panic!("this engine rejected {p:?}:\n{e}"));
-    let oracle = regex::Regex::new(p)
-        .unwrap_or_else(|e| panic!("the oracle rejected {p:?}: {e}"));
+    let mine =
+        aterm_regex::Regex::new(p).unwrap_or_else(|e| panic!("this engine rejected {p:?}:\n{e}"));
+    let oracle = regex::Regex::new(p).unwrap_or_else(|e| panic!("the oracle rejected {p:?}: {e}"));
     let a: Vec<(usize, usize)> = mine.find_iter(h).map(|m| (m.start(), m.end())).collect();
     let b: Vec<(usize, usize)> = oracle.find_iter(h).map(|m| (m.start(), m.end())).collect();
     assert_eq!(a, b, "find_iter disagreed for {p:?} on {h:?}");
@@ -111,7 +124,10 @@ fn agree(p: &str, h: &str) {
     // Every offset must land on a code-point boundary, or the call sites'
     // `&text[m.start()..m.end()]` would panic.
     for (start, end) in a {
-        assert!(h.is_char_boundary(start) && h.is_char_boundary(end), "{p:?} on {h:?}");
+        assert!(
+            h.is_char_boundary(start) && h.is_char_boundary(end),
+            "{p:?} on {h:?}"
+        );
     }
 }
 
@@ -138,14 +154,26 @@ fn builtin_patterns_select_what_they_are_for() {
             .find(h)
             .map(|m| m.as_str().to_string())
     };
-    let by_name = |n: &str| BUILTIN.iter().find(|&&(k, _)| k == n).expect("known rule").1;
+    let by_name = |n: &str| {
+        BUILTIN
+            .iter()
+            .find(|&&(k, _)| k == n)
+            .expect("known rule")
+            .1
+    };
 
     assert_eq!(
-        find(by_name("url"), "open https://example.com/a?b=c#d, then stop"),
+        find(
+            by_name("url"),
+            "open https://example.com/a?b=c#d, then stop"
+        ),
         Some("https://example.com/a?b=c#d".to_string())
     );
     assert_eq!(
-        find(by_name("file_path"), "at ../crates/aterm-regex/src/lib.rs line 3"),
+        find(
+            by_name("file_path"),
+            "at ../crates/aterm-regex/src/lib.rs line 3"
+        ),
         Some("../crates/aterm-regex/src/lib.rs".to_string())
     );
     assert_eq!(
@@ -161,7 +189,10 @@ fn builtin_patterns_select_what_they_are_for() {
         Some("127.0.0.1:8080".to_string())
     );
     assert_eq!(
-        find(by_name("ipv6"), "peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up"),
+        find(
+            by_name("ipv6"),
+            "peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up"
+        ),
         Some("2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_string())
     );
     assert_eq!(
@@ -186,40 +217,196 @@ fn builtin_patterns_select_what_they_are_for() {
 fn syntax_corpus_matches_the_oracle() {
     const PATTERNS: &[&str] = &[
         // Quantifiers, greedy and lazy.
-        r"a", r"a*", r"a+", r"a?", r"a*?", r"a+?", r"a??", r"a{2}", r"a{2,}", r"a{0,3}",
-        r"a{2,}?", r"a{0,3}?", r"a{0}", r"a**", r"a{2}{3}", r"(?U)a*", r"(?U)a*?",
+        r"a",
+        r"a*",
+        r"a+",
+        r"a?",
+        r"a*?",
+        r"a+?",
+        r"a??",
+        r"a{2}",
+        r"a{2,}",
+        r"a{0,3}",
+        r"a{2,}?",
+        r"a{0,3}?",
+        r"a{0}",
+        r"a**",
+        r"a{2}{3}",
+        r"(?U)a*",
+        r"(?U)a*?",
         // Alternation, including empty branches.
-        r"a|b", r"(a|b)c", r"(?:a|b)*", r"a|", r"|a", r"a||b", r"a|ab", r"(a|ab)c",
-        r"(|a)", r"(a|)", r"(|a)*", r"(a|)*", r"(|a)+", r"(a*)*", r"(a*)+", r"(?:)", r"()",
+        r"a|b",
+        r"(a|b)c",
+        r"(?:a|b)*",
+        r"a|",
+        r"|a",
+        r"a||b",
+        r"a|ab",
+        r"(a|ab)c",
+        r"(|a)",
+        r"(a|)",
+        r"(|a)*",
+        r"(a|)*",
+        r"(|a)+",
+        r"(a*)*",
+        r"(a*)+",
+        r"(?:)",
+        r"()",
         // Assertions.
-        r"^a", r"a$", r"^a$", r"^", r"$", r"^$", r"\ba\b", r"\Ba\B", r"\b", r"\B",
-        r"\Aa", r"a\z", r"\<a", r"a\>", r"\bx*\b", r"\b|a", r"(?m)^a", r"(?m)a$",
-        r"(?m)^", r"(?m)$",
+        r"^a",
+        r"a$",
+        r"^a$",
+        r"^",
+        r"$",
+        r"^$",
+        r"\ba\b",
+        r"\Ba\B",
+        r"\b",
+        r"\B",
+        r"\Aa",
+        r"a\z",
+        r"\<a",
+        r"a\>",
+        r"\bx*\b",
+        r"\b|a",
+        r"(?m)^a",
+        r"(?m)a$",
+        r"(?m)^",
+        r"(?m)$",
+        // START-ANCHOR ADVERSARIES. `Program::start_anchored` claims a pattern
+        // can only match at offset 0, and the search then declines to walk the
+        // rest of the haystack. Every one of these CONTAINS a `^` and is
+        // nonetheless NOT anchored — an alternation with a bare branch, a loop
+        // that can exit without entering, an optional group — so a walk that
+        // merely spotted the `^` and stopped would report a missed match here
+        // rather than a slow one.
+        r"a|^b",
+        r"^a|b",
+        r"(^a)*",
+        r"(^a)+",
+        r"(?:^a)?b",
+        r"(^|x)y",
+        r"^a|^b",
+        r"\A\Aa",
+        r"^a*",
+        r"(?:^)|a",
+        r"(?m:^)a",
+        r"(?:(?m)^)a",
         // Classes.
-        r"[abc]", r"[^abc]", r"[a-z]", r"[^a-z]", r"[a-zA-Z0-9._-]", r"[]a]", r"[a-]",
-        r"[^]a]", r"[\d]", r"[\D]", r"[\w\s]", r"[^\w]", r"[^\D]", r"[\x41-\x43]",
-        r"[[:alpha:]]", r"[[:^digit:]]", r"[[:punct:]]", r"[[:space:][:upper:]]",
-        r"[\\]", r"[\^]", r"[a^]", r"[.!?]", r"[^\s<>]", r"[\u{e0}-\u{ff}]",
+        r"[abc]",
+        r"[^abc]",
+        r"[a-z]",
+        r"[^a-z]",
+        r"[a-zA-Z0-9._-]",
+        r"[]a]",
+        r"[a-]",
+        r"[^]a]",
+        r"[\d]",
+        r"[\D]",
+        r"[\w\s]",
+        r"[^\w]",
+        r"[^\D]",
+        r"[\x41-\x43]",
+        r"[[:alpha:]]",
+        r"[[:^digit:]]",
+        r"[[:punct:]]",
+        r"[[:space:][:upper:]]",
+        r"[\\]",
+        r"[\^]",
+        r"[a^]",
+        r"[.!?]",
+        r"[^\s<>]",
+        r"[\u{e0}-\u{ff}]",
         // Perl classes and dot.
-        r"\d+", r"\w+", r"\s+", r"\W", r"\S", r"\D", r".", r".*", r"(?s).", r"(?s).*",
+        r"\d+",
+        r"\w+",
+        r"\s+",
+        r"\W",
+        r"\S",
+        r"\D",
+        r".",
+        r".*",
+        r"(?s).",
+        r"(?s).*",
         // Flags.
-        r"(?i)abc", r"(?i)[a-z]", r"(?i)[^k]", r"(?i)k", r"(?i)s", r"a(?i)b",
-        r"(a(?i)b)c", r"(?i:a)b", r"(?i-s:a)", r"(?x) a  b ", r"(?x)a#c", r"(?u)a",
+        r"(?i)abc",
+        r"(?i)[a-z]",
+        r"(?i)[^k]",
+        r"(?i)k",
+        r"(?i)s",
+        r"a(?i)b",
+        r"(a(?i)b)c",
+        r"(?i:a)b",
+        r"(?i-s:a)",
+        r"(?x) a  b ",
+        r"(?x)a#c",
+        r"(?u)a",
         // Escapes.
-        r"\.", r"\\", r"\-", r"\+", r"\t", r"\n", r"\x41", r"\x{1F600}", r"\u{4f60}",
-        r"\U{41}", r"e\u{301}", r"(?i)\u{3c3}", r"(?i)stra\u{df}e",
+        r"\.",
+        r"\\",
+        r"\-",
+        r"\+",
+        r"\t",
+        r"\n",
+        r"\x41",
+        r"\x{1F600}",
+        r"\u{4f60}",
+        r"\U{41}",
+        r"e\u{301}",
+        r"(?i)\u{3c3}",
+        r"(?i)stra\u{df}e",
         // Groups.
-        r"(?<name>a)b", r"(?P<other>a)b", r"((a))", r"(a)(b)",
+        r"(?<name>a)b",
+        r"(?P<other>a)b",
+        r"((a))",
+        r"(a)(b)",
         // Shapes that stress the simulation.
-        r"(a+)+b", r"(a|a)*b", r"(a*)*b", r"\bfoo\b|\bbar\b", r"^(?:a|ab)+$",
-        r"(?:ab|a)(?:c|bc)", r"x*y*z*", r"(?:a?){4}a{4}",
+        r"(a+)+b",
+        r"(a|a)*b",
+        r"(a*)*b",
+        r"\bfoo\b|\bbar\b",
+        r"^(?:a|ab)+$",
+        r"(?:ab|a)(?:c|bc)",
+        r"x*y*z*",
+        r"(?:a?){4}a{4}",
     ];
     const HAY: &[&str] = &[
-        "", "a", "aa", "aaa", "ab", "abc", "abcabc", "a b c", "  ", "\n", "a\nb", "\r\n",
-        "aab", "ba", "Hello World", "K\u{212a}k", "\u{3c3}\u{3c2}\u{3a3}", "\u{df}",
-        "e\u{301}x", "\u{4f60}\u{597d}", "42 and 0x2A", "_foo_bar", "a-b-c", "foo.bar",
-        "foo bar baz", "A", "z", "\u{661}\u{662}", "!?.", "\u{1F600}!", "stra\u{df}e",
-        "aaaaaaaaaaaaaaaaaaaaab", "xxxxx", "abababab", "<a> [b] (c)", "\u{e0}\u{ff}",
+        "",
+        "a",
+        "aa",
+        "aaa",
+        "ab",
+        "abc",
+        "abcabc",
+        "a b c",
+        "  ",
+        "\n",
+        "a\nb",
+        "\r\n",
+        "aab",
+        "ba",
+        "Hello World",
+        "K\u{212a}k",
+        "\u{3c3}\u{3c2}\u{3a3}",
+        "\u{df}",
+        "e\u{301}x",
+        "\u{4f60}\u{597d}",
+        "42 and 0x2A",
+        "_foo_bar",
+        "a-b-c",
+        "foo.bar",
+        "foo bar baz",
+        "A",
+        "z",
+        "\u{661}\u{662}",
+        "!?.",
+        "\u{1F600}!",
+        "stra\u{df}e",
+        "aaaaaaaaaaaaaaaaaaaaab",
+        "xxxxx",
+        "abababab",
+        "<a> [b] (c)",
+        "\u{e0}\u{ff}",
     ];
     for p in PATTERNS {
         for h in HAY {
@@ -247,7 +434,9 @@ fn perl_classes_match_the_oracle() {
     let mut buf = [0u8; 4];
     let mut word_skew = 0usize;
     for cp in 0u32..0x11_0000 {
-        let Some(c) = char::from_u32(cp) else { continue };
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
         let s: &str = c.encode_utf8(&mut buf);
         assert_eq!(mine_d.is_match(s), their_d.is_match(s), "\\d at U+{cp:04X}");
         assert_eq!(mine_s.is_match(s), their_s.is_match(s), "\\s at U+{cp:04X}");
@@ -261,7 +450,10 @@ fn perl_classes_match_the_oracle() {
     }
     // Non-zero and bounded: the skew is real, known, and small next to the
     // ~140k code points `\w` covers.
-    assert!(word_skew < 10_000, "unexpectedly large \\w skew: {word_skew}");
+    assert!(
+        word_skew < 10_000,
+        "unexpectedly large \\w skew: {word_skew}"
+    );
 }
 
 /// The `\w` skew reaches `\b`, and therefore a rule aterm actually ships.
@@ -287,7 +479,10 @@ fn the_word_class_skew_moves_word_boundaries_in_a_shipped_rule() {
         .find(|(name, _)| *name == "git_hash")
         .expect("the git_hash rule is part of the specification")
         .1;
-    assert!(git_hash.contains(r"\b"), "this test is about the \\b delimiters");
+    assert!(
+        git_hash.contains(r"\b"),
+        "this test is about the \\b delimiters"
+    );
 
     let mine = aterm_regex::Regex::new(git_hash).expect("compiles");
     let oracle = regex::Regex::new(git_hash).expect("compiles");
@@ -312,14 +507,29 @@ fn the_word_class_skew_moves_word_boundaries_in_a_shipped_rule() {
     let probe_oracle = regex::Regex::new(r"^\w$").expect("compiles");
     let sep_str: &str = sep.encode_utf8(&mut buf);
     if probe_mine.is_match(sep_str) && !probe_oracle.is_match(sep_str) {
-        assert!(sep.is_alphabetic(), "the divergence rests on `std` calling U+088F alphabetic");
+        assert!(
+            sep.is_alphabetic(),
+            "the divergence rests on `std` calling U+088F alphabetic"
+        );
         let haystack = format!("deadbeef{sep}");
-        let ours: Vec<(usize, usize)> =
-            mine.find_iter(&haystack).map(|m| (m.start(), m.end())).collect();
-        let theirs: Vec<(usize, usize)> =
-            oracle.find_iter(&haystack).map(|m| (m.start(), m.end())).collect();
-        assert_eq!(theirs, vec![(0, 8)], "the retired crate selected the hash here");
-        assert_eq!(ours, Vec::new(), "and this engine does not, because U+088F is a \\w");
+        let ours: Vec<(usize, usize)> = mine
+            .find_iter(&haystack)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        let theirs: Vec<(usize, usize)> = oracle
+            .find_iter(&haystack)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(
+            theirs,
+            vec![(0, 8)],
+            "the retired crate selected the hash here"
+        );
+        assert_eq!(
+            ours,
+            Vec::new(),
+            "and this engine does not, because U+088F is a \\w"
+        );
     }
 
     // The direction is fixed: the skew only ever *removes* a selection, because
@@ -327,7 +537,9 @@ fn the_word_class_skew_moves_word_boundaries_in_a_shipped_rule() {
     // be a different bug wearing this one's clothes.
     let mut suppressed = 0usize;
     for cp in 0u32..0x11_0000 {
-        let Some(c) = char::from_u32(cp) else { continue };
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
         if !c.is_alphabetic() || c.is_ascii() {
             continue;
         }
@@ -352,7 +564,10 @@ fn the_word_class_skew_moves_word_boundaries_in_a_shipped_rule() {
          toolchain's, so the divergence note in lib.rs is now false and this test \
          has nothing to pin — update both together"
     );
-    assert!(suppressed < 10_000, "unexpectedly large boundary skew: {suppressed}");
+    assert!(
+        suppressed < 10_000,
+        "unexpectedly large boundary skew: {suppressed}"
+    );
 
     // The rules with no `\b` are untouched, which is what confines the blast
     // radius to word-boundary rules rather than to selection generally.
@@ -428,7 +643,9 @@ fn case_folding_matches_the_oracle() {
     let mut upper_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
     let mut cased: Vec<char> = Vec::new();
     for cp in 0u32..0x11_0000 {
-        let Some(c) = char::from_u32(cp) else { continue };
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
         let lo = c.to_lowercase().next().expect("non-empty mapping");
         let up = c.to_uppercase().next().expect("non-empty mapping");
         lower_bucket.entry(lo).or_default().push(c);
@@ -454,12 +671,15 @@ fn case_folding_matches_the_oracle() {
     for &c in &cased {
         let cp = c as u32;
         let escaped = regex::escape(&c.to_string());
-        let Ok(oracle) = regex::Regex::new(&format!("(?i){escaped}")) else { continue };
-        let Ok(oracle_class) = regex::Regex::new(&format!("(?i)[{escaped}]")) else { continue };
+        let Ok(oracle) = regex::Regex::new(&format!("(?i){escaped}")) else {
+            continue;
+        };
+        let Ok(oracle_class) = regex::Regex::new(&format!("(?i)[{escaped}]")) else {
+            continue;
+        };
         let mine_src = aterm_regex::escape(&c.to_string());
         let mine = aterm_regex::Regex::new(&format!("(?i){mine_src}")).expect("compiles");
-        let mine_class =
-            aterm_regex::Regex::new(&format!("(?i)[{mine_src}]")).expect("compiles");
+        let mine_class = aterm_regex::Regex::new(&format!("(?i)[{mine_src}]")).expect("compiles");
 
         let mut candidates: BTreeSet<char> = ('a'..='z').chain('A'..='Z').collect();
         candidates.insert(c);
@@ -516,7 +736,10 @@ fn case_folding_matches_the_oracle() {
         }
         checked += 1;
     }
-    assert!(checked > 2_000, "expected the whole cased range, checked {checked}");
+    assert!(
+        checked > 2_000,
+        "expected the whole cased range, checked {checked}"
+    );
     // Non-zero and bounded, exactly as `perl_classes_match_the_oracle` bounds
     // the `\w` skew: real, known, and small.
     assert!(skew < 5_000, "unexpectedly large case-fold skew: {skew}");
@@ -546,10 +769,22 @@ fn exotic_fold_orbits_match_the_oracle() {
 /// ones the oracle would.
 #[test]
 fn zero_width_matches_match_the_oracle() {
-    for p in [r"", r"x*", r"a*", r"\b", r"\B", r"^", r"$", r"(?m)^", r"(?m)$", r"()",
-              r"(?:)", r"a{0}", r"\bx*\b", r"(|a)*", r"\b|a", r"a*?", r"(?:a|)*"] {
-        for h in ["", "a", "aa", "aab", "hello", "ab cd", "a\nb", "\u{4f60}\u{597d}",
-                  "a\u{301}b c", "  x  "] {
+    for p in [
+        r"", r"x*", r"a*", r"\b", r"\B", r"^", r"$", r"(?m)^", r"(?m)$", r"()", r"(?:)", r"a{0}",
+        r"\bx*\b", r"(|a)*", r"\b|a", r"a*?", r"(?:a|)*",
+    ] {
+        for h in [
+            "",
+            "a",
+            "aa",
+            "aab",
+            "hello",
+            "ab cd",
+            "a\nb",
+            "\u{4f60}\u{597d}",
+            "a\u{301}b c",
+            "  x  ",
+        ] {
             agree(p, h);
         }
     }
@@ -563,18 +798,69 @@ fn zero_width_matches_match_the_oracle() {
 #[test]
 fn nullable_and_lazy_repetitions_match_the_oracle() {
     const PATTERNS: &[&str] = &[
-        r"(|a)*", r"(a|)*", r"(|a)+", r"(a|)+", r"(|a){2,}", r"(|a){0,3}", r"(|a){2}",
-        r"(?:)*", r"()*", r"()+", r"(?:a?)*", r"(?:a*)*", r"(?:a*)+", r"(?:a*?)*",
-        r"(a*)*b", r"(a*)+b", r"((a*)*)*b", r"(?:a*|b*)*c",
-        r"(.*?){2,}\b", r"(.*?){2,}", r"(.*?)*\b", r"(.*?)+\b", r"(.*?){1,3}\b",
-        r"(?U:.*){2,}\b", r"(?U:.*)*\b", r"(?U:a*)+b", r"(.*?b)*c", r"([^b]*?b)*c",
-        r"(\b)*a", r"(\b|a)*", r"(^)*a", r"(a|\b)*b", r"(?:\b)+",
-        r"(x*?){2,}y", r"(x*){2,}y", r"(x+?){2,}y", r"(x??){3,}y",
+        r"(|a)*",
+        r"(a|)*",
+        r"(|a)+",
+        r"(a|)+",
+        r"(|a){2,}",
+        r"(|a){0,3}",
+        r"(|a){2}",
+        r"(?:)*",
+        r"()*",
+        r"()+",
+        r"(?:a?)*",
+        r"(?:a*)*",
+        r"(?:a*)+",
+        r"(?:a*?)*",
+        r"(a*)*b",
+        r"(a*)+b",
+        r"((a*)*)*b",
+        r"(?:a*|b*)*c",
+        r"(.*?){2,}\b",
+        r"(.*?){2,}",
+        r"(.*?)*\b",
+        r"(.*?)+\b",
+        r"(.*?){1,3}\b",
+        r"(?U:.*){2,}\b",
+        r"(?U:.*)*\b",
+        r"(?U:a*)+b",
+        r"(.*?b)*c",
+        r"([^b]*?b)*c",
+        r"(\b)*a",
+        r"(\b|a)*",
+        r"(^)*a",
+        r"(a|\b)*b",
+        r"(?:\b)+",
+        r"(x*?){2,}y",
+        r"(x*){2,}y",
+        r"(x+?){2,}y",
+        r"(x??){3,}y",
     ];
     const HAY: &[&str] = &[
-        "", " ", "a", "aa", "aaa", "ab", " ab", "ab ", "aab", "b", "bb", "abc",
-        "xxy", "xy", "y", " a b ", "a\nb", "\u{4f60}b\u{4f60}", "aa\u{e9}b\u{e9}",
-        "K0\u{4f60}b\u{4f60}", "aab\u{e9}b", "c", "aaac", "abababc",
+        "",
+        " ",
+        "a",
+        "aa",
+        "aaa",
+        "ab",
+        " ab",
+        "ab ",
+        "aab",
+        "b",
+        "bb",
+        "abc",
+        "xxy",
+        "xy",
+        "y",
+        " a b ",
+        "a\nb",
+        "\u{4f60}b\u{4f60}",
+        "aa\u{e9}b\u{e9}",
+        "K0\u{4f60}b\u{4f60}",
+        "aab\u{e9}b",
+        "c",
+        "aaac",
+        "abababc",
     ];
     for p in PATTERNS {
         for h in HAY {
@@ -593,19 +879,66 @@ fn nullable_and_lazy_repetitions_match_the_oracle() {
 #[test]
 fn extended_mode_matches_the_oracle() {
     const PATTERNS: &[&str] = &[
-        r"(?x)a b c", r"(?x) a  b ", r"(?x)a#comment", "(?x)a#comment\nb",
-        r"(?x)a? ?", r"(?x)a* ?", r"(?x)a+ ?", r"(?x)a{1,2} ?", r"(?x)a{2,} ?",
-        r"(?x)a{1} ?", r"(?x)a?  ?", "(?x)a?\n?", r"(?x)a??", r"(?x)a*?",
-        r"(?x)( ?:a)b", r"(?x)( ?i)abc", r"(?x)(  ?:a|b)", r"(?x)( ?<n>a)b",
-        r"(?x)( ?P<n>a)b", "(?x)( #c\n?:a)b", r"(?x)[ ^a]", r"(?x)[ ]]",
-        "(?x)[ #c\n^a]", r"(?x)[a b]", r"(?x)[a-  z]", r"(?x)a\ b", r"(?x)a{ 1 , 2 }",
-        r"(?x)(a | b)+", r"(?x)a |b", r"(?x)\d {2}", r"(?x)x{2} ?",
-        r"(?x:a b)c", r"a(?x:b c)d", r"(?x)(?-x:a b)", r"(?x)a(?-x)b c",
-        r"(?x)\S{0,2}? \w", r"(?x) \b a \b ",
+        r"(?x)a b c",
+        r"(?x) a  b ",
+        r"(?x)a#comment",
+        "(?x)a#comment\nb",
+        r"(?x)a? ?",
+        r"(?x)a* ?",
+        r"(?x)a+ ?",
+        r"(?x)a{1,2} ?",
+        r"(?x)a{2,} ?",
+        r"(?x)a{1} ?",
+        r"(?x)a?  ?",
+        "(?x)a?\n?",
+        r"(?x)a??",
+        r"(?x)a*?",
+        r"(?x)( ?:a)b",
+        r"(?x)( ?i)abc",
+        r"(?x)(  ?:a|b)",
+        r"(?x)( ?<n>a)b",
+        r"(?x)( ?P<n>a)b",
+        "(?x)( #c\n?:a)b",
+        r"(?x)[ ^a]",
+        r"(?x)[ ]]",
+        "(?x)[ #c\n^a]",
+        r"(?x)[a b]",
+        r"(?x)[a-  z]",
+        r"(?x)a\ b",
+        r"(?x)a{ 1 , 2 }",
+        r"(?x)(a | b)+",
+        r"(?x)a |b",
+        r"(?x)\d {2}",
+        r"(?x)x{2} ?",
+        r"(?x:a b)c",
+        r"a(?x:b c)d",
+        r"(?x)(?-x:a b)",
+        r"(?x)a(?-x)b c",
+        r"(?x)\S{0,2}? \w",
+        r"(?x) \b a \b ",
     ];
     const HAY: &[&str] = &[
-        "", " ", "a", "aa", "ab", "abc", "a b c", "abcabc", "^a ", "]", "b", "aab",
-        "A", "ABC", "12", "xx", "a#b", "a\nb", "\u{4f60} a", "  a  b  ", "za bz",
+        "",
+        " ",
+        "a",
+        "aa",
+        "ab",
+        "abc",
+        "a b c",
+        "abcabc",
+        "^a ",
+        "]",
+        "b",
+        "aab",
+        "A",
+        "ABC",
+        "12",
+        "xx",
+        "a#b",
+        "a\nb",
+        "\u{4f60} a",
+        "  a  b  ",
+        "za bz",
     ];
     for p in PATTERNS {
         for h in HAY {
@@ -622,21 +955,53 @@ fn extended_mode_matches_the_oracle() {
 #[test]
 fn the_prefilter_never_changes_the_answer() {
     const PATTERNS: &[&str] = &[
-        r"zebra", r"\bzebra\b", r"^zebra", r"[z]ebra", r"z|Q", r"(?i)ZEBRA",
-        r"\u{4f60}z", r"\d+z", r"[^\s]z", r"\bz", r"\<z", r"(?m)^z", r"\bz+\b",
-        r"[a-z\u{4f60}]+", r"(?i)[k]\u{e9}", r"\u{1F600}+",
+        r"zebra",
+        r"\bzebra\b",
+        r"^zebra",
+        r"[z]ebra",
+        r"z|Q",
+        r"(?i)ZEBRA",
+        r"\u{4f60}z",
+        r"\d+z",
+        r"[^\s]z",
+        r"\bz",
+        r"\<z",
+        r"(?m)^z",
+        r"\bz+\b",
+        r"[a-z\u{4f60}]+",
+        r"(?i)[k]\u{e9}",
+        r"\u{1F600}+",
         // A failing assertion *mid*-pattern empties the thread list without
         // emptying its visited marks, and the next skip has to retire them.
-        r"ab\Bc", r"x\B\d", r"\-?\B\d", r"z\b\d", r"a\bz|q", r"[a-c]\B[0-9]",
-        r"\u{4f60}\Bz", r"q\B\u{4f60}", r"(?:ab|az)\Bc",
+        r"ab\Bc",
+        r"x\B\d",
+        r"\-?\B\d",
+        r"z\b\d",
+        r"a\bz|q",
+        r"[a-c]\B[0-9]",
+        r"\u{4f60}\Bz",
+        r"q\B\u{4f60}",
+        r"(?:ab|az)\Bc",
     ];
     let filler = "\u{4f60}\u{597d}\u{e9}\u{1F600}e\u{301}";
     for pattern in PATTERNS {
         for pad in 0..12usize {
             let prefix: String = filler.chars().cycle().take(pad).collect();
-            for body in ["zebra", "\u{4f60}zebra", "Qx", "nothing here", "", "zz z",
-                         "K\u{e9}", "\u{1F600}\u{1F600}", "abxabc", "xy x1",
-                         "\u{e9}-bx\u{4f60}0\u{4f60}", "ab qz", "az0 ab1"] {
+            for body in [
+                "zebra",
+                "\u{4f60}zebra",
+                "Qx",
+                "nothing here",
+                "",
+                "zz z",
+                "K\u{e9}",
+                "\u{1F600}\u{1F600}",
+                "abxabc",
+                "xy x1",
+                "\u{e9}-bx\u{4f60}0\u{4f60}",
+                "ab qz",
+                "az0 ab1",
+            ] {
                 agree(pattern, &format!("{prefix}{body}{prefix}"));
             }
         }
@@ -677,12 +1042,45 @@ fn refusals_are_refusals_and_the_oracle_accepts_them() {
 #[test]
 fn malformed_patterns_are_rejected_by_both() {
     for pattern in [
-        r"(unclosed", r"a)", r"[a", r"[z-a]", r"a{2,1}", r"a{,3}", r"a{", r"a{}",
-        r"a{b}", r"*a", r"+a", r"?a", r"{2}", r"\", r"\q", r"[\q]", r"[\b]", r"\1",
-        r"(?=a)", r"(?!a)", r"(?<=a)", r"(?<!a)", r"(?z)", r"(?i-i)", r"[]",
-        r"[^]", r"\x{110000}", r"\uD800", r"[\d-a]", r"[a-\d]", r"\Q..\E", r"\Z",
-        r"(?P=n)", r"(?<n>a)(?<n>b)", r"(?<n >a)", r"(?<n-x>a)", r"(?<1n>a)",
-        r"(?<>a)", r"(?P<n >a)",
+        r"(unclosed",
+        r"a)",
+        r"[a",
+        r"[z-a]",
+        r"a{2,1}",
+        r"a{,3}",
+        r"a{",
+        r"a{}",
+        r"a{b}",
+        r"*a",
+        r"+a",
+        r"?a",
+        r"{2}",
+        r"\",
+        r"\q",
+        r"[\q]",
+        r"[\b]",
+        r"\1",
+        r"(?=a)",
+        r"(?!a)",
+        r"(?<=a)",
+        r"(?<!a)",
+        r"(?z)",
+        r"(?i-i)",
+        r"[]",
+        r"[^]",
+        r"\x{110000}",
+        r"\uD800",
+        r"[\d-a]",
+        r"[a-\d]",
+        r"\Q..\E",
+        r"\Z",
+        r"(?P=n)",
+        r"(?<n>a)(?<n>b)",
+        r"(?<n >a)",
+        r"(?<n-x>a)",
+        r"(?<1n>a)",
+        r"(?<>a)",
+        r"(?P<n >a)",
     ] {
         assert!(
             regex::Regex::new(pattern).is_err(),
@@ -752,15 +1150,18 @@ fn this_engine_finds_the_leftmost_start_whichever_oracle_vintage_resolves() {
         let mine = aterm_regex::Regex::new(pattern).expect("compiles");
         let oracle = regex::Regex::new(pattern).expect("compiles");
         let got = mine.find(haystack).map(|m| (m.start(), m.end()));
-        assert_eq!(got, Some(correct), "this engine must find the leftmost match");
+        assert_eq!(
+            got,
+            Some(correct),
+            "this engine must find the leftmost match"
+        );
 
         // The oracle contradicting itself is the proof, not our own say-so:
         // anchored, it agrees the match starts where we say it does. The prefix
         // flag is scoped so it cannot rewrite `{pattern}`'s own `.` — these
         // patterns are all built from `.`, so an unscoped `(?s)` would be
         // arbitrating a different pattern than the one under test.
-        let arbiter = regex::Regex::new(&format!(r"\A(?s:(?:.)*?)({pattern})"))
-            .expect("compiles");
+        let arbiter = regex::Regex::new(&format!(r"\A(?s:(?:.)*?)({pattern})")).expect("compiles");
         let span = arbiter
             .captures(haystack)
             .and_then(|c| c.get(1))
@@ -787,8 +1188,25 @@ fn this_engine_finds_the_leftmost_start_whichever_oracle_vintage_resolves() {
 fn escape_round_trips() {
     let mut seen = BTreeSet::new();
     for s in [
-        r"a.b", r"a*b", r"[x]", r"(y)", r"a|b", r"a\b", r"^$", r"{2}", r"a-b", r"a&b",
-        r"a~b", r"#c", r"+?", r"a<b>c", "\u{4f60}.*", "e\u{301}", "", " ", r"\\",
+        r"a.b",
+        r"a*b",
+        r"[x]",
+        r"(y)",
+        r"a|b",
+        r"a\b",
+        r"^$",
+        r"{2}",
+        r"a-b",
+        r"a&b",
+        r"a~b",
+        r"#c",
+        r"+?",
+        r"a<b>c",
+        "\u{4f60}.*",
+        "e\u{301}",
+        "",
+        " ",
+        r"\\",
     ] {
         let escaped = aterm_regex::escape(s);
         seen.insert(escaped.clone());

@@ -789,6 +789,7 @@ fn to_render_cell(cell: ExternalRainCell, default_bg: [u8; 3]) -> RenderCell {
         strikethrough: cell.flags & EXTERNAL_CELL_STRIKETHROUGH != 0,
         overline: cell.flags & EXTERNAL_CELL_OVERLINE != 0,
         underline_color: None,
+        overline_color: None,
     }
 }
 

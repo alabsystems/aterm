@@ -84,8 +84,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
 /// The highest roster `schema` this build understands. A roster declaring a higher schema
@@ -192,8 +190,7 @@ fn verify_under(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), RosterRe
     if pubkey_b64.is_empty() {
         return Err(RosterReject::Disabled);
     }
-    let pk = STANDARD
-        .decode(pubkey_b64)
+    let pk = aterm_codec::base64::decode_strict(pubkey_b64.as_bytes())
         .map_err(|_| RosterReject::BadKey)?;
     if pk.len() != 32 {
         return Err(RosterReject::BadKey);
@@ -338,7 +335,7 @@ impl Roster {
     /// merely tested: there is no way to call this on unverified bytes.
     pub fn parse(verified: &VerifiedRoster) -> Result<Self, RosterReject> {
         let text = std::str::from_utf8(verified.as_slice()).map_err(|_| RosterReject::Malformed)?;
-        let roster: Roster = toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
+        let roster: Roster = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
         // Reject-newer BEFORE any semantic use of the fields: a newer schema may mean
         // something different by them.
         if roster.schema > SUPPORTED_SCHEMA {
@@ -616,7 +613,7 @@ impl Roster {
     /// signed, and published only to be rejected by every client in the field.
     pub fn to_toml(&self) -> Result<String, RosterReject> {
         self.validate()?;
-        toml::to_string(self).map_err(|_| RosterReject::Malformed)
+        aterm_toml::to_string(self).map_err(|_| RosterReject::Malformed)
     }
 }
 
@@ -641,7 +638,7 @@ mod tests {
     }
 
     fn pk(kp: &Ed25519KeyPair) -> String {
-        STANDARD.encode(kp.public_key().as_ref())
+        aterm_codec::base64::encode(kp.public_key().as_ref()).expect("32-byte key")
     }
 
     fn sign(kp: &Ed25519KeyPair, msg: &[u8]) -> Vec<u8> {

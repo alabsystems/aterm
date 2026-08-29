@@ -12,13 +12,140 @@ use crate::App;
 use crate::native_app::UpdateOutcome;
 use crate::update_screen::{UpdateHit, UpdateState};
 
+/// Serializes the tests that both WRITE and READ the process-wide scratch update
+/// ledger.
+///
+/// `App::headless_for_test` points `ATERM_UPDATE_ROOT` at ONE scratch root per test
+/// process (so the unit suite cannot write the developer's real `health.toml`), and
+/// the ledger's standing slots — `last_apply_failure_target_build` above all — are
+/// single-valued. A test that records a failure for its own build number and then
+/// asks the reducer to read it back is therefore racing every sibling that records
+/// one for a different build: observed, not theorised, on the first parallel run.
+/// The build numbers below are already unique per test, which keeps the COUNTS
+/// independent; this keeps the standing slots independent too.
+///
+/// Poison is absorbed deliberately: a panicking test has already failed, and letting
+/// it convert every later ledger test into a second failure only hides the first.
+#[cfg(test)]
+pub(crate) static UPDATE_LEDGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`UPDATE_LEDGER_TEST_LOCK`] for the rest of the calling test.
+#[cfg(test)]
+pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()> {
+    UPDATE_LEDGER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl App {
     /// Snapshot the current process-owned updater reducer into a fresh [`UpdateState`].
     /// This is memory-only: ledger and installed-bundle facts enter the reducer solely
     /// through typed worker completions, so Settings/introspection never block input.
     /// `checking` marks a manual check as in flight.
     pub(crate) fn update_snapshot(&self, checking: bool) -> UpdateState {
-        UpdateState::from_service(self.native_updater_service.snapshot(), checking)
+        let snapshot = self.native_updater_service.snapshot();
+        // The retry disposition is EVENT-LOOP state, so only the host can answer it —
+        // and the answer is half of what a person needs from a failed apply ("wait" vs
+        // "press this").
+        let retry = self.apply_retry_for(snapshot.staged.as_ref().map(|staged| staged.build));
+        UpdateState::from_service(snapshot, checking, retry)
+    }
+
+    /// Whether the automatic apply lane still INTENDS this exact staged build — the
+    /// difference between "leave it alone and it will land" and "this will not move
+    /// until you ask for it".
+    ///
+    /// ASK EVERY CARRIER OF THE ANSWER, NOT ONE. There are two — a live
+    /// `auto_apply_intent` (a failure does not necessarily consume it; a
+    /// control-request apply, for one, leaves it armed) and an `AutoApplyManualOnly`
+    /// latch that still carries a lapse deadline — and either one means the loop will
+    /// come back to this artifact.
+    ///
+    /// THEY DO NOT COME BACK THE SAME WAY, which is why the wording this feeds says
+    /// "by itself" and not "a retry is armed". Only the intent's `retry_at` is folded
+    /// into the loop's own deadline (`fold_auto_apply_deadline`); the latch is
+    /// released by `lapse_expired_auto_apply_manual_only` at the top of
+    /// `arm_native_auto_apply`, so on a genuinely idle machine it waits for the next
+    /// background check rather than for its own deadline. Both do land unaided; only
+    /// one of them is armed to the second. Both must name THIS build, because a leftover for
+    /// a superseded artifact schedules nothing for the one on screen, and automatic
+    /// apply has to actually be enabled in config or a lapse would only re-arm into a
+    /// poll that answers `Clear`.
+    ///
+    /// Extracted from the failure-pill decision in
+    /// [`Self::react_to_update_apply_outcome`] so the STANDING surfaces (the Version
+    /// menu, the palette's Version row, the Settings page) answer the question the
+    /// same way the transient pill does. Two answers to "will this retry?" in one
+    /// program is how a user ends up waiting on something that stopped.
+    pub(crate) fn automatic_apply_retry_scheduled(&self, staged_build: u64) -> bool {
+        crate::app_config::update_auto_apply(&self.config)
+            && (self
+                .auto_apply_intent
+                .is_some_and(|intent| intent.build == staged_build)
+                || self.auto_apply_manual_only.is_some_and(|manual| {
+                    manual.build == staged_build && manual.retry_at.is_some()
+                }))
+    }
+
+    /// [`Self::automatic_apply_retry_scheduled`] as the typed value the wording law
+    /// reads. `None` — no build on offer — answers `ManualOnly`, the conservative
+    /// half: promising a retry that is not scheduled is the one error that costs the
+    /// reader real time.
+    pub(crate) fn apply_retry_for(
+        &self,
+        staged_build: Option<u64>,
+    ) -> crate::update_apply_trouble::ApplyRetry {
+        use crate::update_apply_trouble::ApplyRetry;
+        match staged_build {
+            Some(build) if self.automatic_apply_retry_scheduled(build) => ApplyRetry::Scheduled,
+            _ => ApplyRetry::ManualOnly,
+        }
+    }
+
+    /// The apply lane's standing trouble for the build a surface is offering, or
+    /// `None` when there is none to report.
+    ///
+    /// Memory-only, like every other read a repaint may take: the failure COUNT and
+    /// the failure REASON both arrive through the updater reducer's typed worker
+    /// completions ([`crate::native_updater_service::UpdaterSnapshot`]), and the
+    /// retry disposition is event-loop state. Nothing here touches the ledger.
+    ///
+    /// `staged_build` is passed in rather than read from the snapshot so the caller's
+    /// own notion of "the build being offered" (the `relaunch` nudge drives the menu
+    /// and the palette; the reducer's stage drives Settings) is the one the trouble
+    /// describes. A streak belonging to a superseded artifact must not decorate a
+    /// fresh offer.
+    ///
+    /// THE LEDGER HAS TO NAME THE ARTIFACT, and that is why it now does. The apply
+    /// streak `failing_applies` carries is expiry-bound to the RUNNING build — it
+    /// means "this machine cannot be moved through the lane" — so staging a NEWER
+    /// artifact resets nothing at all: stage X failing twice, superseded by a fresh
+    /// download Y, left every surface telling the reader that Y had already been
+    /// tried twice and had watched its successor die, while the automatic lane had
+    /// just armed a clean first attempt for it. `apply_failure_build` /
+    /// `apply_failures_for_target` are the artifact-scoped pair; nothing is reported
+    /// unless they name the build on offer.
+    pub(crate) fn apply_trouble_for(
+        &self,
+        staged_build: u64,
+    ) -> Option<crate::update_apply_trouble::ApplyTrouble> {
+        use crate::update_apply_trouble::ApplyTrouble;
+        let snapshot = self.native_updater_service.snapshot();
+        // Only a genuinely newer artifact is on offer at all…
+        if staged_build <= snapshot.current_build {
+            return None;
+        }
+        // …and only the artifact the failures were actually about may wear them. A
+        // zero target is a ledger that predates this field, or an attempt with no
+        // stage behind it (the QA seam): unknown, therefore silent.
+        if snapshot.apply_failure_build != staged_build {
+            return None;
+        }
+        ApplyTrouble::new(
+            snapshot.apply_failures_for_target,
+            &snapshot.apply_failure,
+            self.apply_retry_for(Some(staged_build)),
+        )
     }
 
     /// Canonical human "Check for Updates…" gesture: reveal the durable Settings
@@ -201,11 +328,33 @@ impl App {
     /// since a successful in-session apply execs away and never returns to clear
     /// it. Which outcome is which — and why nothing here can record a SUCCESS —
     /// is [`apply_ledger_verdict`].
+    ///
+    /// A FAILURE ALSO REPUBLISHES, because the write is the only moment the window
+    /// can learn about it in time — see the comment on the `Failed` arm.
     fn record_apply_outcome_in_ledger(&mut self, outcome: &crate::native_app::UpdateOutcome) {
-        let current_build = self.native_updater_service.snapshot().current_build;
+        let snapshot = self.native_updater_service.snapshot();
+        let current_build = snapshot.current_build;
+        // WHICH ARTIFACT THE ATTEMPT WAS FOR. Every failure path re-arms the exact
+        // stage before returning here (`abort_apply` leaves `staged` in place), so
+        // the reducer's stage IS the target. `0` — the debug seam, or a stage already
+        // consumed — is recorded honestly as "unknown", and a surface that cannot
+        // match the target simply reports no trouble.
+        let target_build = snapshot.staged.as_ref().map_or(0, |staged| staged.build);
         match apply_ledger_verdict(outcome) {
             ApplyLedgerVerdict::Failed(message) => {
-                aterm_update::record_apply_failure(current_build, &message);
+                // FEED THE REDUCER AT THE WRITE. The facts that used to carry a
+                // failure back to the window are gathered by a worker that has
+                // already run by the time this executes, so the FIRST failed apply
+                // — the case this surface exists for — reached the Version menu and
+                // the palette only when some later, unrelated reconcile landed.
+                // `record_apply_failure` hands back what it just wrote, under the
+                // same lock, so the surfaces move now.
+                if let Some(recorded) =
+                    aterm_update::record_apply_failure(current_build, target_build, &message)
+                    && self.native_updater_service.note_apply_failure(&recorded)
+                {
+                    self.publish_native_update_state();
+                }
             }
             ApplyLedgerVerdict::Refused(reason) => {
                 aterm_update::record_apply_refusal(current_build, &reason);
@@ -297,13 +446,7 @@ impl App {
                     // superseded build schedules nothing for the one on screen,
                     // and automatic apply must actually be enabled or the lapse
                     // would re-arm into a poll that answers `Clear`.
-                    let retry_scheduled = crate::app_config::update_auto_apply(&self.config)
-                        && (self
-                            .auto_apply_intent
-                            .is_some_and(|intent| intent.build == staged_build)
-                            || self.auto_apply_manual_only.is_some_and(|manual| {
-                                manual.build == staged_build && manual.retry_at.is_some()
-                            }));
+                    let retry_scheduled = self.automatic_apply_retry_scheduled(staged_build);
                     if retry_scheduled {
                         // …AND A SCHEDULED RETRY IS NOT AUTOMATICALLY WORTH A PILL.
                         // The physical lane may spend nine attempts before it gives
@@ -394,9 +537,18 @@ impl App {
                 && self
                     .upgrade_realized
                     .is_some_and(|t| t.elapsed() < crate::relaunch_notice::REALIZED_ARROW_TTL);
+            // The always-visible offer carries the apply lane's verdict on ITSELF. A
+            // Version menu that says "restart now" while the engine has already tried
+            // and failed is the surface that made the 2026-08-21 field state
+            // unreadable; the row now says how many attempts died, why, and whether
+            // anything is still scheduled.
+            let trouble = staged
+                .as_ref()
+                .and_then(|(build, _)| self.apply_trouble_for(*build));
             crate::menu::update_version_menu(
                 handle,
                 staged.as_ref().map(|(b, v)| (*b, v.as_str())),
+                trouble.as_ref(),
                 realized,
             );
         }
@@ -443,6 +595,7 @@ impl App {
             return false;
         }
         let actionable = n.is_update_ready();
+        let admin_names = n.admin_step_names().map(<[String]>::to_vec);
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid) as f32;
         let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
@@ -458,22 +611,72 @@ impl App {
         let motion = self
             .motion_policy(true)
             .amplitude(crate::motion::MotionEffect::NoticePill);
-        let (rx, ry, rw, rh) =
-            crate::notice::notice_rect(n, &geom, now, motion, self.notice_clear_rows());
         let (x, y) = self.window_to_frame(wid, x, y);
         let (px, py) = (x as f32 - pad, y as f32 - top);
-        if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
-            self.notice = None;
-            if actionable {
-                // UPGRADE (one click; details-overlay fallback when nothing is actually
-                // staged) — see `apply_update_or_details`.
-                self.apply_update_or_details();
+        let Some(hit) =
+            crate::notice::notice_hit(n, &geom, now, motion, self.notice_clear_rows(), px, py)
+        else {
+            return false;
+        };
+        self.notice = None;
+        match (admin_names, hit) {
+            // THE ADMIN CARD'S INSTALL: the osascript door, through the very seam the
+            // Packages page's buttons use (`execute_native_packages`, busy-gated, one
+            // worker). macOS raises its own dialog; nothing here sees a password. A
+            // refusal (inert manager, a verb already running) is answered on a plain
+            // status card so the press is never silently swallowed.
+            (Some(names), crate::notice::NoticeHit::Install) => {
+                let outcome = self.execute_native_packages(
+                    crate::native_app::PackagesRequest::InstallElevated { names },
+                );
+                match outcome {
+                    crate::native_app::PackagesOutcome::Accepted => {
+                        self.surface_nonmodal_update_status(
+                            "\u{21e3} Installing through macOS \u{2014} progress in Settings \u{25b8} Packages",
+                        );
+                    }
+                    crate::native_app::PackagesOutcome::Blocked { message }
+                    | crate::native_app::PackagesOutcome::Failed { message } => {
+                        aterm_log::warn!("admin install did not start: {message}");
+                        self.surface_gesture_failure(&format!(
+                            "Admin install did not start \u{2014} {message}"
+                        ));
+                    }
+                }
             }
-            self.request_redraw_all_windows();
-            true
-        } else {
-            false
+            // NOT NOW: record the exact set so the card is not raised again until the
+            // set changes (`packages_screen::admin_step_should_show`). The write is a
+            // tiny file, but it is still a disk write, so it leaves the UI thread; a
+            // failure only means the card comes back next pass.
+            (Some(names), crate::notice::NoticeHit::NotNow) => {
+                let config_path = crate::app_config::config_path();
+                let spawned = std::thread::Builder::new()
+                    .name("aterm-admin-step-dismiss".into())
+                    .spawn(move || {
+                        if let Err(error) = crate::packages_screen::record_admin_step_dismissal(
+                            config_path.as_deref(),
+                            &names,
+                        ) {
+                            aterm_log::warn!("admin step dismissal not recorded: {error}");
+                        }
+                    });
+                if let Err(error) = spawned {
+                    aterm_log::warn!("admin step dismissal not recorded: {error}");
+                }
+            }
+            // A press on the admin card's body dismisses it for now — nothing is
+            // recorded, and the next pass re-raises it.
+            (Some(_), crate::notice::NoticeHit::Body) => {}
+            (None, _) => {
+                if actionable {
+                    // UPGRADE (one click; details-overlay fallback when nothing is actually
+                    // staged) — see `apply_update_or_details`.
+                    self.apply_update_or_details();
+                }
+            }
         }
+        self.request_redraw_all_windows();
+        true
     }
 
     /// The in-grid chrome rows the notice card must sit BELOW: the tab strip and the
@@ -718,6 +921,391 @@ mod tests {
 
     /// Stage one strictly-newer build through the REAL check reducer, so the
     /// snapshot the pill predicate reads is the one production reads.
+    /// Stage `build` through the SHIPPING check reducer, carrying the apply-lane
+    /// facts a real `durable_update_status` read would carry beside it.
+    ///
+    /// `apply_lane` is read from the ledger the test itself just wrote, through the
+    /// same `aterm_update::apply_lane_report` the worker uses, so a check landing
+    /// after a failure reproduces exactly what production hands the reducer.
+    #[cfg(target_os = "macos")]
+    fn stage_build_with_ledger(app: &mut App, build: u64) {
+        let current_build = app.native_updater_service.snapshot().current_build;
+        // THE SHIPPING READER, not a hand-built literal. `durable_update_status` is
+        // the one place the check lane's status and the apply lane's ledger are read
+        // side by side, and it is the only path a FRESH PROCESS has to the apply
+        // reason at all — so a fixture that assembled those three fields itself would
+        // leave the startup lane untested while looking thorough. Only the staged
+        // artifact is substituted: the scratch root has no real download in it.
+        let base = aterm_update::status(current_build)
+            .map(crate::app_native::durable_update_status)
+            .expect("the scratch staging root yields a status under test");
+        let status = crate::native_updater_service::DurableUpdateStatus {
+            enabled: true,
+            staged_build: Some(build),
+            staged_version: Some(format!("1.0.{build}")),
+            staged_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            staged_dmg_sha256: Some("ab".repeat(32)),
+            changelog: None,
+            outcome: "staged".to_string(),
+            installable: true,
+            channel_unreadable: false,
+            ..base
+        };
+        let CheckStart::Start(ticket) = app.native_updater_service.request_check() else {
+            panic!("a service between checks must start exactly one");
+        };
+        assert_eq!(
+            app.native_updater_service.finish_check(ticket, status),
+            crate::native_updater_service::CheckCompletion::Reduced,
+        );
+        app.publish_native_update_state();
+    }
+
+    /// An `AutoApplyIntent` for `build`, i.e. the state in which the automatic lane
+    /// still means to try this artifact by itself.
+    #[cfg(target_os = "macos")]
+    fn arm_intent(app: &mut App, build: u64) {
+        app.auto_apply_manual_only = None;
+        app.auto_apply_intent = Some(crate::AutoApplyIntent {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
+            attempts: 0,
+            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(600),
+        });
+    }
+
+    /// THE WHOLE SHIPPING ASSEMBLY, FROM ONE REAL FAILED APPLY.
+    ///
+    /// Everything else about this work can be asserted through seams — `ApplyTrouble`
+    /// renders in isolation, `UpdateState::with_apply_lane` attaches a reason to a
+    /// fixture — and NONE of those seams is on the path a user's machine takes. This
+    /// test takes that path and only that path: `App::surface_update_apply_outcome`
+    /// with a real `UpdateOutcome::Failed`, the real ledger write (the harness points
+    /// `ATERM_UPDATE_ROOT` at a scratch root), the real reducer, `apply_trouble_for`,
+    /// `apply_retry_for`, `from_service`, and the exact label constructor
+    /// `refresh_version_menu` and the palette both call.
+    ///
+    /// It also pins the FIRST failure, which is the one the machinery could not
+    /// deliver: the ledger write is on the event loop, every path that used to carry
+    /// apply facts back into the reducer is a worker observation gathered BEFORE that
+    /// write, and no reconcile is run anywhere below. If the failure does not reach
+    /// these surfaces at the instant it is recorded, it does not reach them at all.
+    ///
+    /// Ledger isolation note: the count asserted here is the ARTIFACT-scoped one, and
+    /// every build number below is unique to this test, so a sibling test writing the
+    /// process-wide scratch ledger in parallel cannot perturb it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_real_failed_apply_reaches_every_standing_surface_at_once() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let current_build = app.native_updater_service.snapshot().current_build;
+        let build = current_build + 4_101;
+        stage_build_with_ledger(&mut app, build);
+        arm_intent(&mut app, build);
+
+        // PRECONDITION: a clean stage says nothing about failures, anywhere.
+        assert!(
+            app.apply_trouble_for(build).is_none(),
+            "a stage nothing has attempted carries no trouble"
+        );
+        assert_eq!(
+            crate::menu::staged_apply_label(
+                "\u{2191}",
+                build,
+                "9.9.9",
+                app.apply_trouble_for(build).as_ref()
+            ),
+            "\u{2191} Update to v9.9.9 \u{2014} restart now"
+        );
+
+        // ONE REAL FAILURE, through the door the handoff completion uses. Nothing
+        // else happens: no reconcile, no check, no republish the test performs.
+        app.surface_update_apply_outcome(
+            "automatic handoff",
+            UpdateOutcome::Failed {
+                message: "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
+            },
+            false,
+        );
+
+        // THE VERSION MENU — the affordance that read "restart now" for hours on
+        // 2026-08-21 over an engine that had already tried twice.
+        let trouble = app
+            .apply_trouble_for(build)
+            .expect("the failure that just happened is standing trouble for this build");
+        assert_eq!(
+            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble)),
+            "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
+             retrying on its own"
+        );
+
+        // THE PALETTE ROW, gathered by `palette_live` exactly as the real repaint
+        // does — including `relaunch`, which only exists because the ledger write
+        // republished the update state.
+        let live = app.palette_live();
+        assert_eq!(
+            live.staged.as_ref().map(|(b, _)| *b),
+            Some(build),
+            "the ledger write republished the staged nudge"
+        );
+        assert_eq!(live.staged_trouble.as_ref(), Some(&trouble));
+
+        // THE SETTINGS PAGE, through `from_service` + `apply_retry_for`.
+        //
+        // The ESCALATION streak is process-wide in the shared scratch ledger (every
+        // headless test in this binary writes the same root), so the two things it
+        // decides — the louder headline, and the pointer at the log — are read from
+        // the projection rather than assumed. Everything the ARTIFACT owns is exact:
+        // it is keyed by a build number unique to this test.
+        let projection = app.update_snapshot(false).projection();
+        assert_ne!(
+            projection.headline, "Update ready",
+            "a build the engine has already failed to start is not simply ready"
+        );
+        assert_eq!(
+            projection.headline,
+            if projection.apply_is_failing {
+                "Update ready, but it keeps failing to apply."
+            } else {
+                "Update ready, but applying it failed."
+            },
+            "one failure is already below `PERSISTENT_AFTER` and already news"
+        );
+        let log_pointer = if projection.apply_is_failing {
+            " See aterm.log."
+        } else {
+            ""
+        };
+        assert_eq!(
+            projection.detail.as_deref(),
+            Some(
+                format!(
+                    "Version 1.0.{build} \u{b7} build {build} \u{b7} aterm tried to update once \
+                     and the new version did not finish starting. It will try again by \
+                     itself.{log_pointer}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            crate::native_settings::compact_update_detail(&projection),
+            "Tried once, didn\u{2019}t start \u{b7} retrying."
+        );
+        assert_eq!(
+            crate::native_settings::compact_update_headline(&projection),
+            "Not applying"
+        );
+
+        // AND NOT ONE OF THEM LEAKS THE LEDGER'S OWN PROSE. "overlap handoff failed
+        // safely" in a menu item is worse than the plain "Update ready" it replaced:
+        // it tells the reader the failure succeeded.
+        for surfaced in [
+            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&trouble)),
+            projection.detail.clone().expect("detail"),
+            crate::native_settings::compact_update_detail(&projection),
+            crate::native_settings::compact_update_detail_minimum(&projection),
+        ] {
+            for leak in ["failed safely", "handoff", "ChildDied"] {
+                assert!(
+                    !surfaced.contains(leak),
+                    "{leak:?} leaked into {surfaced:?}"
+                );
+            }
+        }
+
+        // THE OTHER HALF OF THE ANSWER IS EVENT-LOOP STATE, and it has to reach the
+        // words. Same ledger, same count, same cause — only the scheduling changes.
+        app.auto_apply_intent = None;
+        app.auto_apply_manual_only = None;
+        let latched = app
+            .apply_trouble_for(build)
+            .expect("still standing trouble");
+        assert_eq!(
+            crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&latched)),
+            "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
+             restart now to retry"
+        );
+        assert!(
+            app.update_snapshot(false)
+                .projection()
+                .detail
+                .expect("detail")
+                .contains("not try again until you ask"),
+            "a lane that has stopped must say so on the page too"
+        );
+    }
+
+    /// A FRESH PROCESS READS THE REASON OUT OF THE LEDGER, NOT ONLY THE COUNT.
+    ///
+    /// The other half of the wiring. `note_apply_failure` covers the failure that
+    /// happens WHILE the window is open; this covers the one that happened before it
+    /// opened — which is the field state exactly (the owner restarted into a build
+    /// whose ledger already carried two dead attempts). The only path to the reason
+    /// there is `app_native::durable_update_status`, which reads
+    /// `aterm_update::apply_lane_report` beside the check lane's status, and nothing
+    /// else in this crate reads it at all: without this test, deleting that read
+    /// leaves every surface saying "it did not finish applying" and the whole suite
+    /// green.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_check_that_lands_on_a_ledger_reads_the_reason_and_not_only_the_count() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let current_build = app.native_updater_service.snapshot().current_build;
+        let staged = current_build + 6_301;
+
+        // What a previous run left on disk.
+        let recorded = aterm_update::record_apply_failure(
+            current_build,
+            staged,
+            "overlap handoff failed safely: handoff proof ended AdoptionMismatch",
+        )
+        .expect("the scratch staging root is resolvable under test");
+        assert_eq!(recorded.failures_for_target, 1);
+
+        // This process learns all of it from the check that imports the stage —
+        // nothing was recorded in THIS App.
+        stage_build_with_ledger(&mut app, staged);
+        app.auto_apply_intent = None;
+        app.auto_apply_manual_only = None;
+
+        let trouble = app
+            .apply_trouble_for(staged)
+            .expect("the ledger remembers what this process never saw");
+        assert_eq!(
+            crate::menu::staged_apply_label("\u{2191}", staged, "9.9.9", Some(&trouble)),
+            "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t take over; \
+             restart now to retry",
+            "the CAUSE came off the disk, and so did the fact that nothing is scheduled"
+        );
+        assert!(
+            app.update_snapshot(false)
+                .projection()
+                .detail
+                .expect("detail")
+                .contains("did not take over the open sessions"),
+            "…and the page says the same thing at its own width"
+        );
+    }
+
+    /// A SUPERSEDED STAGE DOES NOT INHERIT THE FAILURES OF THE ONE IT REPLACED.
+    ///
+    /// The apply streak `failing_applies` carries expires only when the RUNNING build
+    /// changes, so staging a newer artifact resets nothing at all. Before the ledger
+    /// learned to name the artifact, this exact sequence — an artifact fails, a check
+    /// imports a newer one — left the Version menu telling the reader that the FRESH
+    /// download had already been tried and had watched its successor die, while
+    /// `arm_native_auto_apply` had just armed a clean first attempt for it.
+    ///
+    /// Both halves run through the shipping path: `aterm_update::record_apply_failure`
+    /// writes the real ledger, `NativeUpdaterService::finish_check` imports the newer
+    /// stage carrying that ledger forward exactly as `durable_update_status` reads it,
+    /// and `apply_trouble_for` is asked the question the menu asks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_newer_stage_starts_clean_even_though_the_running_build_has_not_changed() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let current_build = app.native_updater_service.snapshot().current_build;
+        let superseded = current_build + 5_201;
+        let fresh = superseded + 1;
+
+        // The artifact that actually failed, recorded exactly as a returned handoff
+        // records it.
+        let recorded = aterm_update::record_apply_failure(
+            current_build,
+            superseded,
+            "overlap handoff failed safely: handoff proof ended ChildDied",
+        )
+        .expect("the scratch staging root is resolvable under test");
+        assert_eq!(recorded.failures_for_target, 1);
+        assert!(app.native_updater_service.note_apply_failure(&recorded));
+        assert!(
+            app.apply_trouble_for(superseded).is_some(),
+            "PRECONDITION: the artifact that failed wears its own failure"
+        );
+
+        // THE CHECK LANE IMPORTS A NEWER ARTIFACT, carrying the ledger forward
+        // verbatim — a stage does not touch the apply streak, by design.
+        stage_build_with_ledger(&mut app, fresh);
+        arm_intent(&mut app, fresh);
+        assert!(
+            app.native_updater_service.snapshot().failing_applies > 0,
+            "PRECONDITION: the escalation streak really does survive the new stage — \
+             that is what made this a bug and not a hypothetical"
+        );
+        assert_eq!(
+            app.apply_trouble_for(fresh),
+            None,
+            "a build that has never been attempted must not wear the previous one's \
+             attempts"
+        );
+        assert_eq!(
+            crate::menu::staged_apply_label(
+                "\u{2191}",
+                fresh,
+                "9.9.9",
+                app.apply_trouble_for(fresh).as_ref()
+            ),
+            "\u{2191} Update to v9.9.9 \u{2014} restart now"
+        );
+        assert!(
+            app.update_snapshot(false)
+                .projection()
+                .apply_trouble
+                .is_none(),
+            "…and the page agrees with the menu"
+        );
+
+        // …and the fresh artifact's OWN first failure counts from one, not from two,
+        // and carries ITS cause rather than the previous artifact's.
+        app.surface_update_apply_outcome(
+            "automatic handoff",
+            UpdateOutcome::Failed {
+                message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            },
+            false,
+        );
+        let trouble = app.apply_trouble_for(fresh).expect("its own failure");
+        assert_eq!(
+            crate::menu::staged_apply_label("\u{2191}", fresh, "9.9.9", Some(&trouble)),
+            "\u{2191} Update to v9.9.9 \u{2014} tried once, too slow to start; \
+             retrying on its own",
+            "the count restarted with the artifact, and the CAUSE moved with it"
+        );
+    }
+
+    /// A STAGE THAT IS NOT NEWER THAN THE RUNNING BUILD IS NOT AN OFFER.
+    ///
+    /// `aterm-update`'s own boot-trial recovery records failures whose target IS the
+    /// running build (`install.rs`), so a ledger in which the target matches the
+    /// running build is reachable in production — and `apply_trouble_for` must still
+    /// refuse to decorate it, because there is nothing to restart into.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failure_recorded_against_the_running_build_decorates_nothing() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let current_build = app.native_updater_service.snapshot().current_build;
+        let recorded = aterm_update::record_apply_failure(
+            current_build,
+            current_build,
+            "trial recovery proof failed 3x (receipt missing); disarmed the boot sentinel \
+             to keep updates possible",
+        )
+        .expect("the scratch staging root is resolvable under test");
+        assert_eq!(recorded.target_build, current_build);
+        assert!(app.native_updater_service.note_apply_failure(&recorded));
+
+        assert_eq!(
+            app.apply_trouble_for(current_build),
+            None,
+            "there is no newer build on offer, so there is nothing to qualify"
+        );
+    }
+
     fn stage_one_build(app: &mut App) -> u64 {
         let current_build = app.native_updater_service.snapshot().current_build;
         let build = current_build + 1;
@@ -740,6 +1328,9 @@ mod tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    apply_failure: String::new(),
+                    apply_failure_build: 0,
+                    apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
                 },
@@ -765,6 +1356,7 @@ mod tests {
     /// The user-facing strings are the assertion, because they are the contract.
     #[test]
     fn the_failure_pill_says_retrying_only_when_a_retry_is_actually_scheduled() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         assert!(
             crate::app_config::update_auto_apply(&app.config),
@@ -980,6 +1572,7 @@ mod tests {
     /// (`aterm-update`'s `confirm_boot_health`), which this process cannot observe.
     #[test]
     fn a_submitted_then_failed_apply_writes_one_streak_increment_and_never_a_clear() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let failed = |reason: &str| UpdateOutcome::Failed {
             message: reason.to_string(),
         };

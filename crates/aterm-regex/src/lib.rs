@@ -121,6 +121,80 @@
 //! assertion — `\bcommit` and `^ERROR` are what a terminal actually searches for,
 //! and arming those took the never-matches case from 21.6 ms to 1.0 ms.
 //!
+//! Surviving a leading assertion is right for `\bcommit` and was wrong for
+//! `^ERROR`: the prefilter would hunt down every `E` in the scrollback so the
+//! simulation could fail `\A` on each one. A start-anchored program can only
+//! match at offset 0, so [`compile`](compile) now proves that fact once
+//! ([`Program::start_anchored`]) and the search stops rather than walks.
+//! `benches/anchored_scan.rs` measures it over the shipped 100,000-row default,
+//! paired and slot-alternated against the same binary with the fact forced off:
+//!
+//! | pattern | anchor fact off | on |
+//! |---|---|---|
+//! | `(?i)^ERROR` — the find bar's default | 7.42 ms | **2.10 ms** |
+//! | `(?i)^\d+` | 10.10 ms | **1.45 ms** |
+//! | `^\[` (a pattern that *does* match) | 2.82 ms | **1.19 ms** |
+//! | `(?i)ERROR` — control | 16.99 ms | 16.64 ms |
+//! | `(?im)^ERROR` — control, `StartLine` anchors nothing | 7.80 ms | 7.59 ms |
+//! | `\bcommit` — control | 5.53 ms | 5.71 ms |
+//!
+//! The three controls sit inside a 3.1% identical-binary noise floor, which is
+//! the point: the fast path must take the anchored patterns and nothing else.
+//!
+//! The other half of the gap is the CLASS path, and it is the case-insensitive
+//! search — the find bar's default — that pays it. `(?i)ERROR` compiles to five
+//! `Inst::Class` where the case-sensitive form compiles to five `Inst::Char`,
+//! so the default search asks a lookup structure built for the whole of Unicode
+//! about one ASCII byte, five times per candidate position. `Program`
+//! now carries a dense `u128` per class covering U+0000..U+007F, built at the
+//! moment the classes are frozen, and below U+0080 a membership test is a shift
+//! and a test against sixteen bytes rather than a reach through two `Vec`
+//! headers and a binary search:
+//!
+//! | pattern | binary search | ASCII bitmap |
+//! |---|---|---|
+//! | `(?i)ERROR` — the find bar's default | 16.90 ms | **13.76 ms** |
+//!
+//! Measured the same way; that lane's identical-binary control is 0.1% over
+//! eleven rounds. The other lanes do not move outside their own noise, which
+//! for `\bcommit` is ±15% on a loaded box and for `(?i)^\d+` is ±1.2% — a
+//! reminder that the floor is per-arm and quoting one number for the suite
+//! would be quoting the wrong one.
+//!
+//! What remained after that was not the simulation but the PREFILTER'S HIT
+//! RATE, and the bench states the cost model as a measurement rather than an
+//! argument: `(?i)QUARK` and `(?i)ERROR` are the same shape and length over the
+//! same corpus and differ only in how common their lead byte is — 3.6 ms
+//! against 13.2 ms. That gap is what a one-byte filter spends entering the
+//! simulation at positions that die on their SECOND character.
+//!
+//! So [`Prefilter`](compile::Prefilter) now carries a second marking, for the
+//! code point after the first, armed only when every path provably consumes
+//! one. `(?i)ERROR` stops meaning "every `e` in the scrollback" and starts
+//! meaning "every `e` followed by an `r`":
+//!
+//! | pattern | one byte | two bytes |
+//! |---|---|---|
+//! | `(?i)ERROR` | 12.87 ms | **8.39 ms** |
+//! | `\bcommit` | 5.90 ms | **4.66 ms** |
+//! | `(?im)^ERROR` | 7.23 ms | **5.96 ms** |
+//! | `(?i)^ERROR` | 1.836 ms | 1.835 ms |
+//!
+//! The last row is the anchored fast path getting there first, as it should.
+//! Per-lane controls were 0.0-1.8%.
+//!
+//! One more, from the same measurement: the second-byte test now runs BEFORE
+//! the decode rather than after it. Everything else in the skip loop needs the
+//! decoded code point — the viability walk compares whole `char`s — but an
+//! ASCII lead byte IS its whole code point, so the next one starts at `pos + 1`
+//! and can be tested with an array lookup. Doing it second meant paying a
+//! decode on every marked byte in order to reject nearly all of them:
+//! `(?i)ERROR` -5.0%, `(?im)^ERROR` -5.1%, `\bcommit` -1.9%, `(?i)QUARK`
+//! -1.8%, against per-lane controls of 0.0-0.3%.
+//!
+//! Taken together, the find bar's default over the shipped 100,000-row
+//! scrollback has gone from 16.90 ms per keystroke to 7.79 ms.
+//!
 //! ## Divergences from the `regex` crate, stated plainly
 //!
 //! Every one of these is a *refusal* — an [`Error`] naming the construct — never
@@ -382,7 +456,13 @@ impl Regex {
     /// truncated list.
     #[must_use]
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
-        Matches { re: self, text, last_end: 0, last_match: None, cut_short: false }
+        Matches {
+            re: self,
+            text,
+            last_end: 0,
+            last_match: None,
+            cut_short: false,
+        }
     }
 
     /// The leftmost-first match starting at or after byte offset `start`.
@@ -554,7 +634,11 @@ impl<'t> Iterator for Matches<'_, 't> {
                 self.last_end = end;
             }
             self.last_match = Some(end);
-            return Some(Match { text: self.text, start, end });
+            return Some(Match {
+                text: self.text,
+                start,
+                end,
+            });
         }
     }
 }
@@ -811,7 +895,10 @@ mod step_budget_tests {
 
     /// Does a whole `find_iter` over `haystack` finish inside `limit` units?
     fn completes_within(pattern: &str, haystack: &str, limit: u64) -> bool {
-        let re = RegexBuilder::new(pattern).step_limit(limit).build().expect("compiles");
+        let re = RegexBuilder::new(pattern)
+            .step_limit(limit)
+            .build()
+            .expect("compiles");
         let mut it = re.find_iter(haystack);
         while it.next().is_some() {}
         !it.step_limit_exceeded()
@@ -830,7 +917,11 @@ mod step_budget_tests {
         let mut lo = hi / 2;
         while lo / 64 + 1 < hi - lo {
             let mid = lo + (hi - lo) / 2;
-            if completes_within(pattern, haystack, mid) { hi = mid } else { lo = mid }
+            if completes_within(pattern, haystack, mid) {
+                hi = mid
+            } else {
+                lo = mid
+            }
         }
         hi
     }
@@ -898,21 +989,32 @@ mod step_budget_tests {
         let haystack = format!("{}z", "x".repeat(4096));
         let pattern = AMPLIFIERS[0];
 
-        let starved = RegexBuilder::new(pattern).step_limit(10_000).build().expect("compiles");
+        let starved = RegexBuilder::new(pattern)
+            .step_limit(10_000)
+            .build()
+            .expect("compiles");
         assert_eq!(
             starved.try_find(&haystack).map(|m| m.map(|m| m.range())),
             Err(StepLimitExceeded::new(10_000)),
             "a starved search must refuse, not answer"
         );
-        assert!(!starved.is_match(&haystack), "the infallible form fails closed");
+        assert!(
+            !starved.is_match(&haystack),
+            "the infallible form fails closed"
+        );
         assert!(
             starved.step_limit_exceeded(),
             "and records that it did, so failing closed is not the same as being silent"
         );
 
-        let fed = RegexBuilder::new(pattern).step_limit(u64::MAX).build().expect("compiles");
+        let fed = RegexBuilder::new(pattern)
+            .step_limit(u64::MAX)
+            .build()
+            .expect("compiles");
         assert_eq!(
-            fed.try_find(&haystack).expect("no exhaustion").map(|m| m.range()),
+            fed.try_find(&haystack)
+                .expect("no exhaustion")
+                .map(|m| m.range()),
             // 2,000 optional `x`s and then the `z`: the leftmost start that can
             // reach the end of a 4,096-`x` run is 4,097 - 2,001.
             Some(2096..4097),
@@ -935,14 +1037,27 @@ mod step_budget_tests {
             .expect("compiles");
         let mut it = re.find_iter(&haystack);
         let found: Vec<_> = it.by_ref().map(|m| m.range()).collect();
-        assert_eq!(found, vec![0..2, 3..5, 6..8], "the cheap matches are still reported");
-        assert!(it.step_limit_exceeded(), "and the truncation is on the record");
+        assert_eq!(
+            found,
+            vec![0..2, 3..5, 6..8],
+            "the cheap matches are still reported"
+        );
+        assert!(
+            it.step_limit_exceeded(),
+            "and the truncation is on the record"
+        );
         let started = Instant::now();
         for _ in 0..1_000 {
             assert!(it.next().is_none(), "a truncated iterator is fused");
         }
-        assert!(started.elapsed().as_millis() < 500, "polling a fused iterator is free");
-        assert!(re.step_limit_exceeded(), "the regex carries the fact for infallible callers");
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "polling a fused iterator is free"
+        );
+        assert!(
+            re.step_limit_exceeded(),
+            "the regex carries the fact for infallible callers"
+        );
     }
 
     /// The default budget is chosen to be invisible to everything aterm runs.
@@ -972,9 +1087,18 @@ mod step_budget_tests {
                 r"\[?(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}|::)\]?(?::\d{1,5})?",
                 "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:443 fe80::1 ",
             ),
-            (r"\b[0-9a-fA-F]{7,40}\b", "commit 66390b5c8f2a1b3c4d5e6f7a8b9c0d1e2f3a4b5c landed "),
-            (r"'(?:[^'\\]|\\.)*'", "echo 'a quoted \\'string\\' here' | cat "),
-            (r"`(?:[^`\\]|\\.)*`", "run `git log --oneline` and `cargo test` "),
+            (
+                r"\b[0-9a-fA-F]{7,40}\b",
+                "commit 66390b5c8f2a1b3c4d5e6f7a8b9c0d1e2f3a4b5c landed ",
+            ),
+            (
+                r"'(?:[^'\\]|\\.)*'",
+                "echo 'a quoted \\'string\\' here' | cat ",
+            ),
+            (
+                r"`(?:[^`\\]|\\.)*`",
+                "run `git log --oneline` and `cargo test` ",
+            ),
             (
                 r"v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?(?:\+[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?",
                 "aterm v0.47.0-rc.1+build.1787445038 released ",
@@ -1001,7 +1125,10 @@ mod step_budget_tests {
             for haystack in [&row, &scrollback] {
                 let mut it = re.find_iter(haystack);
                 let count = it.by_ref().count();
-                assert!(count > 0 && !it.step_limit_exceeded(), "{pattern:?} matched nothing");
+                assert!(
+                    count > 0 && !it.step_limit_exceeded(),
+                    "{pattern:?} matched nothing"
+                );
             }
             assert!(!re.step_limit_exceeded());
         }
@@ -1025,7 +1152,6 @@ mod step_budget_tests {
             );
         }
     }
-
 
     /// The knob is real in both directions, and readable back.
     #[test]
@@ -1054,7 +1180,10 @@ mod step_budget_tests {
         );
         assert_eq!(RegexBuilder::new("a").step_limit(7).get_step_limit(), 7);
         assert_eq!(RegexBuilder::new("a").get_step_limit(), DEFAULT_STEP_LIMIT);
-        assert_eq!(Regex::new("a").expect("compiles").step_limit(), DEFAULT_STEP_LIMIT);
+        assert_eq!(
+            Regex::new("a").expect("compiles").step_limit(),
+            DEFAULT_STEP_LIMIT
+        );
     }
 
     /// Ordinary patterns over ordinary rows are untouched: same matches, no
@@ -1062,10 +1191,22 @@ mod step_budget_tests {
     #[test]
     fn ordinary_patterns_are_unaffected() {
         let text = "commit 66390b5c8f is the release; see http://example.com/x?y=1 (v1.2.3)";
-        for pattern in [r"\b[0-9a-f]{7,40}\b", r"\w+", "a|ab", "(?i)COMMIT", r"\d+\.\d+\.\d+"] {
-            let unbounded = RegexBuilder::new(pattern).step_limit(u64::MAX).build().expect("ok");
+        for pattern in [
+            r"\b[0-9a-f]{7,40}\b",
+            r"\w+",
+            "a|ab",
+            "(?i)COMMIT",
+            r"\d+\.\d+\.\d+",
+        ] {
+            let unbounded = RegexBuilder::new(pattern)
+                .step_limit(u64::MAX)
+                .build()
+                .expect("ok");
             let defaulted = Regex::new(pattern).expect("compiles");
-            let tight = RegexBuilder::new(pattern).step_limit(1 << 16).build().expect("ok");
+            let tight = RegexBuilder::new(pattern)
+                .step_limit(1 << 16)
+                .build()
+                .expect("ok");
             let spans = |re: &Regex| -> Vec<std::ops::Range<usize>> {
                 re.find_iter(text).map(|m| m.range()).collect()
             };
@@ -1088,6 +1229,9 @@ mod step_budget_tests {
         let clone = re.clone();
         assert!(!clone.step_limit_exceeded());
         assert!(!re.is_match(&row()));
-        assert!(clone.step_limit_exceeded(), "the clone sees what the original learned");
+        assert!(
+            clone.step_limit_exceeded(),
+            "the clone sees what the original learned"
+        );
     }
 }

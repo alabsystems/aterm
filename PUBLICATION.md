@@ -17,6 +17,10 @@ different things:
   that installed copies verify. The same page also hosts the signed
   `atpkg-index-N` package index that `aterm pkg` reads.
 
+When a release lands here, [alab.systems](https://alab.systems) follows it
+automatically: `/terminal` is rebuilt from the promoted commit, the download
+button points at the current release asset, and `/releases` carries the notes.
+
 Both report the same version: a single `MAJOR.MINOR.0` whose patch slot is
 always `0` and whose `MINOR` is the knob that moves, described in
 [VERSIONING.md](VERSIONING.md). The authoritative value is the root Cargo
@@ -48,7 +52,7 @@ the reviewed `Cargo.lock` needs no regeneration — plus modified vendored
 crates, the public README media, the installer script `tools/install.sh`, and
 the license material needed for that boundary.
 
-Where a test's only fixture is something the export omits — the internal `ay`
+Where a test's only fixture is something the export omits — the `ay`
 proof bundles, the changelog — that test is left out too, so a fresh clone of
 this tree tests clean. Those obligations still run on the development line,
 where their inputs exist.

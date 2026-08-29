@@ -46,9 +46,11 @@ target-trust
 /.trust-cache/
 
 # Vendored dependency SOURCE must never be swallowed by the build-artifact `debug`
-# rule near the top: winnow ships a real `combinator/debug` tracing module, and
-# dropping it broke `cargo build` on a fresh checkout. Re-include any vendored
-# `debug` source directory (the bare `debug` rule still covers `target/**/debug`).
+# rule near the top. MEASURED on the winnow fork (retired 2026-08-27 with
+# `toml_edit`): it shipped a real `combinator/debug` tracing module, and dropping
+# it broke `cargo build` on a fresh checkout. The re-include stays for the NEXT
+# vendored crate with a `debug` source directory — the bare `debug` rule still
+# covers `target/**/debug`.
 !vendor/**/debug/
 /target-tippy/
 

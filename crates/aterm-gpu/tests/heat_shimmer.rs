@@ -465,9 +465,9 @@ fn shimmer_region_derivation_sanity() {
 fn write_png(path: &std::path::Path, w: usize, h: usize, rgb: &[u8]) {
     let file = std::fs::File::create(path).expect("create png");
     let wtr = std::io::BufWriter::new(file);
-    let mut enc = png::Encoder::new(wtr, w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(wtr, w as u32, h as u32);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header()
         .expect("png header")
         .write_image_data(rgb)

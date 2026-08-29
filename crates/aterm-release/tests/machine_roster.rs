@@ -79,8 +79,12 @@ use std::path::{Path, PathBuf};
 
 use aterm_update_core::Manifest;
 use aterm_update_core::roster::{Attribution, Machine, Roster};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
+/// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`), held
+/// byte-identical to the retired `base64` package's `general_purpose::STANDARD`
+/// by `crates/aterm-codec/tests/base64_oracle.rs`.
+fn b64(raw: &[u8]) -> String {
+    aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
+}
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 use publish::{RosterEvidence, SignaturePolicy};
@@ -109,7 +113,7 @@ fn kp(seed: &[u8; 32]) -> Ed25519KeyPair {
 }
 
 fn pk(seed: &[u8; 32]) -> String {
-    B64.encode(kp(seed).public_key().as_ref())
+    b64(kp(seed).public_key().as_ref())
 }
 
 /// A master-signed roster naming m3 and m11, with the deny-list under the caller's
@@ -1466,10 +1470,7 @@ fn fresh_keypair() -> (String, String) {
     let rng = ring::rand::SystemRandom::new();
     let doc = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let kp = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
-    (
-        B64.encode(doc.as_ref()),
-        B64.encode(kp.public_key().as_ref()),
-    )
+    (b64(doc.as_ref()), b64(kp.public_key().as_ref()))
 }
 
 /// A base64 PKCS#8 Ed25519 key, generated here. It signs nothing that leaves this
@@ -1482,7 +1483,7 @@ fn pkcs8_b64() -> String {
     KEY.get_or_init(|| {
         let rng = ring::rand::SystemRandom::new();
         let doc = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        B64.encode(doc.as_ref())
+        b64(doc.as_ref())
     })
     .clone()
 }

@@ -19,6 +19,7 @@ mod scroll_damage;
 mod scroll_region;
 mod scrollback;
 mod scrollback_grapheme_edge;
+mod scrollback_images;
 mod scrollback_materialize;
 mod scrollback_materialize_len;
 mod scrollback_style_roundtrip;

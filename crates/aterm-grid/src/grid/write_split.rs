@@ -627,12 +627,53 @@ impl Grid {
             if let Some(row) = self.storage.row_mut(cursor_row) {
                 // #7456: capture stale-extras columns (both wide halves)
                 // before the overwrite clobbers the HAS_EXTRAS flags.
+                let end_col_run = cursor_col + (to_write as u16) * 2;
                 if scan_stale {
-                    stale = stale_extras_cols(row, cursor_col, cursor_col + (to_write as u16) * 2);
+                    stale = stale_extras_cols(row, cursor_col, end_col_run);
                 }
-                for i in 0..to_write {
-                    let col = cursor_col + (i as u16) * 2;
-                    row.write_wide_char_packed(col, chars[pos + i], colors, flags);
+                // Bounds-check once for the whole run, then write unchecked —
+                // the same shape `write_emoji_run_autowrap` already uses. The
+                // run has settled the wrap, the row, the margin clamp and the
+                // damage mark once; the per-glyph CHECKED writer then re-did a
+                // bounds test, two flag loads of the cells being overwritten,
+                // the orphan-fixup branch and a `len` grow-check for every
+                // glyph. On a CJK run those are the same answer every time.
+                if (end_col_run as usize) <= row.cells_len() {
+                    // The no-fixup writes skip orphaned-wide-half cleanup, and a
+                    // run has exactly two places one can occur: the FIRST cell
+                    // can land on the WIDE_CONTINUATION half of a pre-existing
+                    // wide char (cursor placed there by CUP), and the cell just
+                    // past the run can be the continuation of a wide base at
+                    // `end_col_run - 1`. Interior glyphs land only on cells this
+                    // run itself wrote. Clean both edges once.
+                    row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    for i in 0..to_write {
+                        let col = cursor_col + (i as u16) * 2;
+                        // SAFETY: (a) `col + 1 < cells.len()` because
+                        // `end_col_run = cursor_col + to_write*2 <= cells_len()`
+                        // and `col + 2 <= end_col_run`, so
+                        // `col + 1 < end_col_run <= cells.len()`. (b) `col` is on
+                        // a wide-cell boundary: writes land at `cursor_col + 0,
+                        // 2, 4, ...` by construction. (c) writes are sequential
+                        // and non-overlapping: `i` strictly increases and each
+                        // iteration covers exactly the two cells `(col, col+1)`.
+                        unsafe {
+                            row.write_wide_char_packed_no_fixup(col, chars[pos + i], colors, flags);
+                        }
+                    }
+                    // NOT `update_len`. That is grow-only, and the checked
+                    // writer this replaces also SHRINKS: the edge fixup above can
+                    // clear the row's last content, and leaving `len` stale-high
+                    // paints a phantom trailing space into `row_text`, search and
+                    // scrollback (the #7522 len class). Pinned by
+                    // `wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail`.
+                    row.settle_len_after_wide_run(end_col_run);
+                    row.mark_has_wide_chars();
+                } else {
+                    for i in 0..to_write {
+                        let col = cursor_col + (i as u16) * 2;
+                        row.write_wide_char_packed(col, chars[pos + i], colors, flags);
+                    }
                 }
             }
             if !stale.is_empty() {
@@ -762,7 +803,13 @@ impl Grid {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + j], colors, flags);
                         }
                     }
-                    row.update_len(end_col);
+                    // NOT `update_len`: it is grow-only, and the edge fixup
+                    // above can clear the row's last content. Leaving `len`
+                    // stale-high paints a phantom trailing space into
+                    // `row_text`, search and scrollback — the #7522 len class,
+                    // which the single-glyph writer and `fill_cell_run` both
+                    // close and which the bulk run lanes did not.
+                    row.settle_len_after_wide_run(end_col);
                     row.mark_has_wide_chars();
                 } else {
                     for j in 0..to_write {
@@ -899,7 +946,13 @@ impl Grid {
                             row.write_wide_char_packed_no_fixup(col, c, bmp_colors, fl);
                         }
                     }
-                    row.update_len(end_col);
+                    // NOT `update_len`: it is grow-only, and the edge fixup
+                    // above can clear the row's last content. Leaving `len`
+                    // stale-high paints a phantom trailing space into
+                    // `row_text`, search and scrollback — the #7522 len class,
+                    // which the single-glyph writer and `fill_cell_run` both
+                    // close and which the bulk run lanes did not.
+                    row.settle_len_after_wide_run(end_col);
                     row.mark_has_wide_chars();
                 } else {
                     for (j, &c) in slice.iter().enumerate() {

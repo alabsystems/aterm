@@ -238,7 +238,7 @@ fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
 
 /// Reusable per-query case-insensitive line matcher.
 ///
-/// One- and two-byte ASCII queries take the allocation-free memchr path. Longer
+/// One- and two-byte ASCII queries take the allocation-free byte-scanner path. Longer
 /// queries use the standard library's linear-time substring search over one
 /// reusable lowercase buffer. Unicode lowercasing can change byte length and
 /// therefore additionally requires a [`LowerByteMap`] to preserve original
@@ -2108,6 +2108,10 @@ impl SearchIndex {
         let mut matches: Vec<SearchMatch> = Vec::new();
         let mut occurrence_lines: Vec<u32> = Vec::new();
         let mut capped = false;
+        // ONE preparation of the needle for the whole sweep: the literal
+        // verifier below runs per match and the occurrence probe per line, and
+        // both used to re-derive the needle's critical factorization.
+        let searcher = crate::bytesearch::Searcher::new(query.as_bytes());
         'lines: while let Some(line_u32) = candidates.next() {
             let line_num = line_u32 as usize;
             let Some(text) = self.lines.get(&line_num) else {
@@ -2128,7 +2132,7 @@ impl SearchIndex {
                 None => {
                     let mut from_byte = 0usize;
                     while let Some((found, resume)) =
-                        next_literal_match(line_num, text, query, col_map, from_byte)
+                        next_literal_match(line_num, text, &searcher, col_map, from_byte)
                     {
                         from_byte = resume;
                         line_matched = true;
@@ -2144,9 +2148,7 @@ impl SearchIndex {
                     // Occurrence, not match: a byte-level containment probe so
                     // zero-display-width matches still keep the line in the
                     // frame (see `CaseInsensitiveMatcher::has_occurrence`).
-                    if line_matched
-                        || memchr::memmem::find(text.as_bytes(), query.as_bytes()).is_some()
-                    {
+                    if line_matched || searcher.find_in(text.as_bytes()).is_some() {
                         occurrence_lines.push(line_u32);
                     }
                 }
@@ -2577,7 +2579,10 @@ mod regex_scan_budget_tests {
                 },
             )
             .expect_err("navigation must refuse too");
-        assert!(matches!(err, SearchOptionsError::InvalidRegex(_)), "{err:?}");
+        assert!(
+            matches!(err, SearchOptionsError::InvalidRegex(_)),
+            "{err:?}"
+        );
     }
 
     /// Ordinary patterns over the same content are untouched: the budget is

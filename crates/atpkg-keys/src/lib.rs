@@ -48,8 +48,6 @@ pub mod pins_edit;
 pub mod provision;
 pub mod roster_ops;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -70,7 +68,8 @@ pub fn generate() -> Result<(Vec<u8>, String), String> {
 /// publishable pubkey from a stored key file without re-generating).
 pub fn pubkey_b64(pkcs8: &[u8]) -> Result<String, String> {
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| "invalid pkcs8 key".to_string())?;
-    Ok(STANDARD.encode(kp.public_key().as_ref()))
+    aterm_codec::base64::encode(kp.public_key().as_ref())
+        .map_err(|_| "public key too large to encode".to_string())
 }
 
 /// Detached-sign `msg`'s exact bytes with the pkcs8 key → the 64-byte Ed25519 signature
@@ -144,7 +143,12 @@ mod tests {
         let (key, pub_b64) = generate().unwrap();
         assert_eq!(pubkey_b64(&key).unwrap(), pub_b64);
         // A 32-byte base64 pubkey decodes to exactly 32 bytes (the client's BadKey gate).
-        assert_eq!(STANDARD.decode(&pub_b64).unwrap().len(), 32);
+        assert_eq!(
+            aterm_codec::base64::decode_strict(pub_b64.as_bytes())
+                .unwrap()
+                .len(),
+            32
+        );
     }
 
     #[test]

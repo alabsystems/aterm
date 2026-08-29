@@ -144,10 +144,16 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
 }
 
 /// An OPAQUE sixel inline image hides the cat sprite on BOTH backends: the CPU
-/// stamps sprites in pass 1c BEFORE pass 1b images; the GPU draws the cat
-/// stream in `emit_base_pre` before the inline-image stream — so with-cat and
-/// without-cat frames are byte-identical per backend when the image fully
+/// stamps sprites in pass 1c BEFORE the inline-image stamp; the GPU draws the
+/// cat stream in `emit_base_pre` before the inline-image stream — so with-cat
+/// and without-cat frames are byte-identical per backend when the image fully
 /// covers the quad.
+///
+/// "WHEN THE IMAGE FULLY COVERS THE QUAD" is now a checked precondition, not a
+/// sentence. It stopped being true under the fixture (see the DCS below) and
+/// the test went red on a claim it was not making; and had it gone the other
+/// way — image and cat both absent — the equality would have passed while
+/// nothing was drawn at all.
 #[test]
 fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let theme = Theme::default();
@@ -159,12 +165,38 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let (rows, cols) = (4usize, 8usize);
 
     // A REAL sixel DCS (the aterm-gpu test build enables the engine's `sixel`
-    // feature): raster 2*cw px wide x 6 px tall, ALL columns opaque red — the
-    // decoded RawRgba8 image scales to a fully-opaque 2x1-cell footprint.
+    // feature): raster 2*cw px wide x ch px TALL, every pixel opaque red — a
+    // decoded RawRgba8 image that fills a 2x1-cell footprint edge to edge.
+    //
+    // IT USED TO BE ONE SIXEL BAND — six pixel rows — and the comment said the
+    // decode "scales to a fully-opaque 2x1-cell footprint". That was true while
+    // the renderer STRETCHED an inline image to its cell footprint, and
+    // `6c6f6a94` ("an inline image survives a resize, reports its pixels, and
+    // stops being stretched") deliberately ended that: an image now paints at
+    // its own pixel size inside the footprint. So the fixture's 22x6 raster
+    // covered 6 of the cell's 21 rows, the 21-px-tall cat quad stuck out of the
+    // top of it, and the CPU arm went red — not because the z-order this test
+    // is about had moved, but because the premise it never checked had.
+    // MEASURED at that point: 132 red pixels in the base frame (22 x 6), not
+    // the 2*cw*ch a cover owes. The raster is now built to the LIVE cell height
+    // so the premise holds on any font metric, and `red_px` below CHECKS it
+    // rather than assuming it.
+    //
+    // Sixel writes six pixel rows per data char, so `ch` rows is `ch / 6` full
+    // bands (`~` = all six bits) plus, when `ch` is not a multiple of six, one
+    // partial band whose low `ch % 6` bits are set (`?` + (2^rem - 1)).
     let mut dcs: Vec<u8> = Vec::new();
-    dcs.extend_from_slice(format!("\x1bP0;0;8q\"1;1;{};6#1;2;100;0;0#1", 2 * cw).as_bytes());
-    dcs.extend(std::iter::repeat_n(b'~', 2 * cw));
-    dcs.extend_from_slice(b"$-\x1b\\");
+    dcs.extend_from_slice(format!("\x1bP0;0;8q\"1;1;{};{ch}#1;2;100;0;0#1", 2 * cw).as_bytes());
+    for _ in 0..ch / 6 {
+        dcs.extend(std::iter::repeat_n(b'~', 2 * cw));
+        dcs.extend_from_slice(b"$-");
+    }
+    if !ch.is_multiple_of(6) {
+        let partial = b'?' + u8::try_from((1u32 << (ch % 6)) - 1).expect("rem < 6 ⇒ value < 64");
+        dcs.extend(std::iter::repeat_n(partial, 2 * cw));
+        dcs.extend_from_slice(b"$-");
+    }
+    dcs.extend_from_slice(b"\x1b\\");
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.set_cell_pixel_size(cw as u16, ch as u16);
     term.process(b"\x1b[?25l");
@@ -183,9 +215,27 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
 
     let cpu_base = cpu.render_input(&base_input);
     let cpu_cat = cpu.render_input(&input);
+    // THE PREMISE, CHECKED. `assert_eq!(base, cat)` is satisfied just as well by
+    // a renderer that draws neither the image nor the cat, so the cover has to
+    // be measured or the whole test can pass while painting nothing. The
+    // opaque red must fill exactly the 2x1-cell footprint.
+    let red_px = |f: &aterm_render::Frame| {
+        f.pixels
+            .iter()
+            .filter(|&&p| ((p >> 16) & 0xFF) > 150 && ((p >> 8) & 0xFF) < 90 && (p & 0xFF) < 90)
+            .count()
+    };
+    assert_eq!(
+        red_px(&cpu_base),
+        2 * cw * ch,
+        "CPU: the sixel must cover its whole 2x1-cell footprint — a partial \
+         cover makes the comparison below true for the wrong reason (the cat \
+         painting where no image reaches)"
+    );
     assert_eq!(
         cpu_base.pixels, cpu_cat.pixels,
-        "CPU: an opaque sixel must hide the cat sprite (pass 1c is under pass 1b)"
+        "CPU: an opaque sixel must hide the cat sprite (the pass-1c sprite stamp \
+         is under the inline-image stamp — pass 2b for this image's z >= 0)"
     );
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
     let gpu_cat = gpu.render_input(&mut win, &input, None);

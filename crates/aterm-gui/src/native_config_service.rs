@@ -5,7 +5,7 @@
 //!
 //! The reducer is pure and deterministic. A host worker reads/writes the file and feeds
 //! whole snapshots here; this service performs OCC, per-key stale rebase, conditional
-//! undo, and one `toml_edit` transform per accepted patch. The UI never writes config
+//! undo, and one `aterm-toml` document transform per accepted patch. The UI never writes config
 //! bytes directly.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -814,7 +814,7 @@ impl VersionedConfigService {
 }
 
 fn parse_config(text: &str) -> Result<crate::app_config::Config, String> {
-    toml::from_str::<crate::app_config::Config>(text)
+    aterm_toml::from_str::<crate::app_config::Config>(text)
         .map_err(|error| format!("aterm.toml is not a valid aterm config: {error}"))
 }
 
@@ -848,7 +848,7 @@ fn decode_config_bytes(bytes: &[u8], path: &Path) -> Result<String, String> {
 
 fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
     let document = text
-        .parse::<toml_edit::DocumentMut>()
+        .parse::<aterm_toml::edit::DocumentMut>()
         .map_err(|error| format!("existing aterm.toml is not valid TOML: {error}"))?;
     let mut values = BTreeMap::new();
     for (key, item) in document.iter() {
@@ -873,12 +873,12 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
 /// TOML's `packages.include` is a two-segment path, while
 /// `"packages.include"` is one literal segment. Flattening both to the same
 /// bytes lets an authored forward-compatible value impersonate a registered
-/// setting. `toml_edit::Key` supplies the canonical, escaped TOML spelling for
+/// setting. `aterm_toml::edit::Key` supplies the canonical, escaped TOML spelling for
 /// a segment: bare-safe names stay compact and names containing `.` remain
 /// quoted. The result is therefore both human-readable and injective over
 /// segment sequences.
 pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
-    let segment = toml_edit::Key::new(segment).to_string();
+    let segment = aterm_toml::edit::Key::new(segment).to_string();
     if parent.is_empty() {
         segment
     } else {
@@ -890,7 +890,7 @@ pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
 /// (both `[a.b]` header tables and `b = { … }` inline tables), recurse into
 /// every child under `path.child`. Arrays of tables stay one opaque entry,
 /// matching the nested writer, which never addresses into them.
-fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &toml_edit::Item) {
+fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
     if let Some(table) = item.as_table_like() {
         for (child, child_item) in table.iter() {
             project_item(values, &join_config_key_path(path, child), child_item);
@@ -899,9 +899,9 @@ fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &toml_e
     values.insert(path.to_string(), semantic_item(item));
 }
 
-fn semantic_item(item: &toml_edit::Item) -> String {
+fn semantic_item(item: &aterm_toml::edit::Item) -> String {
     match item {
-        toml_edit::Item::Value(value) => {
+        aterm_toml::edit::Item::Value(value) => {
             if let Some(value) = value.as_str() {
                 value.to_owned()
             } else if let Some(value) = value.as_integer() {
@@ -914,9 +914,9 @@ fn semantic_item(item: &toml_edit::Item) -> String {
                 value.to_string().trim().to_owned()
             }
         }
-        toml_edit::Item::Table(table) => table.to_string().trim().to_owned(),
-        toml_edit::Item::ArrayOfTables(tables) => tables.to_string().trim().to_owned(),
-        toml_edit::Item::None => String::new(),
+        aterm_toml::edit::Item::Table(table) => table.to_string().trim().to_owned(),
+        aterm_toml::edit::Item::ArrayOfTables(tables) => tables.to_string().trim().to_owned(),
+        aterm_toml::edit::Item::None => String::new(),
     }
 }
 

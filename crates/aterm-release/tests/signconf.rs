@@ -123,15 +123,13 @@ fn write_profile(dir: &std::path::Path, body: &str, mode: u32) -> std::path::Pat
 
 /// A fresh Ed25519 keypair as (base64 PKCS#8, base64 public key).
 fn keypair_b64() -> (String, String) {
-    use base64::Engine as _;
     use ring::signature::KeyPair as _;
     let rng = ring::rand::SystemRandom::new();
     let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let kp = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
-    let b64 = base64::engine::general_purpose::STANDARD;
     (
-        b64.encode(doc.as_ref()),
-        b64.encode(kp.public_key().as_ref()),
+        aterm_codec::base64::encode(doc.as_ref()).expect("pkcs8"),
+        aterm_codec::base64::encode(kp.public_key().as_ref()).expect("32-byte key"),
     )
 }
 
@@ -217,10 +215,9 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let expected = {
-        use base64::Engine as _;
         use ring::signature::KeyPair as _;
         let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        base64::engine::general_purpose::STANDARD.encode(kp.public_key().as_ref())
+        aterm_codec::base64::encode(kp.public_key().as_ref()).expect("32-byte key")
     };
     let key_path = aterm.join("machine.key");
     std::fs::write(&key_path, pkcs8.as_ref()).unwrap();

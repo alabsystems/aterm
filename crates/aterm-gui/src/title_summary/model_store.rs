@@ -324,16 +324,16 @@ fn digest_hex(bytes: &[u8]) -> String {
 
 #[cfg(target_os = "macos")]
 fn descriptor_digest_and_size(
-    descriptor: &serde_json::Value,
+    descriptor: &aterm_json::Value,
 ) -> Result<(String, String, u64), String> {
     let media_type = descriptor
         .get("mediaType")
-        .and_then(serde_json::Value::as_str)
+        .and_then(aterm_json::Value::as_str)
         .filter(|media_type| !media_type.is_empty() && media_type.len() <= 256)
         .ok_or_else(|| "managed model manifest descriptor lacks a media type".to_string())?;
     let digest = descriptor
         .get("digest")
-        .and_then(serde_json::Value::as_str)
+        .and_then(aterm_json::Value::as_str)
         .and_then(|digest| digest.strip_prefix("sha256:"))
         .ok_or_else(|| "managed model manifest descriptor lacks a SHA-256 digest".to_string())?;
     if digest.len() != 64
@@ -345,7 +345,7 @@ fn descriptor_digest_and_size(
     }
     let size = descriptor
         .get("size")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(aterm_json::Value::as_u64)
         .ok_or_else(|| "managed model manifest descriptor lacks a byte size".to_string())?;
     if size == 0 || size > MAX_BLOB_BYTES {
         return Err("managed model manifest blob size is outside the bounded range".to_string());
@@ -407,11 +407,11 @@ fn attest_managed_model_with_pin(
     if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
         return Err("managed model manifest exceeds 1 MiB".to_string());
     }
-    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+    let manifest_json: aterm_json::Value = aterm_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("invalid managed model manifest JSON: {error}"))?;
     if manifest_json
         .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(aterm_json::Value::as_u64)
         != Some(2)
     {
         return Err("managed model manifest schemaVersion must be 2".to_string());
@@ -421,7 +421,7 @@ fn attest_managed_model_with_pin(
         .ok_or_else(|| "managed model manifest lacks its config descriptor".to_string())?;
     let layers = manifest_json
         .get("layers")
-        .and_then(serde_json::Value::as_array)
+        .and_then(aterm_json::Value::as_array)
         .ok_or_else(|| "managed model manifest lacks its layer list".to_string())?;
     if layers.len().saturating_add(1) > MAX_MANIFEST_BLOBS {
         return Err("managed model manifest references more than 64 blobs".to_string());
@@ -547,7 +547,7 @@ mod tests {
             let digest = digest_hex(&Sha256::digest(blob_bytes));
             let blob = root.join("blobs").join(format!("sha256-{digest}"));
             std::fs::write(&blob, blob_bytes).unwrap();
-            let manifest_json = serde_json::json!({
+            let manifest_json = aterm_json::json!({
                 "schemaVersion": 2,
                 "config": {
                     "mediaType": "application/vnd.ollama.image.test",
@@ -556,7 +556,7 @@ mod tests {
                 },
                 "layers": []
             });
-            std::fs::write(manifest, serde_json::to_vec(&manifest_json).unwrap()).unwrap();
+            std::fs::write(manifest, aterm_json::to_vec(&manifest_json).unwrap()).unwrap();
             seal_tree(&root);
             let leaked_digest: &'static str = Box::leak(digest.into_boxed_str());
             Self {

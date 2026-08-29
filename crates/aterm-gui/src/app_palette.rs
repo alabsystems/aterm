@@ -121,6 +121,12 @@ impl App {
         // (post-update boot, TTL-bounded by the about_to_wait sweep) drives the fading
         // celebration row. Both may be live at once — `resolve` gives staged precedence.
         let staged = self.relaunch.as_ref().map(|r| (r.build, r.version.clone()));
+        // The palette row is the cross-platform twin of the macOS Version-menu item,
+        // so it carries the same apply-lane verdict: a row that offers a restart must
+        // say when restarting has already been tried and did not work.
+        let staged_trouble = staged
+            .as_ref()
+            .and_then(|(build, _)| self.apply_trouble_for(*build));
         let realized = if self.serious_mode_enabled() {
             None
         } else {
@@ -195,6 +201,7 @@ impl App {
             // wherever the dialog genuinely cannot open.
             local_file_picker_available: crate::menu::local_file_picker_available(),
             staged,
+            staged_trouble,
             realized,
             // Reduced motion pins the realized celebration fade at full alpha.
             // Serious mode removes the decorative row altogether above.

@@ -408,29 +408,28 @@ impl TerminalHandler<'_> {
                     .chars()
                     .any(|c| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
             {
-                // CF-014: route through HyperlinkCapability. The capability
-                // gate is orthogonal to the scheme-allowlist / BiDi / length
-                // checks above — those validate the URI shape; this mints
-                // a capability iff the host has authorized OSC 8 at all.
-                if let Some(token) = self.hyperlink_auth.try_mint_capability() {
-                    // Parse id from params field (key=value pairs separated by ':')
-                    // e.g. "id=mylink" or "id=mylink:foo=bar"
-                    let id = params
-                        .get(1)
-                        .and_then(|p| std::str::from_utf8(p).ok())
-                        .and_then(|param_str| {
-                            param_str.split(':').find_map(|kv| {
-                                kv.strip_prefix("id=")
-                                    .filter(|v| !v.is_empty() && v.len() <= 256)
-                            })
-                        });
-                    super::hyperlink_auth::invoke_set_hyperlink(
-                        &mut *self.transient,
-                        token,
-                        uri,
-                        id,
-                    );
-                }
+                // The predicates above ARE the acceptance decision: a URI that
+                // clears them is carried, with no second gate behind them.
+                // Tagging a cell is not following a link — what a click may
+                // OPEN is decided in the host at press time (aterm-gui's
+                // `is_safe_url` guarding `open_url_external`, with the link
+                // caption disclosing the destination first), which is the only
+                // end where a person is present to be deceived.
+                //
+                // Parse id from params field (key=value pairs separated by ':')
+                // e.g. "id=mylink" or "id=mylink:foo=bar"
+                let id = params
+                    .get(1)
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .and_then(|param_str| {
+                        param_str.split(':').find_map(|kv| {
+                            kv.strip_prefix("id=")
+                                .filter(|v| !v.is_empty() && v.len() <= 256)
+                        })
+                    });
+                self.transient.current_hyperlink = Some(std::sync::Arc::from(uri));
+                self.transient.current_hyperlink_id = id.map(std::sync::Arc::from);
+                self.transient.update_has_transient_extras();
             }
             // Invalid URLs are silently ignored (consistent with other terminals)
         }
@@ -1349,14 +1348,14 @@ mod tests {
             "semicolon reconstruction must apply to extra-scheme URIs too"
         );
 
-        // The CF-014 capability gate still layers on top: revoking OSC 8
-        // acceptance wholesale kills minted-scheme links too.
+        // Revoking the mint is the only way back: a minted scheme is admitted
+        // for exactly as long as the host keeps it minted.
         term.process(b"\x1b]8;;\x07");
-        term.revoke_hyperlinks();
+        term.revoke_hyperlink_scheme("orca");
         term.process(b"\x1b]8;;orca://focus/w3\x07");
         assert!(
             term.current_hyperlink().is_none(),
-            "revoke_hyperlinks must gate extra-scheme URIs as well"
+            "a revoked scheme must be refused again"
         );
     }
 

@@ -167,6 +167,32 @@ pub struct Health {
     /// up-to-date install).
     #[serde(default)]
     pub last_apply_failure_build: u64,
+    /// The build the failed apply was TRYING TO REACH (0 when unknown) — the
+    /// staged artifact's own identity, as distinct from
+    /// [`Self::last_apply_failure_build`], which names the build that was
+    /// RUNNING.
+    ///
+    /// The two are different questions and only one of them was ever recorded.
+    /// `apply_failures` is expiry-bound to the RUNNING build, so staging a NEWER
+    /// artifact resets nothing: a stage that failed twice, superseded by a fresh
+    /// download, handed its streak and its reason straight to the successor, and
+    /// every surface decorated a never-attempted build with "tried twice, the new
+    /// version didn't start". This field is what lets a reader ask "is that streak
+    /// about the thing I am looking at?" and get a truthful no.
+    #[serde(default)]
+    pub last_apply_failure_target_build: u64,
+    /// Consecutive failed applies OF [`Self::last_apply_failure_target_build`],
+    /// reset the moment a different target is attempted.
+    ///
+    /// [`Self::apply_failures`] is the ESCALATION streak and is deliberately
+    /// running-build-scoped ("this machine cannot be moved through the lane"), so
+    /// it must not reset when a new artifact appears or a machine whose every
+    /// stage fails once would never escalate. But "aterm tried to update twice" is
+    /// a claim about the ARTIFACT ON OFFER, and answering it from the escalation
+    /// streak told a person their fresh download had already been attempted three
+    /// times. Two counts because there are two questions.
+    #[serde(default)]
+    pub apply_failures_for_target: u32,
     /// The most recent apply-lane REFUSAL: a verdict that stopped an apply
     /// BEFORE it could fail, in the words of whichever caller refused it.
     ///
@@ -204,7 +230,7 @@ impl Health {
     #[must_use]
     pub fn read(path: &Path) -> Self {
         crate::read_ledger_text(path)
-            .and_then(|t| toml::from_str(&t).ok())
+            .and_then(|t| aterm_toml::from_str(&t).ok())
             .unwrap_or_default()
     }
 
@@ -483,7 +509,18 @@ impl Health {
     /// observed by `current_build`. `reason` is the typed handoff/apply
     /// outcome (e.g. `ChildDied`, `AdoptionMismatch`, `ActivityRevoked`,
     /// `re-exec failed`), stored for `update status`.
-    pub fn record_apply_failure(path: &Path, current_build: u64, reason: &str) -> Self {
+    ///
+    /// `target_build` is the artifact the attempt was TRYING to reach (0 when the
+    /// caller genuinely does not know — a debug seam, or a stage already consumed).
+    /// It keys [`Self::apply_failures_for_target`], which is the count any surface
+    /// offering that build may quote; see that field for why the escalation streak
+    /// cannot answer the same question.
+    pub fn record_apply_failure(
+        path: &Path,
+        current_build: u64,
+        target_build: u64,
+        reason: &str,
+    ) -> Self {
         // ONE LOCK SCOPE, deliberately. This used to call `record_failure` (which
         // locks, writes and releases) and then re-lock to mirror the reason. Between
         // the two scopes another writer could land — `expire_stale_apply_streak` runs
@@ -499,6 +536,14 @@ impl Health {
         h.last_apply_error = reason.chars().take(400).collect();
         h.last_apply_failure_at = crate::install::now_rfc3339();
         h.last_apply_failure_build = current_build;
+        // A DIFFERENT ARTIFACT STARTS ITS OWN COUNT. Carrying the previous target's
+        // streak forward is what let a freshly-downloaded build inherit "tried
+        // twice" from the one it replaced.
+        if h.last_apply_failure_target_build != target_build {
+            h.apply_failures_for_target = 0;
+        }
+        h.apply_failures_for_target = h.apply_failures_for_target.saturating_add(1);
+        h.last_apply_failure_target_build = target_build;
         // A terminal verdict supersedes whatever refusal preceded it: leaving the
         // old "the terminal was busy" standing beside a hard failure would offer
         // an operator two competing answers to one question.
@@ -528,6 +573,8 @@ impl Health {
         h.last_apply_error = String::new();
         h.last_apply_failure_at = String::new();
         h.last_apply_failure_build = 0;
+        h.apply_failures_for_target = 0;
+        h.last_apply_failure_target_build = 0;
         if h.total_failures() == 0 {
             h.kind = String::new();
             h.failing_since = String::new();
@@ -590,10 +637,17 @@ impl Health {
         // An apply that actually went through answers every standing apply-lane
         // question, refusals included: a "the terminal was busy" left behind by an
         // earlier attempt must not outlive the attempt that succeeded.
-        if h.apply_failures == 0 && h.last_apply_refusal.is_empty() {
+        if h.apply_failures == 0
+            && h.apply_failures_for_target == 0
+            && h.last_apply_refusal.is_empty()
+        {
             return h;
         }
         h.clear_apply_refusal();
+        // The artifact-scoped count answers to the same success: whatever build just
+        // became the running build, no standing attempt survives it.
+        h.apply_failures_for_target = 0;
+        h.last_apply_failure_target_build = 0;
         if h.apply_failures > 0 {
             h.apply_failures = 0;
             h.apply_since = String::new();
@@ -628,7 +682,7 @@ impl Health {
     /// Best-effort atomic write (temp + rename), mirroring `status::record`.
     fn write(&self, path: &Path) {
         use std::sync::atomic::{AtomicU64, Ordering};
-        let Ok(text) = toml::to_string(self) else {
+        let Ok(text) = aterm_toml::to_string(self) else {
             return;
         };
         // Unique per INVOCATION (pid + a process-wide counter), not just per process:
@@ -672,7 +726,7 @@ mod tests {
         let p = tmp("acquisition-success");
         Health::record_failure(&p, "network", "dns");
         Health::record_failure(&p, "stage", "bundle would not verify");
-        Health::record_apply_failure(&p, 9, "ActivityRevoked");
+        Health::record_apply_failure(&p, 9, 900 + 9, "ActivityRevoked");
         let h = Health::read(&p);
         assert_eq!(
             (h.network_failures, h.stage_failures, h.apply_failures),
@@ -699,7 +753,7 @@ mod tests {
     fn clearing_the_apply_lane_names_the_streak_that_is_still_standing() {
         let p = tmp("apply-clear-names-standing");
         Health::record_failure(&p, "manifest", "bad signature");
-        Health::record_apply_failure(&p, 11, "AdoptionMismatch");
+        Health::record_apply_failure(&p, 11, 900 + 11, "AdoptionMismatch");
         assert_eq!(Health::read(&p).kind, "apply");
 
         let h = Health::record_apply_success(&p);
@@ -710,7 +764,7 @@ mod tests {
         // The expiry path is the same rule from the other direction.
         let p = tmp("apply-expire-names-standing");
         Health::record_failure(&p, "pipeline", "asset fetch failed");
-        Health::record_apply_failure(&p, 11, "ChildDied");
+        Health::record_apply_failure(&p, 11, 900 + 11, "ChildDied");
         let h = Health::expire_stale_apply_streak(&p, 12);
         assert_eq!(h.apply_failures, 0, "a streak from another build is stale");
         assert_eq!(h.pipeline_failures, 1);
@@ -724,7 +778,7 @@ mod tests {
     #[test]
     fn an_apply_failure_records_its_streak_and_its_reason_together() {
         let p = tmp("apply-failure-atomic");
-        let h = Health::record_apply_failure(&p, 77, "AdoptionMismatch");
+        let h = Health::record_apply_failure(&p, 77, 900 + 77, "AdoptionMismatch");
         assert_eq!(h.apply_failures, 1);
         assert_eq!(h.kind, "apply");
         assert_eq!(h.last_apply_error, "AdoptionMismatch");
@@ -747,7 +801,7 @@ mod tests {
     #[test]
     fn each_failure_class_carries_its_own_clock() {
         let p = tmp("per-class-clock");
-        Health::record_apply_failure(&p, 5, "ActivityRevoked");
+        Health::record_apply_failure(&p, 5, 900 + 5, "ActivityRevoked");
         let after_apply = Health::read(&p);
         assert_eq!(after_apply.apply_failures, 1);
         assert!(!after_apply.failing_since.is_empty());
@@ -822,8 +876,8 @@ mod tests {
     #[test]
     fn a_healthy_check_never_clears_the_apply_streak() {
         let p = tmp("apply-survives-check");
-        Health::record_apply_failure(&p, 77, "AdoptionMismatch");
-        Health::record_apply_failure(&p, 77, "ActivityRevoked");
+        Health::record_apply_failure(&p, 77, 900 + 77, "AdoptionMismatch");
+        Health::record_apply_failure(&p, 77, 900 + 77, "ActivityRevoked");
         let h = Health::read(&p);
         assert_eq!(h.apply_failures, 2);
         assert_eq!(h.kind, "apply");
@@ -892,7 +946,7 @@ mod tests {
         assert_eq!(Health::read(&p).last_apply_refusal, quiet);
 
         // A hard failure supersedes it — one standing answer, never two.
-        Health::record_apply_failure(&p, 77, "ChildDied");
+        Health::record_apply_failure(&p, 77, 900 + 77, "ChildDied");
         let h = Health::read(&p);
         assert!(!h.apply_refusal_applies_to(812));
         assert!(h.last_apply_refusal.is_empty());
@@ -910,6 +964,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
+    /// TWO COUNTS, BECAUSE THERE ARE TWO QUESTIONS.
+    ///
+    /// `apply_failures` answers "can this machine be moved through the lane at all?"
+    /// and is expiry-bound to the RUNNING build, so it deliberately survives a new
+    /// download — otherwise a machine whose every stage fails once would never
+    /// escalate. But a window offering a build says "aterm tried to update twice",
+    /// which is a claim about THAT ARTIFACT, and answering it from the escalation
+    /// streak told a person their fresh download had already been attempted. The
+    /// artifact-scoped pair below is what a surface may quote.
+    #[test]
+    fn the_artifact_scoped_count_restarts_with_the_artifact_and_the_escalation_does_not() {
+        let p = tmp("apply-target-scope");
+        Health::record_apply_failure(&p, 77, 500, "handoff proof ended ChildDied");
+        Health::record_apply_failure(&p, 77, 500, "handoff proof ended ChildDied");
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 2);
+        assert_eq!(h.apply_failures_for_target, 2);
+        assert_eq!(h.last_apply_failure_target_build, 500);
+
+        // A NEWER ARTIFACT IS A NEW QUESTION. The escalation streak keeps counting
+        // (the machine still has not moved); the artifact's own count starts over.
+        Health::record_apply_failure(&p, 77, 501, "handoff proof ended TimedOut");
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 3, "the machine still has not moved");
+        assert_eq!(
+            h.apply_failures_for_target, 1,
+            "…but THIS build has been tried exactly once"
+        );
+        assert_eq!(h.last_apply_failure_target_build, 501);
+
+        // Both expire together when the running build proves the streak stale.
+        Health::expire_stale_apply_streak(&p, 78);
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 0);
+        assert_eq!(h.apply_failures_for_target, 0);
+        assert_eq!(h.last_apply_failure_target_build, 0);
+
+        // …and an apply that actually lands clears the artifact-scoped pair even
+        // when it is the only thing standing.
+        Health::record_apply_failure(&p, 78, 900, "handoff proof ended ChildDied");
+        Health::record_apply_success(&p);
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures_for_target, 0);
+        assert_eq!(h.last_apply_failure_target_build, 0);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
     /// An apply streak recorded by a DIFFERENT running build is proven stale
     /// and expires; the same build's streak stands. The m3 field case: 2,191
     /// counted failures presented as `persistent=true` on a machine that had
@@ -918,7 +1019,7 @@ mod tests {
     fn an_apply_streak_expires_once_a_different_build_is_running() {
         let p = tmp("apply-expiry");
         for _ in 0..PERSISTENT_AFTER {
-            Health::record_apply_failure(&p, 77, "handoff proof ended TimedOut");
+            Health::record_apply_failure(&p, 77, 900 + 77, "handoff proof ended TimedOut");
         }
         let h = Health::read(&p);
         assert!(h.is_persistent());
@@ -948,7 +1049,7 @@ mod tests {
         // An interleaved acquisition failure keeps ITS OWN streak through the
         // apply expiry — the lanes never launder each other.
         Health::record_failure(&p, "network", "dns");
-        Health::record_apply_failure(&p, 78, "ChildDied");
+        Health::record_apply_failure(&p, 78, 900 + 78, "ChildDied");
         Health::expire_stale_apply_streak(&p, 79);
         let h = Health::read(&p);
         assert_eq!(h.apply_failures, 0);
@@ -963,7 +1064,7 @@ mod tests {
     fn a_persistent_apply_streak_is_surfaced_like_a_persistent_pipeline_streak() {
         let p = tmp("apply-persistent");
         for _ in 0..PERSISTENT_AFTER {
-            Health::record_apply_failure(&p, 77, "ChildDied");
+            Health::record_apply_failure(&p, 77, 900 + 77, "ChildDied");
         }
         let h = Health::read(&p);
         assert_eq!(h.apply_failures, PERSISTENT_AFTER);

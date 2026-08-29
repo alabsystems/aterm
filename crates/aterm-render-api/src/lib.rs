@@ -77,13 +77,13 @@ impl Frame {
     pub fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, self.width as u32, self.height as u32);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, self.width as u32, self.height as u32);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             // Frame RGB is canonical non-linear sRGB. Emit the sRGB chunk so
             // wide-gamut/HDR viewers never have to guess how `image` bytes
             // should be interpreted.
-            enc.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+            enc.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
             let mut w = enc.write_header().expect("png header");
             w.write_image_data(&self.rgba_bytes()).expect("png data");
         }
@@ -216,13 +216,13 @@ mod tests {
     fn png_preserves_converted_frame_alpha() {
         let frame = alpha_fixture();
         let png = frame.to_png();
-        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+        let mut reader = aterm_png::Decoder::new(std::io::Cursor::new(png))
             .read_info()
             .expect("decode header");
-        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        assert_eq!(reader.info().color_type, aterm_png::ColorType::Rgba);
         assert_eq!(
             reader.info().srgb,
-            Some(png::SrgbRenderingIntent::Perceptual),
+            Some(aterm_png::SrgbRenderingIntent::Perceptual),
             "renderer PNGs carry explicit sRGB metadata"
         );
         let mut decoded = vec![0; reader.output_buffer_size()];

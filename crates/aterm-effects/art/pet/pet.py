@@ -87,7 +87,7 @@ class Pose:
 
     # face
     eyes: str = "open"       # open | happy | closed | squint | halflid | wide | wink
-    mouth: str = "smile"     # smile | open | flat | oof | none
+    mouth: str = "smile"     # smile | open | flat | oof | yawn | none
     blush: bool = True
     gaze: tuple = (0.0, 0.0)
 
@@ -521,6 +521,10 @@ def eye_paths(p: Pose):
     if p.eyes == "halflid":
         return [_half(near, rn, 1), _half(far, rfx, -1)]
     if p.eyes == "wink":
+        # The NEAR eye is the closed one (an arc), the FAR eye stays open —
+        # and the iris/pupil/catch-light stack below follows the same split:
+        # far eye only. A stack painted on the near side would land on the
+        # closed arc and leave the open eye a solid black dot.
         return [_arc_eye(near, rn), ellipse(far[0], far[1], rfx, rfy * 1.06)]
     k = 1.22 if p.eyes == "wide" else 1.06
     return [ellipse(near[0], near[1], rn, rn * k),
@@ -573,12 +577,13 @@ def iris_paths(p: Pose):
         return []
     near, far = eye_centres(p)
     _, rfx, rfy = eye_scales(p)
-    out = [ellipse(near[0], near[1], 6.2, 6.8)]
-    if p.eyes != "wink":
-        # the far iris keeps the near iris's share of ITS eye (6.2/8.6 wide,
-        # 6.8/9.1 tall), so it foreshortens exactly with the aperture
-        frx, fry = (6.2, 6.8) if p.front else (rfx * 0.71, rfy * 0.79)
-        out.append(ellipse(far[0], far[1], frx, fry))
+    # On a wink the NEAR eye is the closed one (`eye_paths`), so the iris —
+    # and the pupil and catch-light that ride on it — goes to the FAR (open)
+    # eye only. An earlier branch had this backwards: the stack sat on the
+    # closed arc and the open eye rendered as a solid black dot.
+    out = [] if p.eyes == "wink" else [ellipse(near[0], near[1], 6.2, 6.8)]
+    frx, fry = (6.2, 6.8) if p.front else (rfx * 0.71, rfy * 0.79)
+    out.append(ellipse(far[0], far[1], frx, fry))
     return out
 
 
@@ -589,11 +594,10 @@ def pupil_paths(p: Pose):
     _, rfx, rfy = eye_scales(p)
     gx, gy = p.gaze
     k = 1.9 if p.eyes == "wide" else 2.5
-    out = [ellipse(near[0] + gx, near[1] + gy, 2.9, 6.4 / k * 2.5 * 0.62)]
-    if p.eyes != "wink":
-        frx, fh = (2.9, 6.4) if p.front else (rfx * 0.33, rfy * 0.74)
-        fgx = gx if p.front else gx * 0.85
-        out.append(ellipse(far[0] + fgx, far[1] + gy, frx, fh / k * 2.5 * 0.62))
+    out = [] if p.eyes == "wink" else [ellipse(near[0] + gx, near[1] + gy, 2.9, 6.4 / k * 2.5 * 0.62)]
+    frx, fh = (2.9, 6.4) if p.front else (rfx * 0.33, rfy * 0.74)
+    fgx = gx if p.front else gx * 0.85
+    out.append(ellipse(far[0] + fgx, far[1] + gy, frx, fh / k * 2.5 * 0.62))
     return out
 
 
@@ -602,13 +606,12 @@ def catchlight_paths(p: Pose):
         return []
     near, far = eye_centres(p)
     _, rfx, rfy = eye_scales(p)
-    out = [ellipse(near[0] - 2.6, near[1] - 3.4, 2.5, 2.5)]
-    if p.eyes != "wink":
-        if p.front:
-            out.append(ellipse(far[0] - 2.6, far[1] - 3.4, 2.5, 2.5))
-        else:
-            out.append(ellipse(far[0] - rfx * 0.32, far[1] - rfy * 0.42,
-                               rfx * 0.29, rfx * 0.29))
+    out = [] if p.eyes == "wink" else [ellipse(near[0] - 2.6, near[1] - 3.4, 2.5, 2.5)]
+    if p.front:
+        out.append(ellipse(far[0] - 2.6, far[1] - 3.4, 2.5, 2.5))
+    else:
+        out.append(ellipse(far[0] - rfx * 0.32, far[1] - rfy * 0.42,
+                           rfx * 0.29, rfx * 0.29))
     return out
 
 
@@ -627,14 +630,31 @@ def nose_paths(p: Pose):
             cx, cy = face_anchor(p, dog_snout_dx(p), 0.56)
         else:
             cx, cy = face_anchor(p, dog_snout_dx(p) + lerp(0.28, 0.34, p.yaw), 0.58)
-        return [blob(cx, cy, [(0, 5.4), (55, 7.2), (110, 6.6), (180, 5.6),
-                              (250, 6.6), (305, 7.2)])]
+        gape = []
+        if p.mouth == "yawn":
+            mcx, mcy = face_anchor(p, dog_snout_dx(p) + (0.0 if p.front else lerp(0.28, 0.34, p.yaw)), 0.62)
+            gape.append(blob(mcx, mcy + 9.6, [(0, 7.4), (60, 9.2), (120, 9.6), (180, 9.0),
+                                              (240, 9.6), (300, 9.2)]))
+        return gape + [blob(cx, cy, [(0, 5.4), (55, 7.2), (110, 6.6), (180, 5.6),
+                                     (250, 6.6), (305, 7.2)])]
+    out = []
+    if p.mouth == "yawn":
+        # The yawn's GAPE is painted TWICE: here in the nose layer (nose
+        # rose) as well as in `mouth_paths`. The bake (`pet_baker.rs`) culls
+        # the `mouth` role below `MOUTH_DETAIL_MIN_H` = 40 px, and the ship
+        # tile is 34 px tall — so a yawn authored only as a mouth has no
+        # mouth at the one size that matters. The nose role is never culled;
+        # at >= 40 px the dark mouth blob paints exactly over this one, so
+        # nothing doubles up where both survive.
+        mcx, mcy = face_anchor(p, muzzle_dx(p), 0.38)
+        out.append(blob(mcx, mcy + 9.6, [(0, 7.4), (60, 9.2), (120, 9.6), (180, 9.0),
+                                          (240, 9.6), (300, 9.2)]))
     # the nose slides DOWN the muzzle as the head yaws — with the eyes lifted
     # and the muzzle pushed forward, this is what keeps the pink triangle from
     # clipping the near eye's lower lid
     cx, cy = face_anchor(p, muzzle_dx(p), lerp(0.26, 0.32, 0.0 if p.front else p.yaw))
-    return [catmull_closed([(cx - 5.2, cy - 2.6), (cx + 5.2, cy - 2.6),
-                            (cx, cy + 5.0)], tension=0.22)]
+    return out + [catmull_closed([(cx - 5.2, cy - 2.6), (cx + 5.2, cy - 2.6),
+                                  (cx, cy + 5.0)], tension=0.22)]
 
 
 def mouth_paths(p: Pose):
@@ -665,6 +685,13 @@ def mouth_paths(p: Pose):
     if p.mouth == "open":
         return [blob(cx, cy + 8.0, [(0, 5.4), (60, 6.8), (120, 7.0), (180, 6.8),
                                     (240, 7.0), (300, 6.8)])]
+    if p.mouth == "yawn":
+        # The pre-sleep yawn: the open blob grown ~1.4x and dropped a step,
+        # so the gape reads as a yawn where the plain "open" reads as a meow.
+        # Below the mouth cull this layer is gone — `nose_paths` carries the
+        # same blob for the ship size.
+        return [blob(cx, cy + 9.6, [(0, 7.4), (60, 9.2), (120, 9.6), (180, 9.0),
+                                    (240, 9.6), (300, 9.2)])]
     if p.mouth == "oof":
         # The landing's grunt: a small round "oof", ~60% of the open mouth.
         # The full open blob smears the whole muzzle to a black clot at

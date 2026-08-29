@@ -84,9 +84,9 @@ impl Canvas {
     fn save(&self, path: &str) {
         let file = std::fs::File::create(path).expect("create png");
         let mut enc =
-            png::Encoder::new(std::io::BufWriter::new(file), self.w as u32, self.h as u32);
-        enc.set_color(png::ColorType::Rgb);
-        enc.set_depth(png::BitDepth::Eight);
+            aterm_png::Encoder::new(std::io::BufWriter::new(file), self.w as u32, self.h as u32);
+        enc.set_color(aterm_png::ColorType::Rgb);
+        enc.set_depth(aterm_png::BitDepth::Eight);
         enc.write_header()
             .expect("png header")
             .write_image_data(&self.rgb)

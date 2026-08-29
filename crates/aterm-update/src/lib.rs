@@ -134,6 +134,9 @@ mod status;
 mod sys;
 #[cfg(target_os = "macos")]
 mod verify;
+// Not macOS-only: every platform names the copy of aterm it is running (S12 of
+// `docs/DESIGN-which-copy-runs-2026-08-27.md`); only the other-copy probe is `.app`-shaped.
+pub mod which_copy;
 
 /// Hard cap for every small TOML ledger/marker consumed by the updater. The cap is
 /// checked on the opened descriptor before allocation or parsing, then enforced again
@@ -283,13 +286,11 @@ pub const PINNED_UPDATE_PUBKEYS: &[&str] = aterm_update_core::pins::UPDATE_CHANN
 /// literal that an optimizer may transform or eliminate.
 pub fn update_pubkey_sha256(encoded: &str) -> Result<Option<String>, String> {
     use aterm_digest::Sha256;
-    use base64::Engine as _;
 
     if encoded.is_empty() {
         return Ok(None);
     }
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
+    let raw = aterm_codec::base64::decode_strict(encoded.as_bytes())
         .map_err(|_| "compiled update public key is not standard base64".to_string())?;
     if raw.len() != 32 {
         return Err(format!(
@@ -449,19 +450,71 @@ pub fn preverify_staged_for_handoff(
 /// which one it is decides whether the answer is "your machine was too busy" or
 /// "these two builds cannot hand off to each other".
 ///
+/// `target_build` names the artifact the attempt was trying to reach; see
+/// [`health::Health::apply_failures_for_target`].
+///
+/// RETURNS WHAT IT JUST WROTE, and callers with a surface are expected to use it.
+/// The GUI's ledger write happens on the event loop, but the facts that carry the
+/// count and the reason BACK to the window are gathered by a worker that has
+/// already run — so the first failed apply was durably recorded and then not
+/// mentioned by the menu, the palette or the update card until some later,
+/// unrelated reconcile happened to land. The first failure is precisely the one a
+/// person is entitled to hear about, so the writer hands the numbers straight back
+/// rather than making the reader wait for a re-read.
+///
+/// `None` means nothing was recorded (no staging root); it must NOT be read as
+/// "zero failures", or a surface would erase a streak it merely failed to observe.
+///
 /// Best-effort by construction: observability must never be able to block or fail
 /// an update.
 #[cfg(target_os = "macos")]
-pub fn record_apply_failure(current_build: u64, reason: &str) {
-    let Some(staging) = paths::Staging::resolve() else {
-        return;
-    };
-    health::Health::record_apply_failure(&staging.health(), current_build, reason);
+pub fn record_apply_failure(
+    current_build: u64,
+    target_build: u64,
+    reason: &str,
+) -> Option<RecordedApplyFailure> {
+    let staging = paths::Staging::resolve()?;
+    let ledger = health::Health::record_apply_failure(
+        &staging.health(),
+        current_build,
+        target_build,
+        reason,
+    );
     status::record(
         &staging,
         current_build,
         &format!("staged build did not apply: {reason}"),
     );
+    let persistent = ledger.is_persistent();
+    Some(RecordedApplyFailure {
+        apply_failures: ledger.apply_failures,
+        failures_for_target: ledger.apply_failures_for_target,
+        target_build: ledger.last_apply_failure_target_build,
+        reason: ledger.last_apply_error,
+        persistent,
+    })
+}
+
+/// Exactly what one [`record_apply_failure`] left in the ledger, read back from
+/// inside the same lock scope that wrote it.
+///
+/// Taken under the write lock on purpose: a second read to fetch these numbers
+/// could interleave with `expire_stale_apply_streak` (which runs on the check
+/// lane's own cadence) and report a streak that no longer matches the one just
+/// recorded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordedApplyFailure {
+    /// The ESCALATION streak after this write (`UpdateStatus::failing_applies`).
+    pub apply_failures: u32,
+    /// Consecutive failures of [`Self::target_build`] after this write.
+    pub failures_for_target: u32,
+    /// The artifact this failure was about (0 when the caller did not know one).
+    pub target_build: u64,
+    /// The stored reason, already truncated exactly as the ledger stores it.
+    pub reason: String,
+    /// Whether the ledger now reads as persistently failing — the loud verdict, so
+    /// a surface can escalate at the write instead of at the next check.
+    pub persistent: bool,
 }
 
 /// Record that an apply SUCCEEDED — the staged build is the running build now.
@@ -522,7 +575,13 @@ pub fn record_apply_refusal(current_build: u64, reason: &str) {
 
 /// Non-macOS: no apply lane exists, so there is nothing to record.
 #[cfg(not(target_os = "macos"))]
-pub fn record_apply_failure(_current_build: u64, _reason: &str) {}
+pub fn record_apply_failure(
+    _current_build: u64,
+    _target_build: u64,
+    _reason: &str,
+) -> Option<RecordedApplyFailure> {
+    None
+}
 
 /// Non-macOS counterpart to [`record_apply_success`].
 #[cfg(not(target_os = "macos"))]
@@ -539,14 +598,25 @@ pub fn record_apply_refusal(_current_build: u64, _reason: &str) {}
 /// independently. Consumers that need apply-lane detail (today: the control
 /// socket's `update` reply) read this alongside it.
 ///
-/// The apply-failure STREAK is deliberately absent: `UpdateStatus::failing_applies`
+/// The ESCALATION streak is deliberately absent: `UpdateStatus::failing_applies`
 /// already carries it, and two reads of one ledger racing each other could disagree
-/// about a number that has exactly one source of truth. This carries only what
-/// nothing else reports — the REASONS.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// about a number that has exactly one source of truth. This carries what nothing
+/// else reports — the REASONS, and the artifact those reasons are about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApplyLaneReport {
     /// Reason of the most recent apply failure; empty when none is standing.
     pub last_failure: String,
+    /// The build [`Self::last_failure`] was trying to reach (0 when unknown), and
+    /// [`Self::failures_for_target`] the number of consecutive attempts on THAT
+    /// artifact. Read together they answer the only question a surface offering a
+    /// staged build can act on: has THIS one been tried, and how often?
+    ///
+    /// `failing_applies` cannot answer it. That streak is expiry-bound to the
+    /// RUNNING build, so a newer download inherits the count and the reason of the
+    /// artifact it replaced.
+    pub last_failure_target_build: u64,
+    /// See [`Self::last_failure_target_build`].
+    pub failures_for_target: u32,
     /// Reason of the most recent apply REFUSAL — a verdict that stopped an apply
     /// before it could fail. Empty once an apply succeeds or hard-fails.
     pub last_refusal: String,
@@ -568,6 +638,8 @@ pub fn apply_lane_report(current_build: u64) -> Option<ApplyLaneReport> {
     let standing = ledger.apply_refusal_applies_to(current_build);
     Some(ApplyLaneReport {
         last_failure: ledger.last_apply_error,
+        last_failure_target_build: ledger.last_apply_failure_target_build,
+        failures_for_target: ledger.apply_failures_for_target,
         last_refusal: if standing {
             ledger.last_apply_refusal
         } else {
@@ -805,6 +877,16 @@ pub fn set_uncommitted_handoff_candidate(uncommitted: bool) {
 pub fn is_uncommitted_handoff_candidate() -> bool {
     UNCOMMITTED_CANDIDATE.load(std::sync::atomic::Ordering::SeqCst)
 }
+
+/// Consecutive unconfirmed launches after which a freshly-swapped build is
+/// auto-reverted to its predecessor and marked failed.
+///
+/// Exposed because a caller that DECLINES to forgive a counted trial launch is
+/// spending this budget, and the two have to be reasoned about together: a retry
+/// schedule longer than this walks a healthy build into the revert. `aterm-gui`'s
+/// handoff lane compile-time-asserts its structural budget against it.
+#[cfg(target_os = "macos")]
+pub const MAX_BOOT_ATTEMPTS: u32 = install::MAX_BOOT_ATTEMPTS;
 
 /// Launches the boot sentinel has counted for `build` right now — the snapshot a
 /// parent takes before launching a candidate.
@@ -1781,14 +1863,14 @@ const DEFERRED_WINDOW_INTERVALS: u32 = 2;
 #[cfg(target_os = "macos")]
 fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<&'static str> {
     let text = read_ledger_text(&staging.status)?;
-    let v = text.parse::<toml::Value>().ok()?;
-    let updated = v.get("updated_at").and_then(toml::Value::as_str)?;
+    let v = text.parse::<aterm_toml::Value>().ok()?;
+    let updated = v.get("updated_at").and_then(aterm_toml::Value::as_str)?;
     if updated.is_empty() {
         return None;
     }
     let deferred = v
         .get("outcome")
-        .and_then(toml::Value::as_str)
+        .and_then(aterm_toml::Value::as_str)
         .is_some_and(|outcome| outcome.contains("deferred"));
     let window = if deferred {
         base.saturating_mul(DEFERRED_WINDOW_INTERVALS)
@@ -1815,23 +1897,23 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
     let (mut checked_from_build, mut outcome, mut updated_at) =
         (current_build, String::new(), String::new());
     if let Some(text) = read_ledger_text(&staging.status)
-        && let Ok(v) = text.parse::<toml::Value>()
+        && let Ok(v) = text.parse::<aterm_toml::Value>()
     {
         // Best-effort (via `u64::try_from` — the verifier cannot lower i64<->u64
         // `as` casts): absent or negative reads keep the running build.
         checked_from_build = v
             .get("current_build")
-            .and_then(toml::Value::as_integer)
+            .and_then(aterm_toml::Value::as_integer)
             .and_then(|n| u64::try_from(n).ok())
             .unwrap_or(checked_from_build);
         outcome = v
             .get("outcome")
-            .and_then(toml::Value::as_str)
+            .and_then(aterm_toml::Value::as_str)
             .unwrap_or("")
             .to_string();
         updated_at = v
             .get("updated_at")
-            .and_then(toml::Value::as_str)
+            .and_then(aterm_toml::Value::as_str)
             .unwrap_or("")
             .to_string();
     }
@@ -2228,16 +2310,14 @@ mod commit_match_tests {
 
     #[test]
     fn update_pin_fingerprint_hashes_decoded_key_and_fails_closed() {
-        use base64::Engine as _;
-
-        let encoded = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let encoded = aterm_codec::base64::encode(&[0_u8; 32]).unwrap();
         assert_eq!(
             update_pubkey_sha256(&encoded).unwrap().as_deref(),
             Some("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
         );
         assert_eq!(update_pubkey_sha256("").unwrap(), None);
         assert!(update_pubkey_sha256("not-base64").is_err());
-        let short = base64::engine::general_purpose::STANDARD.encode([0_u8; 31]);
+        let short = aterm_codec::base64::encode(&[0_u8; 31]).unwrap();
         assert!(update_pubkey_sha256(&short).is_err());
 
         let compiled = compiled_update_pin_sha256();

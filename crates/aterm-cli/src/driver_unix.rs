@@ -89,7 +89,17 @@ fn eintr() -> bool {
 /// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
 /// returns the shell's exit status (non-exit → 1). The body is the parent-side
 /// session loop moved verbatim from `main()`.
-pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose: bool) -> i32 {
+///
+/// `engine` is `None` for an ordinary session — the VT model is demand-driven
+/// and off by default (`$ATERM_SESSION_MODEL`, `aterm_cli::session_model_armed`).
+/// Only the two `if let` arms below depend on it; everything the SHELL can
+/// observe — the stdout passthrough and the `TIOCSWINSZ` forwarded to the PTY —
+/// is unconditional, so a session behaves identically with the model absent.
+pub(crate) fn run(
+    shell: aterm_pty::SpawnedShell,
+    mut engine: Option<&mut Terminal>,
+    verbose: bool,
+) -> i32 {
     let master = shell.master;
 
     // PARENT.
@@ -127,11 +137,16 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose
 
     loop {
         // Apply a pending resize before blocking: tell the PTY (so full-screen
-        // apps reflow) and the engine model.
+        // apps reflow) and, when one is armed, the engine model. The ioctl is
+        // NOT inside the `if let`: the PTY is what every full-screen app reads
+        // its geometry from, and it must be told whether or not anything is
+        // modelling the screen. Nothing else in this process holds a size.
         if GOT_WINCH.swap(false, Ordering::Relaxed) {
             let mut nws = host_winsize_raw();
             unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &mut nws) };
-            engine.resize(nws.ws_row, nws.ws_col);
+            if let Some(engine) = engine.as_deref_mut() {
+                engine.resize(nws.ws_row, nws.ws_col);
+            }
         }
 
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
@@ -160,7 +175,9 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose
             }
         }
 
-        // shell output -> host terminal (passthrough) AND the engine (model).
+        // shell output -> host terminal (passthrough), and the engine (model)
+        // only when one is armed. The write comes FIRST either way, so the
+        // bytes are out the door before anything else touches them.
         if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let r = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if r < 0 && eintr() {
@@ -171,7 +188,9 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose
             }
             let out = &buf[..r as usize];
             write_all(libc::STDOUT_FILENO, out);
-            engine.process(out);
+            if let Some(engine) = engine.as_deref_mut() {
+                engine.process(out);
+            }
             bytes_in += out.len() as u64;
         }
     }
@@ -189,7 +208,15 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose
         libc::waitpid(-1, &mut status, 0);
     }
     if verbose {
-        eprintln!("\r\n[aterm] session ended — engine processed {bytes_in} bytes via the VT core.");
+        // Say which session this was. The old wording claimed the VT core had
+        // processed every byte, which is now true only when the model is armed —
+        // and a summary that overstates is worse than no summary.
+        let modelled = if engine.is_some() {
+            "and into the armed VT core"
+        } else {
+            "(session model off: nothing modelled)"
+        };
+        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through {modelled}.");
     }
     if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)

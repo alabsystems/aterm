@@ -23,9 +23,10 @@
 //! above it. That is deliberate: a reason is prose, and prose crammed into a
 //! TOML string loses its line breaks and its editability. It also means every
 //! read/write of this file MUST preserve comments, which is exactly why the
-//! parser is `toml_edit` and not a hand-rolled reader: [`Policy::render`]
-//! returns the parsed document byte-for-byte, so a future `--update` that adds a
-//! key cannot silently eat the paragraph explaining why `winnow` is forked.
+//! parser is `aterm-toml`'s document model and not a hand-rolled reader:
+//! [`Policy::render`] returns the parsed document byte-for-byte, so a future
+//! `--update` that adds a key cannot silently eat the paragraph explaining why
+//! `winit` is forked.
 //!
 //! # Fail-closed, both ways
 //!
@@ -38,20 +39,22 @@
 //!
 //! # Version drift silently un-uses a patch
 //!
-//! `[patch.crates-io] winnow = { path = "vendor/winnow" }` only takes effect
-//! while the vendored manifest's version still satisfies the requirement the
-//! graph asks for. Bump `vendor/winnow/Cargo.toml` to `0.8.0` and every
-//! `winnow = "0.7"` in the graph quietly resolves to the *registry* copy again —
+//! `[patch.crates-io] indexmap = { path = "vendor/indexmap" }` only takes
+//! effect while the vendored manifest's version still satisfies the requirement
+//! the graph asks for. Bump `vendor/indexmap/Cargo.toml` to `3.0.0` and every
+//! `indexmap = "2"` in the graph quietly resolves to the *registry* copy again —
 //! the fix is gone, nothing fails, and the only visible trace is a line in
 //! `Cargo.lock`. [`patch_entries`] therefore reads the lock and reports, per
 //! entry, the version the lock actually resolved for the path package and any
 //! registry-sourced copies of the same name that coexist with it.
 
 use crate::model::Cell;
-use aterm_census::scan_set::{REVIEWED_VENDORED_CRATES, VendoredMode};
+use aterm_census::scan_set::{
+    PatchTargetKind, REVIEWED_VENDORED_CRATES, VendoredMode, classify_patch_target,
+};
+use aterm_toml::edit::{DocumentMut, Item, TableLike};
 use std::fmt::Write as _;
 use std::path::Path;
-use toml_edit::{DocumentMut, Item, TableLike};
 
 /// The ledger's path, relative to the workspace root.
 pub const POLICY_PATH: &str = "vendor/forge.toml";
@@ -524,17 +527,43 @@ pub struct PatchEntry {
     /// (the source-less entry). `None` when the lock has no path copy at all —
     /// i.e. the patch is not in effect.
     pub lock_version: Option<String>,
-    /// Registry-sourced versions of the SAME NAME that coexist with the fork.
-    /// Non-empty means the fix is not everywhere the name is: `winnow 1.0.3`
-    /// rides in beside the forked `winnow 0.7.15` on Linux.
+    /// Registry-sourced versions of the SAME NAME that coexist with the fork,
+    /// read from `Cargo.lock` alone.
+    ///
+    /// Non-empty is a QUESTION, not a verdict, and the distinction was learned
+    /// from a false positive. It was the shape that held on Linux until
+    /// 2026-08-27, when registry `winnow 1.0.3` rode in beside the
+    /// `winnow 0.7.15` this repository forked and the fix was absent from the
+    /// copy that compiled. It is ALSO the shape of a dev-only differential
+    /// oracle — `crates/aterm-alloc` dev-depends on registry `arrayvec =0.7.7`
+    /// precisely so its differential is not the shim compared with itself — and
+    /// that copy compiles into nothing aterm ships.
+    ///
+    /// The lock records no edge kinds, so this field cannot tell them apart.
+    /// Whether a sibling is a DEFECT is decided against the per-cell
+    /// `--edges normal` graph, by `[OB-12]` in [`crate::check`] and by
+    /// `no_fork_is_shadowed_by_an_unpatched_registry_copy`.
     pub shadowed_by: Vec<String>,
+    /// What the replacement IS: third-party source under `vendor/`, or a
+    /// first-party workspace member under `crates/`. Read from the path by
+    /// [`aterm_census::scan_set::classify_patch_target`], so forge and the
+    /// census cannot disagree about which obligations apply.
+    pub kind: PatchTargetKind,
 }
 
 impl PatchEntry {
     /// The patch is in effect: the lock resolved the path copy at exactly the
-    /// version the vendored manifest declares.
+    /// version the patched manifest declares.
     pub fn is_live(&self) -> bool {
         self.lock_version.as_deref() == Some(self.manifest_version.as_str())
+    }
+
+    /// A VENDORED fork: third-party source this repository redistributes, and
+    /// therefore owes the provenance obligations and a fork-ledger block.
+    /// FALSE for a first-party replacement, which owes neither — that is the
+    /// whole distinction this type now carries.
+    pub fn is_vendored(&self) -> bool {
+        self.kind == PatchTargetKind::Vendored
     }
 }
 
@@ -588,7 +617,8 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
             )
         })?;
 
-        let (pkg_name, manifest_version, license) = vendored_manifest(root, path)?;
+        let kind = classify_patch_target(name, path, root)?;
+        let (pkg_name, manifest_version, license) = patched_manifest(root, path, kind)?;
         if pkg_name != name {
             return Err(format!(
                 "{}/Cargo.toml declares package `{pkg_name}` but it is patched in as \
@@ -614,18 +644,38 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
             license,
             lock_version,
             shadowed_by,
+            kind,
         });
     }
     Ok(out)
 }
 
-/// `(name, version, license)` from a vendored crate's own manifest.
-fn vendored_manifest(root: &Path, rel: &str) -> Result<(String, String, String), String> {
+/// `(name, version, license)` from a patched crate's own manifest.
+///
+/// The LITERAL requirement is a `vendor/` rule, not a patch rule. A vendored
+/// fork is outside the workspace — `version.workspace = true` in `vendor/x`
+/// resolves against nothing, so an inherited key there is a defect worth a
+/// named error. A FIRST-PARTY patch target is a workspace MEMBER, where
+/// inheritance is the house style and every other crate uses it; demanding
+/// literals there would be demanding that one member be written unlike all the
+/// others for no reason anyone could state. So inheritance is resolved from
+/// `[workspace.package]` for the first-party arm, and refused for the
+/// vendored one.
+///
+/// `version` stays literal even first-party in practice: the shim's version is
+/// a SEMVER CONTRACT with its third-party consumers (`^0.1.4x`), not an aterm
+/// release number — but that is the crate's business to state, not this
+/// function's to enforce.
+fn patched_manifest(
+    root: &Path,
+    rel: &str,
+    kind: PatchTargetKind,
+) -> Result<(String, String, String), String> {
     let path = root.join(rel).join("Cargo.toml");
     let text = std::fs::read_to_string(&path).map_err(|e| {
         format!(
             "cannot read {} ({e}) — `[patch.crates-io]` points at `{rel}`, so that directory \
-             must contain the vendored crate. Restore it, or delete the patch entry",
+             must contain the patched crate. Restore it, or delete the patch entry",
             path.display()
         )
     })?;
@@ -636,17 +686,55 @@ fn vendored_manifest(root: &Path, rel: &str) -> Result<(String, String, String),
         .get("package")
         .and_then(Item::as_table_like)
         .ok_or_else(|| format!("{}: no `[package]` table", path.display()))?;
-    let get =
-        |key: &str| -> Result<String, String> {
-            pkg.get(key).and_then(Item::as_str).map(str::to_string).ok_or_else(|| {
-            format!(
+    // `[workspace.package]` of the ROOT, read lazily and only for the
+    // first-party arm.
+    let inherited = |key: &str| -> Option<String> {
+        if kind != PatchTargetKind::FirstParty {
+            return None;
+        }
+        // `key.workspace = true` is the only inheritance form cargo accepts.
+        let claims_inheritance = pkg
+            .get(key)
+            .and_then(Item::as_table_like)
+            .and_then(|t| t.get("workspace"))
+            .and_then(Item::as_bool)
+            .unwrap_or(false);
+        if !claims_inheritance {
+            return None;
+        }
+        let root_text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+        let root_doc: DocumentMut = root_text.parse().ok()?;
+        root_doc
+            .get("workspace")
+            .and_then(Item::as_table_like)
+            .and_then(|w| w.get("package"))
+            .and_then(Item::as_table_like)
+            .and_then(|p| p.get(key))
+            .and_then(Item::as_str)
+            .map(str::to_string)
+    };
+    let get = |key: &str| -> Result<String, String> {
+        if let Some(v) = pkg.get(key).and_then(Item::as_str) {
+            return Ok(v.to_string());
+        }
+        if let Some(v) = inherited(key) {
+            return Ok(v);
+        }
+        Err(match kind {
+            PatchTargetKind::Vendored => format!(
                 "{}: `[package] {key}` is missing or not a plain string — a vendored fork's \
                  manifest must state it literally (workspace inheritance does not reach \
                  across into `vendor/`)",
                 path.display()
-            )
+            ),
+            PatchTargetKind::FirstParty => format!(
+                "{}: `[package] {key}` is missing — a first-party patch target may state it \
+                 literally or inherit it with `{key}.workspace = true`, but the root \
+                 `[workspace.package]` has no `{key}` to inherit",
+                path.display()
+            ),
         })
-        };
+    };
     Ok((get("name")?, get("version")?, get("license")?))
 }
 
@@ -665,11 +753,18 @@ fn vendored_manifest(root: &Path, rel: &str) -> Result<(String, String, String),
 /// compiled, and a ledger asserting obligations over dead code is worse than no
 /// ledger.
 pub fn seed_from_vendor(root: &Path) -> Result<String, String> {
-    let patches = patch_entries(root)?;
+    let all = patch_entries(root)?;
+    // FIRST-PARTY patch targets are not forks and must not be seeded. The
+    // ledger's own parser refuses a `path` outside `vendor/` — correctly, it
+    // records vendored forks — so a seeder that emitted one would produce a
+    // file its own reader rejects. They are named in a comment instead, so the
+    // ledger's silence about them is a stated fact rather than an omission.
+    let (patches, first_party): (Vec<PatchEntry>, Vec<PatchEntry>) =
+        all.into_iter().partition(PatchEntry::is_vendored);
     if patches.is_empty() {
         return Err(format!(
-            "{}: no `[patch.crates-io]` entries — there are no forks to record. Delete \
-             {POLICY_PATH} rather than seeding an empty ledger",
+            "{}: no VENDORED `[patch.crates-io]` entries — there are no forks to record. \
+             Delete {POLICY_PATH} rather than seeding an empty ledger",
             root.join("Cargo.toml").display()
         ));
     }
@@ -688,7 +783,7 @@ pub fn seed_from_vendor(root: &Path) -> Result<String, String> {
         "# ",
         "# ",
         "THE COMMENTS ARE THE RECORD. A fork's reason to exist is not a key here — it is the \
-         comment block above it. forge round-trips this file with toml_edit precisely so that \
+         comment block above it. forge round-trips this file with aterm-toml precisely so that \
          no future write can eat one. Unknown KEYS are refused by name (fail-closed, the way \
          aterm-census's vendored-crate registry is); unknown COMMENTS are kept verbatim.",
     ));
@@ -707,6 +802,28 @@ pub fn seed_from_vendor(root: &Path) -> Result<String, String> {
         "Regenerate this skeleton with aterm_forge::policy::seed_from_vendor and DIFF it \
          against the checked-in file. Never overwrite: the diff is the review.",
     ));
+    if !first_party.is_empty() {
+        s.push_str("#\n");
+        s.push_str(&comment(
+            "# ",
+            "# ",
+            &format!(
+                "NOT RECORDED HERE, deliberately: {} — [patch.crates-io] entr{} pointing at a \
+                 FIRST-PARTY workspace member. This ledger records what aterm VENDORED, and a \
+                 crate aterm wrote is not a redistribution of anyone's work: it has no \
+                 upstream version, no upstream license to retain and no §4(b) obligation, so \
+                 a [[fork]] block for it could only state falsehoods. The patch is still \
+                 checked — `cargo forge attest` [OB-1]/[OB-2] and `cargo forge check` \
+                 [OB-12] cover that it exists and that it is live in every cell.",
+                first_party
+                    .iter()
+                    .map(|p| format!("`{}` → {}", p.name, p.path))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if first_party.len() == 1 { "y" } else { "ies" }
+            ),
+        ));
+    }
     s.push_str("\n[forge]\n");
     s.push_str(&comment(
         "# ",
@@ -976,7 +1093,7 @@ census.mode = "build-dep-only"
         let back = p.render().expect("a parsed policy renders");
         assert_eq!(
             back, SAMPLE,
-            "toml_edit round-trip must not move a single byte"
+            "the document round-trip must not move a single byte"
         );
         assert!(back.contains("THIS PARAGRAPH is why the fork exists"));
     }
@@ -1080,17 +1197,44 @@ census.mode = "build-dep-only"
     // --- tests that walk the REAL tree (the house norm) ---------------------
 
     #[test]
-    fn the_real_patch_table_is_six_live_vendored_forks() {
+    fn the_real_patch_table_is_five_live_vendored_forks_and_five_first_party_targets() {
         let root = repo_root();
-        let p = patch_entries(&root).expect("the real patch table reads");
+        let all = patch_entries(&root).expect("the real patch table reads");
+        let (vendored, first_party): (Vec<_>, Vec<_>) = all.iter().partition(|e| e.is_vendored());
         assert_eq!(
-            p.len(),
-            6,
-            "measured 2026-08-22: {:?}",
-            p.iter().map(|e| &e.name).collect::<Vec<_>>()
+            vendored.len(),
+            5,
+            "measured 2026-08-27, when retiring `toml_edit` retired the winnow \
+             fork with it: {:?}",
+            vendored.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
-        for e in &p {
+        for e in &vendored {
             assert!(e.path.starts_with("vendor/"), "{} -> {}", e.name, e.path);
+        }
+        // The `vendor/` prefix is a property of the VENDORED arm, not of being
+        // patched: a first-party replacement is a workspace member and lives
+        // under crates/. Asserting it over the whole table made "is patched"
+        // mean "is somebody else's code".
+        assert_eq!(
+            first_party
+                .iter()
+                .map(|e| (e.name.as_str(), e.path.as_str()))
+                .collect::<Vec<_>>(),
+            // MANIFEST ORDER here, not sorted: `patch_entries` walks the table
+            // as written, where `attest::partition_patches` sorts. Both orders
+            // are asserted literally, in their own module, rather than being
+            // normalised — the order IS part of what each function returns.
+            [
+                ("tracing", "crates/aterm-tracing"),
+                ("profiling", "crates/aterm-profiling"),
+                ("cfg-if", "crates/aterm-cfg-if"),
+                ("arrayvec", "crates/aterm-arrayvec"),
+                ("log", "crates/aterm-log-shim"),
+            ]
+        );
+        // LIVENESS, on the other hand, is owed by every entry alike: a patch
+        // that does not take compiles into nothing, whoever wrote it.
+        for e in &all {
             assert!(
                 e.is_live(),
                 "{} is not live: manifest {} vs lock {:?}",
@@ -1101,20 +1245,112 @@ census.mode = "build-dep-only"
         }
     }
 
+    /// A first-party patch target inherits `license` from `[workspace.package]`
+    /// like every other member, and `patched_manifest` resolves it. The
+    /// literal-only rule is a `vendor/` rule (inheritance reaches nothing out
+    /// there), and applying it to a workspace member would have made
+    /// `patch_entries` — and with it the whole `cargo forge budget` ratchet —
+    /// a hard could-not-run.
     #[test]
-    fn winnow_is_the_shadowed_fork_and_the_only_one() {
+    fn a_first_party_patch_target_may_inherit_its_license_from_the_workspace() {
         let root = repo_root();
-        let shadowed: Vec<_> = patch_entries(&root)
-            .unwrap()
-            .into_iter()
-            .filter(|e| !e.shadowed_by.is_empty())
-            .map(|e| (e.name, e.shadowed_by))
+        let all = patch_entries(&root).expect("the real patch table reads");
+        let shims: Vec<_> = all.iter().filter(|e| !e.is_vendored()).collect();
+        assert_eq!(
+            shims.len(),
+            5,
+            "this tree has five first-party patch targets"
+        );
+        // EVERY one, not the first one found. The original read
+        // `.find(|e| !e.is_vendored())` and asserted `0.1.44` — which happened
+        // to be right only because `tracing` sat first in the manifest, so four
+        // later replacements could have inherited nothing and it would still
+        // have passed.
+        for e in &shims {
+            assert_eq!(e.license, "Apache-2.0", "{} inherited, not literal", e.name);
+        }
+        // The versions are semver contracts with third-party consumers, not
+        // aterm release numbers, so each is pinned by name.
+        let versions: Vec<(&str, &str)> = shims
+            .iter()
+            .map(|e| (e.name.as_str(), e.manifest_version.as_str()))
             .collect();
         assert_eq!(
-            shadowed,
-            vec![("winnow".to_string(), vec!["1.0.3".to_string()])],
-            "the forked winnow 0.7.15 rides beside an unpatched registry winnow"
+            versions,
+            [
+                ("tracing", "0.1.44"),
+                ("profiling", "1.0.18"),
+                ("cfg-if", "1.0.4"),
+                ("arrayvec", "0.7.8"),
+                ("log", "0.4.32"),
+            ]
         );
+    }
+
+    /// POLARITY: this asserts the CLEAN state, and did not always.
+    ///
+    /// Until 2026-08-27 it required `winnow` to be shadowed — `winnow 1.0.3`
+    /// from the registry rode beside the `winnow 0.7.15` fork on Linux, and the
+    /// test named that as the tree's one known defect. Retiring `toml_edit` for
+    /// the first-party `aterm-toml` removed aterm's only winnow 0.7 edge, so
+    /// the fork went with it and there is nothing left for the registry copy to
+    /// shadow. A test that requires a defect to be present goes red the day
+    /// someone fixes it, so this states the property instead: NO patched name
+    /// runs unpatched. The detector itself stays proved by
+    /// `tests/red_fixtures.rs::an_unpatched_sibling_version_reds_the_forge_verb`.
+    ///
+    /// # Why the lock alone is the wrong instrument, and what replaced it
+    ///
+    /// This asserted `shadowed_by.is_empty()` over `Cargo.lock`, and that read
+    /// went WRONG the day a patch target kept a differential oracle:
+    /// `crates/aterm-alloc` dev-depends on registry `arrayvec =0.7.7` so its
+    /// differential compares aterm's `ArrayVec` against real upstream code
+    /// rather than against the shim (the same shape `aterm-digest` uses for
+    /// sha2/hmac and `aterm-toml` for toml/toml_edit). That copy IS a
+    /// registry-sourced sibling in the lock — and it is in NO shipped graph, so
+    /// nothing about it is a shadow. `shadowed_by` cannot tell the two apart:
+    /// the lock records no edge kinds, so a dev-only node and a shipped one
+    /// look identical there.
+    ///
+    /// The obligation was always about what COMPILES INTO ATERM, so it is
+    /// asserted where that is decidable — the per-cell `--edges normal` graph,
+    /// which is `[OB-12]`'s own instrument. A lock-level sibling that appears
+    /// in any cell's shipped graph still fails here, by name and cell.
+    #[test]
+    fn no_fork_is_shadowed_by_an_unpatched_registry_copy() {
+        let root = repo_root();
+        let entries = patch_entries(&root).unwrap();
+        let siblings: Vec<_> = entries
+            .iter()
+            .filter(|e| !e.shadowed_by.is_empty())
+            .map(|e| (e.name.clone(), e.shadowed_by.clone()))
+            .collect();
+
+        // The lock-level facts, pinned so a NEW sibling is a visible diff and
+        // not something this test silently tolerates.
+        assert_eq!(
+            siblings,
+            vec![("arrayvec".to_string(), vec!["0.7.7".to_string()])],
+            "a registry copy of a patched name appeared in Cargo.lock. If it is              another dev-only oracle, add it here WITH the cell check below              proving it ships nowhere; if it is reached by a normal edge, the              fork's fix is absent from the copy that compiles."
+        );
+
+        // THE OBLIGATION: no sibling is in any cell's shipped graph.
+        for cell in crate::resolve::default_cells() {
+            let graph = crate::resolve::graph(&root, &cell)
+                .unwrap_or_else(|e| panic!("cell `{}` must resolve: {e}", cell.name));
+            for (name, versions) in &siblings {
+                for v in versions {
+                    let id = crate::model::PkgId::new(name.clone(), v.clone());
+                    assert!(
+                        !graph.nodes.contains(&id),
+                        "cell `{}` ({}) resolves an UNPATCHED `{name} {v}` in its                          `--edges normal` graph, so the patch's replacement is absent                          from the copy that compiles. Find the edge with                          `cargo tree -p aterm -e normal --target {} -i {name}@{v}`.",
+                        cell.name,
+                        cell.triple,
+                        cell.triple
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1137,7 +1373,34 @@ census.mode = "build-dep-only"
         let root = repo_root();
         let body = seed_from_vendor(&root).expect("the real tree seeds");
         let p = parse(&body).expect("the emitted body is a valid ledger");
-        assert_eq!(p.forks.len(), 6);
+        // FIVE, not ten: the five first-party targets are deliberately not
+        // seeded. The ledger parser refuses a `path` outside `vendor/`, so a
+        // seeder that emitted one would write a file its own reader rejects —
+        // which is exactly how this landed before the partition.
+        assert_eq!(p.forks.len(), 5);
+        for name in ["tracing", "profiling", "cfg-if", "arrayvec", "log"] {
+            assert!(
+                p.forks.iter().all(|f| f.name != name),
+                "a first-party replacement is not a vendored fork: {name}"
+            );
+        }
+        assert!(body.contains("NOT RECORDED HERE"), "{body}");
+        // Named INDIVIDUALLY, not counted: the failure this guards against is a
+        // seeder that omits one silently, and a length check would pass while
+        // the omitted crate's patch entry went unrecorded and unexplained.
+        for path in [
+            "crates/aterm-tracing",
+            "crates/aterm-profiling",
+            "crates/aterm-cfg-if",
+            "crates/aterm-arrayvec",
+            "crates/aterm-log-shim",
+        ] {
+            assert!(
+                body.contains(path),
+                "the seed must SAY which patch entries it left out, and why; \
+                 `{path}` is missing:\n{body}"
+            );
+        }
         let winit = p.fork("winit").expect("winit");
         assert!(winit.apache_notice, "winit is Apache-2.0 only");
         assert_eq!(winit.census_namespace.as_deref(), Some("winit"));
@@ -1147,8 +1410,8 @@ census.mode = "build-dep-only"
         // The seed carries the census's own review notes as comments.
         assert!(body.contains("# census review:"), "{body}");
         assert!(
-            body.contains("PATCH LIVENESS"),
-            "the winnow shadowing is recorded"
+            !body.contains("PATCH LIVENESS"),
+            "no fork is shadowed today, so the seed must not claim one is:\n{body}"
         );
         // And the round-trip of the emitted body is byte-identical too.
         assert_eq!(p.render().unwrap(), body);

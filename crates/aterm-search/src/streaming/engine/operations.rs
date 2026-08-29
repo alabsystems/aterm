@@ -1483,7 +1483,10 @@ mod regex_scan_budget_tests {
         search
             .start_search("needle", FilterMode::Regex)
             .expect("compiles");
-        let re = search.compiled_regex.as_ref().expect("regex mode compiled a pattern");
+        let re = search
+            .compiled_regex
+            .as_ref()
+            .expect("regex mode compiled a pattern");
         assert_eq!(re.step_limit(), REGEX_STEP_LIMIT);
     }
 
@@ -1531,7 +1534,10 @@ mod regex_scan_budget_tests {
             .start_search(r"\b[0-9a-f]{7,40}\b", FilterMode::Regex)
             .expect("compiles");
         let row = "commit 66390b5c8f2a1b3c ".repeat(170);
-        assert!(search.scan_row(0, &row, 1) > 0, "a real pattern still finds its matches");
+        assert!(
+            search.scan_row(0, &row, 1) > 0,
+            "a real pattern still finds its matches"
+        );
         assert!(
             !search
                 .compiled_regex

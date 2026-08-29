@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use aterm_hash::FxHashMap;
-use aterm_scrollback::{CellAttrs, HyperlinkSpan, Line, UnderlineColorSpan};
+use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
 
 use super::scroll_convert::{
     RowToLineCursorState, ScrolledRowExtras, coalesce_underline_spans, is_spacer, next_combining,
@@ -20,6 +20,7 @@ use super::scroll_convert::{
 };
 use crate::CellExtra;
 use crate::CellFlags;
+use crate::ImageRef;
 use crate::PackedColor;
 use crate::Row;
 
@@ -53,6 +54,18 @@ impl MaterializedRow {
     #[inline]
     pub fn get_extra(&self, col: u16) -> Option<&CellExtra> {
         self.extras.get(&col)
+    }
+
+    /// Iterate this row's populated extras as `(col, extra)`.
+    ///
+    /// The sparse counterpart to probing [`get_extra`](Self::get_extra) for
+    /// every column: a per-frame reader that wants the few columns carrying
+    /// something (the inline-image fill) pays for the entries that exist rather
+    /// than `cols` hash probes per scrolled-back row per frame. Order is the
+    /// map's, i.e. arbitrary — callers that need columns in order sort, exactly
+    /// as the live `CellExtras::iter` consumers do.
+    pub fn extras_iter(&self) -> impl Iterator<Item = (u16, &CellExtra)> + '_ {
+        self.extras.iter().map(|(&col, extra)| (col, extra))
     }
 
     /// Whether this row is a soft-wrap continuation of the previous line
@@ -205,6 +218,9 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
     // Restore SGR 58 underline colours from Line into extras.
     restore_underline_colors(&mut row.extras, line, cols);
 
+    // Restore inline images from Line into extras.
+    restore_images(&mut row.extras, line, cols);
+
     row
 }
 
@@ -293,8 +309,13 @@ pub(in crate::grid) fn materialize_from_row_extras(
         wrapped: row.is_wrapped(),
     };
     if len == 0 {
-        // The round trip builds an EMPTY Line for a zero-length row (no text, no
-        // hyperlinks, no underline spans), so every cell stays default.
+        // The round trip builds an EMPTY Line for a zero-length row — no text,
+        // no hyperlinks, no underline spans — so every cell stays default. It
+        // does NOT drop the row's inline images: `place_image` writes no glyph,
+        // so a picture's own rows are exactly the zero-length ones, and the
+        // round trip carries their spans over the top of an empty Line. Restore
+        // them here or this path diverges from it on every image row.
+        restore_image_spans(&mut out.extras, &extras.images, cols);
         #[cfg(any(test, feature = "testing"))]
         super::count_ring_fast_materialize();
         return Some(out);
@@ -445,6 +466,7 @@ pub(in crate::grid) fn materialize_from_row_extras(
             cols,
         );
     }
+    restore_image_spans(&mut out.extras, &extras.images, cols);
 
     #[cfg(any(test, feature = "testing"))]
     super::count_ring_fast_materialize();
@@ -810,6 +832,45 @@ fn restore_underline_color_spans(
                 .entry(ucol)
                 .or_default()
                 .set_underline_color_u32(Some(span.color));
+            budget -= 1;
+        }
+    }
+}
+
+/// Restore inline images from a Line into extras.
+///
+/// Mirrors [`restore_hyperlinks`]: expands each span back to the per-cell
+/// [`ImageRef`](crate::ImageRef)s the renderer reads, which is the form a LIVE
+/// image cell has, so a scrolled-back picture takes the very same (pixel-tested)
+/// draw path as one on screen. The payload `Arc` is cloned, never the raster, so
+/// every restored cell of every restored row points at the ONE allocation the
+/// renderer's decode cache is keyed on.
+fn restore_images(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, cols: u16) {
+    if let Some(spans) = line.images() {
+        restore_image_spans(extras, spans, cols);
+    }
+}
+
+/// The body of [`restore_images`], over spans from either source — shared for
+/// the same reason as [`restore_hyperlink_spans`].
+///
+/// Bounds total column-writes to O(cols) against a stored `Line` carrying many
+/// OVERLAPPING spans (the same crafted-input guard as the hyperlink and
+/// underline restores); a legit line's spans are disjoint and never hit it.
+fn restore_image_spans(extras: &mut FxHashMap<u16, CellExtra>, spans: &[ImageSpan], cols: u16) {
+    let mut budget = cols;
+    'restore: for span in spans {
+        for icol in span.start_col..span.end_col.min(cols) {
+            if budget == 0 {
+                break 'restore;
+            }
+            if let Some((cell_row, cell_col)) = span.tile_at(icol) {
+                extras.entry(icol).or_default().set_image(Some(ImageRef {
+                    image: Arc::clone(&span.image),
+                    cell_row,
+                    cell_col,
+                }));
+            }
             budget -= 1;
         }
     }

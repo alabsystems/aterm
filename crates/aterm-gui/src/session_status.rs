@@ -334,6 +334,23 @@ impl StatusFsm {
         &self.published
     }
 
+    /// Fold the running-command `detail` onto the published status — the name
+    /// the tab chrome renders as `running <detail>` ([`summary_text`]). Kept
+    /// SEPARATE from [`Self::classify`]: the classifier's job is the phase, and
+    /// the command line is a fact the sweep reads from the same engine lock and
+    /// hands straight through. Without this the field was seeded `None` and only
+    /// ever carried across a phase flip (`apply`'s `.take()`), so every tab read
+    /// plain `running` while the wire's `status detail=` — its own producer —
+    /// named the program. Returns whether the value moved, the caller's signal
+    /// to refold the tab.
+    fn set_detail(&mut self, detail: Option<String>) -> bool {
+        if self.published.detail == detail {
+            return false;
+        }
+        self.published.detail = detail;
+        true
+    }
+
     /// The instant at which this session could publish a transition that NO new
     /// output would cause. Three exist: a candidate still serving its dwell,
     /// `Running` aging into `Quiet`, and the LIVE typing `Idle` settling into
@@ -684,6 +701,390 @@ pub(crate) fn shell_evidence(term: &aterm_core::terminal::Terminal) -> Option<Sh
     })
 }
 
+/// The RUNNING command of `term`'s current shell-integration block, reduced by
+/// [`command_detail`]; `None` unless a block is `Executing` and names a command.
+/// The one producer of `Status.detail` (RFC §4 rung 3): the `status` record and
+/// the `sessions` roster both read it under a `try_lock`, so a busy engine
+/// answers `-` rather than parking a poller behind the PTY reader.
+pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<String> {
+    let block = term.current_block()?;
+    if block.state != aterm_types::BlockState::Executing {
+        return None;
+    }
+    let explicit = block
+        .commandline
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let text = match explicit {
+        // OSC 633;E: the shell said the command line itself.
+        Some(explicit) => explicit.to_string(),
+        // The screen scrape reads WHOLE rows, so the command's first row still
+        // carries the prompt in front of it (`$ sleep 30`); cut at the column
+        // the shell marked the command start (OSC 133;B) — by display column,
+        // not char count, so a wide prompt glyph does not eat the program's
+        // first letter.
+        None => {
+            let scraped = term.block_command(block)?;
+            let skip = usize::from(block.command_start_col.unwrap_or(0));
+            let from = aterm_grapheme::column_to_char_index(&scraped, skip);
+            scraped.chars().skip(from).collect()
+        }
+    };
+    command_detail(&text)
+}
+
+/// The most a `detail=` may say about a command line: the program's basename,
+/// plus its first subcommand when that word is in the program's CLOSED
+/// vocabulary ([`SUBCOMMANDS`]) — never an argument. This is the RFC §4 privacy
+/// rule made executable: a command line carries tokens, hostnames and paths,
+/// and an agent reading `status` across a fleet must learn WHO lives in a
+/// session (`claude`, `codex`, `targo test`) without learning what it was told.
+/// Only the first non-flag word is looked at, and only membership in the
+/// vocabulary lets it through: a value-taking flag's argument (`git -C aterm
+/// status` → `git`, `kubectl -n prod get` → `kubectl`) is a directory or a
+/// namespace, exactly what the rule exists to keep off the wire, and a bare
+/// identifier shape cannot tell it from a subcommand. The bound is the
+/// vocabulary, not flag parsing: the program's own flags are skipped and their
+/// values are not, so a value that itself spells a vocabulary word passes as
+/// the subcommand (`git -C status log` → `git status`) — a wrong reading, and
+/// still a word from the closed list. Env-assignment prefixes
+/// are skipped and one wrapper (`sudo`/`env`/`time`/`nice`/…, matched by its
+/// basename, so `/usr/bin/env` is `env`) is unwrapped, so `FOO=1 sudo -u me
+/// targo --unverified test -p x` still reads `targo test`.
+/// Empty or whitespace input is `None`.
+///
+/// The first word is taken as the program on its face, so a COMPOUND command
+/// line reads as the shell KEYWORD that opens it — measured: `for i in 1 2 3;
+/// do sleep 1; done` is `detail=for`, and `if`/`while`/`case`/`until` behave the
+/// same (a `{`/`(` group is the exception the prompt-glyph skip already covers,
+/// because neither word carries an alphanumeric). That is not a wrong answer to
+/// hide: `for` IS what the block is executing, and unwrapping it would mean
+/// parsing shell grammar here, where the rule is deliberately word-shaped and
+/// privacy-bounded. The `status`/`sessions` verb entries say so in the same
+/// words, so the wire promise matches what this returns.
+///
+/// `title_summary/description.rs`'s `short_command` is the precedent the RFC
+/// names, but not this transform: it hides every program outside its own
+/// allow-list as "a command", which is exactly the answer F5 found insufficient.
+pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
+    /// Wrappers unwrapped ONE level: the interesting program is the next word.
+    const WRAPPERS: [&str; 6] = ["sudo", "env", "time", "nice", "command", "nohup"];
+    /// Wrapper flags that consume the following word (`sudo -u me`, `nice -n 5`,
+    /// `env -u VAR`), so that word is never mistaken for the program.
+    const WRAPPER_FLAGS_WITH_VALUE: [&str; 3] = ["-u", "-n", "-g"];
+    /// The bound on the reply: enough for `kubectl port-forward`, never a
+    /// screen-scraped line.
+    const MAX_CHARS: usize = 48;
+
+    let clean = |word: &str| -> String {
+        word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | ';' | '(' | ')' | '&' | '|'))
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect()
+    };
+    let is_assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
+    };
+    let mut words = cmdline
+        .split_whitespace()
+        .map(clean)
+        .filter(|w| !w.is_empty())
+        .peekable();
+
+    // `FOO=1 BAR=2 cmd` — the assignments are environment, not the program;
+    // a word with no letter or digit at all (`$`, `%`, `❯`, `>`) is a prompt
+    // glyph a scrape left in front of the command, not a program either.
+    while words
+        .peek()
+        .is_some_and(|w| is_assignment(w) || !w.chars().any(char::is_alphanumeric))
+    {
+        words.next();
+    }
+    // Every word in the program slot is reduced to its BASENAME before it is
+    // looked at, the wrapper included: a shell that reports `/usr/bin/env
+    // FOO=1 codex` names the same wrapper as `env FOO=1 codex`, and comparing
+    // the full path would leave the `env` in place as the "program".
+    let basename = |word: &str| -> Option<String> {
+        word.rsplit(['/', '\\'])
+            .next()
+            .filter(|base| !base.is_empty())
+            .map(str::to_string)
+    };
+    let mut program = basename(&words.next()?)?;
+    if WRAPPERS.contains(&program.as_str()) {
+        // Unwrap one level: skip the wrapper's own flags (and the value a
+        // value-taking flag consumes), then any assignments `env` carries.
+        while let Some(next) = words.peek() {
+            if WRAPPER_FLAGS_WITH_VALUE.contains(&next.as_str()) {
+                words.next();
+                words.next();
+            } else if next.starts_with('-') || is_assignment(next) {
+                words.next();
+            } else {
+                break;
+            }
+        }
+        program = basename(&words.next()?)?;
+    }
+
+    let mut detail = program.clone();
+    if let Some((_, vocabulary)) = SUBCOMMANDS.iter().find(|(p, _)| *p == program) {
+        // The first word after the program that does not start with `-`, and
+        // ONLY when the vocabulary owns it; otherwise the program stands
+        // alone. The program's own flags are not modelled: a flag is skipped,
+        // its value is not, so the value IS the candidate. Membership is the
+        // whole gate, and it bounds the miss in both directions — `git -C
+        // aterm status` reads `git` (the real subcommand lost behind a value
+        // outside the list), `git -C status log` reads `git status` (a value
+        // that spells a list word taken as the subcommand). Wrong either way,
+        // never an argument: nothing outside the closed list can follow the
+        // program on the wire.
+        let sub = words.find(|w| !w.starts_with('-'));
+        if let Some(sub) = sub.filter(|s| vocabulary.contains(&s.as_str())) {
+            detail.push(' ');
+            detail.push_str(&sub);
+        }
+    }
+    Some(detail.chars().take(MAX_CHARS).collect())
+}
+
+/// The programs whose first subcommand a `detail=` may name, each with the
+/// CLOSED vocabulary it is checked against. Membership, not shape, is the
+/// gate: a word outside the list is an argument by definition, whatever it
+/// looks like. `make`/`just` targets are user-named, so only the conventional
+/// ones are listed — `make deploy-prod` reads `make`, and the target stays in
+/// the pane. Extending a list is a wording change to the wire, so the table
+/// test names one row per program.
+const SUBCOMMANDS: &[(&str, &[&str])] = &[
+    (
+        "git",
+        &[
+            "status",
+            "commit",
+            "push",
+            "pull",
+            "fetch",
+            "log",
+            "diff",
+            "checkout",
+            "switch",
+            "rebase",
+            "merge",
+            "clone",
+            "add",
+            "stash",
+            "branch",
+            "tag",
+            "reset",
+            "restore",
+            "show",
+            "init",
+            "bisect",
+            "cherry-pick",
+            "worktree",
+            "remote",
+            "submodule",
+            "blame",
+            "grep",
+            "rm",
+            "mv",
+            "apply",
+            "am",
+            "format-patch",
+            "describe",
+            "reflog",
+            "revert",
+            "clean",
+        ],
+    ),
+    ("cargo", CARGO_SUBCOMMANDS),
+    ("targo", CARGO_SUBCOMMANDS),
+    ("npm", NODE_SUBCOMMANDS),
+    ("pnpm", NODE_SUBCOMMANDS),
+    ("yarn", NODE_SUBCOMMANDS),
+    (
+        "aterm",
+        &[
+            "ctl",
+            "conn",
+            "pkg",
+            "fleet",
+            "drive",
+            "ship",
+            "update",
+            "agents",
+            "help",
+            "new-tab",
+            "new-window",
+            "split-pane",
+        ],
+    ),
+    (
+        "atpkg",
+        &[
+            "install",
+            "list",
+            "update",
+            "doctor",
+            "status",
+            "which",
+            "run",
+            "uninstall",
+            "rollback",
+            "pin",
+            "unpin",
+            "verify",
+            "gc",
+            "seed",
+        ],
+    ),
+    (
+        "docker",
+        &[
+            "compose",
+            "run",
+            "build",
+            "ps",
+            "exec",
+            "pull",
+            "push",
+            "images",
+            "logs",
+            "stop",
+            "start",
+            "restart",
+            "rm",
+            "rmi",
+            "inspect",
+            "login",
+            "logout",
+            "tag",
+            "volume",
+            "network",
+            "system",
+            "container",
+            "image",
+            "stats",
+            "kill",
+            "attach",
+            "cp",
+            "commit",
+            "save",
+            "load",
+            "buildx",
+        ],
+    ),
+    (
+        "kubectl",
+        &[
+            "get",
+            "apply",
+            "delete",
+            "logs",
+            "exec",
+            "port-forward",
+            "describe",
+            "create",
+            "edit",
+            "rollout",
+            "scale",
+            "config",
+            "cluster-info",
+            "top",
+            "explain",
+            "patch",
+            "label",
+            "annotate",
+            "cp",
+            "attach",
+            "auth",
+            "drain",
+            "cordon",
+            "uncordon",
+            "taint",
+            "wait",
+            "diff",
+            "kustomize",
+            "version",
+        ],
+    ),
+    ("make", CONVENTIONAL_TARGETS),
+    ("just", CONVENTIONAL_TARGETS),
+];
+
+/// `cargo`'s subcommands, shared with `targo` (the same tool behind a
+/// verifier).
+const CARGO_SUBCOMMANDS: &[&str] = &[
+    "build",
+    "test",
+    "check",
+    "run",
+    "clippy",
+    "fmt",
+    "doc",
+    "bench",
+    "install",
+    "update",
+    "add",
+    "remove",
+    "new",
+    "init",
+    "publish",
+    "clean",
+    "tree",
+    "metadata",
+    "nextest",
+    "expand",
+    "miri",
+    "audit",
+    "deny",
+    "fix",
+    "package",
+    "search",
+    "vendor",
+    "uninstall",
+];
+
+/// The subcommands the three node package managers share. A `run` SCRIPT name
+/// (`npm run build:prod`) is an argument and stays in the pane.
+const NODE_SUBCOMMANDS: &[&str] = &[
+    "run", "install", "test", "build", "start", "dev", "ci", "add", "remove", "exec", "publish",
+    "init", "link", "update", "outdated", "audit", "lint", "format", "dlx", "create", "why",
+    "list",
+];
+
+/// The `make`/`just` targets common enough to be a vocabulary rather than a
+/// name; anything else is the user's own word.
+const CONVENTIONAL_TARGETS: &[&str] = &[
+    "all",
+    "build",
+    "test",
+    "check",
+    "clean",
+    "install",
+    "uninstall",
+    "run",
+    "fmt",
+    "format",
+    "lint",
+    "clippy",
+    "doc",
+    "docs",
+    "release",
+    "dist",
+    "deploy",
+    "dev",
+    "watch",
+    "ci",
+    "bench",
+    "help",
+    "setup",
+    "update",
+];
+
 /// Short, human display text for chrome. `None` for phases not worth showing —
 /// an honest blank beats a confident "unknown".
 pub(crate) fn summary_text(status: &Status) -> Option<String> {
@@ -1009,6 +1410,25 @@ impl StatusObserver {
         self.sessions.get(&session).map_or(0, |slot| slot.revision)
     }
 
+    /// Fold the running-command `detail` onto `session`'s published status (F5),
+    /// read by the sweep under the SAME `try_lock` it already holds so the
+    /// chrome's `running <detail>` and the wire's `status detail=` cannot
+    /// disagree about who lives here. A session with no slot (its first
+    /// classification lost the lock) is a no-op — the next sweep that classifies
+    /// it carries the detail too. Bumps the revision so chrome recomposes on a
+    /// program change even when the phase held; returns whether it moved.
+    pub(crate) fn set_detail(&mut self, session: u64, detail: Option<String>) -> bool {
+        let Some(slot) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        if slot.fsm.set_detail(detail) {
+            slot.revision = slot.revision.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Drop a retired session's state. Without this the map would grow for the
     /// process lifetime as tabs open and close.
     pub(crate) fn retire(&mut self, session: u64) {
@@ -1143,10 +1563,15 @@ impl crate::App {
             };
             // Two field reads and a block peek, then the lock is released:
             // nothing below it needs the terminal, and the PTY reader must not
-            // wait behind a syscall.
+            // wait behind a syscall. The running-command `detail=` (F5) is read
+            // from this SAME guard so the chrome's `running <detail>` and the
+            // wire's `status detail=` share one producer and one lock attempt;
+            // a contended engine is skipped above, so reaching here means the
+            // read is non-blocking.
             let shell = shell_evidence(&guard);
             let alt_screen = guard.is_alternate_screen();
             let content_seq = guard.content_seq();
+            let detail = executing_detail(&guard);
             drop(guard);
             let last_output = match latest_output_ns {
                 0 => None,
@@ -1207,7 +1632,14 @@ impl crate::App {
                     last_input,
                 },
             };
-            if self.session_status.observe(id, &evidence, now) {
+            // The classifier decides the PHASE; the running command is a
+            // separate fact the same guard already read, folded onto the
+            // published status the chrome renders. Either moving is a reason to
+            // refold the tab, so a program change under a steady `Running`
+            // (`running targo test` -> `running claude`) still repaints.
+            let status_changed = self.session_status.observe(id, &evidence, now);
+            let detail_changed = self.session_status.set_detail(id, detail);
+            if status_changed || detail_changed {
                 changed.push(id);
             }
         }
@@ -1417,11 +1849,20 @@ impl crate::App {
     /// body (RFC §8). The caller adds the `OK ` prefix and the newline.
     ///
     /// Runs on the event loop, so the Subject ladder uses the same discipline as
-    /// tab titles: the `ctx.meta` LEAF lock first — a pin returns without the
-    /// terminal lock ever being attempted — then `try_lock`, with contention
-    /// reported as `subject_source=unavailable` rather than silently answered
-    /// from a lower rung. A driver polling under load must be able to tell "the
-    /// title changed" from "I could not look".
+    /// tab titles: the `ctx.meta` LEAF lock first (released before anything
+    /// else is taken), then ONE `try_lock` on the terminal that serves both the
+    /// subject rungs and the running-command `detail=`, with contention
+    /// reported as `subject_source=unavailable` / `detail=-` rather than
+    /// silently answered from a lower rung. A driver polling under load must
+    /// be able to tell "the title changed" from "I could not look". A pin
+    /// answers the SUBJECT without the terminal, but the `try_lock` is still
+    /// attempted (never waited on) so a pinned session keeps its `detail=`.
+    ///
+    /// Deliberately NO `window=` here (nor on `meta`): `status` is what a driver
+    /// polls, and window membership lives on the main thread, so answering it
+    /// would put an event-loop hop under every poll — a latency regression, not
+    /// a feature. `sessions` pays that hop once for the whole roster; `dims`
+    /// already names the window. Do not add the hop to this record.
     pub(crate) fn session_status_record(&self, session: u64) -> Result<String, String> {
         let Some(pooled) = self.pool.get(session) else {
             return Err(format!("no such session {session}"));
@@ -1431,11 +1872,16 @@ impl crate::App {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")
         };
+        let term = match pooled.term.try_lock() {
+            Ok(t) => Some(t),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
         let (subject, subject_source) = match pin {
             Some(title) if !title.is_empty() => (Some(title), "pin"),
-            // Rungs 2 and 4 (RFC §4). Rung 3 (command-derived) has no producer
-            // and rung 5 (shell name) is not resolvable here, so an empty
-            // terminal answers `-`/`unavailable` instead of inventing one.
+            // Rungs 2 and 4 (RFC §4). Rung 5 (shell name) is not resolvable
+            // here, so an empty terminal answers `-`/`unavailable` instead of
+            // inventing one.
             _ => {
                 let rungs = |t: &aterm_core::terminal::Terminal| {
                     use crate::cwd_native::ReportedCwd as _;
@@ -1452,24 +1898,33 @@ impl crate::App {
                         (Some(osc), "osc")
                     }
                 };
-                match pooled.term.try_lock() {
-                    Ok(t) => rungs(&t),
-                    Err(std::sync::TryLockError::Poisoned(p)) => rungs(&p.into_inner()),
-                    Err(std::sync::TryLockError::WouldBlock) => (None, "unavailable"),
+                match term.as_deref() {
+                    Some(t) => rungs(t),
+                    None => (None, "unavailable"),
                 }
             }
         };
+        // Rung 3 (command-derived), sanitized: what is RUNNING in the session,
+        // read from the same guard. `-` when nothing executes or the lock was
+        // contended — the roster's `detail=` is the same value from the same
+        // producer, so the two verbs can never disagree about who lives here.
+        let detail = term.as_deref().and_then(executing_detail);
+        drop(term);
         let opt = |value: Option<&str>| {
             value.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
         };
         let Some(status) = self.session_status.status(session) else {
             // Never classified. Distinct from `phase=unknown`, which IS a
             // classification ("evidence was looked for and none was usable").
+            // `detail=` is the engine's fact, not the classifier's, so it is
+            // answered here too — a poller must not see it flip from `-` to a
+            // command on the first publish of an unchanged block.
             return Ok(format!(
                 "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
-                 phase=unknown since_ms=- outcome=none exit_code=- signal=- detail=- \
+                 phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- conflict=false revision=0 enabled={enabled}",
-                opt(subject.as_deref())
+                opt(subject.as_deref()),
+                opt(detail.as_deref()),
             ));
         };
         // `Status::since` is a raw `Instant`, so the reply carries an AGE rather
@@ -1499,7 +1954,7 @@ impl crate::App {
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
-            opt(status.detail.as_deref()),
+            opt(detail.as_deref().or(status.detail.as_deref())),
             status.confidence.as_str(),
             status.conflict,
             self.session_status.revision(session),
@@ -2926,6 +3381,260 @@ mod tests {
         assert!(
             !observer.knows(404),
             "a refusal never invents a classification"
+        );
+    }
+
+    /// The RFC §4 privacy rule as a table: the program's basename, an
+    /// allow-listed subcommand at most, never an argument — and the wrappers,
+    /// assignments and paths an agent's real command lines carry.
+    #[test]
+    fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("claude --dangerously-skip-permissions", Some("claude")),
+            // A prompt glyph a scrape left in front is not the program.
+            ("$ sleep 30", Some("sleep")),
+            ("❯ codex", Some("codex")),
+            ("% ", None),
+            ("codex", Some("codex")),
+            ("targo --unverified test -p x", Some("targo test")),
+            ("cargo build --release", Some("cargo build")),
+            ("git status", Some("git status")),
+            // A flag's VALUE is never a subcommand: the program stands alone.
+            // The value may look exactly like a subcommand (a bare identifier);
+            // only vocabulary membership tells them apart, and a directory, a
+            // namespace, a context or a prefix is the very category the rule
+            // keeps off the wire.
+            ("git -C /secret/repo status", Some("git")),
+            ("git -C aterm status", Some("git")),
+            ("kubectl -n prod get pods", Some("kubectl")),
+            ("docker --context customer-acme ps", Some("docker")),
+            ("npm --prefix web run build", Some("npm")),
+            // A word OUTSIDE the vocabulary is an argument even in the
+            // subcommand slot.
+            ("git customer-acme", Some("git")),
+            ("cargo xtask release", Some("cargo")),
+            ("ssh me@host", Some("ssh")),
+            ("/usr/local/bin/python3 secret.py", Some("python3")),
+            ("./run.sh --token abc", Some("run.sh")),
+            ("FOO=1 cmd --secret", Some("cmd")),
+            ("FOO=1 BAR=two targo test", Some("targo test")),
+            ("sudo -u root targo --unverified test", Some("targo test")),
+            ("sudo apt install x", Some("apt")),
+            ("env FOO=1 codex", Some("codex")),
+            // A wrapper by full path is the same wrapper: basename first.
+            ("/usr/bin/env FOO=1 codex", Some("codex")),
+            (
+                "/usr/bin/sudo -u root targo --unverified test",
+                Some("targo test"),
+            ),
+            // A make/just target is user-named: only the conventional ones
+            // are vocabulary.
+            ("time make deploy-prod", Some("make")),
+            ("make test", Some("make test")),
+            ("just fmt", Some("just fmt")),
+            ("aterm ctl ls", Some("aterm ctl")),
+            ("atpkg install foo", Some("atpkg install")),
+            ("nice -n 5 kubectl get pods -n prod", Some("kubectl get")),
+            ("docker compose up", Some("docker compose")),
+            ("'claude' 'resume'", Some("claude")),
+            ("npm run build:prod", Some("npm run")),
+            ("pnpm dlx create-foo", Some("pnpm dlx")),
+            ("yarn build --token abc", Some("yarn build")),
+            // A subcommand slot holding a path or an assignment is dropped.
+            ("make ./target/x", Some("make")),
+            ("", None),
+            ("   \t ", None),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(command_detail(cmd).as_deref(), *want, "{cmd:?}");
+        }
+        // Every program in the table is exercised above, so a vocabulary
+        // change cannot land without a row that shows what it does.
+        for (program, vocabulary) in SUBCOMMANDS {
+            assert!(
+                cases
+                    .iter()
+                    .any(|(cmd, _)| cmd.split_whitespace().any(|w| w == *program)),
+                "no table row exercises {program}"
+            );
+            assert!(
+                !vocabulary.is_empty() && vocabulary.iter().all(|w| !w.starts_with('-')),
+                "{program}: a vocabulary word is never a flag"
+            );
+        }
+        // Bounded: a screen-scraped line can be long; the reply cannot.
+        let long = format!("{} arg", "p".repeat(200));
+        assert_eq!(command_detail(&long).map(|d| d.chars().count()), Some(48));
+        // A program name is never reported with a subcommand it does not own.
+        assert_eq!(command_detail("claude commit").as_deref(), Some("claude"));
+    }
+
+    /// `executing_detail` is the one producer: a block that is EXECUTING names
+    /// its (sanitized) command; a prompt, an entering block and a completed
+    /// block name nothing, whatever text they carry.
+    #[test]
+    fn executing_detail_reads_only_an_executing_block() {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        assert_eq!(executing_detail(&term), None, "no shell integration");
+        term.process(b"\x1b]133;A\x07$ ");
+        assert_eq!(executing_detail(&term), None, "prompt only");
+        term.process(b"\x1b]133;B\x07targo --unverified test -p aterm-gui");
+        assert_eq!(executing_detail(&term), None, "entering, not executing");
+        term.process(b"\n\x1b]133;C\x07");
+        assert_eq!(
+            executing_detail(&term).as_deref(),
+            Some("targo test"),
+            "executing: screen-scraped command, sanitized"
+        );
+        term.process(b"running\n\x1b]133;D;0\x07");
+        assert_eq!(executing_detail(&term), None, "complete");
+        // OSC 633;E's explicit command line wins over the screen scrape.
+        term.process(b"\x1b]133;A\x07$ \x1b]633;E;claude --dangerously-skip-permissions\x07\x1b]133;B\x07claude --dangerously-skip-permissions\n\x1b]133;C\x07");
+        assert_eq!(executing_detail(&term).as_deref(), Some("claude"));
+        term.process(b"\x1b]133;D;0\x07");
+        // A WIDE prompt glyph before the 133;B mark: the cut is by display
+        // column, so the program keeps its first letter.
+        term.process(
+            "]133;A🐱 $ ]133;Bcodex resume
+]133;C"
+                .as_bytes(),
+        );
+        assert_eq!(executing_detail(&term).as_deref(), Some("codex"));
+    }
+
+    /// The `status` record's `detail=`: the sanitized running command while the
+    /// block executes, `-` otherwise; the engine's fact, so it is answered
+    /// before the classifier's first publish, under a pin, and never by
+    /// waiting on a contended terminal.
+    #[test]
+    fn the_status_record_details_the_executing_block_and_nothing_else() {
+        let mut app = crate::App::headless_for_test();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" detail=- "), "nothing running: {record}");
+
+        term.lock()
+            .unwrap()
+            .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 30\n\x1b]133;C\x07");
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" observed=false ") && record.contains(" detail=sleep "),
+            "the engine's fact precedes the classifier's first publish: {record}"
+        );
+
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Executing);
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" observed=true ") && record.contains(" detail=sleep "),
+            "{record}"
+        );
+        assert!(
+            !record.contains("30"),
+            "arguments never reach the wire: {record}"
+        );
+
+        // A pin answers the subject from the leaf lock and keeps the detail.
+        app.pool
+            .get(0)
+            .expect("session 0")
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set("title", Some("deploy".to_string()))
+            .expect("a short title is within cap");
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" subject=deploy subject_source=pin ")
+                && record.contains(" detail=sleep "),
+            "{record}"
+        );
+
+        // Contended: `-`, never a wait — and the pinned subject still answers.
+        let held = term.lock().unwrap();
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" subject_source=pin ") && record.contains(" detail=- "),
+            "a contended terminal is `-`, not a stall: {record}"
+        );
+        drop(held);
+
+        term.lock().unwrap().process(b"\x1b]133;D;0\x07");
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" detail=- "), "complete: {record}");
+    }
+
+    /// The chrome already composes `running {detail}`; with the field populated
+    /// it reads as the running program, and a blank detail stays plain `running`.
+    #[test]
+    fn chrome_renders_the_running_detail() {
+        let status = |detail: Option<&str>| Status {
+            phase: Phase::Running,
+            last_outcome: Outcome::None,
+            since: Instant::now(),
+            detail: detail.map(str::to_string),
+            confidence: Confidence::Strong,
+            reasons: vec![Reason::ShellBlock],
+            conflict: false,
+        };
+        assert_eq!(
+            summary_text(&status(Some("targo test"))).as_deref(),
+            Some("running targo test")
+        );
+        assert_eq!(summary_text(&status(Some(""))).as_deref(), Some("running"));
+        assert_eq!(summary_text(&status(None)).as_deref(), Some("running"));
+    }
+
+    /// The chrome's `detail` was seeded `None` and never written, so every tab
+    /// read plain `running` while the wire named the program. The sweep now
+    /// folds `executing_detail` onto the published status through
+    /// [`StatusObserver::set_detail`]: an Executing block publishes the
+    /// sanitized program, and idle (prompt, complete, no integration) clears it.
+    #[test]
+    fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
+        let mut app = crate::App::headless_for_test();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let t0 = Instant::now();
+
+        // Idle: no executing block, so the published detail the chrome reads is
+        // empty (plain `running` once running, never a stale command).
+        app.observe_session_statuses(t0);
+        assert_eq!(
+            app.session_status.status(0).and_then(|s| s.detail.clone()),
+            None,
+            "idle publishes no detail"
+        );
+
+        // An executing block: the same sweep guard reads the command and folds
+        // its sanitized basename onto the status `summary_text` turns into
+        // `running <detail>`.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 30\n\x1b]133;C\x07");
+        let t1 = t0 + Duration::from_secs(10);
+        app.observe_session_statuses(t1);
+        assert_eq!(
+            app.session_status
+                .status(0)
+                .and_then(|s| s.detail.clone())
+                .as_deref(),
+            Some("sleep"),
+            "the executing block's sanitized program reaches the chrome status"
+        );
+
+        // The block completes: back to idle, the detail clears — a done tab
+        // never keeps naming the command that finished.
+        term.lock().unwrap().process(b"\x1b]133;D;0\x07");
+        let t2 = t1 + Duration::from_secs(10);
+        app.observe_session_statuses(t2);
+        assert_eq!(
+            app.session_status.status(0).and_then(|s| s.detail.clone()),
+            None,
+            "a completed block clears the chrome detail"
         );
     }
 }

@@ -18,23 +18,26 @@
 //! other gate in this repository keeps passing and the UNFIXED upstream code
 //! compiles into the product.
 //!
-//! MEASURED ON THIS TREE, and since FIXED — the case this gate was built on.
-//! On 2026-08-22 the `linux` cell resolved BOTH `winnow 0.7.15` — the fork at
-//! `vendor/winnow`, which exists to fix an `offset_from` underflow — AND an
+//! MEASURED ON THIS TREE, and since RETIRED — the case this gate was built on.
+//! On 2026-08-22 the `linux` cell resolved BOTH `winnow 0.7.15` — a fork at
+//! `vendor/winnow`, which existed to fix an `offset_from` underflow — AND an
 //! unpatched `winnow 1.0.3` from the registry, reached by
 //! `accesskit_winit → accesskit_unix → zbus → zbus_macros (proc-macro) →
 //! proc-macro-crate → toml_edit 0.25 → winnow 1.0.3`. The forked fix was absent
 //! from the copy that ran inside the compiler on every Linux build, and
 //! `[OB-12]` below was the only check in this repository that said so.
 //!
-//! Dropping the `a11y-accesskit` default feature removed `accesskit_unix`, the
-//! only edge pulling zbus, and the sibling with it: as of 2026-08-25 no cell
-//! resolves an unpatched sibling of any fork. That is the CLEAN state, and it
-//! is what the tests below assert — a gate whose tests demanded the defect
-//! still be there would go red the day someone fixed it. `[OB-12]` stays armed
-//! because the next major bump or new dependency can reintroduce it silently,
-//! at cargo exit 0, and `tests/red_fixtures.rs` keeps a planted violation to
-//! prove the detector still bites.
+//! That obligation is now discharged at the root rather than patched: aterm's
+//! only edge to winnow 0.7 was `toml_edit`, and retiring `toml` + `toml_edit`
+//! for the first-party `aterm-toml` (2026-08-27) removed the fork, its
+//! `[patch.crates-io]` entry, and its review row together. `winnow 1.0.3` is
+//! still in the Linux graph — through zbus AND through `ntest_timeout`, an
+//! aterm-grid dev-dependency that has nothing to do with AccessKit — but it is
+//! no longer a SIBLING OF A FORK, so no exception is carried for it. `[OB-12]`
+//! stays armed because the next major bump or new dependency can silently
+//! shadow one of the five remaining forks, at cargo exit 0, and
+//! `tests/red_fixtures.rs` keeps a planted violation to prove the detector
+//! still bites.
 //!
 //! # The obligations
 //!
@@ -212,14 +215,69 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         );
     }
 
-    // -- [OB-11] every path fork is REVIEWED ---------------------------------
+    // -- [OB-11] every VENDORED path fork is REVIEWED ------------------------
+    //
+    // The registration obligation belongs to THIRD-PARTY source, not to
+    // whatever the patch table names. A patch pointing at `crates/` is a
+    // workspace member — code aterm wrote — and REVIEWED_VENDORED_CRATES
+    // exists to track code this repository must keep re-reviewing because it
+    // came from somebody else. Demanding a row for a first-party crate would
+    // file our own code as a reviewed vendored fork; the classification lives
+    // in `aterm_census::scan_set::classify_patch_target` so check, attest and
+    // the census cannot disagree about it. Everything else about a
+    // first-party target IS still checked: it must exist on disk (below) and
+    // its patch must be live per cell ([OB-12], unchanged).
     let _ = writeln!(
         log,
-        "  [OB-11] REVIEW REGISTRATION — every `[patch.crates-io]` path fork has a \
-         REVIEWED_VENDORED_CRATES row:"
+        "  [OB-11] REVIEW REGISTRATION — every VENDORED `[patch.crates-io]` path fork has a \
+         REVIEWED_VENDORED_CRATES row (first-party targets under crates/ are named, not \
+         registered — they are not third-party code):"
     );
     let mut missing_on_disk = false;
     for e in &patches {
+        let first_party = matches!(
+            aterm_census::scan_set::classify_patch_target(&e.name, &e.path, root),
+            Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
+        );
+        if first_party {
+            match REVIEWED_VENDORED_CRATES
+                .iter()
+                .find(|r| r.package == e.name)
+            {
+                Some(r) => {
+                    fails += 1;
+                    let _ = writeln!(
+                        log,
+                        "  ✗ FAIL [OB-11] `{}` is patched to first-party `{}` but ALSO carries \
+                         a REVIEWED_VENDORED_CRATES row (registered at `{}`) — that registry \
+                         records third-party source this repository redistributes and must \
+                         keep reviewing, and a workspace member is neither. A false \
+                         provenance claim is as wrong as a missing one. Fix: delete the row \
+                         from crates/aterm-census/src/scan_set.rs.",
+                        e.name, e.path, r.path
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        log,
+                        "    ✓ {} → {} (first-party workspace member; no review row owed)",
+                        e.name, e.path
+                    );
+                }
+            }
+            if !root.join(&e.path).join("Cargo.toml").is_file() {
+                fails += 1;
+                missing_on_disk = true;
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-11] `{}` is patched to `{}`, which has no Cargo.toml on \
+                     disk — cargo cannot resolve this workspace at all. Fix: restore the \
+                     crate, or delete the `[patch.crates-io].{}` line.",
+                    e.name, e.path, e.name
+                );
+            }
+            continue;
+        }
         match REVIEWED_VENDORED_CRATES
             .iter()
             .find(|r| r.package == e.name)
@@ -540,13 +598,27 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     }
 
     // -- verdict --------------------------------------------------------------
+    // Counted separately in the verdict because they are separate things: a
+    // fork is third-party source under standing review, a first-party target
+    // is a workspace member. Summing them under the word "fork" is the
+    // conflation this gate stopped making.
+    let first_party_count = patches
+        .iter()
+        .filter(|e| {
+            matches!(
+                aterm_census::scan_set::classify_patch_target(&e.name, &e.path, root),
+                Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
+            )
+        })
+        .count();
     if fails == 0 {
         let _ = writeln!(
             log,
-            "gate forge: GREEN — {} path fork(s) reviewed and live across {} cell(s) with no \
-             unpatched sibling; {} carved path(s) still absent; provenance attested; {notes} \
-             note(s).",
-            patches.len(),
+            "gate forge: GREEN — {} vendored fork(s) reviewed + {} first-party patch \
+             target(s), all live across {} cell(s) with no unpatched sibling; {} carved \
+             path(s) still absent; provenance attested; {notes} note(s).",
+            patches.len() - first_party_count,
+            first_party_count,
             cells.len(),
             carved.len()
         );
@@ -607,7 +679,7 @@ fn read_manifest_patches(root: &Path) -> Result<(Vec<PatchEntry>, Vec<String>), 
 }
 
 fn parse_patch_table(text: &str, whence: &Path) -> Result<(Vec<PatchEntry>, Vec<String>), String> {
-    let doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    let doc = text.parse::<aterm_toml::edit::DocumentMut>().map_err(|e| {
         format!(
             "{} is not valid TOML: {e} — fix the manifest, then re-run.",
             whence.display()
@@ -616,14 +688,14 @@ fn parse_patch_table(text: &str, whence: &Path) -> Result<(Vec<PatchEntry>, Vec<
     let Some(table) = doc
         .get("patch")
         .and_then(|p| p.get("crates-io"))
-        .and_then(toml_edit::Item::as_table_like)
+        .and_then(aterm_toml::edit::Item::as_table_like)
     else {
         return Ok((Vec::new(), Vec::new()));
     };
     let mut forks = Vec::new();
     let mut other = Vec::new();
     for (name, item) in table.iter() {
-        match item.get("path").and_then(toml_edit::Item::as_str) {
+        match item.get("path").and_then(aterm_toml::edit::Item::as_str) {
             Some(path) => {
                 forks.push(PatchEntry {
                     name: name.to_string(),
@@ -651,7 +723,7 @@ fn read_carve_ledger(root: &Path) -> Result<Vec<Carved>, String> {
 }
 
 fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> {
-    let doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    let doc = text.parse::<aterm_toml::edit::DocumentMut>().map_err(|e| {
         format!(
             "{} is not valid TOML: {e} — fix the policy file, then re-run.",
             whence.display()
@@ -669,10 +741,10 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
         for t in tables {
             rows.push((
                 t.get("path")
-                    .and_then(toml_edit::Item::as_str)
+                    .and_then(aterm_toml::edit::Item::as_str)
                     .map(ToString::to_string),
                 t.get("reason")
-                    .and_then(toml_edit::Item::as_str)
+                    .and_then(aterm_toml::edit::Item::as_str)
                     .unwrap_or_default()
                     .to_string(),
             ));
@@ -688,10 +760,10 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
             };
             rows.push((
                 t.get("path")
-                    .and_then(toml_edit::Value::as_str)
+                    .and_then(aterm_toml::edit::Value::as_str)
                     .map(ToString::to_string),
                 t.get("reason")
-                    .and_then(toml_edit::Value::as_str)
+                    .and_then(aterm_toml::edit::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
             ));
@@ -796,26 +868,37 @@ mod tests {
             .to_path_buf()
     }
 
+    /// Partition the real patch table the way [OB-11] does.
+    fn real_patches() -> (Vec<PatchEntry>, Vec<PatchEntry>) {
+        let (forks, _) = read_manifest_patches(&repo_root()).expect("root manifest reads");
+        forks.into_iter().partition(|f| {
+            !matches!(
+                aterm_census::scan_set::classify_patch_target(&f.name, &f.path, &repo_root()),
+                Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
+            )
+        })
+    }
+
+    /// The patch table is read as path patches, PARTITIONED. The `vendor/<name>`
+    /// path shape is a genuine invariant of the vendored arm — it is what makes
+    /// `[OB-1]`'s reverse sweep over `vendor/` directories decidable — but it
+    /// was asserted over the whole table, which made it a rule that a
+    /// first-party replacement must be filed as somebody else's source. It is
+    /// asserted per-arm now.
     #[test]
     fn the_root_patch_table_is_read_as_path_forks() {
-        let (forks, other) = read_manifest_patches(&repo_root()).expect("root manifest reads");
-        let names: Vec<&str> = forks.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "indexmap",
-                "libm",
-                "pkg-config",
-                "smol_str",
-                "winit",
-                "winnow"
-            ]
-        );
+        let (_, other) = read_manifest_patches(&repo_root()).expect("root manifest reads");
         assert!(
             other.is_empty(),
             "this repo patches only path forks: {other:?}"
         );
-        for f in &forks {
+        let (vendored, first_party) = real_patches();
+        let names: Vec<&str> = vendored.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["indexmap", "libm", "pkg-config", "smol_str", "winit"]
+        );
+        for f in &vendored {
             assert_eq!(
                 f.path,
                 format!("vendor/{}", f.name),
@@ -823,17 +906,58 @@ mod tests {
                 f.name
             );
         }
+        let fp: Vec<(&str, &str)> = first_party
+            .iter()
+            .map(|f| (f.name.as_str(), f.path.as_str()))
+            .collect();
+        assert_eq!(
+            fp,
+            [
+                ("arrayvec", "crates/aterm-arrayvec"),
+                ("cfg-if", "crates/aterm-cfg-if"),
+                ("log", "crates/aterm-log-shim"),
+                ("profiling", "crates/aterm-profiling"),
+                ("tracing", "crates/aterm-tracing"),
+            ]
+        );
     }
 
     #[test]
-    fn every_path_fork_in_this_repo_is_registered_for_review() {
-        let (forks, _) = read_manifest_patches(&repo_root()).unwrap();
-        for f in &forks {
+    fn every_vendored_path_fork_in_this_repo_is_registered_for_review() {
+        let (vendored, _) = real_patches();
+        for f in &vendored {
             let row = REVIEWED_VENDORED_CRATES
                 .iter()
                 .find(|r| r.package == f.name)
                 .unwrap_or_else(|| panic!("`{}` has no REVIEWED_VENDORED_CRATES row", f.name));
             assert_eq!(row.path, f.path, "reviewed path for {}", f.name);
+        }
+    }
+
+    /// The other direction, and the one this change is FOR: a first-party
+    /// patch target must NOT be registered as a reviewed vendored fork. The
+    /// registry is the repository's record of third-party code it owes a
+    /// standing review; putting our own crate in it would be a false entry
+    /// that no later reader could tell from a true one.
+    #[test]
+    fn no_first_party_patch_target_is_registered_as_a_vendored_fork() {
+        let (_, first_party) = real_patches();
+        assert!(
+            !first_party.is_empty(),
+            "the partition is vacuous if there is no first-party target to test it on"
+        );
+        for f in &first_party {
+            assert!(
+                REVIEWED_VENDORED_CRATES.iter().all(|r| r.package != f.name),
+                "`{}` is a workspace member and must not carry a REVIEWED_VENDORED_CRATES row",
+                f.name
+            );
+            assert!(
+                repo_root().join(&f.path).join("Cargo.toml").is_file(),
+                "`{}` is patched to `{}`, which must exist on disk",
+                f.name,
+                f.path
+            );
         }
     }
 
@@ -992,22 +1116,21 @@ reason = \"no arch intrinsics reach the shipped build\"
                 found.extend(sibs.iter().map(|s| s.0.spec()));
             }
             found.sort();
-            // ONE NAMED EXCEPTION, carried deliberately and visibly.
+            // NO EXCEPTIONS, as of 2026-08-27.
             //
-            // `winnow 1.0.3` re-entered the LINUX graph on 2026-08-26 when the
-            // owner made AccessKit an unconditional Linux dependency: measured
-            // with the feature off, the AT-SPI registry reports ZERO
-            // applications for aterm while a GTK app sits in the same registry,
-            // so a blind Linux user gets no terminal at all. That trade is
-            // settled. Its COST is this: accesskit_unix -> zbus -> winnow 1.0.3
-            // is the registry copy, and aterm forks winnow at 0.7.15 to remove
-            // an `offset_from` underflow that a `^1.0` requirement cannot reach.
+            // There used to be exactly one, named per cell: the LINUX graph
+            // resolved `winnow 1.0.3` from the registry beside aterm's
+            // `winnow 0.7.15` fork, so the `offset_from` fix was absent from the
+            // copy that actually compiled there. It is gone because the FORK is
+            // gone, not because the edge closed — `winnow 1.0.3` is still in the
+            // Linux graph, reached independently through zbus and through
+            // `ntest_timeout` (an aterm-grid dev-dependency). Retiring
+            // `toml_edit` for the first-party `aterm-toml` removed aterm's only
+            // winnow 0.7 edge, and with it the fork that copy was shadowing.
             //
-            // The exception is spelled out per cell rather than deleted, so the
-            // gate still fails on any OTHER unpatched sibling, and this one
-            // stays legible instead of being absorbed. Closing it means carrying
-            // the fix into a 1.x fork and repointing [patch.crates-io].
-            let expected: &[&str] = if cell.name == "linux" { &["winnow@1.0.3"] } else { &[] };
+            // So this is now the plain property: no cell resolves an unpatched
+            // sibling of ANY fork. Re-introducing one reds the gate.
+            let expected: &[&str] = &[];
             assert_eq!(
                 found, expected,
                 "cell `{}` resolves an unpatched sibling beside a vendored fork — \

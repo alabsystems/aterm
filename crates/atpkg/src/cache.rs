@@ -54,8 +54,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::select::Candidate;
@@ -174,20 +172,36 @@ impl IndexCache {
             schema: CACHE_SCHEMA,
             source: source_id.to_string(),
             fetched_at: String::new(),
-            candidate: candidates
-                .iter()
-                .enumerate()
-                .map(|(i, c)| CachedCandidate {
-                    label: c.label.clone(),
-                    index_b64: STANDARD.encode(&c.index_bytes),
-                    sig_b64: STANDARD.encode(&c.sig),
-                    roster_b64: STANDARD.encode(&c.roster_bytes),
-                    roster_sig_b64: STANDARD.encode(&c.roster_sig),
-                    identity: paired.get(i).cloned().unwrap_or_default(),
-                })
-                .collect(),
+            candidate: {
+                // Every blob is already bounded by the `store` guard above (index
+                // 5 MB, roster 64 KiB, signatures 4 KiB), all far below
+                // `aterm_codec::MAX_INPUT_LEN`, so no encode here can actually
+                // refuse. A cache write is best-effort regardless, so a refusal
+                // drops the write exactly like the `to_string` failure below —
+                // never a panic, and never a half-encoded document.
+                let mut rows = Vec::with_capacity(candidates.len());
+                for (i, c) in candidates.iter().enumerate() {
+                    let (Ok(index_b64), Ok(sig_b64), Ok(roster_b64), Ok(roster_sig_b64)) = (
+                        aterm_codec::base64::encode(&c.index_bytes),
+                        aterm_codec::base64::encode(&c.sig),
+                        aterm_codec::base64::encode(&c.roster_bytes),
+                        aterm_codec::base64::encode(&c.roster_sig),
+                    ) else {
+                        return;
+                    };
+                    rows.push(CachedCandidate {
+                        label: c.label.clone(),
+                        index_b64,
+                        sig_b64,
+                        roster_b64,
+                        roster_sig_b64,
+                        identity: paired.get(i).cloned().unwrap_or_default(),
+                    });
+                }
+                rows
+            },
         };
-        let Ok(text) = toml::to_string(&doc) else {
+        let Ok(text) = aterm_toml::to_string(&doc) else {
             return;
         };
         if text.len() > MAX_INDEX_CACHE_BYTES {
@@ -280,7 +294,7 @@ impl IndexCache {
     fn read_doc(&self, source_id: &str) -> Option<CacheDoc> {
         let text = crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_INDEX_CACHE_BYTES)
             .ok()?;
-        let doc: CacheDoc = toml::from_str(&text).ok()?;
+        let doc: CacheDoc = aterm_toml::from_str(&text).ok()?;
         if doc.schema != CACHE_SCHEMA {
             // FAIL CLOSED on an unrecognized version. A version field that fails OPEN is
             // the wrong direction for this document in particular: it has already needed
@@ -322,10 +336,10 @@ impl IndexCache {
 fn decode(doc: CacheDoc) -> Option<Vec<Candidate>> {
     let mut out = Vec::with_capacity(doc.candidate.len());
     for c in doc.candidate {
-        let index_bytes = STANDARD.decode(c.index_b64.as_bytes()).ok()?;
-        let sig = STANDARD.decode(c.sig_b64.as_bytes()).ok()?;
-        let roster_bytes = STANDARD.decode(c.roster_b64.as_bytes()).ok()?;
-        let roster_sig = STANDARD.decode(c.roster_sig_b64.as_bytes()).ok()?;
+        let index_bytes = aterm_codec::base64::decode_strict(c.index_b64.as_bytes()).ok()?;
+        let sig = aterm_codec::base64::decode_strict(c.sig_b64.as_bytes()).ok()?;
+        let roster_bytes = aterm_codec::base64::decode_strict(c.roster_b64.as_bytes()).ok()?;
+        let roster_sig = aterm_codec::base64::decode_strict(c.roster_sig_b64.as_bytes()).ok()?;
         if index_bytes.len() > MAX_CACHED_INDEX_BYTES
             || sig.len() > MAX_CACHED_SIGNATURE_BYTES
             || roster_bytes.len() > MAX_CACHED_ROSTER_BYTES

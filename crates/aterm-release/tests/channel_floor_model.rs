@@ -57,7 +57,6 @@ use aterm_spec::derive::{
     Model, release_channel_floor_model, release_channel_single_head_model,
     release_published_identity_model, release_yank_successor_first_model,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use ledger::{GitRunner, RunOut};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use std::collections::{BTreeSet, VecDeque};
@@ -750,7 +749,7 @@ fn live_release_identity_conforms_to_single_head_archive_guard() {
     );
 
     let keypair = Ed25519KeyPair::from_seed_unchecked(&[42_u8; 32]).unwrap();
-    let pubkey = B64.encode(keypair.public_key().as_ref());
+    let pubkey = aterm_codec::base64::encode(keypair.public_key().as_ref()).expect("32-byte key");
     let signature = keypair.sign(&manifest).as_ref().to_vec();
     let bad_signature = [0_u8; 64];
     assert!(

@@ -107,7 +107,11 @@ pub(crate) struct ClassSet {
 impl ClassSet {
     /// A class holding exactly the code points of one inclusive range.
     pub(crate) fn range(lo: char, hi: char) -> Self {
-        Self { ranges: vec![(lo, hi)], perls: Vec::new(), negated: false }
+        Self {
+            ranges: vec![(lo, hi)],
+            perls: Vec::new(),
+            negated: false,
+        }
     }
 
     /// The class every code point belongs to (`(?s).`).
@@ -117,14 +121,22 @@ impl ClassSet {
 
     /// `.` outside `(?s)`: everything except the line terminator.
     pub(crate) fn any_except_newline() -> Self {
-        let mut set = Self { ranges: vec![('\n', '\n')], perls: Vec::new(), negated: true };
+        let mut set = Self {
+            ranges: vec![('\n', '\n')],
+            perls: Vec::new(),
+            negated: true,
+        };
         set.normalize();
         set
     }
 
     /// One perl class on its own (`\d`, `\W`, …).
     fn perl(p: PerlClass) -> Self {
-        Self { ranges: Vec::new(), perls: vec![p], negated: false }
+        Self {
+            ranges: Vec::new(),
+            perls: vec![p],
+            negated: false,
+        }
     }
 
     /// Does `c` belong to this class?
@@ -228,7 +240,12 @@ pub(crate) enum Ast {
     Concat(Vec<Ast>),
     /// Alternation, in preference order: earlier branches win ties.
     Alt(Vec<Ast>),
-    Repeat { node: Box<Ast>, min: u32, max: Option<u32>, greedy: bool },
+    Repeat {
+        node: Box<Ast>,
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+    },
 }
 
 /// The inline flags in force at a point in the pattern.
@@ -450,7 +467,11 @@ impl Parser<'_> {
             return Ast::Literal(c);
         }
         orbit.sort_unstable();
-        let mut set = ClassSet { ranges: orbit, perls: Vec::new(), negated: false };
+        let mut set = ClassSet {
+            ranges: orbit,
+            perls: Vec::new(),
+            negated: false,
+        };
         set.normalize();
         Ast::Class(set)
     }
@@ -483,7 +504,12 @@ impl Parser<'_> {
             ));
         }
         self.concat.push((
-            Ast::Repeat { node: Box::new(node), min, max, greedy },
+            Ast::Repeat {
+                node: Box::new(node),
+                min,
+                max,
+                greedy,
+            },
             depth + 1,
         ));
         Ok(())
@@ -867,7 +893,11 @@ impl Parser<'_> {
         if negated {
             self.pos += 1;
         }
-        let mut set = ClassSet { ranges: Vec::new(), perls: Vec::new(), negated };
+        let mut set = ClassSet {
+            ranges: Vec::new(),
+            perls: Vec::new(),
+            negated,
+        };
         let mut first = true;
         loop {
             if self.flags.ignore_whitespace {
@@ -974,9 +1004,7 @@ impl Parser<'_> {
                 };
                 if hi < lo {
                     self.pos = dash;
-                    return self.err(
-                        "invalid character class range, the start must be <= the end",
-                    );
+                    return self.err("invalid character class range, the start must be <= the end");
                 }
                 set.ranges.push((lo, hi));
             } else {
@@ -1057,26 +1085,32 @@ fn posix_class(name: &str, negated: bool) -> Option<Ranges> {
     const XDIGIT: Ranges = &[('0', '9'), ('A', 'F'), ('a', 'f')];
     // Complements, precomputed: a class is one flat range list, and the class
     // parser has no way to express "negate just this item".
-    const N_ALNUM: Ranges =
-        &[('\0', '/'), (':', '@'), ('[', '`'), ('{', char::MAX)];
+    const N_ALNUM: Ranges = &[('\0', '/'), (':', '@'), ('[', '`'), ('{', char::MAX)];
     const N_ALPHA: Ranges = &[('\0', '@'), ('[', '`'), ('{', char::MAX)];
     const N_ASCII: Ranges = &[('\u{80}', char::MAX)];
-    const N_BLANK: Ranges =
-        &[('\0', '\u{8}'), ('\n', '\u{1f}'), ('!', char::MAX)];
+    const N_BLANK: Ranges = &[('\0', '\u{8}'), ('\n', '\u{1f}'), ('!', char::MAX)];
     const N_CNTRL: Ranges = &[(' ', '~'), ('\u{80}', char::MAX)];
     const N_DIGIT: Ranges = &[('\0', '/'), (':', char::MAX)];
     const N_GRAPH: Ranges = &[('\0', ' '), ('\u{7f}', char::MAX)];
     const N_LOWER: Ranges = &[('\0', '`'), ('{', char::MAX)];
     const N_PRINT: Ranges = &[('\0', '\u{1f}'), ('\u{7f}', char::MAX)];
-    const N_PUNCT: Ranges =
-        &[('\0', ' '), ('0', '9'), ('A', 'Z'), ('a', 'z'), ('\u{7f}', char::MAX)];
-    const N_SPACE: Ranges =
-        &[('\0', '\u{8}'), ('\u{e}', '\u{1f}'), ('!', char::MAX)];
+    const N_PUNCT: Ranges = &[
+        ('\0', ' '),
+        ('0', '9'),
+        ('A', 'Z'),
+        ('a', 'z'),
+        ('\u{7f}', char::MAX),
+    ];
+    const N_SPACE: Ranges = &[('\0', '\u{8}'), ('\u{e}', '\u{1f}'), ('!', char::MAX)];
     const N_UPPER: Ranges = &[('\0', '@'), ('[', char::MAX)];
-    const N_WORD: Ranges =
-        &[('\0', '/'), (':', '@'), ('[', '^'), ('`', '`'), ('{', char::MAX)];
-    const N_XDIGIT: Ranges =
-        &[('\0', '/'), (':', '@'), ('G', '`'), ('g', char::MAX)];
+    const N_WORD: Ranges = &[
+        ('\0', '/'),
+        (':', '@'),
+        ('[', '^'),
+        ('`', '`'),
+        ('{', char::MAX),
+    ];
+    const N_XDIGIT: Ranges = &[('\0', '/'), (':', '@'), ('G', '`'), ('g', char::MAX)];
 
     let (yes, no): (Ranges, Ranges) = match name {
         "alnum" => (ALNUM, N_ALNUM),
@@ -1100,7 +1134,10 @@ fn posix_class(name: &str, negated: bool) -> Option<Ranges> {
 
 /// Collapse a branch's items into one node.
 fn take_concat(concat: &mut Vec<(Ast, usize)>) -> Ast {
-    let items: Vec<Ast> = core::mem::take(concat).into_iter().map(|(a, _)| a).collect();
+    let items: Vec<Ast> = core::mem::take(concat)
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
     match items.len() {
         0 => Ast::Empty,
         1 => items.into_iter().next().unwrap_or(Ast::Empty),
@@ -1182,7 +1219,10 @@ mod tests {
     /// orbit — `(?i)7` stays a literal, which keeps the common path cheap.
     #[test]
     fn case_folding_only_widens_what_it_must() {
-        let i = Flags { case_insensitive: true, ..Flags::default() };
+        let i = Flags {
+            case_insensitive: true,
+            ..Flags::default()
+        };
         assert!(matches!(parse("7", i), Ok(Ast::Literal('7'))));
         assert!(matches!(parse("a", i), Ok(Ast::Class(_))));
     }
@@ -1191,7 +1231,9 @@ mod tests {
     /// adjacency counts: `[a-mn-z]` is one range, not two.
     #[test]
     fn class_ranges_are_normalized() {
-        let Ast::Class(set) = ast("[z-za-mn-yA]") else { panic!("a class") };
+        let Ast::Class(set) = ast("[z-za-mn-yA]") else {
+            panic!("a class")
+        };
         assert_eq!(set.ranges, vec![('A', 'A'), ('a', 'z')]);
         assert!(set.matches('q') && set.matches('A') && !set.matches('B'));
     }
@@ -1200,11 +1242,18 @@ mod tests {
     /// after case folding.
     #[test]
     fn negation_covers_the_whole_class() {
-        let Ast::Class(set) = ast(r"[^\d a-c]") else { panic!("a class") };
+        let Ast::Class(set) = ast(r"[^\d a-c]") else {
+            panic!("a class")
+        };
         assert!(set.matches('z') && !set.matches('5') && !set.matches(' ') && !set.matches('b'));
 
-        let i = Flags { case_insensitive: true, ..Flags::default() };
-        let Ok(Ast::Class(set)) = parse("[^k]", i) else { panic!("a class") };
+        let i = Flags {
+            case_insensitive: true,
+            ..Flags::default()
+        };
+        let Ok(Ast::Class(set)) = parse("[^k]", i) else {
+            panic!("a class")
+        };
         assert!(!set.matches('k') && !set.matches('K') && !set.matches('\u{212a}'));
         assert!(set.matches('z'));
     }
@@ -1213,9 +1262,13 @@ mod tests {
     /// nested class full of colons.
     #[test]
     fn posix_classes_are_ascii_and_closed() {
-        let Ast::Class(set) = ast("[[:alpha:]]") else { panic!("a class") };
+        let Ast::Class(set) = ast("[[:alpha:]]") else {
+            panic!("a class")
+        };
         assert!(set.matches('a') && set.matches('Z') && !set.matches('\u{e9}'));
-        let Ast::Class(set) = ast("[[:^digit:]]") else { panic!("a class") };
+        let Ast::Class(set) = ast("[[:^digit:]]") else {
+            panic!("a class")
+        };
         assert!(set.matches('x') && !set.matches('4'));
         assert!(message("[[:nosuch:]]").contains("nested character classes"));
     }
@@ -1224,7 +1277,11 @@ mod tests {
     /// tree's `Drop` can be driven off the stack.
     #[test]
     fn nesting_is_capped() {
-        let ok = format!("{}a{}", "(".repeat(MAX_NESTING_DEPTH - 1), ")".repeat(MAX_NESTING_DEPTH - 1));
+        let ok = format!(
+            "{}a{}",
+            "(".repeat(MAX_NESTING_DEPTH - 1),
+            ")".repeat(MAX_NESTING_DEPTH - 1)
+        );
         assert!(parse(&ok, Flags::default()).is_ok());
         let too_deep = format!(
             "{}a{}",
@@ -1233,7 +1290,9 @@ mod tests {
         );
         assert!(message(&too_deep).contains("nests more than"));
         // Stacked quantifiers deepen the tree without opening a group.
-        assert!(message(&format!("a{}", "*".repeat(MAX_NESTING_DEPTH + 1))).contains("nests more than"));
+        assert!(
+            message(&format!("a{}", "*".repeat(MAX_NESTING_DEPTH + 1))).contains("nests more than")
+        );
     }
 
     /// Whitespace inside `{…}` is insignificant even outside `x` mode, which is
@@ -1242,29 +1301,58 @@ mod tests {
     fn counted_repetition_tolerates_spaces() {
         assert!(matches!(
             ast("a{ 2 , 3 }"),
-            Ast::Repeat { min: 2, max: Some(3), .. }
+            Ast::Repeat {
+                min: 2,
+                max: Some(3),
+                ..
+            }
         ));
-        assert!(matches!(ast("a{2,}"), Ast::Repeat { min: 2, max: None, .. }));
+        assert!(matches!(
+            ast("a{2,}"),
+            Ast::Repeat {
+                min: 2,
+                max: None,
+                ..
+            }
+        ));
         assert!(matches!(
             ast("a{2}?"),
-            Ast::Repeat { min: 2, max: Some(2), greedy: false, .. }
+            Ast::Repeat {
+                min: 2,
+                max: Some(2),
+                greedy: false,
+                ..
+            }
         ));
     }
 
     /// `(?U)` swaps greediness, and an explicit `?` swaps it back.
     #[test]
     fn swap_greed_inverts_and_composes() {
-        let u = Flags { swap_greed: true, ..Flags::default() };
-        assert!(matches!(parse("a*", u), Ok(Ast::Repeat { greedy: false, .. })));
-        assert!(matches!(parse("a*?", u), Ok(Ast::Repeat { greedy: true, .. })));
+        let u = Flags {
+            swap_greed: true,
+            ..Flags::default()
+        };
+        assert!(matches!(
+            parse("a*", u),
+            Ok(Ast::Repeat { greedy: false, .. })
+        ));
+        assert!(matches!(
+            parse("a*?", u),
+            Ok(Ast::Repeat { greedy: true, .. })
+        ));
     }
 
     /// A class costs bytes, and those bytes are charged against the compile
     /// ceiling — so the accounting has to see them.
     #[test]
     fn classes_report_their_size() {
-        let Ast::Class(small) = ast("[a]") else { panic!("a class") };
-        let Ast::Class(big) = ast("[a-cx-zA-F0-9_]") else { panic!("a class") };
+        let Ast::Class(small) = ast("[a]") else {
+            panic!("a class")
+        };
+        let Ast::Class(big) = ast("[a-cx-zA-F0-9_]") else {
+            panic!("a class")
+        };
         assert!(big.byte_size() > small.byte_size());
         assert!(small.byte_size() >= size_of::<ClassSet>());
     }

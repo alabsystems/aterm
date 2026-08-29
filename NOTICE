@@ -15,7 +15,6 @@ This source distribution includes modified copies of these upstream crates:
 - pkg-config 0.3.33, MIT OR Apache-2.0 (`vendor/pkg-config/`)
 - smol_str 0.2.2, MIT OR Apache-2.0 (`vendor/smol_str/`)
 - winit 0.30.13, Apache-2.0 (`vendor/winit/`)
-- winnow 0.7.15, MIT (`vendor/winnow/`)
 
 Each vendored crate retains its upstream license text. The winit copy contains
 aterm modifications to macOS application behavior, Wayland seat/data-device

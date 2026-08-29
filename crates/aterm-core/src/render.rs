@@ -1407,6 +1407,34 @@ pub struct RenderInput {
     /// prepend applied on top of already-mutated cells. Metadata, EXCLUDED from
     /// `PartialEq`/`Eq`.
     pub shifted_fill_seq: u64,
+    /// `snapshot_seq` as of the last COMPOSED FRAME a host committed into this
+    /// snapshot — the K2 rectangle-retention lane's provenance token, and the
+    /// exact twin of [`shifted_fill_seq`](Self::shifted_fill_seq) one level up.
+    ///
+    /// A split compositor rebuilds this whole grid out of several panes, and the
+    /// overwhelming majority of a settled composite's cells are byte-identical
+    /// to the frame before. Retaining them means NOT rewriting them, which is
+    /// only sound while the cells still are what that compose left — so the
+    /// compositor needs to know, at the top of the next frame, whether anything
+    /// touched them in between.
+    ///
+    /// A SECOND CLOCK rather than a relaxation of `snapshot_seq`, for the reason
+    /// the splice token exists: every host mutator that writes cells into a
+    /// composite (the find bar, the config notice, the settings panel, the tab
+    /// menu, the paste banner, the status bars, the in-grid tab strip, every
+    /// in-place band) bumps `snapshot_seq` by the established discipline and
+    /// touches NOTHING here, so `snapshot_seq != composed_fill_seq` means "some
+    /// host wrote into the composite" and the retention lane fails closed
+    /// WITHOUT any of them knowing this field exists. An ENGINE fill and every
+    /// host REBUILD of the rows ([`invalidate_row_revisions`](Self::invalidate_row_revisions),
+    /// which every divider-grid fill calls) return it to `0`, so a snapshot that
+    /// changed hands — a single-pane frame, a native tab, a capture — can never
+    /// be mistaken for the composite a ledger describes.
+    ///
+    /// `0` is the NEVER-BLESSED sentinel and the only value any producer other
+    /// than [`bless_composed_fill`](Self::bless_composed_fill) can leave here.
+    /// Metadata, EXCLUDED from `PartialEq`/`Eq`.
+    pub composed_fill_seq: u64,
 }
 
 /// The column order a [`RenderInput`]'s rows are in, as left by the last ENGINE
@@ -1679,6 +1707,7 @@ impl Clone for RenderInput {
             row_rev_lane: self.row_rev_lane,
             row_shift: self.row_shift,
             shifted_fill_seq: self.shifted_fill_seq,
+            composed_fill_seq: self.composed_fill_seq,
         }
     }
 
@@ -1758,6 +1787,7 @@ impl Clone for RenderInput {
         self.row_rev_lane = source.row_rev_lane;
         self.row_shift = source.row_shift;
         self.shifted_fill_seq = source.shifted_fill_seq;
+        self.composed_fill_seq = source.composed_fill_seq;
     }
 }
 
@@ -1909,6 +1939,9 @@ impl PartialEq for RenderInput {
         // frame, so folding them into content equality would make two snapshots of
         // an unchanged screen compare unequal and turn every gate hit into a
         // repaint — the exact opposite of what they exist to buy.
+        // `composed_fill_seq` (K2 composed-frame provenance) is excluded on the
+        // same law as `shifted_fill_seq`: it is a host continuity token, not a
+        // rendered cell.
     }
 }
 
@@ -1992,6 +2025,7 @@ impl RenderInput {
             row_rev_lane: 0,
             row_shift: 0,
             shifted_fill_seq: 0,
+            composed_fill_seq: 0,
         }
     }
 
@@ -2027,6 +2061,11 @@ impl RenderInput {
         self.row_rev.clear();
         self.row_shift = 0;
         self.shifted_fill_seq = 0;
+        // K2: and the rows are no longer the COMPOSITE a retention ledger
+        // describes either — this is the seam every divider-grid fill runs, so
+        // disowning here is what makes a native tab, a capture, or a mixed
+        // composite unable to inherit the previous split frame's blessing.
+        self.composed_fill_seq = 0;
     }
 
     /// Record that a host just PREPENDED `prepended` rows to this snapshot (the
@@ -2053,6 +2092,10 @@ impl RenderInput {
     /// un-splice must remove, not a claim about provenance.
     pub fn note_host_row_prepend(&mut self, prepended: usize, blessed: bool) {
         self.row_shift = self.row_shift.saturating_add(prepended);
+        // K2: a prepend slides every composed row down, so a retention ledger
+        // indexed by composed row no longer describes them. The caller's own
+        // `snapshot_seq` bump already disowns the lane; this says it outright.
+        self.composed_fill_seq = 0;
         if blessed {
             self.row_rev.splice(0..0, (0..prepended).map(|_| 0u64));
             self.shifted_fill_seq = self.snapshot_seq;
@@ -2061,6 +2104,31 @@ impl RenderInput {
             self.row_rev.clear();
             self.shifted_fill_seq = 0;
         }
+    }
+
+    /// BLESS this snapshot as a committed COMPOSED FRAME: record that its cells
+    /// are exactly what the compositor just wrote, so the next compose may
+    /// retain the rows nothing changed (K2).
+    ///
+    /// Called ONCE, by the compositor, after its last cell write and after the
+    /// `snapshot_seq` bump that composite owes the render cache — the twin of
+    /// [`note_host_row_prepend`](Self::note_host_row_prepend)'s blessed leg. Any
+    /// host that writes cells afterwards bumps `snapshot_seq` alone and thereby
+    /// revokes this, which is the whole point of the second clock.
+    pub fn bless_composed_fill(&mut self) {
+        self.composed_fill_seq = self.snapshot_seq;
+    }
+
+    /// Whether this snapshot is STILL, cell for cell, the composed frame
+    /// [`bless_composed_fill`](Self::bless_composed_fill) last blessed.
+    ///
+    /// `false` for every snapshot that was never blessed, every one an engine
+    /// fill or a divider-grid rebuild has since disowned, and every one a host
+    /// mutator has written into (they all bump `snapshot_seq`). Read at the TOP
+    /// of a compose, before the fill that will re-bless it.
+    #[must_use]
+    pub fn composed_fill_intact(&self) -> bool {
+        self.composed_fill_seq != 0 && self.snapshot_seq == self.composed_fill_seq
     }
 
     /// Whether a host row PREPEND about to be applied to this snapshot may keep
@@ -2140,6 +2208,9 @@ impl RenderInput {
         // the prepend was the sole host write.
         self.snapshot_seq = self.engine_fill_seq;
         self.shifted_fill_seq = self.engine_fill_seq;
+        // K2 is NOT re-armed here: an un-splice restores an ENGINE fill, which
+        // is the one thing a composite is not.
+        self.composed_fill_seq = 0;
         true
     }
 
@@ -2621,6 +2692,7 @@ impl RenderInput {
                     strikethrough: false,
                     overline: false,
                     underline_color: None,
+                    overline_color: None,
                 };
                 if let Some(cell) = cells.get_mut(col) {
                     *cell = lead;
@@ -4171,6 +4243,85 @@ mod rain_channel_tests {
         input.char_fg = vec![char_fg(1, 3), char_fg(1, 4)];
         input.fire_halo = vec![fire_halo(1, 3), fire_halo(1, 4)];
         input
+    }
+
+    /// K2's SECOND CLOCK, both directions: only the compositor's own blessing
+    /// arms it, and every other producer revokes it without naming it.
+    ///
+    /// The revoke leg is the whole design. `bless_composed_fill` is the ONLY
+    /// writer, so a mutator that has never heard of this field disowns the lane
+    /// simply by following the `snapshot_seq` discipline it already follows —
+    /// which is what makes a composite with unenumerable producers safe to
+    /// retain rows from.
+    #[test]
+    fn the_composed_fill_blessing_is_revoked_by_every_other_producer() {
+        let mut input = RenderInput::empty();
+        assert!(
+            !input.composed_fill_intact(),
+            "a never-blessed snapshot must not claim to be a composite"
+        );
+
+        input.snapshot_seq = 41;
+        input.bless_composed_fill();
+        assert!(input.composed_fill_intact(), "the blessing did not take");
+
+        // 1. ANY host cell write. The established discipline is one
+        // `snapshot_seq` bump and nothing else — no mutator touches the token.
+        let mut host = input.clone();
+        host.snapshot_seq = host.snapshot_seq.wrapping_add(1);
+        assert!(
+            !host.composed_fill_intact(),
+            "a host mutator's `snapshot_seq` bump must revoke the blessing — \
+             this is the clause every unenumerated composite producer relies on"
+        );
+
+        // 2. A ROW REBUILD, which is what every divider-grid fill opens with.
+        let mut rebuilt = input.clone();
+        rebuilt.invalidate_row_revisions();
+        assert!(
+            !rebuilt.composed_fill_intact(),
+            "a row rebuild must revoke the blessing"
+        );
+
+        // 3. A HOST ROW PREPEND, blessed or not: it slides every composed row.
+        for blessed in [false, true] {
+            let mut spliced = input.clone();
+            spliced.note_host_row_prepend(1, blessed);
+            assert!(
+                !spliced.composed_fill_intact(),
+                "a {} row prepend must revoke the blessing — composed row `r` is \
+                 no longer the row a ledger indexed",
+                if blessed { "blessed" } else { "disowned" }
+            );
+        }
+
+        // 4. And the un-splice, which restores an ENGINE fill — the one thing a
+        //    composite is not.
+        let mut unspliced = RenderInput::empty();
+        unspliced.rows = 1;
+        unspliced.cells = vec![Vec::new()];
+        unspliced.clusters = vec![Vec::new()];
+        unspliced.combining = vec![Vec::new()];
+        unspliced.row_rev = vec![0];
+        unspliced.row_rev_lane = 9;
+        unspliced.snapshot_seq = 7;
+        unspliced.engine_fill_seq = 7;
+        unspliced.shifted_fill_seq = 7;
+        assert!(unspliced.host_prepend_blessing());
+        unspliced.snapshot_seq = 8;
+        unspliced.note_host_row_prepend(1, true);
+        unspliced.cells.insert(0, Vec::new());
+        unspliced.clusters.insert(0, Vec::new());
+        unspliced.combining.insert(0, Vec::new());
+        unspliced.rows = 2;
+        unspliced.bless_composed_fill();
+        let mut pool = Vec::new();
+        assert!(unspliced.undo_host_row_prepend(1, &mut pool, 1));
+        assert!(
+            !unspliced.composed_fill_intact(),
+            "an un-splice restores an engine fill and must not leave a composed \
+             blessing standing over it"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — a transparent, introspecting terminal: runs your shell unchanged while the engine builds a live model the AI can read (U1)."
+description = "aterm — the transparent session: runs your shell unchanged, byte for byte, through the protected spawn seam. The live model an AI reads is WINDOW mode; a session's own VT model is demand-driven and off by default (U1)."
 
 [dependencies]
 aterm-core = { workspace = true }
@@ -30,15 +30,21 @@ aterm-types = { workspace = true }
 # funnel reads, and every mutation in the workspace routes through that helper
 # rather than a raw `set_var`. Dependency-free leaf, already linked transitively.
 aterm-log = { workspace = true }
+# `aterm agents`: the coding-agent primer installer. Its own std-only crate so the
+# GUI (auto-prime on every session) and this CLI verb drive ONE installer.
+aterm-primer = { workspace = true }
+# `aterm --version` names WHICH COPY of aterm is running (S12 of
+# docs/DESIGN-which-copy-runs-2026-08-27.md): the running bundle's path and, per other
+# aterm.app in the usual places, the one "another copy: …" sentence — spelled by the
+# updater's own `which_copy` module so About and --version cannot drift. Reached only
+# by the print-and-exit path, never the shell hot path; the one binary links the
+# updater already.
+aterm-update = { workspace = true }
 
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-
-[dev-dependencies]
-# Scratch home directories for the `aterm agents` installer tests (primer.rs).
-aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

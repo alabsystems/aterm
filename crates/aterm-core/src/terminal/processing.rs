@@ -818,6 +818,10 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         repaint_blink_epoch: _,
         absolute_row_revision: _,
         // --- Session-only (not forwarded to handler) ---
+        // Host config's last-applied values for the app-negotiated modes. Kept
+        // out of the handler on purpose: an escape sequence moves `modes`, never
+        // the host setting the reload diffs against (see `ConfiguredModes`).
+        configured_modes: _,
         content_scroll_state: _,
         parser: _,
         font: _,

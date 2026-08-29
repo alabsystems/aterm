@@ -1155,6 +1155,13 @@ mod tests {
             "crates/aterm-log/src",
             "crates/aterm-lz4/src",
             "crates/aterm-parser/src",
+            // Entered the closure when the first-party PNG codec replaced
+            // `png` and the flate2/miniz_oxide compression stack behind it:
+            // aterm-render is in the web modules' graph and decodes inline
+            // images through it. Pure Rust over `aterm-codec`'s inflate, with
+            // no C build and no libc — which is precisely why it can be here
+            // when the crate it replaced brought a build script.
+            "crates/aterm-png/src",
             "crates/aterm-policy/src",
             "crates/aterm-predict/src",
             "crates/aterm-provenance/src",
@@ -1179,6 +1186,7 @@ mod tests {
             // sample time through it, and on wasm it IS the shim that keeps
             // `Instant::now()` off the panicking std path.
             "crates/aterm-time/src",
+            "crates/aterm-toml/src",
             "crates/aterm-types/src",
             // NOT browser code — see the over-approximation note on this test.
             // Reached only through aterm-shell-integration's

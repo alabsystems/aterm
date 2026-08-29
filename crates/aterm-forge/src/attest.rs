@@ -3,13 +3,38 @@
 
 //! `attest` — the PROVENANCE AND LICENSE NOTARY over `vendor/`.
 //!
-//! Six upstream crates live under `vendor/` as aterm-owned forks, wired in by
+//! Five upstream crates live under `vendor/` as aterm-owned forks, wired in by
 //! the root `[patch.crates-io]` table. Each one is a redistribution of someone
 //! else's copyrighted work with aterm's edits inside it, and each one is a
 //! `-p` handle that `targo trust check` is expected to be able to drive
 //! standalone. Neither property is self-enforcing: a fork can lose its
 //! `[workspace]` stub, its upstream commit record, its `LICENSE` file or its
 //! `NOTICE` line and nothing in the tree notices.
+//!
+//! # A PATCH ENTRY IS NOT AUTOMATICALLY A FORK
+//!
+//! Every obligation below is a REDISTRIBUTION obligation: it exists because
+//! `vendor/` holds somebody else's source. This module used to derive its fork
+//! set from the patch table alone, which keyed ten provenance checks on
+//! IS-PATCHED when every one of them means IS-THIRD-PARTY. The two came apart
+//! the day aterm patched in a crate it WROTE (`tracing` → `crates/aterm-tracing`,
+//! a no-op facade replacing three upstream packages for four consumers at
+//! once): the old code demanded a `.cargo_vcs_info.json` recording which
+//! upstream commit our own file came from, an upstream `LICENSE` we never
+//! received, a `NOTICE` line claiming we redistribute a modified copy of
+//! somebody's crate, and an Apache §4(b) diff against a pristine registry copy
+//! it shares nothing but a name with. Six of the ten could not be satisfied at
+//! all, and two could only be silenced by writing something FALSE into this
+//! repository's own license record.
+//!
+//! So the patch table is PARTITIONED first, by
+//! [`aterm_census::scan_set::classify_patch_target`]: `vendor/` paths are
+//! forks and owe everything; `crates/` paths are first-party workspace
+//! members and owe only `[OB-1]` (it must really be there) and `[OB-2]` (the
+//! patch must really take, which is the check that matters most for a
+//! replacement). Any other location is still a `[OB-1]` failure. First-party
+//! targets are NAMED in the log every run, so the carve-out can never be a
+//! quiet one.
 //!
 //! This module is the standing check. Every obligation is fail-closed and
 //! tagged `[OB-n]` in the log, the way `aterm_census` numbers its own; the log
@@ -18,10 +43,14 @@
 //! # The obligations
 //!
 //! * `[OB-1]`  patch ↔ `vendor/` agreement, both directions, cross-checked
-//!   against [`aterm_census::scan_set::REVIEWED_VENDORED_CRATES`].
-//! * `[OB-2]`  version equality — a vendored version outside the requirement
+//!   against [`aterm_census::scan_set::REVIEWED_VENDORED_CRATES`] — plus the
+//!   partition itself: every patch path is under `vendor/` or `crates/`, and
+//!   a first-party target is a real directory with sources.
+//! * `[OB-2]`  version equality — a patched version outside the requirement
 //!   the workspace states makes the patch SILENTLY UN-USED (cargo warns and
-//!   exits 0), so `Cargo.lock` is cross-checked for a source-less entry.
+//!   exits 0), so `Cargo.lock` is cross-checked for a source-less entry. This
+//!   is the ONE obligation that covers first-party targets too: it is about
+//!   the patch working, not about provenance.
 //! * `[OB-3]`  the empty `[workspace]` stub. MEASURED on this tree: with the
 //!   stub, `cargo metadata` with cwd inside the crate exits 0 (indexmap);
 //!   without it, exit 101 — "current package believes it's in a workspace
@@ -51,7 +80,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use toml_edit::{DocumentMut, Item, TableLike};
+use aterm_toml::edit::{DocumentMut, Item, TableLike};
 
 use crate::{Outcome, PRECISION_NOTE};
 
@@ -139,6 +168,31 @@ fn patch_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// `(patch key, replacement path)` pairs, in patch-table order.
+type PatchTable = Vec<(String, String)>;
+
+/// Split the patch table into `(vendored, first_party)` by replacement path.
+///
+/// FIRST-PARTY is the narrow arm and it is spelled out positively: only a path
+/// under `crates/` — a workspace member, code aterm wrote — is carved out of
+/// the provenance obligations. EVERYTHING ELSE stays in the vendored arm,
+/// including an empty path (a git/registry patch) and a path in some third
+/// location, so `[OB-1]`'s "not under vendor/" failure still fires on both
+/// rather than being quietly widened into an escape hatch.
+fn partition_patches(patch: &[(String, String)], root: &Path) -> (PatchTable, PatchTable) {
+    let mut vendored = Vec::new();
+    let mut first_party = Vec::new();
+    for (name, rel) in patch {
+        match aterm_census::scan_set::classify_patch_target(name, rel, root) {
+            Ok(aterm_census::scan_set::PatchTargetKind::FirstParty) => {
+                first_party.push((name.clone(), rel.clone()));
+            }
+            _ => vendored.push((name.clone(), rel.clone())),
+        }
+    }
+    (vendored, first_party)
 }
 
 /// Directory names directly under `vendor/`, sorted. Absent `vendor/` is an
@@ -627,17 +681,30 @@ pub fn report(root: &Path) -> (bool, String) {
             return (false, log);
         }
     };
-    let forks = survey_forks(root, &patch);
+    // THE PARTITION. Redistribution obligations belong to third-party source,
+    // not to "whatever the patch table names" — see the module docs.
+    let (vendored, first_party) = partition_patches(&patch, root);
+    let forks = survey_forks(root, &vendored);
+    let first_party_forks = survey_forks(root, &first_party);
     let dirs = vendor_dirs(root);
     let _ = writeln!(
         log,
-        "    forks: {} from [patch.crates-io]; {} director(y/ies) under vendor/",
+        "    forks: {} vendored from [patch.crates-io]; {} director(y/ies) under vendor/; \
+         {} FIRST-PARTY patch target(s) under crates/ (aterm's own code — provenance \
+         obligations do not apply, and [OB-1]/[OB-2] say so by name)",
         forks.len(),
-        dirs.len()
+        dirs.len(),
+        first_party_forks.len()
     );
 
-    fails += ob1_patch_vendor_agreement(root, &forks, &dirs, &mut log);
-    fails += ob2_version_equality(root, &forks, &mut log);
+    fails += ob1_patch_vendor_agreement(root, &forks, &first_party_forks, &dirs, &mut log);
+    // [OB-2] is the liveness obligation, and a replacement that does not take
+    // is exactly as broken as a fork that does not take. Both sets, one pass.
+    let mut ob2_all: Vec<VendoredFork> = Vec::new();
+    ob2_all.extend(forks.iter().cloned());
+    ob2_all.extend(first_party_forks.iter().cloned());
+    ob2_all.sort_by(|a, b| a.name.cmp(&b.name));
+    fails += ob2_version_equality(root, &ob2_all, &mut log);
     fails += ob3_workspace_stub(&forks, &mut log);
     fails += ob4_provenance_files(&forks, &mut log);
     fails += ob5_license_files(&forks, &mut log);
@@ -650,8 +717,10 @@ pub fn report(root: &Path) -> (bool, String) {
     if fails == 0 {
         let _ = writeln!(
             log,
-            "cargo forge attest: PASS — 10 obligations held over {} vendored fork(s).",
-            forks.len()
+            "cargo forge attest: PASS — 10 obligations held over {} vendored fork(s) \
+             (+ [OB-1]/[OB-2] over {} first-party patch target(s)).",
+            forks.len(),
+            first_party_forks.len()
         );
         return (true, log);
     }
@@ -664,16 +733,62 @@ pub fn report(root: &Path) -> (bool, String) {
     (false, log)
 }
 
-/// `[OB-1]` Every patch key resolves to a real `vendor/<dir>` with sources, and
-/// every `vendor/<dir>` is claimed by a patch key. Cross-checked against the
-/// census registry when this root IS the workspace that registry describes.
+/// `[OB-1]` Every VENDORED patch key resolves to a real `vendor/<dir>` with
+/// sources, and every `vendor/<dir>` is claimed by a patch key. Cross-checked
+/// against the census registry when this root IS the workspace that registry
+/// describes.
+///
+/// FIRST-PARTY patch targets are checked here too, against the only two things
+/// that can be wrong about them — the directory must exist and must have
+/// sources — and are then NAMED in the log so the carve-out from `[OB-3]`
+/// onwards is visible on every run. They are deliberately excluded from the
+/// REVIEWED_VENDORED_CRATES cross-check in BOTH directions: demanding a
+/// "reviewed vendored fork" row for a workspace member would record a false
+/// provenance claim, which `[OB-6]` already argues is as wrong as a missing
+/// one.
 fn ob1_patch_vendor_agreement(
     root: &Path,
     forks: &[VendoredFork],
+    first_party: &[VendoredFork],
     dirs: &[String],
     log: &mut String,
 ) -> usize {
     let mut fails = 0;
+    for fp in first_party {
+        if !fp.dir.is_dir() {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-1] [patch.crates-io] `{}` points at first-party `{}`, which does \
+                 not exist — cargo cannot resolve this workspace at all. Restore the crate or \
+                 remove the patch entry from {}/Cargo.toml.",
+                fp.name,
+                fp.rel,
+                root.display()
+            );
+            fails += 1;
+            continue;
+        }
+        if !fp.dir.join("src").is_dir() {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-1] first-party patch target `{}` has no `src/` — a replacement \
+                 with no sources replaces nothing.",
+                fp.rel
+            );
+            fails += 1;
+            continue;
+        }
+        let _ = writeln!(
+            log,
+            "    [OB-1] `{}` → `{}` is a FIRST-PARTY patch target (a workspace member, code \
+             aterm wrote). It is not a redistribution, so [OB-3]..[OB-10] — the [workspace] \
+             stub, .cargo_vcs_info.json/Cargo.toml.orig, a retained upstream LICENSE, a \
+             NOTICE row, the Apache §4(b) pristine diff, the fork-marker census, the SPDX \
+             allowlist and the vendor/ ignore sweep — do NOT apply to it. [OB-2] does, and \
+             it is the one that matters: the patch must actually take.",
+            fp.name, fp.rel
+        );
+    }
     for fork in forks {
         if !fork.rel.starts_with("vendor/") {
             let _ = writeln!(
@@ -774,15 +889,23 @@ fn ob1_patch_vendor_agreement(
     if fails == 0 {
         let _ = writeln!(
             log,
-            "  ✓ [OB-1] patch ↔ vendor/ agreement holds in both directions ({} fork(s)).",
-            forks.len()
+            "  ✓ [OB-1] patch ↔ vendor/ agreement holds in both directions ({} vendored \
+             fork(s); {} first-party target(s) present with sources).",
+            forks.len(),
+            first_party.len()
         );
     }
     fails
 }
 
-/// `[OB-2]` The vendored version must satisfy every requirement the workspace
-/// states, and `Cargo.lock` must show the patch actually took.
+/// `[OB-2]` The patched crate's version must satisfy every requirement the
+/// workspace states, and `Cargo.lock` must show the patch actually took.
+///
+/// Runs over BOTH arms of the partition: vendored forks and first-party patch
+/// targets. Nothing here is a provenance question — "does this redirect
+/// actually compile into anything" is equally live for a fork and for a
+/// replacement, and it is the failure mode cargo hides behind a warning at
+/// exit 0.
 fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
     let mut fails = 0;
     for fork in forks {
@@ -897,8 +1020,8 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
     if fails == 0 {
         let _ = writeln!(
             log,
-            "  ✓ [OB-2] every fork's vendored version satisfies the workspace requirements and \
-             appears source-less in Cargo.lock (the patch is live): {}",
+            "  ✓ [OB-2] every patched crate's version satisfies the workspace requirements \
+             and appears source-less in Cargo.lock (the patch is live): {}",
             forks
                 .iter()
                 .map(|f| format!("{} {}", f.name, f.version))
@@ -1453,7 +1576,7 @@ fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usiz
                  the rule did (or were force-added) — a plain `git add` of the same path in a \
                  re-vendor does NOTHING and the file is lost silently. FIX: add a \
                  `!vendor/**/<name>` re-include beside the rule, the way `!vendor/**/debug/` \
-                 already rescues winnow's `combinator/debug` source module.",
+                 is kept for any vendored crate shipping a real `debug` source module.",
                 present.len(),
                 present.join(", ")
             );
@@ -1537,46 +1660,100 @@ mod tests {
         }
     }
 
+    /// The vendored arm of the real tree's patch table, as every fork-shaped
+    /// test below wants it: first-party targets are not forks and must not be
+    /// measured as if they were.
+    fn real_forks(root: &Path) -> Vec<VendoredFork> {
+        let (vendored, _) = partition_patches(&patch_paths(root).unwrap(), root);
+        survey_forks(root, &vendored)
+    }
+
     #[test]
     fn the_real_tree_reproduces_the_measured_marker_floor() {
         let root = repo_root();
-        let forks = survey_forks(&root, &patch_paths(&root).unwrap());
+        let forks = real_forks(&root);
         let trust: u64 = forks.iter().map(|f| f.trust_markers).sum();
         let patch: u64 = forks.iter().map(|f| f.patch_markers).sum();
-        assert_eq!(trust, 16, "`{TRUST_MARKER}` marker count");
-        assert_eq!(patch, 2, "`{LOCAL_PATCH_MARKER}` marker count");
+        assert_eq!(trust, 14, "`{TRUST_MARKER}` marker count");
+        // 2 -> 3 on 2026-08-28. The third is in
+        // vendor/winit/src/platform_impl/macos/util.rs, and it exists BECAUSE
+        // of the tracing shim: `TraceGuard`'s two fields are read only inside
+        // the `trace!` calls that the first-party facade discards, so with the
+        // patch live rustc correctly reports them dead. The marker annotates a
+        // scoped `#[allow(dead_code)]` that keeps upstream's fields intact, so
+        // restoring the real `tracing` restores their readers with no further
+        // edit. Counted here, not waived: this pin exists so a change to a
+        // vendored fork cannot happen quietly, and it worked — it caught this
+        // edit on the run that made it.
+        assert_eq!(patch, 3, "`{LOCAL_PATCH_MARKER}` marker count");
         let by_name: BTreeMap<&str, (u64, u64)> = forks
             .iter()
             .map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers)))
             .collect();
         assert_eq!(by_name["indexmap"], (8, 0));
         assert_eq!(by_name["smol_str"], (4, 0));
-        assert_eq!(by_name["winnow"], (2, 0));
         assert_eq!(by_name["libm"], (1, 0));
         assert_eq!(by_name["pkg-config"], (1, 0));
-        assert_eq!(by_name["winit"], (0, 2));
+        assert_eq!(by_name["winit"], (0, 3));
     }
 
+    /// The patch table PARTITIONED. Five vendored forks — third-party source
+    /// this repository redistributes and must keep reviewing — and five
+    /// first-party targets, which are workspace members and owe none of that.
+    /// Asserting the two lists separately is the point: the old single-list
+    /// assertion could only be repaired by adding "tracing" to a list named
+    /// "known forks", which is precisely the framing that made six provenance
+    /// obligations demand impossible or false artifacts.
+    ///
+    /// The first-party arm went 1 → 5 in one wave (`profiling`, `cfg-if`,
+    /// `arrayvec`, `log`), which is the shape the partition was built for: four
+    /// packages left the shipped graph and NOT ONE of them added a
+    /// REVIEWED_VENDORED_CRATES row, a NOTICE line or a §4(b) byte-diff. The
+    /// The arm is SORTED (measured, not assumed — the first draft of this
+    /// assertion listed them in manifest order and went red).
     #[test]
-    fn the_real_tree_has_exactly_the_six_known_forks() {
+    fn the_real_patch_table_is_five_vendored_forks_and_five_first_party_targets() {
         let root = repo_root();
-        let mut names: Vec<String> = patch_paths(&root)
-            .unwrap()
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
+        let (vendored, first_party) = partition_patches(&patch_paths(&root).unwrap(), &root);
+        let mut names: Vec<String> = vendored.into_iter().map(|(n, _)| n).collect();
         names.sort();
         assert_eq!(
             names,
-            [
-                "indexmap",
-                "libm",
-                "pkg-config",
-                "smol_str",
-                "winit",
-                "winnow"
+            ["indexmap", "libm", "pkg-config", "smol_str", "winit"]
+        );
+        assert_eq!(
+            first_party,
+            vec![
+                ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
+                ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
+                ("log".to_string(), "crates/aterm-log-shim".to_string()),
+                (
+                    "profiling".to_string(),
+                    "crates/aterm-profiling".to_string()
+                ),
+                ("tracing".to_string(), "crates/aterm-tracing".to_string()),
             ]
         );
+    }
+
+    /// Every VENDORED fork sits at `vendor/`; every FIRST-PARTY target sits at
+    /// `crates/`. This is the invariant the whole partition rests on, and it
+    /// is asserted on the real tree so a patch entry pointing somewhere else
+    /// cannot slip through by being neither.
+    #[test]
+    fn every_patch_entry_is_classified_vendored_or_first_party() {
+        for (name, rel) in patch_paths(&repo_root()).unwrap() {
+            let kind = aterm_census::scan_set::classify_patch_target(&name, &rel, &repo_root())
+                .unwrap_or_else(|e| panic!("{e}"));
+            match kind {
+                aterm_census::scan_set::PatchTargetKind::Vendored => {
+                    assert!(rel.starts_with("vendor/"), "{name} → {rel}");
+                }
+                aterm_census::scan_set::PatchTargetKind::FirstParty => {
+                    assert!(rel.starts_with("crates/"), "{name} → {rel}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1586,8 +1763,8 @@ mod tests {
         // `targo trust check -p <fork>` run from inside the fork at all, and the
         // two provenance files are what make a pristine diff possible.
         let root = repo_root();
-        let forks = survey_forks(&root, &patch_paths(&root).unwrap());
-        assert_eq!(forks.len(), 6);
+        let forks = real_forks(&root);
+        assert_eq!(forks.len(), 5);
         for fork in &forks {
             assert!(
                 fork.workspace_stub,

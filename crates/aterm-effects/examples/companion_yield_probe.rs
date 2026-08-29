@@ -7,7 +7,12 @@ use aterm_effects::word_decorations::{EffectGeom, KittyCursorLayout, WordDecorat
 
 fn main() {
     for (cw, ch) in [(10u16, 20u16), (9, 19), (8, 17), (20, 20)] {
-        let geom = EffectGeom { cell_w: cw, cell_h: ch, rows: 24, cols: 80 };
+        let geom = EffectGeom {
+            cell_w: cw,
+            cell_h: ch,
+            rows: 24,
+            cols: 80,
+        };
         let wd = WordDecorations::default();
         let (row, col) = (10u16, 20u16);
         let fp = wd
@@ -30,8 +35,16 @@ fn main() {
         println!(
             "cell {cw}x{ch}: sprite x[{}..{}] y[{}..{}] ({}x{})  box x[{}..{}] y[{}..{}]  \
              covered {cover}% of the head",
-            sprite.0, sprite.1, sprite.2, sprite.3, fp.w, fp.h,
-            box_px.0, box_px.1, box_px.2, box_px.3
+            sprite.0,
+            sprite.1,
+            sprite.2,
+            sprite.3,
+            fp.w,
+            fp.h,
+            box_px.0,
+            box_px.1,
+            box_px.2,
+            box_px.3
         );
     }
 }

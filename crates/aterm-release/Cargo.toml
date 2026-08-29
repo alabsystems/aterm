@@ -28,8 +28,11 @@ atpkg = { workspace = true }
 # Manifest emission, the dist/cut-state.toml resume journal, and the release.conf
 # key=value surface are all serde-derived TOML (derive comes with the workspace dep).
 serde = { workspace = true }
-serde_json = { workspace = true }
-toml = { workspace = true }
+# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
+# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
+# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+aterm-json = { workspace = true }
+aterm-toml = { workspace = true }
 # DMG sha256 is computed in-process (dmg.rs) — never shelled out to `shasum`,
 # so the digest that lands in the manifest is the digest of the bytes we hashed.
 aterm-digest = { workspace = true }
@@ -37,7 +40,12 @@ aterm-digest = { workspace = true }
 # deliberately external/owner-only, but trusting its exit status would not bind
 # the bytes uploaded to the public key compiled into clients.
 ring = { version = "0.17.14", default-features = false }
-base64 = "0.22.1"
+# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
+# to the retired `base64` package's `general_purpose::STANDARD` engine by
+# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
+# point every trust path uses: canonical padding REQUIRED and no trailing bits,
+# so a pinned key has exactly one spelling.
+aterm-codec = { workspace = true }
 # The provisioning engine: `cargo ship provision` drives the join ceremony
 # in-process (RELEASE-KEYS.md's "signing is in-process" rule, extended to
 # minting), so one phrase prompt provisions the machine with no second binary.

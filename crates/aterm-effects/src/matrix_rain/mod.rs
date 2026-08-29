@@ -965,6 +965,25 @@ impl MatrixRain {
         !self.have_scanned || epoch != self.last_epoch
     }
 
+    /// The damage epoch the Tier-A occupancy scan last CONSUMED — `None` until
+    /// the first [`rescan_from_cells`](Self::rescan_from_cells).
+    ///
+    /// A host that believes it feeds the rescan every frame can assert this
+    /// ADVANCES, which nothing else here can show:
+    /// [`needs_rescan`](Self::needs_rescan) is a predicate about the FUTURE (it
+    /// reads `false` both when the scan just ran and when the grid simply did
+    /// not move), and [`diag_line`](Self::diag_line)'s `scanned=` flag is
+    /// sticky — once true it stays true forever, so a host that stopped
+    /// scanning would keep reporting a healthy line. That distinction is not
+    /// hypothetical: the O(rows·cols) rescan is fed from a snapshot buffer the
+    /// caller chooses, and a caller that points it at the wrong buffer, or
+    /// stops calling it, changes the frame's cost by exactly the amount a
+    /// benchmark of that frame is trying to measure.
+    #[must_use]
+    pub fn scanned_epoch(&self) -> Option<u64> {
+        self.have_scanned.then_some(self.last_epoch)
+    }
+
     /// Rebuild the Tier-A occupancy bitset from the frame snapshot (the same
     /// `cell_frame_into` rows sparkle scans). Eligible iff the cell is a
     /// space, not a wide half, not underlined, on the default background,
@@ -2616,6 +2635,7 @@ mod tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 

@@ -77,6 +77,137 @@ fn record_shell_integration_outcome(outcome: ShellIntegrationOutcome) {
         .expect("shell integration outcome lock") = Some(outcome);
 }
 
+// ---------------------------------------------------------------------------
+// Auto-prime: aterm installs the coding-agent primer ITSELF
+//
+// `aterm agents install` is a manual step, and a manual step nobody runs is
+// how finding F1 happened (docs/AGENT-EXPERIENCE-2026-08-26.md §2.1): every
+// agent row `absent` on a machine that had run aterm for weeks, so an agent
+// launched anywhere but the repo had no idea what aterm was. Owner decision:
+// "having aterm installed in aterm itself isn't something that happens later"
+// — so every FRESH session spawn runs the same installer, on a detached
+// thread, throttled, fail-soft. `agents_auto_prime = false` is the off switch.
+// ---------------------------------------------------------------------------
+
+/// How often one process re-runs the installer at most. A spawn burst (a
+/// restore of twenty tabs) must cost one pass, not twenty; and after the first
+/// pass every later one is a no-op re-read, so a minute loses nothing.
+const AGENT_PRIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When the installer last STARTED in this process (`None` before the first
+/// fresh spawn). Stamped before the thread runs, so a burst of spawns inside
+/// the window never launches a second thread.
+static AGENT_PRIME_LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The result of the most recent auto-prime pass — what actually happened,
+/// recorded for the same reason [`SHELL_INTEGRATION_OUTCOME`] is: a surface
+/// that reports on the primer must read the outcome, never assume success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentPrimeOutcome {
+    /// `agents_auto_prime = false`: nothing was read or written.
+    Disabled,
+    /// `$HOME` is unset or empty: nowhere to look.
+    NoHome,
+    /// The installer ran; its per-agent result and one-line summary.
+    Ran(aterm_primer::AutoPrime),
+}
+
+/// Last-write-wins record of the most recent pass.
+static AGENT_PRIME_OUTCOME: Mutex<Option<AgentPrimeOutcome>> = Mutex::new(None);
+
+/// The recorded outcome of the most recent auto-prime pass, `None` before any
+/// fresh spawn (or while the first pass is still on its thread).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the in-app reader (a primer notice beside the toolchain pill, S1's \
+                  product half) lands in lib.rs; the record exists so it reads truth, \
+                  and the tests read it today"
+    )
+)]
+pub(crate) fn agent_prime_outcome() -> Option<AgentPrimeOutcome> {
+    AGENT_PRIME_OUTCOME
+        .lock()
+        .expect("agent prime outcome lock")
+        .clone()
+}
+
+fn record_agent_prime_outcome(outcome: AgentPrimeOutcome) {
+    *AGENT_PRIME_OUTCOME
+        .lock()
+        .expect("agent prime outcome lock") = Some(outcome);
+}
+
+/// The throttle decision, pure: due when nothing ran yet, or when the last pass
+/// started at least [`AGENT_PRIME_INTERVAL`] ago. `now` is injected so a test
+/// walks the clock instead of sleeping; a clock that went backwards is simply
+/// "not due", never a panic.
+fn due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(started) => now.saturating_duration_since(started) >= AGENT_PRIME_INTERVAL,
+    }
+}
+
+/// One pass with its inputs injected (the knob, the home), so a test drives it
+/// against a scratch directory: runs the installer, records the outcome, logs
+/// a change at `info` and each failed agent at `warn` — and nothing when the
+/// pass changed nothing, because a line per spawn would be noise.
+fn run_agent_prime(enabled: bool, home: Option<std::path::PathBuf>) -> AgentPrimeOutcome {
+    let outcome = if !enabled {
+        AgentPrimeOutcome::Disabled
+    } else if let Some(home) = home {
+        let pass = aterm_primer::auto_prime(&home);
+        if pass.changed() {
+            aterm_log::info!("{}", pass.summary);
+        }
+        for (agent, err) in pass.errors() {
+            aterm_log::warn!(
+                "agent primer: {agent}: {err} — `aterm agents` names the file; nothing was \
+                 written to it"
+            );
+        }
+        AgentPrimeOutcome::Ran(pass)
+    } else {
+        AgentPrimeOutcome::NoHome
+    };
+    record_agent_prime_outcome(outcome.clone());
+    outcome
+}
+
+/// Prime detected coding agents if the throttle says a pass is due — called at
+/// the top of every FRESH [`spawn_session`]. Returns at once either way: the
+/// pass runs on a DETACHED thread, because the spawn path is the event loop's
+/// and the installer reads the config file plus a handful of context files —
+/// disk I/O the caret must never wait on. The handle is dropped on purpose:
+/// nothing joins it, and a pass the process outlives wrote whole files only.
+pub(crate) fn prime_agents_if_due() {
+    // Unit tests construct `App`s that reach spawn seams; none may ever write
+    // the developer's real `$HOME`. The integration lane (a headless aterm
+    // under a scratch HOME) is where this runs for real.
+    if cfg!(test) {
+        return;
+    }
+    let now = Instant::now();
+    {
+        let mut last = AGENT_PRIME_LAST.lock().expect("agent prime throttle lock");
+        if !due(*last, now) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let spawned = std::thread::Builder::new()
+        .name("aterm-agent-prime".to_string())
+        .spawn(|| {
+            let enabled = crate::app_config::agents_auto_prime_setting();
+            let _ = run_agent_prime(enabled, aterm_primer::home_dir());
+        });
+    if let Err(e) = spawned {
+        aterm_log::warn!("agent primer: could not start the installer thread: {e}");
+    }
+}
+
 /// Prepare OSC 133/633 shell integration for `$SHELL`: returns the `(key, value)`
 /// environment additions + an optional argv override (bash's `--rcfile`) to
 /// inject into the spawned shell so it emits the command marks the
@@ -598,6 +729,12 @@ pub(crate) fn spawn_session(
     // fresh shell. `None` = the normal fork-a-new-shell path (every existing caller).
     adopt: Option<Adopted>,
 ) -> std::io::Result<Session> {
+    // The coding-agent primer rides every FRESH spawn (an adopted shell is
+    // already running; whatever agent it hosts was primed when it was first
+    // spawned): throttled and detached, so it costs this spawn nothing.
+    if adopt.is_none() {
+        prime_agents_if_due();
+    }
     let handoff_local_id = adopt.as_ref().map(|adopted| adopted.local_id);
     // Per-tab shell integration: a FRESH nonce per session. Reusing a nonce
     // across tabs would let tab A's (untrusted) output emit tab B's authorized
@@ -1051,6 +1188,66 @@ impl DeferredReaderGate {
             };
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod agent_prime_tests {
+    use super::{
+        AGENT_PRIME_INTERVAL, AgentPrimeOutcome, agent_prime_outcome, due, run_agent_prime,
+    };
+    use std::time::{Duration, Instant};
+
+    /// The throttle: the first spawn is due, a burst inside the window is not,
+    /// the window's edge is inclusive, and a clock step backwards is harmless.
+    #[test]
+    fn due_when_never_ran_or_once_the_interval_has_passed() {
+        let t0 = Instant::now();
+        assert!(due(None, t0), "nothing ran yet");
+        assert!(!due(Some(t0), t0), "same instant");
+        assert!(!due(
+            Some(t0),
+            t0 + AGENT_PRIME_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(
+            due(Some(t0), t0 + AGENT_PRIME_INTERVAL),
+            "edge is inclusive"
+        );
+        assert!(due(Some(t0), t0 + AGENT_PRIME_INTERVAL * 5));
+        assert!(
+            !due(Some(t0 + Duration::from_secs(1)), t0),
+            "a clock that went backwards is not due, never a panic"
+        );
+    }
+
+    /// One pass against a SCRATCH home: the knob is honoured before any read,
+    /// a missing home is named, a detected agent gets primed, and the recorded
+    /// outcome is what the pass returned — so a reader sees the truth.
+    #[test]
+    fn a_pass_records_exactly_what_it_did() {
+        assert_eq!(run_agent_prime(false, None), AgentPrimeOutcome::Disabled);
+        assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::Disabled));
+        assert_eq!(run_agent_prime(true, None), AgentPrimeOutcome::NoHome);
+        assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::NoHome));
+
+        let home = aterm_tempfile::tempdir().expect("scratch home");
+        std::fs::create_dir_all(home.path().join(".codex")).expect("detect codex");
+        let AgentPrimeOutcome::Ran(pass) = run_agent_prime(true, Some(home.path().to_path_buf()))
+        else {
+            panic!("enabled with a home must run");
+        };
+        assert!(pass.changed(), "{}", pass.summary);
+        assert_eq!(pass.agents.len(), 1);
+        assert_eq!(pass.agents[0].agent, "codex");
+        assert_eq!(pass.agents[0].outcome, aterm_primer::Outcome::Installed);
+        assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::Ran(pass)));
+        let written = std::fs::read_to_string(home.path().join(".codex/AGENTS.md"))
+            .expect("the primer landed");
+        assert_eq!(written, aterm_primer::primer_block(Some("codex")));
+        assert!(
+            !home.path().join(".claude").exists(),
+            "never creates an agent dir"
+        );
     }
 }
 

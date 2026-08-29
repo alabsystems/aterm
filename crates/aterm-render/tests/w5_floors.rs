@@ -6,7 +6,7 @@
 // vanish outright) and the line decorations (underline colour used to paint
 // raw/unfloored on both backends). CPU fills are exact, so both are asserted
 // as exact pixel values. GPU parity for these paths is carried by the shared
-// pure functions (`floor_cursor_fill` / `effective_deco_color`) plus the
+// pure functions (`floor_cursor_fill` / `deco_inks`) plus the
 // gpu_matches_cpu suite.
 
 use aterm_core::terminal::Terminal;

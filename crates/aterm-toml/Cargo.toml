@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-toml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party TOML 1.0 for aterm: a serde Deserializer/Serializer (replaces `toml`) and a comment-preserving document model (replaces `toml_edit`)"
+
+[dependencies]
+# serde is the ONLY dependency, and it is deliberate. 168 `from_str` call sites
+# in this tree are backed by 161 `#[derive(Deserialize)]` types, so the
+# replacement has to BE a `serde::Deserializer` — a parser that returned a value
+# tree would mean rewriting 161 hand-written models. serde_derive is a proc
+# macro: it contributes zero machine code to the shipped binary, and `serde`
+# itself is already in the graph for a dozen other reasons. Retiring serde is
+# explicitly NOT what this crate is for.
+serde = { workspace = true }
+
+[dev-dependencies]
+# ORACLES ONLY — the two crates this one retires, kept as dev-dependencies so
+# every parse in the repository's own .toml corpus is proved equal to the
+# reference implementation, exactly as crates/aterm-digest keeps sha2/hmac and
+# crates/aterm-regex keeps regex. A dev-dependency never enters the shipped
+# graph, so the proof costs nothing at ship time.
+#
+# Pinned HERE rather than inherited from [workspace.dependencies]: the point of
+# this crate is that no shipped member declares them any more.
+toml = "0.8"
+toml_edit = "0.22"
+# ONE RESIDUAL, recorded rather than hidden: `toml_edit` still pulls
+# `winnow 0.7.15`, and now it comes from the REGISTRY rather than from
+# vendor/winnow — so the `offset_from` divide-by-zero and underflow the fork
+# fixed are back in the code this workspace compiles for `cargo test -p
+# aterm-toml`. It is dev-only and reaches no shipped binary, but the vendor
+# rationale in the workspace manifest exists because Trust correctly refuses to
+# compile that code, so a fully verified build needs no verification-bypass
+# flags. The day `.cargo/config.toml`'s `-Ztrust-verify=off` opt-out is deleted
+# — the Trust-Std campaign's stated endpoint — this lane has to either drop the
+# `toml_edit` oracle or re-vendor the fix. Nothing else in the workspace
+# declares either crate.
+
+[lints]
+workspace = true

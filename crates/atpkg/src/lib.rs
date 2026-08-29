@@ -102,7 +102,11 @@ pub mod platform;
 pub mod progress;
 pub mod provisional;
 pub mod relocate;
+/// The `requires` relation's one gate (`unmet_requirement`, §17.10), shared by the
+/// set-completion pass, the OS-installed reconcile and the update pass.
+pub mod requires;
 pub mod select;
+pub mod shim_env;
 pub mod sig;
 /// The `softwareupdate` protocol's lane: Apple's Command Line Tools, installed
 /// headlessly by `softwareupdate` with elevation (never `xcode-select --install`).
@@ -130,7 +134,7 @@ pub mod tree;
 pub mod vendor;
 pub mod verify;
 
-pub use activate::{activate_channel, atomic_symlink, install_shims};
+pub use activate::{Aliases, activate_channel, atomic_symlink, install_shims};
 pub use appgate::{AppIndexGate, app_apply_allowed};
 pub use apply::{Group, TxnOutcome, plan_groups, transact};
 pub use bundled::{SEED_DIR_NAME, bundled_seed_dir};
@@ -164,6 +168,7 @@ pub use manifest::{
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
 pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, Selection, select_index};
+pub use shim_env::ShimEnv;
 pub use sig::{
     Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,
     check_freshness,

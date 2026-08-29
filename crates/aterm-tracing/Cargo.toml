@@ -1,0 +1,72 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the four
+# third-party consumers' `tracing = "0.1.4x"` lines at this code the package
+# must be called `tracing` — nothing else works. The DIRECTORY keeps the
+# `aterm-` prefix so a `ls crates/` or a stack trace still reads as ours and
+# nobody mistakes this for a vendored upstream (those live under `vendor/`,
+# which is where genuinely-upstream source belongs).
+name = "tracing"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number: softbuffer 0.4.8 asks for ^0.1.41,
+# the winit fork for ^0.1.40, tiny-xlib 0.2.5 for ^0.1.37 and zbus 5.16.0 for
+# ^0.1.40. 0.1.44 is what the graph resolved to before the swap, and it
+# satisfies all four, so the lockfile's version line does not move.
+version = "0.1.44"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party no-op `tracing` facade for aterm (replaces tracing + tracing-core + tracing-attributes; also pin-project-lite on mac/windows)"
+
+[dependencies]
+# The ONLY dependency, optional, and off on three of the four cells.
+#
+# Renamed from `aterm-tracing-attributes` to `tracing-attributes` for two
+# reasons: the shim re-exports it as `tracing::instrument`, and the rename makes
+# the implicit optional-dependency feature spell `tracing-attributes` — the same
+# feature name upstream's `attributes = ["tracing-attributes"]` refers to.
+# Measured on Linux the resolver enables exactly `attributes, default, std,
+# tracing-attributes` on this package (zbus takes `tracing` with default
+# features on), so that spelling has to exist or the resolve breaks.
+tracing-attributes = { package = "aterm-tracing-attributes", path = "../aterm-tracing-attributes", optional = true }
+
+[features]
+# Upstream's feature table, reproduced. Only `default`, `std`, `attributes` and
+# `tracing-attributes` are reachable from aterm's graph today (Linux, via zbus);
+# mac / windows / wasm resolve this package with NO features at all, which is
+# why the crate is `#![no_std]` unconditionally and why every macro has to work
+# with the table completely empty.
+#
+# The unreachable entries are declared anyway because they cost one line each
+# and they remove a whole class of "some transitive crate asked for
+# `tracing/log`" resolution failures that would otherwise surface as a broken
+# build on a cell we cannot compile here. They are all no-ops: there is no
+# `log` bridge and no level filtering, because there is nothing to filter.
+default = ["std", "attributes"]
+attributes = ["tracing-attributes"]
+# Accepted and ignored: the shim is `no_std` whether or not this is on. Upstream
+# forwards it to `tracing-core/std`; we have no `tracing-core`.
+std = []
+async-await = []
+log = []
+log-always = ["log"]
+valuable = []
+max_level_off = []
+max_level_error = []
+max_level_warn = []
+max_level_info = []
+max_level_debug = []
+max_level_trace = []
+release_max_level_off = []
+release_max_level_error = []
+release_max_level_warn = []
+release_max_level_info = []
+release_max_level_debug = []
+release_max_level_trace = []
+
+[lints]
+workspace = true

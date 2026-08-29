@@ -497,7 +497,7 @@ mod tests {
         cert: &std::path::Path,
         key: &std::path::Path,
     ) -> crate::app_config::Config {
-        toml::from_str(&format!(
+        aterm_toml::from_str(&format!(
             "[net]\nlisten = {listen:?}\ncert = {:?}\nkey = {:?}\n",
             cert.to_string_lossy(),
             key.to_string_lossy(),
@@ -561,7 +561,7 @@ mod tests {
     fn effective_listener_inputs_honor_environment_precedence_including_blank_values() {
         let root = test_dir("env-precedence");
         let (cert, key) = fixture_files(&root);
-        let config: crate::app_config::Config = toml::from_str(
+        let config: crate::app_config::Config = aterm_toml::from_str(
             "[net]\nlisten = \"config:1\"\ncert = \"config-cert\"\nkey = \"config-key\"\n",
         )
         .unwrap();

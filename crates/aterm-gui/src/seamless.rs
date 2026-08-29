@@ -694,7 +694,7 @@ fn screen_digest_refs(
     }
     let mut aggregate_cells = 0_u64;
     // Project each live checkpoint into EXACTLY the bytes `write_outgoing` puts
-    // on the wire (`serde_json` meta + the verbatim grid blobs), then hash those
+    // on the wire (`aterm_json` meta + the verbatim grid blobs), then hash those
     // bytes. The child hashes the same three byte strings after reading them
     // back, so the two digests agree by construction rather than by both codecs
     // happening to be fixed points across a version boundary.
@@ -773,7 +773,7 @@ fn screen_digest_refs(
         }
         metas.push((
             local_id,
-            serde_json::to_vec(&meta)
+            aterm_json::to_vec(&meta)
                 .map_err(|_| ScreenDigestRefusal::MetaSerialization { local_id })?,
         ));
     }
@@ -798,7 +798,7 @@ fn screen_digest_refs(
 /// One session's screen carry AS BYTES — precisely what crosses the wire.
 struct ScreenWireEntry<'a> {
     local_id: u64,
-    /// The `serde_json` `CheckpointMeta` blob (`ScreenCarry::meta`), verbatim.
+    /// The `aterm_json` `CheckpointMeta` blob (`ScreenCarry::meta`), verbatim.
     meta: &'a [u8],
     /// The main grid sidecar's `serialize_lines` bytes, verbatim.
     grid: &'a [u8],
@@ -982,7 +982,7 @@ fn parse_checkpoint_meta(carry: &ScreenCarry) -> Option<CheckpointMeta> {
         if carry.schema != ScreenCarry::SCHEMA {
             return None;
         }
-        let value: serde_json::Value = serde_json::from_str(&carry.meta).ok()?;
+        let value: aterm_json::Value = aterm_json::from_str(&carry.meta).ok()?;
         let object = value.as_object()?;
         const REQUIRED: &[&str] = &[
             "rows",
@@ -1006,7 +1006,7 @@ fn parse_checkpoint_meta(carry: &ScreenCarry) -> Option<CheckpointMeta> {
         if !REQUIRED.iter().all(|key| object.contains_key(*key)) {
             return None;
         }
-        serde_json::from_value(value).ok()
+        aterm_json::from_value(value).ok()
     }
 }
 
@@ -1364,7 +1364,7 @@ pub(crate) fn write_outgoing(
             }
             return None;
         }
-        let Ok(meta) = serde_json::to_string(&checkpoint_meta) else {
+        let Ok(meta) = aterm_json::to_string(&checkpoint_meta) else {
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
@@ -2332,8 +2332,8 @@ pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
         // invisible for a release: a successor started through LaunchServices is
         // launchd's child with no terminal on either standard stream, so an
         // `eprintln!` here reaches nobody. The outgoing process meanwhile sees only
-        // the readiness pipe close — `ChildDied`, the outcome that means the new
-        // bytes crashed — and reports THAT. Five identical field failures produced
+        // the readiness pipe close — `ChildDied`, which it then read as "the new
+        // bytes crashed" — and reports THAT. Five identical field failures produced
         // zero explanation because these three lines were stderr-only. The log file
         // is the durable sink; stderr stays for a developer running the binary from
         // a shell.
@@ -3079,6 +3079,181 @@ mod tests {
         }
     }
 
+    /// A pipe whose BOTH ends are close-on-exec from birth, as `(read, write)`.
+    ///
+    /// The flag has to be carried by the syscall that creates the descriptors.
+    /// A `pipe` + `F_SETFD` pair leaves a window in which a `posix_spawn` on
+    /// another test thread — this binary launches copies of itself constantly —
+    /// forks a child that inherits duplicates of both ends, and a duplicate
+    /// WRITER is exactly what keeps a read end from ever reaching EOF, which is
+    /// the witness every handoff-close test here rests on. `pipe2` closes the
+    /// window where the platform has it; the two-step is the only spelling
+    /// available elsewhere, and [`assert_peer_reaches_eof`]'s bound is sized to
+    /// outlive an inherited duplicate rather than trip over one.
+    #[cfg(unix)]
+    fn cloexec_pipe() -> (i32, i32) {
+        let mut fds = [-1i32; 2];
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(
+                // SAFETY: `pipe2` fills the two-element array this frame owns.
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0,
+                "pipe2"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            assert_eq!(
+                // SAFETY: `pipe` fills the two-element array this frame owns.
+                unsafe { libc::pipe(fds.as_mut_ptr()) },
+                0,
+                "pipe"
+            );
+            for fd in fds {
+                aterm_pty::set_cloexec(fd, true).expect("pipe end cloexec");
+            }
+        }
+        (fds[0], fds[1])
+    }
+
+    /// Park a descriptor at a number no sibling test thread can be handed, and
+    /// answer with that number. The kernel hands out the LOWEST free
+    /// descriptor, so a slot claimed above the suite's whole working set is the
+    /// caller's for as long as it holds it — the only way a handoff's fd-REUSE
+    /// behaviour can be stated as a property at all in a binary that runs
+    /// thousands of tests on parallel threads and spawns copies of itself,
+    /// every one of those events opening and closing descriptors.
+    ///
+    /// The floor is read from the live `RLIMIT_NOFILE` rather than fixed,
+    /// because the two facts that make a number unreachable differ by host. A
+    /// slot just under the ceiling is unreachable BY CONSTRUCTION — a sibling
+    /// only gets it once every lower number is taken, and then the caller's own
+    /// `pipe` would already be failing. [`ISOLATED_FD_FLOOR`] caps the claim
+    /// where the ceiling is enormous, so this never inflates the process fd
+    /// table to half a million entries; there the reachability argument is the
+    /// working set instead. Measured, this binary peaks at 589 open descriptors
+    /// (highest number 592) across repeated full-suite runs, so the 4096 floor
+    /// clears the working set by about sevenfold — headroom, and worth knowing
+    /// as a number, because a future fd-hungry test spends it.
+    ///
+    /// The claim is `F_DUPFD_CLOEXEC`, never `dup2`: it takes the lowest free
+    /// number AT OR ABOVE the floor, so it can never silently replace a
+    /// descriptor a neighbour is using, and the copy cannot leak through a
+    /// concurrent spawn. `None` leaves the caller on an unisolated number, and
+    /// every caller stays sound there because the assertions it guards are
+    /// identity assertions, not number assertions.
+    #[cfg(unix)]
+    fn claim_isolated_fd_slot(fd: i32) -> Option<i32> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` only fills the `rlimit` this frame owns.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+            return None;
+        }
+        // `RLIM_INFINITY` and any ceiling past the descriptor type both mean
+        // "the cap below decides", never "no isolated region exists".
+        let ceiling = i32::try_from(limit.rlim_cur).unwrap_or(i32::MAX);
+        // Leave headroom above the floor: the caller reclaims the same number
+        // after the close under test, and `F_DUPFD` refuses a floor the ceiling
+        // does not admit.
+        let floor = ceiling.checked_sub(8)?.min(ISOLATED_FD_FLOOR);
+        // Below stdio there is no isolated region to claim, only stdin.
+        if floor < 3 {
+            return None;
+        }
+        // SAFETY: `fd` is a live descriptor the caller owns; F_DUPFD_CLOEXEC
+        // only duplicates it.
+        let claimed = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
+        (claimed >= floor).then_some(claimed)
+    }
+
+    /// The cap on [`claim_isolated_fd_slot`]'s floor: high enough that no
+    /// concurrent test in this binary reaches it, low enough that claiming it
+    /// leaves the process fd table small.
+    #[cfg(unix)]
+    const ISOLATED_FD_FLOOR: i32 = 4096;
+
+    /// Arm a pipe read endpoint as the witness for its writer's close, and
+    /// prove the witness can still say NO: while the named writer is live the
+    /// empty peer is merely pending, so an EOF observed later can only be the
+    /// close under test.
+    #[cfg(unix)]
+    fn arm_peer_eof_witness(peer: i32) {
+        // SAFETY: `peer` is a live descriptor; F_GETFL only reads status flags.
+        let flags = unsafe { libc::fcntl(peer, libc::F_GETFL) };
+        assert!(flags >= 0, "read peer flags");
+        assert_eq!(
+            // SAFETY: same descriptor, setting the status word we just read.
+            unsafe { libc::fcntl(peer, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "read peer nonblocking"
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            // SAFETY: a 1-byte read into a stack buffer of that length.
+            unsafe { libc::read(peer, byte.as_mut_ptr().cast(), byte.len()) },
+            -1,
+            "negative control: a live named writer leaves the empty peer pending"
+        );
+        assert!(matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
+        ));
+    }
+
+    /// The one sound witness that a handoff endpoint was CLOSED: its pipe peer
+    /// reaches EOF. A numeric `F_GETFD` probe cannot say it — the number is
+    /// free the instant the close lands, and in this threaded binary a
+    /// neighbour can be holding it before the next instruction runs, so the
+    /// number answers a question about a stranger's descriptor rather than
+    /// about the open file description the handoff owned.
+    ///
+    /// The wait is generous rather than instantaneous to cover the platforms
+    /// [`cloexec_pipe`] cannot arm atomically: a child forked in the window
+    /// between the pipe and its `F_SETFD` inherits a duplicate writer and keeps
+    /// it for its WHOLE life — `exec` closes only what is ALREADY marked
+    /// close-on-exec — and this binary's spawned copies of itself live for
+    /// seconds. POLLHUP is still the exact open-file-description witness, so
+    /// the bound decides nothing but how long a genuinely missing close takes
+    /// to report.
+    #[cfg(unix)]
+    fn assert_peer_reaches_eof(peer: i32, subject: &str) {
+        let mut pfd = libc::pollfd {
+            fd: peer,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let polled = loop {
+            // SAFETY: one initialized `pollfd` describing a live descriptor.
+            let result = unsafe { libc::poll(&raw mut pfd, 1, 30_000) };
+            if result < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            break result;
+        };
+        assert_eq!(
+            polled, 1,
+            "{subject}: the closed named writer must make its peer readable/hung up"
+        );
+        assert_ne!(
+            pfd.revents & libc::POLLHUP,
+            0,
+            "{subject}: the peer wake must be the named writer's EOF"
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            // SAFETY: a 1-byte read into a stack buffer of that length.
+            unsafe { libc::read(peer, byte.as_mut_ptr().cast(), byte.len()) },
+            0,
+            "{subject}: the peer must reach EOF, not data"
+        );
+    }
+
     fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
         RestoreManifest::new(vec![WindowLayout {
             rows: 24,
@@ -3268,7 +3443,7 @@ mod tests {
 
         let carry = ScreenCarry {
             schema: ScreenCarry::SCHEMA,
-            meta: serde_json::to_string(&meta).unwrap(),
+            meta: aterm_json::to_string(&meta).unwrap(),
             grid_file: "unused-in-parser-test".to_string(),
             alt_grid_file: None,
         };
@@ -3433,77 +3608,23 @@ mod tests {
         let _restore_fds = RestoreVar::new(ENV_FDS);
         let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
         let _restore_nonce = RestoreVar::new(ENV_NONCE);
-        let mut pipe = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
         // Keep the read endpoint and name the write endpoint. Observing the
         // pipe peer proves that exact open-file description was closed; checking
         // the numeric descriptor after close is racy because another parallel
         // test may immediately reuse the number.
-        let (peer, named) = (pipe[0], pipe[1]);
+        let (peer, named) = cloexec_pipe();
         assert!(
             peer >= 3 && named >= 3,
             "handoff descriptors are never stdio"
         );
-        // This test runs beside process-spawning tests. Prevent a concurrent
-        // posix_spawn from inheriting a second writer that would temporarily
-        // mask the EOF produced by the exact close under test.
-        aterm_pty::set_cloexec(peer, true).expect("read peer cloexec");
-        aterm_pty::set_cloexec(named, true).expect("named writer cloexec");
-        let peer_flags = unsafe { libc::fcntl(peer, libc::F_GETFL) };
-        assert!(peer_flags >= 0, "read peer flags");
-        assert_eq!(
-            unsafe { libc::fcntl(peer, libc::F_SETFL, peer_flags | libc::O_NONBLOCK) },
-            0,
-            "read peer nonblocking"
-        );
-        let mut byte = [0u8; 1];
-        assert_eq!(
-            unsafe { libc::read(peer, byte.as_mut_ptr().cast(), byte.len()) },
-            -1,
-            "negative control: a live named writer leaves the empty peer pending"
-        );
-        assert!(matches!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
-        ));
+        arm_peer_eof_witness(peer);
         // The descriptor position is syntactically valid, while both identity
         // and pid invalidate the authority. Duplicate mentions must close once.
         aterm_log::env::unset(ENV_MANIFEST);
         aterm_log::env::unset(ENV_NONCE);
         aterm_log::env::set(ENV_FDS, format!("bad={named}:badpid,bad={named}:badpid"));
         assert!(take_incoming().adopted.is_empty());
-        // A process forked in the tiny pipe-create→CLOEXEC window can retain a
-        // duplicate until it execs. POLLHUP is still the exact open-file-
-        // description witness, while this bounded wait removes scheduler luck
-        // from the parallel all-target gate.
-        let mut pfd = libc::pollfd {
-            fd: peer,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        let polled = loop {
-            let result = unsafe { libc::poll(&raw mut pfd, 1, 2_000) };
-            if result < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
-            }
-            break result;
-        };
-        assert_eq!(
-            polled, 1,
-            "closed named writer must make its peer readable/hung up"
-        );
-        assert_ne!(
-            pfd.revents & libc::POLLHUP,
-            0,
-            "peer wake must be the named writer's EOF"
-        );
-        assert_eq!(
-            unsafe { libc::read(peer, byte.as_mut_ptr().cast(), byte.len()) },
-            0,
-            "every syntactically named invalid-authority endpoint reaches peer EOF"
-        );
+        assert_peer_reaches_eof(peer, "every syntactically named invalid-authority endpoint");
         aterm_pty::close_fd(peer);
     }
 
@@ -3518,9 +3639,26 @@ mod tests {
         let _restore_ready = RestoreVar::new(ENV_READY_FD);
         let _restore_commit = RestoreVar::new(ENV_COMMIT_FD);
 
-        let mut pipe = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
-        let (aliased, peer) = (pipe[0], pipe[1]);
+        // Keep the read endpoint and hand over the WRITE endpoint: the peer's
+        // EOF is what proves the aliased open file description was closed.
+        let (peer, writer) = cloexec_pipe();
+        // Everything this test says after the prearm is a statement about the
+        // NUMBER it handed over — that the close freed it, and that a resource
+        // put back at it survives — so the number has to be one no sibling
+        // thread can be handed while the test is running. The claim inherits
+        // close-on-exec from `F_DUPFD_CLOEXEC`, so the parked writer is no more
+        // inheritable than the pipe end it copies.
+        let isolated = claim_isolated_fd_slot(writer);
+        let aliased = isolated.map_or(writer, |slot| {
+            aterm_pty::close_fd(writer);
+            slot
+        });
+        assert!(
+            peer >= 3 && aliased >= 3,
+            "handoff descriptors are never stdio"
+        );
+        arm_peer_eof_witness(peer);
+
         // This is an otherwise recognizable v0.52 overlap shape, but READY
         // aliases the PTY authority. A single fd cannot have two owners.
         aterm_log::env::set(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
@@ -3533,7 +3671,7 @@ mod tests {
         let prearmed = prearm_incoming_fds();
         assert!(prearmed.rejects_boot());
         assert!(prearmed.final_exec_fds().is_empty());
-        assert_eq!(unsafe { libc::fcntl(aliased, libc::F_GETFD) }, -1);
+        assert_peer_reaches_eof(peer, "the doubly named alias");
         for key in [
             ENV_MANIFEST,
             ENV_FDS,
@@ -3547,40 +3685,46 @@ mod tests {
 
         // Reuse the exact numeric slot for an unrelated resource. A later
         // authority parse sees no stale environment and therefore cannot close
-        // the replacement (the double-close/fd-reuse regression).
-        let source = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        assert!(source >= 0, "open replacement");
-        // REUSE, without stomping a neighbour. The prearm closed `aliased`, so
-        // the NUMBER is free — and this suite runs threaded, where a sibling
-        // test can open a file and be handed that very number microseconds
-        // later. `dup2` onto it would then silently replace a descriptor
-        // another test is using, which is a worse bug than the flake it caused
-        // here. So: take the number only while it is still free, and prove the
-        // fd we end up asserting on is OURS (it points at /dev/null) before
-        // trusting it. When the race is lost the reuse arm is skipped — the
-        // invariants above still ran, and a stomped sibling is not a price
-        // worth paying for one more assertion.
-        let mut reused = source == aliased;
-        if !reused && unsafe { libc::fcntl(aliased, libc::F_GETFD) } == -1 {
-            reused = unsafe { libc::dup2(source, aliased) } == aliased;
-        }
-        if reused && source != aliased {
-            aterm_pty::close_fd(source);
-        }
-        let ours = reused
-            && std::fs::read_link(format!("/proc/self/fd/{aliased}"))
-                .map(|target| target == std::path::Path::new("/dev/null"))
-                .unwrap_or(false);
+        // the replacement (the double-close/fd-reuse regression). The
+        // replacement is a pipe rather than an anonymous handle because its own
+        // peer is what turns "still open" into "still OURS".
+        let (replacement_peer, replacement_writer) = cloexec_pipe();
+        // Reclaim with `F_DUPFD_CLOEXEC` at the freed number, never `dup2`:
+        // `dup2` installs unconditionally, so on a number this test does not own
+        // it would silently replace a descriptor a sibling is using — corrupting
+        // a neighbour in order to stage this one. `F_DUPFD` can only land on a
+        // FREE number, so an isolated slot is always reclaimed, while a
+        // fallback slot that lost its number simply reports a different one and
+        // leaves the identity arm below unrun rather than aimed at a stranger.
+        let reclaimed = unsafe { libc::fcntl(replacement_writer, libc::F_DUPFD_CLOEXEC, aliased) };
+        aterm_pty::close_fd(replacement_writer);
+        assert!(
+            reclaimed == aliased || isolated.is_none(),
+            "an isolated slot is this test's own, so the prearm's close must leave it reclaimable"
+        );
+
         assert!(take_incoming().adopted.is_empty());
-        if ours {
-            assert!(
-                unsafe { libc::fcntl(aliased, libc::F_GETFD) } >= 0,
+
+        if reclaimed == aliased {
+            // IDENTITY, not liveness: the byte written through the reclaimed
+            // NUMBER has to arrive on the pipe kept here. A descriptor a stale
+            // handoff had closed — and the kernel then re-handed to a
+            // neighbour — passes an `F_GETFD` probe and fails this.
+            assert_eq!(
+                unsafe { libc::write(aliased, b"R".as_ptr().cast(), 1) },
+                1,
                 "stale handoff must not close a reused descriptor"
             );
-            aterm_pty::close_fd(aliased);
-        } else if !reused {
-            aterm_pty::close_fd(source);
+            let mut got = [0u8; 1];
+            assert_eq!(
+                unsafe { libc::read(replacement_peer, got.as_mut_ptr().cast(), got.len()) },
+                1,
+                "the reused descriptor must still carry bytes to its own peer"
+            );
+            assert_eq!(got, *b"R", "the reclaimed number must name the replacement");
         }
+        aterm_pty::close_fd(reclaimed);
+        aterm_pty::close_fd(replacement_peer);
         aterm_pty::close_fd(peer);
     }
 
@@ -4016,8 +4160,10 @@ mod tests {
     /// `take_ready_fd` has already taken ownership of the readiness write end by
     /// the time it refuses, so refusing DROPS it, the pipe's last write end
     /// closes, and the parent's `wait_handoff_ready` reads EOF and books
-    /// `ChildDied` — the outcome that means "the new bytes crashed" — against a
-    /// build that never even started.
+    /// `ChildDied` against a build that never even started. (What `ChildDied`
+    /// COSTS such a build is no longer decided by the outcome alone — see
+    /// `crate::ChildDeathEvidence` — but the EOF this test pins is unchanged, and
+    /// it is still the only thing the parent sees.)
     ///
     /// The close is CORRECT and stays (a refused candidate must not sit on a
     /// live channel it will never write). What was wrong is that it was the only
@@ -5472,7 +5618,7 @@ mod f4_adoption_proof_asymmetry {
         // into_checkpoint → screen_digest_refs.
         let carry = ScreenCarry {
             schema: ScreenCarry::SCHEMA,
-            meta: serde_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta"),
+            meta: aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta"),
             grid_file: "unused".to_string(),
             alt_grid_file: None,
         };
@@ -5493,7 +5639,7 @@ mod f4_adoption_proof_asymmetry {
     fn cross_version_extra_meta_field_breaks_the_screen_digest() {
         let cp = live_checkpoint();
         let meta_json =
-            serde_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta json");
+            aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta json");
         // What a NEWER parent's wire looks like: one additive key the running
         // (older) child does not know.
         let newer_parent_meta = meta_json.replacen('{', "{\"scene_overlay\":true,", 1);
@@ -5510,7 +5656,7 @@ mod f4_adoption_proof_asymmetry {
             alt_grid_file: None,
         };
         let parsed = parse_checkpoint_meta(&carry).expect("child parses (no deny_unknown)");
-        let child_meta = serde_json::to_string(&parsed).expect("child reserializes");
+        let child_meta = aterm_json::to_string(&parsed).expect("child reserializes");
         assert_ne!(
             newer_parent_meta, child_meta,
             "the child dropped the unknown key"
@@ -5537,8 +5683,8 @@ mod f4_adoption_proof_asymmetry {
     #[test]
     fn cross_version_missing_required_meta_key_refuses_adoption_entirely() {
         let cp = live_checkpoint();
-        let mut value: serde_json::Value =
-            serde_json::to_value(CheckpointMeta::from_checkpoint(&cp)).expect("meta value");
+        let mut value: aterm_json::Value =
+            aterm_json::to_value(CheckpointMeta::from_checkpoint(&cp)).expect("meta value");
         value
             .as_object_mut()
             .expect("object")
@@ -5546,7 +5692,7 @@ mod f4_adoption_proof_asymmetry {
             .expect("key was present");
         let carry = ScreenCarry {
             schema: ScreenCarry::SCHEMA,
-            meta: serde_json::to_string(&value).expect("json"),
+            meta: aterm_json::to_string(&value).expect("json"),
             grid_file: "unused".to_string(),
             alt_grid_file: None,
         };

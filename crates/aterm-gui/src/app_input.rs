@@ -2166,23 +2166,35 @@ impl App {
         // terminal modes and write to the PTY masters, which persist across
         // the whole overlap — the shell receives the bytes exactly once and
         // the echo waits in the kernel queue for the child's fresh parser.
+        //
         // ACCEPTED BOUND (encoding-mode staleness): a mode-changing escape
         // (kitty keyboard push/pop, bracketed paste) can sit unread in that
-        // queue while we encode against the pre-overlap modes. The divergence
-        // window is the overlap itself — admission required ≥500 ms of output
-        // quiet, so a mid-handshake mode flip is already rare — and it is
-        // exactly the same staleness any fast typist races against a live
-        // shell; the terminal re-converges when the child drains the queue.
-        // Focus reports are pure notifications under the same modes. Anything
-        // that can CHANGE terminal modes or presentation mid-overlap — paste
-        // (bracketed-mode implications), mouse, wheel, scroll, resize —
-        // still revokes, exactly like the structural window events.
-        match &ev {
-            InputEvent::Key { .. }
-            | InputEvent::Text(_)
-            | InputEvent::KeySequence(_)
-            | InputEvent::Focus(_) => self.note_update_handoff_tolerated_activity(),
-            _ => self.note_update_handoff_activity(),
+        // queue while we encode against the pre-overlap modes. What makes that
+        // acceptable is NOT rarity — this used to rest on "admission required
+        // ≥500 ms of output quiet", which is true of `ApplyMode::Automatic`
+        // ALONE (the quiet gate keys off `automatic_activity_epoch`, `Some` for
+        // that one lane) while `Immediate` and `AutomaticPastGrace` skip it by
+        // construction. It is acceptable because the divergence is DISCARDED
+        // NOISE, not lost work: the classification below runs BEFORE delivery
+        // and changes no byte, so the shell receives exactly the same stream
+        // either way, and the terminal re-converges when the child drains the
+        // queue. Focus reports are pure notifications under the same modes.
+        //
+        // THE POLICY ITSELF LIVES BESIDE ITS SIBLING (`input_event_handoff_class`,
+        // next to `update_handoff_window_event_class` in lib.rs) and no longer
+        // here. The two must agree — the winit event and the `InputEvent` it is
+        // lowered into are the same gesture — and for pointer traffic they did
+        // not: the window seam tolerated `CursorMoved`/`MouseInput`/`MouseWheel`
+        // while a catch-all `_` arm here revoked on the very events they lower
+        // to, so a plain hover killed an in-flight handoff in every lane. Both
+        // sides are exhaustive now, 8 000 lines apart no longer meaning 8 000
+        // lines of drift.
+        match crate::input_event_handoff_class(&ev) {
+            crate::UpdateHandoffEventClass::Exempt => {}
+            crate::UpdateHandoffEventClass::Tolerated => {
+                self.note_update_handoff_tolerated_activity();
+            }
+            crate::UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
         }
         // AUDIT-ONLY: bind `src` so the one allowed use (a future §7.5 audit log)
         // is obvious and so a stray behavioural `match src` would stand out in
@@ -2584,11 +2596,14 @@ impl App {
                     let kitty_cursor_enabled = match self.kitty_cursor_enabled_cache {
                         Some(n) => n,
                         None => {
+                            // The RESOLVED style, not `GlowStyle::parse` of the
+                            // raw string: an unrecognized spelling renders the
+                            // default, and parsing the typo would answer
+                            // `Lumen` and gate the companion off under a trail
+                            // that is drawing the rainbow kitty.
                             let n = crate::app_render::ordinary_kitty_cursor_enabled(
                                 self.config.cursor_trail_or_default(),
-                                crate::cursor_glow::GlowStyle::parse(
-                                    self.config.cursor_trail_style_raw(),
-                                ),
+                                self.glow_style(),
                             );
                             self.kitty_cursor_enabled_cache = Some(n);
                             n
@@ -15445,6 +15460,12 @@ mod homecoming_rate_law_tests {
     fn a_capture_never_spends_a_hello() {
         let t0 = Instant::now();
         let mut app = App::headless_for_test();
+        // ASK for the trail rather than inherit it: the master's absent-key
+        // default is platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`
+        // is OFF on Windows, per the minimal-fast posture), and the rate law
+        // below is about what the companion does ONCE IT IS ON — a law that
+        // must hold identically on every host a viewer can enable the pet on.
+        app.config.cursor_trail = Some(true);
         app.recompute_sparkle();
         let wid = WindowId(0);
         let session = app.front_terminal(wid).expect("front terminal").session;
@@ -15506,6 +15527,11 @@ mod homecoming_rate_law_tests {
     fn a_background_window_never_spends_a_hello() {
         let t0 = Instant::now();
         let mut app = App::headless_for_test();
+        // The trail is ASKED FOR, not inherited — see the sibling trace above:
+        // `DEFAULT_DECORATIVE_EFFECTS` is OFF on Windows, and a pet that never
+        // reaches the glass would pass this rate law vacuously instead of
+        // proving it.
+        app.config.cursor_trail = Some(true);
         app.recompute_sparkle();
         let wid = WindowId(0);
         let session = app.front_terminal(wid).expect("front terminal").session;

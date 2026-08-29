@@ -149,8 +149,9 @@ pub(crate) struct Config {
     /// HEAD instead — the explicit opt-in for anyone who wants the rare flypast
     /// back; `flying kitty`/`kitty flying` and the historical
     /// `nyan rainbow`/`nyan`/`rainbow` also select it), `rainbow kitty
-    /// underline` (the explicit thin/highlighter geometry), and `rainbow kitty
-    /// tall` (an explicit spelling of the default smooth full-height geometry),
+    /// underline` (an explicit spelling of the DEFAULT highlighter-plus-strip
+    /// geometry), and `rainbow kitty tall` (the v0.43 full-height geometry the
+    /// letters stand inside),
     /// `phaser` (a full-spectrum additive hue sweep along the
     /// swept path), `comet` (the cadence-comet: a directional fading comet of
     /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
@@ -732,6 +733,16 @@ pub(crate) struct Config {
     /// (`chrome` states, `edges`) stay live — authority must never be quieter
     /// than the chrome showing it.
     pub(crate) tab_connection_badge: Option<bool>,
+    /// Whether every FRESH session spawn also installs/updates the coding-agent
+    /// primer (and the bundled skills) for every DETECTED agent — the same upsert
+    /// `aterm agents install` performs, run by aterm itself on a detached thread
+    /// and throttled to once a minute per process. Default ON: the primer is the
+    /// only channel that reaches an agent's context in every cwd, and a machine
+    /// where nobody ran the manual install had every agent row `absent`
+    /// (docs/AGENT-EXPERIENCE-2026-08-26.md F1). `false` genuinely stops it — no
+    /// context file is read or written — which is what makes `aterm agents
+    /// remove` stick; `aterm agents status` names this key for exactly that reason.
+    pub(crate) agents_auto_prime: Option<bool>,
     /// BiDi (right-to-left) text handling: `"implicit"` (default — automatic
     /// per-line UAX#9 reordering, so Hebrew/Arabic display in visual order),
     /// `"disabled"` (keep logical order), or `"explicit"` (app-controlled). Maps to
@@ -2780,6 +2791,13 @@ impl Config {
         self.window_title_format.unwrap_or_default()
     }
 
+    /// Whether aterm primes detected coding agents itself on each fresh session
+    /// spawn (see the field). Batteries-on; `false` is a real off — nothing is
+    /// read or written.
+    pub(crate) fn agents_auto_prime_or_default(&self) -> bool {
+        self.agents_auto_prime.unwrap_or(true)
+    }
+
     /// Master switch for status classification. Batteries-on, and `false` is a
     /// real off: the observer stops gathering evidence entirely, so a user who
     /// does not want this subsystem pays nothing for it.
@@ -3145,7 +3163,7 @@ impl Config {
     /// classify it with `eq_ignore_ascii_case` / a case-insensitive `GlowStyle::parse`
     /// instead of paying a `to_ascii_lowercase` heap allocation on every frame.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
-        // Default: the RAINBOW KITTY PET (the smooth full-height rainbow trailed by the
+        // Default: the RAINBOW KITTY PET (the smooth rainbow ribbon trailed by the
         // walking cat — the companion the owner runs), read from the single
         // definition in `prefs` rather than re-typed here, so a rename
         // of the style cannot leave this resolver pointing at a dead spelling.
@@ -3154,6 +3172,16 @@ impl Config {
             .as_deref()
             .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
             .trim()
+    }
+
+    /// The configured style as the engine RESOLVES it — the canonical spelling,
+    /// or the default when the authored value is not a spelling anything knows.
+    /// Every raw-token predicate on the draw path asks this rather than
+    /// [`Self::cursor_trail_style_raw`]; see [`effective_trail_style_token`].
+    /// `trail status` still prints the authored string beside it, so a fallback
+    /// stays legible as a fallback.
+    pub(crate) fn cursor_trail_style_effective(&self) -> &str {
+        effective_trail_style_token(self.cursor_trail_style_raw())
     }
 
     /// Aurora brightness, default 0.7, clamped 0.0..=1.0. A non-finite value
@@ -4503,10 +4531,11 @@ impl Config {
     }
 
     /// Warn (the `font_family_warning` twin) when a configured
-    /// `cursor_trail_style` is a spelling the engine does not recognize — the
-    /// `glow_config` enablement gate silently DISABLES the whole cursor effect
-    /// for an unknown value (a typo'd `"phasr"` just makes the trail vanish),
-    /// and `--validate-config` previously false-greened it. Checked against the
+    /// `cursor_trail_style` is a spelling the engine does not recognize. The
+    /// value is not honoured — `resolve_trail_style` falls back to
+    /// [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`] — so a typo'd `"phasr"`
+    /// draws the default trail, and this message is the only place the
+    /// substitution is stated. Checked against the
     /// canonical option set + the documented alias table
     /// ([`crate::prefs::cursor_trail_style_canonical`]) — the same source the
     /// Settings picker resolves through. Returns the message so startup, reload,
@@ -4522,14 +4551,17 @@ impl Config {
                      effect is disabled; add its manifest to cursor_trail_packs = [\"…\"]"
                 ))
             }
-            Some(TrailStyleIssue::Unknown) => Some(format!(
-                "cursor_trail_style: unknown style {raw:?} — the cursor effect is disabled; \
-                 expected one of phaser|rainbow kitty|rainbow kitty pet|rainbow dog pet|\
-                 rainbow kitty flying|rainbow kitty tall|comet|lumen|sparkle|fire|laser|water|\
-                 beam|off \
-                 (or a documented alias like nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean), \
-                 or pack:<id> for a loaded Trail Pack"
-            )),
+            Some(TrailStyleIssue::Unknown) => {
+                let default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
+                Some(format!(
+                    "cursor_trail_style: unknown style {raw:?} — falling back to {default:?}; \
+                     expected one of phaser|rainbow kitty|rainbow kitty pet|rainbow dog pet|\
+                     rainbow kitty flying|rainbow kitty underline|rainbow kitty tall|comet|\
+                     lumen|sparkle|fire|laser|water|beam|off (or a documented alias like \
+                     nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean), or pack:<id> for a \
+                     loaded Trail Pack"
+                ))
+            }
         }
     }
 
@@ -6318,12 +6350,39 @@ pub(crate) fn load_config() -> Config {
                 return Config::default();
             }
         };
-    let config: Config = toml::from_str(&observation.text).unwrap_or_else(|e| {
+    let config: Config = aterm_toml::from_str(&observation.text).unwrap_or_else(|e| {
         eprintln!("aterm-gui: ignoring invalid config {}: {e}", path.display());
         Config::default()
     });
     warn_deprecated_display_font_spelling(&observation.text, &config);
     config
+}
+
+/// The `agents_auto_prime` knob alone, read WITHOUT [`load_config`]'s user-visible
+/// side effects (its stderr lines for an unreadable/invalid file and the
+/// deprecation notice it queues for the banner): the auto-prime thread runs on
+/// every fresh spawn, off the UI thread, and must never print or queue anything
+/// on its own account. Same file resolution and the SAME serde parse the app
+/// uses, so the key cannot be read two ways — an unreadable, missing, or
+/// malformed file resolves to the default (on), exactly as [`load_config`]
+/// resolves it.
+pub(crate) fn agents_auto_prime_setting() -> bool {
+    let Some(path) = config_path() else {
+        return true;
+    };
+    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+        Ok(observation) => agents_auto_prime_from_text(&observation.text),
+        Err(_) => true,
+    }
+}
+
+/// Pure core of [`agents_auto_prime_setting`]: the knob's value in `text`, the
+/// default when the text does not parse as a config.
+pub(crate) fn agents_auto_prime_from_text(text: &str) -> bool {
+    match aterm_toml::from_str::<Config>(text) {
+        Ok(config) => config.agents_auto_prime_or_default(),
+        Err(_) => true,
+    }
 }
 
 /// Resolve the glyph size in physical px with the canonical precedence
@@ -6569,9 +6628,18 @@ pub(crate) fn resolve_trail_style(raw: &str, catalog: &TrailPackCatalog) -> Reso
         };
     }
     let Some(canonical) = crate::prefs::cursor_trail_style_canonical(raw) else {
+        // AN UNRECOGNIZED SPELLING FALLS BACK; IT DOES NOT SWITCH THE EFFECT
+        // OFF. `style: None` is reserved for the resolutions that genuinely
+        // mean "draw nothing" — `off`, and a `pack:` naming no loaded pack —
+        // because `resolve_cursor_glow` gates the whole effect on it. A typo
+        // resolves to the default style and keeps `issue`, which is what
+        // `Config::cursor_trail_style_warning` and the Settings disclosure
+        // read to say the value was not honoured.
         return ResolvedTrailStyle {
-            canonical: None,
-            style: None,
+            canonical: Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+            style: Some(aterm_effects::cursor_glow::GlowStyle::parse(
+                crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            )),
             pack: None,
             issue: Some(TrailStyleIssue::Unknown),
         };
@@ -6585,6 +6653,28 @@ pub(crate) fn resolve_trail_style(raw: &str, catalog: &TrailPackCatalog) -> Reso
         pack: None,
         issue: None,
     }
+}
+
+/// The spelling the raw-token predicates must read: what the trail actually
+/// DRAWS, not what was authored.
+///
+/// The companion, species, comet and ribbon forks are string predicates over
+/// the style token rather than [`aterm_effects::cursor_glow::GlowStyle`] arms,
+/// so they have to be asked about the same spelling
+/// [`resolve_trail_style`] settled on. Asked about a typo they answer for a
+/// look nothing renders — the default's ribbon under the wrong companion.
+/// Aliases collapse onto their canonical (an alias and its canonical agree on
+/// every one of those predicates; `prefs`'
+/// `cursor_trail_style_aliases_agree_with_engine_parse` pins it), and a
+/// `pack:<id>` token comes back unchanged because no builtin predicate matches
+/// it whether or not the pack is loaded.
+pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
+    let raw = raw.trim();
+    if raw.starts_with("pack:") {
+        return raw;
+    }
+    crate::prefs::cursor_trail_style_canonical(raw)
+        .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
 }
 
 fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
@@ -6622,8 +6712,10 @@ pub(crate) fn resolve_cursor_glow(
         SPARKLE_DEFAULT_COLOR, style_has_beam_of,
     };
 
-    // Invalid/off values carry a harmless concrete enum because GlowConfig is a
-    // POD; `enabled = false` is the sole engine gate and no geometry is emitted.
+    // Off / missing-pack values carry a harmless concrete enum because
+    // GlowConfig is a POD; `enabled = false` is the sole engine gate and no
+    // geometry is emitted. An unrecognized spelling is NOT one of them — it
+    // arrives already resolved to the default style and renders.
     // Laser's default is STORM VIOLET (a night strike's white-violet flash —
     // the old electric yellow read yellow-green on dark themes); Sparkle's is
     // STARLIGHT GOLD (live review disliked the theme green riding the glitter
@@ -6664,11 +6756,11 @@ pub(crate) fn resolve_cursor_glow(
         // The host's taste dial; the engine fails it OFF on a non-finite value,
         // and the resolver has already clamped it into 0..=1.5 s.
         wake_persist_s: inputs.wake_persist_s,
-        // The ribbon presentation rides the RAW spelling, like the pet
-        // companions do. Every ordinary rainbow spelling uses the smooth
-        // v0.43-shaped full-height body; only an explicit `... underline`
-        // spelling selects the later thin/highlighter alternate.
-        ribbon_tall: GlowStyle::style_names_tall_ribbon(inputs.style_raw),
+        // The ribbon presentation rides the RESOLVED spelling, like the beam
+        // above and the pet companions do. Every ordinary rainbow spelling uses
+        // the highlighter-plus-under-baseline mark; only an explicit `... tall`
+        // spelling selects the v0.43 full-height body.
+        ribbon_tall: GlowStyle::style_names_tall_ribbon(style_token),
     }
 }
 
@@ -7385,7 +7477,44 @@ impl App {
         // through the frozen echo. The bar keeps its row count until the handoff
         // finishes (`Wake::UpdateHandoffFinished` re-syncs); the bars themselves
         // keep updating, painted within the committed rows.
-        if self.pending_update_handoff.is_some() {
+        //
+        // BOTH SIDES OF THAT SEAM. The outgoing process holds
+        // `pending_update_handoff`; the INCOMING one holds
+        // `incoming_handoff_pending` instead, and its layout is the one the proof
+        // compares against what the parent captured. A bar appearing in the
+        // successor before Commit would move `ws.rows` there and refuse the very
+        // handoff that is revealing it. Today that is unreachable — the
+        // pre-Commit wake gate drops the progress wakes that would raise a bar —
+        // but the guard belongs here, next to its reason, rather than depending
+        // on a gate two files away that exists for a different purpose.
+        if self.pending_update_handoff.is_some() || self.incoming_handoff_pending {
+            return false;
+        }
+        // …AND NEVER MORE ROWS THAN THE GLASS CAN SPARE. `grid_dims_for` floors
+        // the terminal at one row, so chrome that outgrows the window does not
+        // shrink the grid — it makes the COMPOSED frame taller than the window,
+        // and the surplus is simply clipped. A short window (a tiny split-off
+        // pane, a hand-resized strip of a window) with a 4-row tab strip plus
+        // two bars is the reachable case. The bars yield instead: they are
+        // chrome about background work, and background work never outranks the
+        // one row of terminal the user is actually looking at.
+        //
+        // Measured against what each window CURRENTLY affords — its terminal
+        // rows plus whatever bar rows are already committed — so the answer does
+        // not depend on the re-grid it is about to trigger. The smallest window
+        // decides, because the count is global.
+        let afford = self
+            .windows
+            .values()
+            .filter(|ws| ws.os_window.is_some())
+            .map(|ws| {
+                ws.rows
+                    .saturating_add(self.status_bar_rows)
+                    .saturating_sub(1)
+            })
+            .min();
+        let rows = afford.map_or(rows, |afford| rows.min(afford));
+        if rows == self.status_bar_rows {
             return false;
         }
         self.status_bar_rows = rows;
@@ -8845,9 +8974,9 @@ impl App {
             .and_then(|prepared| prepared.family.clone())
             .or_else(|| self.font_family.clone());
         warns.append(&mut font_prepare_warnings);
-        // An unrecognized `cursor_trail_style` silently disables the whole cursor
-        // effect (the `glow_config` gate) — warn on the same banner instead of
-        // letting the typo'd style just make the trail vanish.
+        // An unrecognized `cursor_trail_style` silently draws the DEFAULT style
+        // instead of the requested one — warn on the same banner, or the
+        // substitution has no surface at all.
         warns.extend(
             config_snapshot
                 .assets
@@ -9685,7 +9814,7 @@ mod reload_render_transaction_tests {
         // This is the candidate state reload_config publishes before its one
         // fallible step. It deliberately changes every cached renderer source,
         // both geometry keys, theme keys, and one UNRELATED live input policy.
-        let candidate: Config = toml::from_str(
+        let candidate: Config = aterm_toml::from_str(
             r##"
 font_px = 23.0
 theme = "Dracula"
@@ -9870,7 +9999,7 @@ mod descriptive_title_config_tests {
             "an absurd value clamps, never escapes"
         );
         // Round-trips through the real TOML surface the settings writer emits.
-        let parsed: Config = toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
+        let parsed: Config = aterm_toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
         assert_eq!(parsed.cursor_trail_wake_ms, Some(900));
         assert!((parsed.cursor_trail_wake_persist_or_default() - 0.9).abs() < 1e-6);
     }
@@ -9883,7 +10012,7 @@ mod descriptive_title_config_tests {
     /// only pipelines still reachable are sub-frame builds the demand path absorbs.
     #[test]
     fn an_effects_off_config_never_warms_the_effect_pipelines() {
-        let off: Config = toml::from_str("cursor_trail = false\n").unwrap();
+        let off: Config = aterm_toml::from_str("cursor_trail = false\n").unwrap();
         assert!(
             !off.warms_effect_pipelines(),
             "`cursor_trail = false` must not compile fire/rain pipelines it can never bind"
@@ -9891,7 +10020,7 @@ mod descriptive_title_config_tests {
         // The batteries-on default and an explicit opt-in DO warm: with the trail
         // live, `fire_add` + `fire_over` alone are 111.07 ms, and paying that
         // inline on the first frame that ignites is a hitch the eye sees.
-        let on: Config = toml::from_str("cursor_trail = true\n").unwrap();
+        let on: Config = aterm_toml::from_str("cursor_trail = true\n").unwrap();
         assert!(on.warms_effect_pipelines());
         // …and the ABSENT key follows the platform default, so the warm is exactly
         // as demand-driven as the trail itself: paid where the trail ships on,
@@ -9908,7 +10037,7 @@ mod descriptive_title_config_tests {
     };
 
     fn cfg(source: &str) -> Config {
-        toml::from_str(source).expect("valid descriptive-title config")
+        aterm_toml::from_str(source).expect("valid descriptive-title config")
     }
 
     #[test]
@@ -10019,7 +10148,7 @@ window_title_format = "description"
             assert_eq!(config.title_summary_provider_or_default(), expected);
             assert_eq!(expected.as_str(), token);
         }
-        assert!(toml::from_str::<Config>("title_summary_provider = \"remote\"").is_err());
+        assert!(aterm_toml::from_str::<Config>("title_summary_provider = \"remote\"").is_err());
 
         assert_eq!(
             cfg("title_summary_provider = \"ollama\"").title_summary_endpoint_or_default(),
@@ -10129,8 +10258,8 @@ window_title_format = "description"
             assert_eq!(config.tab_title_format_or_default(), expected);
             assert_eq!(expected.as_str(), token);
         }
-        assert!(toml::from_str::<Config>("tab_title_format = \"title_only\"").is_err());
-        assert!(toml::from_str::<Config>("window_title_format = \"both\"").is_err());
+        assert!(aterm_toml::from_str::<Config>("tab_title_format = \"title_only\"").is_err());
+        assert!(aterm_toml::from_str::<Config>("window_title_format = \"both\"").is_err());
     }
 
     #[test]
@@ -10143,7 +10272,9 @@ window_title_format = "description"
             assert_eq!(config.title_summary_proxy_mode_or_default(), expected);
             assert_eq!(expected.as_str(), token);
         }
-        assert!(toml::from_str::<Config>("title_summary_proxy_mode = \"automatic\"").is_err());
+        assert!(
+            aterm_toml::from_str::<Config>("title_summary_proxy_mode = \"automatic\"").is_err()
+        );
     }
 
     #[test]
@@ -10201,7 +10332,7 @@ mod cfg_engine_tests {
     use aterm_core::config::BiDiMode;
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     #[test]
@@ -10625,10 +10756,14 @@ mod cfg_engine_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-render/assets/DejaVuSansMono.ttf"
         );
+        // `CARGO_MANIFEST_DIR` is a NATIVE path — on Windows it is
+        // `C:\Users\…`, which a TOML basic string reads as escape sequences.
+        // It goes through the same escaper the sibling W6 fixtures use.
         let toml = format!(
             "font_family_bold = \"definitely-not-a-real-font-xyzzy\"\n\
              font_synthetic_style = false\n\
-             fallback_fonts = [\"{fixture}\", \"also-not-a-real-font-xyzzy\"]\n"
+             fallback_fonts = [{}, \"also-not-a-real-font-xyzzy\"]\n",
+            super::toml_basic_string(fixture)
         );
         let (fc, warns) = super::FontConfig::from_config(&cfg(&toml));
         assert_eq!(fc.styled_paths[0], None, "bogus bold family skipped");
@@ -11802,7 +11937,7 @@ mod w5_knob_tests {
     use super::{Config, KnobChange, RenderKnobs};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// (a) parse + clamp for every new renderer/engine key.
@@ -12020,7 +12155,7 @@ mod w5_knob_tests {
             ],
         )
         .expect("writes typed values");
-        let c: Config = toml::from_str(&out).expect("round-trips through serde");
+        let c: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
         assert_eq!(c.line_height_or_default(), 1.35);
         assert_eq!(c.minimum_contrast_or_default(), 4.5);
         assert_eq!(c.selection_foreground_u32(), Some(0x00AA_BBCC));
@@ -12173,7 +12308,7 @@ mod vibrancy_contrast_guarantee {
     use super::{Config, VIBRANCY_CONTRAST_FLOOR};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     #[test]
@@ -12259,7 +12394,7 @@ mod window_theme_tests {
     use super::{Config, WindowTheme};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     #[test]
@@ -12327,7 +12462,7 @@ mod decorative_effect_default_tests {
     use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// THE MINIMAL-FAST DEFAULT: with a FRESH, EMPTY config a Windows terminal
@@ -12395,7 +12530,7 @@ mod tab_band_height_tests {
     use super::{Config, TabBandHeight, synthetic_band_head_px};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// The absent-key default is PER-PLATFORM — `standard` only where the in-grid
@@ -12745,7 +12880,7 @@ mod right_click_tests {
     use super::{Config, RightClickGesture};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// The absent-key default is PER-PLATFORM: the conhost/WT gesture on Windows,
@@ -12814,7 +12949,7 @@ mod tab_menu_chord_tests {
     use super::{Config, TabMenuChord};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// Absent ⇒ `On` — an unedited config keeps both Windows spellings, which
@@ -12881,7 +13016,7 @@ mod window_colorspace_tests {
     use super::{Config, WindowColorspace};
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// Absent key -> `Srgb` (the colour-managed default): existing configs get
@@ -12942,7 +13077,7 @@ mod window_padding_tests {
     use super::Config;
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// Unset keys resolve to EXACTLY the built-in constants (12 / 2) — the
@@ -13219,7 +13354,7 @@ mod split_theme_tests {
     use aterm_types::Appearance;
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// A plain `theme = "<name>"` (no `dark:`/`light:` prefix) resolves to the SAME
@@ -13378,7 +13513,7 @@ mod reload_dedupe_tests {
     use super::Config;
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// The prepared-admission dedupe's equality gate: two parses of the same
@@ -13422,10 +13557,13 @@ mod reload_dedupe_tests {
         let pack = dir.join("trail-pack.toml");
         std::fs::write(&lex, "one").unwrap();
         std::fs::write(&pack, "alpha").unwrap();
+        // Paths reach TOML through the crate's own escaper, never raw: a
+        // Windows fixture path (`C:\Users\…`) pasted into a basic string is
+        // `\U` — an invalid escape the parser rejects outright.
         let config = cfg(&format!(
-            "cursor_trail_packs = [\"{}\"]\n[sparkle_words]\nlexicon = \"{}\"\n",
-            pack.display(),
-            lex.display()
+            "cursor_trail_packs = [{}]\n[sparkle_words]\nlexicon = {}\n",
+            super::toml_basic_string(&pack.to_string_lossy()),
+            super::toml_basic_string(&lex.to_string_lossy())
         ));
         let base = config.path_feed_fingerprints();
         assert_eq!(
@@ -13688,10 +13826,12 @@ mod reload_dedupe_tests {
         std::fs::write(&pack, "# pack v1\n").unwrap();
 
         let mut app = crate::App::headless_for_test();
+        // Escaped, not raw — see the sibling fingerprint test: a Windows
+        // fixture path in a TOML basic string is an invalid escape sequence.
         app.config = cfg(&format!(
-            "cursor_trail_packs = [\"{}\"]\n[sparkle_words]\nlexicon = \"{}\"\n",
-            pack.display(),
-            lex.display()
+            "cursor_trail_packs = [{}]\n[sparkle_words]\nlexicon = {}\n",
+            super::toml_basic_string(&pack.to_string_lossy()),
+            super::toml_basic_string(&lex.to_string_lossy())
         ));
         // The startup/worker step: compile feeds and carry their fingerprints
         // in the same immutable generation; render only activates that bundle.
@@ -13933,7 +14073,7 @@ mod matrix_rain_cfg_tests {
     /// split (`matrix_rain_enabled` + `matrix_rain_params`) still composes to
     /// the old contract.
     fn rain(toml: &str) -> Option<RainConfig> {
-        let cfg = toml::from_str::<Config>(toml).expect("valid toml");
+        let cfg = aterm_toml::from_str::<Config>(toml).expect("valid toml");
         cfg.matrix_rain_enabled()
             .then(|| cfg.matrix_rain_params(BG, FG))
     }
@@ -13965,10 +14105,10 @@ mod matrix_rain_cfg_tests {
     /// field it would get from `enabled = true`.
     #[test]
     fn params_resolve_independent_of_enabled() {
-        let disabled = toml::from_str::<Config>("[matrix_rain]\nenabled = false\nfps = 24")
+        let disabled = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = false\nfps = 24")
             .unwrap()
             .matrix_rain_params(BG, FG);
-        let enabled = toml::from_str::<Config>("[matrix_rain]\nenabled = true\nfps = 24")
+        let enabled = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = true\nfps = 24")
             .unwrap()
             .matrix_rain_params(BG, FG);
         assert_eq!(disabled, enabled, "the enabled bit never shapes the params");
@@ -13994,16 +14134,16 @@ mod matrix_rain_cfg_tests {
             Config::default().packages_update_loop_enabled(),
             "absent [packages] table ⇒ the loop runs (pre-config behavior)"
         );
-        let empty = toml::from_str::<Config>("[packages]").unwrap();
+        let empty = aterm_toml::from_str::<Config>("[packages]").unwrap();
         assert!(empty.packages_update_loop_enabled());
-        let off = toml::from_str::<Config>("[packages]\nenabled = false").unwrap();
+        let off = aterm_toml::from_str::<Config>("[packages]\nenabled = false").unwrap();
         assert!(!off.packages_update_loop_enabled(), "master off ⇒ no loop");
-        let no_auto = toml::from_str::<Config>("[packages]\nauto_update = false").unwrap();
+        let no_auto = aterm_toml::from_str::<Config>("[packages]\nauto_update = false").unwrap();
         assert!(
             !no_auto.packages_update_loop_enabled(),
             "auto_update off ⇒ no loop (enabled alone is not enough)"
         );
-        let full = toml::from_str::<Config>(concat!(
+        let full = aterm_toml::from_str::<Config>(concat!(
             "[packages]\nenabled = true\nauto_update = true\nauto_install = true\n",
             "account = \"alabsystems\"\nchannel = \"stable\"\n",
             "include = [\"ay\"]\nexclude = [\"trust\"]\n",
@@ -14048,7 +14188,7 @@ mod matrix_rain_cfg_tests {
         assert_eq!(pkg.channel(), "stable", "atpkg's channel default");
         // Explicit values: the SAME text resolves identically through both parsers.
         let text = "[packages]\nauto_update = false\nauto_install = true\n";
-        let gui = toml::from_str::<Config>(text).unwrap();
+        let gui = aterm_toml::from_str::<Config>(text).unwrap();
         let pkg = atpkg::config::parse_packages(text);
         assert_eq!(gui.packages_auto_install(), pkg.auto_install());
         assert!(
@@ -14213,7 +14353,7 @@ mod matrix_rain_cfg_tests {
     /// if a caller hands a value with a dirty top byte.
     #[test]
     fn theme_channels_are_masked() {
-        let c = toml::from_str::<Config>("[matrix_rain]\nenabled = true")
+        let c = aterm_toml::from_str::<Config>("[matrix_rain]\nenabled = true")
             .unwrap()
             .matrix_rain_params(0xFF11_1318, 0xFFD0_D0D0);
         assert_eq!(c.default_bg, 0x0011_1318);
@@ -14236,7 +14376,7 @@ mod matrix_rain_app_tests {
     use crate::keybinding::Action;
 
     fn cfg(toml: &str) -> Config {
-        toml::from_str(toml).expect("valid toml")
+        aterm_toml::from_str(toml).expect("valid toml")
     }
 
     /// Config absent + no session override ⇒ every session's effective state
@@ -14488,5 +14628,192 @@ mod matrix_rain_app_tests {
         // Control: the invariant is not satisfied vacuously by a dead engine.
         e.set_reduced_motion(false);
         assert!(e.is_active(), "the same engine wakes once reduced lifts");
+    }
+}
+
+/// The auto-prime knob: batteries-on, a real off, and readable without the
+/// side effects of a full config load.
+#[cfg(test)]
+mod agents_auto_prime_tests {
+    use super::{Config, agents_auto_prime_from_text};
+
+    #[test]
+    fn agents_auto_prime_defaults_on_and_parses_off() {
+        assert!(
+            Config::default().agents_auto_prime_or_default(),
+            "batteries on"
+        );
+        let off: Config = aterm_toml::from_str("agents_auto_prime = false").expect("valid config");
+        assert_eq!(off.agents_auto_prime, Some(false));
+        assert!(!off.agents_auto_prime_or_default());
+        let on: Config = aterm_toml::from_str("agents_auto_prime = true").expect("valid config");
+        assert!(on.agents_auto_prime_or_default());
+    }
+
+    #[test]
+    fn the_knob_reads_without_a_full_config_load() {
+        assert!(agents_auto_prime_from_text(""), "empty file: default");
+        assert!(
+            agents_auto_prime_from_text("tab_status = false"),
+            "unrelated key: default"
+        );
+        assert!(!agents_auto_prime_from_text("agents_auto_prime = false"));
+        assert!(agents_auto_prime_from_text("agents_auto_prime = true"));
+        // A malformed file resolves the way `load_config` resolves it: defaults.
+        assert!(agents_auto_prime_from_text("agents_auto_prime = "));
+        assert!(agents_auto_prime_from_text("agents_auto_prime = \"no\""));
+    }
+}
+
+/// The one enablement gate, exercised from the config string down.
+///
+/// `resolve_cursor_glow` reads `enabled` off `style.style.is_some()`, so the
+/// question these pin is which raw values resolve to no style at all. That set
+/// is EXACTLY the values that mean "draw nothing" — `off`, and a `pack:` naming
+/// no loaded pack. Everything else, a typo included, draws.
+#[cfg(test)]
+mod trail_style_resolution_tests {
+    use super::*;
+    use aterm_effects::cursor_glow::{GlowConfig, GlowStyle};
+
+    fn glow(raw: &str, enabled: bool) -> GlowConfig {
+        let catalog = TrailPackCatalog::empty();
+        resolve_cursor_glow(
+            CursorGlowInputs {
+                enabled,
+                style_raw: raw,
+                color: None,
+                accent: None,
+                duration_ms: 260,
+                length: 24,
+                intensity: 0.7,
+                radius: 0.6,
+                ring: true,
+                wake_persist_s: 0.9,
+            },
+            resolve_trail_style(raw, &catalog),
+            0x00FF_FFFF,
+            true,
+            0x00C8_D3F5,
+            0x001A_1B26,
+            0.5,
+        )
+    }
+
+    fn warning_for(raw: &str) -> Option<String> {
+        Config {
+            cursor_trail_style: Some(raw.to_string()),
+            ..Config::default()
+        }
+        .cursor_trail_style_warning(&TrailPackCatalog::empty())
+    }
+
+    /// A MISTYPED STYLE FALLS BACK AND SAYS SO. It used to switch the whole
+    /// cursor effect off with nothing on screen to explain it — `trail status`
+    /// printed `effective=false` beside the look that had been asked for.
+    #[test]
+    fn an_unknown_style_draws_the_default_and_is_reported() {
+        let default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
+        let catalog = TrailPackCatalog::empty();
+        for typo in ["phasr", "rainbow kity tall", "plasma", ""] {
+            let resolved = resolve_trail_style(typo, &catalog);
+            assert_eq!(resolved.canonical, Some(default), "{typo:?}");
+            assert_eq!(resolved.style, Some(GlowStyle::parse(default)), "{typo:?}");
+            assert_eq!(resolved.pack, None, "{typo:?}");
+            assert_eq!(
+                resolved.issue,
+                Some(TrailStyleIssue::Unknown),
+                "{typo:?} stays flagged — the fallback is not an endorsement"
+            );
+            assert!(glow(typo, true).enabled, "{typo:?} must still draw");
+
+            // The COMPANION and the RIBBON travel with the fallback. These are
+            // string predicates over the style token, so asked about the typo
+            // they would answer for a look nothing renders.
+            let token = effective_trail_style_token(typo);
+            assert_eq!(token, default, "{typo:?}");
+            assert!(GlowStyle::style_names_any_pet(token), "{typo:?}");
+            assert_eq!(
+                glow(typo, true).ribbon_tall,
+                glow(default, true).ribbon_tall,
+                "{typo:?}"
+            );
+
+            let warning = warning_for(typo).unwrap_or_else(|| panic!("{typo:?} must warn"));
+            assert!(warning.contains("cursor_trail_style"), "{warning}");
+            assert!(
+                warning.contains(&format!("{typo:?}")),
+                "the warning must name the offending value: {warning}"
+            );
+            assert!(
+                warning.contains(default) && warning.contains("expected one of"),
+                "the warning must name the fallback and the accepted set: {warning}"
+            );
+        }
+    }
+
+    /// The three ways the trail legitimately goes dark, none of which the
+    /// fallback may re-light.
+    #[test]
+    fn off_the_master_switch_and_a_missing_pack_still_disable_the_trail() {
+        let catalog = TrailPackCatalog::empty();
+        for spelling in ["off", "OFF", "  off  "] {
+            assert_eq!(resolve_trail_style(spelling, &catalog).style, None);
+            assert_eq!(resolve_trail_style(spelling, &catalog).issue, None);
+            assert!(!glow(spelling, true).enabled, "{spelling:?}");
+            assert!(
+                warning_for(spelling).is_none(),
+                "{spelling:?} is not a typo"
+            );
+        }
+        assert!(
+            !glow(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE, false).enabled,
+            "`cursor_trail = false` owns the whole effect"
+        );
+        for pack in ["pack:", "pack:  ", "pack:not-loaded"] {
+            assert_eq!(resolve_trail_style(pack, &catalog).style, None, "{pack:?}");
+            assert!(!glow(pack, true).enabled, "{pack:?}");
+            assert!(warning_for(pack).is_some(), "{pack:?}");
+        }
+        // `off` is the ONLY builtin spelling that means off, and no alias adds
+        // a second one.
+        for &s in crate::prefs::CURSOR_TRAIL_STYLES {
+            assert_eq!(
+                resolve_trail_style(s, &catalog).style.is_none(),
+                s == "off",
+                "style {s:?}"
+            );
+        }
+        for &(alias, _) in crate::prefs::CURSOR_TRAIL_STYLE_ALIASES {
+            assert!(
+                resolve_trail_style(alias, &catalog).style.is_some(),
+                "alias {alias:?} must not disable the trail"
+            );
+        }
+    }
+
+    /// [`effective_trail_style_token`] is the resolver's own answer, not a
+    /// second opinion: the raw-token predicates on the draw path must read the
+    /// spelling `resolve_trail_style` settled on.
+    #[test]
+    fn the_effective_token_never_disagrees_with_the_resolver() {
+        let catalog = TrailPackCatalog::empty();
+        let extra = ["phasr", "", "  ", "pack:", "pack:not-loaded", " NYAN "];
+        let aliases = crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
+            .iter()
+            .map(|&(alias, _)| alias);
+        for raw in crate::prefs::CURSOR_TRAIL_STYLES
+            .iter()
+            .copied()
+            .chain(aliases)
+            .chain(extra)
+        {
+            let resolved = resolve_trail_style(raw, &catalog);
+            assert_eq!(
+                effective_trail_style_token(raw),
+                resolved.canonical.unwrap_or(raw.trim()),
+                "raw {raw:?}"
+            );
+        }
     }
 }

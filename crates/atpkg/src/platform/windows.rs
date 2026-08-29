@@ -325,11 +325,19 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Install a bin shim at `shim` (a `.cmd`) forwarding to `target` (`…\<tool>.exe`).
+/// Install a bin shim at `shim` (a `.cmd`) forwarding to `target` (`…\<tool>.exe`),
+/// setting `env` first (design S7; an empty `env` is the plain shim — the form without
+/// an environment is [`super::install_shim_to`]).
 /// Fail-closed: refuse a target that could break out of the `@"<target>" %*` quoting
 /// (a `"`/`%`/CR/LF/NUL) rather than write an injectable batch wrapper — a managed
-/// store path never contains these, so this only ever rejects a pathological path.
-pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
+/// store path never contains these, so this only ever rejects a pathological path —
+/// and, the same way, an env entry that could break out of `@set "NAME=VALUE"`
+/// (already refused at manifest parse; this is the I/O site's own refusal).
+pub fn install_shim_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<()> {
     if !super::cmd_target_is_injection_safe(target) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -339,7 +347,13 @@ pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
             ),
         ));
     }
-    atomic_write(shim, super::cmd_shim_content(target).as_bytes())
+    if !super::cmd_env_is_injection_safe(env) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to shim an unsafe shim_env entry (quote/%/newline)",
+        ));
+    }
+    atomic_write(shim, super::cmd_shim_content_env(target, env).as_bytes())
 }
 
 /// Install a **failing tombstone shim** at `shim` (a `.cmd`) that prints `message` to
@@ -354,6 +368,13 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     super::read_cmd_shim_target(shim)
+}
+
+/// The environment the `.cmd` shim at `shim` sets before it forwards — its `@set` lines
+/// ([`super::read_cmd_shim_env`]; NONE for a tombstone, a stub, or anything unreadable).
+#[must_use]
+pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
+    super::read_cmd_shim_env(shim)
 }
 
 /// Run `command` to completion, then `exit` with its code (Windows has no `execve`, so

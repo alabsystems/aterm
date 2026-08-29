@@ -574,53 +574,14 @@ impl Terminal {
         self.modes.allow_session_memory
     }
 
-    /// Authorize OSC 8 hyperlink URI acceptance (#8009 CF-014).
-    ///
-    /// Grants the OSC 8 handler structural authorization to write the
-    /// `current_hyperlink` slot. The zero-sized
-    /// [`super::hyperlink_auth::HyperlinkCapability`] can only be
-    /// minted while the underlying
-    /// [`super::hyperlink_auth::HyperlinkAuth`] is authorized.
-    ///
-    /// **Default is authorized** — hyperlinks have been a universally
-    /// supported terminal feature since xterm's 2017 patch, so new
-    /// `Terminal` instances accept OSC 8 without an explicit host
-    /// opt-in. This mirrors the pre-refactor behavior; hosts that ship
-    /// a hardened profile can call
-    /// [`revoke_hyperlinks`][Self::revoke_hyperlinks] after
-    /// construction.
-    ///
-    /// Does **not** relax the URL scheme allowlist — the OSC 8 handler
-    /// still rejects unsafe schemes, BiDi-override smuggling, and
-    /// over-length URLs before consulting the capability. This call
-    /// only toggles the structural gate.
-    pub fn authorize_hyperlinks(&mut self) {
-        self.hyperlink_auth.authorize();
-    }
-
-    /// Revoke OSC 8 hyperlink URI acceptance (#8009 CF-014).
-    ///
-    /// Subsequent PTY-origin OSC 8 sequences fail at the capability
-    /// gate before any write to `transient.current_hyperlink` —
-    /// `invoke_set_hyperlink` is unreachable without a minted token.
-    /// The URL-scheme allowlist is unaffected; this is a coarser
-    /// "accept OSC 8 at all" switch layered on top.
-    pub fn revoke_hyperlinks(&mut self) {
-        self.hyperlink_auth.revoke();
-    }
-
-    /// Whether OSC 8 hyperlink URI acceptance is currently authorized
-    /// (#8009 CF-014).
-    ///
-    /// Defaults to `true` on newly constructed `Terminal` instances.
-    #[must_use]
-    pub fn is_hyperlinks_authorized(&self) -> bool {
-        self.hyperlink_auth.is_authorized()
-    }
-
     /// Mint an EXTRA OSC 8 URI scheme onto the safe allowlist (orca
-    /// deep-links §7, #4384) — the host-mintable extension the hyperlink
-    /// capability module documented from day one.
+    /// deep-links §7, #4384) — the ONE hyperlink decision a host makes.
+    ///
+    /// OSC 8 acceptance itself is not a host switch: a URI that clears
+    /// the byte cap, the control-character and BiDi-override scans and
+    /// the scheme allowlist is carried, on every host, always. See
+    /// [`super::hyperlink_auth`] for why, and for where the decision a
+    /// PERSON makes lives (the host's click-time URL check).
     ///
     /// Returns `false` — refusing, state unchanged — when `scheme` is
     /// over-long (> 32 bytes), not RFC 3986 scheme-shaped
@@ -631,9 +592,8 @@ impl Terminal {
     /// lowercased; OSC-8 matching is case-insensitive like the safe list.
     ///
     /// Every ORTHOGONAL OSC-8 guard still applies to extra-scheme URIs — the
-    /// byte cap, control-char scan, BiDi-override rejection, and the
-    /// [`revoke_hyperlinks`][Self::revoke_hyperlinks] capability gate — so
-    /// minting a scheme never widens anything but the scheme comparison.
+    /// byte cap, control-char scan and BiDi-override rejection — so minting a
+    /// scheme never widens anything but the scheme comparison.
     /// Extra schemes are TERMINAL-INSTANCE state: they survive soft/RIS reset
     /// like the other host authorizations and are excluded from checkpoints.
     #[cfg_attr(

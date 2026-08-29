@@ -471,8 +471,11 @@ impl App {
             // An explicit reopen can race that escalation (or recover a window
             // left behind by an older caller), so installing/focusing a real tab
             // must cancel the stale empty-window teardown before another wake
-            // observes it.
-            ws.pending_close = false;
+            // observes it. Cancel it through the one helper, which also drops
+            // the attribution that close stashed: the teardown that consumes it
+            // is exactly what is NOT going to run, and left behind it would be
+            // journalled on this window's next scope-less close.
+            crate::app_tabs::cancel_pending_close(ws);
             ws.last_present = None;
         }
         // Returning from Manual's separate config Editor (or another native
@@ -1663,6 +1666,14 @@ impl App {
         } else {
             Vec::new()
         };
+        // The status bars' spoken lines — the rows are real chrome above the
+        // grid, so a tree without them describes a taller terminal than the one
+        // on glass and drops the only announcement of background work.
+        let grid_status_bars = if grid_snap.is_some() {
+            self.status_bars.spoken_lines()
+        } else {
+            Vec::new()
+        };
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1675,7 +1686,12 @@ impl App {
                 Some(Err(_)) => (crate::accesskit_tree::empty_tree(), None),
                 None => match &grid_snap {
                     Some(snap) => (
-                        crate::accesskit_tree::grid_tree(snap, grid_geometry, &grid_tabs),
+                        crate::accesskit_tree::grid_tree(
+                            snap,
+                            grid_geometry,
+                            &grid_tabs,
+                            &grid_status_bars,
+                        ),
                         None,
                     ),
                     None => (crate::accesskit_tree::empty_tree(), None),
@@ -1723,6 +1739,14 @@ impl App {
             cell_h: ch as f64,
             strip_y: strip_y as f64,
             strip_h: (strip_rows * ch) as f64,
+            // The bar band sits between the strip and grid row 0 — the same
+            // arithmetic `native_content_origin_y` uses, from the other end.
+            bars_y: (strip_y + strip_rows * ch) as f64,
+            bar_h: if self.status_bar_rows == 0 {
+                0.0
+            } else {
+                ch as f64
+            },
         })
     }
 
@@ -2714,6 +2738,10 @@ mod tests {
             app.windows[&wid].pending_close,
             "the main-loop Settings wake must escalate this empty window"
         );
+        assert!(
+            app.windows[&wid].pending_close_attribution.is_some(),
+            "the deferred close stashed its attribution for the teardown"
+        );
 
         // If an explicit open wins the race before escalation, the new tab is
         // authoritative and the old pending-close edge must not later destroy it.
@@ -2723,6 +2751,11 @@ mod tests {
         assert!(
             !app.windows[&wid].pending_close,
             "reopening a real Settings tab cancels stale empty-window teardown"
+        );
+        assert!(
+            app.windows[&wid].pending_close_attribution.is_none(),
+            "the cancelled teardown never runs, so its attribution must not \
+             survive to be journalled on this window's NEXT close"
         );
         assert!(app.structural_invariants_ok());
     }

@@ -29,14 +29,14 @@ fn read_image_encodes_the_rendered_screen_as_valid_png() {
     assert!(bytes.len() > 100, "non-trivial PNG");
 
     // round-trips: decodes back to the exact rendered dimensions
-    let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+    let decoder = aterm_png::Decoder::new(std::io::Cursor::new(&bytes));
     let mut reader = decoder.read_info().expect("decode header");
     let info = reader.info();
     assert_eq!(info.width as usize, frame.width);
     assert_eq!(info.height as usize, frame.height);
     assert_eq!(
         info.color_type,
-        png::ColorType::Rgba,
+        aterm_png::ColorType::Rgba,
         "read_image retains framebuffer alpha"
     );
     let mut decoded = vec![0; reader.output_buffer_size()];

@@ -2014,10 +2014,20 @@ pub(crate) enum UpdateOutcome {
 /// CO-LOCATED `atpkg` binary (never `PATH`), always off the UI thread. Plain
 /// status refreshes are not a request: the host calls its own
 /// `start_native_packages_refresh` directly (Settings open, verb completion).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PackagesRequest {
     /// `atpkg update` — check/update every installed managed program now.
     CheckUpdate,
+    /// `atpkg install <name> --elevate=never` — the Install control on an EXTRA's
+    /// Packages row (`docs/DESIGN-which-copy-runs-2026-08-27.md` S9). The explicit
+    /// door records the opt-in marker itself before it installs; `--elevate=never`
+    /// means a windowed child can never wait on a password prompt nobody sees.
+    InstallExtra { name: String },
+    /// `atpkg install <name> --elevate=osascript` for each name IN ORDER — the GUI
+    /// door for the `needs admin` rows (§17.8): one process per program, dependency
+    /// first (`clt` before `brew`), macOS's own administrator dialog for each
+    /// installer. Stops at the first failure. macOS only: nowhere else has a GUI door.
+    InstallElevated { names: Vec<String> },
     /// `atpkg install --default-set` — the explicit ALab-toolset consent click.
     InstallDefaultSet,
     /// `atpkg uninstall --all` — remove the whole managed toolset and reclaim its

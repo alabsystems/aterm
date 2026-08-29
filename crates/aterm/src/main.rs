@@ -12,7 +12,7 @@
 //!                           fork so it answers the same at a TTY and through a pipe
 //! aterm help [topic]        the toolchain manual (aterm-cli's parser owns it)
 //! aterm <tool> …            managed-store toolchain dispatch (via `pkg`)
-//! aterm            (a TTY)  the transparent session — your shell, modeled live
+//! aterm            (a TTY)  the transparent session — your shell, passed through
 //! aterm         (no TTY)    the window (a Finder/.app launch has no TTY)
 //! aterm --window            the window, explicitly, from anywhere
 //! ```

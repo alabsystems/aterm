@@ -243,3 +243,88 @@ fn failed_wide_write_does_not_drop_live_extras() {
         "failed write must not drop live extras"
     );
 }
+
+/// THE #7522 LEN CLASS, on the bulk wide-RUN lane.
+///
+/// A wide run whose first glyph lands on the WIDE_CONTINUATION half of an
+/// existing wide char orphans that char's base, and the run's own tail can
+/// orphan the continuation of the wide char just past its end. When that
+/// orphan WAS the row's last content, `len` must tighten — otherwise
+/// `row_text`, search and scrollback all report a phantom trailing space.
+///
+/// The single-glyph writer closes this in its else arm
+/// (`write_wide_char_packed_shrinks_len_on_tail_wide_orphan`), and
+/// `fill_cell_run` closes it too. This pins the run lane to the same contract,
+/// because `Row::update_len` is grow-only and a run lane that reaches for it
+/// alone reopens the class.
+#[test]
+fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
+    let mut grid = Grid::new(2, 80);
+    grid.set_cursor(0, 0);
+    grid.write_wide_run_autowrap(&['日', '本', '語'], PackedColors::new(), CellFlags::empty());
+    assert_eq!(
+        grid.row_text(0).as_deref(),
+        Some("日本語"),
+        "three wide chars occupy cols 0..6"
+    );
+
+    // Cursor onto col 1 — the CONTINUATION half of `日` — then a two-glyph run.
+    // It orphans `日`'s base at col 0, and its own end orphans `語`'s
+    // continuation at col 5, which is the row's last content.
+    grid.set_cursor(0, 1);
+    grid.write_wide_run_autowrap(&['あ', 'い'], PackedColors::new(), CellFlags::empty());
+
+    assert!(
+        grid.cell(0, 0).unwrap().is_empty(),
+        "the orphaned base of the char the run landed inside must be cleared"
+    );
+    assert!(
+        grid.cell(0, 5).unwrap().is_empty(),
+        "the orphaned continuation past the run's end must be cleared"
+    );
+    assert_eq!(
+        grid.row_text(0).as_deref(),
+        Some(" あい"),
+        "len must tighten to 5 — a stale-high len paints a phantom trailing space"
+    );
+}
+
+/// The SAME obligation on the EMOJI run lane, which has always used the bulk
+/// no-fixup path.
+///
+/// Asserted on the TRAILING SPACE rather than on the glyphs: a non-BMP
+/// codepoint lives in the complex-char ring, so a bare `Grid` renders these as
+/// U+FFFD. The replacement chars are beside the point — whether `len` was left
+/// stale-high is the point, and a stale-high `len` shows up as exactly one
+/// trailing blank.
+#[test]
+fn emoji_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
+    let mut grid = Grid::new(2, 80);
+    grid.set_cursor(0, 0);
+    grid.write_emoji_run_autowrap(
+        &['\u{1F600}', '\u{1F601}', '\u{1F602}'],
+        PackedColors::new(),
+        CellFlags::empty(),
+    );
+    let three = grid.row_text(0).expect("row 0 exists");
+    assert_eq!(three.chars().count(), 3, "three emoji occupy cols 0..6");
+
+    // Cursor onto col 1 — the continuation half of the first emoji — then a
+    // two-glyph run whose end orphans the third emoji's continuation at col 5,
+    // which is the row's last content.
+    grid.set_cursor(0, 1);
+    grid.write_emoji_run_autowrap(
+        &['\u{1F603}', '\u{1F604}'],
+        PackedColors::new(),
+        CellFlags::empty(),
+    );
+    assert!(
+        grid.cell(0, 5).unwrap().is_empty(),
+        "the orphaned continuation past the run's end must be cleared"
+    );
+    let after = grid.row_text(0).expect("row 0 exists");
+    assert!(
+        !after.ends_with(' '),
+        "len must tighten — a stale-high len paints a phantom trailing space, got {after:?}"
+    );
+}

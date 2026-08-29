@@ -169,22 +169,69 @@ pub const MISSING_FONT_CLASS_EMOJI: u8 = 1 << 1;
 static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<std::sync::Arc<Vec<u8>>>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Intern `bytes` in [`DISCOVERED_FONT_BYTES`], reusing an identical blob when one
-/// is already resident. Copies only a genuinely new face.
-fn intern_discovered_font_bytes(bytes: &[u8]) -> std::sync::Arc<Vec<u8>> {
+/// Intern a just-READ font file in [`DISCOVERED_FONT_BYTES`], reusing an
+/// identical blob when one is already resident.
+///
+/// THE ARGUMENT IS THE READER'S OWN HANDLE, and that is the whole point. This
+/// used to take a `&[u8]` and end in `bytes.to_vec()`, so from the read until the
+/// caller's buffer dropped a few microseconds later, the file was resident
+/// TWICE. On Linux that is invisible — the whole broad chain is ONE 4 MB file.
+/// On WINDOWS Microsoft splits the world's scripts across per-script faces, so
+/// [`FALLBACK_CANDIDATES`]' Windows arm is NINE files totalling 40,464 kB and
+/// `build_fallback_chain` reads all nine CONCURRENTLY on scoped workers, so ~43 MB
+/// of the process's startup was a `memcpy` of files it had just read.
+///
+/// MEASURED on this box (`crates/aterm-render/tests/win_heap_attribution.rs`,
+/// `full_font_stack_heap`, three runs per arm, byte-identical within each arm):
+/// the seal's own PEAK heap 60,151 kB before, 55,088 kB after — **−5,063 kB** —
+/// and its wall clock 18.3/18.0/17.4 ms before against 10.4/11.5/11.5 ms after,
+/// **−6.8 ms (−38%)** with no overlap between the arms, on the backend-build
+/// thread that window attach blocks on. The live cost, 55,086 kB, does not move
+/// at all. Quote it honestly: the
+/// copies do not all overlap, because the interner is behind one mutex and the
+/// nine workers serialise through it, so the doubling window is one file wide
+/// rather than nine. What this buys is the peak, the commit charge and ~43 MB of
+/// copying; the SETTLED figure is unchanged, since Windows serves these
+/// multi-megabyte blocks from `VirtualAlloc` and returns them on free.
+/// See `docs/measured/win-heap-2026-08-29.md` §5.
+///
+/// Taking the handle instead makes the store's entry the allocation the caller
+/// already had: `Arc::new(read_font_file(..)?)` MOVES the `Vec`, so neither a
+/// hit nor a publish copies a byte. Same bargain [`intern_parsed_font_owned`]
+/// strikes for the parsed store and [`shared_parsed_face_owned`] for the styled
+/// tier. There is deliberately no slice entry point left: a copying one is what
+/// this replaced, and every discovery caller reads its own file.
+fn intern_discovered_font_bytes(bytes: &std::sync::Arc<Vec<u8>>) -> std::sync::Arc<Vec<u8>> {
     let mut store = DISCOVERED_FONT_BYTES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = store
         .iter()
-        .find(|a| a.len() == bytes.len() && a.as_slice() == bytes)
+        .find(|a| a.len() == bytes.len() && a.as_slice() == bytes.as_slice())
     {
         return existing.clone();
     }
-    let arc = std::sync::Arc::new(bytes.to_vec());
-    store.push(arc.clone());
-    arc
+    store.push(bytes.clone());
+    bytes.clone()
 }
+
+///
+/// The observable for "a refused face left nothing behind". It asks about ONE
+/// file rather than counting the store, and that difference is load-bearing:
+/// the store is process-global and never evicts, sibling tests in the same
+/// binary publish into it concurrently (`windows_fallback_chain_covers_hangul`
+/// alone publishes nine faces), so a before/after LENGTH comparison is a race
+/// and failed about two runs in three. Absence of a specific file is a stable
+/// property no concurrent publish of a DIFFERENT file can disturb.
+#[cfg(test)]
+fn discovered_font_bytes_contains(bytes: &[u8]) -> bool {
+    DISCOVERED_FONT_BYTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|held| held.as_slice() == bytes)
+}
+
 
 /// Parse a fallback `fontdue::Font` from `bytes`, sharing ONE parsed instance across
 /// all Renderers for identical bytes (a broad Unicode fallback is ~370MB parsed, so
@@ -3325,7 +3372,16 @@ impl FallbackFace {
     /// both of fontdue 0.9.3's failure modes over the parsed face without touching
     /// an outline. [`Renderer::retire_unparsable_fallback`] is the second line of
     /// defence if it is ever wrong.
-    fn from_path_bytes(bytes: &[u8], path: Option<String>) -> Result<FallbackFace, String> {
+    ///
+    /// The bytes arrive as the READ's OWN handle (`&Arc<Vec<u8>>`), not a slice,
+    /// so a genuinely new face enters [`DISCOVERED_FONT_BYTES`] as the allocation
+    /// the caller already had. The slice form copied every file it was handed —
+    /// ~43 MB per launch on this platform's nine-file fallback chain, for a peak
+    /// of 5,063 kB — see [`intern_discovered_font_bytes`].
+    fn from_path_bytes(
+        bytes: &std::sync::Arc<Vec<u8>>,
+        path: Option<String>,
+    ) -> Result<FallbackFace, String> {
         // PROCESS-GLOBAL intern, not the thread-local one. `intern_font_bytes_slice`
         // keys off FONT_BYTES_INTERN, a `thread_local!` store documented for the
         // injection path ("N panes injecting the same font cost one copy, not N").
@@ -3334,20 +3390,27 @@ impl FallbackFace {
         // each 23 MB face — measured: two chain builds shared 2/2 blobs before the
         // lazy-parse change and 0/2 after. Discovery-path faces are process-wide by
         // nature, so they belong in a process-wide store.
-        let bytes = intern_discovered_font_bytes(bytes);
-        // The admission verdict is a pure function of the file bytes, so a
-        // path-backed face consults the persistent cache (keyed to the file's
-        // mtime+size identity) before paying the cmap walk — the walk is the
-        // dominant remaining cold-start term (~203 ms on Hiragino alone, the
-        // table below). A pathless face (injection) always walks: there is no
-        // identity to key on, and injected bytes are one-offs by nature.
+        //
+        // ADMISSION FIRST, PUBLISH SECOND, and the order is load-bearing: the
+        // store has no eviction, so publishing before the verdict left a REFUSED
+        // face's whole file resident for the life of the process, with nothing
+        // holding a handle to it and no path back. The verdict is a pure function
+        // of the bytes, so asking it of the caller's handle is the same question.
+        //
+        // The admission verdict being pure is also why a path-backed face can
+        // consult the persistent cache (keyed to the file's mtime+size identity)
+        // before paying the cmap walk — the walk is the dominant remaining
+        // cold-start term (~203 ms on Hiragino alone, the table below). A pathless
+        // face (injection) always walks: there is no identity to key on, and
+        // injected bytes are one-offs by nature.
         let admissible = match path.as_deref() {
-            Some(p) => admission_cache::admissible_cached(p, 0, || fontdue_admissible(&bytes, 0)),
-            None => fontdue_admissible(&bytes, 0),
+            Some(p) => admission_cache::admissible_cached(p, 0, || fontdue_admissible(bytes, 0)),
+            None => fontdue_admissible(bytes, 0),
         };
         if !admissible {
             return Err("face is not admissible as a fontdue font".to_string());
         }
+        let bytes = intern_discovered_font_bytes(bytes);
         let norm = face_norm_facts(&bytes, 0);
         Ok(FallbackFace {
             font: LazyFontdue::deferred(),
@@ -4125,7 +4188,9 @@ pub fn warm_font_coverage_index() {
 /// process-global parsed-face intern.
 fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
     paths.iter().find_map(|p| {
-        let bytes = font_file::read_font_file(std::path::Path::new(p)).ok()?;
+        // The read's buffer goes STRAIGHT into the store: `Arc::new` moves the
+        // `Vec`, it does not copy the file. See `intern_discovered_font_bytes`.
+        let bytes = std::sync::Arc::new(font_file::read_font_file(std::path::Path::new(p)).ok()?);
         FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
     })
 }
@@ -4214,7 +4279,11 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
             .iter()
             .map(|p| {
                 scope.spawn(move || {
-                    let bytes = font_file::read_font_file(std::path::Path::new(p)).ok()?;
+                    // Straight into the store — this is the loop that had NINE
+                    // files in flight at once on Windows, each one resident twice.
+                    let bytes = std::sync::Arc::new(
+                        font_file::read_font_file(std::path::Path::new(p)).ok()?,
+                    );
                     FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
                 })
             })
@@ -4242,6 +4311,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
         let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
             continue;
         };
+        let bytes = std::sync::Arc::new(bytes);
         let keep_scanning = additive(i, p.as_str());
         let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
             continue;
@@ -7417,6 +7487,7 @@ impl Renderer {
                 strikethrough: false,
                 overline: false,
                 underline_color: None,
+                overline_color: None,
             })
             .collect();
         let mut input = RenderInput::empty();
@@ -13993,8 +14064,8 @@ impl Renderer {
             let dw = if is_wide_lead { 2 * cw } else { cw };
             // Ink — and, when no ink governs the cell, char_fg — follows into
             // decorations too (Sparkle Words v2 / EMBERFORGE): the substituted
-            // base_fg is the deco's fg operand below (an explicit SGR 58 underline
-            // colour still wins inside `effective_deco_color`).
+            // base_fg is the deco's fg operand below (an explicit per-band
+            // colour still wins inside `deco_inks`).
             let base_fg = match ink_walk.at(c as u16) {
                 Some(ink) => rgb_to_u32(ink),
                 None => char_fg_walk
@@ -14004,22 +14075,17 @@ impl Renderer {
             // Decorations route through the SAME floors as the glyph fg (W5b):
             // selected cells get the selection floor against the painted band,
             // unselected ones the per-cell minimum-contrast floor (off by
-            // default → byte-identical). GPU mirrors via the same functions.
+            // default → byte-identical). All three inks come from the ONE
+            // shared resolver the GPU encoder calls (`deco_inks`), so the
+            // backends cannot drift on which band wears which colour.
             let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
             let selected = hit.is_some();
             let SelectionColors {
                 bg: sel_bg,
                 fg: sel_fg,
             } = sel.at_hit(hit);
-            let ucolor = effective_deco_color(
-                sel_fg,
-                self.min_contrast,
-                cell.underline_color.map(rgb_to_u32),
-                base_fg,
-                rgb_to_u32(cell.bg),
-                selected,
-                sel_bg,
-            );
+            let inks = deco_inks(cell, sel_fg, self.min_contrast, base_fg, selected, sel_bg);
+            let ucolor = inks.underline;
             underline_rects_into(
                 &mut deco_scratch,
                 cell.underline,
@@ -14066,29 +14132,31 @@ impl Renderer {
                     }
                 }
             }
-            // Strike/overline follow the SAME shared floor as the glyph fg (W5b),
-            // fed the ink/char_fg-substituted base_fg (parity with the GPU).
-            let fgc = effective_glyph_fg(
-                sel_fg,
-                self.min_contrast,
-                base_fg,
-                rgb_to_u32(cell.bg),
-                selected,
-                sel_bg,
-            );
-            strike_overline_rects_into(
-                &mut deco_scratch,
-                cell.strikethrough,
-                cell.overline,
-                x,
-                y0,
-                dw,
-                self.cell_h,
-                dm,
-            );
-            for &[rx, ry, rw, rh] in &deco_scratch {
+            // Strike and overline are emitted band-by-band, each paired with
+            // its OWN ink: the strike always wears the glyph fg (nothing
+            // anywhere colours a strike), the overline wears its explicit
+            // channel when chrome set one. Strike first, the order
+            // `strike_overline_rects` composes them in and the order the GPU
+            // pushes its quads in. Both are one rect, so no scratch is spent.
+            for (rect, ink) in [
+                (
+                    cell.strikethrough
+                        .then(|| strike_rect(x, y0, dw, self.cell_h, dm))
+                        .flatten(),
+                    inks.strike,
+                ),
+                (
+                    cell.overline
+                        .then(|| overline_rect(x, y0, dw, self.cell_h, dm))
+                        .flatten(),
+                    inks.overline,
+                ),
+            ] {
+                let Some([rx, ry, rw, rh]) = rect else {
+                    continue;
+                };
                 if let Some((fx, fw)) = clip_span_to_run(rx, rw, lo, hi) {
-                    self.fill_rect(pixels, w, h, fx, ry, fw, rh, fgc);
+                    self.fill_rect(pixels, w, h, fx, ry, fw, rh, ink);
                 }
             }
         }
@@ -14120,9 +14188,8 @@ impl Renderer {
                 // pass 3 above (and as the GPU does for both in one loop). A
                 // curly underline is a decoration of the same glyph; nothing
                 // about the wave makes it wear a different colour. An explicit
-                // SGR 58 underline colour still wins inside
-                // `effective_deco_color`, whose `Some(_)` arms ignore this
-                // operand entirely.
+                // SGR 58 underline colour still wins inside `deco_inks`, whose
+                // explicit arm ignores this operand entirely.
                 let base_fg = match ink_walk.at(c as u16) {
                     Some(ink) => rgb_to_u32(ink),
                     None => char_fg_walk
@@ -14135,15 +14202,8 @@ impl Renderer {
                     bg: sel_bg,
                     fg: sel_fg,
                 } = sel.at_hit(hit);
-                let ucolor = effective_deco_color(
-                    sel_fg,
-                    self.min_contrast,
-                    cell.underline_color.map(rgb_to_u32),
-                    base_fg,
-                    rgb_to_u32(cell.bg),
-                    selected,
-                    sel_bg,
-                );
+                let ucolor =
+                    deco_inks(cell, sel_fg, self.min_contrast, base_fg, selected, sel_bg).underline;
                 let skip = self.underline_keep_spans_with_metrics(
                     input,
                     r,
@@ -16707,8 +16767,51 @@ fn pattern_rects_into(
     }
 }
 
+/// The one pixel rect of a cell's STRIKETHROUGH band — through the glyph
+/// middle, positioned and sized from the OS/2 table via the resolved metrics
+/// (W7). `None` for a degenerate cell (`w == 0` / `cell_h == 0`).
+///
+/// Split from [`overline_rect`] because the two bands do not share an ink: the
+/// overline has a colour channel of its own ([`RenderCell::overline_color`]) and
+/// the strike has none, so each backend pairs a rect with the ink resolved for
+/// THAT band. [`strike_overline_rects_into`] composes both, so the geometry has
+/// one definition whichever way a caller asks for it.
+#[must_use]
+pub fn strike_rect(
+    x0: usize,
+    y0: usize,
+    w: usize,
+    cell_h: usize,
+    deco: deco::DecoMetrics,
+) -> Option<[usize; 4]> {
+    if w == 0 || cell_h == 0 {
+        return None;
+    }
+    let t = deco.strike_t.clamp(1, cell_h);
+    let sy = y0 + deco.strike_y.min(cell_h - t);
+    Some([x0, sy, w, t])
+}
+
+/// The one pixel rect of a cell's OVERLINE band: hugging the cell top at the
+/// underline thickness. `None` for a degenerate cell (`w == 0` / `cell_h == 0`).
+/// See [`strike_rect`] for why the two bands are emitted apart.
+#[must_use]
+pub fn overline_rect(
+    x0: usize,
+    y0: usize,
+    w: usize,
+    cell_h: usize,
+    deco: deco::DecoMetrics,
+) -> Option<[usize; 4]> {
+    if w == 0 || cell_h == 0 {
+        return None;
+    }
+    let t = deco.underline_t.clamp(1, cell_h);
+    Some([x0, y0, w, t])
+}
+
 /// The pixel rects for a cell's STRIKETHROUGH (through the glyph middle) and
-/// OVERLINE (along the cell top) decorations, drawn in the foreground colour.
+/// OVERLINE (along the cell top) decorations, strike first.
 /// The strike band comes from the OS/2 table via the resolved metrics (W7);
 /// the overline hugs the cell top at the underline thickness.
 pub fn strike_overline_rects(
@@ -16740,17 +16843,14 @@ pub fn strike_overline_rects_into(
     deco: deco::DecoMetrics,
 ) {
     out.clear();
-    if w == 0 || cell_h == 0 {
-        return;
-    }
+    // Composed from the per-band emitters so a caller that wants both in one
+    // buffer and a backend that wants them apart (each with its own ink) can
+    // never disagree about where a band sits.
     if strikethrough {
-        let t = deco.strike_t.clamp(1, cell_h);
-        let sy = y0 + deco.strike_y.min(cell_h - t);
-        out.push([x0, sy, w, t]);
+        out.extend(strike_rect(x0, y0, w, cell_h, deco));
     }
     if overline {
-        let t = deco.underline_t.clamp(1, cell_h);
-        out.push([x0, y0, w, t]);
+        out.extend(overline_rect(x0, y0, w, cell_h, deco));
     }
 }
 
@@ -19515,7 +19615,7 @@ pub fn floor_min_contrast_fg(fg: u32, bg: u32, min_contrast: f32) -> u32 {
 
 /// The EFFECTIVE ink colour a glyph paints with (W5b): the single policy both
 /// backends apply to the base glyph, its combining-mark overlays, AND (via
-/// [`effective_deco_color`]) its line decorations — so every piece of a cell's
+/// [`deco_inks`]) its line decorations — so every piece of a cell's
 /// ink gets the same legibility floors:
 ///
 /// * SELECTED cell → the explicit theme `selectionForeground` when set, else
@@ -19540,28 +19640,57 @@ pub fn effective_glyph_fg(
     }
 }
 
-/// The colour a LINE DECORATION (underline / strikethrough / overline) paints
-/// with (W5b). `explicit` is the SGR 58 underline colour when set — it keeps
-/// its identity (an explicit colour is never replaced by `selectionForeground`)
-/// but is routed through the SAME floors the glyph fg gets: the 4.5:1 selection
-/// floor on selected cells, the per-cell minimum-contrast floor otherwise.
-/// With no explicit colour the decoration simply paints in the effective glyph
-/// fg. Previously decorations used the raw colour unfloored on both backends,
-/// so a floored glyph could sit on an illegible underline.
+/// The three inks a cell's LINE DECORATIONS paint with. Separate fields because
+/// a cell's bands are separately coloured: SGR 58 gives the underline its own,
+/// [`RenderCell::overline_color`] gives the overline one (aterm's chrome seam
+/// channel — no escape sequence sets it), and the strike has none anywhere, so
+/// it always wears the glyph's own effective ink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoInks {
+    /// Underline / undercurl ink.
+    pub underline: u32,
+    /// Strikethrough ink — always the effective glyph fg.
+    pub strike: u32,
+    /// Overline ink.
+    pub overline: u32,
+}
+
+/// Resolve all three decoration inks for one cell, in ONE place both backends
+/// call.
+///
+/// The CPU raster and the GPU encoder each draw the same bands, and the only
+/// thing keeping their colours equal is that neither derives them: a cell's
+/// explicit channels are read here, and the W5b legibility floors (the 4.5:1
+/// selection floor, the per-cell minimum-contrast floor) are applied here. A
+/// new channel — or a new floor — therefore lands on both backends at once
+/// instead of in two edits that agree only until one of them is forgotten.
+///
+/// `base_fg` is the cell's fg AFTER the host's ink / `char_fg` substitutions
+/// (Sparkle Words v2, EMBERFORGE); an explicit channel outranks it, matching
+/// the glyph rule that a program's chosen colour is not animated over. An
+/// explicit channel keeps its identity — it is never replaced by
+/// `selectionForeground` — but still passes the floors, so a floored glyph can
+/// never sit on an illegible rule.
 #[must_use]
-pub fn effective_deco_color(
+pub fn deco_inks(
+    cell: &RenderCell,
     selection_fg: Option<u32>,
     min_contrast: f32,
-    explicit: Option<u32>,
-    fg: u32,
-    bg: u32,
+    base_fg: u32,
     selected: bool,
     sel_bg: u32,
-) -> u32 {
-    match explicit {
+) -> DecoInks {
+    let bg = rgb_to_u32(cell.bg);
+    let glyph = effective_glyph_fg(selection_fg, min_contrast, base_fg, bg, selected, sel_bg);
+    let explicit = |c: Option<[u8; 3]>| match c.map(rgb_to_u32) {
         Some(c) if selected => floor_selection_fg(c, sel_bg),
         Some(c) => floor_min_contrast_fg(c, bg, min_contrast),
-        None => effective_glyph_fg(selection_fg, min_contrast, fg, bg, selected, sel_bg),
+        None => glyph,
+    };
+    DecoInks {
+        underline: explicit(cell.underline_color),
+        strike: glyph,
+        overline: explicit(cell.overline_color),
     }
 }
 
@@ -20882,7 +21011,7 @@ const PNG_DECODE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 ///
 /// Hardened against the inline-image allocation-bomb DoS: a tiny PNG can declare
 /// huge IHDR dimensions and force a multi-GB output buffer. We (1) cap the
-/// decoder's intermediate allocations via `png::Limits`, and (2) reject either
+/// decoder's intermediate allocations via `aterm_png::Limits`, and (2) reject either
 /// axis past `IMAGE_MAX_DIMENSION` after parsing IHDR but BEFORE allocating the
 /// output buffer. Non-8-bit depths and a pixel count that overflows or exceeds
 /// the byte budget also bail (returning `None`) — never panic, never allocate.
@@ -20899,8 +21028,8 @@ pub fn decode_png_rgba8_bounded(
     bytes: &[u8],
     max_dimension: u32,
 ) -> Option<(Vec<u8>, usize, usize)> {
-    let mut decoder = png::Decoder::new(bytes);
-    decoder.set_limits(png::Limits {
+    let mut decoder = aterm_png::Decoder::new(bytes);
+    decoder.set_limits(aterm_png::Limits {
         bytes: PNG_DECODE_BYTE_LIMIT,
     });
     // EXPAND palette (Indexed) → RGB(A) and apply tRNS transparency; STRIP_16 folds
@@ -20908,7 +21037,9 @@ pub fn decode_png_rgba8_bounded(
     // (palette + tRNS) — without EXPAND `to_rgba8` can't read them and every emoji
     // renders blank. RGB/RGBA PNGs (Apple sbix) are unaffected (EXPAND is a no-op
     // for them, save honouring a tRNS chunk).
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    decoder.set_transformations(
+        aterm_png::Transformations::EXPAND | aterm_png::Transformations::STRIP_16,
+    );
     let mut reader = decoder.read_info().ok()?;
     // IHDR is parsed by `read_info`; reject oversized dims before the alloc.
     let (w, h) = (reader.info().width, reader.info().height);
@@ -20930,7 +21061,7 @@ pub fn decode_png_rgba8_bounded(
     }
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
-    if info.bit_depth != png::BitDepth::Eight {
+    if info.bit_depth != aterm_png::BitDepth::Eight {
         return None;
     }
     let (src_w, src_h) = (info.width as usize, info.height as usize);
@@ -20942,11 +21073,11 @@ pub fn decode_png_rgba8_bounded(
 /// EXPAND transform, palette images arrive as RGB/RGBA, so the cases here are RGBA
 /// (Apple sbix, expanded Noto Color Emoji), RGB, and grayscale (±alpha) for any
 /// monochrome strike; anything else returns `None`.
-fn to_rgba8(buf: &[u8], color_type: png::ColorType, w: usize, h: usize) -> Option<Vec<u8>> {
+fn to_rgba8(buf: &[u8], color_type: aterm_png::ColorType, w: usize, h: usize) -> Option<Vec<u8>> {
     let n = w.checked_mul(h)?;
     match color_type {
-        png::ColorType::Rgba => (buf.len() >= n * 4).then(|| buf[..n * 4].to_vec()),
-        png::ColorType::Rgb => {
+        aterm_png::ColorType::Rgba => (buf.len() >= n * 4).then(|| buf[..n * 4].to_vec()),
+        aterm_png::ColorType::Rgb => {
             if buf.len() < n * 3 {
                 return None;
             }
@@ -20956,7 +21087,7 @@ fn to_rgba8(buf: &[u8], color_type: png::ColorType, w: usize, h: usize) -> Optio
             }
             Some(out)
         }
-        png::ColorType::GrayscaleAlpha => {
+        aterm_png::ColorType::GrayscaleAlpha => {
             if buf.len() < n * 2 {
                 return None;
             }
@@ -20966,7 +21097,7 @@ fn to_rgba8(buf: &[u8], color_type: png::ColorType, w: usize, h: usize) -> Optio
             }
             Some(out)
         }
-        png::ColorType::Grayscale => {
+        aterm_png::ColorType::Grayscale => {
             if buf.len() < n {
                 return None;
             }
@@ -21586,6 +21717,78 @@ mod tests {
         assert!(again.horizontal_line_metrics(16.0).is_some());
     }
 
+    /// MEMORY: READING a discovered chain face must not put a SECOND copy of the
+    /// file in the process — the twin, one layer earlier, of
+    /// `a_materialising_chain_face_adopts_its_own_byte_handle` below.
+    ///
+    /// `FallbackFace::from_path_bytes` used to take a SLICE and end in
+    /// `bytes.to_vec()`, so from the read until the caller's buffer dropped, the
+    /// file was resident TWICE. On Linux that is one 4 MB file and invisible; on
+    /// WINDOWS `build_fallback_chain` reads NINE files totalling 40,464 kB on
+    /// concurrent scoped workers, and every one of them was doubled at once.
+    /// MEASURED on this box (`tests/win_heap_attribution.rs`): peak live heap
+    /// 116,397 kB before, 76,730 kB after, against an unchanged 80,006 kB settled.
+    ///
+    /// The observable is pointer identity: the store's blob for these bytes IS
+    /// the allocation the reader handed over, not an equal-content twin. The face
+    /// is built from a nonce-suffixed copy of a bundled face so no earlier test in
+    /// this binary can already own the store entry — a TrueType parser reads the
+    /// table directory, so trailing bytes leave the face itself untouched, and
+    /// `from_path_bytes` succeeding is what proves that.
+    #[test]
+    fn a_discovered_chain_face_adopts_the_readers_byte_handle() {
+        let mut unique = embedded_font().to_vec();
+        unique.extend_from_slice(format!("aterm-nonce-{:?}", std::time::Instant::now()).as_bytes());
+        let bytes = std::sync::Arc::new(unique);
+        let handed_over = bytes.as_ptr();
+        let face = FallbackFace::from_path_bytes(&bytes, Some("nonce".into()))
+            .expect("a bundled face with trailing bytes is still admissible");
+        assert_eq!(
+            face.bytes.as_ptr(),
+            handed_over,
+            "the discovery store must ADOPT the read's buffer; a copy here is the \
+             whole Windows fallback chain resident twice"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&face.bytes, &bytes),
+            "and it must be the same handle, not merely the same address"
+        );
+    }
+
+    /// MEMORY: a face the chain REFUSES must leave nothing in the discovery
+    /// store.
+    ///
+    /// [`DISCOVERED_FONT_BYTES`] has no eviction — it is a `Vec<Arc<Vec<u8>>>`
+    /// that only ever grows, by design, because a discovered face is process-wide
+    /// and permanent. `from_path_bytes` used to publish into it BEFORE asking
+    /// `fontdue_admissible`, so a refused candidate's whole file stayed resident
+    /// for the life of the process with no handle to it and no path back. Every
+    /// built-in Windows candidate is admissible on this host, so the cost here is
+    /// zero — which is exactly when the hole is cheap to close; the reachable case
+    /// is a configured `fallback_fonts` entry ttf-parser accepts and fontdue does
+    /// not, and it is a whole font file per reload.
+    #[test]
+    fn a_refused_face_leaves_no_bytes_in_the_discovery_store() {
+        // The one input class that separates `fontdue_admissible` from a bare
+        // `ttf_parser::Face::parse` — the same fixture the admission gate uses.
+        let patched = std::sync::Arc::new(
+            patch_num_glyphs(embedded_symbols_font(), 1)
+                .expect("the bundled symbols face has a maxp table"),
+        );
+        assert!(
+            !discovered_font_bytes_contains(patched.as_slice()),
+            "fixture guard: this file must not already be in the store"
+        );
+        assert!(
+            FallbackFace::from_path_bytes(&patched, Some("refused".into())).is_err(),
+            "the fixture must actually be refused, or this proves nothing"
+        );
+        assert!(
+            !discovered_font_bytes_contains(patched.as_slice()),
+            "a refused face must not leave its file in the un-evictable discovery store"
+        );
+    }
+
     /// MEMORY: materialising a DISCOVERED chain face must not put a SECOND copy
     /// of the file in the process.
     ///
@@ -21608,8 +21811,12 @@ mod tests {
         // in `PARSED_FONT_INTERN` (the store is content-keyed, so a slice-path
         // intern of the same face by another test would legitimately win the
         // entry and the assertion would be about scheduling, not the change).
-        let bytes = display_face_bytes("pixel").expect("bundled display face");
-        let face = FallbackFace::from_path_bytes(bytes, None)
+        let bytes = std::sync::Arc::new(
+            display_face_bytes("pixel")
+                .expect("bundled display face")
+                .to_vec(),
+        );
+        let face = FallbackFace::from_path_bytes(&bytes, None)
             .expect("a bundled face is admissible on the discovery path");
         assert!(
             !face.font.is_materialised(),
@@ -23322,9 +23529,9 @@ mod tests {
     fn decode_png_expands_indexed_palette_to_rgba() {
         let mut png_bytes = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut png_bytes, 2, 1);
-            enc.set_color(png::ColorType::Indexed);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut png_bytes, 2, 1);
+            enc.set_color(aterm_png::ColorType::Indexed);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             // idx0 = red, idx1 = green; idx0 opaque, idx1 fully transparent.
             enc.set_palette(vec![255, 0, 0, 0, 255, 0]);
             enc.set_trns(vec![255, 0]);
@@ -25667,7 +25874,11 @@ mod tests {
             "admission must reject what the deferred fontdue parse would reject"
         );
         assert!(
-            FallbackFace::from_path_bytes(&patched, Some("patched".into())).is_err(),
+            FallbackFace::from_path_bytes(
+                &std::sync::Arc::new(patched.clone()),
+                Some("patched".into())
+            )
+            .is_err(),
             "such a face must never enter the chain"
         );
     }
@@ -28487,9 +28698,9 @@ mod tests {
         }
         let mut out = Vec::new();
         {
-            let mut enc = png::Encoder::new(&mut out, w, h);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
+            let mut enc = aterm_png::Encoder::new(&mut out, w, h);
+            enc.set_color(aterm_png::ColorType::Rgba);
+            enc.set_depth(aterm_png::BitDepth::Eight);
             let mut writer = enc.write_header().expect("png header");
             writer.write_image_data(&rgba).expect("png data");
         }
@@ -28509,7 +28720,7 @@ mod tests {
         bytes[ihdr_data..ihdr_data + 4].copy_from_slice(&w.to_be_bytes());
         bytes[ihdr_data + 4..ihdr_data + 8].copy_from_slice(&h.to_be_bytes());
         // IHDR chunk = type(4) + data(13); CRC covers type+data. Recompute it so
-        // `png::read_info` accepts the header and reaches our dimension guard.
+        // `aterm_png::read_info` accepts the header and reaches our dimension guard.
         let crc_input = &bytes[ihdr_data - 4..ihdr_data + 13];
         let crc = crc32_ieee(crc_input);
         bytes[ihdr_data + 13..ihdr_data + 17].copy_from_slice(&crc.to_be_bytes());

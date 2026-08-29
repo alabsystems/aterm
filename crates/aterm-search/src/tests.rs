@@ -1263,7 +1263,7 @@ fn case_insensitive_overlapping_matches() {
     assert_eq!(matches.len(), 4, "should find 4 overlapping matches");
 }
 
-/// A repeated first-byte prefix used to make the candidate-at-every-byte memchr
+/// A repeated first-byte prefix used to make the candidate-at-every-byte scanner
 /// verifier quadratic. Three-byte-and-longer literals now use `str::find`'s
 /// linear-time search over one reusable folded buffer instead.
 #[test]

@@ -313,9 +313,10 @@ impl BudgetedSearch {
                         &fallback
                     }
                 };
+                let searcher = crate::bytesearch::Searcher::new(self.query.as_bytes());
                 let mut next_byte = 0;
                 while let Some((found, resume)) =
-                    next_literal_match(abs_row, text, &self.query, col_map, next_byte)
+                    next_literal_match(abs_row, text, &searcher, col_map, next_byte)
                 {
                     next_byte = resume;
                     self.matches.push(found);

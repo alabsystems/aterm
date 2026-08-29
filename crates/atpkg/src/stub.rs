@@ -40,6 +40,18 @@
 //! applies to stubs identically. A stub is recognized by its marker line and
 //! removed only when it still carries it: a real shim, a tombstone, a dev link or
 //! any hand-made file is never touched.
+//!
+//! # An alias is never a stub (owner decision 2026-08-27)
+//!
+//! A stub is laid for the PLAIN program name only. The `alab-<tool>` alias
+//! ([`crate::activate::Aliases`], `crate::store::ALIAS_PREFIX`) exists to name
+//! ALab's copy unambiguously ONCE IT IS INSTALLED — beside a `trust` that Homebrew's
+//! p11-kit may shadow, `alab-trust` always runs the managed build. Before the
+//! install there is nothing to disambiguate: the plain-name stub already answers
+//! (bumps, or asks consent), and a second promising name on `PATH` would double
+//! every "not found" into two courtesy scripts for one program. So the reconcile
+//! never lays `alab-*`, and [`write_pending_stub_with`] is a no-op for an alias
+//! name — the alias appears with the real shims, and only then.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -464,6 +476,11 @@ pub fn write_pending_stub_with(
         // See `cmd_stub_name_safe`: no inert embedding exists, so no stub.
         return Ok(());
     }
+    if tool.is_alias() {
+        // An alias is never a stub (module doc): it names the managed copy once
+        // installed, and the plain name's stub already answers until then.
+        return Ok(());
+    }
     let shim = layout.shim(tool);
     match std::fs::symlink_metadata(&shim) {
         Err(_) => {}                          // absent: ours to claim
@@ -652,6 +669,30 @@ mod tests {
             );
             assert!(!desc.is_empty(), "{name} needs its authored line");
         }
+    }
+
+    /// An alias is never a stub (module doc): the reconcile lays the PLAIN names only,
+    /// and the writer is a no-op for an `alab-` name even when asked directly.
+    #[test]
+    fn an_alias_is_never_a_stub() {
+        let l = layout("alias-stub");
+        let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
+        reconcile(&l, &wanted, &BTreeSet::new(), &BTreeMap::new());
+        assert!(
+            pending_stub_exists(&l, "trust"),
+            "the plain name is stubbed"
+        );
+        assert!(
+            std::fs::symlink_metadata(l.shim(&tool("alab-trust"))).is_err(),
+            "no stub is laid under the alias name"
+        );
+        assert_eq!(pending_stub_kind(&l, "alab-trust"), None);
+        write_pending_stub(&l, &tool("alab-trust")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(l.shim(&tool("alab-trust"))).is_err(),
+            "the writer is a no-op for an alias"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     /// The stub body: marker present, the three-step fallback chain in order, the

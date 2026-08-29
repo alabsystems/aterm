@@ -110,6 +110,10 @@ pub(crate) fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u6
 /// Returns `None` when the program has no shims at all (nothing installed), which is
 /// distinguishable from `Some(vec![])` and lets a caller refuse rather than silently link
 /// nothing.
+///
+/// The `alab-<tool>` ALIASES are not exposes — they are derived from the primaries
+/// ([`crate::activate::Aliases`]) — so they are left out: a sysroot dev link that had to
+/// cover `alab-trustc` would abort on every checkout, and a link is what this feeds.
 pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> {
     let shims = std::fs::read_dir(layout.bin_dir()).ok()?;
     let mut out = Vec::new();
@@ -120,9 +124,14 @@ pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> 
         let Some((owner, _build)) = program_build_of_target(&target) else {
             continue;
         };
-        if owner == program {
-            out.push(shim.file_name().to_string_lossy().into_owned());
+        if owner != program {
+            continue;
         }
+        let name = shim.file_name().to_string_lossy().into_owned();
+        if ToolName::from_shim_file(&name).is_some_and(|t| t.is_alias()) {
+            continue;
+        }
+        out.push(name);
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -157,8 +166,27 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
 /// suffix, and the reason to keep the type all the way through is that handing those the raw
 /// `bin/` entry would double it (`bin/ay.cmd.cmd`) — writing tombstones and rollback shims
 /// BESIDE the live shim instead of replacing it. [`ToolName::from_shim_file`] owns that strip.
+///
+/// PRIMARIES only: the `alab-<tool>` aliases that resolve into the same build are listed
+/// by [`active_aliases`] instead, so a caller that re-lays or probes "the tools this
+/// program exposes" never treats an alias as a tool of its own.
 #[must_use]
 pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
+    active_names(layout, program, build, false)
+}
+
+/// The `alab-<tool>` ALIAS names whose `bin/` shims currently point into
+/// `store/<program>/<build>/` — the counterpart of [`active_tools`], for the passes that
+/// must treat an alias exactly like its primary (tombstoning a revoked build, the
+/// rollback verb's policy probe). Sorted; empty when the program has no aliases laid.
+#[must_use]
+pub fn active_aliases(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
+    active_names(layout, program, build, true)
+}
+
+/// The shared scan behind [`active_tools`] (`aliases == false`) and [`active_aliases`]
+/// (`true`).
+fn active_names(layout: &Layout, program: &str, build: u64, aliases: bool) -> Vec<ToolName> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
         return out;
@@ -176,6 +204,7 @@ pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<ToolName>
             && b == build
             && let Some(name) = e.file_name().to_str()
             && let Some(tool) = ToolName::from_shim_file(name)
+            && tool.is_alias() == aliases
         {
             out.push(tool);
         }
@@ -331,7 +360,13 @@ mod tests {
             b"#!/bin/true\n",
         )
         .unwrap();
-        install_shims(layout, &dir, &[program.to_string()]).unwrap();
+        install_shims(
+            layout,
+            &dir,
+            &[program.to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
         activate_channel(layout, "stable", &dir).unwrap();
         // A real install marks the build complete as its last step (verify_and_stage).
         crate::store::mark_build_ready(&dir).unwrap();

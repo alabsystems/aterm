@@ -312,7 +312,7 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
 /// Row 1 is the per-site isolate: its cells are SPACES, so the decoration is
 /// the only ink in them. Col 2 (solid underline) and col 4 (undercurl) must
 /// each change when char_fg lands; col 0's explicit SGR 58 underline colour
-/// must not move (`effective_deco_color`'s `Some(_)` arms ignore the operand).
+/// must not move (`deco_inks`'s explicit arms ignore the operand).
 #[test]
 fn char_fg_follows_into_line_decorations_on_both_backends() {
     let theme = Theme::default();

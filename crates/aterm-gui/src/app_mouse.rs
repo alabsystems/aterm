@@ -1580,6 +1580,27 @@ impl App {
         {
             return Some((from, from - 1));
         }
+        // PAST THE PAGE'S EDGE. The strip seats a PAGE of the tab list
+        // (`tab_bar::strip_window`), so the held chip's neighbour is not always
+        // ON the strip: at a page edge there is no next segment, and therefore
+        // no midpoint for the rules above to pass. Stopping there would let a
+        // paint decision bar a reorder — a tab could never be dragged out of
+        // the page it started in, which the centred window used to hide by
+        // travelling with the drag.
+        //
+        // The threshold is what the midpoint rule DEGENERATES to when the
+        // neighbour is off-strip: the pointer has left the held chip on that
+        // side. One such step turns the page, the held tab arrives on it, and
+        // `advance_strip_drag`'s loop then settles the chip under the hand
+        // exactly as it does for an ordinary step.
+        let held = segment(from)?;
+        let tabs = ws.tab_set.len();
+        if from + 1 < tabs && segment(from + 1).is_none() && col >= held.end_col {
+            return Some((from, from + 1));
+        }
+        if from > 0 && segment(from - 1).is_none() && col < held.start_col {
+            return Some((from, from - 1));
+        }
         None
     }
 
@@ -7729,15 +7750,36 @@ mod tests {
         assert_eq!(app.windows[&wid].tab_set.len(), 1);
     }
 
-    /// THE PRESSURE REGIME (share < `PREFERRED_MIN_TAB_COLS`): eight chips on the
-    /// 80-column harness strip share ~9 cells each, so `layout_segments` gives the
-    /// ACTIVE chip a wide share and compresses the rest around it — and every step
-    /// of a drag reshapes the band, because the dragged tab stays selected. The
-    /// march below models the real frame loop (`move_tab` requests a redraw; the
-    /// repaint re-records `ws.tab_segments`) by re-splicing after every motion,
-    /// and walks the wide chip from the front of the strip to the back one
-    /// neighbour at a time — the self-stabilisation `advance_strip_drag`'s doc
-    /// analyses, finally pinned by a test.
+    /// THE PRESSURE REGIME (the equal share falls under the legibility floor):
+    /// eight tabs on the 80-column harness strip cannot all have a legible chip,
+    /// so `layout_segments` stops compressing and seats a PAGE of four
+    /// (`tab_bar::strip_window`). The march below models the real frame loop
+    /// (`move_tab` requests a redraw; the repaint re-records `ws.tab_segments`)
+    /// by re-splicing after every motion, and walks the held chip from the front
+    /// of the strip to the back one neighbour at a time — the self-stabilisation
+    /// `advance_strip_drag`'s doc analyses, finally pinned by a test.
+    ///
+    /// WHAT CHANGED WITH THE PAGE, and why this test had to be re-derived rather
+    /// than relaxed. The window used to be centred on the selection, which made
+    /// two things true that are no longer true and that this test was reading as
+    /// its subject:
+    ///
+    /// - The held chip was WIDER than its neighbours (the active-priority
+    ///   reserve). A page does not compress anybody, so its chips are equal —
+    ///   the pressure signature below is now "the strip seats fewer chips than
+    ///   it has tabs, all of one width", which is the same fact about the same
+    ///   regime, read off the thing the regime actually does.
+    /// - The next neighbour was ALWAYS seated, because the window followed the
+    ///   held tab. On a paged strip the neighbour across a page edge has no
+    ///   chip, so the march crosses that edge on `strip_drag_step`'s
+    ///   off-strip rule — the pointer leaving the held chip — and the page turns
+    ///   under it. The march therefore reaches for the neighbour's span only
+    ///   while the neighbour is seated, and drives the pointer past the held
+    ///   chip's own end otherwise.
+    ///
+    /// It starts at the first chip the PAGE seats rather than at tab 0: a tab
+    /// the strip does not paint has no pixel to press, and the drag gesture is
+    /// defined on the chips a hand can actually reach.
     #[test]
     fn under_pressure_the_wide_active_chip_marches_across_the_strip() {
         use winit::event::{ElementState, MouseButton as WinitMouseButton};
@@ -7752,65 +7794,120 @@ mod tests {
         let before = tab_order(&app, wid);
         assert_eq!(before.len(), 8, "eight chips to force the pressure layout");
 
-        // Grab the FIRST chip: the press selects it, so from the first repaint on
-        // the dragged chip is the WIDE one and the band reshapes around every step.
-        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        // The first chip the WINDOW seats — the leftmost one a hand can reach.
+        let seated = |app: &crate::App| -> Vec<usize> {
+            app.windows[&wid]
+                .tab_segments
+                .iter()
+                .filter_map(|seg| match seg.kind {
+                    crate::tab_bar::TabHit::Select(index) => Some(index),
+                    _ => None,
+                })
+                .collect()
+        };
+        let held = seated(&app)[0];
+        assert!(
+            seated(&app).len() < before.len(),
+            "eight tabs on an 80-column strip must be more than it can seat"
+        );
+
+        // Grab it: the press selects it, and the band is re-recorded around the
+        // page that selection is on.
+        let grab = strip_point(&app, wid, chip_span(&app, wid, held).0 + 1);
         app.on_cursor_moved(wid, grab.0, grab.1);
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
         assert_eq!(
-            app.windows[&wid].tabs.active, 0,
-            "the press selected chip 0"
+            app.windows[&wid].tabs.active, held,
+            "the press selected the chip under it"
         );
         app.splice_tab_strip(wid); // the repaint the selection requested
 
-        // The PRESSURE SIGNATURE, on the freshly recorded segments: the active
-        // chip's share is wider than an inactive neighbour's — the
-        // selection-DEPENDENT geometry the equal-share tests above never see. If
-        // this fails, the harness is no longer testing the regime it names.
+        // The PRESSURE SIGNATURE, on the freshly recorded segments: the strip
+        // seats FEWER chips than it has tabs, and each of them is wider than an
+        // equal split of the band would have been — the strip stopped
+        // compressing and paged instead. If this fails, the harness is no longer
+        // testing the regime it names.
         let width = |index: usize| {
             let (start, end) = chip_span(&app, wid, index);
             end - start
         };
+        let widths: Vec<u16> = seated(&app).iter().map(|&i| width(i)).collect();
         assert!(
-            width(0) > width(1),
-            "eight tabs on this strip must engage the pressure layout \
-             (active {} cols vs inactive {})",
-            width(0),
-            width(1)
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "a seated page divides its band equally: {widths:?}"
+        );
+        assert!(
+            widths[0] > 80 / before.len() as u16,
+            "eight tabs on this strip must engage the pressure layout: a seated \
+             chip ({} cols) has to beat the equal eighth it refused to shrink to",
+            widths[0]
         );
 
-        // March the held chip one neighbour at a time to the far end, re-splicing
-        // after every step exactly as the runtime repaints after one.
-        for step in 0..before.len() - 1 {
-            let (start, end) = chip_span(&app, wid, step + 1);
-            let over = strip_point(&app, wid, start + (end - start) / 2);
+        // March the held chip past its neighbour, over and over, to the far end
+        // — re-splicing after every motion exactly as the runtime repaints after
+        // one. Each motion advances it by AT LEAST one slot: crossing a PAGE
+        // edge turns the page under the pointer, and `advance_strip_drag` then
+        // keeps stepping until the held chip is back under the hand — several
+        // slots for one motion, which is the self-stabilisation doing its job
+        // rather than a runaway.
+        let mut motions = 0;
+        let mut last_col = None::<u16>;
+        while app.windows[&wid].tabs.active + 1 < before.len() {
+            motions += 1;
+            assert!(
+                motions <= before.len(),
+                "the march must terminate: {:?}",
+                tab_order(&app, wid)
+            );
+            let was = app.windows[&wid].tabs.active;
+            // Past the NEIGHBOUR's midpoint while the neighbour is seated;
+            // past the held chip's own END when the neighbour is over a page
+            // edge and has no chip to have a midpoint (`strip_drag_step`'s
+            // off-strip rule). Always a column to the RIGHT of where the last
+            // motion ended: `advance_strip_drag` ignores a pointer that has not
+            // moved, so a hand that stops moving stops the march, exactly as it
+            // should.
+            let col = if seated(&app).contains(&(was + 1)) {
+                let (start, end) = chip_span(&app, wid, was + 1);
+                start + (end - start) / 2
+            } else {
+                chip_span(&app, wid, was).1
+            }
+            .max(last_col.map_or(0, |c| c + 1));
+            last_col = Some(col);
+            let over = strip_point(&app, wid, col);
             app.on_cursor_moved(wid, over.0, over.1);
-            assert_eq!(
-                tab_order(&app, wid)[step + 1],
-                before[0],
-                "step {step}: the held chip advanced exactly one slot"
+            let now = app.windows[&wid].tabs.active;
+            assert!(
+                now > was,
+                "motion {motions}: the held chip advanced (was {was}, now {now})"
             );
             assert_eq!(
-                app.windows[&wid].tabs.active,
-                step + 1,
-                "step {step}: the dragged tab is still the selected one"
+                tab_order(&app, wid)[now],
+                before[held],
+                "motion {motions}: the dragged tab is the one that moved, and it \
+                 is still the selected one"
             );
             app.splice_tab_strip(wid);
-            // The SAME pointer, re-delivered over the reshaped band (the repaint
-            // moved the chips under a stationary hand): the held chip's new wide
-            // share contains the pointer, so a settled pointer takes no second
-            // step — the drag must not oscillate against its own relayout.
+            // The SAME pointer, re-delivered over the re-recorded band: a hand
+            // that has not moved takes no further step, whatever the repaint did
+            // underneath it — including the repaint that TURNED THE PAGE and put
+            // four different chips under the same columns. That is
+            // `advance_strip_drag`'s stationary-pointer guard, and it is what
+            // keeps a paged strip from marching a tab away from a resting hand.
             app.on_cursor_moved(wid, over.0, over.1);
             assert_eq!(
-                tab_order(&app, wid)[step + 1],
-                before[0],
-                "step {step}: a settled pointer must not oscillate after the repaint"
+                app.windows[&wid].tabs.active, now,
+                "motion {motions}: a settled pointer must not oscillate after \
+                 the repaint"
             );
+            assert_eq!(tab_order(&app, wid)[now], before[held]);
         }
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
 
-        let mut expect: Vec<_> = before[1..].to_vec();
-        expect.push(before[0]);
+        let mut expect: Vec<_> = before.clone();
+        let moved = expect.remove(held);
+        expect.push(moved);
         assert_eq!(
             tab_order(&app, wid),
             expect,

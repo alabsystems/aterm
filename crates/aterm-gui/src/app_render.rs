@@ -6500,9 +6500,9 @@ pub(crate) fn emit_single_cursor_companion(
 #[cfg(test)]
 mod resident_pet_presentation_tests {
     use super::{
-        CompanionDuty, cursor_companion_duty, cursor_companion_on_glass,
-        prepare_resident_pet_tick, resident_pet_presentation_enabled, shed_companion_alpha,
-        shed_companion_presentable, shed_envelope_transitioning,
+        CompanionDuty, cursor_companion_duty, cursor_companion_on_glass, prepare_resident_pet_tick,
+        resident_pet_presentation_enabled, shed_companion_alpha, shed_companion_presentable,
+        shed_envelope_transitioning,
     };
     use crate::cursor_glow::GlowStyle;
     use crate::word_decorations::WordDecorations;
@@ -6824,6 +6824,7 @@ mod cursor_cat_context_tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 
@@ -11186,6 +11187,7 @@ pub(crate) fn divider_cell(theme: Theme) -> RenderCell {
         strikethrough: false,
         overline: false,
         underline_color: None,
+        overline_color: None,
     }
 }
 
@@ -11968,6 +11970,1041 @@ fn terminal_frame_colors(term: &Terminal) -> (u32, u32, u32) {
     (default_bg, default_fg, terminal_cursor_color(term))
 }
 
+/// THE TILED SEAM PASS'S CORRECTNESS BAR, both halves.
+///
+/// `seed_seam_cells` stops writing the divider seam into cells it expects a
+/// pane blit to overwrite. If that expectation is ever wrong the cell keeps the
+/// PREVIOUS frame's content — stale content on screen, silently, for as long as
+/// nothing else moves. Two oracles run one scripted corpus:
+///
+/// * COVERAGE. Stamp a cell no fixture can produce over the whole composed
+///   scratch before every frame. Any of it still there afterwards is precisely
+///   a cell the frame wrote neither a seam nor a pane into.
+/// * DIFFERENTIAL. Run the same corpus again with the seam pass forced back to
+///   its historical whole-grid form and compare every frame cell for cell.
+///
+/// Coverage alone would miss a cell written with the WRONG value and the
+/// differential alone would miss a cell that is stale in both arms, so both
+/// run. The corpus itself is proved non-vacuous by [`Armed`]: a corpus that
+/// never arms a producer proves nothing about that producer.
+#[cfg(test)]
+mod tiled_seam_oracle_tests {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    use aterm_core::terminal::RenderCell;
+
+    use super::{
+        COMPOSE_RETAIN_ARMS, COMPOSE_RETAIN_OFF, COMPOSE_RETAIN_UNSOUND, COMPOSE_SEAM_ARMS,
+        COMPOSE_SEAM_UNTILED, divider_cell,
+    };
+    use crate::{App, WindowId, pane, term_lock};
+
+    /// EVERY per-row channel of a composed frame the K2 retention lane can skip
+    /// rebuilding.
+    ///
+    /// Recorded whole, because "the cells match" is not the claim the lane
+    /// needs: a retained row keeps its emoji clusters, its combining marks, its
+    /// inline-image placements, its DEC line size and BOTH of its span lanes,
+    /// and a stale one of those is a stale frame just as surely as a stale
+    /// glyph. The fill rebuilds all seven from scratch on a rebuilt row and
+    /// touches none of them on a retained one, so all seven are what the
+    /// differential oracle compares.
+    ///
+    /// Inline images are recorded by COLUMN rather than by payload: `ImageRef`
+    /// is `Arc`-backed and the two arms are two independently driven `App`s
+    /// that can never share one, so the comparable fact is the placement.
+    #[derive(Clone, PartialEq, Debug)]
+    struct Composed {
+        cells: Vec<Vec<RenderCell>>,
+        clusters: Vec<Vec<(usize, Box<str>)>>,
+        combining: Vec<Vec<(usize, Box<[char]>)>>,
+        line_sizes: Vec<aterm_core::grid::LineSize>,
+        line_size_spans: Vec<Vec<aterm_core::render::LineSizeSpan>>,
+        default_bg_spans: Vec<Vec<aterm_core::render::DefaultBgSpan>>,
+        image_columns: Vec<Vec<usize>>,
+    }
+
+    impl Composed {
+        fn of(input: &aterm_render::RenderInput) -> Self {
+            Self {
+                cells: input.cells.clone(),
+                clusters: input.clusters.clone(),
+                combining: input.combining.clone(),
+                line_sizes: input.line_sizes.clone(),
+                line_size_spans: input.line_size_spans.clone(),
+                default_bg_spans: input.default_bg_spans.clone(),
+                image_columns: input
+                    .images
+                    .iter()
+                    .map(|row| row.iter().map(|(c, _)| *c).collect())
+                    .collect(),
+            }
+        }
+    }
+
+    const FRAME: Duration = Duration::from_millis(16);
+    /// The four glyphs the active-pane mark can put in a divider gap; no
+    /// terminal in this corpus ever prints one.
+    const MARK_GLYPHS: [char; 4] = ['\u{2581}', '\u{2594}', '\u{2590}', '\u{258c}'];
+
+    /// The stamp the coverage oracle floods the composed scratch with between
+    /// frames. Nothing in the corpus prints a snowman and no theme resolves
+    /// `[1, 2, 3]` on `[4, 5, 6]`, so a surviving one is unambiguous.
+    fn poison_cell() -> RenderCell {
+        RenderCell {
+            ch: '\u{2603}',
+            fg: [1, 2, 3],
+            bg: [4, 5, 6],
+            ..RenderCell::default()
+        }
+    }
+
+    /// What the corpus ARMED, counted while it ran.
+    #[derive(Default)]
+    struct Armed {
+        frames: usize,
+        pane_counts: BTreeSet<usize>,
+        ring_frames: usize,
+        ring_columns: BTreeSet<usize>,
+        seam_frames: usize,
+        gap_frames: usize,
+        tiled_seam_passes: u64,
+        whole_grid_seam_passes: u64,
+        resize_frames: usize,
+        alt_screen_frames: usize,
+        scrolled_beside_live_frames: usize,
+        preedit_frames: usize,
+        prediction_frames: usize,
+        close_frames: usize,
+        /// K2: composed rows this corpus RETAINED and rebuilt, the frames on
+        /// which at least one row was retained, the frames on which EVERY row
+        /// was, and the soundness witness.
+        retained_rows: u64,
+        rebuilt_rows: u64,
+        retain_frames: usize,
+        unsound: u64,
+        /// `(step label, rows retained, rows composed)` per frame — the reach
+        /// witness a failing census prints, so "the lane did not arm" names the
+        /// step it did not arm on.
+        retain_log: Vec<(String, u64, usize)>,
+    }
+
+    impl Armed {
+        /// PROVE THE CORPUS IS NOT VACUOUS. Every clause here names a producer
+        /// that can put a cell into a split composite; a zero means the oracles
+        /// above ran without that producer ever being on, and therefore say
+        /// nothing about it.
+        fn assert_non_vacuous(&self) {
+            assert!(
+                self.frames >= 27,
+                "the corpus composed only {} frames",
+                self.frames
+            );
+            for want in [2usize, 3, 4] {
+                assert!(
+                    self.pane_counts.contains(&want),
+                    "the corpus never composed a {want}-pane layout: {:?}",
+                    self.pane_counts
+                );
+            }
+            assert_eq!(
+                self.gap_frames,
+                self.frames,
+                "{} of {} composed layouts left no cell outside every pane \
+                 rectangle — the divider lattice this whole pass is about was \
+                 never on screen, so the seam pass had nothing to get wrong",
+                self.frames - self.gap_frames,
+                self.frames
+            );
+            assert!(
+                self.seam_frames > 0,
+                "no frame ever carried a PLAIN divider seam: every gap was \
+                 inked by the active-pane mark, so the seam cell itself was \
+                 never composed"
+            );
+            assert!(
+                self.ring_frames > 0,
+                "the active-pane mark never painted, so the one producer that \
+                 writes INTO a divider gap was never armed"
+            );
+            assert!(
+                self.ring_columns.len() >= 2,
+                "the mark never moved: it inked one column set for the whole \
+                 corpus, so a focus change was never composed"
+            );
+            assert!(
+                self.resize_frames >= 2,
+                "the window grid never changed under the composite"
+            );
+            assert!(
+                self.alt_screen_frames > 0,
+                "no pane was ever on the alternate screen"
+            );
+            assert!(
+                self.scrolled_beside_live_frames > 0,
+                "no frame put a scrolled-back pane beside a live one"
+            );
+            assert!(
+                self.preedit_frames > 0,
+                "the IME composition never painted into a pane's cells"
+            );
+            assert!(
+                self.prediction_frames > 0,
+                "the prediction ghosts never painted into a pane's cells"
+            );
+            assert!(
+                self.close_frames >= 1,
+                "no pane was ever closed under the composite"
+            );
+        }
+
+        /// …and WHICH per-row verdict the K2 retention lane reached. Same law
+        /// as [`Self::assert_seam_pass`]: the historical rebuild-every-row form
+        /// satisfies the differential oracle for free, so a run in which the
+        /// retention never armed would pass it while proving nothing.
+        fn assert_retention(&self, on: bool) {
+            assert_eq!(
+                self.unsound, 0,
+                "{} composed frame(s) retained a pane's rows and then let a host \
+                 mutator write into that pane's snapshot — `focus_quiet` is \
+                 predicting something it cannot see (see COMPOSE_RETAIN_UNSOUND)",
+                self.unsound
+            );
+            let (kept, rebuilt) = (self.retained_rows, self.rebuilt_rows);
+            if on {
+                assert!(
+                    kept > 0,
+                    "the retention arm retained NOT ONE composed row in {} \
+                     frames ({rebuilt} rebuilt) — the oracle is comparing the \
+                     rebuild against itself",
+                    self.frames
+                );
+                assert!(
+                    self.retain_frames >= 12,
+                    "only {} of {} corpus frames retained anything; the corpus \
+                     is meant to settle often enough that the lane is exercised \
+                     against several producers, not once: {:?}",
+                    self.retain_frames,
+                    self.frames,
+                    self.retain_log
+                );
+                assert!(
+                    self.retain_log.iter().any(|(_, kept, rows)| {
+                        usize::try_from(*kept).expect("row count") + 1 >= *rows
+                    }),
+                    "no corpus frame retained all but ONE composed row — the \
+                     steady state the whole lane exists for (a keystroke echo \
+                     that damages exactly one row) was never composed: {:?}",
+                    self.retain_log
+                );
+            } else {
+                assert_eq!(
+                    (kept, self.retain_frames),
+                    (0, 0),
+                    "the control arm retained {kept} composed row(s); it is \
+                     supposed to rebuild every row of every frame"
+                );
+                assert!(rebuilt > 0, "the control arm composed no rows at all");
+            }
+        }
+
+        /// …and WHICH seam pass the corpus exercised. The oracles check
+        /// properties the historical whole-grid fill satisfies for free, so a
+        /// run that never tiled would pass them while proving nothing.
+        fn assert_seam_pass(&self, tiled: bool) {
+            let (t, w) = (self.tiled_seam_passes, self.whole_grid_seam_passes);
+            if tiled {
+                assert_eq!(
+                    (t as usize, w),
+                    (self.frames, 0),
+                    "the corpus meant to compose every one of its {} frames \
+                     TILED, and ran {t} tiled / {w} whole-grid seam passes",
+                    self.frames
+                );
+            } else {
+                assert_eq!(
+                    (t, w as usize),
+                    (0, self.frames),
+                    "the control arm meant to compose every one of its {} frames \
+                     WHOLE-GRID, and ran {t} tiled / {w} whole-grid seam passes",
+                    self.frames
+                );
+            }
+        }
+    }
+
+    /// The corpus driver: a real headless `App` composing through the shipping
+    /// `redraw_compose`, one recorded frame per step.
+    struct Corpus {
+        app: App,
+        wid: WindowId,
+        now: Instant,
+        poison: bool,
+        armed: Armed,
+        frames: Vec<Composed>,
+    }
+
+    impl Corpus {
+        fn new(poison: bool, retain: bool) -> Self {
+            COMPOSE_SEAM_ARMS.with(|arms| arms.set((0, 0)));
+            COMPOSE_RETAIN_ARMS.with(|arms| arms.set((0, 0)));
+            COMPOSE_RETAIN_UNSOUND.with(|c| c.set(0));
+            COMPOSE_RETAIN_OFF.with(|off| off.set(!retain));
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.windows.get_mut(&wid).expect("test window").focused = true;
+            // The prediction ghosts are one of the producers under test and
+            // they are off by default policy, not by construction.
+            app.config.predictive_echo = Some("always".to_string());
+            app.predict_mode_cache = None;
+            Self {
+                app,
+                wid,
+                now: Instant::now(),
+                poison,
+                armed: Armed::default(),
+                frames: Vec::new(),
+            }
+        }
+
+        fn dims(&self) -> (usize, usize) {
+            let ws = &self.app.windows[&self.wid];
+            (usize::from(ws.rows), usize::from(ws.cols))
+        }
+
+        fn sessions(&self) -> Vec<u64> {
+            self.app
+                .active_tree(self.wid)
+                .expect("a pure-terminal tab")
+                .sessions()
+        }
+
+        fn focus(&self) -> u64 {
+            self.app
+                .active_tree(self.wid)
+                .expect("a pure-terminal tab")
+                .focus()
+        }
+
+        fn feed(&mut self, session: u64, bytes: &[u8]) {
+            let term = self
+                .app
+                .pool
+                .get(session)
+                .expect("a live corpus session")
+                .term
+                .clone();
+            term_lock(&term).process(bytes);
+        }
+
+        fn set_focus(&mut self, session: u64) {
+            assert!(
+                self.app
+                    .active_tree_mut(self.wid)
+                    .is_some_and(|tree| tree.set_focus(session)),
+                "the pane is live"
+            );
+            let active = self.app.windows[&self.wid].tabs.active;
+            assert!(self.app.sync_tab_model_from_layout(self.wid, active));
+            self.app.sync_window(self.wid);
+        }
+
+        fn resize(&mut self, rows: u16, cols: u16) {
+            {
+                let ws = self.app.windows.get_mut(&self.wid).expect("test window");
+                ws.rows = rows;
+                ws.cols = cols;
+            }
+            self.app.resize_panes(self.wid);
+            self.app.sync_window(self.wid);
+            self.armed.resize_frames += 1;
+        }
+
+        fn close_focused_pane(&mut self) {
+            let before = self.sessions().len();
+            let outcome = self
+                .app
+                .active_tree_mut(self.wid)
+                .expect("a pure-terminal tab")
+                .close_focused();
+            assert!(
+                matches!(outcome, pane::CloseOutcome::Collapsed { .. }),
+                "the corpus close did not collapse a pane"
+            );
+            let active = self.app.windows[&self.wid].tabs.active;
+            assert!(self.app.sync_tab_model_from_layout(self.wid, active));
+            self.app.resize_panes(self.wid);
+            self.app.sync_window(self.wid);
+            assert_eq!(self.sessions().len(), before - 1, "a pane did not close");
+            self.armed.close_frames += 1;
+        }
+
+        /// One recorded corpus frame, driving output into the FOCUSED pane.
+        fn step(&mut self, label: &str) {
+            let focus = self.focus();
+            self.step_feeding(focus, label);
+        }
+
+        /// One recorded corpus frame. Every step feeds SOME visible pane a byte
+        /// first, so the `RepaintKey` always moves: a frame that took the
+        /// early-out would compose nothing, and the coverage oracle would read
+        /// the poison it stamped as a tiling failure.
+        ///
+        /// Which pane is a parameter because two producers care. The prediction
+        /// ghosts are guessed at the focused pane's caret and are dropped the
+        /// moment the engine echoes something there, so those steps drive a
+        /// BACKGROUND pane and leave the caret where the guess is.
+        fn step_feeding(&mut self, session: u64, label: &str) {
+            self.feed(session, b"x");
+            let (rows, cols) = self.dims();
+            if self.poison {
+                let ws = self.app.windows.get_mut(&self.wid).expect("test window");
+                for row in &mut ws.input_scratch.cells {
+                    row.fill(poison_cell());
+                }
+            }
+            self.now += FRAME;
+            let now = self.now;
+            let before = COMPOSE_RETAIN_ARMS.with(std::cell::Cell::get);
+            let presented = self
+                .app
+                .redraw_compose(self.wid, rows, cols, false, false, None, 0, now)
+                .is_some();
+            let after = COMPOSE_RETAIN_ARMS.with(std::cell::Cell::get);
+            let (kept, rebuilt) = (after.0 - before.0, after.1 - before.1);
+            assert!(
+                presented,
+                "corpus step `{label}` took the RepaintKey early-out — it \
+                 composed nothing, so neither oracle would be looking at a frame"
+            );
+
+            let seam = divider_cell(self.app.theme);
+            let (mut ring_columns, mut seam_seen, mut stale) = (Vec::new(), false, Vec::new());
+            {
+                let ws = &self.app.windows[&self.wid];
+                for (r, row) in ws.input_scratch.cells.iter().enumerate() {
+                    for (c, cell) in row.iter().enumerate() {
+                        if MARK_GLYPHS.contains(&cell.ch) {
+                            ring_columns.push(c);
+                        }
+                        if *cell == seam {
+                            seam_seen = true;
+                        }
+                        if *cell == poison_cell() {
+                            stale.push((r, c));
+                        }
+                    }
+                }
+            }
+            assert!(
+                stale.is_empty(),
+                "corpus step `{label}`: {} composed cell(s) were written by \
+                 neither the seam pass nor a pane blit and kept the previous \
+                 frame's content — first at {:?}",
+                stale.len(),
+                &stale[..stale.len().min(8)]
+            );
+            debug_assert!(
+                !self.poison || COMPOSE_RETAIN_OFF.with(std::cell::Cell::get),
+                "the poison flood is an UNDECLARED write into the composite (no \
+                 `snapshot_seq` bump), which is precisely the thing the K2 \
+                 second clock cannot see — the coverage oracle must drive the \
+                 rebuild arm"
+            );
+            let layout = self
+                .app
+                .active_tree(self.wid)
+                .expect("a pure-terminal tab")
+                .compute_layout(
+                    u16::try_from(rows).expect("corpus rows"),
+                    u16::try_from(cols).expect("corpus cols"),
+                );
+            let covered: usize = layout
+                .iter()
+                .map(|rect| usize::from(rect.rows) * usize::from(rect.cols))
+                .sum();
+            let panes = layout.len();
+            let (preedit, predicted) = {
+                let ws = &self.app.windows[&self.wid];
+                (ws.preedit_shown, ws.pred_shown)
+            };
+            self.armed.frames += 1;
+            self.armed.pane_counts.insert(panes);
+            self.armed.ring_frames += usize::from(!ring_columns.is_empty());
+            self.armed.ring_columns.extend(ring_columns);
+            self.armed.seam_frames += usize::from(seam_seen);
+            self.armed.gap_frames += usize::from(covered < rows * cols);
+            self.armed.preedit_frames += usize::from(preedit);
+            self.armed.prediction_frames += usize::from(predicted);
+            self.armed.retained_rows += kept;
+            self.armed.rebuilt_rows += rebuilt;
+            self.armed.retain_frames += usize::from(kept > 0);
+            self.armed.retain_log.push((label.to_string(), kept, rows));
+            self.frames
+                .push(Composed::of(&self.app.windows[&self.wid].input_scratch));
+        }
+    }
+
+    /// THE CORPUS. One script, run by both oracles.
+    fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
+        let mut c = Corpus::new(poison, retain);
+        let wid = c.wid;
+
+        // 1. Two panes side by side, both carrying text.
+        let right = c.app.split_active_stub_tab(wid);
+        let left = *c
+            .sessions()
+            .iter()
+            .find(|s| **s != right)
+            .expect("two panes");
+        c.feed(left, b"left pane content\r\n");
+        c.feed(right, b"right pane content\r\n");
+        c.step("two panes established");
+        c.step("two panes, echo");
+
+        // 2. THE FOCUS CHANGE — moves the mark from one side of the shared
+        //    divider column to the other.
+        c.set_focus(left);
+        c.step("focus moved to the left pane");
+        c.set_focus(right);
+        c.step("focus moved back to the right pane");
+        c.step("two panes settled after the focus move");
+
+        // 3. THREE panes, then FOUR — a layout change under the composite.
+        let third = c
+            .app
+            .split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        c.feed(third, b"third pane content\r\n");
+        c.step("three panes");
+        let fourth = c
+            .app
+            .split_active_stub_tab_dir(wid, pane::SplitDir::Vertical);
+        c.feed(fourth, b"fourth pane content\r\n");
+        c.step("four panes");
+        c.step("four panes settled");
+
+        // 4. THE DIVIDER DRAG, modelled as the geometry change it is: the
+        //    window grid moves and every pane rectangle moves with it.
+        c.resize(31, 97);
+        c.step("window grid shrunk under four panes");
+        c.resize(44, 123);
+        c.step("window grid grown under four panes");
+        c.step("settled at the grown grid");
+
+        // 5. ALT SCREEN in ONE pane, beside three ordinary ones.
+        c.feed(left, b"\x1b[?1049h\x1b[Halt screen here\r\n");
+        {
+            let term = c.app.pool.get(left).expect("left session").term.clone();
+            assert!(
+                term_lock(&term).is_alternate_screen(),
+                "the alt-screen producer did not arm"
+            );
+        }
+        c.armed.alt_screen_frames += 1;
+        c.step("one pane on the alternate screen");
+        c.step("settled with one pane on the alternate screen");
+
+        // 6. A SCROLLED-BACK pane beside a live one. The scrolled pane is a
+        //    BACKGROUND pane on purpose: the focused one has to stay at the
+        //    live bottom for the composition and the ghosts below to paint.
+        for i in 0..60 {
+            c.feed(third, format!("history line {i:03}\r\n").as_bytes());
+        }
+        {
+            let term = c.app.pool.get(third).expect("third session").term.clone();
+            term_lock(&term).grid_mut().scroll_display(12);
+            assert!(
+                term_lock(&term).grid().display_offset() > 0,
+                "the scrollback producer did not arm"
+            );
+        }
+        c.armed.scrolled_beside_live_frames += 1;
+        c.step("a scrolled-back pane beside live ones");
+        c.step("settled with a scrolled-back pane beside live ones");
+
+        // 6b. …AND BACK TO THE LIVE BOTTOM, which is not tidying up: the
+        //     scrolled pane sits on the SAME composed rows as the focused one
+        //     in this layout, so leaving it parked would knock those rows out
+        //     for a reason that has nothing to do with the two host mutators
+        //     below — and the K2 clause that guards them (`focus_quiet`) would
+        //     never be reached. A mutation probe that forced that clause `true`
+        //     passed the whole corpus until this step existed.
+        {
+            let term = c.app.pool.get(third).expect("third session").term.clone();
+            term_lock(&term).grid_mut().scroll_display(-12);
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                0,
+                "the scrollback producer did not disarm"
+            );
+        }
+        c.step("the scrolled pane returned to the live bottom");
+        c.step("settled with every pane live again");
+
+        // 7. THE IME COMPOSITION, which writes engine cells into the FOCUSED
+        //    pane's snapshot on the compose path.
+        {
+            let ws = c.app.windows.get_mut(&wid).expect("test window");
+            ws.preedit = "\u{3053}\u{3093}".to_string();
+            ws.preedit_caret = Some(1);
+        }
+        c.step("IME preedit on the focused pane");
+        {
+            let ws = c.app.windows.get_mut(&wid).expect("test window");
+            ws.preedit = "\u{3053}\u{3093}\u{306b}\u{3061}".to_string();
+            ws.preedit_caret = Some(3);
+        }
+        c.step("IME preedit grown");
+        {
+            let ws = c.app.windows.get_mut(&wid).expect("test window");
+            ws.preedit.clear();
+            ws.preedit_caret = None;
+        }
+        c.step("IME preedit committed away");
+
+        // 8. THE PREDICTION GHOSTS, the other host writer of engine cells.
+        //    Guessed AT THE FOCUSED PANE'S OWN CARET: the compose path
+        //    reconciles every pending guess against that cursor before it
+        //    paints, so a guess parked anywhere else is dropped and the ghost
+        //    producer would never actually arm.
+        {
+            let focus = c.focus();
+            let caret = {
+                let term = c.app.pool.get(focus).expect("focused session").term.clone();
+                let term = term_lock(&term);
+                let cursor = term.cursor();
+                (cursor.row, cursor.col)
+            };
+            let now = c.now + FRAME;
+            let ws = c.app.windows.get_mut(&wid).expect("test window");
+            ws.predictor.set_mode(crate::predict::PredictMode::Always);
+            let cols = ws.cols;
+            assert!(
+                ws.predictor.predict_char('?', caret, cols, now),
+                "the prediction producer did not arm"
+            );
+        }
+        c.step_feeding(left, "prediction ghosts on the focused pane");
+        c.step_feeding(left, "prediction ghosts settling");
+
+        // 9. A PANE CLOSING, twice — the layout shrinks back under the
+        //    composite it was just tiled against.
+        c.close_focused_pane();
+        c.step("a pane closed");
+        c.step("settled after the close");
+        c.close_focused_pane();
+        c.step("another pane closed");
+        c.resize(24, 80);
+        c.step("back to the original grid");
+        c.step("settled back at the original grid");
+
+        let (tiled, whole) = COMPOSE_SEAM_ARMS.with(std::cell::Cell::get);
+        c.armed.tiled_seam_passes = tiled;
+        c.armed.whole_grid_seam_passes = whole;
+        c.armed.unsound = COMPOSE_RETAIN_UNSOUND.with(std::cell::Cell::get);
+        COMPOSE_RETAIN_OFF.with(|off| off.set(false));
+        (c.frames, c.armed)
+    }
+
+    /// Compare two corpus runs frame for frame, channel for channel, naming the
+    /// first divergence exactly.
+    fn assert_frames_agree(a: &[Composed], b: &[Composed], a_name: &str, b_name: &str) {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "the two arms composed different numbers of frames"
+        );
+        for (f, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                x.cells.len(),
+                y.cells.len(),
+                "frame {f}: different row counts"
+            );
+            for (r, (xrow, yrow)) in x.cells.iter().zip(y.cells.iter()).enumerate() {
+                assert_eq!(
+                    xrow.len(),
+                    yrow.len(),
+                    "frame {f} row {r}: different widths"
+                );
+                if xrow != yrow {
+                    let c = xrow
+                        .iter()
+                        .zip(yrow.iter())
+                        .position(|(p, q)| p != q)
+                        .expect("the rows differ");
+                    panic!(
+                        "frame {f}, cell ({r}, {c}): {a_name} composed {:?} where \
+                         {b_name} composed {:?}",
+                        xrow[c], yrow[c]
+                    );
+                }
+            }
+            assert_eq!(
+                x.clusters, y.clusters,
+                "frame {f}: {a_name} and {b_name} disagree on the emoji-cluster lane"
+            );
+            assert_eq!(
+                x.combining, y.combining,
+                "frame {f}: {a_name} and {b_name} disagree on the combining-mark lane"
+            );
+            assert_eq!(
+                x.line_sizes, y.line_sizes,
+                "frame {f}: {a_name} and {b_name} disagree on the row-level DEC line sizes"
+            );
+            assert_eq!(
+                x.line_size_spans, y.line_size_spans,
+                "frame {f}: {a_name} and {b_name} disagree on the per-pane DEC line-size runs"
+            );
+            assert_eq!(
+                x.default_bg_spans, y.default_bg_spans,
+                "frame {f}: {a_name} and {b_name} disagree on the per-pane default-background runs"
+            );
+            assert_eq!(
+                x.image_columns, y.image_columns,
+                "frame {f}: {a_name} and {b_name} disagree on the inline-image placements"
+            );
+        }
+    }
+
+    /// The two clauses of [`super::seed_seam_cells`] the App-level corpus
+    /// cannot reach, checked directly against the whole-grid fill they fall
+    /// back to.
+    ///
+    /// * THE SHORTFALL. `cell_frame_fill` stamps the requested dimensions onto
+    ///   every snapshot, so a shipping pane blit always covers the rectangle
+    ///   the fill skipped and no corpus frame can arm
+    ///   [`super::seam_declared_shortfall`]. Here the snapshot is made short by
+    ///   hand, which is the only way to see that clause do its job.
+    /// * THE OUT-OF-RANGE TILE. A rectangle reaching past the window edge is
+    ///   one no blit can cover, and a layout cannot produce one either.
+    #[test]
+    fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
+        use aterm_render::{RenderInput, Theme};
+
+        use super::{blit_pane_into, fill_divider_grid, fill_divider_grid_tiled};
+
+        let theme = Theme::default();
+        let blank = RenderCell {
+            ch: ' ',
+            fg: [9, 9, 9],
+            bg: [7, 7, 7],
+            ..RenderCell::default()
+        };
+        // A 4x9 window: pane at (0,0) 4x4, divider column 4, pane at (0,5) 4x4.
+        // Nine columns, not five, because the fifth clause caps the tiling at
+        // `n * (n + 1) <= cols` and two panes need six.
+        let rect = |session, row_off, col_off, rows, cols| pane::PaneRect {
+            session,
+            row_off,
+            col_off,
+            rows,
+            cols,
+        };
+        let tiles = [rect(0, 0, 0, 4, 4), rect(1, 0, 5, 4, 4)];
+
+        // A pane snapshot of `rows`x`cols` filled with one cell, with every
+        // per-row channel `blit_pane_into` indexes sized to match.
+        let snapshot = |rows: usize, cols: usize, cell: RenderCell| RenderInput {
+            rows,
+            cols,
+            cells: vec![vec![cell; cols]; rows],
+            line_sizes: vec![aterm_core::grid::LineSize::SingleWidth; rows],
+            clusters: vec![Vec::new(); rows],
+            combining: vec![Vec::new(); rows],
+            images: vec![Vec::new(); rows],
+            line_size_spans: vec![Vec::new(); rows],
+            default_bg_spans: vec![Vec::new(); rows],
+            ..RenderInput::default()
+        };
+        // The SHORT snapshot: declared 4x4, filled 2x2. Everything the blit
+        // does not reach inside the declared rectangle is the shortfall.
+        let short = snapshot(2, 2, blank);
+        // The FULL snapshot: exactly the declared rectangle, carrying a glyph
+        // no seam and no blank can produce. Frame one blits it, so the cells the
+        // short frame below fails to reach are visibly pane content — without
+        // it both arms would read "seam", and the test would pass vacuously.
+        let full = snapshot(
+            4,
+            4,
+            RenderCell {
+                ch: 'Z',
+                fg: [9, 9, 9],
+                bg: [7, 7, 7],
+                ..RenderCell::default()
+            },
+        );
+
+        let compose = |tiled: bool, shortfall: bool| {
+            let mut dst = RenderInput::default();
+            // Two frames into ONE buffer: frame one fills every rectangle with
+            // pane content, frame two's snapshot is short. Whatever the second
+            // frame does not write is the first frame's `Z`s.
+            for src in [&full, &short] {
+                if tiled {
+                    fill_divider_grid_tiled(&mut dst, 4, 9, theme, None, tiles.iter().copied());
+                } else {
+                    fill_divider_grid(&mut dst, 4, 9, theme, None);
+                }
+                for tile in tiles {
+                    blit_pane_into(
+                        &mut dst,
+                        src,
+                        usize::from(tile.row_off),
+                        usize::from(tile.col_off),
+                        blank,
+                    );
+                    if shortfall {
+                        super::seam_declared_shortfall(
+                            &mut dst,
+                            theme,
+                            tile,
+                            src.rows,
+                            src.cols,
+                            &[],
+                        );
+                    }
+                }
+            }
+            dst.cells
+        };
+
+        let whole = compose(false, false);
+        assert_eq!(
+            compose(true, true),
+            whole,
+            "the shortfall clause did not restore the seam under the part of a \
+             declared rectangle its snapshot never covered"
+        );
+        assert_ne!(
+            compose(true, false),
+            whole,
+            "the shortfall region came out right WITHOUT the clause, so this \
+             test is not exercising it"
+        );
+
+        // An out-of-range tile disowns the tiling for the whole frame.
+        let mut off_grid = RenderInput::default();
+        let over = [rect(0, 0, 0, 4, 4), rect(1, 0, 5, 4, 99)];
+        for _ in 0..2 {
+            fill_divider_grid_tiled(&mut off_grid, 4, 9, theme, None, over.iter().copied());
+        }
+        let mut plain = RenderInput::default();
+        for _ in 0..2 {
+            fill_divider_grid(&mut plain, 4, 9, theme, None);
+        }
+        assert_eq!(
+            off_grid.cells, plain.cells,
+            "a rectangle past the window edge must fall back to the whole-grid \
+             seam, not tile around it"
+        );
+    }
+
+    /// COVERAGE: every composed cell is written every frame, by the seam pass
+    /// or by a pane blit. Nothing survives from the frame before.
+    #[test]
+    fn the_tiled_compose_leaves_no_composed_cell_unwritten_over_the_corpus() {
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
+        // The K2 retention lane is OFF here, and has to be: the poison flood is
+        // a cell write into the composite that bumps NO `snapshot_seq`, so the
+        // second clock cannot see it and the lane would (correctly, by its own
+        // contract) retain rows the poison had overwritten. What this oracle
+        // owns is the SEAM's coverage claim — every cell written by the fill or
+        // by a blit — and the retention lane's own correctness is the
+        // differential oracle two tests down.
+        let (frames, armed) = drive_corpus(true, false);
+        armed.assert_non_vacuous();
+        armed.assert_seam_pass(true);
+        armed.assert_retention(false);
+        assert!(!frames.is_empty());
+    }
+
+    /// THE STEADY STATE the whole lane exists for, pinned: a settled four-pane
+    /// split whose only change is one keystroke echoed into the focused pane
+    /// retains EVERY composed row but the one that echo touched.
+    ///
+    /// This is the arming witness the differential oracle cannot be: that
+    /// oracle proves the retained composite is right, and would prove it just
+    /// as happily on a run that retained nothing. This one says how much the
+    /// lane actually leaves alone on the frame shape the measurement is about
+    /// — a 90-row, four-pane split changes ONE cell of 30,600 per settled
+    /// frame, and one changed cell is one composed row.
+    #[test]
+    fn a_settled_split_retains_every_row_but_the_one_the_keystroke_touched() {
+        let (mut c, rows) = four_pane_split(true);
+        let mut log: Vec<usize> = Vec::new();
+        for i in 0..10u8 {
+            log.push(settled_frame(&mut c, i));
+        }
+        COMPOSE_RETAIN_OFF.with(|off| off.set(false));
+        let settled = &log[log.len() - 4..];
+        assert!(
+            settled.iter().all(|kept| *kept == rows - 1),
+            "a settled four-pane split retained {settled:?} of {rows} composed rows \
+             per frame; the keystroke damages exactly one row, so every other row \
+             is one this frame does not need to write (full log {log:?})"
+        );
+    }
+
+    /// THE SECOND CLOCK, at the `App` level and in both directions.
+    ///
+    /// A host that writes into the finished composite bumps `snapshot_seq` and
+    /// touches nothing else — the discipline every in-place band, bar, card and
+    /// splice already follows. That bump is the ONLY thing standing between the
+    /// retention lane and a composed frame it has no right to keep, so this
+    /// pins it: after such a write the next frame retains NOTHING and the
+    /// intruding cells are gone.
+    ///
+    /// The second leg is the contract's boundary, stated rather than left to be
+    /// discovered: a write with NO bump is invisible to the lane and its cells
+    /// survive. That is not a defect the lane can close — it is what "every
+    /// producer disowns the lane by following the discipline it already
+    /// follows" means — and a test that did not say so would leave the reader
+    /// believing the lane inspects the cells.
+    #[test]
+    fn a_host_write_into_the_composite_revokes_the_retention_only_when_it_says_so() {
+        for declared in [true, false] {
+            let (mut c, rows) = four_pane_split(true);
+            for i in 0..6u8 {
+                settled_frame(&mut c, i);
+            }
+            assert_eq!(
+                settled_frame(&mut c, 6),
+                rows - 1,
+                "the fixture is not retaining before the host write, so the \
+                 revoke below would prove nothing"
+            );
+            {
+                let ws = c.app.windows.get_mut(&c.wid).expect("test window");
+                for row in &mut ws.input_scratch.cells {
+                    row.fill(poison_cell());
+                }
+                if declared {
+                    ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
+                }
+            }
+            let kept = settled_frame(&mut c, 7);
+            let survivors = {
+                let ws = &c.app.windows[&c.wid];
+                ws.input_scratch
+                    .cells
+                    .iter()
+                    .flatten()
+                    .filter(|cell| **cell == poison_cell())
+                    .count()
+            };
+            if declared {
+                assert_eq!(
+                    (kept, survivors),
+                    (0, 0),
+                    "a DECLARED host write (one `snapshot_seq` bump, the shipping \
+                     discipline) must revoke the blessing outright: the frame after \
+                     it retained {kept} of {rows} rows and left {survivors} of the \
+                     intruder's cells on screen"
+                );
+            } else {
+                assert!(
+                    kept > 0 && survivors > 0,
+                    "an UNDECLARED write is supposed to be invisible to the second \
+                     clock — if it is not, the lane is inspecting cells rather than \
+                     provenance and this test is documenting the wrong contract \
+                     (kept {kept}, survivors {survivors})"
+                );
+            }
+            COMPOSE_RETAIN_OFF.with(|off| off.set(false));
+        }
+    }
+
+    /// A four-pane split with every leaf carrying materialized rows, plus the
+    /// composed row count. `retain` chooses the arm.
+    fn four_pane_split(retain: bool) -> (Corpus, usize) {
+        let mut c = Corpus::new(false, retain);
+        let wid = c.wid;
+        c.app.split_active_stub_tab(wid);
+        c.app
+            .split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        c.app
+            .split_active_stub_tab_dir(wid, pane::SplitDir::Vertical);
+        c.app.sync_window(wid);
+        let sessions = c.sessions();
+        assert_eq!(
+            sessions.len(),
+            4,
+            "the fixture did not build a four-way split"
+        );
+        for session in &sessions {
+            c.feed(*session, b"pane content here\r\n");
+        }
+        let rows = c.dims().0;
+        (c, rows)
+    }
+
+    /// ONE settled frame: a keystroke echo into the focused pane, composed.
+    /// Returns how many composed rows the retention lane left alone.
+    ///
+    /// CR then one glyph: real damage every frame, EXACTLY one damaged row, no
+    /// wrap and no scroll — the shipping keystroke echo, and the same shape
+    /// `BenchApp::split_echo` feeds the measured workload.
+    fn settled_frame(c: &mut Corpus, i: u8) -> usize {
+        let focus = c.focus();
+        c.feed(focus, if i.is_multiple_of(2) { b"\rx" } else { b"\ry" });
+        let (rows, cols) = c.dims();
+        c.now += FRAME;
+        let now = c.now;
+        let wid = c.wid;
+        assert!(
+            c.app
+                .redraw_compose(wid, rows, cols, false, false, None, 0, now)
+                .is_some(),
+            "settled frame {i} took the RepaintKey early-out"
+        );
+        c.app.windows[&wid].composed_retain.retained_rows()
+    }
+
+    /// DIFFERENTIAL (K2): the RETAINED composite equals the one that rebuilds
+    /// every row, channel for channel, on every frame of the corpus.
+    ///
+    /// This is the whole correctness bar for the retention lane. A retained
+    /// rectangle that should have been redrawn is stale content on screen —
+    /// strictly worse than the microseconds it saves — so the two arms drive the
+    /// SAME script through two independent `App`s and compare the cells and all
+    /// six per-row channels the fill would otherwise rebuild.
+    #[test]
+    fn the_retained_composite_matches_the_rebuilt_one_channel_for_channel() {
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
+        let (retained, retained_armed) = drive_corpus(false, true);
+        let (rebuilt, rebuilt_armed) = drive_corpus(false, false);
+
+        retained_armed.assert_non_vacuous();
+        retained_armed.assert_seam_pass(true);
+        retained_armed.assert_retention(true);
+        rebuilt_armed.assert_non_vacuous();
+        rebuilt_armed.assert_seam_pass(true);
+        rebuilt_armed.assert_retention(false);
+        assert_frames_agree(&retained, &rebuilt, "the retained arm", "the rebuilt arm");
+    }
+
+    /// DIFFERENTIAL: the tiled composite equals the whole-grid one, cell for
+    /// cell, on every frame of the corpus.
+    #[test]
+    fn the_tiled_composite_matches_the_whole_grid_fill_cell_for_cell() {
+        // Both arms rebuild every row: this oracle is about the SEAM pass, and
+        // letting the retention lane skip rows would make it compare two
+        // frames neither arm actually wrote.
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
+        let (tiled, tiled_armed) = drive_corpus(false, false);
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(true));
+        let (whole, whole_armed) = drive_corpus(false, false);
+        COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
+
+        tiled_armed.assert_non_vacuous();
+        tiled_armed.assert_seam_pass(true);
+        whole_armed.assert_non_vacuous();
+        whole_armed.assert_seam_pass(false);
+        assert_frames_agree(&tiled, &whole, "the tiled seam pass", "the whole-grid fill");
+    }
+}
+
 #[cfg(test)]
 mod cursor_body_master_switch_tests {
     use super::CursorFxInputs;
@@ -12433,6 +13470,642 @@ mod terminal_cursor_color_tests {
     }
 }
 
+// TEST-ONLY: force the composed seam pass back to its historical whole-grid
+// form, so the differential oracle can compose ONE corpus BOTH ways inside one
+// process and compare the two composites cell for cell.
+//
+// Thread-local, like the lock-hold probe: `cargo test` runs each test function
+// on its own thread, so two oracles can never see each other's setting. (Plain
+// comments, not doc comments: rustdoc documents no item produced by a macro
+// invocation and `unused_doc_comments` is an error under the lint gate.)
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COMPOSE_SEAM_UNTILED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+// TEST-ONLY REACH WITNESS: `(tiled, whole_grid)` seam passes this thread has
+// run.
+//
+// Without it both oracles below are VACUOUS. Each one drives the corpus and
+// checks a property that the HISTORICAL whole-grid fill satisfies trivially, so
+// a corpus in which `tiles_ready` happened to be false on every frame would
+// pass them both while proving nothing about the tiling. This is how they say
+// which pass they actually exercised.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COMPOSE_SEAM_ARMS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// THE SEAM PASS of [`fill_divider_grid_cells`]: write the divider seam
+/// into every window cell the pane rectangles in `tiles` do NOT cover.
+///
+/// This used to write the seam into ALL `rows * cols` cells, and the per-pane
+/// blit then overwrote all but the 1-cell divider gaps — the whole window grid
+/// written twice per composed frame, which at four panes on a 90x340 grid was
+/// the largest single cost in a settled split frame (a measured ~35 us of ~67).
+/// A cell a pane rectangle covers is one that pane's blit writes outright, so
+/// the seam underneath it was never read by anything.
+///
+/// THE CLAIM this makes is "every cell inside a declared rectangle WILL be
+/// written by that pane's blit", and the composite is byte-identical exactly
+/// while that holds. Five clauses keep it honest, and each one falls back to
+/// the historical whole-grid write:
+///
+/// * an EMPTY `tiles` claims nothing, so every caller that does not hand over
+///   its layout — the native tab, the mixed composite, the capture path, every
+///   unit fixture — writes the full grid exactly as before;
+/// * a rectangle reaching past the window edge is one no blit can cover
+///   (`blit_pane_into` clips), so a single out-of-range tile disowns the
+///   tiling for the whole frame rather than for its own rows;
+/// * a row whose length is not `cols` is a row this frame RESHAPED, so it is
+///   rebuilt whole — which seams it whole — before anything looks at it;
+/// * a pane count high enough that the per-row sweep below would cost more
+///   than the writes it saves takes the whole-grid write for that reason
+///   alone (see the sweep's own note);
+/// * and the one clause that cannot be seen from here, because extraction has
+///   not happened yet: a pane whose snapshot comes back SMALLER than its
+///   declared rectangle covers less than the rectangle promised. That is
+///   [`seam_declared_shortfall`], and the blit site owes the call.
+///
+/// The sweep is per row and allocation-free: `tiles` is re-walked (it is
+/// `Clone`) rather than materialized into a per-row span list, because a window
+/// holds a handful of panes and re-walking a handful beats allocating a span
+/// list per frame.
+///
+/// That re-walk is what the FIFTH clause bounds. Each row takes at most one
+/// step per tile plus one per gap, and each step examines every tile — so the
+/// per-row work is at most `n * (n + 1)` integer compares against the `cols`
+/// cell writes it saves. A window whose pane count makes those two cross over
+/// is a window the sweep would cost more than it earns, so it composes
+/// whole-grid like every other caller. It is a real bound and not a round
+/// number: at 340 columns it lets seventeen panes tile and stops at eighteen,
+/// and at 80 columns it stops at nine.
+fn seed_seam_cells<T>(
+    dst: &mut RenderInput,
+    rows: usize,
+    cols: usize,
+    seam: RenderCell,
+    tiles: T,
+    keep: &[bool],
+) where
+    T: Iterator<Item = pane::PaneRect> + Clone,
+{
+    dst.cells.resize_with(rows, Vec::new);
+    let mut count = 0usize;
+    for tile in tiles.clone() {
+        if usize::from(tile.row_off).saturating_add(usize::from(tile.rows)) > rows
+            || usize::from(tile.col_off).saturating_add(usize::from(tile.cols)) > cols
+        {
+            count = 0;
+            break;
+        }
+        count += 1;
+    }
+    let tiled = count > 0 && count.saturating_mul(count.saturating_add(1)) <= cols;
+    #[cfg(test)]
+    COMPOSE_SEAM_ARMS.with(|arms| {
+        let (t, w) = arms.get();
+        arms.set(if tiled { (t + 1, w) } else { (t, w + 1) });
+    });
+    for (r, row) in dst.cells.iter_mut().enumerate() {
+        if row.len() != cols {
+            row.clear();
+            row.resize(cols, seam);
+            continue;
+        }
+        // K2 RETENTION: this composed row is already, cell for cell, what this
+        // frame would write into it — every pane covering it reports the same
+        // D-2 stamps it reported last frame, the seam and the mark are the same
+        // seam and mark, and nothing has written into the composite since. So
+        // write nothing: not the seam, and (below, in `fill_divider_grid_cells`)
+        // not the per-row sparse channels either. `keep` is EMPTY for every
+        // caller that retains nothing, which is every caller but the live split
+        // compose.
+        if row_retained(keep, r) {
+            continue;
+        }
+        if !tiled {
+            row.fill(seam);
+            continue;
+        }
+        let on_this_row = |tile: &pane::PaneRect| {
+            let top = usize::from(tile.row_off);
+            r >= top && r < top.saturating_add(usize::from(tile.rows))
+        };
+        let mut c = 0usize;
+        while c < cols {
+            // A tile covering column `c`: its blit owns the span, jump past it.
+            // `.max(c + 1)` cannot be reached by a real `PaneRect` (its width is
+            // documented `>= 1`) and is here so a degenerate one cannot spin.
+            if let Some(tile) = tiles.clone().find(|tile| {
+                on_this_row(tile)
+                    && c >= usize::from(tile.col_off)
+                    && c < usize::from(tile.col_off).saturating_add(usize::from(tile.cols))
+            }) {
+                c = usize::from(tile.col_off)
+                    .saturating_add(usize::from(tile.cols))
+                    .max(c.saturating_add(1));
+                continue;
+            }
+            // No tile here: seam up to wherever the next one on this row starts.
+            let next = tiles
+                .clone()
+                .filter(|tile| on_this_row(tile) && usize::from(tile.col_off) > c)
+                .map(|tile| usize::from(tile.col_off))
+                .min()
+                .unwrap_or(cols)
+                .min(cols);
+            row[c..next].fill(seam);
+            c = next;
+        }
+    }
+}
+
+/// THE FOURTH CLAUSE of [`seed_seam_cells`], owed by every caller that hands
+/// the fill its layout: seam the part of a pane's DECLARED rectangle its
+/// snapshot did not reach.
+///
+/// The fill skipped the seam under `rect` because `blit_pane_into` was going to
+/// write all of it, and the blit writes exactly `src.rows` × `src.cols` from
+/// `(rect.row_off, rect.col_off)`. `cell_frame_fill` stamps the requested
+/// dimensions onto the snapshot, so in the shipping path the two agree and this
+/// is two integer compares and a return. When they do NOT agree the shortfall
+/// would keep the PREVIOUS frame's cells — stale content on screen, which is
+/// the one failure this whole lane must not have — so it takes the seam it
+/// would have had.
+fn seam_declared_shortfall(
+    dst: &mut RenderInput,
+    theme: Theme,
+    rect: pane::PaneRect,
+    src_rows: usize,
+    src_cols: usize,
+    keep: &[bool],
+) {
+    let rows = usize::from(rect.rows);
+    let cols = usize::from(rect.cols);
+    if src_rows >= rows && src_cols >= cols {
+        return;
+    }
+    let seam = divider_cell(theme);
+    let top = usize::from(rect.row_off);
+    let left = usize::from(rect.col_off);
+    for dr in top..top.saturating_add(rows) {
+        // K2: a RETAINED row already carries this seam from the frame that
+        // wrote it — the retention gate pins the declared rectangle, the
+        // snapshot's dimensions and the theme's seam cell, so the shortfall it
+        // would write is the shortfall already there.
+        if row_retained(keep, dr) {
+            continue;
+        }
+        let Some(row) = dst.cells.get_mut(dr) else {
+            break;
+        };
+        let covered = if dr < top.saturating_add(src_rows) {
+            src_cols.min(cols)
+        } else {
+            0
+        };
+        let start = left.saturating_add(covered).min(row.len());
+        let end = left.saturating_add(cols).min(row.len());
+        if start < end {
+            row[start..end].fill(seam);
+        }
+    }
+}
+
+/// Whether composed row `r` is one this frame leaves exactly as it is (K2).
+///
+/// An EMPTY `keep` — every caller that retains nothing — is `false` for every
+/// row, in one length compare.
+#[inline]
+fn row_retained(keep: &[bool], r: usize) -> bool {
+    matches!(keep.get(r), Some(true))
+}
+
+/// Rebuild a per-row SPARSE channel to exactly `rows` empty rows, skipping the
+/// rows this frame retains (K2) — those keep the entries the pane that owns
+/// them pushed last frame and is about to not push again.
+fn reset_sparse_rows<T>(channel: &mut Vec<Vec<T>>, rows: usize, keep: &[bool]) {
+    channel.resize_with(rows, Vec::new);
+    if keep.is_empty() {
+        for row in channel.iter_mut() {
+            row.clear();
+        }
+        return;
+    }
+    for (r, row) in channel.iter_mut().enumerate() {
+        if !row_retained(keep, r) {
+            row.clear();
+        }
+    }
+}
+
+/// ONE PANE's entry in the composed-retention ledger: everything the next
+/// compose must find UNCHANGED before it may leave that pane's rows alone.
+///
+/// Every field is either a term the D-2 row stamps do NOT cover (the declared
+/// rectangle, the snapshot's own dimensions, the pane's implicit blank — the
+/// blit's sparse-tail fill and its `default_bg_spans` colour) or a term
+/// `aterm_render::row_revisions_comparable` already names as a precondition for
+/// comparing stamps at all. `Option` where there is no honest zero, so a
+/// never-recorded slot compares equal to nothing.
+#[derive(Default, Clone, Debug)]
+struct RetainPane {
+    /// The rectangle this pane was blitted into.
+    rect: Option<pane::PaneRect>,
+    /// The snapshot dimensions actually blitted. `blit_pane_into` writes
+    /// `src.rows` × `src.cols`, which is NOT necessarily the rectangle.
+    src_rows: usize,
+    src_cols: usize,
+    /// The pane's implicit blank cell.
+    blank: Option<RenderCell>,
+    /// D-2 lane identity of the snapshot blitted. Distinct terminals mint
+    /// revisions from independent clocks, so two panes' stamps are numerically
+    /// unrelated and the lane is what says whose clock a number came from.
+    lane: u64,
+    /// Row IDENTITY of the snapshot blitted (the `row_stamps_usable` terms that
+    /// are not folded into `engine_clean`).
+    base_y: i64,
+    absolute_row_revision: u64,
+    engine_alt: bool,
+    /// The snapshot was, at blit time, exactly what an ENGINE fill left AND its
+    /// lane covered every row: no host wrote cells into it (no IME composition,
+    /// no prediction ghost), no viewport offset, no host row shift, logical row
+    /// order. `false` disowns this entry outright.
+    engine_clean: bool,
+    /// The per-row stamps of the snapshot blitted; empty when `!engine_clean`.
+    row_rev: Vec<u64>,
+}
+
+/// THE COMPOSED-RETENTION LEDGER (K2): what a window's last committed composite
+/// was made of, so the next one can leave the rows nothing changed exactly as
+/// they are.
+///
+/// A steady-state four-pane split at 90×340 changes ONE cell of 30,600 and
+/// rewrites 61,200 — the seam pass under the panes was the first half of that
+/// (deleted outright by the tiled fill) and the per-pane blit is the second.
+/// This is the bookkeeping that lets the blit be skipped, and it is deliberately
+/// ROW-granular: a composed row belongs to as many panes as cross it, so
+/// "retain a rectangle" is only ever expressed as "retain the rows on which
+/// EVERY covering pane agrees nothing changed".
+///
+/// # The fail-closed construction
+///
+/// The ledger itself proves nothing. What makes it safe is
+/// [`aterm_core::render::RenderInput::composed_fill_seq`], a SECOND CLOCK on the
+/// composed scratch advanced ONLY by the compositor's own blessing and returned
+/// to `0` by every engine fill and every divider-grid rebuild — while every host
+/// mutator that writes composed cells bumps `snapshot_seq` alone, by the
+/// established discipline, and thereby revokes the blessing WITHOUT KNOWING THIS
+/// FIELD EXISTS. A composed frame has producers that cannot be enumerated
+/// reliably (the find bar, the tab menu, the settings panel, the paste banner,
+/// the status bars, the in-grid tab strip, and whatever lands next), so the lane
+/// is built to be disowned by default and re-armed only by the one operation
+/// that knows what it wrote.
+///
+/// # What that costs, stated exactly
+///
+/// A window with IN-GRID CHROME retains nothing, ever. The tab strip and the
+/// status bars are PREPENDS onto the finished composite
+/// (`RenderInput::note_host_row_prepend`), so every frame of such a window
+/// revokes the blessing and the next one rebuilds the whole grid — one length
+/// compare per row added to the pre-K2 cost, and not a cell of behaviour
+/// changed. That is the whole of macOS (`DEFAULT_TAB_STRIP_ROWS` is `0` there,
+/// tabs live in the native toolbar) versus a Linux/Windows window with the
+/// in-grid strip on. Un-splicing the composite before the fill the way the
+/// single-pane path un-splices before its refill would lift it, and it is a
+/// SECOND splice lane with its own provenance question — deliberately not
+/// built here, and named rather than hidden.
+#[derive(Default, Debug)]
+pub(crate) struct ComposedRetain {
+    /// `input_scratch.composed_fill_seq` this ledger describes; `0` = none.
+    seq: u64,
+    /// The window grid the ledger describes.
+    rows: usize,
+    cols: usize,
+    /// The seam cell (`divider_cell(theme)`) the retained gaps hold, and the
+    /// active-pane mark inked into them.
+    seam: Option<RenderCell>,
+    mark: Option<ActivePaneMark>,
+    /// The session the keyboard was in. Nothing in a composed CELL depends on
+    /// it today — the mark above is the focus term that reaches the grid, and
+    /// the cursor, the selection flags and the pane grounds are all metadata
+    /// re-stamped every frame — but the focused pane is the ONE pane the loop
+    /// lends to host mutators, so which pane that is belongs in the ledger
+    /// rather than in a reader's head.
+    focus: u64,
+    /// One entry per pane, in BLIT order.
+    panes: Vec<RetainPane>,
+    /// THIS frame's per-row verdict, resident across frames so a settled split
+    /// allocates nothing. EMPTY means "retain nothing", which is the historical
+    /// whole-composite rebuild.
+    row_keep: Vec<bool>,
+}
+
+// TEST-ONLY: force the composed frame back to its historical
+// rebuild-every-row form, so the differential oracle can compose ONE corpus
+// BOTH ways inside one process and compare the two composites cell for cell.
+// The twin of `COMPOSE_SEAM_UNTILED`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COMPOSE_RETAIN_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+// TEST-ONLY REACH WITNESS: `(rows retained, rows rebuilt)` this thread has
+// composed. Without it the oracles below are VACUOUS — the historical rebuild
+// satisfies every property they check, so a corpus in which the retention never
+// armed would pass them while proving nothing.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COMPOSE_RETAIN_ARMS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+// TEST-ONLY SOUNDNESS WITNESS: how many times a pane whose rows were RETAINED
+// turned out to have been written by a host mutator after the retention was
+// decided.
+//
+// The retention plan is taken BEFORE the pane loop, because the fill it steers
+// runs before the loop; the focused pane's two in-loop host mutators (the IME
+// composition overlay and the prediction ghosts) are therefore gated on a
+// POSITIVE QUIET PROOF read before the fill (`focus_quiet`) rather than
+// observed. This counter is what turns "a future mutator was added between
+// those two points" from a stale pixel into a failing test: the corpus arms
+// both mutators and asserts it stayed at zero.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COMPOSE_RETAIN_UNSOUND: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Record `(retained, rebuilt)` composed rows for the reach witness.
+#[cfg(test)]
+fn note_retain_arms(retained: usize, rebuilt: usize) {
+    COMPOSE_RETAIN_ARMS.with(|arms| {
+        let (r, w) = arms.get();
+        let widen = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        arms.set((r + widen(retained), w + widen(rebuilt)));
+    });
+}
+
+/// DECIDE, for each composed row, whether this frame may leave it exactly as
+/// the last committed composite left it (K2) — filling
+/// [`ComposedRetain::row_keep`], which the fill and every pane blit then read.
+///
+/// Runs immediately before the fill, because the fill is the first thing that
+/// would overwrite a retainable row. Everything it consults is already resolved
+/// at that point: pass 1 has extracted every visible pane into its resident
+/// buffer, the layout is fixed, and the mark is chosen.
+///
+/// # The whole-frame gate
+///
+/// * THE SECOND CLOCK. `composed_fill_intact()` — the composite is still,
+///   cell for cell, the frame this ledger was written for. Any host mutator,
+///   any engine fill, any other divider-grid fill in between revokes it.
+/// * The ledger describes THIS grid, THIS seam, THIS mark, and a pane list of
+///   THIS length. A theme whose seam cell moved rebuilds every gap; a mark that
+///   moved rebuilds the columns it used to ink.
+/// * The composite's own shape agrees (`rows`/`cols`/`cells.len()`), and no host
+///   rows are spliced onto it (`row_shift == 0`) — a spliced scratch's row `r`
+///   is a different row than the ledger's row `r`.
+/// * `tiles_ready`: the pane loop must be able to run to its end. The one early
+///   exit that sits between the fill and the last blit is a background pane with
+///   no pass-1 staging metadata, and a frame that takes it would leave the panes
+///   after it unwritten.
+///
+/// # The per-pane gate
+///
+/// Every clause `aterm_render::row_revisions_comparable` names, plus the three
+/// the stamps do not describe: the declared RECTANGLE, the snapshot's own
+/// DIMENSIONS, and the pane's implicit BLANK (the blit's sparse-tail fill and
+/// its `default_bg_spans` colour both come from it, and neither moves a stamp).
+///
+/// # The one clause that predicts rather than observes
+///
+/// `focus_quiet`. The focused pane's snapshot is lent to two host mutators
+/// INSIDE the loop — `overlay_ime_preedit` and `paint_prediction_ghosts` — which
+/// run after this plan is taken, so `snapshot_seq == engine_fill_seq` read here
+/// cannot see them. `focus_quiet` is the caller's POSITIVE proof that neither
+/// can fire: no composition pending, the predictor idle, and no guess displayed
+/// on the previous frame. It is the forward twin of the `host_wrote` argument
+/// [`return_focused_pane_scratch`] takes, and `COMPOSE_RETAIN_UNSOUND` is the
+/// witness that keeps the two honest.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retention gate is a conjunction of independently-sourced frame facts; bundling them into a struct would hide which clause refused"
+)]
+fn plan_composed_retention(
+    ws: &mut WindowState,
+    rows: usize,
+    cols: usize,
+    seam: RenderCell,
+    mark: Option<ActivePaneMark>,
+    panes: &[(pane::PaneRect, Arc<Mutex<Terminal>>)],
+    focus: u64,
+    focus_blank: RenderCell,
+    focus_quiet: bool,
+    tiles_ready: bool,
+) {
+    let ComposedRetain {
+        seq: l_seq,
+        rows: l_rows,
+        cols: l_cols,
+        seam: l_seam,
+        mark: l_mark,
+        focus: l_focus,
+        panes: l_panes,
+        row_keep: keep,
+    } = &mut ws.composed_retain;
+    keep.clear();
+    #[cfg(test)]
+    if COMPOSE_RETAIN_OFF.with(std::cell::Cell::get) {
+        note_retain_arms(0, rows);
+        return;
+    }
+    let inp = &ws.input_scratch;
+    let gate = tiles_ready
+        && inp.composed_fill_intact()
+        && *l_seq != 0
+        && *l_seq == inp.composed_fill_seq
+        && *l_rows == rows
+        && *l_cols == cols
+        && *l_seam == Some(seam)
+        && *l_mark == mark
+        && *l_focus == focus
+        && l_panes.len() == panes.len()
+        && inp.rows == rows
+        && inp.cols == cols
+        && inp.cells.len() == rows
+        && inp.row_shift == 0;
+    if !gate {
+        #[cfg(test)]
+        note_retain_arms(0, rows);
+        return;
+    }
+    // Optimistic: a row nothing knocks out is a row every pane covering it
+    // agrees is unchanged. Rows no pane covers at all are pure seam (plus the
+    // mark, which is re-stamped unconditionally every frame), and the gate above
+    // has already pinned the seam cell and the layout that places them.
+    keep.resize(rows, true);
+    for (i, (r, _)) in panes.iter().enumerate() {
+        let prev = &l_panes[i];
+        let src = if r.session == focus {
+            &ws.composed_focus_scratch
+        } else if let Some(buf) = ws.unfocused_pane_scratch.get(&r.session) {
+            buf
+        } else {
+            keep.clear();
+            #[cfg(test)]
+            note_retain_arms(0, rows);
+            return;
+        };
+        let blank = if r.session == focus {
+            Some(focus_blank)
+        } else {
+            ws.composed_pane_stage_meta
+                .get(i)
+                .and_then(Option::as_ref)
+                .map(|(_, blank)| *blank)
+        };
+        let comparable = prev.engine_clean
+            && prev.rect == Some(*r)
+            && prev.src_rows == src.rows
+            && prev.src_cols == src.cols
+            && prev.blank.is_some()
+            && prev.blank == blank
+            && prev.lane != 0
+            && prev.lane == src.row_rev_lane
+            && prev.base_y == src.base_y
+            && prev.absolute_row_revision == src.absolute_row_revision
+            && prev.engine_alt == src.engine_alt
+            && prev.row_rev.len() == src.rows
+            && src.row_rev.len() == src.rows
+            && src.snapshot_seq == src.engine_fill_seq
+            && src.display_offset == 0
+            && src.row_shift == 0
+            && src.engine_row_order == aterm_core::render::RowOrder::Logical
+            && (r.session != focus || focus_quiet);
+        // The rows this pane's blit can WRITE, which is its declared rectangle
+        // UNION the rows its snapshot actually covers — `blit_pane_into` loops
+        // over `src.rows`, not over the rectangle, so a snapshot taller than its
+        // rectangle writes past it and must knock those rows out too.
+        let top = usize::from(r.row_off);
+        let reach = usize::from(r.rows).max(src.rows);
+        let end = top.saturating_add(reach).min(rows);
+        // Indexed from the PANE's first row: `sr` is the snapshot row that
+        // lands on composed row `top + sr`, which is the row both revision
+        // lanes are keyed by.
+        for (sr, slot) in keep[top..end].iter_mut().enumerate() {
+            if !*slot {
+                continue;
+            }
+            let unchanged = comparable
+                && src.row_rev.get(sr).copied().is_some_and(|rev| rev != 0)
+                && src.row_rev.get(sr) == prev.row_rev.get(sr);
+            if !unchanged {
+                *slot = false;
+            }
+        }
+    }
+    // A composed row whose buffer is not exactly `cols` wide is a row this frame
+    // RESHAPES, and the fill rebuilds it whole (the third tiling clause). It can
+    // never be retained, whatever the panes say.
+    for (r, row) in ws.input_scratch.cells.iter().enumerate() {
+        if row.len() != cols
+            && let Some(slot) = keep.get_mut(r)
+        {
+            *slot = false;
+        }
+    }
+    let retained = keep.iter().filter(|k| **k).count();
+    if retained == 0 {
+        // The whole-composite rebuild, spelled as the empty slice every other
+        // caller passes — so a frame that retains nothing costs exactly the
+        // pre-K2 fill and blit with one length compare per row added.
+        keep.clear();
+    }
+    #[cfg(test)]
+    note_retain_arms(retained, rows - retained);
+}
+
+impl ComposedRetain {
+    /// How many composed rows the last plan decided to leave alone — the K2
+    /// reach witness, read by the bench fixtures and the oracles. `0` for every
+    /// frame the lane refused, which is exactly what a workload that silently
+    /// never armed reports.
+    ///
+    /// WITNESS ONLY, and gated to say so: nothing on the shipping path asks
+    /// this question (the fill and the blits read `row_keep` directly), so a
+    /// shipping build compiles no counter at all.
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.row_keep.iter().filter(|keep| **keep).count()
+    }
+}
+
+/// TEST-ONLY: count a pane whose rows the plan RETAINED and which a host
+/// mutator then wrote into anyway — the failure `focus_quiet` exists to make
+/// impossible. See [`COMPOSE_RETAIN_UNSOUND`].
+#[cfg(test)]
+fn note_retain_unsound_if_kept(keep: &[bool], rect: pane::PaneRect, host_wrote: bool) {
+    if !host_wrote {
+        return;
+    }
+    let end = usize::from(rect.row_off)
+        .saturating_add(usize::from(rect.rows))
+        .min(keep.len());
+    let top = usize::from(rect.row_off).min(end);
+    if keep[top..end].iter().any(|k| *k) {
+        COMPOSE_RETAIN_UNSOUND.with(|c| c.set(c.get().saturating_add(1)));
+    }
+}
+
+/// RECORD what this pane's blit just wrote, for the next frame's plan (K2).
+///
+/// Called once per pane, immediately after its blit. `host_wrote` is the same
+/// answer [`return_focused_pane_scratch`] takes and for the same reason: the
+/// focused pane's snapshot is lent to the IME overlay and the prediction ghosts
+/// between its extraction and this point, and their `snapshot_seq` bump has not
+/// landed yet. A `true` disowns the entry outright, which costs exactly the full
+/// blit this lane is avoiding.
+fn record_retain_pane(
+    ledger: &mut ComposedRetain,
+    index: usize,
+    src: &RenderInput,
+    rect: pane::PaneRect,
+    blank: RenderCell,
+    host_wrote: bool,
+) {
+    if ledger.panes.len() <= index {
+        ledger.panes.resize_with(index + 1, RetainPane::default);
+    }
+    let engine_clean = !host_wrote
+        && src.snapshot_seq == src.engine_fill_seq
+        && src.row_rev_lane != 0
+        && src.row_rev.len() == src.rows
+        && src.display_offset == 0
+        && src.row_shift == 0
+        && src.engine_row_order == aterm_core::render::RowOrder::Logical;
+    let slot = &mut ledger.panes[index];
+    slot.rect = Some(rect);
+    slot.src_rows = src.rows;
+    slot.src_cols = src.cols;
+    slot.blank = Some(blank);
+    slot.lane = src.row_rev_lane;
+    slot.base_y = src.base_y;
+    slot.absolute_row_revision = src.absolute_row_revision;
+    slot.engine_alt = src.engine_alt;
+    slot.engine_clean = engine_clean;
+    if engine_clean {
+        slot.row_rev.clone_from(&src.row_rev);
+    } else {
+        slot.row_rev.clear();
+    }
+}
+
 /// SPLIT-PANE composition: fill `dst` with a `rows`×`cols` grid of divider cells
 /// (the seam colour), reset to no cursor / no clusters / single-width rows. The
 /// per-pane blit then overwrites each pane's rectangle; the cells left untouched
@@ -12449,23 +14122,79 @@ pub(crate) fn fill_divider_grid(
     theme: Theme,
     mark: Option<ActivePaneMark>,
 ) {
-    fill_divider_grid_cells(dst, rows, cols, theme, mark);
-    clear_effect_overlays_for_compose(dst);
+    fill_divider_grid_tiled(dst, rows, cols, theme, mark, std::iter::empty());
 }
 
-/// The CELL half of [`fill_divider_grid`]: divider-seam grid + cluster/
-/// combining/image/line-size/cursor resets, effect overlays UNTOUCHED. The
-/// composed `image`/`snapshot` capture uses this alone (split-pane audit): a
-/// capture must show the retained last-present effect quads WYSIWYG, not wipe
-/// them — the live compose path clears them separately because it re-produces
-/// every overlay each frame.
-pub(crate) fn fill_divider_grid_cells(
+/// [`fill_divider_grid`] told which pane rectangles the caller is about to
+/// blit, so the seam pass can skip the cells those blits will overwrite.
+///
+/// The composite it produces is byte-identical to the untiled form — see
+/// [`seed_seam_cells`] for the claim that makes that true and the clauses that
+/// keep it honest. `std::iter::empty()` is the untiled form and every caller
+/// that cannot name its layout passes exactly that.
+pub(crate) fn fill_divider_grid_tiled<T>(
     dst: &mut RenderInput,
     rows: usize,
     cols: usize,
     theme: Theme,
     mark: Option<ActivePaneMark>,
-) {
+    tiles: T,
+) where
+    T: Iterator<Item = pane::PaneRect> + Clone,
+{
+    fill_divider_grid_retained(dst, rows, cols, theme, mark, tiles, &[]);
+}
+
+/// [`fill_divider_grid_tiled`] told, in addition, which composed ROWS this
+/// frame may leave exactly as the last committed composite left them (K2).
+///
+/// `keep[r] == true` means row `r` is written by NOTHING in this fill and by no
+/// pane blit afterwards: not the seam, not the mark's own re-stamp cost, and
+/// none of the six per-row sparse channels the fill otherwise rebuilds from
+/// scratch. An EMPTY `keep` retains nothing and is byte-for-byte the historical
+/// fill — which is what every caller but the live split compose passes.
+///
+/// See [`plan_composed_retention`] for the clauses that decide a row, and
+/// [`aterm_core::render::RenderInput::composed_fill_seq`] for the second clock
+/// that makes every other producer disown the ledger without knowing it exists.
+pub(crate) fn fill_divider_grid_retained<T>(
+    dst: &mut RenderInput,
+    rows: usize,
+    cols: usize,
+    theme: Theme,
+    mark: Option<ActivePaneMark>,
+    tiles: T,
+    keep: &[bool],
+) where
+    T: Iterator<Item = pane::PaneRect> + Clone,
+{
+    fill_divider_grid_cells(dst, rows, cols, theme, mark, tiles, keep);
+    clear_effect_overlays_for_compose(dst);
+}
+
+/// The CELL half of [`fill_divider_grid`]: divider-seam grid + cluster/
+/// combining/image/line-size/cursor resets, effect overlays UNTOUCHED — they
+/// are cleared by [`fill_divider_grid_retained`] one level up, so a caller that
+/// wants a capture's retained last-present quads left WYSIWYG can have the cell
+/// half alone.
+///
+/// `tiles` is the pane-rectangle list [`fill_divider_grid_tiled`] carries; see
+/// [`seed_seam_cells`] for what handing it over buys and what it claims.
+///
+/// `keep` is the K2 per-row retention verdict [`fill_divider_grid_retained`]
+/// carries; an EMPTY slice rebuilds every row, which is every caller but the
+/// live split compose.
+fn fill_divider_grid_cells<T>(
+    dst: &mut RenderInput,
+    rows: usize,
+    cols: usize,
+    theme: Theme,
+    mark: Option<ActivePaneMark>,
+    tiles: T,
+    keep: &[bool],
+) where
+    T: Iterator<Item = pane::PaneRect> + Clone,
+{
     let seam = divider_cell(theme);
     // D-2: a composed frame's row `r` is a band of SOME pane (or a divider
     // seam), not the row the last engine fill stamped into this reused scratch.
@@ -12474,25 +14203,15 @@ pub(crate) fn fill_divider_grid_cells(
     dst.invalidate_row_revisions();
     dst.rows = rows;
     dst.cols = cols;
-    dst.cells.resize_with(rows, Vec::new);
-    for row in &mut dst.cells {
-        row.clear();
-        row.resize(cols, seam);
-    }
+    seed_seam_cells(dst, rows, cols, seam, tiles, keep);
     // The one thing in a composite that is neither a pane nor a plain seam. It
     // runs here, before any pane blit, so a rectangle that disagrees with the
     // layout loses to the blit and shows no mark rather than eating pane text.
     if let Some(mark) = mark {
         mark_active_pane_edges(dst, rows, cols, theme, mark);
     }
-    dst.clusters.resize_with(rows, Vec::new);
-    for row in &mut dst.clusters {
-        row.clear();
-    }
-    dst.combining.resize_with(rows, Vec::new);
-    for row in &mut dst.combining {
-        row.clear();
-    }
+    reset_sparse_rows(&mut dst.clusters, rows, keep);
+    reset_sparse_rows(&mut dst.combining, rows, keep);
     // Inline-image placements are per-row sparse like clusters/combining; reset them
     // to exactly `rows` empty rows each compose frame, mirroring `cell_frame_into`'s
     // `images.resize_with(rows, Vec::new)`. Without this, `prepend_strip_rows`
@@ -12500,30 +14219,27 @@ pub(crate) fn fill_divider_grid_cells(
     // `cells`, corrupting the per-row damage gate — and a compose frame after a
     // GROW left `images` shorter than `rows`, panicking the CPU renderer's
     // unguarded `input.images[r]`.
-    dst.images.resize_with(rows, Vec::new);
-    for row in &mut dst.images {
-        row.clear();
-    }
+    reset_sparse_rows(&mut dst.images, rows, keep);
     dst.line_sizes
         .resize(rows, aterm_core::grid::LineSize::SingleWidth);
     // `resize` only initializes rows a GROW appends, so a same-size (or shrunk)
     // compose would inherit the previous frame's DEC sizes on every surviving row.
-    dst.line_sizes.fill(aterm_core::grid::LineSize::SingleWidth);
+    // K2: except a RETAINED row, whose row-level summary is the one the pane
+    // that owns it wrote last frame and is about to not re-write.
+    for (r, size) in dst.line_sizes.iter_mut().enumerate() {
+        if !row_retained(keep, r) {
+            *size = aterm_core::grid::LineSize::SingleWidth;
+        }
+    }
     // Per-pane line-size runs, rebuilt from scratch each compose frame like the
     // other per-row sparse lists. Rows stay EMPTY unless a pane actually lands a
     // non-single DEC line size on them, so the ordinary split keeps the uniform
     // `line_sizes` fast path.
-    dst.line_size_spans.resize_with(rows, Vec::new);
-    for row in &mut dst.line_size_spans {
-        row.clear();
-    }
+    reset_sparse_rows(&mut dst.line_size_spans, rows, keep);
     // Per-pane live default backgrounds. A composite has no honest window-wide
     // OSC 11 / DECSCNM ground, so each pane stamps its own run in the blit;
     // rebuilt from scratch each frame like the other per-row sparse lists.
-    dst.default_bg_spans.resize_with(rows, Vec::new);
-    for row in &mut dst.default_bg_spans {
-        row.clear();
-    }
+    reset_sparse_rows(&mut dst.default_bg_spans, rows, keep);
     dst.cursor_visible = false;
     dst.cursor_row = 0;
     dst.cursor_col = 0;
@@ -15065,10 +16781,36 @@ pub(crate) fn blit_pane_into(
     col_off: usize,
     blank: RenderCell,
 ) {
+    blit_pane_into_retained(dst, src, row_off, col_off, blank, &[]);
+}
+
+/// [`blit_pane_into`] told which composed rows this frame is leaving exactly as
+/// the last committed composite left them (K2) — those rows are skipped whole:
+/// no cell write, no sparse-tail blank, no span push and no re-sort.
+///
+/// The decision is per COMPOSED ROW, never per pane, and that is what makes it
+/// sound: a row is retained only when EVERY pane covering it reports the same
+/// D-2 stamps it reported last frame, so "skip the row" and "skip this pane's
+/// part of the row" can never disagree about who owns a column. See
+/// [`plan_composed_retention`].
+///
+/// An EMPTY `keep` retains nothing, which is [`blit_pane_into`] and every
+/// caller that is not the live split compose.
+pub(crate) fn blit_pane_into_retained(
+    dst: &mut RenderInput,
+    src: &RenderInput,
+    row_off: usize,
+    col_off: usize,
+    blank: RenderCell,
+    keep: &[bool],
+) {
     for sr in 0..src.rows {
         let Some(dr) = row_off.checked_add(sr) else {
             break;
         };
+        if row_retained(keep, dr) {
+            continue;
+        }
         let Some(dst_row) = dst.cells.get_mut(dr) else {
             break;
         };
@@ -15931,6 +17673,7 @@ mod suggestion_paint_tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 
@@ -16094,6 +17837,7 @@ mod prediction_ghost_tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 
@@ -17231,6 +18975,57 @@ mod motion_policy_tests {
             app.perf_shed_dwell > crate::app_render::PERF_SHED_DWELL_MIN,
             "repeated flaps must have backed the dwell off"
         );
+    }
+
+    /// A PERFORMANCE SHED MAY NOT REWRITE THE RESIDENT'S MOTION MODEL.
+    ///
+    /// `PetBrain`'s reduced-motion arm is a hard PIN: under that flag the pet
+    /// does not travel to its station, it simply IS there, every frame, by
+    /// contract (`reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait`
+    /// in aterm-effects). That is correct for a STABLE accessibility
+    /// preference and catastrophic for a flag that toggles under load: both
+    /// `PetSense` feeds used to pass `!animate_cat`, i.e.
+    /// `!(policy.animate(CursorGlow) && shed_envelope > 0.0)`, so a heavy
+    /// paste or a build log welded a walking, visible cat to the caret and
+    /// teleported it the width of the grid on the next keystroke — then handed
+    /// it back when the load passed. That is the owner's "slides, snaps, or
+    /// teleports", on a path the launch-speed law cannot see because it is not
+    /// a flight at all.
+    ///
+    /// A shed is a request to spend less time DRAWING. It still fades the
+    /// companion (`shed_companion_alpha`) and still freezes the flying cat's
+    /// frame (`animate_cat`); it may not change what the animal IS.
+    #[test]
+    fn a_performance_shed_never_puts_the_pet_into_reduced_motion() {
+        // The resolved policy for an ordinary focused window with no system
+        // reduce-motion preference — the shape the owner runs.
+        let policy =
+            crate::motion::MotionPolicy::resolve(crate::motion::MotionMode::Full, false, true);
+
+        // The shed's own envelope is the term under test: whatever it does,
+        // the pet's reduced-motion input must depend on the POLICY alone.
+        for shed_envelope in [0.0f32, 0.25, 1.0] {
+            let animate_cat =
+                policy.animate(crate::motion::MotionEffect::CursorGlow) && shed_envelope > 0.0;
+            let pet_reduced = !policy.animate(crate::motion::MotionEffect::CursorGlow);
+
+            assert_eq!(
+                pet_reduced,
+                !policy.animate(crate::motion::MotionEffect::CursorGlow),
+                "the pet's motion model is the policy's alone"
+            );
+            if shed_envelope == 0.0 {
+                assert!(
+                    !animate_cat,
+                    "fixture: a fully shed frame does freeze the flying cat"
+                );
+                assert!(
+                    !pet_reduced,
+                    "…but must NOT pin the resident pet: a shed that flips \
+                     reduced motion teleports a visible walking body"
+                );
+            }
+        }
     }
 
     /// A latch flip drives the cursor glow/trail through the SOFT envelope —
@@ -19043,10 +20838,11 @@ impl App {
     /// Whether the ACTIVE trail style is the native cadence-comet — the one style
     /// (`cursor_trail_style = "comet"`) that produces the directional
     /// [`aterm_render::TrailCell`] comet body (the other additive styles are the
-    /// LIGHT crown only). Case-insensitive, trimmed — mirrors `glow_config`.
+    /// LIGHT crown only). Case-insensitive, trimmed, and asked of the RESOLVED
+    /// spelling — mirrors `glow_config`.
     pub(crate) fn trail_is_comet(&self) -> bool {
         self.config
-            .cursor_trail_style_raw()
+            .cursor_trail_style_effective()
             .eq_ignore_ascii_case("comet")
     }
 
@@ -19060,15 +20856,18 @@ impl App {
     /// is the only question the draw path's gating needs. Which animal is
     /// [`Self::trail_pet_species`], asked once when the brain is fed.
     pub(crate) fn trail_is_kitty_pet(&self) -> bool {
-        crate::cursor_glow::GlowStyle::style_names_any_pet(self.config.cursor_trail_style_raw())
+        crate::cursor_glow::GlowStyle::style_names_any_pet(
+            self.config.cursor_trail_style_effective(),
+        )
     }
 
     /// Which animal the full-body pet is drawn as. Meaningless unless
     /// [`Self::trail_is_kitty_pet`] — defaults to the cat, so a style string
     /// that names no pet at all can never select the dog by accident.
     pub(crate) fn trail_pet_species(&self) -> aterm_effects::kitty_pet::PetSpecies {
-        if crate::cursor_glow::GlowStyle::style_names_dog_pet(self.config.cursor_trail_style_raw())
-        {
+        if crate::cursor_glow::GlowStyle::style_names_dog_pet(
+            self.config.cursor_trail_style_effective(),
+        ) {
             aterm_effects::kitty_pet::PetSpecies::Dog
         } else {
             aterm_effects::kitty_pet::PetSpecies::Cat
@@ -19204,8 +21003,8 @@ impl App {
                 0.0
             },
             // The presentation the same resolved config draws: the default
-            // smooth v0.43-shaped full-height stream, or the explicit
-            // underline/highlighter alternate.
+            // underline/highlighter mark, or the full-height v0.43 stream an
+            // explicit `… tall` spelling selects. Stable wire tokens.
             ribbon_look: if glow_cfg.ribbon_tall {
                 "tall"
             } else {
@@ -23545,10 +25344,26 @@ impl App {
                 cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
                 cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
                 cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
-                // The same demotion the cat frame took two lines above, from the
-                // one motion policy — so a reduced-motion window cannot animate
-                // one companion and freeze the other.
-                reduced_motion: !animate_cat,
+                // THE MOTION POLICY ONLY — never the performance shed.
+                //
+                // This took `!animate_cat`, which is
+                // `!(policy.animate(CursorGlow) && shed_envelope > 0.0)`. The
+                // policy half is right: one motion policy must not animate one
+                // companion and freeze the other. The SHED half was a category
+                // error. `PetBrain`'s reduced-motion arm is a hard PIN — under
+                // that flag the pet does not travel to its station, it simply
+                // IS there, every frame, by contract
+                // (`reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait`).
+                // Raising it on a VISIBLE, WALKING cat therefore welds the body
+                // to the caret and teleports it the full width of the grid on
+                // the next keystroke — then hands it back when the load passes.
+                //
+                // A shed is a request to spend LESS TIME DRAWING, not to change
+                // what the animal is. The shed still fades the companion out
+                // through `shed_companion_alpha` below and still freezes the
+                // flying cat's frame via `animate_cat`; what it may no longer
+                // do is rewrite the resident's position model mid-walk.
+                reduced_motion: !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
                 output_burst: pet_burst,
                 pointer: pet_pointer,
                 wrapped: pet_wrapped,
@@ -28031,11 +29846,38 @@ impl App {
                             usize::from(r.rows),
                         );
                     }
-                    // Tier-A refresh gate + extraction, the LOCK A etiquette:
-                    // extract AND consume together under one lock. Pass 2
-                    // re-extracts for the blit; a PTY write racing between the
-                    // passes leaves occupancy one frame stale at worst (the
-                    // epoch key term forces the corrective present).
+                    // Tier-A refresh gate. NO SECOND EXTRACTION: the scoped
+                    // call above already filled `composed_focus_scratch` from
+                    // THIS pane, at THIS geometry, under THIS lock, and
+                    // consumed the damage session doing it — so the rain scan
+                    // below reads that buffer instead of re-resolving the same
+                    // grid into `pane_scratch`.
+                    //
+                    // WHAT WAS HERE, and why deleting it is strictly a
+                    // deletion. This block used to run the historical
+                    // `cell_frame_into` + `take_damage` pair a SECOND time,
+                    // between which nothing could touch the grid: the lock is
+                    // held across both, and everything in between is a pure
+                    // read (`row_cols_into`, cursor/mode/selection accessors).
+                    // The second fill was therefore byte-identical to the
+                    // first by construction, and `cell_frame_damage_scoped_into`
+                    // is pinned content-equal to `cell_frame_into` by the
+                    // in-crate differential oracle
+                    // (`damage_scoped_extraction_matches_full_extract_over_mutation_corpus`),
+                    // so the cells, `line_sizes` and `images` the rescan and
+                    // the material sample read are the same bytes either way.
+                    //
+                    // Its `take_damage` was not free. `take_damage` bumps
+                    // `extract_gen`, and the focused pane's own scratch had
+                    // just been stamped with the PRE-bump value — so every
+                    // rain-refresh frame broke the DMG-1 continuity chain for
+                    // the NEXT frame, which then refused under
+                    // `FullRefillCause::DamageTaken` and re-resolved the whole
+                    // pane. Fail-closed, so always correct; but it meant the
+                    // focused pane's damage-scoped arm was unreachable for as
+                    // long as rain was on. `frame_latency/split_rain_compose`
+                    // measured that clause by name: `damage_taken` on 300 of
+                    // 300 sampled rain frames, and nothing else.
                     rain_refresh = rain_refresh_needed(
                         rain_cfg.is_some(),
                         rain_suspend,
@@ -28044,14 +29886,6 @@ impl App {
                         ws.matrix_rain.as_deref(),
                         focus_epoch,
                     );
-                    if rain_refresh {
-                        term.cell_frame_into(
-                            &mut ws.pane_scratch,
-                            usize::from(r.rows),
-                            usize::from(r.cols),
-                        );
-                        term.take_damage();
-                    }
                 }
             } else if let Some(ws) = self.windows.get_mut(&wid) {
                 let staged = ws.unfocused_pane_scratch.entry(r.session).or_default();
@@ -28129,17 +29963,23 @@ impl App {
                     }
                 }
                 if rain_refresh && engine.can_emit() {
-                    // Pass 1 extracted the focused pane into `pane_scratch`
-                    // under its lock at this same epoch; scan those cells
-                    // here on host state, no lock held.
+                    // Pass 1 extracted the focused pane into
+                    // `composed_focus_scratch` under its lock at this same
+                    // epoch; scan those cells here on host state, no lock
+                    // held. This is the SAME buffer pass 2 blits from (it is
+                    // swapped into `pane_scratch` by
+                    // `take_focused_pane_scratch` further down), and it is
+                    // still exactly as the engine left it here — the two host
+                    // mutators that write it (the IME preedit overlay and the
+                    // prediction ghosts) run in pass 2, after this point.
                     let needs_grid_rescan = engine.needs_rescan(focus_epoch);
                     let needs_material_sample = engine.needs_material_sample()
                         || (needs_grid_rescan && cfg.output_material);
                     if needs_grid_rescan {
                         engine.rescan_from_cells(
-                            &ws.pane_scratch.cells,
-                            &ws.pane_scratch.line_sizes,
-                            &ws.pane_scratch.images,
+                            &ws.composed_focus_scratch.cells,
+                            &ws.composed_focus_scratch.line_sizes,
+                            &ws.composed_focus_scratch.images,
                             usize::from(focus_dims.0),
                             usize::from(focus_dims.1),
                             pane_default_bg_u32,
@@ -28148,7 +29988,7 @@ impl App {
                     }
                     if needs_material_sample {
                         engine.sample_material(
-                            &ws.pane_scratch.cells,
+                            &ws.composed_focus_scratch.cells,
                             usize::from(focus_dims.0),
                             (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
                             &ws.rain_hidden_band,
@@ -28545,7 +30385,11 @@ impl App {
                 cols: pane_cols,
                 cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
                 cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
-                reduced_motion: !animate_cat,
+                // The motion policy ONLY — never the performance shed; the
+                // split path owes the resident the same law as the single-grid
+                // path, or the teleport survives in exactly the layout that is
+                // hardest to notice it in. See the sibling site's note.
+                reduced_motion: !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
                 output_burst: pet_burst,
                 pointer: pet_pointer,
                 wrapped: pet_wrapped,
@@ -28781,7 +30625,64 @@ impl App {
         // above is dropped). Fill the composite: window-size grid of divider cells
         // first, then overlay each pane.
         let ws = self.windows.get_mut(&wid)?;
-        fill_divider_grid(&mut ws.input_scratch, rows, cols, theme, active_pane_mark);
+        // THE TILED SEAM PASS (see `seed_seam_cells`): hand the fill the exact
+        // rectangles the loop below is about to blit, so it stops writing the
+        // seam into cells a pane immediately overwrites.
+        //
+        // `tiles_ready` is the ONE early exit that sits between this fill and
+        // those blits: a background pane whose pass-1 staging metadata is
+        // missing takes a `?` out of the loop, and the panes after it would
+        // never be blitted — their rectangles would keep the previous frame's
+        // cells instead of the seam. Answered HERE, before the fill, so that
+        // frame composes untiled (whole-grid seam) exactly as it did before.
+        // Every other exit from this function is after the last blit.
+        let tiles_ready = panes.iter().enumerate().all(|(i, (r, _))| {
+            r.session == focus
+                || ws
+                    .composed_pane_stage_meta
+                    .get(i)
+                    .is_some_and(Option::is_some)
+        });
+        // The differential oracle's control arm (`tiled_seam_oracle_tests`).
+        #[cfg(test)]
+        let tiles_ready = tiles_ready && !COMPOSE_SEAM_UNTILED.with(std::cell::Cell::get);
+        // K2 RETENTION, THE ONE CLAUSE THAT PREDICTS: the focused pane's
+        // snapshot is lent to two host mutators INSIDE the loop below — the IME
+        // composition overlay and the prediction ghosts — which run after the
+        // fill this plan steers. Neither can fire while there is no composition
+        // pending, the predictor is idle, and the previous frame displayed no
+        // guess, so that is what is proven here, positively, rather than a list
+        // of writers checked one by one. Both mutators' own gates are strictly
+        // narrower than this, so it is the conservative side of every one of
+        // them (`plan_composed_retention`, and `COMPOSE_RETAIN_UNSOUND` is the
+        // witness that keeps the prediction honest).
+        let focus_quiet = ws.preedit.is_empty() && ws.predictor.idle() && !ws.pred_shown;
+        // WHICH COMPOSED ROWS THIS FRAME MAY LEAVE ALONE. Taken here, before the
+        // fill, because the fill is the first thing that would overwrite one.
+        plan_composed_retention(
+            ws,
+            rows,
+            cols,
+            divider_cell(theme),
+            active_pane_mark,
+            &panes,
+            focus,
+            focus_blank,
+            focus_quiet,
+            tiles_ready,
+        );
+        fill_divider_grid_retained(
+            &mut ws.input_scratch,
+            rows,
+            cols,
+            theme,
+            active_pane_mark,
+            panes
+                .iter()
+                .map(|(r, _)| *r)
+                .take(if tiles_ready { panes.len() } else { 0 }),
+            &ws.composed_retain.row_keep,
+        );
         // FOCUSED-PANE fx clip for the PRESENT-TIME GPU post-fx (split-pane
         // audit): the bloom composite and the heat-shimmer refraction operate
         // on the finished frame AFTER the host-side quad clip above, so their
@@ -28982,12 +30883,44 @@ impl App {
                     ws.pane_scratch.cursor_style,
                 ));
             // `pane_scratch` and `input_scratch` are disjoint fields of `ws`.
-            blit_pane_into(
+            // K2: `row_keep` is a third — the rows this frame is leaving exactly
+            // as the last committed composite left them, which this blit skips
+            // whole (see `plan_composed_retention`). It is EMPTY on every frame
+            // that retains nothing, and then this is the historical blit.
+            blit_pane_into_retained(
                 &mut ws.input_scratch,
                 &ws.pane_scratch,
                 r.row_off as usize,
                 r.col_off as usize,
                 blank,
+                &ws.composed_retain.row_keep,
+            );
+            // The tiled fill's fourth clause (`seed_seam_cells`): the seam under
+            // this rectangle was skipped because the blit above was going to
+            // cover all of it. Two compares when it did — and gated on the fill
+            // having actually tiled, so a frame that fell back to the whole-grid
+            // seam is byte-for-byte the historical path with nothing added.
+            if tiles_ready {
+                seam_declared_shortfall(
+                    &mut ws.input_scratch,
+                    theme,
+                    *r,
+                    ws.pane_scratch.rows,
+                    ws.pane_scratch.cols,
+                    &ws.composed_retain.row_keep,
+                );
+            }
+            // K2: what this pane's blit just wrote, for the NEXT frame's plan.
+            // `host_wrote` is the same answer `return_focused_pane_scratch`
+            // takes below and for the same reason — the focused pane's own
+            // `snapshot_seq` bump has not landed yet at this point.
+            record_retain_pane(
+                &mut ws.composed_retain,
+                pane_index,
+                &ws.pane_scratch,
+                *r,
+                blank,
+                focused_pane && (preedit_drawn || painted_pred),
             );
             // EVERY terminal pane, focused or not (see `push_pane_selection`).
             push_pane_selection(
@@ -29017,6 +30950,16 @@ impl App {
                 // host wrote engine cells into this buffer, so the next frame
                 // must re-resolve the whole grid rather than retain rows the
                 // engine no longer vouches for.
+                // K2 SOUNDNESS WITNESS: the plan taken before the fill said
+                // this pane's rows could be retained, and something wrote into
+                // its cells after all. Counted, never silently tolerated —
+                // the corpus asserts it stayed at zero with both mutators armed.
+                #[cfg(test)]
+                note_retain_unsound_if_kept(
+                    &ws.composed_retain.row_keep,
+                    *r,
+                    preedit_drawn || painted_pred,
+                );
                 return_focused_pane_scratch(ws, preedit_drawn || painted_pred);
             } else {
                 // Return this pane's persistent buffer to the map, holding its
@@ -29140,6 +31083,24 @@ impl App {
         // the exact snapshot blitted above. Stamp a fresh seq so the cache sees
         // this host-owned composite change.
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
+        // K2: …and BLESS the result. From here until some host writes into this
+        // composite (every one of them bumps `snapshot_seq` and touches nothing
+        // else), the next compose may leave the rows nothing changed exactly as
+        // this frame wrote them. The ledger is pinned to THIS blessing, and to a
+        // pane list of exactly this length — a shrunk split must not compare
+        // this frame's panes against a stale tail.
+        ws.input_scratch.bless_composed_fill();
+        ws.composed_retain.panes.truncate(panes.len());
+        ws.composed_retain.seq = if ws.composed_retain.panes.len() == panes.len() {
+            ws.input_scratch.composed_fill_seq
+        } else {
+            0
+        };
+        ws.composed_retain.rows = rows;
+        ws.composed_retain.cols = cols;
+        ws.composed_retain.seam = Some(divider_cell(theme));
+        ws.composed_retain.mark = active_pane_mark;
+        ws.composed_retain.focus = focus;
         ws.stamp_present_decision(key);
         // FL-1: this committed compose IS the redraw any outstanding recovery
         // edge asked for — acknowledge the delivery. Without this, a
@@ -31247,7 +33208,11 @@ impl App {
     ///   a two-second popup is a cosmetic overlap; a dead click region is a
     ///   regression on every platform.
     pub(crate) fn splice_tab_menu(&mut self, wid: WindowId) {
-        let strip = self.tab_strip_rows as usize;
+        // CHROME rows, not strip rows: `tab_menu::place` treats this as the first
+        // frame row the menu may occupy, so measuring the strip alone would open
+        // the menu ON TOP of a live status bar — chrome covering chrome, and the
+        // bar it covers is the one explaining why the terminal is busy.
+        let strip = usize::from(self.chrome_rows());
         // Tint off the LIVE OSC-11 background (like `splice_config_notice` and
         // the settings panel) so the card's tones — which are derived from the
         // theme and contrast-floored against it — stay WCAG-AA legible when a
@@ -36792,13 +38757,13 @@ mod find_panel_visual_tests {
         }
         let path = dir.join(format!("{name}.png"));
         let file = std::fs::File::create(&path).expect("create png");
-        let mut encoder = png::Encoder::new(
+        let mut encoder = aterm_png::Encoder::new(
             std::io::BufWriter::new(file),
             frame.width as u32,
             frame.height as u32,
         );
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_color(aterm_png::ColorType::Rgb);
+        encoder.set_depth(aterm_png::BitDepth::Eight);
         encoder
             .write_header()
             .expect("png header")
@@ -39014,6 +40979,16 @@ mod compose_focused_carrier {
     /// two-sided witness for WHICH ARM RAN, with no process-global counter for a
     /// parallel test to race against.
     fn plant_marker(app: &mut App, wid: WindowId, pane_row: usize) {
+        // K2: the marker is an UNDECLARED host write, and the composed
+        // retention lane is built to skip a pane row whose D-2 stamp has not
+        // moved — which is exactly this row. That is the lane behaving
+        // correctly (no shipping mutator writes a pane buffer without
+        // declaring it, which is what `return_focused_pane_scratch` takes
+        // `host_wrote` for), and it would make the marker invisible in the
+        // composite for a reason that has nothing to do with which extraction
+        // arm ran. So the witness runs with the retention forced off: the
+        // claim under test is the EXTRACTION's arm, one layer below the blit.
+        super::COMPOSE_RETAIN_OFF.with(|off| off.set(true));
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.composed_focus_scratch
             .cells
@@ -39056,6 +41031,103 @@ mod compose_focused_carrier {
         assert_eq!(
             composed_char(&app, wid, CARET_ROW, 0),
             'x',
+            "…while the DAMAGED row really did refill (otherwise the marker \
+             above proves nothing but a frozen frame)"
+        );
+    }
+
+    /// [`split_app`] with PHOSPHOR rain enabled at its shipped defaults, through
+    /// the same resolve a config load runs (`recompute_matrix_rain`) — without
+    /// it `App::rain` stays `None` and the frame gate finds no parameters, so
+    /// the fixture would look armed and rain nothing.
+    fn split_app_raining() -> (App, WindowId) {
+        let (mut app, wid) = split_app();
+        app.config.matrix_rain = Some(crate::app_config::MatrixRainConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        app.recompute_matrix_rain();
+        (app, wid)
+    }
+
+    /// The damage epoch the rain engine's Tier-A occupancy scan last consumed —
+    /// `None` while no engine exists or nothing has scanned. The reach witness
+    /// for "this frame really was a rain-REFRESH frame", which no config flag
+    /// can show.
+    fn rain_scan(app: &App, wid: WindowId) -> Option<u64> {
+        app.windows[&wid]
+            .matrix_rain
+            .as_deref()
+            .and_then(crate::matrix_rain::MatrixRain::scanned_epoch)
+    }
+
+    /// RAIN MUST NOT COST THE FOCUSED PANE ITS ARM.
+    ///
+    /// The compose path used to extract the focused pane TWICE on a
+    /// rain-refresh frame: once (damage-scoped) into `composed_focus_scratch`,
+    /// then again in full into `pane_scratch` for the Tier-A occupancy rescan —
+    /// with a second `take_damage` between them. Both fills were byte-identical
+    /// by construction (one lock, only pure reads in between), but the second
+    /// `take_damage` bumped `extract_gen` past the value the focused pane's own
+    /// scratch had just been stamped with, so the NEXT frame's continuity check
+    /// refused under `FullRefillCause::DamageTaken` and re-resolved the whole
+    /// pane. Fail-closed, so never wrong — but it meant that for as long as rain
+    /// was on, the focused pane could never take the damage-scoped arm at all.
+    ///
+    /// This is the positive leg above with the ONE knob flipped, and it uses the
+    /// same planted marker rather than a process-global counter a parallel test
+    /// could race. Two witnesses keep it from passing vacuously: the frame must
+    /// really be a rain-refresh frame (the scan epoch ADVANCES over the echo),
+    /// and the DAMAGED row must really refill (otherwise a frozen frame would
+    /// retain the marker for the wrong reason).
+    #[test]
+    fn rain_does_not_cost_the_focused_pane_its_damage_scoped_arm() {
+        let (mut app, wid) = split_app_raining();
+        let mut now = Instant::now();
+        assert!(
+            compose(&mut app, wid, now),
+            "the establishing frame presents"
+        );
+        let focus = focus_rect(&app, wid).session;
+        let scan0 = rain_scan(&app, wid)
+            .expect("REACH: rain must be live and scanning, or this test pins nothing about rain");
+        // TWO CONSECUTIVE DAMAGED FRAMES, which is what it takes. The rain
+        // refresh gate only fires when the damage epoch MOVED, so an idle frame
+        // runs no rescan, takes no extra damage, and leaves the carrier intact.
+        // The defect is therefore invisible after a settled frame and shows only
+        // on the frame FOLLOWING a rain-refresh frame — which is every frame of
+        // a window that is being typed into, the case this is about.
+        feed(&app, focus, b"\rx");
+        now += DT;
+        assert!(compose(&mut app, wid, now), "the first echo frame presents");
+        let scan1 = rain_scan(&app, wid);
+        assert_ne!(
+            scan1,
+            Some(scan0),
+            "REACH: the first echo frame ran no fresh Tier-A rescan, so it did \
+             not arm the condition this test is about"
+        );
+        plant_marker(&mut app, wid, QUIET_ROW);
+        feed(&app, focus, b"\ry");
+        now += DT;
+        assert!(
+            compose(&mut app, wid, now),
+            "the second echo frame presents"
+        );
+        assert_ne!(
+            rain_scan(&app, wid),
+            scan1,
+            "REACH: the second echo frame ran no fresh Tier-A rescan"
+        );
+        assert_eq!(
+            composed_char(&app, wid, QUIET_ROW, 0),
+            'Q',
+            "a RAINING focused pane re-resolved its UNDAMAGED row — the rain \
+             refresh is taking the pane's damage-scoped arm away again"
+        );
+        assert_eq!(
+            composed_char(&app, wid, CARET_ROW, 0),
+            'y',
             "…while the DAMAGED row really did refill (otherwise the marker \
              above proves nothing but a frozen frame)"
         );

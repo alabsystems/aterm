@@ -3162,3 +3162,125 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
         "non-vacuity: a NEGATIVE frac (overscroll bounce) must move GPU pixels DOWN"
     );
 }
+
+/// One cell's TOP pixel row — where `overline_rect` anchors its band.
+fn top_row(f: &Frame, cw: usize, col: usize) -> Vec<u32> {
+    let x0 = col * cw;
+    f.pixels[x0..(x0 + cw).min(f.width)].to_vec()
+}
+
+/// How deep `ink` runs down from a cell's top edge. Measured off the frame
+/// rather than assumed to be one pixel: an overline is drawn at the font's
+/// resolved underline thickness, which differs per face, per size and per
+/// platform, and this suite is only ever run on one of the three.
+fn band_depth(f: &Frame, cw: usize, ch: usize, col: usize, ink: u32) -> usize {
+    let x0 = col * cw;
+    let x1 = (x0 + cw).min(f.width);
+    (0..ch.min(f.height))
+        .take_while(|&y| {
+            f.pixels[y * f.width + x0..y * f.width + x1]
+                .iter()
+                .all(|px| *px == ink)
+        })
+        .count()
+}
+
+/// THE OVERLINE'S OWN COLOUR CHANNEL, PROVEN ON BOTH BACKENDS AT ONCE.
+///
+/// `RenderCell::overline_color` is unreachable from the byte stream — no
+/// ECMA-48 code and no vendor extension assigns an overline colour — so nothing
+/// in the escape-sequence conformance suites can catch a backend that ignores
+/// it, and this differential is its only oracle. Both renderers resolve the
+/// band through the one shared `aterm_render::deco_inks`, and the property the
+/// chrome bands actually depend on is that a seam holds ONE tone across a row
+/// whose cells carry different foregrounds — so the row here carries two.
+#[test]
+fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    // Deterministic parity: block on the lazy fallback parses so neither
+    // renderer compares a provisional `.notdef` frame against a real glyph.
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (1usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    // Two runs of overlined text in two very different inks; the cursor is
+    // hidden so no blink phase can move a pixel between the renders compared.
+    term.process(b"\x1b[?25l\x1b[53m\x1b[38;2;80;80;80mdim\x1b[38;2;255;255;255mLIT");
+
+    // The un-channelled frame is the negative control on BOTH sides: with no
+    // channel a rule follows each cell's own fg, so the two runs' bands differ.
+    let plain = term.cell_frame(rows, cols);
+    let cpu_plain = cpu.render_input(&plain);
+    let gpu_plain = gpu.render_input(&mut win, &plain, None);
+    for (label, f) in [("cpu", &cpu_plain), ("gpu", &gpu_plain)] {
+        assert_ne!(
+            top_row(f, cw, 0),
+            top_row(f, cw, 3),
+            "{label}: without the channel a rule takes as many tones as the row has inks"
+        );
+    }
+
+    let seam: [u8; 3] = [0x40, 0x44, 0x4A];
+    let want = aterm_render::rgb_to_u32(seam);
+    let mut input = term.cell_frame(rows, cols);
+    for row in &mut input.cells {
+        for cell in row.iter_mut() {
+            cell.overline_color = Some(seam);
+        }
+    }
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "overline colour: dimensions differ"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    eprintln!("overline-colour GPU vs CPU max per-channel delta = {delta}");
+    assert!(
+        delta <= 8,
+        "overline-colour GPU/CPU pixels diverge: max per-channel delta {delta} > 8"
+    );
+
+    for (label, f, plain_f) in [
+        ("cpu", &cpu_frame, &cpu_plain),
+        ("gpu", &gpu_frame, &gpu_plain),
+    ] {
+        // Non-vacuity per backend: the channel moved THAT backend's pixels,
+        // rather than the two agreeing by both ignoring it.
+        assert_ne!(
+            f.pixels, plain_f.pixels,
+            "{label}: an overline colour that changes nothing is not a channel"
+        );
+        let t = band_depth(f, cw, ch, 0, want);
+        assert!(
+            (1..ch).contains(&t),
+            "{label}: the seam must be a band inside the cell, not {t} of {ch} rows"
+        );
+        for col in 0..6 {
+            let band = top_row(f, cw, col);
+            assert!(
+                band.iter().all(|px| *px == want),
+                "{label}: column {col} breaks the seam's one tone: {band:?}"
+            );
+            assert_eq!(
+                band_depth(f, cw, ch, col, want),
+                t,
+                "{label}: column {col} wears the seam to a different depth"
+            );
+        }
+        // The channel colours ONE rule, not the text under it: everything below
+        // the band is what it was before any seam colour was set.
+        assert_eq!(
+            &f.pixels[f.width * t..],
+            &plain_f.pixels[plain_f.width * t..],
+            "{label}: the channel must not reach any row but the overline's own"
+        );
+    }
+}

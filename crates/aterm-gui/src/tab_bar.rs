@@ -20,6 +20,16 @@
 //! their insets, gutters, corners and vertical centring are not bound to the
 //! terminal's cell grid.
 //!
+//! AND IT STOPS SHRINKING. Past the point where every tab can have a legible
+//! chip ([`STRIP_SEATS_FLOOR`]) the strip does not compress further — it seats
+//! a WINDOW of tabs, always containing the selection, and marks the edges it
+//! continues past with `‹`/`›` ([`strip_overflow`]), the same two glyphs the
+//! inline rename well marks a clipped edge with. Eight tabs on an 80-column
+//! window used to be eight cards of four title cells, which no cut can name;
+//! it is five named cards and a mark now. The window is a function of
+//! `(cols, tab_count, active)` and stores no scroll offset of its own, so what
+//! the hit map answers and what the painter drew cannot drift apart.
+//!
 //! It is PURE LAYOUT + a small [`RenderCell`] paint, mirroring [`crate::pane`]:
 //! [`layout_segments`] produces the segment list (each a column range + an
 //! optional close-`x` column + a [`TabHit`] target) and is unit-testable with no
@@ -455,6 +465,122 @@ const PREFERRED_MIN_TAB_COLS: u16 = 12;
 /// the band, exactly as in points.
 const ACTIVE_TAB_PRESSURE_CAP_COLS: u16 = 18;
 
+/// The width, in columns, below which the strip STOPS COMPRESSING and starts
+/// showing a WINDOW of its tabs instead ([`layout_segments`]).
+///
+/// It is [`PREFERRED_MIN_TAB_COLS`] and deliberately not a second number: that
+/// constant is already this module's answer to "how wide is a legible tab" —
+/// 12 columns, which after the pads and the reserved `✕` leave the 8 title
+/// cells "Settings" measures — and a strip that will not paint a chip it calls
+/// illegible needs exactly one such floor, not a preferred one and a grudging
+/// one. Above it tabs share the band; at it the strip seats what fits and marks
+/// the rest.
+///
+/// WHY A WINDOW AND NOT MORE COMPRESSION. Measured on Windows, eight shells in
+/// one directory on an 80-column window: each quiet chip held 8 columns — four
+/// title cells — so no cut of any title could name a tab, and the strip fell
+/// back to seven bare ordinals. Compression's floor had to land somewhere, and
+/// every native Windows strip lands it in the same place: Explorer, Edge,
+/// Windows Terminal and VS Code all stop shrinking tabs at a readable width and
+/// scroll the strip past the ones that no longer fit. This is that answer in
+/// the vocabulary this module already speaks — and the strip's own inline
+/// rename well ([`paint_rename_field`]) already implements it for text: a
+/// window that keeps the thing you are working on inside it and marks the edges
+/// it continues past with `‹`/`›`.
+///
+/// IT IS THE PLAIN CHIP'S FLOOR. What this number ever promised was a TITLE
+/// width — 12 columns because 12 columns leave the 8 cells "Settings" measures
+/// — and a chip spending cells on a status canvas or an app icon does not get
+/// that title here. So this is where the search for a seat STARTS
+/// ([`chip_seat_cols`]): the answer for a chip wearing nothing, and the answer
+/// for the whole strip exactly when no tab wears anything. The floor's meaning
+/// is unchanged; it is finally being asked of the chip that is painted.
+const STRIP_SEATS_FLOOR: u16 = PREFERRED_MIN_TAB_COLS;
+
+/// The fewest chips a windowed strip seats, however narrow the band.
+///
+/// TWO, because one chip is not a switcher: a strip showing a single card is a
+/// title bar, and it cannot show you there is anywhere to switch TO. Two chips
+/// (and, where the band affords them, the marks) still read as "these are tabs,
+/// and there are more". Seats are additionally capped at one per column, so a
+/// band too narrow for two chips seats the one it can rather than emitting
+/// zero-width segments.
+const STRIP_MIN_SEATS: usize = 2;
+
+/// How many chips `band` columns seat at the floor: one per `seat` columns,
+/// where `seat` is the narrowest chip THIS strip's chrome can carry a title in
+/// ([`strip_seat_cols`]).
+///
+/// Clamped into `1..=tab_count` and to one seat per column, so this is a legal
+/// seat count for every band a window can have — including the degenerate ones
+/// where the answer is "one chip, and it gets everything".
+///
+/// NO ACTIVE RESERVATION. The seated chips all get the SAME width
+/// ([`strip_window`] and its callers), so counting them is a plain division —
+/// see the window arm of [`layout_segments`] for why the active-priority
+/// reservation has no business inside a window it did not need.
+fn strip_seats(band: u16, tab_count: usize, seat: u16) -> usize {
+    usize::from(band / seat.max(1))
+        .clamp(STRIP_MIN_SEATS.min(tab_count.max(1)), tab_count.max(1))
+        .min(usize::from(band).max(1))
+}
+
+/// The window of tabs the strip seats when `active` is selected, as
+/// `(first, len)` — a PAGE of a fixed partition of the tab list, never a run
+/// centred on the selection.
+///
+/// WHY A PARTITION, AND WHY THAT IS THE WHOLE POINT. The window is recomputed
+/// from `(cols, tab_count, active)` every frame, so SELECTING re-runs it — and
+/// a window centred on the selection therefore re-anchored the entire strip the
+/// instant you used it. Measured with a click-drift harness (click a chip,
+/// relayout with the new selection, re-hit-test the same column): at eight tabs
+/// on eighty columns, clicking column 2 selected tab 3 and left tab 1 under the
+/// pointer; at twenty tabs on a hundred and twenty, nearly every quiet chip
+/// moved, some by two tabs. The click was always correct and the paint always
+/// agreed with the hit map — but two clicks in the same place selected two
+/// different tabs, and the hover wash and the revealed `✕` jumped under a hand
+/// that had not moved. A switcher whose targets move when you use it is worse
+/// than one that names its tabs badly.
+///
+/// The fix is forced, not chosen. "Selecting a seated chip moves nothing" says
+/// exactly: for every tab `t` this window seats, the window computed FOR `t` is
+/// this same window. A family of windows each closed under its own membership
+/// is a PARTITION of the tab list — there is no other shape it can have — so
+/// the strip pages, and the only remaining freedom is where the page boundaries
+/// fall. The trade a partition makes, honestly: crossing a page edge moves the
+/// whole strip at once, where centring moved it a little all the time. A
+/// motion the user asked for by walking off the edge is a different thing from
+/// a motion that answers a click on a chip that was already showing.
+///
+/// THE PAGE BOUNDARIES: as few pages as the seat count allows
+/// (`tab_count.div_ceil(seats)`), sized as evenly as that count allows, with
+/// the LONGER pages first. Even sizing is what keeps a page from being a
+/// two-chip runt beside a six-chip neighbour — the shape plain
+/// `first = (active / seats) * seats` paging leaves at the end of the list, and
+/// the reason a "flush the last page against the end" patch is not the answer
+/// either: flushing overlaps the last two pages, which is precisely the closure
+/// property above being given back. Every page spends the WHOLE band (the chips
+/// divide it equally), so a shorter page is wider chips and longer titles, never
+/// dead band.
+fn strip_window(active: usize, seats: usize, tab_count: usize) -> (usize, usize) {
+    let seats = seats.max(1);
+    if tab_count <= seats {
+        return (0, tab_count);
+    }
+    let pages = tab_count.div_ceil(seats);
+    let narrow = tab_count / pages;
+    // How many pages carry the extra tab; `narrow + 1` wide when any do.
+    let long = tab_count % pages;
+    let wide = narrow + usize::from(long > 0);
+    if active < long * wide {
+        let page = active / wide;
+        (page * wide, wide)
+    } else {
+        let page = (active - long * wide) / narrow.max(1);
+        (long * wide + page * narrow, narrow)
+    }
+}
+
 /// Cell-space content ordering inside an in-grid tab: leading pad, two-cell icon,
 /// one-cell breathing gap, title, optional shape-coded status canvas, close affordance. Two cells
 /// yield an approximately square 16–18 px icon with ordinary terminal cell metrics;
@@ -709,6 +835,99 @@ fn tab_content_layout(seg: &TabSegment, metadata: TabStripMetadata) -> TabConten
     }
 }
 
+/// How many TITLE cells a `width`-column chip wearing `chrome` actually keeps —
+/// [`tab_content_layout`]'s own answer, asked of a hypothetical segment instead
+/// of a laid-out one.
+///
+/// The strip's legibility floor is a promise about a NAME, and a name is painted
+/// into `title_start..title_end` — not into the segment. The segment also pays
+/// for the leading pad, the card's interior pad, the icon and its gap, the
+/// reserved close `✕` and the status canvas, and those are not the same tax on
+/// every chip: a BUSY chip spends three more cells than an idle one. Measuring
+/// the floor against the segment therefore promised a title width the chip does
+/// not have — eight busy shells at 100 columns each held a 12-cell chip (the
+/// floor, to the column) and FOUR title cells, which is the bare-ordinal render
+/// the window regime exists to prevent. This function is how the gate asks the
+/// question it means.
+fn chip_title_cols(width: u16, chrome: TabStripMetadata) -> u16 {
+    let seg = TabSegment {
+        start_col: 0,
+        end_col: width,
+        // The same two conditions [`layout_segments`] and
+        // [`layout_segments_with_metadata`] apply, in that order: a segment too
+        // narrow for ` x ` reserves no close cell, and a chip the presentation
+        // marks non-closable gives that cell back.
+        close_col: (chrome.closable && width >= MIN_SEG_WITH_CLOSE).then(|| width - 2),
+        connector_col: None,
+        kind: TabHit::Select(0),
+        solo: false,
+    };
+    let layout = tab_content_layout(&seg, chrome);
+    layout.title_end.saturating_sub(layout.title_start)
+}
+
+/// The legibility floor in TITLE cells: exactly what a PLAIN chip keeps at
+/// [`PREFERRED_MIN_TAB_COLS`].
+///
+/// DERIVED, never a second number. [`PREFERRED_MIN_TAB_COLS`] is already this
+/// module's answer to "how wide is a legible tab", and its whole justification
+/// is a title measurement ("after the pads and the reserved `✕`, 12 cells keep
+/// the 8 that spell *Settings*"). Reading that measurement back out of
+/// [`tab_content_layout`] means the two cannot drift, and means an ordinary idle
+/// strip's gate is the shipped one to the column — only chips that spend cells
+/// on chrome the plain chip does not wear move at all. (The number differs by
+/// band: a chip-card band spends one more cell on its interior pad, so it is 7
+/// there and 8 on the padless bands — which is the honest reading of "what a
+/// title gets", not a regression.)
+fn preferred_min_title_cols() -> u16 {
+    chip_title_cols(PREFERRED_MIN_TAB_COLS, PLAIN_TAB)
+}
+
+/// The narrowest chip that still carries a title while wearing `chrome` — the
+/// per-tab reading of [`STRIP_SEATS_FLOOR`].
+///
+/// Scanned upward from [`PREFERRED_MIN_TAB_COLS`] because
+/// [`chip_title_cols`] is not a formula: the card's interior pad, the icon
+/// admission and the status canvas each turn on at their own width. Bounded by
+/// [`SEAT_COLS_CEILING`], which is comfortably past the widest chrome a chip can
+/// wear (icon + gap + status + close, on top of the plain chip's pads).
+fn chip_seat_cols(chrome: TabStripMetadata) -> u16 {
+    let floor = preferred_min_title_cols();
+    (STRIP_SEATS_FLOOR..=SEAT_COLS_CEILING)
+        .find(|&width| chip_title_cols(width, chrome) >= floor)
+        .unwrap_or(SEAT_COLS_CEILING)
+}
+
+/// The widest a chrome-aware seat can be: [`STRIP_SEATS_FLOOR`] plus the whole
+/// ornament budget a chip can wear — the icon and its gap
+/// (`ICON_COLS + ICON_GAP`), and the three cells the status canvas costs a
+/// title (the canvas, its separator, and the cell it pushes the label off) —
+/// plus a column of slack, so the scan in [`chip_seat_cols`] always terminates
+/// on a real answer rather than on its own bound.
+///
+/// That the bound is not binding is asserted, for every chrome a chip can wear,
+/// by `the_legibility_floor_is_a_title_width_and_every_seat_is_minimal`.
+const SEAT_COLS_CEILING: u16 = STRIP_SEATS_FLOOR + (ICON_COLS + ICON_GAP) + 3 + 1;
+
+/// The narrowest chip THIS STRIP can seat: the widest seat any of its tabs
+/// needs ([`chip_seat_cols`]).
+///
+/// The strip lays every quiet chip out at ONE width, so the question "does a
+/// share still carry a title" has one answer per strip, and it has to be the
+/// answer for the tab that pays the most chrome. Taking the maximum is the
+/// same statement as "every chip the layout emits can carry a name" — the
+/// promise the window regime was built to keep, now measured against the chips
+/// the strip is actually painting rather than against a plain chip nobody has.
+///
+/// Tabs past the end of `metadata` are read as [`PLAIN_TAB`], exactly as the
+/// painter reads them.
+fn strip_seat_cols(tab_count: usize, metadata: &[TabStripMetadata]) -> u16 {
+    (0..tab_count)
+        .map(|i| chip_seat_cols(metadata.get(i).copied().unwrap_or(PLAIN_TAB)))
+        .max()
+        .unwrap_or(PREFERRED_MIN_TAB_COLS)
+}
+
 /// Lay out the tab strip across `cols` columns for `tab_count` tabs (`active` is
 /// the highlighted one). Returns one [`TabSegment`] per visible tab plus, when
 /// room remains, a trailing [`TabHit::NewTab`] `+` segment. Segments are packed
@@ -730,6 +949,23 @@ fn tab_content_layout(seg: &TabSegment, metadata: TabStripMetadata) -> TabConten
 /// user is actually reading collapsed with all the rest; the pressure layout is
 /// `native_tab_cells`' answer, in cells.
 ///
+/// AND THE COMPRESSION STOPS ([`STRIP_SEATS_FLOOR`]). Compression alone has no
+/// bottom: eight tabs on an 80-column window — an utterly ordinary window —
+/// gave every quiet chip 8 columns, which after the pads and the `✕` is FOUR
+/// title cells, and four cells cannot carry a name. The strip then painted
+/// seven bare ordinals, which is the distinct pass admitting it has no width to
+/// work in. So the strip stops shrinking at the floor it already names and
+/// shows a WINDOW of tabs instead: a contiguous run, always containing the
+/// selection, with the tabs it does not reach marked by `‹`/`›`
+/// ([`strip_overflow`]). Every chip the window seats is legible; the tabs
+/// outside it stay reachable by cycling, by `switch_tab_<n>`, and by selecting
+/// their way into view.
+///
+/// The window follows the SELECTION and holds no scroll state of its own, so
+/// it is still pure geometry: `(cols, tab_count, active)` determines it
+/// completely, the same three numbers this function has always taken, and no
+/// stored offset can drift out of step with what was painted.
+///
 /// All three rules are macOS's, and the native strip they mirror is macOS's alone
 /// (the AppKit toolbar). Off macOS a lone tab is neither a title band
 /// ([`SOLO_TITLE_BAND`]) nor entitled to the whole width ([`SOLO_CHIP_MAX_COLS`])
@@ -740,12 +976,41 @@ fn tab_content_layout(seg: &TabSegment, metadata: TabStripMetadata) -> TabConten
 /// Pure geometry: no window, no renderer, no `App`. `active` matters only under
 /// pressure — with legible equal shares the layout is selection-independent, so
 /// switching tabs on a roomy strip moves no chip and no close column.
+///
+/// PLAIN CHROME. This entry point measures the legibility floor against a
+/// [`PLAIN_TAB`] chip, because it is handed no metadata to measure anything
+/// else. The shipping strip goes through [`layout_segments_with_metadata`],
+/// which measures it against the chrome its tabs actually wear
+/// ([`strip_seat_cols`]) — the two agree exactly wherever every tab is plain.
 #[must_use]
+// The metadata-free entry: the pure-geometry contract this module states (and
+// the ~40 layout tests that hold it) is written against THIS signature, and the
+// shipping strip now reaches the same code through the metadata-aware door.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn layout_segments(
     cols: u16,
     tab_count: usize,
     active: usize,
     show_update: bool,
+) -> Vec<TabSegment> {
+    layout_segments_seated(
+        cols,
+        tab_count,
+        active,
+        show_update,
+        chip_seat_cols(PLAIN_TAB),
+    )
+}
+
+/// [`layout_segments`], told how narrow a chip this strip's chrome can still
+/// carry a title in (`seat` — [`strip_seat_cols`]). The floor is the ONE number
+/// the two entry points disagree about; everything else here is shared.
+fn layout_segments_seated(
+    cols: u16,
+    tab_count: usize,
+    active: usize,
+    show_update: bool,
+    seat: u16,
 ) -> Vec<TabSegment> {
     let mut segs = Vec::new();
     if cols == 0 {
@@ -808,20 +1073,74 @@ pub fn layout_segments(
         // floor are untouched, so a roomy strip stays selection-independent:
         // switching tabs there moves no geometry, and the hover-reserved close
         // columns stay under a stationary pointer.
+        //
+        // ...AND THE COMPRESSION HAS A BOTTOM ([`STRIP_SEATS_FLOOR`]): when even
+        // the compressed share cannot seat every tab at the floor, the strip
+        // stops shrinking and seats a WINDOW instead — a PAGE of `seats` chips
+        // starting at `first` ([`strip_window`]), with a marked column at each
+        // end the page continues past. Where the band CAN seat every tab,
+        // `seats == tab_count`, `first == 0`, no column is marked, and the
+        // arithmetic below is the shipped pressure layout to the byte.
         let active = active.min(tab_count - 1);
-        let (active_w, inactive_w) = if tab_count > 1 && share < PREFERRED_MIN_TAB_COLS {
-            // u32 for the 60% product only: `band` is a u16 column count, and
-            // `band * 3` can overflow u16 on absurd-but-legal widths.
-            let selected = u16::try_from(u32::from(band) * 3 / 5)
-                .unwrap_or(u16::MAX)
-                .min(ACTIVE_TAB_PRESSURE_CAP_COLS)
-                .max(share);
-            let inactive = (band.saturating_sub(selected) / (tab_count as u16 - 1)).max(1);
-            (selected, inactive)
+        let mut seats = tab_count;
+        let mut first = 0usize;
+        let (mut mark_left, mut mark_right) = (false, false);
+        let (active_w, inactive_w) = if tab_count > 1 && share < seat {
+            if strip_seats(band, tab_count, seat) >= tab_count {
+                // Every tab still clears the floor: the shipped pressure split.
+                // u32 for the 60% product only: `band` is a u16 column count, and
+                // `band * 3` can overflow u16 on absurd-but-legal widths.
+                let selected = u16::try_from(u32::from(band) * 3 / 5)
+                    .unwrap_or(u16::MAX)
+                    .min(ACTIVE_TAB_PRESSURE_CAP_COLS)
+                    .max(share);
+                let inactive = (band.saturating_sub(selected) / (tab_count as u16 - 1)).max(1);
+                (selected, inactive)
+            } else {
+                // THE WINDOW. Count the seats against the band the MARKS leave
+                // (both of them, pessimistically — a mark whose end turns out
+                // not to overflow gives its column back rather than costing a
+                // seat that then has to be taken away again). The marks
+                // themselves need a band wide enough to still seat a chip at
+                // the floor beside them; below that the columns go to the chip
+                // and the strip windows silently, because a strip with no chip
+                // on it says even less than a strip with no mark.
+                let marked = band >= seat + 2;
+                let counted = if marked { band - 2 } else { band };
+                let (start, len) =
+                    strip_window(active, strip_seats(counted, tab_count, seat), tab_count);
+                seats = len;
+                first = start;
+                mark_left = marked && first > 0;
+                mark_right = marked && first + seats < tab_count;
+                let chip_band = band - u16::from(mark_left) - u16::from(mark_right);
+                // EQUAL SHARES, and no active reservation. The reservation is
+                // the answer to COMPRESSION — "the one title the user is
+                // reading must survive the squeeze" — and a window is what the
+                // strip does INSTEAD of compressing: every chip it seats
+                // already clears the floor, so there is no squeeze left to
+                // exempt anyone from. Charging for it twice bought nothing and
+                // cost two things. It made the seated geometry depend on WHICH
+                // chip is selected, which is the drift [`strip_window`]
+                // describes, still leaking in through the widths after the
+                // paging fixed the anchor; and on a page shorter than the band
+                // it made the ACTIVE chip the NARROW one (capped at
+                // [`ACTIVE_TAB_PRESSURE_CAP_COLS`] while its quiet neighbours
+                // divided the rest). Equal shares are the strip's own rule for
+                // chips that fit, which is exactly what these are — and they
+                // make the whole seated layout a function of the PAGE, so
+                // selecting a chip the strip is already showing moves nothing
+                // at all: not the chips, not the close columns, not the marks.
+                //
+                // The division's remainder stays BAND, as it always has.
+                let per = (chip_band / seats.max(1) as u16).max(1);
+                (per, per)
+            }
         } else {
             (per, per)
         };
-        for i in 0..tab_count {
+        x += u16::from(mark_left);
+        for i in first..(first + seats).min(tab_count) {
             let per = if i == active { active_w } else { inactive_w };
             if per == 0 || x >= avail {
                 break; // out of room: remaining tabs are not drawn (still reachable)
@@ -843,6 +1162,10 @@ pub fn layout_segments(
             });
             x = end;
         }
+        // The trailing mark's own column, so the `+` lands past it rather than
+        // on it — the mark is band furniture and owns no hit target, but it
+        // must not share a cell with one either.
+        x = x.saturating_add(u16::from(mark_right)).min(avail);
     }
     // Trailing `+` (open a tab), placed flush after the last tab when it fits.
     if plus_room {
@@ -860,9 +1183,20 @@ pub fn layout_segments(
 }
 
 /// Canonical-presentation-aware layout used by the shipping strip.  The base segment
-/// widths, order, select hit areas, reorder geometry, and trailing `+` remain exactly
+/// order, select hit areas, reorder geometry, and trailing `+` remain exactly
 /// [`layout_segments`]'s.  Only a tab explicitly marked non-closable loses its close
 /// column; no icon/status field can shrink or move a hit target.
+///
+/// ...AND THE LEGIBILITY FLOOR IS MEASURED ON THIS STRIP'S CHIPS. The one thing
+/// the metadata is allowed to move is the WIDTH AT WHICH THE STRIP GIVES UP ON
+/// EQUAL SHARES ([`strip_seat_cols`]) — because a busy chip's title is three
+/// cells shorter than an idle one's at the same width, and a floor tested
+/// against the segment promised those three cells to a title that never got
+/// them. Eight busy shells at 100 columns each held a chip exactly at the floor
+/// and painted `1  2  3  4  5  6  7`. Above the floor nothing moves: while the
+/// shares are legible for the chrome the tabs wear, this function's output is
+/// [`layout_segments`]'s to the column, so the hover-reserved `✕` still cannot
+/// be moved by a tab going busy on a strip that has width to spare.
 #[must_use]
 pub(crate) fn layout_segments_with_metadata(
     cols: u16,
@@ -871,7 +1205,13 @@ pub(crate) fn layout_segments_with_metadata(
     active: usize,
     show_update: bool,
 ) -> Vec<TabSegment> {
-    let mut segments = layout_segments(cols, tab_count, active, show_update);
+    let mut segments = layout_segments_seated(
+        cols,
+        tab_count,
+        active,
+        show_update,
+        strip_seat_cols(tab_count, metadata),
+    );
     for segment in &mut segments {
         let TabHit::Select(index) = segment.kind else {
             continue;
@@ -920,6 +1260,82 @@ pub fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
         }
     }
     None
+}
+
+/// Where the strip's WINDOW continues past its own edges — the columns the
+/// `‹` / `›` overflow marks paint on, or `None` for an edge that reaches the
+/// end of the tab list.
+///
+/// Read back OUT OF THE SEGMENTS, exactly as [`hit_test`] is, and by both
+/// painters: the cell lane draws the glyph and the pixel band punches its
+/// column through to it. The layout reserved these columns
+/// ([`layout_segments`]); this function only names them, and only ever names a
+/// column NO segment covers — so a mark can never land on a hit target, and
+/// the strip's one column→[`TabHit`] map stays the whole truth about what a
+/// click does.
+///
+/// The marks are SIGNS, not buttons — the same choice [`paint_rename_field`]'s
+/// `‹`/`›` make. There is no scroll offset for a button to move: the window is
+/// a function of the selection, so "scroll without selecting" names nothing
+/// this strip can do. Reaching a marked-off tab is selecting it — by cycling,
+/// by `switch_tab_<n>`, or by walking the selection to the edge.
+#[must_use]
+pub(crate) fn strip_overflow(segments: &[TabSegment], tab_count: usize) -> StripOverflow {
+    let mut lo: Option<(usize, u16)> = None;
+    let mut hi: Option<(usize, u16)> = None;
+    for seg in segments {
+        let TabHit::Select(i) = seg.kind else {
+            continue;
+        };
+        // The SOLO band is the window's title, not a switcher, and it is the
+        // one tab there is: nothing to overflow.
+        if seg.solo {
+            return StripOverflow::NONE;
+        }
+        if lo.is_none_or(|(j, _)| i < j) {
+            lo = Some((i, seg.start_col));
+        }
+        if hi.is_none_or(|(j, _)| i > j) {
+            hi = Some((i, seg.end_col));
+        }
+    }
+    let free = |col: u16| {
+        !segments
+            .iter()
+            .any(|seg| col >= seg.start_col && col < seg.end_col)
+    };
+    StripOverflow {
+        left: lo
+            .and_then(|(tab, start)| (tab > 0 && start > 0 && free(start - 1)).then(|| start - 1)),
+        right: hi.and_then(|(tab, end)| (tab + 1 < tab_count && free(end)).then_some(end)),
+    }
+}
+
+/// The two overflow-mark columns [`strip_overflow`] resolves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct StripOverflow {
+    /// The column carrying `‹` — tabs before the window's first chip.
+    pub(crate) left: Option<u16>,
+    /// The column carrying `›` — tabs after the window's last chip.
+    pub(crate) right: Option<u16>,
+}
+
+impl StripOverflow {
+    /// Neither edge overflows: every tab is on the strip.
+    pub(crate) const NONE: Self = Self {
+        left: None,
+        right: None,
+    };
+
+    /// The mark columns that exist, in strip order — what both painters walk.
+    pub(crate) fn columns(self) -> impl Iterator<Item = (u16, char)> {
+        [
+            self.left.map(|col| (col, STRIP_OVERFLOW_LEFT)),
+            self.right.map(|col| (col, STRIP_OVERFLOW_RIGHT)),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 /// What a strip cell represents, selecting its precomputed tone in [`strip_cell`].
@@ -1682,6 +2098,7 @@ fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
         strikethrough: false,
         overline: false,
         underline_color,
+        overline_color: None,
     }
 }
 
@@ -2261,6 +2678,16 @@ fn paint_strip_impl(
             TabHit::Close(_) | TabHit::Connector(_) => {}
         }
     }
+    // THE WINDOW'S EDGES ([`strip_overflow`]). Painted after the segments, on
+    // columns no segment covers, in the band's own dim ink — furniture, like
+    // the gutter it sits in, not a chip and not a button. The pixel band leaves
+    // these columns to this lane ([`pixel_band`]), so the mark is one glyph in
+    // one place on both.
+    for (col, mark) in strip_overflow(segments, titles.len()).columns() {
+        if let Some(slot) = row.get_mut(usize::from(col)) {
+            *slot = strip_cell(mark, &colors, StripRole::Inactive);
+        }
+    }
     images.sort_unstable_by_key(|(col, _)| *col);
     (images, rename_caret)
 }
@@ -2591,6 +3018,13 @@ fn append_status_image(
 const RENAME_SCROLL_LEFT: char = '‹';
 const RENAME_SCROLL_RIGHT: char = '›';
 
+/// Clipped-edge markers for the STRIP's own window ([`strip_overflow`]) — the
+/// same two glyphs, because a strip that continues past its edge is making the
+/// same statement the rename well makes, about tabs instead of characters. One
+/// vocabulary for "there is more this way", wherever the band clips something.
+const STRIP_OVERFLOW_LEFT: char = RENAME_SCROLL_LEFT;
+const STRIP_OVERFLOW_RIGHT: char = RENAME_SCROLL_RIGHT;
+
 /// Paint the inline SESSION-RENAME field across `field` (a column range of `row`):
 /// a recessed well holding the visible slice of `text`, with a REVERSE-VIDEO block
 /// caret on the character at `cursor`.
@@ -2911,18 +3345,26 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// SUBJECT BEFORE STATE. The pairwise shed alone cannot find the composed state
 /// clause: a strip of twins shares its title WHOLE (nothing to subtract) and a
 /// strip mid-work shares no ending at all (`· Ready in aterm` beside `· Typing
-/// a command`). So every clustered member also sheds its own state clause
-/// ([`state_clause_bytes`]) before the cut — measured on Windows, eight shells
-/// in one directory: the selected chip spent its whole window on `…in aterm`,
-/// and a capture later on `…a command`, while the directory and the program
-/// that would have named it were cut away.
+/// a command`). So every chip this pass TAIL-CUTS sheds its own state clause
+/// first ([`cut_core`]) — measured on Windows, eight shells in one directory:
+/// the selected chip spent its whole window on `…in aterm`, and a capture later
+/// on `…a command`, while the directory and the program that would have named
+/// it were cut away. Every chip, and not every CLUSTERED chip, because the two
+/// are not the same set: the cluster admission asks for a shared HEAD that
+/// dominates the window, and eight shells share only `claude · ` — nine cells,
+/// which dominates a fourteen-cell window and not a nineteen-cell one. At 98
+/// columns the strip seats four such chips at nineteen and the selected one
+/// fell through to the dialect flip below, which tail-cut the raw title and
+/// painted the state after all. A chip's name may not turn on which door it
+/// came through.
 ///
 /// TWINS get their ORDINAL: when several cut tabs carry one identical SUBJECT,
 /// no cut can tell them apart — ten shells in one cwd under pressure rendered
 /// ten copies of `…d`, nine meaningless stubs (measured; the audit's capture).
 /// Text cannot distinguish them, so their POSITION does: each non-active twin
-/// is labelled with its 1-based STRIP POSITION — `2 · …~/aterm` when the window
-/// affords a tail, bare `2` when it doesn't — which for the first nine tabs is
+/// is labelled with its 1-based position in the window's TAB ORDER (not among
+/// the painted chips — see [`ordinal_chip_label`]) — `2 · …~/aterm` when the
+/// chip affords a tail, bare `2` when it doesn't — which for the first nine is
 /// also the number the `switch_tab_<n>` action takes, and past that is a
 /// position and nothing more ([`ordinal_chip_label`] documents exactly what the
 /// number does and does not promise). Twins by SUBJECT rather than by title,
@@ -2958,12 +3400,28 @@ fn distinct_chip_labels(
     // The strip is UNDER PRESSURE when any chip was compressed below the
     // legibility floor — `layout_segments` only ever emits such a segment on
     // its pressure branch (equal shares are floored at
-    // [`PREFERRED_MIN_TAB_COLS`] by the branch condition itself).
-    let pressure = segments.iter().any(|seg| {
-        matches!(seg.kind, TabHit::Select(_))
-            && !seg.solo
-            && seg.end_col.saturating_sub(seg.start_col) < PREFERRED_MIN_TAB_COLS
-    });
+    // [`PREFERRED_MIN_TAB_COLS`] by the branch condition itself) — OR when it
+    // could not seat every tab and showed a WINDOW instead
+    // ([`STRIP_SEATS_FLOOR`]).
+    //
+    // THE WINDOW IS THE SAME PRESSURE, answered a different way. This flag
+    // exists for the ONE DIALECT rule at the end of this function: a strip
+    // whose windows are tight enough for a flipped family to sit beside a
+    // head-cut loner must not mix the two. Seating fewer chips is what the
+    // layout does INSTEAD of compressing them past the floor, so reading the
+    // flag off chip width alone would switch the rule off exactly where the
+    // strip is most starved — the windowed chips sit AT the floor, and a
+    // seven-cell title window is where `…oml` beside `REA…` reads worst.
+    let seated = segments
+        .iter()
+        .filter(|seg| matches!(seg.kind, TabHit::Select(_)) && !seg.solo)
+        .count();
+    let pressure = seated < titles.len()
+        || segments.iter().any(|seg| {
+            matches!(seg.kind, TabHit::Select(_))
+                && !seg.solo
+                && seg.end_col.saturating_sub(seg.start_col) < PREFERRED_MIN_TAB_COLS
+        });
     // (tab, its title width budget) for every label the first cut shortened.
     let mut cut: Vec<(usize, usize)> = Vec::new();
     for seg in segments {
@@ -2977,8 +3435,25 @@ fn distinct_chip_labels(
         let layout = tab_content_layout(seg, item.unwrap_or(PLAIN_TAB));
         let avail = usize::from(layout.title_end.saturating_sub(layout.title_start));
         let raw = titles[i].as_str();
-        labels[i] = Some(truncate_title(raw, avail));
-        if strip_display_cells(raw) > avail {
+        let over = strip_display_cells(raw) > avail;
+        // THE THIRD DOOR. `cut_core` made the shed a property of the CUT rather
+        // than of cluster admission, and routed the cluster arm and the
+        // one-dialect flip through it. Both of those still sit BEHIND a cluster:
+        // the flip runs only `if pressure && any_cluster`. So a pressured strip
+        // with NO cluster anywhere — eight different projects, each with its own
+        // activity clause, sharing no head to be admitted on — reaches neither,
+        // falls through to this first cut of the whole composed title, and spends
+        // every window on the half that names no tab.
+        //
+        // Shedding is a property of ONE title, so it belongs on the path every
+        // cut tab takes. A title with no separator sheds nothing
+        // (`state_clause_bytes` returns 0, including where a shed would leave no
+        // subject), and a title that FITS is still shown whole, state and all —
+        // only a cut sheds. `cut_core` with no pairwise suffix is exactly "this
+        // title minus its own state clause".
+        let source = if over { cut_core(raw, 0) } else { raw };
+        labels[i] = Some(truncate_title(source, avail));
+        if over {
             cut.push((i, avail));
         }
     }
@@ -3036,7 +3511,7 @@ fn distinct_chip_labels(
         // `…in aterm` and `…a command` — measured, eight shells, one cwd.
         // Whichever is longer wins: a cluster whose shared ending reaches past
         // the separator into the subject keeps shedding that far.
-        let core = clustered_core(&titles[i], suffix);
+        let core = cut_core(&titles[i], suffix);
         // Prefer the cut at the last word boundary inside the shared head:
         // `…~/aterm` reads as the path it is, where a raw tail-keep pads the
         // width with a `…ower: ` fragment of the shared prompt.
@@ -3072,7 +3547,7 @@ fn distinct_chip_labels(
         // keeps as much of the real subject as fits.
         let twins = members
             .iter()
-            .filter(|&&m| clustered_core(&titles[m], suffix) == core)
+            .filter(|&&m| cut_core(&titles[m], suffix) == core)
             .count();
         if twins >= 2 && i != active {
             labels[i] = Some(ordinal_chip_label(
@@ -3132,7 +3607,22 @@ fn distinct_chip_labels(
             {
                 suffix = 0;
             }
-            let core = &titles[i][..titles[i].len() - suffix];
+            // ...AND ITS OWN STATE CLAUSE, unconditionally ([`cut_core`]).
+            // The pairwise shed above cannot find it: a loner mid-work shares
+            // no ending with anyone (`· Typing a command` beside seven
+            // `· Ready in aterm`), so `furniture` is 0 and the tail cut keeps
+            // the very clause the strip is not there to paint — measured at 98
+            // columns, four seated `claude` shells, the selected one painting
+            // `…Typing a command` while the program that names it was cut
+            // away. It is the defect the cluster arm already answers, reached
+            // through the door the cluster admission (a shared HEAD that
+            // dominates the window) does not open: eight shells share only
+            // `claude · `, which is nine cells of a nineteen-cell window. The
+            // guard above is about DISTINGUISHING text outranking a shed; the
+            // state clause distinguishes nothing — every idle tab says it
+            // identically and it changes as the user types — so no width buys
+            // it a keep.
+            let core = cut_core(&titles[i], suffix);
             let mut cand = truncate_title_tail(core, avail);
             // SURVIVOR CHECK. The guard above declines to shed while
             // distinguishing characters still reach the screen — but the cut
@@ -3145,8 +3635,7 @@ fn distinct_chip_labels(
                 let painted = cand.trim_start_matches('…').trim_start();
                 let shed_tail = titles[i][titles[i].len() - furniture..].trim_start();
                 if !painted.is_empty() && shed_tail.ends_with(painted) {
-                    let shed_core = &titles[i][..titles[i].len() - furniture];
-                    let recut = truncate_title_tail(shed_core, avail);
+                    let recut = truncate_title_tail(cut_core(&titles[i], furniture), avail);
                     if !recut.trim_start_matches('…').trim().is_empty() {
                         cand = recut;
                     }
@@ -3225,10 +3714,15 @@ fn furniture_survivor_recut(
 /// nothing but the shared furniture names no tab, and painting it after the
 /// ordinal only spends the window twice.
 ///
-/// WHAT THE NUMBER PROMISES, exactly. It is the tab's POSITION on the strip,
-/// left to right (1-based) — what the strip is ordered by and what the user
-/// counts. Whether it is also an ADDRESS depends on the platform, and on the two
-/// that paint these ordinals the honest answer is "only if you bound one":
+/// WHAT THE NUMBER PROMISES, exactly. It is the TAB's 1-based position in the
+/// window's tab order — what the strip is ordered by and what the user counts.
+/// Not its position among the painted CHIPS: a strip too narrow to seat every
+/// tab shows a window of them ([`STRIP_SEATS_FLOOR`]), and the leftmost card
+/// there can read `4`. That is the number that stays put while the strip
+/// scrolls under it, and the number `switch_tab_4` takes — a seat index would
+/// name a different tab every time the window moved. Whether it is also an
+/// ADDRESS depends on the platform, and on the two that paint these ordinals
+/// the honest answer is "only if you bound one":
 ///
 /// * The ACTION exists everywhere: [`crate::keybinding::Action::parse`] accepts
 ///   `switch_tab_1`..`switch_tab_9` and NOTHING above nine, on every platform
@@ -3296,15 +3790,28 @@ fn ordinal_chip_label(
     digits
 }
 
-/// What ONE clustered chip is cut from: its title with the cluster's shared
-/// ending and its own composed STATE clause taken off, whichever reaches
-/// further back ([`state_clause_bytes`], [`distinct_chip_labels`]).
+/// What ONE chip's TAIL CUT is taken from: its title with the shared ending
+/// this pass computed for it and its own composed STATE clause taken off,
+/// whichever reaches further back ([`state_clause_bytes`],
+/// [`distinct_chip_labels`]).
 ///
-/// `shared` is the cluster's pairwise common suffix in bytes. A member the
-/// whole of whose title is that suffix (the byte-identical twins) contributes
-/// nothing pairwise — shedding it all would leave no title to cut — so the
-/// state clause is what answers there, and it answers alone.
-fn clustered_core(title: &str, shared: usize) -> &str {
+/// EVERY TAIL CUT, not only a cluster's. The tail dialect exists to keep the
+/// END of a title, which is exactly where the composed state clause lives, so
+/// a tail cut of a raw title spends the window on the moment the tab is having
+/// — the defect this module was measured painting twice (`…in aterm`, then
+/// `…a command`, on eight shells in one directory). Both doors into a tail cut
+/// therefore come through here: the CLUSTER arm, whose `shared` is the family's
+/// pairwise common suffix, and the one-dialect FLIP, whose `shared` is the
+/// strip furniture the loner shares with two or more other cut chips. Reaching
+/// the second door through the first's helper is the point — a chip's name must
+/// not depend on whether the cluster admission happened to catch it, and at 98
+/// columns it did not.
+///
+/// `shared` is that pairwise suffix in bytes. A chip the whole of whose title
+/// is that suffix (the byte-identical twins) contributes nothing pairwise —
+/// shedding it all would leave no title to cut — so the state clause is what
+/// answers there, and it answers alone.
+fn cut_core(title: &str, shared: usize) -> &str {
     let pairwise = if shared >= title.len() { 0 } else { shared };
     let shed = pairwise.max(state_clause_bytes(title));
     &title[..title.len() - shed]
@@ -4041,6 +4548,16 @@ pub(crate) mod pixel_band {
                 }
                 TabHit::Close(_) => {}
             }
+        }
+        // THE WINDOW'S EDGE MARKS ([`strip_overflow`]) go to the CELL painter,
+        // the same way the rename well's own `‹`/`›` do: one glyph, one lane,
+        // no second drawing of it to drift. The band is opaque edge to edge, so
+        // the mark's column has to be uncovered for the cell glyph underneath
+        // to show at all — and `StripRole::Inactive` paints it on `band_bg`,
+        // the very tone this raster fills that column with, so the punched
+        // column is invisible as a seam.
+        for (col, _) in strip_overflow(input.segments, input.titles.len()).columns() {
+            fallback.push((col, col.saturating_add(1)));
         }
         if !drew_any {
             return None;
@@ -5088,6 +5605,62 @@ pub(crate) mod pixel_band {
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
+        /// THE WINDOW'S EDGE MARKS REACH THE LANE THE USER SEES. The band is an
+        /// opaque bar edge to edge, so a `‹` the cell painter wrote under it is
+        /// invisible unless the band leaves that column alone — and a window
+        /// that hides three tabs while showing no mark is worse than the
+        /// compression it replaced. The mark columns are therefore FALLBACK
+        /// columns, the same escape the rename well's own `‹`/`›` take, and
+        /// every other column stays covered.
+        ///
+        /// TWENTY TABS, AND A SELECTION ON AN INTERIOR PAGE. The strip pages
+        /// ([`strip_window`]) rather than centring a run on the selection, so
+        /// "both edges clip" is a statement about WHICH PAGE is showing, not
+        /// about where in the list the selection sits: eighty columns seat six
+        /// chips, which pages twenty tabs into four fives, and tab 7 is on the
+        /// second of them — tabs before it and tabs after it, so both marks.
+        #[test]
+        fn the_overflow_marks_are_punched_through_to_the_cell_painter() {
+            if !with_ui_faces() {
+                return;
+            }
+            let metadata = plain(20);
+            let segments = layout_segments_with_metadata(80, 20, &metadata, 7, false);
+            let titles: Vec<String> = (0..20).map(|i| format!("job-{i}")).collect();
+            let marks = strip_overflow(&segments, titles.len());
+            assert_eq!(
+                (marks.left.is_some(), marks.right.is_some()),
+                (true, true),
+                "twenty tabs on eighty columns, selected on an interior page: \
+                 both edges clip"
+            );
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry(80, 1),
+            );
+            let rows = raster_band(&input, &[]).expect("UI faces installed ⇒ a band");
+            let covered: Vec<usize> = rows[0].iter().map(|(c, _)| *c).collect();
+            for (col, _) in marks.columns() {
+                assert!(
+                    !covered.contains(&usize::from(col)),
+                    "the band covered the mark at {col}, so nothing is painted there"
+                );
+            }
+            for col in 0..80usize {
+                if marks.columns().any(|(mark, _)| usize::from(mark) == col) {
+                    continue;
+                }
+                assert!(
+                    covered.contains(&col),
+                    "column {col} is neither band nor mark"
+                );
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
         #[test]
         fn label_ink_lands_inside_its_title_span_and_is_vertically_centred() {
             if !with_ui_faces() {
@@ -5589,18 +6162,17 @@ pub(crate) mod pixel_band {
             for cols in [80u16, 130, 200] {
                 let segments =
                     layout_segments_with_metadata(cols, titles.len(), &metadata, 0, false);
-                let cell: Vec<String> =
-                    distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
-                        .into_iter()
-                        .map(Option::unwrap)
-                        .collect();
+                // Indexed by TAB, and `None` for a tab the strip's window
+                // ([`STRIP_SEATS_FLOOR`]) did not seat — those chips are not
+                // painted, so they are not the band's to fit either.
+                let cell = distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None);
                 let entries: Vec<BandLabel> = segments
                     .iter()
                     .filter_map(|seg| match seg.kind {
                         TabHit::Select(i) => Some(BandLabel {
                             tab: i,
                             span_px: window(seg).1,
-                            text: cell[i].clone(),
+                            text: cell[i].clone().expect("a seated chip is labelled"),
                         }),
                         _ => None,
                     })
@@ -6176,13 +6748,13 @@ pub(crate) mod pixel_band {
                     }
                     let path = dir.join(format!("{name}-{cols}c.png"));
                     let file = std::fs::File::create(&path).expect("create png");
-                    let mut encoder = png::Encoder::new(
+                    let mut encoder = aterm_png::Encoder::new(
                         std::io::BufWriter::new(file),
                         (w * ZOOM) as u32,
                         (h * ZOOM) as u32,
                     );
-                    encoder.set_color(png::ColorType::Rgb);
-                    encoder.set_depth(png::BitDepth::Eight);
+                    encoder.set_color(aterm_png::ColorType::Rgb);
+                    encoder.set_depth(aterm_png::BitDepth::Eight);
                     encoder
                         .write_header()
                         .expect("png header")
@@ -8131,20 +8703,38 @@ mod tests {
 
     /// A narrow strip drops the close `x` (segments below MIN_SEG_WITH_CLOSE) but
     /// the tab is still clickable to SELECT — close just isn't offered.
+    ///
+    /// The rule is per SEGMENT, not per strip, and the window
+    /// ([`STRIP_SEATS_FLOOR`]) is why that distinction now shows: 9 columns and
+    /// 3 tabs used to be three 2-cell chips, and is now the two-seat minimum
+    /// ([`STRIP_MIN_SEATS`]) — the selected chip taking what the band has and
+    /// its neighbour the one column left. So the assertion is the rule itself
+    /// (a close column exists exactly where the segment can carry one), pinned
+    /// on a strip that still produces a segment too narrow for it.
     #[test]
     fn narrow_tab_drops_close_but_selectable() {
-        // 9 cols, 3 tabs → each tab is (9-3)/3 = 2 cells wide: too narrow for a close x.
         let segs = layout_segments(9, 3, 0, false);
         let tabs: Vec<_> = segs
             .iter()
             .filter(|s| matches!(s.kind, TabHit::Select(_)))
             .collect();
         assert!(!tabs.is_empty());
+        let mut saw_narrow = false;
         for t in &tabs {
-            assert!(t.close_col.is_none(), "narrow tab has no close x: {t:?}");
+            let width = t.end_col - t.start_col;
+            assert_eq!(
+                t.close_col.is_some(),
+                width >= MIN_SEG_WITH_CLOSE,
+                "a close x exists exactly where the segment can carry one: {t:?}"
+            );
+            saw_narrow |= width < MIN_SEG_WITH_CLOSE;
             // Still selectable.
             assert_eq!(hit_test(&segs, t.start_col), Some(t.kind));
         }
+        assert!(
+            saw_narrow,
+            "the case is still reachable — a segment too narrow for a close x: {tabs:?}"
+        );
     }
 
     /// Title truncation: a long title is cut to `max` cells with a trailing `…`; a
@@ -8225,6 +8815,34 @@ mod tests {
     /// branching in place, and this helper is that fix as a named idiom.
     fn on_band<'a>(chip_card: &'a str, padless: &'a str) -> &'a str {
         if STRIP_CHIP_CARDS { chip_card } else { padless }
+    }
+
+    /// `(tab, label)` for every chip the strip SEATS, in strip order — what a
+    /// reader can actually see.
+    ///
+    /// [`distinct_chip_labels`] is indexed by TAB and leaves `None` wherever
+    /// the window ([`STRIP_SEATS_FLOOR`]) seated no chip, so a test that
+    /// unwraps the whole vector is asserting about tabs that are not on the
+    /// strip at all. This helper asks the question the painter asks.
+    fn seated(segments: &[TabSegment], titles: &[String], active: usize) -> Vec<(usize, String)> {
+        let labels = distinct_chip_labels(segments, titles, None, active, None);
+        segments
+            .iter()
+            .filter_map(|seg| match seg.kind {
+                TabHit::Select(i) => {
+                    Some((i, labels[i].clone().expect("a seated chip is labelled")))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Just the painted strings of [`seated`], for a whole-strip pin.
+    fn seated_labels(segments: &[TabSegment], titles: &[String], active: usize) -> Vec<String> {
+        seated(segments, titles, active)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
     }
 
     /// THE FOUR-IDENTICAL-TABS DEFECT, fixed at the pass that owns it: four
@@ -8437,6 +9055,51 @@ mod tests {
     /// alone differs), the strip must name the same eight tabs the same way.
     /// That is what makes twins a question about SUBJECTS rather than titles —
     /// a label that flips to `…a command` while the user types is not a name.
+    /// SUBJECT BEFORE STATE WITH NO CLUSTER TO CARRY IT — the third door.
+    ///
+    /// `cut_core` made the shed a property of the cut and gave the cluster arm
+    /// and the one-dialect flip a shared way through it. Both still sit behind a
+    /// CLUSTER: the flip runs only `if pressure && any_cluster`. A strip whose
+    /// tabs share no head at all reaches neither, so every chip fell through to
+    /// the plain first cut of its WHOLE composed title and painted
+    /// `…y in aterm` / `…a command` — the defect `473d42bf` set out to end,
+    /// surviving in the one shape no cluster can rescue.
+    ///
+    /// BAND-INDEPENDENT by construction: it asserts what a label must NOT say,
+    /// never a width, so the chip-card interior pad cannot move it.
+    #[test]
+    fn a_loner_sheds_its_state_clause_with_no_cluster_to_carry_it() {
+        let titles: Vec<String> = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            if i % 2 == 0 {
+                format!("{subject} · Ready in aterm")
+            } else {
+                format!("{subject} · Typing a command")
+            }
+        })
+        .collect();
+        // No two of these share a head, so `lcp_cells * 2 >= avail` fails for
+        // every pair and the union-find leaves eight singletons — no cluster for
+        // either of the other two doors to open.
+        let segments = layout_segments(80, titles.len(), 0, false);
+        let resolved = seated_labels(&segments, &titles, 0);
+        assert!(!resolved.is_empty(), "the strip seats something");
+        for label in &resolved {
+            assert!(
+                !label.contains("Ready")
+                    && !label.contains("Typing")
+                    && !label.contains("command")
+                    && !label.contains("aterm"),
+                "a chip with no cluster still names its tab, not the moment it \
+                 is having: {resolved:?}"
+            );
+        }
+    }
+
     #[test]
     fn eight_shells_in_one_cwd_name_their_subject_not_their_state() {
         let idle: Vec<String> = (0..8)
@@ -8468,19 +9131,45 @@ mod tests {
                 );
             }
 
-            // The PHOTOGRAPHED width: 80 cols, where the pressure layout leaves
-            // a quiet chip four title cells — a window no name fits in, so the
-            // position is all that is left to say (the ordinal's floor, and the
-            // only rung of this that a narrow strip cannot climb off). The
-            // selected chip's reserved width still names it.
+            // THE PHOTOGRAPHED WIDTH: 80 cols. Eight chips here is eight
+            // 8-column cards — four title cells each — and four cells fit no
+            // name at all, so every quiet chip fell back to a bare ordinal and
+            // the strip said nothing seven times. It does not seat eight chips
+            // any more ([`STRIP_SEATS_FLOOR`]): it seats the PAGE the selection
+            // is on — four 19-column chips, a 14-cell title each — marks the
+            // page it clipped (`‹`), and every seated chip carries its position
+            // AND its whole subject.
             let segments = layout_segments(80, titles.len(), 7, false);
-            let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 7, None)
-                .into_iter()
-                .map(Option::unwrap)
-                .collect();
-            assert_eq!(resolved[7], "claude", "{capture}: {resolved:?}");
-            for (i, label) in resolved.iter().enumerate().take(7) {
-                assert_eq!(label, &(i + 1).to_string(), "{capture}: {resolved:?}");
+            let seats = seated(&segments, &titles, 7);
+            assert_eq!(
+                seats.iter().map(|(tab, _)| *tab).collect::<Vec<_>>(),
+                [4, 5, 6, 7],
+                "{capture}: the window is the selection's PAGE"
+            );
+            assert_eq!(
+                strip_overflow(&segments, titles.len()),
+                StripOverflow {
+                    left: Some(0),
+                    right: None
+                },
+                "{capture}: and says so at the edge it clips"
+            );
+            for (tab, label) in &seats {
+                if *tab == 7 {
+                    assert_eq!(label, "claude", "{capture}: {seats:?}");
+                    continue;
+                }
+                assert_eq!(
+                    label,
+                    &format!("{} · claude", tab + 1),
+                    "{capture}: a quiet chip carries its position AND what it \
+                     is, where it painted a bare number: {seats:?}"
+                );
+                assert_ne!(
+                    label,
+                    &(tab + 1).to_string(),
+                    "{capture}: the bare ordinal is the defect: {seats:?}"
+                );
             }
 
             // AND AT NO WIDTH the strip can still say something does a chip
@@ -8489,21 +9178,139 @@ mod tests {
             // painting its subject first, which is the whole point.)
             for cols in [80u16, 98, 120, 160] {
                 let segments = layout_segments(cols, titles.len(), 7, false);
-                let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 7, None)
-                    .into_iter()
-                    .map(Option::unwrap)
-                    .collect();
+                let resolved = seated_labels(&segments, &titles, 7);
                 for (i, label) in resolved.iter().enumerate() {
                     assert!(
                         !label.contains("Ready")
                             && !label.contains("Typing")
                             && !label.contains("command"),
-                        "{capture} at {cols} cols: tab {i} spends its window on \
+                        "{capture} at {cols} cols: chip {i} spends its window on \
                          the state: {resolved:?}"
                     );
                 }
             }
         }
+    }
+
+    /// SUBJECT BEFORE STATE IS A LAW OF THE CUT, at EVERY width — not a
+    /// property of whichever chips the cluster admission happened to catch.
+    ///
+    /// `eight_shells_in_one_cwd_name_their_subject_not_their_state` samples
+    /// four widths, and the hole was between two of them. The cluster admits a
+    /// pair when their shared HEAD covers half the label window, so admission
+    /// is a race between the shared prefix (`claude · `, nine cells, fixed) and
+    /// the window (a function of the width, the seat count and the page). At
+    /// 98 columns the strip seats a four-chip page nineteen cells wide, `18 >=
+    /// 19` is false, and the busy shell fell out of its own family into the
+    /// one-dialect flip — which tail-cut the raw title and painted
+    /// `…Typing a command`, the exact string the family arm exists to prevent.
+    /// Sampling cannot police a threshold; this walks every width the layout
+    /// can be given.
+    ///
+    /// THE LAW, stated so it survives a roomy strip: a chip may show its state
+    /// only AFTER it has named its subject. A window with room for
+    /// `claude · Typing a …` is painting its subject first, which is the point;
+    /// a window that spends itself on the state alone has named no tab. So the
+    /// assertion is positional, not a forbidden-substring list — the form the
+    /// four-width pin above could not take, and the reason it needed a list of
+    /// widths at all.
+    #[test]
+    fn a_cut_chip_names_its_subject_before_its_state_at_every_width() {
+        let idle: Vec<String> = (0..8)
+            .map(|_| "claude · Ready in aterm".to_string())
+            .collect();
+        let mut typing = idle.clone();
+        typing[7] = "claude · Typing a command".to_string();
+        let mut chips = 0usize;
+        for (capture, titles) in [("idle", idle), ("typing", typing)] {
+            for cols in 40..=240u16 {
+                let segments = layout_segments(cols, titles.len(), 7, false);
+                for (tab, label) in seated(&segments, &titles, 7) {
+                    chips += 1;
+                    assert!(
+                        !label.is_empty() && label != "…",
+                        "{capture} at {cols} cols: chip {tab} says nothing ({label:?})"
+                    );
+                    assert!(
+                        !label.chars().all(|c| c.is_ascii_digit()),
+                        "{capture} at {cols} cols: chip {tab} is the bare ordinal {label:?}"
+                    );
+                    let Some(state) = ["Ready", "Typing", "command", "in aterm"]
+                        .iter()
+                        .filter_map(|word| label.find(word))
+                        .min()
+                    else {
+                        continue;
+                    };
+                    let subject = label.find("claude").unwrap_or_else(|| {
+                        panic!(
+                            "{capture} at {cols} cols: chip {tab} spends its window on the \
+                             state and never names its subject: {label:?}"
+                        )
+                    });
+                    assert!(
+                        subject < state,
+                        "{capture} at {cols} cols: chip {tab} leads with the moment it is \
+                         having: {label:?}"
+                    );
+                }
+            }
+        }
+        assert!(chips > 1000, "vacuous: only {chips} chips were labelled");
+    }
+
+    /// ...AND THE SHED REACHES THE LONER ARM, on a strip whose chips are not
+    /// twins at all — the door the fix had to be taken through, exercised on
+    /// its own fixture so the law is not a fact about eight `claude` shells.
+    ///
+    /// Three tabs seated under pressure: a shared-title FAMILY that clusters,
+    /// and one unrelated shell mid-build that clusters with nobody (no shared
+    /// head) and shares no ENDING with them either (`· Building the project`
+    /// beside `· Ready`), so the pairwise furniture shed finds nothing to take.
+    /// One dialect makes it tail-cut with the family, and a tail cut of the raw
+    /// title is the whole defect: it painted `…project`, naming the moment. Its
+    /// own state clause is shed first now ([`cut_core`]), so the tail lands on
+    /// `build` — the program the tab is running, which is what the chip is for.
+    #[test]
+    fn the_one_dialect_flip_cuts_the_subject_not_the_state() {
+        let titles = [
+            "Settings.toml · Ready".to_string(),
+            "Settings.toml · Ready".to_string(),
+            "cargo build · Building the project".to_string(),
+            "README.md · Ready".to_string(),
+            "Setup.sh · Ready".to_string(),
+        ];
+        // 48 columns seats the first page of three 14-column chips — the
+        // narrowest strip that puts two clustered twins and a loner on one
+        // page, which is the only geometry where the flip is observable.
+        let segments = layout_segments(48, titles.len(), 0, false);
+        let seats = seated(&segments, &titles, 0);
+        assert_eq!(
+            seats.iter().map(|(tab, _)| *tab).collect::<Vec<_>>(),
+            [0, 1, 2],
+            "the fixture's geometry: family, family, loner on one page"
+        );
+        assert_eq!(
+            seats[2].1, "…build",
+            "the loner is named by what it is RUNNING, where it painted the \
+             phrase for what it is doing: {seats:?}"
+        );
+        for (tab, label) in &seats {
+            for moment in ["Ready", "Building", "project"] {
+                assert!(
+                    !label.contains(moment),
+                    "chip {tab} spends its window on the state: {seats:?}"
+                );
+            }
+        }
+        assert!(
+            seats[0].1.contains("toml") && seats[1].1.contains("toml"),
+            "the family still names the file it shares: {seats:?}"
+        );
+        assert!(
+            seats[1].1.starts_with("2 · "),
+            "and the non-active twin is still addressable: {seats:?}"
+        );
     }
 
     /// THE STATE CLAUSE IS NOT A NAME even when it is the only thing that
@@ -8578,72 +9385,132 @@ mod tests {
     /// shells in one cwd under the pressure layout rendered `…command` on the
     /// active chip and NINE copies of `…d` beside it — nine tabs, no way to
     /// name any of them. Byte-identical titles have no distinguishing text for
-    /// any cut to keep, so a non-active twin is labelled by its 1-based strip
-    /// POSITION (`switch_tab_<n>`'s number for the first nine): bare digits in a
-    /// two-cell window, `2 · …rm` where the window affords a tail. The ACTIVE
-    /// twin keeps as much real SUBJECT as its reserved pressure width fits —
-    /// `…~/aterm`, the cwd, the state clause having been shed before the cut.
+    /// any cut to keep, so a non-active twin is labelled by its 1-based
+    /// POSITION (`switch_tab_<n>`'s number for the first nine), with a tail of
+    /// the subject beside it. The ACTIVE twin keeps as much real SUBJECT as its
+    /// reserved pressure width fits — `…~/aterm`, the cwd, the state clause
+    /// having been shed before the cut.
+    ///
+    /// AND THE ORDINAL IS NEVER BARE HERE ANY MORE. A bare `2` was what the
+    /// ordinal fell back to when the chip's window could not seat `2 · …rm`
+    /// either — six title cells — and the strip does not build windows that
+    /// small now: it seats fewer chips instead ([`STRIP_SEATS_FLOOR`]). The
+    /// bare digits survive as [`ordinal_chip_label`]'s own floor, pinned by
+    /// `every_strip_width_labels_a_twin_honestly`; what this test pins is that
+    /// a strip at an ordinary width never reaches for them.
+    ///
+    /// ...AND THE WINDOW IS A PAGE, NOT A RUN CENTRED ON THE SELECTION
+    /// ([`strip_window`]). That is what the three selections below are for:
+    /// selecting a tab the strip is ALREADY SHOWING must leave the strip
+    /// byte-identical — same chips, same columns, same marks, only the
+    /// exemption moving from one label to another — and only a selection that
+    /// leaves the page turns it. Centring failed both: every click re-anchored
+    /// the strip, and the chip a second click landed on was a different tab.
+    ///
+    /// BOTH BAND GEOMETRIES ([`on_band`]). A chip-card band spends one title
+    /// cell on the card's interior pad ([`tab_content_layout`]), so the
+    /// 15-column seat this width produces keeps ten title cells there and
+    /// eleven on the padless bands. The ordinal's tail is cut to fill exactly
+    /// what is left, so it is one glyph longer where the pad is not charged
+    /// (`2 · …/aterm`) — the strip's own arithmetic, not a second answer.
+    /// Everything else here — the page, the marks, the numbering, the drift
+    /// claim — is the same on every band and is asserted once.
     #[test]
     fn byte_identical_tabs_under_pressure_are_addressable_by_ordinal() {
         let titles: Vec<String> = (0..10)
             .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
             .collect();
-        // 80 cols, 10 tabs → pressure: the active chip takes 18 cells, every
-        // inactive chip compresses to 6 (a 2-cell title window).
+        // 80 cols, 10 tabs → the band seats six chips at the floor, which pages
+        // ten tabs into two fives; the five it cannot reach are marked.
         let segments = layout_segments(80, titles.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
-            .into_iter()
-            .map(Option::unwrap)
-            .collect();
+        let resolved = seated(&segments, &titles, 0);
         assert_eq!(
-            resolved[0], "…~/aterm",
-            "the active twin keeps as much SUBJECT as its reserved width fits \
-             — the cwd its prompt names, not the `…command` its state clause \
-             used to leave there"
+            resolved,
+            [
+                (0, "…~/aterm".to_string()),
+                (1, on_band("2 · …aterm", "2 · …/aterm").to_string()),
+                (2, on_band("3 · …aterm", "3 · …/aterm").to_string()),
+                (3, on_band("4 · …aterm", "4 · …/aterm").to_string()),
+                (4, on_band("5 · …aterm", "5 · …/aterm").to_string()),
+            ],
+            "the active twin keeps as much SUBJECT as its width fits — the cwd \
+             its prompt names, not the `…command` its state clause used to \
+             leave there — and every other seated twin carries its number AND a \
+             piece of that same cwd"
         );
-        for (i, label) in resolved.iter().enumerate().skip(1) {
-            assert_eq!(
-                label,
-                &(i + 1).to_string(),
-                "a two-cell window carries the bare ordinal — tab {i} is \
-                 addressable where `…d` named nothing"
-            );
-        }
-        for (i, a) in resolved.iter().enumerate() {
-            for (j, b) in resolved.iter().enumerate() {
+        assert_eq!(
+            strip_overflow(&segments, titles.len()).right,
+            Some(75),
+            "the five tabs the window does not reach are marked, not silently gone"
+        );
+        for (i, (_, a)) in resolved.iter().enumerate() {
+            for (j, (_, b)) in resolved.iter().enumerate() {
                 if i != j {
-                    assert_ne!(a, b, "tabs {i} and {j} must be tellable apart");
+                    assert_ne!(a, b, "chips {i} and {j} must be tellable apart");
                 }
             }
         }
 
-        // A wider pressure strip affords each ordinal a tail of the SUBJECT —
-        // ordinal first (the part that distinguishes), tail as context. Three
-        // cells is still only a stub of `~/aterm`, but it is a stub of the cwd
-        // rather than of `command`: at every width the ordinal's tail is cut
-        // from the same half of the title the selected chip keeps.
-        let segments = layout_segments(120, titles.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
-            .into_iter()
-            .map(Option::unwrap)
-            .collect();
-        assert_eq!(resolved[1], "2 · …rm");
+        // SELECTING A SEATED CHIP MOVES NOTHING. Tabs 1..4 are on this page, so
+        // each of them lays out the identical strip — the drift harness's whole
+        // claim, at the geometry the reviewer photographed.
+        for active in 0..5 {
+            assert_eq!(
+                layout_segments(80, titles.len(), active, false),
+                segments,
+                "selecting seated tab {active} re-anchored the strip"
+            );
+        }
+        // ...and only the exemption moves: the selected twin keeps the subject,
+        // every other seated twin takes its own number.
+        let resolved = seated(&segments, &titles, 4);
         assert_eq!(
-            resolved[9], "10 · …m",
-            "two-digit ordinals spend their extra cell out of the tail's share"
+            resolved,
+            [
+                (0, on_band("1 · …aterm", "1 · …/aterm").to_string()),
+                (1, on_band("2 · …aterm", "2 · …/aterm").to_string()),
+                (2, on_band("3 · …aterm", "3 · …/aterm").to_string()),
+                (3, on_band("4 · …aterm", "4 · …/aterm").to_string()),
+                (4, "…~/aterm".to_string()),
+            ],
+            "the numbers are the TABS' — `switch_tab_3` reaches the chip \
+             painted `3 · …aterm`"
         );
 
-        // The active tab is a POSITION, not tab 0: mid-strip selection keeps
-        // the title there and hands every other twin its own ordinal — tab 0
-        // included (`1` names it, and `switch_tab_1` reaches it).
-        let segments = layout_segments(80, titles.len(), 4, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 4, None)
-            .into_iter()
-            .map(Option::unwrap)
-            .collect();
-        assert_eq!(resolved[4], "…~/aterm");
-        assert_eq!(resolved[0], "1");
-        assert_eq!(resolved[9], "10");
+        // LEAVING THE PAGE TURNS IT. Tab 5 is the first tab off this page, and
+        // selecting it seats the second page — the strip's one moment of
+        // motion, spent where the user asked for it.
+        let segments = layout_segments(80, titles.len(), 5, false);
+        assert_eq!(
+            seated(&segments, &titles, 5)
+                .iter()
+                .map(|(tab, _)| *tab)
+                .collect::<Vec<_>>(),
+            [5, 6, 7, 8, 9],
+            "the page after the one that was showing"
+        );
+        assert_eq!(
+            strip_overflow(&segments, titles.len()),
+            StripOverflow {
+                left: Some(0),
+                right: None
+            },
+            "the last page marks the tabs behind it and nothing ahead"
+        );
+
+        // A wider strip spends the same page on wider chips, each ordinal still
+        // carrying a tail of the SUBJECT — ordinal first (the part that
+        // distinguishes), tail as context. At every width the ordinal's tail is
+        // cut from the same half of the title the selected chip keeps.
+        let segments = layout_segments(120, titles.len(), 0, false);
+        let resolved = seated_labels(&segments, &titles, 0);
+        assert_eq!(resolved[1], "2 · …~/aterm");
+        assert_eq!(
+            resolved.last().unwrap(),
+            "5 · …~/aterm",
+            "the page's last seat, still numbered by its TAB and not by its \
+             seat: {resolved:?}"
+        );
     }
 
     /// WHAT THE ORDINAL PROMISES, pinned against the things it claims — because
@@ -8871,34 +9738,55 @@ mod tests {
     /// in windows too small for either to say much. Once any cluster on a
     /// PRESSURE strip flips, the cut loners flip with it; a roomy strip keeps
     /// the shipped rule — distinct heads stay head-cut there.
+    /// THE FIXTURE INTERLEAVES the twins and the loners, where the audit's
+    /// capture listed six twins and then four strangers. The strip seats a PAGE
+    /// of the tab list now ([`strip_window`]), and a page of a sorted list is
+    /// either all twins or all strangers — which is a fact about that ORDER,
+    /// not about the rule. A window whose tabs were opened in the order a person
+    /// opens them mixes them, so the fixture does; the titles, the widths and
+    /// the rule under test are the audit's.
+    ///
+    /// AND THE PINS SPEAK BOTH BAND GEOMETRIES ([`on_band`]), like the roomy
+    /// loner's at the end of the same test: the 13-column seat keeps eight
+    /// title cells on a chip-card band and nine on the padless ones, which is
+    /// one more glyph of `Settings.toml` behind each ordinal. The dialect this
+    /// test is about — whether a chip is cut from its head or its tail — is the
+    /// same on both.
+    fn one_dialect_titles() -> [&'static str; 10] {
+        [
+            "Settings.toml",
+            "Settings.toml",
+            "Settings.toml",
+            "README.md",         // loner: shares no head
+            "Settings.toml",     //
+            "cargo build",       // loner
+            "Settings.toml",     //
+            "Setup.sh",          // clusters via the `Set` head
+            "Settings.toml",     //
+            "Settings.toml.bak", // clusters
+        ]
+    }
+
     #[test]
     fn a_pressure_strip_speaks_one_truncation_dialect() {
-        let mut titles: Vec<String> = (0..6).map(|_| "Settings.toml".to_string()).collect();
-        titles.push("README.md".to_string()); // loner: shares no head
-        titles.push("Setup.sh".to_string()); // clusters via the `Set` head
-        titles.push("cargo build".to_string()); // loner
-        titles.push("Settings.toml.bak".to_string()); // clusters
-        let segments = layout_segments(100, titles.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
-            .into_iter()
-            .map(Option::unwrap)
-            .collect();
-        // The active twin's 13-cell window seats the whole title uncut; its
-        // five cut twins are ordinals; every other cut chip — clustered OR
-        // loner — speaks the tail dialect. No `REA…` beside a `…oml`.
+        let titles: Vec<String> = one_dialect_titles().iter().map(|t| t.to_string()).collect();
+        // Selecting the LAST tab puts the window over the page that mixes them
+        // — the strip seats five of the ten here ([`STRIP_SEATS_FLOOR`]), and
+        // the rule this test is about is only visible where a flipped family
+        // and a loner share one strip.
+        let segments = layout_segments(70, titles.len(), 9, false);
+        let resolved = seated_labels(&segments, &titles, 9);
+        // The two seated twins are ordinals with a tail; every other cut chip
+        // — clustered OR loner — speaks the tail dialect. No `car…` beside a
+        // `…oml`. (`Setup.sh` is not cut at all: eight cells, eight fit.)
         assert_eq!(
             resolved,
             [
-                "Settings.toml",
-                "2",
-                "3",
-                "4",
-                "5",
-                "6",
-                "….md",
-                "….sh",
-                "…ild",
-                "…bak"
+                "…build",
+                on_band("7 · …oml", "7 · …toml"),
+                "Setup.sh",
+                on_band("9 · …oml", "9 · …toml"),
+                "….bak"
             ],
             "one strip, one dialect — and the twins are addressable"
         );
@@ -8910,65 +9798,71 @@ mod tests {
         // or more other chips) first — but never a one-chip coincidence like
         // the `d` `build` and `README.md` happen to end with, which would
         // waste visible cells on `…E.m`.
-        let composed: Vec<String> = [
-            "Settings.toml",
-            "Settings.toml",
-            "Settings.toml",
-            "Settings.toml",
-            "Settings.toml",
-            "Settings.toml",
-            "README.md",
-            "Setup.sh",
-            "cargo build",
-            "Settings.toml.bak",
-        ]
-        .iter()
-        .map(|t| format!("{t} · Ready"))
-        .collect();
-        let segments = layout_segments(100, composed.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &composed, None, 0, None)
-            .into_iter()
-            .map(Option::unwrap)
+        let composed: Vec<String> = one_dialect_titles()
+            .iter()
+            .map(|t| format!("{t} · Ready"))
             .collect();
+        let segments = layout_segments(70, composed.len(), 9, false);
+        let resolved = seated_labels(&segments, &composed, 9);
         assert_eq!(
             resolved,
             [
-                "…tings.toml",
-                "2",
-                "3",
-                "4",
-                "5",
-                "6",
-                "….md",
-                "….sh",
-                "…ild",
-                "…bak"
+                "…build",
+                on_band("7 · …oml", "7 · …toml"),
+                "Setup.sh",
+                on_band("9 · …oml", "9 · …toml"),
+                "….bak"
             ],
             "the composed activity is shed strip-wide, the loners stay tellable"
         );
 
-        // THE DEGENERATE CORNER: one visible cell per chip. `README.md` and
+        // THE DEGENERATE CORNER: two visible cells per chip. `README.md` and
         // `cargo build` both tail-cut to `…d` there — the flip would TRADE
         // distinctness for dialect, which is backwards. Colliding candidates
         // keep their head cuts (`R…`/`c…`), which still differ; everything
         // else on the strip stays distinct too.
-        let segments = layout_segments(80, titles.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
-            .into_iter()
-            .map(Option::unwrap)
-            .collect();
+        //
+        // BUILT BY HAND, because [`layout_segments`] no longer produces this
+        // geometry: ten 6-column chips beside an 18-column selection is the
+        // shipped pressure split, and the strip now seats a WINDOW of legible
+        // chips instead ([`STRIP_SEATS_FLOOR`]). The rule still has to hold —
+        // this pass is a pure function of the segments it is handed, both
+        // painters hand it whatever the layout emits, and a label pass that
+        // could only be trusted on the geometries one caller happens to emit
+        // today is not a rule.
+        let segments: Vec<TabSegment> = std::iter::once(TabSegment {
+            start_col: 0,
+            end_col: 18,
+            close_col: Some(16),
+            connector_col: None,
+            kind: TabHit::Select(0),
+            solo: false,
+        })
+        .chain((1..10u16).map(|i| {
+            let start = 18 + (i - 1) * 6;
+            TabSegment {
+                start_col: start,
+                end_col: start + 6,
+                close_col: Some(start + 4),
+                connector_col: None,
+                kind: TabHit::Select(usize::from(i)),
+                solo: false,
+            }
+        }))
+        .collect();
+        let resolved = seated_labels(&segments, &titles, 0);
         assert_eq!(
             resolved,
             [
                 "Settings.toml",
                 "2",
                 "3",
-                "4",
-                "5",
-                "6",
                 "R…",
-                "…h",
+                "5",
                 "c…",
+                "7",
+                "…h",
+                "9",
                 "…k"
             ],
             "distinctness outranks dialect when the tail cut cannot distinguish"
@@ -8976,7 +9870,7 @@ mod tests {
         for (i, a) in resolved.iter().enumerate() {
             for (j, b) in resolved.iter().enumerate() {
                 if i != j {
-                    assert_ne!(a, b, "tabs {i} and {j} collide at one visible cell");
+                    assert_ne!(a, b, "tabs {i} and {j} collide at two visible cells");
                 }
             }
         }
@@ -9382,11 +10276,22 @@ mod tests {
         );
     }
 
-    /// C4: once the equal share falls under [`PREFERRED_MIN_TAB_COLS`], the
-    /// ACTIVE tab keeps a readable floor while the inactive tabs compress —
-    /// `toolbar::native_tab_cells`' pressure rule, in cells. The audit's
-    /// headline case: sixteen tabs on ~130 columns collapsed EVERY title,
-    /// the focused one included, to ~3 chars.
+    /// C4: once the equal share falls under the legibility floor, no seated
+    /// chip is ever compressed below it — the audit's headline case was sixteen
+    /// tabs on ~130 columns collapsing EVERY title, the focused one included,
+    /// to ~3 chars, and ~3 chars is what cannot come back.
+    ///
+    /// AND THE ANSWER IS A PAGE OF EQUAL CHIPS, not a reserved wide one. The
+    /// active-priority reservation ([`ACTIVE_TAB_PRESSURE_CAP_COLS`]) is what
+    /// the strip does while it is still COMPRESSING — it decides who survives a
+    /// squeeze. A page is what the strip does INSTEAD of compressing: every
+    /// chip on it already clears the floor, so there is no squeeze and nobody
+    /// to exempt, and the chips divide the band the way the strip's own rule
+    /// divides it whenever tabs fit — equally. Charging the reservation on top
+    /// of the page made the seated geometry depend on WHICH tab was selected
+    /// (the drift [`strip_window`] documents) and, on a page shorter than the
+    /// band could seat, made the ACTIVE chip the NARROW one. Both are gone;
+    /// what this test pins is the floor, which is what C4 was ever about.
     #[test]
     fn under_pressure_the_active_tab_keeps_a_readable_floor() {
         let cols = 130u16;
@@ -9397,27 +10302,49 @@ mod tests {
             .filter(|s| matches!(s.kind, TabHit::Select(_)))
             .collect();
         assert!(!tabs.is_empty());
-        let widths: Vec<u16> = tabs.iter().map(|s| s.end_col - s.start_col).collect();
         let active_w = tabs
             .iter()
             .find(|s| s.kind == TabHit::Select(active))
             .map(|s| s.end_col - s.start_col)
             .expect("the active tab is placed");
-        assert_eq!(
-            active_w, ACTIVE_TAB_PRESSURE_CAP_COLS,
-            "the active tab takes the pressure reserve"
-        );
         assert!(
             active_w >= PREFERRED_MIN_TAB_COLS,
-            "and it clears the legibility floor"
+            "the selected chip clears the legibility floor: {active_w} cols"
         );
-        for (i, w) in widths.iter().enumerate() {
-            if i != active {
-                assert!(
-                    *w < active_w,
-                    "inactive tab {i} ({w} cols) compresses below the active one"
-                );
-            }
+        // ...and so does every OTHER seated chip, at exactly the same width:
+        // sixteen tabs on 130 columns is past the point where compression can
+        // seat them all legibly, so the strip seats a PAGE and marks the rest
+        // ([`STRIP_SEATS_FLOOR`], [`strip_window`]).
+        for seg in &tabs {
+            let w = seg.end_col - seg.start_col;
+            assert_eq!(
+                w, active_w,
+                "a seated page divides its band equally: {:?} has {w} cols \
+                 against the selection's {active_w}",
+                seg.kind
+            );
+            assert!(
+                w >= PREFERRED_MIN_TAB_COLS,
+                "...and never below the legibility floor: {:?} has {w} cols",
+                seg.kind
+            );
+        }
+        assert!(
+            tabs.len() < 16,
+            "the band cannot seat sixteen legible chips, so it seats a window"
+        );
+        // The page is a function of the WIDTH and the tab count alone: every
+        // selection it seats lays out the identical strip, which is the whole
+        // reason the marks and the `✕` stay put when a chip is clicked.
+        for other in tabs.iter().filter_map(|seg| match seg.kind {
+            TabHit::Select(i) => Some(i),
+            _ => None,
+        }) {
+            assert_eq!(
+                layout_segments(cols, 16, other, false),
+                segs,
+                "selecting seated tab {other} re-laid the strip"
+            );
         }
         // Geometry stays sane: disjoint, ordered, inside the band, close column
         // present on the active tab (it is the one being read and closed).
@@ -9426,7 +10353,11 @@ mod tests {
         }
         assert!(tabs.last().unwrap().end_col <= cols);
         assert!(
-            tabs[active].close_col.is_some(),
+            tabs.iter()
+                .find(|s| s.kind == TabHit::Select(active))
+                .unwrap()
+                .close_col
+                .is_some(),
             "the floored active tab keeps its close affordance"
         );
         for seg in &tabs {
@@ -9435,6 +10366,327 @@ mod tests {
                 Some(seg.kind),
                 "every placed tab remains individually clickable"
             );
+        }
+    }
+
+    /// Three realistic strips: eight shells in one directory (byte-identical
+    /// titles), eight different jobs (nothing shared), and the mixture a real
+    /// window is — two pairs of twins among strangers. Every test below runs
+    /// all three, because a strip rule that only holds for one of them is not a
+    /// rule about tab strips.
+    fn realistic_strips() -> [(&'static str, Vec<String>); 3] {
+        let same: Vec<String> = (0..8)
+            .map(|_| "claude · Ready in aterm".to_string())
+            .collect();
+        let distinct: Vec<String> = [
+            "vim src/main.rs",
+            "cargo test",
+            "~/aterm",
+            "ssh build-01",
+            "psql aterm_dev",
+            "docker compose",
+            "git log",
+            "claude",
+        ]
+        .iter()
+        .map(|subject| format!("{subject} · Ready in aterm"))
+        .collect();
+        let mixed: Vec<String> = [
+            "claude",
+            "claude",
+            "vim TODO",
+            "~/aterm",
+            "~/aterm",
+            "cargo test",
+            "git log",
+            "claude",
+        ]
+        .iter()
+        .map(|subject| format!("{subject} · Ready in aterm"))
+        .collect();
+        [("same", same), ("distinct", distinct), ("mixed", mixed)]
+    }
+
+    /// A painted label with its FURNITURE taken off — a leading ordinal and the
+    /// elision marks — leaving only the characters the chip spent on text.
+    fn painted_text(label: &str) -> &str {
+        label
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start_matches(' ')
+            .trim_start_matches('\u{00b7}')
+            .trim_start_matches(' ')
+            .trim_matches('…')
+    }
+
+    /// Does this chip say something of its OWN tab — text out of the title's
+    /// SUBJECT, rather than the state clause every chip on the strip repeats?
+    ///
+    /// Two ways to qualify, because the strip has two dialects: a cut of the
+    /// subject (the tail dialect, and the ordinal's tail), or a head cut of the
+    /// whole composed title, which reaches the state only after spending the
+    /// subject it starts with.
+    fn says_its_own(label: &str, title: &str) -> bool {
+        let painted = painted_text(label);
+        let subject = title
+            .rsplit_once(" \u{00b7} ")
+            .map_or(title, |(subject, _)| subject);
+        !painted.is_empty() && (subject.contains(painted) || title.starts_with(painted))
+    }
+
+    /// THE STRIP'S ANSWER TO MORE TABS THAN IT CAN LABEL, swept over every
+    /// shape a window can have: 1 to 20 tabs, 40 to 300 columns, the selection
+    /// at each end and in the middle, with and without the leading `↻`.
+    ///
+    /// Six laws, and they are the whole design:
+    ///
+    /// 1. Nothing panics and no segment leaves the strip.
+    /// 2. Chips stay ORDERED and DISJOINT, so a column names one tab.
+    /// 3. The SELECTED chip is always seated while any chip is — the window is
+    ///    built around it, so the tab you are in can never be the one that
+    ///    scrolled off.
+    /// 4. No chip below [`STRIP_SEATS_FLOOR`] once the strip is windowing,
+    ///    unless it is down to the [`STRIP_MIN_SEATS`] pair it always shows.
+    /// 5. Every overflow mark lands on a column [`hit_test`] calls BARE BAND —
+    ///    the mark is furniture, and the hit map remains the whole truth about
+    ///    what a click does.
+    /// 6. A mark appears on exactly the side that has tabs the window does not
+    ///    reach (or on neither, on a band with no column to spare).
+    #[test]
+    fn the_windowed_strip_degrades_sanely_at_every_width_and_tab_count() {
+        for tabs in 1..=20usize {
+            for cols in (40..=300u16).step_by(1) {
+                for active in [0, tabs / 2, tabs - 1] {
+                    for update in [false, true] {
+                        let segs = layout_segments(cols, tabs, active, update);
+                        let chips: Vec<&TabSegment> = segs
+                            .iter()
+                            .filter(|seg| matches!(seg.kind, TabHit::Select(_)))
+                            .collect();
+                        let where_ =
+                            format!("{tabs} tabs, {cols} cols, active {active}, update {update}");
+                        // 1 + 2.
+                        for pair in segs.windows(2) {
+                            assert!(
+                                pair[0].end_col <= pair[1].start_col,
+                                "{where_}: segments overlap: {segs:?}"
+                            );
+                        }
+                        for seg in &segs {
+                            assert!(seg.start_col < seg.end_col, "{where_}: empty segment");
+                            assert!(seg.end_col <= cols, "{where_}: segment past the strip");
+                        }
+                        // 3.
+                        if !chips.is_empty() {
+                            assert!(
+                                chips.iter().any(|seg| seg.kind == TabHit::Select(active)),
+                                "{where_}: the selected tab is not on the strip: {chips:?}"
+                            );
+                        }
+                        let seated: Vec<usize> = chips
+                            .iter()
+                            .filter_map(|seg| match seg.kind {
+                                TabHit::Select(i) => Some(i),
+                                _ => None,
+                            })
+                            .collect();
+                        // The window is one CONTIGUOUS run of tabs.
+                        for pair in seated.windows(2) {
+                            assert_eq!(
+                                pair[1],
+                                pair[0] + 1,
+                                "{where_}: the window has a hole: {seated:?}"
+                            );
+                        }
+                        // 4.
+                        if seated.len() < tabs && seated.len() > STRIP_MIN_SEATS {
+                            for seg in &chips {
+                                assert!(
+                                    seg.end_col - seg.start_col >= STRIP_SEATS_FLOOR,
+                                    "{where_}: a windowed strip seated a chip below \
+                                     the floor: {chips:?}"
+                                );
+                            }
+                        }
+                        // 5 + 6.
+                        let marks = strip_overflow(&segs, tabs);
+                        for (col, _) in marks.columns() {
+                            assert!(col < cols, "{where_}: mark off the strip");
+                            assert_eq!(
+                                hit_test(&segs, col),
+                                None,
+                                "{where_}: the mark at {col} sits on a hit target"
+                            );
+                        }
+                        if let Some(&first) = seated.first() {
+                            assert_eq!(
+                                marks.left.is_some(),
+                                first > 0 && chips[0].start_col > 0,
+                                "{where_}: left mark disagrees with the window"
+                            );
+                        }
+                        if let Some(&last) = seated.last() {
+                            let end = chips[chips.len() - 1].end_col;
+                            let free = !segs
+                                .iter()
+                                .any(|seg| end >= seg.start_col && end < seg.end_col);
+                            assert_eq!(
+                                marks.right.is_some(),
+                                last + 1 < tabs && free,
+                                "{where_}: right mark disagrees with the window"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE SELECTED CHIP NAMES ITS TAB AT EVERY WIDTH — the half of the
+    /// eight-shells defect a previous fix closed, held here against the window
+    /// that replaced the compression around it. Whatever the strip does with
+    /// its other chips, the one the user is IN says what it is: never empty,
+    /// never a bare elision mark, and never the activity phrase the state
+    /// clause carries.
+    #[test]
+    fn the_selected_chip_names_its_tab_at_every_width() {
+        for (set, titles) in realistic_strips() {
+            for cols in (40..=300u16).step_by(1) {
+                for active in [0, titles.len() / 2, titles.len() - 1] {
+                    let segs = layout_segments(cols, titles.len(), active, false);
+                    let labels = distinct_chip_labels(&segs, &titles, None, active, None);
+                    let Some(label) = labels[active].as_deref() else {
+                        // Only a strip with no chips at all may fail to seat it.
+                        assert!(
+                            !segs.iter().any(|s| matches!(s.kind, TabHit::Select(_))),
+                            "{set} at {cols} cols: the selection lost its chip"
+                        );
+                        continue;
+                    };
+                    let where_ = format!("{set} at {cols} cols, active {active}");
+                    assert!(!label.is_empty(), "{where_}: empty label");
+                    assert_ne!(label, "…", "{where_}: the selection names nothing");
+                    assert!(
+                        says_its_own(label, &titles[active]),
+                        "{where_}: the selection spends its chip on the state \
+                         every chip repeats: {label:?}"
+                    );
+                    // The subject is the first word of the title; wherever the
+                    // chip has room for a word at all, it is that word's.
+                    //
+                    // A CUT label pays one cell for its elision mark, so a
+                    // window exactly the subject's width can hold the subject
+                    // OR say that it cut, never both — ask for the word only
+                    // where the label had room for the word AND the mark. (The
+                    // page widths this strip seats now land on that exact cell
+                    // for `~/aterm` at 53 columns, which is how the off-by-one
+                    // in this guard finally showed up.)
+                    let subject = titles[active].split(' ').next().unwrap();
+                    let mark = usize::from(label != titles[active].as_str());
+                    if strip_display_cells(label) >= strip_display_cells(subject) + mark {
+                        assert!(
+                            label.contains(subject),
+                            "{where_}: room for {subject:?} and it painted {label:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE PHOTOGRAPHED WINDOW, in all three vocabularies: eight tabs on 80
+    /// columns. Every seated chip must SAY something — carry text of its own
+    /// title, not just a number — and no two may say the same thing.
+    ///
+    /// This is the law the compression could not keep. Eight 8-column chips
+    /// leave four title cells each: too few for a name, so identical titles
+    /// fell back to seven bare ordinals and distinct ones to three-letter
+    /// stubs. The window seats five chips of fourteen columns instead and
+    /// marks the three it drops.
+    #[test]
+    fn eight_tabs_on_eighty_columns_seat_labels_that_say_something() {
+        for (set, titles) in realistic_strips() {
+            let segs = layout_segments(80, titles.len(), 7, false);
+            let chips = seated(&segs, &titles, 7);
+            assert!(
+                chips.len() < titles.len(),
+                "{set}: 80 columns cannot label eight tabs, so it must not pretend to"
+            );
+            assert!(
+                chips.len() >= 4,
+                "{set}: ...and it must still be a strip: {chips:?}"
+            );
+            assert_eq!(
+                strip_overflow(&segs, titles.len()).left,
+                Some(0),
+                "{set}: the tabs before the window are marked, not silently gone"
+            );
+            for (tab, label) in &chips {
+                assert_ne!(
+                    label,
+                    &(tab + 1).to_string(),
+                    "{set}: chip {tab} is a bare ordinal — the defect: {chips:?}"
+                );
+                // Some of this chip's OWN title survives the cut: the ordinal
+                // may lead, but it never stands alone, and what follows it is
+                // never the state clause every chip repeats.
+                assert!(
+                    says_its_own(label, &titles[*tab]),
+                    "{set}: chip {tab} keeps nothing of {:?}: {label:?}",
+                    titles[*tab]
+                );
+            }
+            for (i, (_, a)) in chips.iter().enumerate() {
+                for (j, (_, b)) in chips.iter().enumerate() {
+                    if i != j {
+                        assert_ne!(a, b, "{set}: two seated chips paint {a:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE MARK IS PAINTED WHERE THE LAYOUT RESERVED IT, on both lanes' shared
+    /// glyph — and on a column the hit map calls bare band. The painter records
+    /// the geometry and the hit test reads it back; an overflow mark that
+    /// wandered onto a chip would put a `‹` on a click target, and one that
+    /// never painted would hide three tabs without saying so.
+    #[test]
+    fn the_overflow_mark_paints_on_bare_band_and_only_there() {
+        let titles: Vec<String> = (0..10)
+            .map(|i| format!("job-{i} · Ready in aterm"))
+            .collect();
+        let theme = Theme::default();
+        for cols in [60u16, 80, 100] {
+            for active in [0, 4, 9] {
+                let segs = layout_segments(cols, titles.len(), active, false);
+                let marks = strip_overflow(&segs, titles.len());
+                let mut row = vec![blank_cell(theme); usize::from(cols)];
+                paint_strip(&mut row, &segs, &titles, None, active, theme);
+                let where_ = format!("{cols} cols, active {active}");
+                assert!(
+                    marks.left.is_some() || marks.right.is_some(),
+                    "{where_}: ten tabs cannot fit, so an edge must be marked"
+                );
+                for (col, glyph) in marks.columns() {
+                    assert_eq!(
+                        row[usize::from(col)].ch,
+                        glyph,
+                        "{where_}: no {glyph:?} painted at {col}"
+                    );
+                    assert_eq!(hit_test(&segs, col), None, "{where_}: {col} is a target");
+                }
+                // ...and NOWHERE else: the two mark columns are the only ones
+                // carrying these glyphs, so a reader cannot mistake a title's
+                // own guillemet for the strip's edge.
+                for (col, cell) in row.iter().enumerate() {
+                    if cell.ch == STRIP_OVERFLOW_LEFT || cell.ch == STRIP_OVERFLOW_RIGHT {
+                        assert!(
+                            marks.columns().any(|(mark, _)| usize::from(mark) == col),
+                            "{where_}: a stray edge mark at column {col}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -10216,5 +11468,474 @@ mod tests {
         // `strip_contrast_meets_wcag_aa`).
         let def = strip_colors(Theme::default());
         assert!(luma(def.active_bg) > luma(def.band_bg));
+    }
+
+    // ================= THE STRIP UNDER A STATIONARY POINTER =================
+
+    /// The widths a real window is dragged through, and the tab counts a real
+    /// window holds. Every rule below is asserted over the whole grid, because
+    /// a strip rule that holds at the width it was written against is a
+    /// coincidence — both defects these tests pin were found by looking one
+    /// width to the side of the one the feature was designed at.
+    const STRIP_GRID_COLS: [u16; 9] = [40, 60, 80, 100, 120, 140, 200, 240, 300];
+    const STRIP_GRID_TABS: [usize; 4] = [1, 2, 8, 20];
+
+    /// A tab wearing `busy` and nothing else — the metadata eight `claude`
+    /// shells mid-command carry, and the one the photographed defect was
+    /// rendered from.
+    fn busy_tab() -> TabStripMetadata {
+        TabStripMetadata {
+            busy: true,
+            ..PLAIN_TAB
+        }
+    }
+
+    /// The four strips every rule below is asserted over: identical titles and
+    /// distinct ones, each idle and each mid-command. Identical titles are the
+    /// photographed case (eight shells in one cwd); distinct ones are the case
+    /// a naive fix breaks; and the busy/idle pair is exactly the difference the
+    /// legibility floor was blind to.
+    fn strip_cases(tabs: usize) -> Vec<(&'static str, Vec<String>, Vec<TabStripMetadata>)> {
+        let same: Vec<String> = (0..tabs).map(|_| "claude".to_string()).collect();
+        let distinct: Vec<String> = (0..tabs)
+            .map(|i| format!("job-{i} · Ready in aterm"))
+            .collect();
+        let idle = vec![PLAIN_TAB; tabs];
+        let busy = vec![busy_tab(); tabs];
+        vec![
+            ("same/idle", same.clone(), idle.clone()),
+            ("same/busy", same, busy.clone()),
+            ("distinct/idle", distinct.clone(), idle),
+            ("distinct/busy", distinct, busy),
+        ]
+    }
+
+    /// The tab a click at `col` resolves to, whichever of the three tab hits
+    /// the column carries — select, close, or the status connector. A chip that
+    /// moved a close `✕` out from under a pointer moved the chip.
+    fn tab_at(segments: &[TabSegment], col: u16) -> Option<usize> {
+        match hit_test(segments, col) {
+            Some(TabHit::Select(i) | TabHit::Close(i) | TabHit::Connector(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// THE CLICK-DRIFT HARNESS, and the defect it was written for: a strip
+    /// whose targets move when you use it.
+    ///
+    /// The window used to be CENTRED on the selection, so selecting re-anchored
+    /// the whole strip. Measured over this grid, that was ~65 drifting chips
+    /// (9815 drifting COLUMNS): at eight tabs on eighty columns, clicking
+    /// column 2 selected tab 3 and left tab 1 under the pointer; clicking
+    /// column 16 selected tab 4 and left tab 3 there; at twenty tabs on a
+    /// hundred and twenty nearly every quiet chip moved, some by two tabs. The
+    /// click itself was always correct — `hit_test` agreed with the paint
+    /// everywhere — which is what made it so bad: two clicks in the same place
+    /// selected two different tabs, and the hover wash and the revealed `✕`
+    /// jumped under a hand that had not moved.
+    ///
+    /// The harness is the reviewer's: click every column, recompute the layout
+    /// with the selection that click makes, and re-hit-test the SAME column.
+    /// Zero drift is not a tolerance here — it is a structural property of
+    /// [`strip_window`] (the window is a PAGE, and a page is closed under its
+    /// own membership) plus equal shares inside it, so any drift at all means
+    /// one of those two is gone.
+    #[test]
+    fn no_click_moves_a_chip_out_from_under_the_pointer() {
+        let mut clicks = 0usize;
+        let mut drifts: Vec<String> = Vec::new();
+        for &tabs in &STRIP_GRID_TABS {
+            for (case, titles, metadata) in strip_cases(tabs) {
+                for &cols in &STRIP_GRID_COLS {
+                    for active in 0..tabs {
+                        let before = layout_segments_with_metadata(
+                            cols,
+                            titles.len(),
+                            &metadata,
+                            active,
+                            false,
+                        );
+                        for col in 0..cols {
+                            let Some(tab) = tab_at(&before, col) else {
+                                continue;
+                            };
+                            clicks += 1;
+                            let after = layout_segments_with_metadata(
+                                cols,
+                                titles.len(),
+                                &metadata,
+                                tab,
+                                false,
+                            );
+                            if tab_at(&after, col) != Some(tab) {
+                                drifts.push(format!(
+                                    "{case} {cols}c/{tabs}t active {active}: column {col} was \
+                                     tab {tab} and is now {:?}",
+                                    tab_at(&after, col)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            drifts.is_empty(),
+            "{} of {clicks} clicks moved their own chip:\n  {}",
+            drifts.len(),
+            drifts.join("\n  ")
+        );
+        assert!(
+            clicks > 10_000,
+            "the harness has to actually click things: {clicks}"
+        );
+    }
+
+    /// ...AND NOTHING ELSE MOVES EITHER. The harness above asks the reviewer's
+    /// question (does my click land on the tab I aimed at, twice); this asks
+    /// the stronger one the answer actually rests on: selecting a chip the
+    /// strip is ALREADY SHOWING must produce the byte-identical strip — same
+    /// chips, same columns, same close columns, same marks. That is what makes
+    /// the hover wash and the revealed `✕` stay put, and it is a property no
+    /// per-column sampling can establish.
+    #[test]
+    fn selecting_a_seated_chip_re_lays_out_the_identical_strip() {
+        let mut compared = 0usize;
+        for &tabs in &STRIP_GRID_TABS {
+            for (case, titles, metadata) in strip_cases(tabs) {
+                for &cols in &STRIP_GRID_COLS {
+                    for active in 0..tabs {
+                        let before = layout_segments_with_metadata(
+                            cols,
+                            titles.len(),
+                            &metadata,
+                            active,
+                            false,
+                        );
+                        for seg in &before {
+                            let TabHit::Select(seated) = seg.kind else {
+                                continue;
+                            };
+                            compared += 1;
+                            assert_eq!(
+                                layout_segments_with_metadata(
+                                    cols,
+                                    titles.len(),
+                                    &metadata,
+                                    seated,
+                                    false
+                                ),
+                                before,
+                                "{case} at {cols} cols, {tabs} tabs: selecting seated tab \
+                                 {seated} (from {active}) re-anchored the strip"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 2_000, "vacuous: {compared} selections compared");
+    }
+
+    /// THE WINDOW IS A PARTITION — the property the drift harness measures, in
+    /// the form it is actually true in, over every seat count and tab count the
+    /// layout can hand [`strip_window`].
+    ///
+    /// Four clauses, and the first three are what force the fourth: every page
+    /// contains its own selection (or the strip could not show what is
+    /// selected); no page is wider than the seats (or a chip is painted off the
+    /// band); the pages are as few as that allows and as even as THAT allows
+    /// (or paging makes the strip lurch between six chips and two); and the
+    /// pages are closed — the page computed for any tab a page seats is that
+    /// same page. Closure is the zero-drift property, and a family of windows
+    /// each closed under its own membership is exactly a partition.
+    #[test]
+    fn the_strip_window_is_an_even_partition_of_the_tab_list() {
+        for tab_count in 1..=24usize {
+            for seats in 1..=tab_count {
+                let windows: Vec<(usize, usize)> = (0..tab_count)
+                    .map(|active| strip_window(active, seats, tab_count))
+                    .collect();
+                let mut sizes: Vec<usize> = Vec::new();
+                let mut covered = vec![0usize; tab_count];
+                for (active, &(first, len)) in windows.iter().enumerate() {
+                    let where_ = format!("{tab_count} tabs, {seats} seats, active {active}");
+                    assert!(len > 0 && len <= seats, "{where_}: {len} chips seated");
+                    assert!(
+                        first <= active && active < first + len,
+                        "{where_}: the page {first}..{} does not seat it",
+                        first + len
+                    );
+                    assert!(
+                        first + len <= tab_count,
+                        "{where_}: the page runs past the end"
+                    );
+                    // CLOSURE: every tab this page seats computes this page.
+                    for seated in first..first + len {
+                        assert_eq!(
+                            strip_window(seated, seats, tab_count),
+                            (first, len),
+                            "{where_}: seated tab {seated} would turn the page"
+                        );
+                    }
+                    if windows[..active].iter().all(|&(f, _)| f != first) {
+                        sizes.push(len);
+                        for seat in covered.iter_mut().skip(first).take(len) {
+                            *seat += 1;
+                        }
+                    }
+                }
+                assert!(
+                    covered.iter().all(|&n| n == 1),
+                    "{tab_count} tabs, {seats} seats: the pages are not a partition ({covered:?})"
+                );
+                // As FEW pages as the seat count allows, and as even as that
+                // page count allows — the alternative is a runt page beside a
+                // full one, which is the shape plain `(active / seats) * seats`
+                // paging leaves at the end of the list.
+                assert_eq!(
+                    sizes.len(),
+                    tab_count.div_ceil(seats),
+                    "{tab_count} tabs, {seats} seats: not the fewest pages ({sizes:?})"
+                );
+                let (lo, hi) = (
+                    *sizes.iter().min().expect("a page"),
+                    *sizes.iter().max().expect("a page"),
+                );
+                assert!(
+                    hi - lo <= 1,
+                    "{tab_count} tabs, {seats} seats: uneven pages {sizes:?}"
+                );
+                assert!(
+                    sizes.windows(2).all(|pair| pair[0] >= pair[1]),
+                    "{tab_count} tabs, {seats} seats: the longer pages come first ({sizes:?})"
+                );
+            }
+        }
+    }
+
+    // ================= THE FLOOR IS A TITLE WIDTH =================
+
+    /// THE FLOOR IS MEASURED ON THE TITLE, NOT THE CHIP — the second defect,
+    /// at its root.
+    ///
+    /// [`PREFERRED_MIN_TAB_COLS`] is justified by a TITLE measurement ("after
+    /// the pads and the reserved `✕`, 12 columns keep the 8 cells *Settings*
+    /// measures"), but the gate tested the SEGMENT against it, and a chip's
+    /// chrome is not free: a busy chip spends three more cells than an idle one
+    /// on the status canvas and its separator. So a 12-column busy chip cleared
+    /// a floor that promised it 7 title cells and gave it 4.
+    ///
+    /// The three clauses: the floor read back off a plain chip is the number
+    /// the constant's own doc claims; a plain chip's seat is that constant to
+    /// the column (so an idle strip's behaviour is the shipped one); and every
+    /// chrome's seat is the MINIMAL width that keeps the floor — never a
+    /// blanket widening that would push idle strips into the window regime
+    /// early.
+    #[test]
+    fn the_legibility_floor_is_a_title_width_and_every_seat_is_minimal() {
+        let floor = preferred_min_title_cols();
+        assert_eq!(
+            floor,
+            chip_title_cols(PREFERRED_MIN_TAB_COLS, PLAIN_TAB),
+            "the floor IS what a plain chip keeps at the constant"
+        );
+        assert_eq!(
+            floor,
+            if STRIP_CHIP_CARDS { 7 } else { 8 },
+            "'Settings' is 8 cells, and a chip-card band spends one of them on \
+             the card's interior pad"
+        );
+        assert_eq!(
+            chip_seat_cols(PLAIN_TAB),
+            PREFERRED_MIN_TAB_COLS,
+            "an idle strip's floor is the shipped one, to the column"
+        );
+
+        // Every chrome a chip can wear, including the ones no test names.
+        let mut wider = 0usize;
+        for icon in [None, Some(TabIconKind::Settings)] {
+            for busy in [false, true] {
+                for closable in [false, true] {
+                    let chrome = TabStripMetadata {
+                        icon,
+                        busy,
+                        closable,
+                        ..PLAIN_TAB
+                    };
+                    let seat = chip_seat_cols(chrome);
+                    assert!(
+                        chip_title_cols(seat, chrome) >= floor,
+                        "{chrome:?}: a {seat}-column seat keeps only {} title cells",
+                        chip_title_cols(seat, chrome)
+                    );
+                    assert!(
+                        seat == PREFERRED_MIN_TAB_COLS || chip_title_cols(seat - 1, chrome) < floor,
+                        "{chrome:?}: {seat} columns is not the NARROWEST seat that \
+                         keeps the floor"
+                    );
+                    assert!(
+                        seat < SEAT_COLS_CEILING
+                            && chip_title_cols(SEAT_COLS_CEILING, chrome) >= floor,
+                        "{chrome:?}: the seat scan's bound is binding — \
+                         [`SEAT_COLS_CEILING`] has to be past the widest chrome, \
+                         or a seat is whatever the bound happened to be"
+                    );
+                    wider += usize::from(seat > PREFERRED_MIN_TAB_COLS);
+                }
+            }
+        }
+        assert!(
+            wider > 0,
+            "vacuous: no chrome costs a chip anything, so the gate cannot be wrong"
+        );
+        // The one that matters: a busy chip needs the status canvas AND its
+        // separator on top of the plain chip's pads.
+        assert_eq!(
+            chip_seat_cols(busy_tab()),
+            PREFERRED_MIN_TAB_COLS + 3,
+            "the status canvas, its separator, and the cell they push the title \
+             off — the three cells the old gate handed a busy chip for free"
+        );
+    }
+
+    /// THE PHOTOGRAPHED SECOND DEFECT: eight BUSY `claude` shells at 100
+    /// columns painted `1  2  3  4  5  6  7` beside a `…ude` — byte-identical
+    /// to the render the window regime was built to end, at a width the window
+    /// never engaged at.
+    ///
+    /// 100 columns is exactly where it hid: the equal share IS 12 there, so
+    /// `12 < 12` was false and the strip stayed on equal shares — while the
+    /// status canvas ate four of those twelve columns and left the title four
+    /// cells. The gate now asks what the TITLE gets ([`strip_seat_cols`]), so a
+    /// busy strip windows at the width its titles stop fitting instead of
+    /// fifteen columns later.
+    ///
+    /// Pinned across the whole band the defect was live in (99–114 columns) and
+    /// at both selections that photographed it.
+    #[test]
+    fn eight_busy_shells_never_paint_a_bare_ordinal() {
+        let titles: Vec<String> = (0..8).map(|_| "claude".to_string()).collect();
+        let metadata = vec![busy_tab(); 8];
+        for cols in 99..=114u16 {
+            for active in [0usize, 7] {
+                let segments =
+                    layout_segments_with_metadata(cols, titles.len(), &metadata, active, false);
+                let labels =
+                    distinct_chip_labels(&segments, &titles, Some(&metadata), active, None);
+                let painted: Vec<String> = segments
+                    .iter()
+                    .filter_map(|seg| match seg.kind {
+                        TabHit::Select(i) => labels[i].clone(),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    !painted.is_empty(),
+                    "{cols} cols: the strip seated nothing at all"
+                );
+                for label in &painted {
+                    assert_eq!(
+                        label, "claude",
+                        "{cols} cols, active {active}: a seated chip says {label:?} \
+                         instead of naming its shell: {painted:?}"
+                    );
+                }
+            }
+        }
+
+        // The gate moved for the BUSY strip and nobody else: at 100 columns the
+        // same eight tabs idle still seat eight chips on equal shares — exactly
+        // the layout the metadata-free entry point computes.
+        let idle = vec![PLAIN_TAB; 8];
+        let quiet = layout_segments_with_metadata(100, 8, &idle, 0, false);
+        assert_eq!(
+            quiet,
+            layout_segments(100, 8, 0, false),
+            "an idle strip's geometry is the pure-geometry one, to the column"
+        );
+        assert_eq!(
+            quiet
+                .iter()
+                .filter(|seg| matches!(seg.kind, TabHit::Select(_)))
+                .count(),
+            8,
+            "eight idle chips still fit at 100 columns"
+        );
+        assert!(
+            layout_segments_with_metadata(100, 8, &metadata, 0, false)
+                .iter()
+                .filter(|seg| matches!(seg.kind, TabHit::Select(_)))
+                .count()
+                < 8,
+            "...and the busy strip windows instead of painting eight chips it \
+             cannot title"
+        );
+    }
+
+    /// NO SEATED CHIP IS EVER A BARE ORDINAL, over the whole grid and all four
+    /// strips. The bare digits are [`ordinal_chip_label`]'s own floor and they
+    /// still exist — a two-cell window has nothing else to say — but the LAYOUT
+    /// must never build a strip that needs them: it seats fewer chips instead.
+    /// This is the defect stated as a law rather than as a width.
+    ///
+    /// THE GRID INCLUDES ONE TAB, which on a [`SOLO_TITLE_BAND`] platform is
+    /// not a chip at all — see the solo arm inside.
+    #[test]
+    fn no_width_seats_a_chip_that_can_only_say_a_number() {
+        let mut seats = 0usize;
+        for &tabs in &STRIP_GRID_TABS {
+            for (case, titles, metadata) in strip_cases(tabs) {
+                for &cols in &STRIP_GRID_COLS {
+                    for active in [0usize, tabs / 2, tabs - 1] {
+                        let segments = layout_segments_with_metadata(
+                            cols,
+                            titles.len(),
+                            &metadata,
+                            active,
+                            false,
+                        );
+                        let labels =
+                            distinct_chip_labels(&segments, &titles, Some(&metadata), active, None);
+                        for seg in &segments {
+                            let TabHit::Select(i) = seg.kind else {
+                                continue;
+                            };
+                            // A SOLO BAND IS NOT A CHIP. One tab where
+                            // [`SOLO_TITLE_BAND`] holds is the WINDOW'S TITLE:
+                            // the painter composes it with [`solo_band_text`]
+                            // and never reads this pass, which documents `None`
+                            // for exactly that segment. The law below is about
+                            // the strip's CARDS — a title band has no ordinal
+                            // to fall back to and no sibling to be told apart
+                            // from — so assert the contract instead and keep
+                            // walking, which is what lets the grid carry the
+                            // one-tab width on every band.
+                            if seg.solo {
+                                assert!(
+                                    labels[i].is_none(),
+                                    "{case} at {cols} cols: the label pass claimed the solo \
+                                     title band ({:?})",
+                                    labels[i]
+                                );
+                                continue;
+                            }
+                            let label = labels[i].as_deref().expect("a seated chip is labelled");
+                            seats += 1;
+                            assert!(
+                                !label.chars().all(|c| c.is_ascii_digit()),
+                                "{case} at {cols} cols, {tabs} tabs, active {active}: chip {i} \
+                                 is the bare ordinal {label:?} — the photographed defect"
+                            );
+                            assert!(
+                                !label.is_empty() && label != "…",
+                                "{case} at {cols} cols: chip {i} says nothing ({label:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seats > 500, "vacuous: only {seats} chips were labelled");
     }
 }

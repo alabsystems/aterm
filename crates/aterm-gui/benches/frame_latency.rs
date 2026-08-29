@@ -89,7 +89,8 @@
 //   4. keystroke_echo     — the latency-critical path: a real `App::input`
 //      keystroke (encode, policy, predictive echo, cadence pulse) as the arm,
 //      and the frame that echoes it (extract + effects + raster) timed.
-//   5. many_tabs_idle/N   — N resident tabs, nothing changing: the
+//   5. many_tabs_idle/N   — N resident tabs, nothing changing AND nothing
+//      animating (every cursor effect off — see `f_many_tabs`): the
 //      steady-state cost of the settled compose frame as state scales.
 //   6. scrolled_back_repaint — SCR-1's price, and the workload this crate
 //      simply did not have: a presented frame whose viewport is SCROLLED
@@ -151,6 +152,17 @@
 // `many_tabs_idle/N` guards PIN the fixed behaviour two-sided (settled
 // presented == 0, fed controls still present); if a pin ever reads nonzero
 // again, the early-out has regressed.
+//
+// AND A PIN LIKE THAT ONLY MEANS "REGRESSED" ON A FIXTURE THAT CAN SETTLE.
+// `many_tabs_idle/N` read 163 of 300 for a while and it was not the early-out:
+// the fixture ran the SHIPPED config, whose default cursor-trail style became
+// `rainbow kitty pet`, so a walking cat moved the `RepaintKey` every frame.
+// The pin was true of the code and false of the fixture, and because these
+// guards run in `main()` before criterion is handed a single workload, the
+// whole bench binary was unrunnable for as long as it stood. Both pinned
+// fixtures now hold the cursor-trail MASTER off and SAY SO in an assertion
+// (`!glow_enabled()` — `pet_invisible` already did, `many_tabs_idle` does
+// now), so "presented != 0" can only mean the early-out.
 //
 // EVERY WORKLOAD IS VERIFIED BEFORE IT IS TIMED, template: the aterm-effects
 // cursor_glow_tick bench. Two-sided guards prove the workload reaches the
@@ -423,6 +435,72 @@ fn f_split() -> (BenchApp, Instant) {
     (b, t0)
 }
 
+/// Rows of text the RAIN split fixture writes into each pane — HALF the
+/// [`SPLIT_ROWS`] screen, with the rest left blank.
+///
+/// THIS IS NOT COSMETIC, AND IT IS WHY THE RAIN FIXTURE CANNOT REUSE
+/// [`f_split`]'s FILL. Rain only draws on cells the Tier-A occupancy scan
+/// found ELIGIBLE — a space, on the default background, with a cell of
+/// clearance from any real glyph. `f_split` writes `SPLIT_FILL_COLS` (170)
+/// columns per line into a focused pane that a four-way split leaves 41
+/// columns wide, so every line WRAPS about four times and the 90-row pane ends
+/// up written edge to edge. Occupancy is then empty, the field has nowhere to
+/// fall, and the engine emits ZERO quads while every config flag still says
+/// "rain is on" — the exact silent non-arming this bench's reach guards exist
+/// to catch, and the first thing `verify_split_rain` caught.
+///
+/// So this fixture writes a scene rain can actually fall through: text in the
+/// top half, blank screen below it, which is also what a terminal with rain
+/// enabled looks like in practice.
+///
+/// WHICH DIRECTION THIS BIASES THE NUMBER, stated plainly: the focused pane's
+/// full extract materializes each row's WRITTEN PREFIX, so this scene is about
+/// 46% of the cells `split_compose_*` resolves (45 rows x 38 cols against 90 x
+/// 41). Any per-frame extraction saving measured here is therefore SMALLER
+/// than the same saving on a denser screen — but a denser screen is not a rain
+/// scene at all, because rain cannot emit on one.
+const RAIN_FILL_ROWS: usize = SPLIT_ROWS as usize / 2;
+
+/// The width the rain fixture's lines are filled to: inside the NARROWEST pane
+/// a `SPLIT_PANES` split of [`SPLIT_COLS`] produces (41 columns), so no line
+/// wraps. A wrapped line is what fills the screen and starves the field; see
+/// [`RAIN_FILL_ROWS`].
+const RAIN_FILL_COLS: usize = 38;
+
+/// The RAIN-ENABLED twin of [`f_split`]: same window grid, same pane count,
+/// same split shape, same echo arm — differing in `[matrix_rain] enabled` and
+/// in the fill density [`RAIN_FILL_ROWS`] explains.
+///
+/// WHY A SEPARATE FIXTURE AND NOT A FLAG ON THE OLD ONE. Rain is resolved from
+/// `App::config` at build time and its engine is retained per WINDOW across
+/// frames (weather, field, literal material bank, the progressive atlas bake),
+/// so a fixture cannot be flipped between arms mid-run without pricing the
+/// build-up on whichever arm happens to flip it. Two fixtures, each warmed to
+/// its own steady state, is the only honest shape.
+///
+/// `rain_on` is called BEFORE the fill so the first compose already resolves
+/// parameters; the engine itself is still built lazily on that first
+/// effectively-on tick, exactly as the product does.
+fn f_split_rain() -> (BenchApp, Instant) {
+    let mut b = BenchApp::headless();
+    for _ in 1..SPLIT_PANES {
+        b.split_stub();
+    }
+    b.set_grid(SPLIT_ROWS, SPLIT_COLS);
+    b.resize_settle();
+    b.rain_on();
+    let t0 = Instant::now();
+    b.mark_deco_birth(t0);
+    for sid in b.session_ids() {
+        for i in 0..RAIN_FILL_ROWS {
+            b.feed(sid, &wide_line(i, RAIN_FILL_COLS));
+        }
+        b.feed(sid, b"user@host demo $ ");
+    }
+    b.compose_at(SPLIT_ROWS, SPLIT_COLS, t0);
+    (b, t0)
+}
+
 /// One split frame plus its arm, returning `(presented, scoped, full)` for the
 /// frame alone — the reach witness `verify_split` asserts on.
 ///
@@ -442,6 +520,19 @@ fn split_frame(b: &mut BenchApp, now: Instant, tick: &mut u8, unscoped: bool) ->
     (presented, s1 - s0, f1 - f0)
 }
 
+/// THE K2 REACH CENSUS for one split frame: how many of the composite's
+/// [`SPLIT_ROWS`] rows the retention lane left exactly as the frame before it
+/// wrote them.
+///
+/// The echo damages EXACTLY ONE grid row, so a settled frame of this fixture
+/// needs to write exactly one composed row and may leave the other 89 alone.
+/// Asserted rather than assumed: without it the split arms would price a
+/// retention lane that had silently refused every frame and read as a plain
+/// re-measurement of the seam pass.
+fn split_retained(b: &BenchApp) -> usize {
+    b.composed_retained_rows()
+}
+
 /// Keystroke-echo fixture: single pane, default config, a prompt on screen.
 fn f_echo() -> (BenchApp, Instant) {
     let mut b = BenchApp::headless();
@@ -453,11 +544,32 @@ fn f_echo() -> (BenchApp, Instant) {
 
 /// Many-tabs fixture: `n` resident tabs (stub sessions), the ACTIVE one
 /// (`push_stub_tab` switches to each new tab, so the last pushed — session
-/// `n-1` — is active) showing a screenful of neutral text, then idle.
+/// `n-1` — is active) showing a screenful of neutral text, then IDLE.
+///
+/// EVERY CURSOR EFFECT OFF, and that is what makes the word "idle" true.
+/// `BenchApp::headless()` starts from the SHIPPED config, whose default
+/// `cursor_trail_style` became `rainbow kitty pet` — a permanently resident,
+/// walking cat. A window with a live pet in it is never settled: the pet's
+/// fingerprint moves every frame, the `RepaintKey` moves with it, and the
+/// early-out this workload exists to price is never reached. MEASURED before
+/// this line existed: `many_tabs_idle/2` presented 163 of 300 settled frames
+/// while the effects-off `pet_invisible` twin presented 0 of 300 — so the
+/// FL-1 pin below was reading an animating window and calling it settled, and
+/// the whole bench binary died in `main()` on it, before a nanosecond of any
+/// workload was timed.
+///
+/// Off rather than re-pinned, because the alternative measures the wrong
+/// thing: with the pet live this arm prices a FULL RECOMPOSE and would report
+/// it under the name `many_tabs_idle`, where the group comment, the report
+/// string and the `n` sweep all promise the steady-state early-out as TAB
+/// COUNT scales. A per-frame pet is a constant in `n`; it is noise on this
+/// axis and a lie in this name. The lit pet has its own priced workloads
+/// (`pet_invisible_frame`, `split_rain_compose`).
 fn f_many_tabs(n: usize) -> (BenchApp, u64, Instant) {
     let mut b = BenchApp::headless();
     assert!(n >= 1);
     b.push_stub_tabs(n - 1);
+    b.effects_all_off();
     // Sessions are minted 0..n in order, and the compose presents the ACTIVE
     // tab — feed that one, or the fed control below would damage a session no
     // visible pane folds into the RepaintKey.
@@ -964,6 +1076,8 @@ fn verify_split() -> (BenchApp, Instant, u8) {
         "the split fixture did not build the shape it claims"
     );
     let mut tick = 0u8;
+    // K2 RETENTION REACH, counted per arm over the warm frames.
+    let (mut full_retained, mut scoped_retained) = (usize::MAX, usize::MAX);
     // The FULL arm never chains, so every one of its frames reads the same.
     for i in 0..WARM_FRAMES {
         now += FRAME_DT;
@@ -972,6 +1086,15 @@ fn verify_split() -> (BenchApp, Instant, u8) {
             presented,
             "split_compose_full: frame {i} took the early-out"
         );
+        // From the SECOND warm frame on: the first compose after a fixture is
+        // built extracts panes whose damage session is still `Damage::Full`,
+        // and a full-damage fill publishes NO row-revision lane at all — so its
+        // ledger entry cannot be compared and the frame after it is the first
+        // that can retain anything. That is the D-2 lane's own contract, not a
+        // property of this fixture.
+        if i > 0 {
+            full_retained = full_retained.min(split_retained(&b));
+        }
         assert_eq!(
             (scoped, full),
             ((SPLIT_PANES - 1) as u64, 1),
@@ -996,14 +1119,198 @@ fn verify_split() -> (BenchApp, Instant, u8) {
             "split_compose_scoped frame {i}: EVERY pane must take the damage-scoped \
              arm — the arm does not price what it is named for"
         );
+        if i > 0 {
+            scoped_retained = scoped_retained.min(split_retained(&b));
+        }
     }
+    // K2: the echo damages exactly ONE grid row, so a settled frame of this
+    // fixture may leave every other composed row exactly as it is. Pinned at the
+    // exact number on the WORST warm frame of each arm — a lane that refused
+    // even once would read here, and a fixture that never armed would read 0.
+    let want_retained = SPLIT_ROWS as usize - 1;
+    assert_eq!(
+        (scoped_retained, full_retained),
+        (want_retained, want_retained),
+        "the composed retention lane did not reach the split arms: scoped kept \
+         {scoped_retained} and full kept {full_retained} of {SPLIT_ROWS} composed \
+         rows on their worst warm frame after the first, against the \
+         {want_retained} a one-row echo leaves untouched — these arms would be \
+         pricing a lane that refused"
+    );
+    // THE DARK HALF OF THE RAIN REACH GUARD. `split_rain_compose` is only a
+    // rain measurement if these two fixtures differ in rain and this one has
+    // none: no engine was ever built (the D-1 zero-cost pin), nothing scanned,
+    // and no sprite reached the frame. Asserted here rather than assumed from
+    // "we never called `rain_on`", because the same three readings are what
+    // the lit arm asserts the positive of — one witness, both directions.
+    let dark = b.rain_witness();
+    assert!(
+        !dark.engine && !dark.active && dark.quads == 0 && dark.scanned_epoch.is_none(),
+        "split_compose_* is the rain-OFF control and must be dark (engine={}, \
+         active={}, quads={}, scanned={:?})",
+        dark.engine,
+        dark.active,
+        dark.quads,
+        dark.scanned_epoch
+    );
     report(
         "split_compose",
         &format!(
             "{SPLIT_PANES} panes at {SPLIT_ROWS}x{SPLIT_COLS} | \
              full arm {}+1 scoped+full on {WARM_FRAMES}/{WARM_FRAMES} | \
-             scoped arm {SPLIT_PANES}+0 on {WARM_FRAMES}/{WARM_FRAMES}",
+             scoped arm {SPLIT_PANES}+0 on {WARM_FRAMES}/{WARM_FRAMES} | \
+             retained {want_retained}/{SPLIT_ROWS} composed rows on every warm \
+             frame after the first of BOTH arms | rain DARK (no engine, no scan, no quads)",
             SPLIT_PANES - 1
+        ),
+    );
+    (b, now, tick)
+}
+
+/// `after - before` over the per-clause full-refill ledger, rendered as
+/// `clause:frames` pairs (or `none` when nothing refused). Only clauses that
+/// MOVED are printed — the ledger is process-wide and cumulative, so a warm-up
+/// era's refusals would otherwise be reported as this window's.
+fn refill_cause_delta(before: &[(&'static str, u64)], after: &[(&'static str, u64)]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (cause, frames) in after {
+        let was = before
+            .iter()
+            .find(|(c, _)| c == cause)
+            .map_or(0, |(_, f)| *f);
+        if *frames > was {
+            out.push(format!("{cause}:{}", frames - was));
+        }
+    }
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out.join(",")
+    }
+}
+
+/// PROVE THE RAIN ARM, four ways, on EVERY sampled frame.
+///
+/// An effects fixture that silently fails to arm is the single most repeated
+/// failure this campaign has had, and rain has more ways to stay dark than any
+/// other effect here: the per-session override, the serious-mode policy,
+/// reduced motion, the load-shed latch, alt-screen suppression, a non-zero
+/// display offset, an empty literal material bank, and the drain. An
+/// `enabled = true` in the config proves none of them.
+///
+/// So the guard reads the state the FRAME left behind, at the END of the
+/// pipeline, and refuses to accept any one reading as the whole answer:
+///
+/// * `engine` + `active` — the window really built an engine and the engine
+///   itself says it is live (`is_active` folds material, drain, reading gate
+///   and whether the last emit produced light).
+/// * `quads > 0` — sprites actually reached the COMPOSED frame, past the pane
+///   translation and the clip to the focused pane's box. This is the reading a
+///   dark fixture cannot fake.
+/// * `scanned_epoch` ADVANCING — the Tier-A occupancy rescan consumed THIS
+///   frame's damage epoch. This is the one that pins the workload to the
+///   finding: the duplicate focused extract under audit exists only on frames
+///   where `rain_refresh` fires, and `rain_refresh` firing is exactly what
+///   moves this number. A sticky "scanned once" or a frozen epoch would mean
+///   the frames being timed are not the frames the finding is about.
+///
+/// The refill census is asserted too, but WEAKLY on purpose: `scoped + full`
+/// must equal the pane count (every pane extracted, nothing took a silent
+/// early-out) and the three BACKGROUND panes must stay scoped, so the arms
+/// differ only at the focused pane. The focused pane's own arm is REPORTED,
+/// not asserted, because it is the thing the fix under test changes —
+/// asserting it would make this guard fail on exactly one side of the A/B it
+/// exists to referee.
+fn verify_split_rain() -> (BenchApp, Instant, u8) {
+    let (mut b, mut now) = f_split_rain();
+    assert_eq!(
+        b.pane_count(),
+        SPLIT_PANES,
+        "the rain split fixture did not build the shape it claims"
+    );
+    let mut tick = 0u8;
+    // Warm: spawn the field, sample the literal material bank, finish the
+    // atlas bake, settle the weather at WORKING off the echo script.
+    for _ in 0..WARM_FRAMES {
+        now += FRAME_DT;
+        let _ = split_frame(&mut b, now, &mut tick, false);
+    }
+    let mut prev_scan = b
+        .rain_witness()
+        .scanned_epoch
+        .expect("the rain warm-up must have scanned at least once");
+    let mut min_quads = usize::MAX;
+    let mut focus_full = 0u64;
+    // A CONTENT FINGERPRINT OF THE FIELD ITSELF, folded over the sampled
+    // window. The arm exists to referee a change to which BUFFER the Tier-A
+    // rescan and the literal material sample read; if that change altered what
+    // rain draws, it is a rendering change and not an optimization at all.
+    // Per-frame quad counts are a cheap, order-sensitive proxy for the emitted
+    // field (they move with occupancy, weather, drops, drain and clearance),
+    // and this fold makes the whole 300-frame sequence one comparable number
+    // rather than a spot check. Printed on BOTH sides of the A/B.
+    let mut field_fold = 0u64;
+    let causes_before = b.refill_full_causes();
+    for i in 0..SAMPLE_FRAMES {
+        now += FRAME_DT;
+        let (presented, scoped, full) = split_frame(&mut b, now, &mut tick, false);
+        assert!(
+            presented,
+            "split_rain_compose: frame {i} took the early-out"
+        );
+        let w = b.rain_witness();
+        assert!(
+            w.engine && w.active,
+            "split_rain_compose frame {i}: rain is NOT live (engine={}, active={}) — \
+             the arm would price a rain-shaped frame with no rain in it",
+            w.engine,
+            w.active
+        );
+        assert!(
+            w.quads > 0,
+            "split_rain_compose frame {i}: no rain quad reached the composed frame"
+        );
+        let scan = w
+            .scanned_epoch
+            .expect("a live rain engine has scanned at least once");
+        assert!(
+            scan != prev_scan,
+            "split_rain_compose frame {i}: the Tier-A rescan did not consume a NEW \
+             damage epoch ({scan}) — this frame is not a rain-refresh frame, which \
+             is the only kind the finding is about"
+        );
+        prev_scan = scan;
+        min_quads = min_quads.min(w.quads);
+        field_fold = field_fold.rotate_left(7) ^ (w.quads as u64);
+        assert_eq!(
+            scoped + full,
+            SPLIT_PANES as u64,
+            "split_rain_compose frame {i}: {scoped} scoped + {full} full is not one \
+             extraction per pane"
+        );
+        assert!(
+            scoped >= (SPLIT_PANES - 1) as u64,
+            "split_rain_compose frame {i}: a BACKGROUND pane left the scoped arm \
+             ({scoped} scoped) — the arms must differ only at the focused pane"
+        );
+        focus_full += full;
+    }
+    // WHICH CLAUSE refused, by name, over exactly the sampled window. The
+    // finding this arm exists to referee claims the extra `take_damage` inside
+    // the rain-refresh block is what costs the focused pane its scoped arm; if
+    // that is right the delta is `damage_taken` and nothing else, and if it is
+    // wrong the stated mechanism is wrong and so is the proposed fix. Reported
+    // rather than asserted for the same reason `focus_full` is: it is the
+    // quantity the fix under test changes.
+    let causes = refill_cause_delta(&causes_before, &b.refill_full_causes());
+    report(
+        "split_rain_compose",
+        &format!(
+            "{SPLIT_PANES} panes at {SPLIT_ROWS}x{SPLIT_COLS} | rain LIVE on \
+             {SAMPLE_FRAMES}/{SAMPLE_FRAMES} frames | min quads {min_quads} | \
+             rescan epoch advanced {SAMPLE_FRAMES}/{SAMPLE_FRAMES} | \
+             focused pane on the FULL arm {focus_full}/{SAMPLE_FRAMES} | \
+             refusing clause {causes} | field fold {field_fold:#018x}"
         ),
     );
     (b, now, tick)
@@ -1022,8 +1329,9 @@ fn echo_arm(b: &mut BenchApp, now: &mut Instant, k: &mut u32) -> Option<char> {
     Some(c)
 }
 
-/// PROVE the many-tabs workload's state: N tabs resident, the settled
-/// early-out steady state pinned (FL-1, fixed), the fed control presenting.
+/// PROVE the many-tabs workload's state: N tabs resident, NOTHING animating,
+/// the settled early-out steady state pinned (FL-1, fixed), the fed control
+/// presenting.
 fn verify_many_tabs(n: usize) -> (BenchApp, Instant) {
     let (mut b, active_sid, t0) = f_many_tabs(n);
     let mut now = t0;
@@ -1036,6 +1344,16 @@ fn verify_many_tabs(n: usize) -> (BenchApp, Instant) {
         n,
         "many_tabs_idle: fixture staged the wrong tab count"
     );
+    // THE PRECONDITION OF THE WORD "IDLE", checked rather than assumed: the
+    // shipped default seats a resident walking pet, and with one on screen no
+    // frame is ever settled (see `f_many_tabs`). If this ever reads true the
+    // pin below is measuring an animating window again.
+    assert!(
+        !b.glow_enabled(),
+        "many_tabs_idle: a cursor effect is live — an animating window has no \
+         settled frame to price, and this workload's whole claim is the settled \
+         early-out (see `f_many_tabs`)"
+    );
     let mut presented = 0usize;
     for _ in 0..SAMPLE_FRAMES {
         now += FRAME_DT;
@@ -1044,7 +1362,8 @@ fn verify_many_tabs(n: usize) -> (BenchApp, Instant) {
     report(
         &format!("many_tabs_idle/{n}"),
         &format!(
-            "tabs {n} | presented {presented}/{SAMPLE_FRAMES} (settled early-out — FL-1 fixed)"
+            "tabs {n} | effects off | presented {presented}/{SAMPLE_FRAMES} \
+             (settled early-out — FL-1 fixed)"
         ),
     );
     // Same FL-1 pin as pet_invisible_frame: a settled window takes the
@@ -1404,6 +1723,7 @@ fn frame_latency(c: &mut Criterion) {
     let (mut sb_wheel, mut sb_wheel_now, mut sb_wheel_dir) = verify_wheel();
     let mut strip = verify_strip();
     let (mut split, mut split_now, mut split_tick) = verify_split();
+    let (mut rain, mut rain_now, mut rain_tick) = verify_split_rain();
 
     {
         let mut group = c.benchmark_group("frame_latency");
@@ -1595,6 +1915,36 @@ fn frame_latency(c: &mut Criterion) {
                     split.split_echo(&mut split_tick);
                     let t0 = Instant::now();
                     black_box(split.compose_at(SPLIT_ROWS, SPLIT_COLS, split_now));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+        // 4d. THE SAME COMPOSED FRAME WITH PHOSPHOR RAIN ON — the instrument
+        // the "duplicate focused-pane extract under rain" finding was refused
+        // for want of. `rain_refresh` fires on every frame here (the echo moves
+        // the damage epoch, so the Tier-A occupancy scan is always stale), and
+        // a rain-refresh frame is the ONLY frame the finding is about.
+        //
+        // Its control is `split_compose_scoped` directly above: same pane
+        // count, same geometry, same fill, same one-row echo, same timed call
+        // — differing in `[matrix_rain] enabled` and nothing else. The
+        // difference between the two numbers is therefore the whole per-frame
+        // price of rain on a split compose (engine tick + occupancy rescan +
+        // literal material sample + the extraction that feeds them + the quad
+        // translation), which is the envelope any deletion inside that block
+        // has to be a fraction of.
+        //
+        // `verify_split_rain` proves the rain is LIVE on every sampled frame
+        // four independent ways, and `verify_split` proves the control is dark.
+        group.bench_function("split_rain_compose", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    rain_now += FRAME_DT;
+                    rain.split_echo(&mut rain_tick);
+                    let t0 = Instant::now();
+                    black_box(rain.compose_at(SPLIT_ROWS, SPLIT_COLS, rain_now));
                     total += t0.elapsed();
                 }
                 total

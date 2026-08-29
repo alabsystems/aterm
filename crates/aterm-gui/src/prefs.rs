@@ -12,7 +12,7 @@
 //!     curated native tab and Manual schema select their surfaces;
 //!   * [`apply_prefs_edits`] / [`save_prefs_edits`] — write edited values back
 //!     NON-DESTRUCTIVELY (preserving the user's other keys, comments, and formatting
-//!     via `toml_edit`; atomic temp-write + rename). The serialized native config
+//!     via `aterm-toml`; atomic temp-write + rename). The serialized native config
 //!     worker returns the exact committed bytes and post-publication proof for
 //!     direct admission; the watcher remains an independent external-edit source.
 //!
@@ -912,6 +912,12 @@ pub(crate) fn nested_leaf(key: &str) -> Option<&'static NestedLeaf> {
 #[cfg_attr(not(test), allow(dead_code))] // consumed by the exhaustiveness gate
 pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
+        "agents_auto_prime",
+        "the coding-agent auto-prime opt-out, read off the UI thread by the spawn seam \
+         (spawn.rs `prime_agents_if_due`); a Settings row belongs with an Agents section \
+         that does not exist yet — `aterm agents status` names the key and what it stops",
+    ),
+    (
         "keybindings",
         "a chord→action TABLE, not a scalar: no faithful single-field shape exists, and a \
          lossy string encoding could corrupt user bindings on a Save round-trip; edit the \
@@ -1170,7 +1176,7 @@ const DEFAULT_SCROLLBACK_LINES: usize = 100_000;
 const DEFAULT_CURSOR_STYLE: &str = "block";
 
 /// The default `cursor_trail_style` when unset — the RAINBOW KITTY PET: the same
-/// smooth full-height rainbow ribbon, trailed by the full-body cat that WALKS, runs and pounces
+/// smooth rainbow ribbon, trailed by the full-body cat that WALKS, runs and pounces
 /// along the line instead of the flying head (the owner's own machine has run this
 /// spelling for weeks, and shipping anything else made the default a stranger to the
 /// product). The name has changed three times: the original single-word `nyan` became
@@ -1312,8 +1318,9 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
 
 /// Resolve a `cursor_trail_style` spelling (canonical or documented alias,
 /// case-insensitive, pre-trimmed by the caller) to its canonical option, or
-/// `None` for a spelling the engine's enablement gate would silently disable —
-/// the case the validator and the load-time warning must flag.
+/// `None` for a spelling nothing recognizes — the case that falls back to
+/// [`DEFAULT_CURSOR_TRAIL_STYLE`], and that the validator and the load-time
+/// warning must flag so the substitution is not silent.
 pub(crate) fn cursor_trail_style_canonical(token: &str) -> Option<&'static str> {
     CURSOR_TRAIL_STYLES
         .iter()
@@ -1368,7 +1375,7 @@ pub(crate) enum EditKind {
 }
 
 /// The TOML type of each editable key, so [`apply_prefs_edits`] can parse the raw
-/// control text into a correctly-typed `toml_edit` value. The single source of truth
+/// control text into a correctly-typed `aterm-toml` value. The single source of truth
 /// shared by the window (which builds the controls) and the writer (which types them).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn edit_kind(key: &str) -> EditKind {
@@ -1536,7 +1543,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum PrefsEditError {
-    /// The current `aterm.toml` text failed to parse as TOML (`toml_edit` error). The
+    /// The current `aterm.toml` text failed to parse as TOML (`aterm-toml` error). The
     /// edit is refused so a malformed file is never overwritten.
     Parse(String),
     /// A control value did not parse as its key's declared [`EditKind`] (e.g. a
@@ -1590,7 +1597,7 @@ impl std::error::Error for PrefsEditError {}
 /// clobbering a hand-authored scalar would destroy user data.
 ///
 /// Every OTHER key, every comment, and the document's formatting are PRESERVED, because
-/// the edit goes through `toml_edit`'s format-preserving DOM, not a re-serialize. Only
+/// the edit goes through `aterm-toml`'s format-preserving DOM, not a re-serialize. Only
 /// the listed keys change.
 ///
 /// Errors ([`PrefsEditError`]): the existing text isn't valid TOML, or a value doesn't
@@ -1601,7 +1608,7 @@ pub(crate) fn apply_prefs_edits(
     edits: &[(&str, Option<String>)],
 ) -> Result<String, PrefsEditError> {
     let mut doc = existing_toml
-        .parse::<toml_edit::DocumentMut>()
+        .parse::<aterm_toml::edit::DocumentMut>()
         .map_err(|e| PrefsEditError::Parse(e.to_string()))?;
 
     for (key, value) in edits {
@@ -1645,7 +1652,7 @@ pub(crate) fn apply_prefs_edits(
 
 /// Copy the SAME-LINE decor of the value being replaced — the whitespace run
 /// between `=` and the value, and the trailing inline `# comment` — onto its
-/// replacement. `toml_edit` stores that decor ON THE VALUE NODE, so replacing the
+/// replacement. `aterm-toml` stores that decor ON THE VALUE NODE, so replacing the
 /// `Item` wholesale (both the `doc[key] = …` top-level path and the dotted-leaf
 /// `TableLike::insert`) discards it: `font_px = 12.0  # cozy` edited to `18` must
 /// serialize as `font_px = 18.0  # cozy`, never lose the annotation. (Full-line
@@ -1653,8 +1660,8 @@ pub(crate) fn apply_prefs_edits(
 /// their own.) A no-op when either side isn't a plain value — a fresh key has no
 /// decor to inherit, and a table squatting on the name is refused upstream.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn adopt_inline_decor(old: Option<&toml_edit::Item>, new: &mut toml_edit::Item) {
-    let Some(old_value) = old.and_then(toml_edit::Item::as_value) else {
+fn adopt_inline_decor(old: Option<&aterm_toml::edit::Item>, new: &mut aterm_toml::edit::Item) {
+    let Some(old_value) = old.and_then(aterm_toml::edit::Item::as_value) else {
         return;
     };
     let Some(new_value) = new.as_value_mut() else {
@@ -1682,9 +1689,9 @@ fn adopt_inline_decor(old: Option<&toml_edit::Item>, new: &mut toml_edit::Item) 
 /// destroy user structure this editor has no business rewriting.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn set_nested_key(
-    doc: &mut toml_edit::DocumentMut,
+    doc: &mut aterm_toml::edit::DocumentMut,
     parts: &[&str],
-    mut item: toml_edit::Item,
+    mut item: aterm_toml::edit::Item,
 ) -> Result<(), PrefsEditError> {
     let not_a_table = |part: &str| {
         PrefsEditError::Parse(format!(
@@ -1692,20 +1699,23 @@ fn set_nested_key(
         ))
     };
     let (leaf, tables) = parts.split_last().expect("dotted key has segments");
-    let mut cur: &mut toml_edit::Item = doc.as_item_mut();
+    let mut cur: &mut aterm_toml::edit::Item = doc.as_item_mut();
     for part in tables {
         let table = cur.as_table_like_mut().ok_or_else(|| not_a_table(part))?;
-        if table.get(part).is_none_or(toml_edit::Item::is_none) {
-            let mut fresh = toml_edit::Table::new();
+        if table.get(part).is_none_or(aterm_toml::edit::Item::is_none) {
+            let mut fresh = aterm_toml::edit::Table::new();
             fresh.set_implicit(true);
-            table.insert(part, toml_edit::Item::Table(fresh));
+            table.insert(part, aterm_toml::edit::Item::Table(fresh));
         }
         cur = table.get_mut(part).expect("just ensured present");
     }
     let table = cur
         .as_table_like_mut()
         .ok_or_else(|| not_a_table(parts[parts.len() - 2]))?;
-    if table.get(leaf).is_some_and(toml_edit::Item::is_table_like) {
+    if table
+        .get(leaf)
+        .is_some_and(aterm_toml::edit::Item::is_table_like)
+    {
         return Err(not_a_table(leaf));
     }
     // Same-line decor survives a leaf replacement, exactly like the top-level
@@ -1722,9 +1732,9 @@ fn set_nested_key(
 /// left in place even when emptied — deleting `[net]` outright would also take
 /// its comments, and an empty table parses to the same defaults.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn remove_nested_key(doc: &mut toml_edit::DocumentMut, parts: &[&str]) {
+fn remove_nested_key(doc: &mut aterm_toml::edit::DocumentMut, parts: &[&str]) {
     let (leaf, tables) = parts.split_last().expect("dotted key has segments");
-    let mut cur: &mut toml_edit::Item = doc.as_item_mut();
+    let mut cur: &mut aterm_toml::edit::Item = doc.as_item_mut();
     for part in tables {
         let Some(table) = cur.as_table_like_mut() else {
             return;
@@ -1919,14 +1929,14 @@ fn title_summary_ca_file_looks_like_path(value: &str) -> bool {
     !upper.contains("-----BEGIN ") && !upper.contains("-----END ")
 }
 
-/// Build the correctly-TYPED `toml_edit` item for `key` from its raw control text,
+/// Build the correctly-TYPED `aterm-toml` item for `key` from its raw control text,
 /// per [`edit_kind`]. A malformed numeric/bool — or an integer outside the key's
 /// serde-representable domain ([`integer_domain`]) — is a
 /// [`PrefsEditError::BadValue`] so a Save never writes a value the reload parser
 /// would reject.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn typed_item(key: &str, raw: &str) -> Result<toml_edit::Item, PrefsEditError> {
-    use toml_edit::{Item, Value};
+fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditError> {
+    use aterm_toml::edit::{Item, Value};
     let bad = || PrefsEditError::BadValue {
         key: key.to_string(),
         raw: raw.to_string(),
@@ -1974,7 +1984,7 @@ fn typed_item(key: &str, raw: &str) -> Result<toml_edit::Item, PrefsEditError> {
         {
             return Err(bad());
         }
-        let array: toml_edit::Array = entries.into_iter().collect();
+        let array: aterm_toml::edit::Array = entries.into_iter().collect();
         return Ok(Item::Value(Value::Array(array)));
     }
     let value = match edit_kind(key) {
@@ -5236,7 +5246,8 @@ mod trail_style_tests {
     /// single seam `app_render::trail_is_kitty_pet` asks before drawing the
     /// full-body companion instead of the flying head — and (c) still lands on
     /// the rainbow ribbon. Pinning only `DEFAULT_CURSOR_TRAIL_STYLE == "…"`
-    /// would pass for a typo the engine silently disables.
+    /// would pass for a spelling nothing recognizes — which every other
+    /// unrecognized value now falls back TO, so the constant has to be a look.
     #[test]
     fn the_unset_default_is_the_full_body_pet_all_the_way_to_the_draw_seam() {
         let unset = crate::app_config::Config::default();
@@ -5322,6 +5333,32 @@ mod trail_style_tests {
                 GlowStyle::style_names_dog_pet(canonical),
                 "alias {alias:?} and its canonical {canonical:?} draw different species"
             );
+            // …AND THE SAME BODY. `GlowConfig::ribbon_tall` is derived from the
+            // RESOLVED spelling (`app_config::resolve_cursor_glow` asks the
+            // predicate about `style_token`), so an alias's own geometry never
+            // reaches the engine — the canonical's does. A disagreeing pair is
+            // therefore not a display/engine split the user could spot: picker,
+            // validator, paint label AND engine all agree on the canonical, and
+            // the body the user asked for is silently swapped for another with
+            // nothing anywhere naming the substitution.
+            assert_eq!(
+                GlowStyle::style_names_tall_ribbon(alias),
+                GlowStyle::style_names_tall_ribbon(canonical),
+                "alias {alias:?} and its canonical {canonical:?} draw different ribbons"
+            );
+            // …AND THE SAME SPELLING on the underline axis, which is a separate
+            // constraint from the body above. `style_names_underline_ribbon`
+            // reports what the string SAYS, explicitly not "is this the hybrid?"
+            // (the hybrid is the default, so a bare `rainbow kitty` draws it and
+            // answers `false`), and its one non-test caller is the Settings
+            // paint label. A disagreeing pair would label one spelling of a
+            // style with the shortened "Rainbow underline" and the other with
+            // its full name.
+            assert_eq!(
+                GlowStyle::style_names_underline_ribbon(alias),
+                GlowStyle::style_names_underline_ribbon(canonical),
+                "alias {alias:?} and its canonical {canonical:?} spell different ribbons"
+            );
             assert_eq!(
                 super::cursor_trail_style_canonical(alias),
                 Some(canonical),
@@ -5347,23 +5384,26 @@ mod trail_style_tests {
     ///
     /// `cursor_trail_style_canonical` returning `None` is not "no style"; it is
     /// `TrailStyleIssue::Unknown`, and `resolve_trail_style` answers that by
-    /// disabling the whole trail (`effective=false intensity=0.00`). So every
-    /// spelling the ENGINE advertises has to be a spelling THIS module resolves,
-    /// or the two halves disagree in the one direction the user cannot see: the
-    /// diagnostic still says `ribbon_look=tall` while nothing is drawn at all,
-    /// and the only warning goes to stderr.
+    /// substituting the DEFAULT style. So every spelling the ENGINE advertises
+    /// has to be a spelling THIS module resolves, or the two halves disagree in
+    /// the one direction the user cannot see: asking for the tall body gets the
+    /// default's highlighter, and the only word about it is a warning on the
+    /// startup banner. (Before 2026-08-29 the same gap switched the whole
+    /// cursor effect OFF — `effective=false intensity=0.00` under a
+    /// `ribbon_look=tall` diagnostic.)
     ///
     /// Both directions are pinned. Forward: each historical explicit-tall
     /// spelling resolves to a canonical picker option that is itself still tall
     /// (an alias that canonicalised to an underline spelling would re-enable the
     /// trail while silently dropping the requested geometry). Backward: every
-    /// canonical rainbow-kitty spelling uses the restored v0.43 full-height body
-    /// except the one explicitly named `underline`; companion selection must not
+    /// canonical rainbow-kitty spelling draws the highlighter-plus-under-baseline
+    /// hybrid — the default since the owner reversed it on 2026-08-28 — except
+    /// the one explicitly named `tall`; companion selection must not
     /// accidentally change the ribbon geometry.
     ///
     /// The four spellings are written out rather than imported because the
     /// engine exports the predicate, not the list; `cursor_glow`'s own
-    /// `rainbow_standard_spellings_use_v043_body_and_underline_aliases_keep_hybrid`
+    /// `rainbow_standard_spellings_use_the_hybrid_and_tall_aliases_keep_the_v043_body`
     /// holds the other copy.
     #[test]
     fn every_tall_ribbon_spelling_stays_selectable() {
@@ -5379,8 +5419,8 @@ mod trail_style_tests {
             );
             let canonical = super::cursor_trail_style_canonical(tall).unwrap_or_else(|| {
                 panic!(
-                    "{tall:?} resolves to None — the enablement gate would DISABLE the whole \
-                     cursor effect for a look the engine implements"
+                    "{tall:?} resolves to None — the resolver would substitute the DEFAULT style \
+                     for a look the engine implements"
                 )
             });
             assert!(
@@ -5398,20 +5438,21 @@ mod trail_style_tests {
                 "the tall body is a presentation of the rainbow ribbon, not a style of its own"
             );
         }
-        // The restored v0.43 full-height body is the rainbow family's default;
-        // only the explicitly named alternate keeps the later underline shape.
+        // The highlighter-plus-under-baseline hybrid is the rainbow family's
+        // default; only the explicitly named `tall` entry forks the geometry.
         for &s in CURSOR_TRAIL_STYLES {
-            let expected = matches!(
-                s,
-                "rainbow kitty"
-                    | "rainbow kitty pet"
-                    | "rainbow dog pet"
-                    | "rainbow kitty flying"
-                    | "rainbow kitty tall"
-            );
+            let expected = matches!(s, "rainbow kitty tall");
             assert_eq!(
                 GlowStyle::style_names_tall_ribbon(s),
                 expected,
+                "style {s:?}"
+            );
+            // The underline spelling is the other half of the same axis: exactly
+            // one canonical option SAYS underline, and the paint label reads that
+            // predicate off the displayed (canonical) value.
+            assert_eq!(
+                GlowStyle::style_names_underline_ribbon(s),
+                matches!(s, "rainbow kitty underline"),
                 "style {s:?}"
             );
         }
@@ -5748,7 +5789,7 @@ mod edit_tests {
             out.contains("[matrix_rain]") && out.contains("enabled = true"),
             "explicit table + typed bool: {out:?}"
         );
-        let c: Config = toml::from_str(&out).expect("round-trips through serde");
+        let c: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
         assert!(c.matrix_rain_enabled());
     }
 
@@ -5771,7 +5812,7 @@ mod edit_tests {
             "sibling + its inline note survive"
         );
         assert!(out.contains("enabled = true"), "the child updated in place");
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert!(c.matrix_rain_enabled());
         assert_eq!(c.matrix_rain.as_ref().unwrap().fps, Some(24));
     }
@@ -5799,7 +5840,7 @@ mod edit_tests {
             "an emptied table is retained (comments live on its header): {out:?}"
         );
         assert!(out.contains("font_px = 13.0"));
-        let cfg: crate::app_config::Config = toml::from_str(&out).expect("round-trip");
+        let cfg: crate::app_config::Config = aterm_toml::from_str(&out).expect("round-trip");
         assert!(
             !cfg.matrix_rain_enabled(),
             "an emptied [matrix_rain] resolves to the same default as an absent one"
@@ -5823,7 +5864,7 @@ mod edit_tests {
             &[(super::EDIT_MATRIX_RAIN_ENABLED, set("true"))],
         )
         .expect("inline-table update");
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert!(c.matrix_rain_enabled());
         assert_eq!(
             c.matrix_rain.as_ref().unwrap().fps,
@@ -5909,7 +5950,7 @@ mod edit_tests {
         assert_eq!(row.kind, EditKind::Bool);
         assert_eq!(row.seed.as_deref(), Some("false"), "resolved default OFF");
 
-        let on: Config = toml::from_str("[matrix_rain]\nenabled = true").unwrap();
+        let on: Config = aterm_toml::from_str("[matrix_rain]\nenabled = true").unwrap();
         let row_on = editable_fields(&on)
             .into_iter()
             .find(|f| f.key == key)
@@ -5942,7 +5983,7 @@ mod edit_tests {
         assert_eq!(row.label, "Mark the active split pane");
         assert_eq!(row.seed.as_deref(), Some("true"), "resolved default ON");
 
-        let off: Config = toml::from_str("split_focus_mark = false").unwrap();
+        let off: Config = aterm_toml::from_str("split_focus_mark = false").unwrap();
         assert!(!off.split_focus_mark_or_default());
         let row_off = editable_fields(&off)
             .into_iter()
@@ -5994,7 +6035,7 @@ mod edit_tests {
             "consent-gated default OFF"
         );
 
-        let configured: Config = toml::from_str(
+        let configured: Config = aterm_toml::from_str(
             "[packages]\nenabled = false\nauto_update = false\nauto_install = true\n",
         )
         .unwrap();
@@ -6048,7 +6089,7 @@ mod edit_tests {
         );
         assert!(out.contains("[packages.links]") && out.contains("ay = \"~/ay\""));
         assert!(out.contains("auto_install = true"));
-        let config: Config = toml::from_str(&out).expect("round-trips through serde");
+        let config: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
         assert!(config.packages_auto_install());
         assert!(
             config.packages_auto_update(),
@@ -6064,7 +6105,7 @@ mod edit_tests {
             reverted.contains("[packages]") && reverted.contains("account = \"alabsystems\""),
             "atpkg-owned keys keep the table alive: {reverted:?}"
         );
-        let config: Config = toml::from_str(&reverted).unwrap();
+        let config: Config = aterm_toml::from_str(&reverted).unwrap();
         assert!(
             !config.packages_auto_install(),
             "back to the consent default"
@@ -6084,7 +6125,7 @@ mod edit_tests {
         let out = apply_prefs_edits("", &[(EDIT_FONT_PX, set("15.5"))]).unwrap();
         assert!(out.contains("font_px"), "wrote the key: {out:?}");
         // Floats are typed as TOML floats, not strings, so serde reads f32.
-        let c: Config = toml::from_str(&out).expect("round-trips");
+        let c: Config = aterm_toml::from_str(&out).expect("round-trips");
         assert_eq!(c.font_px, Some(15.5));
     }
 
@@ -6093,7 +6134,7 @@ mod edit_tests {
     fn update_existing_key() {
         let existing = "font_px = 12.0\ntheme = \"Dracula\"\n";
         let out = apply_prefs_edits(existing, &[(EDIT_FONT_PX, set("18.0"))]).unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.font_px, Some(18.0));
         // The unrelated key is untouched.
         assert_eq!(c.theme.as_deref(), Some("Dracula"));
@@ -6106,7 +6147,7 @@ mod edit_tests {
         let existing = "font_px = 12.0\ntheme = \"Dracula\"\n";
         let out = apply_prefs_edits(existing, &[(EDIT_FONT_PX, None)]).unwrap();
         assert!(!out.contains("font_px"), "key removed: {out:?}");
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.font_px, None);
         // Removing the cleared key does NOT touch the sibling.
         assert_eq!(c.theme.as_deref(), Some("Dracula"));
@@ -6120,7 +6161,7 @@ mod edit_tests {
     }
 
     /// COMMENTS and unrelated keys survive an edit — the whole point of the
-    /// non-destructive (toml_edit DOM) write vs. a re-serialize.
+    /// non-destructive (aterm-toml DOM) write vs. a re-serialize.
     #[test]
     fn preserves_comments_and_unrelated_keys() {
         let existing = "\
@@ -6139,7 +6180,7 @@ gpu = true
         assert!(out.contains("[keybindings]"), "{out}");
         assert!(out.contains("\"cmd+shift+t\" = \"new_tab\""), "{out}");
         // And the new key landed + re-parses.
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.theme.as_deref(), Some("Nord"));
         assert_eq!(c.font_px, Some(12.0));
     }
@@ -6182,7 +6223,7 @@ listen = \"127.0.0.1:7777\" # local only
             "{out}"
         );
         // And the round trip stays serde-clean with the new values.
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.font_px, Some(18.0));
         assert_eq!(
             c.net.as_ref().and_then(|n| n.listen.as_deref()),
@@ -6219,7 +6260,7 @@ listen = \"127.0.0.1:7777\" # local only
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).expect("round-trips");
+        let c: Config = aterm_toml::from_str(&out).expect("round-trips");
         assert_eq!(c.font_family_bold.as_deref(), Some("JetBrains Mono Bold"));
         assert_eq!(
             c.font_family_italic.as_deref(),
@@ -6240,11 +6281,11 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(c.emoji_font.as_deref(), Some("Noto Color Emoji"));
         // The TOML-array spelling parses to the SAME value.
         let arr: Config =
-            toml::from_str("fallback_fonts = [\"Sarasa Mono\", \"Apple Symbols\"]").unwrap();
+            aterm_toml::from_str("fallback_fonts = [\"Sarasa Mono\", \"Apple Symbols\"]").unwrap();
         assert_eq!(arr.fallback_fonts, c.fallback_fonts);
         // And every new key surfaces in the Settings model (search visibility):
         // present in the schema rows, grouped under Typography.
-        let cfg: Config = toml::from_str(&out).unwrap();
+        let cfg: Config = aterm_toml::from_str(&out).unwrap();
         let fields = editable_fields(&cfg);
         for key in [
             super::EDIT_FONT_FAMILY_BOLD,
@@ -6297,7 +6338,7 @@ listen = \"127.0.0.1:7777\" # local only
             ],
         )
         .expect("writes typed values");
-        let c: Config = toml::from_str(&out).expect("round-trips through serde");
+        let c: Config = aterm_toml::from_str(&out).expect("round-trips through serde");
         // The load-adaptive shedding toggle is typed Bool (not a corrupting string) and
         // opts out of the render-overload heuristic.
         assert_eq!(c.load_adaptive_motion, Some(false));
@@ -6319,7 +6360,8 @@ listen = \"127.0.0.1:7777\" # local only
             Some(vec!["wght=450".to_string(), "opsz=14".to_string()])
         );
         // ...the TOML-array spelling parses to the same value...
-        let arr: Config = toml::from_str("font_variation = [\"wght=450\", \"opsz=14\"]").unwrap();
+        let arr: Config =
+            aterm_toml::from_str("font_variation = [\"wght=450\", \"opsz=14\"]").unwrap();
         assert_eq!(
             arr.font_variation.map(|l| l.0),
             c.font_variation.as_ref().map(|l| l.0.clone())
@@ -6380,7 +6422,7 @@ listen = \"127.0.0.1:7777\" # local only
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).expect("typed values round-trip");
+        let c: Config = aterm_toml::from_str(&out).expect("typed values round-trip");
         assert_eq!(c.font_px, Some(14.0)); // float, even from "14"
         assert_eq!(c.scrollback_lines, Some(50000)); // integer
         assert_eq!(c.copy_on_select, Some(true)); // bool
@@ -6440,7 +6482,7 @@ listen = \"127.0.0.1:7777\" # local only
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.font_px, Some(20.0));
         assert_eq!(c.theme, None);
         assert_eq!(c.scrollback_lines, Some(0));
@@ -6453,7 +6495,7 @@ listen = \"127.0.0.1:7777\" # local only
     fn split_theme_string_round_trips() {
         let out =
             apply_prefs_edits("", &[(EDIT_THEME, set("dark:Dracula,light:GitHub Light"))]).unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.theme.as_deref(), Some("dark:Dracula,light:GitHub Light"));
     }
 
@@ -6467,11 +6509,11 @@ listen = \"127.0.0.1:7777\" # local only
             out.contains("cursor_trail_style = \"phaser\""),
             "canonical lower-case spelling written: {out}"
         );
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.cursor_trail_style.as_deref(), Some("phaser"));
         // `fire` likewise — the second look the owner asked about.
         let out = apply_prefs_edits("", &[(EDIT_CURSOR_TRAIL_STYLE, set("fire"))]).unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.cursor_trail_style.as_deref(), Some("fire"));
     }
 
@@ -6498,7 +6540,7 @@ listen = \"127.0.0.1:7777\" # local only
             out.contains("cursor_trail_style = \"pack:synthwave\""),
             "pack selection written verbatim: {out}"
         );
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.cursor_trail_style.as_deref(), Some("pack:synthwave"));
         // An empty pack ref is not a valid pack AND not a canonical option → rejected.
         let err = apply_prefs_edits("", &[(EDIT_CURSOR_TRAIL_STYLE, set("pack:"))]).unwrap_err();
@@ -6519,7 +6561,7 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(field(EDIT_LINES).seed, None);
         assert_eq!(field(EDIT_LINES).placeholder, "24 (default)");
 
-        let configured: Config = toml::from_str("columns = 132\nlines = 50\n").unwrap();
+        let configured: Config = aterm_toml::from_str("columns = 132\nlines = 50\n").unwrap();
         let fields = editable_fields(&configured);
         let field = |key: &str| {
             fields
@@ -6590,7 +6632,8 @@ listen = \"127.0.0.1:7777\" # local only
             (super::EDIT_CURSOR_GLOW_SDR_BOOST, set("0.4")),
         ];
         let out = apply_prefs_edits("", &edits).expect("cursor effects write typed TOML");
-        let cfg: Config = toml::from_str(&out).expect("cursor effects reparse through Config");
+        let cfg: Config =
+            aterm_toml::from_str(&out).expect("cursor effects reparse through Config");
         assert_eq!(cfg.cursor_trail_color.as_deref(), Some("#40C8FF"));
         assert_eq!(cfg.cursor_trail_accent.as_deref(), Some("#FF77AA"));
         assert_eq!(cfg.cursor_nyan_sprite.as_deref(), Some("~/cat.png"));
@@ -6629,7 +6672,7 @@ listen = \"127.0.0.1:7777\" # local only
     #[test]
     fn color_value_is_validated_on_save() {
         let out = apply_prefs_edits("", &[(EDIT_FOREGROUND, set("#1E2030"))]).unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.foreground.as_deref(), Some("#1E2030"));
         let err = apply_prefs_edits("", &[(EDIT_BACKGROUND, set("not-a-color"))]).unwrap_err();
         match err {
@@ -6685,7 +6728,7 @@ listen = \"127.0.0.1:7777\" # local only
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.allow_osc52_query, Some(true)); // TOML bool, not a string
         assert_eq!(c.columns, Some(100)); // TOML int, not a string
     }
@@ -7078,7 +7121,7 @@ listen = \"127.0.0.1:7777\" # local only
         assert!(out.contains("title_summary_proxy_mode = \"direct\""));
         assert!(out.contains("title_summary_ca_file = \"/tmp/private-model-ca.pem\""));
 
-        let cfg: Config = toml::from_str(&out).expect("Smart Titles config re-parses");
+        let cfg: Config = aterm_toml::from_str(&out).expect("Smart Titles config re-parses");
         assert_eq!(cfg.descriptive_titles, Some(false));
         assert_eq!(
             cfg.title_summary_provider
@@ -7199,9 +7242,69 @@ listen = \"127.0.0.1:7777\" # local only
         ] {
             let out = apply_prefs_edits("", &[(super::EDIT_TITLE_SUMMARY_TOKEN_FILE, set(path))])
                 .unwrap_or_else(|error| panic!("valid path {path:?} was rejected: {error}"));
-            let cfg: Config = toml::from_str(&out).expect("token-file TOML re-parses");
+            let cfg: Config = aterm_toml::from_str(&out).expect("token-file TOML re-parses");
             assert_eq!(cfg.title_summary_token_file.as_deref(), Some(path));
         }
+    }
+
+    /// WINDOWS PATH PARITY: a native path is BACKSLASHED, and a backslash is
+    /// TOML's escape character — `C:\Users\…` written into a basic string is
+    /// the invalid escape `\U`, which fails the whole file. A Windows user's
+    /// font, shell and trail-pack rows are all path-valued, so the writer owes
+    /// them a representation that survives: `toml_edit` picks a LITERAL
+    /// (single-quoted) string, and the contract asserted here is the outcome,
+    /// not the spelling. Both writer branches are covered — the scalar one
+    /// (`font_family_bold`, `shell`, and the comma-joined `fallback_fonts`
+    /// `FontList`) and the [`LIST_KEYS`] array one (`cursor_trail_packs`).
+    ///
+    /// Two properties, because a raw write bites twice: the emitted file must
+    /// re-parse to the authored path VERBATIM, and it must survive being fed
+    /// back in as the existing document — an unescaped path would not merely
+    /// lose the value, it would wedge every later Save behind a parse error on
+    /// the user's own config.
+    #[test]
+    fn windows_paths_round_trip_through_scalar_and_list_rows() {
+        let bold = r"C:\Users\example\AppData\Local\Microsoft\Windows\Fonts\Cascadia.ttf";
+        let fallback_a = r"C:\Windows\Fonts\seguiemj.ttf";
+        let fallback_b = r"\\fileserver\share\fonts\Sarasa-Mono.ttf";
+        let shell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let pack = r"C:\Users\example\.config\aterm\packs\trail-pack.toml";
+
+        let out = apply_prefs_edits(
+            "",
+            &[
+                (super::EDIT_FONT_FAMILY_BOLD, set(bold)),
+                (
+                    super::EDIT_FALLBACK_FONTS,
+                    set(&format!("{fallback_a}, {fallback_b}")),
+                ),
+                (super::EDIT_SHELL, set(shell)),
+                (super::EDIT_CURSOR_TRAIL_PACKS, set(pack)),
+            ],
+        )
+        .expect("native Windows paths are writable Settings values");
+
+        let cfg: Config = aterm_toml::from_str(&out)
+            .unwrap_or_else(|error| panic!("Windows-path TOML re-parses: {error}\n{out}"));
+        assert_eq!(cfg.font_family_bold.as_deref(), Some(bold));
+        assert_eq!(cfg.shell.as_deref(), Some(shell));
+        assert_eq!(
+            cfg.fallback_fonts.map(|list| list.0),
+            Some(vec![fallback_a.to_string(), fallback_b.to_string()]),
+            "the comma-joined FontList keeps every entry, UNC prefix included"
+        );
+        assert_eq!(
+            cfg.cursor_trail_packs,
+            Some(vec![pack.to_string()]),
+            "the LIST_KEYS array branch writes a survivable path too"
+        );
+
+        // The saved file is a valid EXISTING document for the next Save.
+        let again = apply_prefs_edits(&out, &[(super::EDIT_FONT_PX, set("14.0"))])
+            .expect("a Windows-path config is editable again, not wedged");
+        let cfg: Config = aterm_toml::from_str(&again).expect("second Save re-parses");
+        assert_eq!(cfg.font_family_bold.as_deref(), Some(bold));
+        assert_eq!(cfg.font_px, Some(14.0));
     }
 
     #[test]
@@ -7243,7 +7346,7 @@ listen = \"127.0.0.1:7777\" # local only
         ] {
             let out = apply_prefs_edits("", &[(super::EDIT_TITLE_SUMMARY_CA_FILE, set(path))])
                 .unwrap_or_else(|error| panic!("valid CA path {path:?} was rejected: {error}"));
-            let cfg: Config = toml::from_str(&out).expect("CA-path TOML re-parses");
+            let cfg: Config = aterm_toml::from_str(&out).expect("CA-path TOML re-parses");
             assert_eq!(cfg.title_summary_ca_file.as_deref(), Some(path));
         }
     }
@@ -7305,7 +7408,7 @@ listen = \"127.0.0.1:7777\" # local only
             &[(super::EDIT_TITLE_SUMMARY_ENDPOINT, set(endpoint))],
         )
         .expect("parameter-free endpoint remains valid");
-        let cfg: Config = toml::from_str(&out).expect("endpoint TOML re-parses");
+        let cfg: Config = aterm_toml::from_str(&out).expect("endpoint TOML re-parses");
         assert_eq!(cfg.title_summary_endpoint.as_deref(), Some(endpoint));
     }
 
@@ -7385,7 +7488,7 @@ listen = \"127.0.0.1:7777\" # local only
     /// row order, with the right keys + kinds — what the window maps to controls.
     #[test]
     fn editable_fields_seed_from_config() {
-        let c: Config = toml::from_str(
+        let c: Config = aterm_toml::from_str(
             "font_px = 13.0\ntheme = \"Nord\"\nscrollback_lines = 4000\ncopy_on_select = true\n",
         )
         .unwrap();
@@ -7522,7 +7625,7 @@ listen = \"127.0.0.1:7777\" # local only
     /// fallback — so re-saving an untouched window doesn't materialise a "   " value.
     #[test]
     fn editable_fields_blank_string_seeds_none() {
-        let c: Config = toml::from_str("theme = \"   \"\nfont_family = \"\"\n").unwrap();
+        let c: Config = aterm_toml::from_str("theme = \"   \"\nfont_family = \"\"\n").unwrap();
         let fields = editable_fields(&c);
         let seed = |k: &str| {
             fields
@@ -7593,7 +7696,7 @@ listen = \"127.0.0.1:7777\" # local only
     /// "unlimited".
     #[test]
     fn editable_fields_placeholder_reflects_configured_value() {
-        let c: Config = toml::from_str(
+        let c: Config = aterm_toml::from_str(
             "theme = \"Nord\"\ncursor_style = \"bar\"\nscrollback_lines = 0\nfont_px = 15.0\n",
         )
         .unwrap();
@@ -7735,7 +7838,7 @@ mod registry_conformance_tests {
             };
             let out = apply_prefs_edits("", &[(leaf.key, set(sample))])
                 .unwrap_or_else(|e| panic!("{} rejected its own sample value: {e}", leaf.key));
-            let _: Config = toml::from_str(&out).unwrap_or_else(|e| {
+            let _: Config = aterm_toml::from_str(&out).unwrap_or_else(|e| {
                 panic!("{} wrote TOML serde rejects: {e}\n---\n{out}", leaf.key)
             });
         }
@@ -7771,7 +7874,7 @@ mod registry_conformance_tests {
         let saves = |key: &str, value: i128| -> bool {
             match apply_prefs_edits("", &[(key, set(&value.to_string()))]) {
                 Ok(out) => {
-                    let _: Config = toml::from_str(&out).unwrap_or_else(|e| {
+                    let _: Config = aterm_toml::from_str(&out).unwrap_or_else(|e| {
                         panic!(
                             "{key} = {value} was ACCEPTED at Save yet serde rejects the \
                              file: {e}\n---\n{out}"
@@ -7828,7 +7931,7 @@ mod registry_conformance_tests {
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).expect("created tables re-parse");
+        let c: Config = aterm_toml::from_str(&out).expect("created tables re-parse");
         assert_eq!(
             c.net.as_ref().and_then(|n| n.listen.as_deref()),
             Some("0.0.0.0:7100")
@@ -7863,7 +7966,7 @@ enabled = true
         assert!(out.contains("# my config"), "{out}");
         assert!(out.contains("# operator cert (DER)"), "{out}");
         assert!(out.contains("# keep me"), "{out}");
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.font_px, Some(12.0));
         let net = c.net.as_ref().unwrap();
         assert_eq!(net.cert.as_deref(), Some("~/x.der"));
@@ -7875,7 +7978,7 @@ enabled = true
         // The INLINE-table spelling (`net = { … }`) edits in place too.
         let out =
             apply_prefs_edits("net = { cert = \"a\" }\n", &[("net.listen", set("b"))]).unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         let net = c.net.as_ref().unwrap();
         assert_eq!(net.cert.as_deref(), Some("a"));
         assert_eq!(net.listen.as_deref(), Some("b"));
@@ -7891,7 +7994,7 @@ enabled = true
         let out = apply_prefs_edits(existing, &[("sparkle_words.reduced_motion", None)]).unwrap();
         assert!(!out.contains("reduced_motion"), "{out}");
         assert!(out.contains("# note"), "{out}");
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(
             c.sparkle_words.as_ref().and_then(|s| s.enabled),
             Some(false)
@@ -7932,7 +8035,7 @@ enabled = true
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).expect("arrays re-parse as Vec<String>");
+        let c: Config = aterm_toml::from_str(&out).expect("arrays re-parse as Vec<String>");
         assert_eq!(
             c.palette,
             Some(vec!["#1d1f21".to_string(), "#cc6666".to_string()])
@@ -8021,7 +8124,7 @@ enabled = true
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).expect("typed values round-trip");
+        let c: Config = aterm_toml::from_str(&out).expect("typed values round-trip");
         assert_eq!(c.gpu, Some(false));
         // The ambient-bed opt-in writes a real TOML bool and resolves ON.
         assert_eq!(c.trail_sound_bed, Some(true));
@@ -8086,7 +8189,7 @@ enabled = true
             ],
         )
         .unwrap();
-        let c: Config = toml::from_str(&out).unwrap();
+        let c: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(c.display_font.as_deref(), Some("pixel"));
         assert_eq!(c.active_tab_color.as_deref(), Some("#FF00AA"));
         assert_eq!(c.active_tab_color_rgb(), Some([0xFF, 0x00, 0xAA]));
@@ -8095,7 +8198,7 @@ enabled = true
         // the resolver canonicalizes it into the `display:` mix family.
         let out = apply_prefs_edits("", &[(super::EDIT_DISPLAY_FONT, set(" pixel + engraved "))])
             .unwrap();
-        let mixed: Config = toml::from_str(&out).unwrap();
+        let mixed: Config = aterm_toml::from_str(&out).unwrap();
         assert_eq!(mixed.display_font.as_deref(), Some("pixel+engraved"));
         assert_eq!(
             mixed.font_family_request().as_deref(),
@@ -8167,7 +8270,7 @@ enabled = true
         }
 
         // The legacy KEY parses into the current field (serde alias).
-        let legacy: Config = toml::from_str("game_font = \"minecraft\"\n").unwrap();
+        let legacy: Config = aterm_toml::from_str("game_font = \"minecraft\"\n").unwrap();
         assert_eq!(legacy.display_font.as_deref(), Some("minecraft"));
         // …and resolves to the RENAMED face, under the renamed scheme.
         assert_eq!(

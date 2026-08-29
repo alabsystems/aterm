@@ -27,6 +27,12 @@ use aterm_session::EdgeToken;
 
 pub(crate) use crate::app_config::Connection;
 
+/// The macOS Keychain generic-password calls, over Security.framework's
+/// `SecItem*` API directly (this module retired the `security-framework`
+/// crate — 10,503 lines for a two-function need).
+#[cfg(target_os = "macos")]
+mod keychain;
+
 /// Keychain generic-password service under which drive tokens are stored on macOS
 /// (account = the connection name). Referenced only by the macOS Keychain lookup in
 /// [`resolve_token`]; kept on every target so the module docs' intra-link resolves.
@@ -160,8 +166,8 @@ pub(crate) fn resolve_token(conn: &Connection) -> Result<EdgeToken, String> {
         // macOS errSecItemNotFound — the ONLY error that means "fall through to a
         // token_file"; any other Keychain error (locked, access denied, …) is
         // surfaced rather than silently downgraded to the file.
-        const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-        match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &conn.name) {
+        use keychain::ERR_SEC_ITEM_NOT_FOUND;
+        match keychain::get_generic_password(KEYCHAIN_SERVICE, &conn.name) {
             Ok(bytes) => {
                 let hex = std::str::from_utf8(&bytes).map_err(|_| {
                     format!("Keychain token for '{}' is not valid UTF-8", conn.name)
@@ -327,12 +333,8 @@ pub(crate) fn store_token(name: &str, token_hex: &str) -> Result<String, String>
     }
     #[cfg(target_os = "macos")]
     {
-        security_framework::passwords::set_generic_password(
-            KEYCHAIN_SERVICE,
-            name,
-            token_hex.as_bytes(),
-        )
-        .map_err(|e| format!("Keychain store failed: {e}"))?;
+        keychain::set_generic_password(KEYCHAIN_SERVICE, name, token_hex.as_bytes())
+            .map_err(|e| format!("Keychain store failed: {e}"))?;
         Ok(format!(
             "stored the drive token for '{name}' in the macOS Keychain (service {KEYCHAIN_SERVICE})"
         ))

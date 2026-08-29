@@ -823,7 +823,7 @@ impl AllowlistConfig {
     ///
     /// Returns [`AllowlistError::Parse`] if the TOML is malformed.
     pub(crate) fn from_toml_str(s: &str) -> Result<Self, AllowlistError> {
-        let table: toml::Table = s.parse().map_err(AllowlistError::Parse)?;
+        let table: aterm_toml::Table = s.parse().map_err(AllowlistError::Parse)?;
         Ok(Self {
             mcp_tools: extract_string_array(&table, "mcp", "allowed"),
             plugins: extract_string_array(&table, "plugins", "allowed"),
@@ -851,7 +851,7 @@ impl AllowlistConfig {
 /// Extract a string array from a TOML table at `[section].key`.
 /// Returns an empty vec if the section or key is missing.
 #[cfg(feature = "allowlist-toml")]
-fn extract_string_array(table: &toml::Table, section: &str, key: &str) -> Vec<String> {
+fn extract_string_array(table: &aterm_toml::Table, section: &str, key: &str) -> Vec<String> {
     table
         .get(section)
         .and_then(|v| v.as_table())
@@ -875,7 +875,7 @@ pub enum AllowlistError {
     ///
     /// Only produced when the `allowlist-toml` feature is enabled (#7729).
     #[cfg(feature = "allowlist-toml")]
-    Parse(toml::de::Error),
+    Parse(aterm_toml::de::Error),
     /// Allowlist was already initialized.
     AlreadyInitialized,
 }

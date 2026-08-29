@@ -31,10 +31,10 @@ struct Asset {
     kind: String,
     viewbox: (f32, f32),
     anchor: (f32, f32, f32),
-    layers: Vec<toml::Value>,
+    layers: Vec<aterm_toml::Value>,
 }
 
-fn number(value: &toml::Value) -> f32 {
+fn number(value: &aterm_toml::Value) -> f32 {
     value
         .as_float()
         .map(|v| v as f32)
@@ -55,7 +55,7 @@ fn load_all() -> Vec<Asset> {
         .map(|path| {
             let stem = path.file_stem().unwrap().to_str().unwrap().to_owned();
             let source = std::fs::read_to_string(path).expect("read animal asset");
-            let doc: toml::Value = source
+            let doc: aterm_toml::Value = source
                 .parse()
                 .unwrap_or_else(|e| panic!("{stem}: parse: {e}"));
             let viewbox = doc["viewbox"].as_array().expect("viewbox array");
@@ -76,11 +76,11 @@ fn load_all() -> Vec<Asset> {
         .collect()
 }
 
-fn role(layer: &toml::Value) -> &str {
+fn role(layer: &aterm_toml::Value) -> &str {
     layer["role"].as_str().expect("semantic layer role")
 }
 
-fn parsed_paths(layer: &toml::Value) -> Vec<Vec<PathCmd>> {
+fn parsed_paths(layer: &aterm_toml::Value) -> Vec<Vec<PathCmd>> {
     layer["paths"]
         .as_array()
         .expect("paths array")
@@ -163,7 +163,7 @@ fn hex_rgb(value: &str) -> [f32; 3] {
     ]
 }
 
-fn luma(layer: &toml::Value) -> f32 {
+fn luma(layer: &aterm_toml::Value) -> f32 {
     let [r, g, b] = hex_rgb(layer["ref_fill"].as_str().expect("ref_fill"));
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }

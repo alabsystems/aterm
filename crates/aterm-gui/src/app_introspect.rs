@@ -2310,9 +2310,7 @@ impl App {
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorCat);
         let load_shed = self.load_shed_active();
-        let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
-            self.config.cursor_trail_style_raw(),
-        );
+        let pet_mode = self.trail_is_kitty_pet();
         let pet_species = self.trail_pet_species();
         // The ONE companion verdict (favourite > program with tenure > launch
         // kitty) — the same seam the composed PRESENT resolves through, so a
@@ -2636,9 +2634,7 @@ impl App {
         let cursor_companions_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorCat);
-        let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
-            self.config.cursor_trail_style_raw(),
-        );
+        let pet_mode = self.trail_is_kitty_pet();
         let pet_species = self.trail_pet_species();
         // The same alt-screen policy the live application-present resolves: only a
         // configured `suppress_in_alt_screen` blanks the capture's decorations.
@@ -4752,7 +4748,7 @@ impl App {
     ) {
         use std::hash::Hash;
 
-        "terminal-render-model-v5".hash(hash);
+        "terminal-render-model-v6".hash(hash);
         input.rows.hash(hash);
         input.cols.hash(hash);
         for row in &input.cells {
@@ -4770,6 +4766,14 @@ impl App {
                 cell.strikethrough.hash(hash);
                 cell.overline.hash(hash);
                 cell.underline_color.hash(hash);
+                // Every field the renderer reads off a cell, including the one
+                // no escape sequence can set: this hash is the identity of what
+                // was rasterized, and a field left out of it is a difference a
+                // capture cannot report. The terminal band leaves the overline
+                // channel `None`, so hashing it changes no identity today —
+                // which is exactly when a field is cheap to wire and easy to
+                // forget.
+                cell.overline_color.hash(hash);
             }
         }
         input.clusters.hash(hash);
@@ -6798,11 +6802,13 @@ fn macos_rect_is_finite(rect: objc2_foundation::NSRect) -> bool {
 #[cfg(target_os = "macos")]
 fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     const MAX_CHROME_BYTES: usize = 256 * 1024 * 1024;
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    decoder.set_limits(png::Limits {
+    let mut decoder = aterm_png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(aterm_png::Limits {
         bytes: MAX_CHROME_BYTES,
     });
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    decoder.set_transformations(
+        aterm_png::Transformations::EXPAND | aterm_png::Transformations::STRIP_16,
+    );
     let mut reader = decoder
         .read_info()
         .map_err(|error| format!("window capture could not decode AppKit chrome: {error}"))?;
@@ -6826,8 +6832,8 @@ fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String>
         .map_err(|error| format!("window capture could not decode AppKit chrome: {error}"))?;
     if info.width != width
         || info.height != height
-        || info.bit_depth != png::BitDepth::Eight
-        || info.color_type != png::ColorType::Rgba
+        || info.bit_depth != aterm_png::BitDepth::Eight
+        || info.color_type != aterm_png::ColorType::Rgba
         || info.buffer_size() != expected
     {
         return Err(format!(
@@ -7340,18 +7346,158 @@ fn composite_straight_rgba_overlay(
 pub(crate) fn encode_rgba8_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
+        let mut encoder = aterm_png::Encoder::new(&mut out, width, height);
+        encoder.set_color(aterm_png::ColorType::Rgba);
+        encoder.set_depth(aterm_png::BitDepth::Eight);
         // Both CoreGraphics normalization and AppKit's transparent chrome PNG
         // arrive in sRGB. Declare that transfer function explicitly so viewers
         // never reinterpret the stitched bytes as untagged device RGB.
-        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        encoder.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
         let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
         writer.write_image_data(rgba).map_err(|e| e.to_string())?;
         writer.finish().map_err(|e| e.to_string())?;
     }
     Ok(out)
+}
+
+/// One session's window membership as the main thread sees it: the row the
+/// `sessions` roster stitches onto its store projection (`window=` / `active=` /
+/// `wfocus=`). Read for the WHOLE roster in one [`crate::Wake::ReadSessionWindows`]
+/// hop, so a fleet listing costs one event-loop turn, not one per session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionWindowRow {
+    /// The process-local session id (`sessions`' first column).
+    pub(crate) local: u64,
+    /// The hosting window's stable logical id.
+    pub(crate) window: u64,
+    /// Whether the session is on that window's ACTIVE tab (the tab a `send`
+    /// would be seen in; a zoomed split counts only its focused pane, the same
+    /// rule the repaint gate uses).
+    pub(crate) active_tab: bool,
+    /// Whether that window is the front window.
+    pub(crate) window_focused: bool,
+}
+
+impl App {
+    /// Every session some window hosts, with the window it is reported under.
+    /// A session no window shows (detached, or a view the strip no longer
+    /// holds) has no row — the roster prints it `window=none`. A session
+    /// hosted by several windows (co-viewing) is reported under the SAME window
+    /// [`Self::dims_snapshot`] projects it through — the front window when it
+    /// contains the session, else the lowest stable id — so `sessions` and
+    /// `dims` can never name two different windows for one session. Pure read.
+    pub(crate) fn session_window_rows(&self) -> Vec<SessionWindowRow> {
+        // `windows` is a BTreeMap: the first window seen for a session IS the
+        // lowest id, so the front-window preference is the only override.
+        let mut rows: Vec<SessionWindowRow> = Vec::new();
+        for (wid, ws) in &self.windows {
+            let focused = self.frontmost_window == Some(*wid);
+            let mut seen: Vec<u64> = Vec::new();
+            for tab in ws.tab_set.tabs() {
+                for view in tab.root.leaves() {
+                    let Some(session) = self
+                        .view_store
+                        .get(view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                    else {
+                        continue;
+                    };
+                    if seen.contains(&session) {
+                        continue;
+                    }
+                    seen.push(session);
+                    let row = SessionWindowRow {
+                        local: session,
+                        window: wid.0,
+                        active_tab: crate::active_tab_displays_session(
+                            ws,
+                            &self.view_store,
+                            session,
+                        ),
+                        window_focused: focused,
+                    };
+                    match rows.iter_mut().find(|r| r.local == session) {
+                        // Already reported under a lower id: only the front
+                        // window may take the row over.
+                        Some(existing) => {
+                            if focused {
+                                *existing = row;
+                            }
+                        }
+                        None => rows.push(row),
+                    }
+                }
+            }
+        }
+        rows.sort_by_key(|r| r.local);
+        rows
+    }
+}
+
+#[cfg(test)]
+mod session_window_rows_tests {
+    use super::SessionWindowRow;
+    use crate::{App, WindowId};
+
+    /// The rows follow the tab tree: the lone session of a fresh headless app is
+    /// on window 0's active tab and that window is front; a pushed tab takes the
+    /// active slot from it; a second window becomes front and demotes the first;
+    /// a session no window hosts has no row at all.
+    #[test]
+    fn rows_follow_the_tab_tree_and_the_front_window() {
+        let mut app = App::headless_for_test();
+        assert_eq!(
+            app.session_window_rows(),
+            vec![SessionWindowRow {
+                local: 0,
+                window: 0,
+                active_tab: true,
+                window_focused: true,
+            }]
+        );
+
+        // A second tab in window 0: it is now the active tab; session 0 is not.
+        let sid1 = app.next_session_id;
+        app.push_stub_tab(WindowId(0), crate::stub_session(sid1));
+        let rows = app.session_window_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].local, rows[0].window, rows[0].active_tab),
+            (0, 0, false)
+        );
+        assert_eq!(
+            (rows[1].local, rows[1].window, rows[1].active_tab),
+            (sid1, 0, true)
+        );
+        assert!(rows.iter().all(|r| r.window_focused));
+
+        // A second window: it is front, so window 0's rows lose `wfocus`.
+        let sid2 = app.next_session_id;
+        let wid2 = app.insert_logical_window(crate::stub_session(sid2), 24, 80);
+        let rows = app.session_window_rows();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .filter(|r| r.window == 0)
+                .all(|r| !r.window_focused)
+        );
+        assert_eq!(
+            rows[2],
+            SessionWindowRow {
+                local: sid2,
+                window: wid2.0,
+                active_tab: true,
+                window_focused: true,
+            }
+        );
+        // Sorted by local id, and every row names a real window.
+        assert!(rows.windows(2).all(|w| w[0].local < w[1].local));
+        assert!(
+            rows.iter()
+                .all(|r| app.windows.contains_key(&WindowId(r.window)))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8533,7 +8679,6 @@ mod terminal_split_capture_tests {
     fn recording_image_keeps_the_exact_successful_present_cursor_layers() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        let now = Instant::now();
         let font_px = app.windows[&wid].metrics.font_px;
         let single = app
             .prepare_terminal_capture_grid(wid)
@@ -8598,7 +8743,21 @@ mod terminal_split_capture_tests {
         let (video_reply, _video_rx) = std::sync::mpsc::channel();
         app.video_rec = Some(crate::VideoRec {
             window: wid,
-            deadline: now + Duration::from_secs(3),
+            // A WALL-CLOCK BUDGET NOTHING HERE IS TESTING, so it is set out of
+            // reach instead of at the product's own 3 s. This used to read
+            // `now + 3s`, where `now` was sampled at the TOP of the function —
+            // before a real GPU renderer is constructed, before a virtual
+            // recording target is opened, and before a channel wait allowed
+            // ten seconds. On a loaded machine that arithmetic expired before
+            // the `Instant::now() < recording.deadline` fixture check below,
+            // and the test went red on the clock rather than on the cursor
+            // layers it is named for — one of the rotating aterm-gui reds this
+            // repo has written down twice (docs/AGENT-EXPERIENCE-2026-08-26.md)
+            // and each time seen pass alone. The deadline is only ever read as
+            // "this recording is still live"; RECORDING EXPIRY has its own
+            // tests (`deadline: now - 1ms` in lib.rs), so nothing is lost by
+            // putting this one where machine load cannot reach it.
+            deadline: Instant::now() + Duration::from_secs(3_600),
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
@@ -10222,12 +10381,12 @@ mod encode_worker_tests {
     fn capture_regression_platform_neutral_rgba_encoder_is_available() {
         let png = encode_rgba8_png(&[0x11, 0x22, 0x33, 0x80], 1, 1)
             .expect("the video/window encoder is available on every host");
-        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+        let mut reader = aterm_png::Decoder::new(std::io::Cursor::new(png))
             .read_info()
             .expect("PNG header");
         assert_eq!(
             reader.info().srgb,
-            Some(png::SrgbRenderingIntent::Perceptual)
+            Some(aterm_png::SrgbRenderingIntent::Perceptual)
         );
         let mut rgba = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut rgba).expect("PNG pixels");

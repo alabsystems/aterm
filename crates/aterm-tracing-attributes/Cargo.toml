@@ -1,0 +1,31 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# The PACKAGE name keeps the aterm- prefix on purpose. Only ONE name in this
+# pair has to lie: `crates/aterm-tracing` must be package `tracing`, because
+# [patch.crates-io] matches on package name and that is how winit/softbuffer/
+# zbus/tiny-xlib's `tracing = "0.1.4x"` lines get redirected here. Nothing
+# redirects `tracing-attributes` — the shim reaches this crate through a path
+# dependency it renames itself (see ../aterm-tracing/Cargo.toml) — so this one
+# gets to keep an honest, greppable, first-party name.
+name = "aterm-tracing-attributes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pass-through #[instrument] for the aterm `tracing` shim (replaces tracing-attributes)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# None, deliberately. Upstream `tracing-attributes` pulls proc-macro2 + quote +
+# syn to PARSE the annotated item and wrap its body in a span. This one returns
+# the item's TokenStream unchanged, so it needs no parser at all — the whole
+# crate is one function that hands back its second argument. That is three
+# fewer packages than the crate it replaces, and it is the only proc-macro in
+# the tree that compiles without touching `syn`.
+
+[lints]
+workspace = true

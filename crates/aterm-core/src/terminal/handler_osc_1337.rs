@@ -370,12 +370,20 @@ impl TerminalHandler<'_> {
                     if col >= self.grid.cols() {
                         break;
                     }
-                    let extra = self.grid.cell_extra_mut(row, col);
-                    extra.set_image(Some(ImageRef {
-                        image: Arc::clone(image),
-                        cell_row,
-                        cell_col,
-                    }));
+                    // `set_cell_image`, not `cell_extra_mut(..).set_image(..)`:
+                    // the grid-level setter also arms the extras collection's
+                    // scroll-off image gate, and a picture the gate never heard
+                    // about is one that cannot be carried into history when its
+                    // row scrolls off the top.
+                    self.grid.set_cell_image(
+                        row,
+                        col,
+                        ImageRef {
+                            image: Arc::clone(image),
+                            cell_row,
+                            cell_col,
+                        },
+                    );
                     self.grid.damage_mut().mark_cell(row, col);
                 }
             }

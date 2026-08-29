@@ -1198,7 +1198,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
         return too_large;
     }
 
-    let document = match source.parse::<toml_edit::DocumentMut>() {
+    let document = match source.parse::<aterm_toml::edit::DocumentMut>() {
         Ok(document) => document,
         Err(error) => {
             let range = parser_diagnostic_range(source, error.span());
@@ -1213,7 +1213,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
         }
     };
 
-    let config = match toml::from_str::<crate::app_config::Config>(source) {
+    let config = match aterm_toml::from_str::<crate::app_config::Config>(source) {
         Ok(config) => config,
         Err(error) => {
             let range = parser_diagnostic_range(source, error.span());
@@ -1255,7 +1255,7 @@ fn parser_diagnostic_range(source: &str, span: Option<Range<usize>>) -> Range<us
 
 fn warn_compatibility_only_values(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     analysis: &mut ConfigAnalysis,
 ) {
     for (key, item) in document.iter() {
@@ -1266,14 +1266,14 @@ fn warn_compatibility_only_values(
 
 fn warn_compatibility_only_item(
     source: &str,
-    item: &toml_edit::Item,
+    item: &aterm_toml::edit::Item,
     path: &str,
     analysis: &mut ConfigAnalysis,
 ) {
     let authored = match item {
-        toml_edit::Item::None => false,
-        toml_edit::Item::Table(table) => !table.is_implicit(),
-        toml_edit::Item::Value(_) | toml_edit::Item::ArrayOfTables(_) => true,
+        aterm_toml::edit::Item::None => false,
+        aterm_toml::edit::Item::Table(table) => !table.is_implicit(),
+        aterm_toml::edit::Item::Value(_) | aterm_toml::edit::Item::ArrayOfTables(_) => true,
     };
     if authored && is_compatibility_only_key(path) {
         push_diagnostic(
@@ -1307,7 +1307,7 @@ fn compatibility_only_message(key: &str) -> String {
 
 fn validate_registered_values(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     analysis: &mut ConfigAnalysis,
 ) {
     for setting in config_schema() {
@@ -1403,7 +1403,7 @@ fn validate_registered_values(
             ConfigSchemaKind::StringList => {
                 if !item
                     .as_array()
-                    .is_some_and(|array| array.iter().all(toml_edit::Value::is_str))
+                    .is_some_and(|array| array.iter().all(aterm_toml::edit::Value::is_str))
                 {
                     push_diagnostic(
                         analysis,
@@ -1418,7 +1418,7 @@ fn validate_registered_values(
                 let valid = item.is_str()
                     || item
                         .as_array()
-                        .is_some_and(|array| array.iter().all(toml_edit::Value::is_str));
+                        .is_some_and(|array| array.iter().all(aterm_toml::edit::Value::is_str));
                 if !valid {
                     push_diagnostic(
                         analysis,
@@ -1531,7 +1531,7 @@ fn semantic_numeric_bounds(key: &str) -> Option<(f64, f64)> {
 /// static-range warning for the same value so Manual never presents two
 /// competing effective values for one authored token.
 fn runtime_semantics_owns_numeric_clamp(
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     key: &str,
     number: f64,
 ) -> bool {
@@ -1540,13 +1540,13 @@ fn runtime_semantics_owns_numeric_clamp(
         "sparkle_words.ink.sweep_ms" => {
             number < 600.0
                 && dotted_item(document, "sparkle_words.ink.loop")
-                    .and_then(toml_edit::Item::as_bool)
+                    .and_then(aterm_toml::edit::Item::as_bool)
                     .unwrap_or(false)
         }
         "matrix_rain.head_alpha" => {
             use crate::matrix_rain::{RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR};
             dotted_item(document, "matrix_rain.alpha")
-                .and_then(toml_edit::Item::as_integer)
+                .and_then(aterm_toml::edit::Item::as_integer)
                 .map_or(number < f64::from(RAIN_ALPHA_CAP), |alpha| {
                     number
                         < alpha.clamp(i64::from(RAIN_ALPHA_FLOOR), i64::from(RAIN_ALPHA_CAP)) as f64
@@ -1580,7 +1580,7 @@ pub(crate) fn analyze_host_nested(
     backend_gpu: bool,
     nested: bool,
 ) -> Vec<ConfigDiagnostic> {
-    let Ok(config) = toml::from_str::<crate::app_config::Config>(source) else {
+    let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(source) else {
         return Vec::new();
     };
     let themes = crate::app_config::ThemeCatalog::discover();
@@ -1600,10 +1600,10 @@ pub(crate) fn analyze_host_with_assets(
     if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
         return Vec::new();
     }
-    let Ok(document) = source.parse::<toml_edit::DocumentMut>() else {
+    let Ok(document) = source.parse::<aterm_toml::edit::DocumentMut>() else {
         return Vec::new();
     };
-    let Ok(config) = toml::from_str::<crate::app_config::Config>(source) else {
+    let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(source) else {
         return Vec::new();
     };
     // Draft-authored Trail/rainbow kitty paths must be validated against the draft, while
@@ -1631,7 +1631,7 @@ pub(crate) fn analyze_host_with_assets(
 /// event-loop analysis path.
 fn warn_runtime_semantics(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     config: &crate::app_config::Config,
     analysis: &mut ConfigAnalysis,
 ) {
@@ -1645,7 +1645,7 @@ fn warn_runtime_semantics(
 
 fn append_semantic_warnings(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     warnings: impl IntoIterator<Item = crate::diagnostics::ConfigSemanticWarning>,
     analysis: &mut ConfigAnalysis,
 ) {
@@ -1664,7 +1664,7 @@ fn append_semantic_warnings(
 
 fn semantic_warning_range(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     warning: &crate::diagnostics::ConfigSemanticWarning,
 ) -> Option<Range<usize>> {
     if let Some(range) = dynamic_map_semantic_warning_range(source, document, warning) {
@@ -1672,7 +1672,8 @@ fn semantic_warning_range(
     }
 
     if let Some(index) = indexed_warning_index(&warning.message, warning.key)
-        && let Some(array) = dotted_item(document, warning.key).and_then(toml_edit::Item::as_array)
+        && let Some(array) =
+            dotted_item(document, warning.key).and_then(aterm_toml::edit::Item::as_array)
     {
         let source_index = if warning.key == crate::prefs::EDIT_FONT_VARIATION {
             // FontList trims and drops blank array entries while deserializing.
@@ -1689,15 +1690,16 @@ fn semantic_warning_range(
         };
         if let Some(range) = source_index
             .and_then(|source_index| array.get(source_index))
-            .and_then(toml_edit::Value::span)
+            .and_then(aterm_toml::edit::Value::span)
         {
             return Some(range);
         }
-        // `toml_edit` does not promise child spans for every array reached
-        // through synthesized tables. Recover the exact lexical element from
+        // The document model does not promise child spans for every array
+        // reached through synthesized tables. Recover the exact lexical element from
         // the already-valid right-hand side instead of widening to the array.
         if let Some(source_index) = source_index {
-            let item_span = dotted_item(document, warning.key).and_then(toml_edit::Item::span);
+            let item_span =
+                dotted_item(document, warning.key).and_then(aterm_toml::edit::Item::span);
             for value_range in source_value_range(source, warning.key)
                 .into_iter()
                 .chain(item_span)
@@ -1742,7 +1744,7 @@ fn semantic_warning_range(
 
     source_value_range(source, warning.key)
         .or_else(|| source_table_header_range(source, warning.key))
-        .or_else(|| dotted_item(document, warning.key).and_then(toml_edit::Item::span))
+        .or_else(|| dotted_item(document, warning.key).and_then(aterm_toml::edit::Item::span))
 }
 
 /// A semantic warning for a dynamic string map owns either the concrete member
@@ -1752,7 +1754,7 @@ fn semantic_warning_range(
 /// another member name.
 fn dynamic_map_semantic_warning_range(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     warning: &crate::diagnostics::ConfigSemanticWarning,
 ) -> Option<Range<usize>> {
     if !matches!(warning.key, "keybindings" | "key_sequences") {
@@ -1925,7 +1927,7 @@ pub(crate) fn theme_names(value: &str) -> Result<Vec<&str>, String> {
 
 fn warn_unknown_values(
     source: &str,
-    document: &toml_edit::DocumentMut,
+    document: &aterm_toml::edit::DocumentMut,
     analysis: &mut ConfigAnalysis,
 ) {
     for (key, item) in document.iter() {
@@ -1936,7 +1938,7 @@ fn warn_unknown_values(
 
 fn warn_unknown_item(
     source: &str,
-    item: &toml_edit::Item,
+    item: &aterm_toml::edit::Item,
     path: &str,
     analysis: &mut ConfigAnalysis,
 ) {
@@ -2029,7 +2031,7 @@ fn warn_unknown_item(
 
 fn warn_unknown_structured_records(
     source: &str,
-    item: &toml_edit::Item,
+    item: &aterm_toml::edit::Item,
     record_path: &str,
     analysis: &mut ConfigAnalysis,
 ) {
@@ -2066,7 +2068,7 @@ fn warn_unknown_structured_records(
 
 fn warn_unknown_structured_table(
     source: &str,
-    table: &dyn toml_edit::TableLike,
+    table: &dyn aterm_toml::edit::TableLike,
     table_path: &str,
     record_path: &str,
     record: usize,
@@ -2080,7 +2082,7 @@ fn warn_unknown_structured_table(
 
 fn warn_unknown_structured_item(
     source: &str,
-    item: &toml_edit::Item,
+    item: &aterm_toml::edit::Item,
     path: &str,
     record_path: &str,
     record: usize,
@@ -2109,7 +2111,7 @@ fn warn_unknown_structured_item(
 
 fn warn_structured_registered_value(
     source: &str,
-    item: &toml_edit::Item,
+    item: &aterm_toml::edit::Item,
     path: &str,
     record_path: &str,
     record: usize,
@@ -2172,9 +2174,12 @@ fn warn_structured_registered_value(
     );
 }
 
-fn dotted_item<'a>(document: &'a toml_edit::DocumentMut, key: &str) -> Option<&'a toml_edit::Item> {
+fn dotted_item<'a>(
+    document: &'a aterm_toml::edit::DocumentMut,
+    key: &str,
+) -> Option<&'a aterm_toml::edit::Item> {
     let mut item = document.as_item();
-    for segment in toml_edit::Key::parse(key).ok()? {
+    for segment in aterm_toml::edit::Key::parse(key).ok()? {
         item = item.as_table_like()?.get(segment.get())?;
     }
     Some(item)
@@ -2184,7 +2189,7 @@ fn dotted_item<'a>(document: &'a toml_edit::DocumentMut, key: &str) -> Option<&'
 /// segments that contain dots remain quoted, while quote-style differences
 /// around an otherwise bare segment collapse to the same TOML key.
 fn canonical_key_expression(expression: &str) -> Option<String> {
-    let segments = toml_edit::Key::parse(expression.trim()).ok()?;
+    let segments = aterm_toml::edit::Key::parse(expression.trim()).ok()?;
     let mut path = String::new();
     for segment in segments {
         path = crate::native_config_service::join_config_key_path(&path, segment.get());
@@ -2201,9 +2206,9 @@ fn join_key_expressions(parent: &str, child: &str) -> String {
 }
 
 /// Locate the concrete right-hand-side token for a scalar authored either as a
-/// top-level/dotted assignment or under a table header. `toml_edit` represents
-/// children of explicit tables through synthesized parent items whose span can
-/// be the opening `[`, so diagnostics must recover the source token rather than
+/// top-level/dotted assignment or under a table header. The document model
+/// represents children of explicit tables through synthesized parent items
+/// whose span can be the opening `[`, so diagnostics must recover the source token rather than
 /// underline an unrelated header byte.
 fn source_value_range(source: &str, dotted_key: &str) -> Option<Range<usize>> {
     let mut current_table = String::new();
@@ -2419,8 +2424,8 @@ fn structured_record_root_range(
 
 /// Locate a concrete member value inside one structured-list record.
 ///
-/// `toml_edit` deliberately synthesizes table items while traversing an array
-/// of tables.  A nested inline member such as `burst.chance` can therefore
+/// The document model deliberately synthesizes table items while traversing
+/// an array of tables.  A nested inline member such as `burst.chance` can therefore
 /// inherit the span of the record's opening `[[` rather than the authored
 /// `101`.  Re-scan only the bounded, already-valid TOML and parse each matching
 /// right-hand side in isolation so diagnostics point at the actual leaf token.
@@ -2544,8 +2549,8 @@ fn parsed_value_descendant_range(
     )
 }
 
-/// Resolve a dotted descendant within an inline table without trusting
-/// `toml_edit`'s synthesized child spans. The containing document has already
+/// Resolve a dotted descendant within an inline table without trusting the
+/// document model's synthesized child spans. The containing document has already
 /// parsed successfully; this bounded lexical pass exists solely to preserve
 /// the exact byte address of the authored leaf.
 fn inline_table_descendant_range(value: &str, dotted_suffix: &str) -> Option<Range<usize>> {
@@ -2666,8 +2671,8 @@ pub(crate) fn config_key_source_range(source: &str, dotted_key: &str) -> Option<
     source_value_range(source, dotted_key)
 }
 
-/// `toml_edit` does not retain a child span for entries reached through an
-/// implicit table synthesized by a `[table.header]`. Recover the concrete
+/// The document model does not retain a child span for entries reached through
+/// an implicit table synthesized by a `[table.header]`. Recover the concrete
 /// value token from the bounded source so a dynamic-map type error underlines
 /// the offending member rather than the table's opening bracket.
 fn dynamic_map_member_value_range(
@@ -2712,7 +2717,7 @@ fn dynamic_map_member_value_range(
 }
 
 /// Lexically recover the concrete key token for a member of an explicit table.
-/// `toml_edit::Key::span` may inherit the synthesized parent table's header
+/// `aterm_toml::edit::Key::span` may inherit the synthesized parent table's header
 /// span, so it is not a trustworthy first choice for `[keybindings]` and
 /// `[key_sequences]` children.
 fn dynamic_map_member_key_range(
@@ -4251,14 +4256,14 @@ extra_words = ["whale"]
 ignore_words = ["skip"]
 future_splash = true
 "#;
-        let document = source.parse::<toml_edit::DocumentMut>().unwrap();
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
         assert_eq!(
             document.to_string(),
             source,
             "compatibility syntax round-trips"
         );
         assert!(
-            toml::from_str::<crate::app_config::Config>(source).is_ok(),
+            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
             "the runtime parser keeps accepting suspended Orca configuration"
         );
 
@@ -4334,7 +4339,7 @@ gaze = false
 color = "#112233"
 intensity = 0.25
 "##;
-        let config = toml::from_str::<crate::app_config::Config>(source)
+        let config = aterm_toml::from_str::<crate::app_config::Config>(source)
             .expect("retired feline keys remain loadable for compatibility");
         let feline = config
             .sparkle_words
@@ -4442,14 +4447,14 @@ intensity = 0.25
     fn retired_bottom_hud_keys_are_preserved_but_never_presented_as_active_settings() {
         let keys = ["show_hud", "show_resources_hud", "show_engine_hud"];
         let source = "show_hud = true\nshow_resources_hud = false\nshow_engine_hud = true\n";
-        let document = source.parse::<toml_edit::DocumentMut>().unwrap();
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
         assert_eq!(
             document.to_string(),
             source,
             "Manual must not destructively rewrite retired configuration"
         );
         assert!(
-            toml::from_str::<crate::app_config::Config>(source).is_ok(),
+            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
             "retired compatibility keys remain loadable while their values are inert"
         );
 
@@ -4518,7 +4523,7 @@ intensity = 0.25
     fn manual_rejects_non_text_dynamic_map_values_even_when_gui_serde_ignores_them() {
         let source = "[packages.links]\nay = 5\n";
         assert!(
-            toml::from_str::<crate::app_config::Config>(source).is_ok(),
+            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
             "the GUI intentionally delegates packages.links to atpkg"
         );
         let analysis = analyze(source);
@@ -5452,8 +5457,8 @@ expect_nonce = "pin"
 
         let source = "trail_sounds = true\ntrail_sound_volume = 0.4\n\
 confirm_multiline_paste = true\nallow_notifications = true\n";
-        let document = source.parse::<toml_edit::DocumentMut>().unwrap();
-        let config = toml::from_str::<crate::app_config::Config>(source).unwrap();
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+        let config = aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
         let mut analysis = ConfigAnalysis::default();
         append_semantic_warnings(
             source,
@@ -5510,8 +5515,8 @@ cursor_trail_bloom_radius = 3.5\n\
 cursor_fire_shimmer = false\n\
 hdr_glow = true\n\
 cursor_glow_sdr_boost = 0.4\n";
-        let document = source.parse::<toml_edit::DocumentMut>().unwrap();
-        let config = toml::from_str::<crate::app_config::Config>(source).unwrap();
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+        let config = aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
         let warnings = crate::diagnostics::config_backend_capability_warnings(
             &config,
             false,
@@ -5584,8 +5589,8 @@ cursor_glow_sdr_boost = 0.4\n";
 
         let source = "background_opacity = 0.7\nbackground_material = \"hud\"\n\
 window_colorspace = \"display-p3\"\n";
-        let document = source.parse::<toml_edit::DocumentMut>().unwrap();
-        let config = toml::from_str::<crate::app_config::Config>(source).unwrap();
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+        let config = aterm_toml::from_str::<crate::app_config::Config>(source).unwrap();
         let mut analysis = ConfigAnalysis::default();
         append_semantic_warnings(
             source,
@@ -5648,7 +5653,7 @@ window_colorspace = \"display-p3\"\n";
         );
 
         let opaque: crate::app_config::Config =
-            toml::from_str("background_material = \"sidebar\"\n").unwrap();
+            aterm_toml::from_str("background_material = \"sidebar\"\n").unwrap();
         let warnings = crate::diagnostics::config_backend_capability_warnings(
             &opaque,
             true,
@@ -6259,7 +6264,7 @@ fps = 999
                 "default completion must be clean: {:?}",
                 analysis.diagnostics
             );
-            let config: crate::app_config::Config = toml::from_str(&completed).unwrap();
+            let config: crate::app_config::Config = aterm_toml::from_str(&completed).unwrap();
             let authored = if key == crate::prefs::EDIT_COLUMNS {
                 config.columns.unwrap()
             } else {

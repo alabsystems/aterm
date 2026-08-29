@@ -21,6 +21,16 @@
 //!
 //! Set `ATERM_CAPTURE_TYPED_PARITY=1` to reprint the fold instead of asserting
 //! (that is how step 1 and step 3 were run).
+//!
+//! AND THE GOLDEN CARRIES ITS OWN CONTROL. A byte-exact constant that has been
+//! RE-BASELINED three times in four days is exactly the shape that quietly
+//! stops testing anything: each re-baseline is a human deciding from prose
+//! that the change was art rather than the seam, and nothing re-checks that
+//! the number can still move for the right reason.
+//! `an_unlicensed_script_moves_every_golden_entry` re-checks it every run —
+//! the identical script with every key hint withheld must move all nine
+//! entries — so the next author re-baselining a rainbow repaint is standing on
+//! a measurement, not on this comment.
 
 use std::time::{Duration, Instant};
 
@@ -84,7 +94,15 @@ fn trail_cfg() -> TrailConfig {
 /// A TYPED script — the shape the license exists to admit. Six glyph echoes at
 /// human cadence, a wrap at the right margin, three more glyphs on the new
 /// row, a gesture jump, and the decay tail.
-fn typed_script(style: GlowStyle) -> u64 {
+///
+/// `licensed` is the SEAM, switched: with it false the identical cursor
+/// trajectory arrives with no key hint behind any of it — the pre-license
+/// denial path, cold program movement. Nothing else about the script changes,
+/// so the difference between the two folds is the license and only the
+/// license. `an_unlicensed_script_moves_every_golden_entry` is the standing
+/// control built on it; see the module header for why a golden that nothing
+/// can redden is the shape this file has to avoid.
+fn typed_script(style: GlowStyle, licensed: bool) -> u64 {
     let g = geom();
     let c = cfg(style);
     let tc = trail_cfg();
@@ -133,8 +151,10 @@ fn typed_script(style: GlowStyle) -> u64 {
     // Six typed glyph echoes at 90 ms — the licensed typing run.
     for k in 1..=6u64 {
         let at = t0 + Duration::from_millis(90 * k);
-        glow.note_synthetic_typed(at, 1);
-        trail.note_synthetic_typed(at);
+        if licensed {
+            glow.note_synthetic_typed(at, 1);
+            trail.note_synthetic_typed(at);
+        }
         step(
             &mut glow,
             &mut trail,
@@ -148,8 +168,10 @@ fn typed_script(style: GlowStyle) -> u64 {
     // The wrap at the right margin, then three glyphs on the new row.
     for (k, cell) in [(7u64, (3u16, 0u16)), (8, (3, 1)), (9, (3, 2))] {
         let at = t0 + Duration::from_millis(90 * k);
-        glow.note_synthetic_typed(at, 1);
-        trail.note_synthetic_typed(at);
+        if licensed {
+            glow.note_synthetic_typed(at, 1);
+            trail.note_synthetic_typed(at);
+        }
         step(
             &mut glow,
             &mut trail,
@@ -162,8 +184,10 @@ fn typed_script(style: GlowStyle) -> u64 {
     }
     // A licensed gesture jump.
     let jump = t0 + Duration::from_millis(1_100);
-    glow.note_synthetic_move(jump);
-    trail.note_synthetic_move(jump);
+    if licensed {
+        glow.note_synthetic_move(jump);
+        trail.note_synthetic_move(jump);
+    }
     step(
         &mut glow,
         &mut trail,
@@ -395,7 +419,43 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // number only through the frame fingerprint — the ribbon is written
         // to `under_out`, which the script never folds as quads — so both
         // `fp` and the quad fold moved, and neither alone explains it.
-        14_083_045_704_876_203_537,
+        //
+        // RE-BASELINED AGAIN (companion head-hue seam, 2026-08-28). Index 2 is
+        // the RAINBOW style and it moved ALONE; the other eight are unchanged
+        // bytes. That is the repaint signature this comment already documents,
+        // not the seam one: a seam regression "moves all NINE entries and flips
+        // the tally to licensed=1/declined=9", and the tally is frozen here —
+        // both sibling tests in this file (`split_batch_suffix_...` and
+        // `earned_light_survives_a_cold_program_move`) still pass untouched.
+        //
+        // The cause is `rainbow_head_rgb` gaining a `head_hue` colour authority.
+        // It previously read "the newest TYPING spark", but tail repair appends
+        // missing older cells AFTER the fresh head, so that sample was not the
+        // head; it also returned `None` before the first cell and after the last
+        // retired, and the `None <-> Some` swap threw the caret and its inner
+        // halo a whole palette arc on first-key and final-fade frames. Rainbow
+        // is the only style with a companion colour authority, so rainbow is the
+        // only index that can move.
+        //
+        // RECAPTURED 2026-08-27 for ROYGBIV. The palette moved from six
+        // anchors to the canonical seven — red, orange, yellow, green, blue,
+        // INDIGO, violet — on the owner's ruling (*"a rainbow. like in the
+        // sky"*), and the hand-built "neutralized handoff" that drove the
+        // green→blue interval 95.3% of the way to flat grey at its midpoint
+        // was deleted with it. A palette change necessarily moves a byte fold
+        // of the emitter, so this golden is re-captured rather than repaired.
+        // The evidence that it is still the SURGICAL change this file exists
+        // to police: the recapture moved index 2 alone
+        // (`3_947_126_183_161_842_362` was the six-anchor value) and every
+        // other style folded byte-identical, so the license seam still lays
+        // the pixel it always laid.
+        // Re-captured on the MERGED tree: upstream's companion head-hue seam
+        // and this branch's ROYGBIV palette are both present, which is why
+        // neither side's number survived the rebase. Index 2 moved ALONE and
+        // the other eight came back byte-identical to the committed values —
+        // the repaint signature this file's own diagnostic describes, not the
+        // seam one.
+        15_294_253_527_449_941_578,
         10_295_259_453_273_105_322,
         3_062_372_403_814_732_219,
         11_710_665_231_074_982_027,
@@ -406,8 +466,8 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];
     for (i, &style) in styles.iter().enumerate() {
-        let a = typed_script(style);
-        let b = typed_script(style);
+        let a = typed_script(style, true);
+        let b = typed_script(style, true);
         assert_eq!(a, b, "{style:?}: the typed script is nondeterministic");
         assert_ne!(a, 0, "{style:?}: the typed script folded nothing");
         actual[i] = a;
@@ -419,4 +479,47 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         actual, GOLDEN,
         "a licensed typed move stopped being byte-identical to the pre-license tree"
     );
+}
+
+/// THE CONTROL FOR THE GOLDEN ABOVE, and the reason it may be trusted.
+///
+/// A byte-exact number is only coverage if something can move it, and this
+/// file's has been RE-BASELINED three times in four days for deliberate
+/// rainbow repaints (see the comments inside `GOLDEN`). Every one of those
+/// re-baselines was a human deciding, from prose, that the change was art and
+/// not the seam. That decision now has a machine behind it: run the identical
+/// script with the key hints WITHHELD — the pre-license denial path, cold
+/// program movement over the same trajectory — and every one of the nine
+/// numbers must move.
+///
+/// PROVEN, not assumed: disabling the `type_hint` disjunct in
+/// `CursorGlow::move_licensed` and re-running the golden moves all NINE
+/// entries (measured 2026-08-28 by exactly that source mutation, reverted).
+/// This test reproduces that verdict from the PUBLIC API alone, on every run,
+/// so "the golden still catches a broken license" stops being a claim in a
+/// comment and becomes a result in the suite.
+///
+/// It is deliberately per-entry rather than a whole-array `assert_ne!`: an
+/// array comparison passes as soon as ONE style moves, which would let the
+/// control go green while eight styles had quietly stopped depending on the
+/// license at all.
+#[test]
+fn an_unlicensed_script_moves_every_golden_entry() {
+    for (i, &style) in ALL_STYLES.iter().enumerate() {
+        let licensed = typed_script(style, true);
+        let cold = typed_script(style, false);
+        assert_eq!(
+            cold,
+            typed_script(style, false),
+            "{style:?}: the unlicensed script is nondeterministic — this control \
+             cannot mean anything until it is not"
+        );
+        assert_ne!(
+            licensed, cold,
+            "{style:?} (GOLDEN entry {i}): withholding every key hint left the fold \
+             UNCHANGED. The golden above is then blind to the license seam it exists \
+             to guard — it would stay green through the exact regression it was \
+             written for."
+        );
+    }
 }

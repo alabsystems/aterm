@@ -20,7 +20,9 @@ disk-tier = ["aterm-core/disk-tier"]
 # forcing it on every workspace consumer; disk-tier is re-enabled by default via this
 # crate's own default = ["disk-tier"], so the native closure is unchanged.
 aterm-core = { path = "../aterm-core", default-features = false }
-png = "0.17"
+# First-party PNG (crates/aterm-png) — the framebuffer-to-PNG encode this
+# crate exposes, plus the sRGB intent its tests assert on.
+aterm-png = { workspace = true }
 
 [lints]
 workspace = true

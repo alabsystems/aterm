@@ -3,7 +3,7 @@
 
 //! Tier-1 conformance for versioned native Settings transactions.
 //!
-//! The test drives the genuine `toml_edit`-backed service and independently
+//! The test drives the genuine `aterm-toml`-backed service and independently
 //! projects its revisions and semantic values into `NativeConfigTransaction`.
 //! Pending request and undo metadata belong to the controller/test driver; the
 //! canonical key values and revision always come from the shipping service.
@@ -794,7 +794,7 @@ impl Drop for KittyFixtures {
 }
 
 fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool {
-    let Ok(config) = toml::from_str::<crate::app_config::Config>(&snapshot.text) else {
+    let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(&snapshot.text) else {
         return false;
     };
     let resolved = crate::app_config::resolve_trail_style(
@@ -852,7 +852,7 @@ fn config_catalog_projection(
     consumers: CatalogConsumers<'_>,
 ) -> State {
     let config: crate::app_config::Config =
-        toml::from_str(&snapshot.text).expect("service snapshot config");
+        aterm_toml::from_str(&snapshot.text).expect("service snapshot config");
     let text_generation = match config.theme.as_deref() {
         Some("Default") => 0,
         Some("Nord") => 1,

@@ -63,6 +63,36 @@ pub struct FxFrame {
     pub twinkle_cursor: bool,
 }
 
+/// What one composed frame left behind of the PHOSPHOR rain — the reach
+/// witness for any workload that claims to price a rain frame.
+///
+/// Every field is read AFTER the frame, from the state the frame itself wrote,
+/// and the set is chosen so that no single silent failure can leave all four
+/// looking healthy. An effects fixture that fails to arm is the most repeated
+/// failure this campaign has: a config flag says only what was ASKED for, and
+/// the rain gate folds a session override, the serious-mode policy, reduced
+/// motion, load shed, the alt screen and the display offset on top of it.
+pub struct RainWitness {
+    /// Did the window build (or retain) a rain engine at all? `false` is the
+    /// zero-cost D-1 pin: rain was never effectively on for this session.
+    pub engine: bool,
+    /// The engine's own `is_active()` — its answer to "keep the timer armed".
+    /// This is NOT a config echo: it folds the resolved config, reduced motion,
+    /// the literal material bank being non-empty, the reading gate, the drain
+    /// and whether the last emit produced light.
+    pub active: bool,
+    /// Rain sprite quads that reached the COMPOSED frame (`input_scratch`) —
+    /// the end of the pipeline, past the engine tick, past the pane
+    /// translation and past the clip to the focused pane's interior box. Zero
+    /// here means nothing rained on glass whatever the engine believed.
+    pub quads: usize,
+    /// The damage epoch the Tier-A occupancy rescan last consumed
+    /// (`MatrixRain::scanned_epoch`). A workload that claims its frames run the
+    /// O(rows·cols) rescan asserts this ADVANCES frame over frame; a sticky
+    /// "we scanned once, long ago" reads as a repeat instead of a rise.
+    pub scanned_epoch: Option<u64>,
+}
+
 /// Ring capacity of the tiered engine [`BenchApp::feed_history`] installs.
 /// SMALL on purpose: the ring is the bounded tier, and history that never
 /// leaves it is history the off-thread hand-off does not have to carry. A
@@ -168,6 +198,25 @@ impl BenchApp {
         self.app.config.cursor_trail = Some(false);
         self.app.config.cursor_trail_style = Some("rainbow kitty pet".into());
         self.refresh_effect_caches();
+    }
+
+    /// PHOSPHOR rain ON, at its SHIPPED defaults: the `[matrix_rain]` table
+    /// present with `enabled = true` and every other key absent, which is
+    /// exactly the config a user writes to turn rain on. Defaults and clamps
+    /// live in `Config::matrix_rain_params`, so an absent key here resolves to
+    /// the shipping value (30 fps, density 6, `output_material = true`) rather
+    /// than to some bench-only field the product never runs.
+    ///
+    /// `recompute_matrix_rain` is the same resolve the config-reload path runs;
+    /// without it `App::rain` stays `None` and the frame gate finds no
+    /// parameters, so the fixture would look armed and rain nothing. The reach
+    /// witness ([`Self::rain_witness`]) is what proves it actually did arm.
+    pub fn rain_on(&mut self) {
+        self.app.config.matrix_rain = Some(crate::app_config::MatrixRainConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        self.app.recompute_matrix_rain();
     }
 
     /// The exact cache-invalidation pair the unit tests perform after mutating
@@ -418,6 +467,18 @@ impl BenchApp {
         ws.layouts[ws.tabs.active].focus()
     }
 
+    /// THE K2 REACH WITNESS: how many composed ROWS the last composed frame
+    /// left exactly as the frame before it wrote them.
+    ///
+    /// Read straight off the window's own per-frame verdict — no counter, so
+    /// nothing is compiled into a shipping build and nothing is added to the
+    /// timed span. `0` for every frame the retention lane refused, which is
+    /// what a fixture that silently never armed would report.
+    #[must_use]
+    pub fn composed_retained_rows(&self) -> usize {
+        self.ws().composed_retain.retained_rows()
+    }
+
     /// THE REACH WITNESS for any compose-path extraction work: `(scoped, full)`
     /// presented-path frame refills counted process-wide since start. Callers
     /// take DELTAS across a scripted window. Every pane that extracts through
@@ -429,6 +490,41 @@ impl BenchApp {
     pub fn refill_arms(&self) -> (u64, u64) {
         let m = crate::metrics::snapshot();
         (m.frame_refills_scoped, m.frame_refills_full)
+    }
+
+    /// WHICH CONTINUITY CLAUSE refused, per cause, counted process-wide since
+    /// start (`metrics::frame_refill_full_causes`, the same attribution
+    /// `aterm-ctl introspect` prints). Callers take DELTAS across a scripted
+    /// window, exactly like [`Self::refill_arms`].
+    ///
+    /// `refill_arms` says THAT a pane fell off the damage-scoped arm; this says
+    /// WHY, and the two answer different questions. "The scratch was written by
+    /// a host mutator", "another consumer took the damage session", and "the
+    /// viewport scrolled" all read as one more `full` and have three unrelated
+    /// causes — so a workload that believes it knows which one its frames hit
+    /// can assert the clause by NAME instead of inferring it from a count.
+    #[must_use]
+    pub fn refill_full_causes(&self) -> Vec<(&'static str, u64)> {
+        crate::metrics::frame_refill_full_causes()
+            .into_iter()
+            .map(|c| (c.cause, c.frames))
+            .collect()
+    }
+
+    /// THE RAIN REACH WITNESS — see [`RainWitness`] for why it is four
+    /// independent readings and not a config flag.
+    ///
+    /// Read-only, and read from the window the frame just composed, so it is
+    /// valid only immediately after a `compose_at`.
+    #[must_use]
+    pub fn rain_witness(&self) -> RainWitness {
+        let ws = self.ws();
+        RainWitness {
+            engine: ws.matrix_rain.is_some(),
+            active: ws.matrix_rain.as_deref().is_some_and(|e| e.is_active()),
+            quads: ws.input_scratch.rain_quads.len(),
+            scanned_epoch: ws.matrix_rain.as_deref().and_then(|e| e.scanned_epoch()),
+        }
     }
 
     /// ONE headless single-pane rastered frame, modeled exactly as the scout

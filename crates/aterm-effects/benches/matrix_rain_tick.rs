@@ -105,6 +105,7 @@ fn space_cell() -> RenderCell {
         strikethrough: false,
         overline: false,
         underline_color: None,
+        overline_color: None,
     }
 }
 

@@ -173,10 +173,14 @@ fn underline_id(u: UnderlineStyle) -> u64 {
 }
 
 /// One cell's content fingerprint: `(ch, style-hash)` — every visible field of
-/// the RAW engine cell (char, resolved fg/bg, rendition flags, underline
-/// style + colour). Computed BEFORE any tint is applied, so the age map always
-/// diffs engine truth against engine truth (a tint can never feed back into
-/// the next frame's diff).
+/// the RAW engine cell (char, resolved fg/bg, rendition flags, underline style,
+/// and BOTH decoration colour channels). Computed BEFORE any tint is applied, so
+/// the age map always diffs engine truth against engine truth (a tint can never
+/// feed back into the next frame's diff).
+///
+/// "Every visible field" is the rule, not "every field a terminal escape can
+/// set": a channel only chrome writes still changes what the eye sees, and a
+/// fingerprint blind to it reports a changed row as settled.
 fn cell_fp(c: &RenderCell) -> u64 {
     let flags = u64::from(c.wide)
         | (u64::from(c.emoji_presentation) << 1)
@@ -188,17 +192,18 @@ fn cell_fp(c: &RenderCell) -> u64 {
         // Keep the pre-existing bit layout stable for ordinary cells; explicit
         // VS15 occupies the first free bit above the 3-bit underline id.
         | (u64::from(c.text_presentation) << 9);
-    // Sentinel bit 32 distinguishes "no underline colour" from colour 0x000000.
-    let ul = c
-        .underline_color
-        .map_or(1 << 32, |rgb| u64::from(aterm_render::rgb_to_u32(rgb)));
+    // Sentinel bit 32 distinguishes "no explicit colour" from colour 0x000000,
+    // for each decoration channel that has one.
+    let deco_color =
+        |c: Option<[u8; 3]>| c.map_or(1 << 32, |rgb| u64::from(aterm_render::rgb_to_u32(rgb)));
     let mut h = FNV_OFFSET;
     for x in [
         u64::from(u32::from(c.ch)),
         u64::from(aterm_render::rgb_to_u32(c.fg)),
         u64::from(aterm_render::rgb_to_u32(c.bg)),
         flags,
-        ul,
+        deco_color(c.underline_color),
+        deco_color(c.overline_color),
     ] {
         h = fnv(h, x);
     }
@@ -562,6 +567,44 @@ mod tests {
         );
     }
 
+    /// EVERY DECORATION COLOUR IS ITS OWN AXIS OF THE FINGERPRINT. The age map
+    /// diffs fingerprints, so a field the fingerprint cannot see is a field
+    /// whose change reports a row as settled and leaves it untinted — and the
+    /// overline's channel is exactly the kind of field that invites the
+    /// oversight, because no escape sequence can reach it and only chrome ever
+    /// writes it. The two channels must also be told APART: hashing one of them
+    /// twice would pass every "it changed" check while making the pair
+    /// indistinguishable.
+    #[test]
+    fn each_decoration_colour_moves_the_fingerprint_on_its_own_axis() {
+        let base = cell('x', [220, 220, 220], [10, 10, 30]);
+        let ink = [0x40, 0x44, 0x4A];
+        let mut over = base;
+        over.overline_color = Some(ink);
+        let mut under = base;
+        under.underline_color = Some(ink);
+
+        assert_ne!(
+            cell_fp(&base),
+            cell_fp(&over),
+            "a seam colour the fingerprint cannot see leaves its row untinted"
+        );
+        assert_ne!(
+            cell_fp(&over),
+            cell_fp(&under),
+            "the two decoration channels must not collapse onto one another"
+        );
+        // The sentinel bit earns its keep: an explicitly BLACK channel is not
+        // the same cell as one with no channel at all.
+        let mut black = base;
+        black.overline_color = Some([0, 0, 0]);
+        assert_ne!(
+            cell_fp(&base),
+            cell_fp(&black),
+            "an explicit black seam must not fingerprint as an absent one"
+        );
+    }
+
     // ---- pipeline tests over the shipping StreamFade -----------------------
 
     fn cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> RenderCell {
@@ -578,6 +621,7 @@ mod tests {
             strikethrough: false,
             overline: false,
             underline_color: None,
+            overline_color: None,
         }
     }
 

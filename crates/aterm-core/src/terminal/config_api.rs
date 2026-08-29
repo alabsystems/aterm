@@ -8,6 +8,27 @@
 
 use super::Terminal;
 
+/// Push ONE host-config value into a mode an application also negotiates over
+/// the wire, and report whether the live mode actually moved.
+///
+/// The diff is against `seed` — the host value last applied
+/// ([`ConfiguredModes`](super::state::ConfiguredModes)) — never against `live`,
+/// because a live value that disagrees with the config normally means the
+/// running program set the mode. A `live` diff cannot tell "the host changed its
+/// mind" from "the shell set the mode", so it re-asserts the power-on value on
+/// every reload — which for mode 2004 strips a running shell's bracketed-paste
+/// guards the moment the user edits an unrelated setting.
+#[inline]
+fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: bool) -> bool {
+    if *seed == configured {
+        return false;
+    }
+    *seed = configured;
+    let moved = *live != configured;
+    *live = configured;
+    moved
+}
+
 impl Terminal {
     // =========================================================================
     // Configuration Hot-Reload API
@@ -40,9 +61,19 @@ impl Terminal {
     ///
     /// # Change Detection
     ///
-    /// The method only applies changes for settings that differ from the
-    /// current terminal state. The returned `Vec<ConfigChange>` contains
-    /// only the settings that were actually modified.
+    /// Most settings apply when they differ from the current terminal state, and
+    /// the returned `Vec<ConfigChange>` names those that actually moved.
+    ///
+    /// THE NEGOTIATED MODES ARE NOT AMONG THEM. `auto_wrap` (DECAWM),
+    /// `bracketed_paste` (DEC 2004) and `focus_reporting` (DEC 1004) belong to
+    /// the running PROGRAM, which sets them over the wire and is never told when
+    /// something else changes them. Diffing those against the live mode makes
+    /// every reload re-assert the host's value: a host that never sets
+    /// `bracketed_paste` carries the `false` default, so an unrelated settings
+    /// edit would silently strip the paste guards from a shell that had
+    /// negotiated them and still believed it had them. They are compared against
+    /// the host's LAST APPLIED value instead, so a live mode moves only when the
+    /// host's own value moves. See `apply_negotiated_mode`.
     ///
     /// # Settings Applied
     ///
@@ -171,21 +202,29 @@ impl Terminal {
             visual_repaint = true;
         }
 
-        // Auto-wrap mode
-        if self.modes.auto_wrap != config.auto_wrap {
-            self.modes.auto_wrap = config.auto_wrap;
+        // The three APP-NEGOTIATED modes (DECAWM, focus reporting, bracketed
+        // paste): each moves only when the HOST's value moved, so a reload for
+        // an unrelated setting cannot re-assert the power-on value over what the
+        // running program negotiated. See [`ConfiguredModes`].
+        if apply_negotiated_mode(
+            &mut self.modes.auto_wrap,
+            &mut self.configured_modes.auto_wrap,
+            config.auto_wrap,
+        ) {
             changes.push(ConfigChange::AutoWrap);
         }
-
-        // Focus reporting
-        if self.modes.focus_reporting != config.focus_reporting {
-            self.modes.focus_reporting = config.focus_reporting;
+        if apply_negotiated_mode(
+            &mut self.modes.focus_reporting,
+            &mut self.configured_modes.focus_reporting,
+            config.focus_reporting,
+        ) {
             changes.push(ConfigChange::FocusReporting);
         }
-
-        // Bracketed paste
-        if self.modes.bracketed_paste != config.bracketed_paste {
-            self.modes.bracketed_paste = config.bracketed_paste;
+        if apply_negotiated_mode(
+            &mut self.modes.bracketed_paste,
+            &mut self.configured_modes.bracketed_paste,
+            config.bracketed_paste,
+        ) {
             changes.push(ConfigChange::BracketedPaste);
         }
 
@@ -304,6 +343,30 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE SEED AND THE HOST DEFAULTS ARE ONE FACT, so they are compared rather
+    /// than spelled twice.
+    ///
+    /// `ConfiguredModes::default` claims to hold the values a default
+    /// `TerminalConfig` carries. If that ever stopped being true, the first
+    /// `apply_config` of a default config would look like a host CHANGING a
+    /// negotiated mode and would drive it over the program's own — which is the
+    /// whole failure this seam exists to prevent, arriving silently through a
+    /// field nobody thought to re-check.
+    #[test]
+    fn the_mode_seed_holds_exactly_what_a_default_host_config_carries() {
+        let host = crate::config::TerminalConfig::default();
+        let seed = super::super::state::ConfiguredModes::default();
+        assert_eq!(seed.auto_wrap, host.auto_wrap, "auto_wrap (DECAWM)");
+        assert_eq!(
+            seed.bracketed_paste, host.bracketed_paste,
+            "bracketed_paste (DEC 2004)"
+        );
+        assert_eq!(
+            seed.focus_reporting, host.focus_reporting,
+            "focus_reporting (DEC 1004)"
+        );
+    }
     use super::*;
     use crate::config::{BiDiMode, ConfigChange, TerminalConfig};
     use crate::terminal::{Rgb, TerminalBuilder};
@@ -591,5 +654,137 @@ mod tests {
                 .memory_budget(),
             config.memory_budget
         );
+    }
+
+    /// A CONFIG RELOAD MUST NOT UN-NEGOTIATE DEC 2004. Bracketed paste is an
+    /// app-owned input protocol mode: the shell sets it, the shell relies on
+    /// aterm to keep framing pastes, and nothing about editing a colour scheme
+    /// says otherwise. Treating the host's power-on value as a live override
+    /// silently strips the `ESC[200~`/`ESC[201~` guards from every later paste
+    /// while the shell still believes it is protected — which is the whole
+    /// pastejacking exposure the mode exists to close.
+    #[test]
+    fn a_config_reload_leaves_an_app_negotiated_bracketed_paste_alone() {
+        let mut term = Terminal::new(4, 16);
+        let config = TerminalConfig::default();
+        term.apply_config(&config);
+        term.process(b"\x1b[?2004h");
+        assert!(term.modes().bracketed_paste(), "the app set DEC 2004");
+
+        let changes = term.apply_config(&config);
+
+        assert!(
+            term.modes().bracketed_paste(),
+            "an unrelated config reload must not clear the shell's bracketed paste"
+        );
+        assert!(!changes.contains(&ConfigChange::BracketedPaste));
+        assert_eq!(
+            term.format_paste("a\nb"),
+            b"\x1b[200~a\rb\x1b[201~",
+            "pastes stay framed after the reload"
+        );
+    }
+
+    /// The other two modes an application negotiates over the wire — DECAWM and
+    /// focus reporting (DEC 1004) — share the seam and the defect: a reload for
+    /// an unrelated setting must not re-assert the power-on value over what a
+    /// full-screen program asked for.
+    #[test]
+    fn a_config_reload_leaves_app_negotiated_wrap_and_focus_reporting_alone() {
+        let mut term = Terminal::new(4, 16);
+        let config = TerminalConfig::default();
+        term.apply_config(&config);
+        term.process(b"\x1b[?7l\x1b[?1004h");
+        assert!(!term.modes().auto_wrap(), "the app reset DECAWM");
+        assert!(term.focus_reporting_enabled(), "the app set DEC 1004");
+
+        let changes = term.apply_config(&config);
+
+        assert!(
+            !term.modes().auto_wrap(),
+            "reload must not re-enable DECAWM"
+        );
+        assert!(
+            term.focus_reporting_enabled(),
+            "reload must not stop the app's focus reports"
+        );
+        assert!(!changes.contains(&ConfigChange::AutoWrap));
+        assert!(!changes.contains(&ConfigChange::FocusReporting));
+    }
+
+    /// The other half of the contract: a host that GENUINELY changes one of
+    /// these settings still reaches the terminal, and still reports the change
+    /// exactly once. Without it the seam would be indistinguishable from
+    /// deleting the three settings outright.
+    #[test]
+    fn a_real_host_change_to_a_negotiated_mode_still_reaches_the_terminal() {
+        let mut term = Terminal::new(4, 16);
+        let mut config = TerminalConfig::default();
+        term.apply_config(&config);
+        term.process(b"\x1b[?2004h");
+
+        // The host now wants pastes UNFRAMED, over the app's own request.
+        config.bracketed_paste = false;
+        config.auto_wrap = false;
+        config.focus_reporting = true;
+        // `bracketed_paste` held the same value in the previous config, so its
+        // seed did not move and the app's mode 2004 survives; only the two
+        // settings the HOST really changed are announced.
+        let changes = term.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::AutoWrap));
+        assert!(changes.contains(&ConfigChange::FocusReporting));
+        assert!(!changes.contains(&ConfigChange::BracketedPaste));
+        assert!(!term.modes().auto_wrap());
+        assert!(term.focus_reporting_enabled());
+        assert!(term.modes().bracketed_paste());
+
+        // Now the host really does move mode 2004, and it lands.
+        config.bracketed_paste = true;
+        assert!(
+            term.apply_config(&config).is_empty(),
+            "the mode already matches the new host value, so nothing was modified"
+        );
+        config.bracketed_paste = false;
+        let changes = term.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::BracketedPaste));
+        assert!(!term.modes().bracketed_paste());
+        assert_eq!(term.format_paste("a\nb"), b"a\rb", "no guards to emit");
+
+        // An identical reload stays a no-op for all three.
+        assert!(term.apply_config(&config).is_empty());
+    }
+
+    /// A RESET RETURNS THESE MODES TO THE DEC POWER-ON STATE, not to the host's
+    /// configured seed — which is already what `handle_decstr` does for mode
+    /// 2004 and what `TerminalModes::new` does for RIS. The seed is the value a
+    /// reload diffs against, so pin that a reset does not resurrect it: the two
+    /// halves of "what a reset means" must not drift apart.
+    #[test]
+    fn a_reset_returns_a_negotiated_mode_to_the_power_on_value_not_the_config_seed() {
+        let mut term = Terminal::new(4, 16);
+        let mut config = TerminalConfig::default();
+        config.bracketed_paste = true;
+        term.apply_config(&config);
+        assert!(term.modes().bracketed_paste(), "the host seeded 2004 on");
+
+        term.process(b"\x1b[!p"); // DECSTR
+        assert!(!term.modes().bracketed_paste(), "soft reset clears 2004");
+        assert!(
+            !term
+                .apply_config(&config)
+                .contains(&ConfigChange::BracketedPaste),
+            "an unchanged config does not undo the program's reset"
+        );
+        assert!(!term.modes().bracketed_paste());
+
+        term.process(b"\x1b[?2004h");
+        term.reset(); // RIS
+        assert!(!term.modes().bracketed_paste(), "RIS clears 2004");
+        assert!(
+            !term
+                .apply_config(&config)
+                .contains(&ConfigChange::BracketedPaste)
+        );
+        assert!(!term.modes().bracketed_paste());
     }
 }

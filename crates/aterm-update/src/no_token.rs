@@ -315,7 +315,7 @@ mod tests {
             text.contains("gh auth token"),
             "the status must carry the remedy command: {text}"
         );
-        let _: toml::Value = toml::from_str(&text).expect("status stays valid TOML");
+        let _: aterm_toml::Value = aterm_toml::from_str(&text).expect("status stays valid TOML");
         assert!(is_stranded(), "the latch arms for the background loop");
         clear();
         assert!(

@@ -340,7 +340,7 @@ impl Policy {
     /// fail-closed branch without pulling in the engine crate.
     #[must_use]
     pub fn from_toml_or_hardened(toml_src: &str) -> (Self, bool) {
-        match toml::from_str::<Policy>(toml_src) {
+        match aterm_toml::from_str::<Policy>(toml_src) {
             Ok(policy) if policy.schema_version == SCHEMA_VERSION => (policy, false),
             _ => (profiles::hardened(), true),
         }
@@ -351,11 +351,11 @@ impl Policy {
     ///
     /// # Errors
     ///
-    /// Returns [`toml::ser::Error`] if the policy contains a shape the TOML
+    /// Returns [`aterm_toml::ser::Error`] if the policy contains a shape the TOML
     /// serializer cannot represent. No policy derived from a built-in
     /// profile can produce such a shape; only operator-constructed values
     /// can fail serialization.
-    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
-        toml::to_string(self)
+    pub fn to_toml(&self) -> Result<String, aterm_toml::ser::Error> {
+        aterm_toml::to_string(self)
     }
 }

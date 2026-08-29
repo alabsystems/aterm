@@ -11,7 +11,7 @@ description = "Multilingual whole-word lexical matching for the sparkle-words te
 
 [dependencies]
 serde = { workspace = true }
-toml = { workspace = true }
+aterm-toml = { workspace = true }
 aterm-hash = { workspace = true }
 
 [dev-dependencies]

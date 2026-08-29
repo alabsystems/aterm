@@ -941,6 +941,10 @@ pub(crate) fn discard_build(build_dir: &Path) {
         prov.push_str(".provenance");
         let _ = std::fs::remove_file(build_dir.with_file_name(prov));
     }
+    // And the shim-environment sidecar (`<build>.shim-env`, design S7): a later
+    // reinstall under this build number writes its own from its own signed manifest,
+    // and must never re-lay shims with an environment a discarded build declared.
+    crate::shim_env::remove_sidecar(build_dir);
 }
 
 /// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`
@@ -1131,6 +1135,18 @@ const SENSITIVE_SHIMS: &[&str] = &[
     "cat",
 ];
 
+/// The prefix of an ALIAS shim: `alab-<tool>` is laid beside every `<tool>` shim of one
+/// of ALab's own programs and forwards to the same store executable
+/// ([`crate::activate::Aliases`]). The alias exists because ALab's bare tool names collide
+/// with other software (verified 2026-08-27: Homebrew's p11-kit installs a certificate
+/// tool at `/opt/homebrew/bin/trust`; Homebrew core owns the formula names `ty` and
+/// `clean`) and the managed `bin/` is deliberately APPENDED to `PATH` — so `trust` may run
+/// someone else's copy, while `alab-trust` always names ALab's. The prefix is RESERVED:
+/// `alab-<x>` is admissible exactly when `<x>` is (the sensitive-name refusal applies to
+/// the base name, so `alab-sudo` is refused like `sudo`), and an alias of an alias
+/// (`alab-alab-x`) never exists — a tool that already carries the prefix is its own alias.
+pub const ALIAS_PREFIX: &str = "alab-";
+
 /// Whether `name` may be installed as a `bin/` shim: a non-empty, path-separator-free
 /// name that is not on the `SENSITIVE_SHIMS` deny-list (case-insensitive). Fail-closed:
 /// an empty name, a name containing `/`, `\` or `\0`, or `.`/`..` is also refused.
@@ -1139,6 +1155,11 @@ const SENSITIVE_SHIMS: &[&str] = &[
 /// (e.g. `..\..\evil` → a `.cmd` written outside the managed tree) and also lets a name like
 /// `..\git` dodge the sensitive-name deny-list. This matches `linkmode::safe_component`,
 /// `ops::uninstall`, and the other name gates, which all reject `\` too.
+///
+/// An [`ALIAS_PREFIX`]ed name is admitted only when its BASE is: `alab-sudo` is refused
+/// exactly like `sudo` (the deny-list is checked on both spellings, case-insensitively),
+/// a bare `alab-` has no base and is refused, and a nested `alab-alab-x` is refused — the
+/// prefix is reserved for one level of aliasing.
 #[must_use]
 pub fn shim_allowed(name: &str) -> bool {
     if name.is_empty()
@@ -1151,7 +1172,14 @@ pub fn shim_allowed(name: &str) -> bool {
         return false;
     }
     let lower = name.to_ascii_lowercase();
-    !SENSITIVE_SHIMS.contains(&lower.as_str())
+    if SENSITIVE_SHIMS.contains(&lower.as_str()) {
+        return false;
+    }
+    match lower.strip_prefix(ALIAS_PREFIX) {
+        // The base must itself be a shim name, and never another alias.
+        Some(base) => !base.is_empty() && !base.starts_with(ALIAS_PREFIX) && shim_allowed(base),
+        None => true,
+    }
 }
 
 /// A **logical** tool name — one entry of a manifest's `exposes` list. Never a file name.
@@ -1253,6 +1281,32 @@ impl ToolName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this is an [`ALIAS_PREFIX`]ed name (`alab-trust`), i.e. a shim that forwards
+    /// to another tool's executable rather than to one of its own name.
+    #[must_use]
+    pub fn is_alias(&self) -> bool {
+        self.0.starts_with(ALIAS_PREFIX)
+    }
+
+    /// The `alab-<tool>` alias of this tool — `None` when the tool already carries the
+    /// prefix (an alias never gets an alias; the name is unambiguous as it stands). Always
+    /// `Some` otherwise: a base [`shim_allowed`] admits, the prefixed spelling admits too.
+    #[must_use]
+    pub fn alias(&self) -> Option<Self> {
+        if self.is_alias() {
+            return None;
+        }
+        let mut s = String::from(ALIAS_PREFIX);
+        s.push_str(&self.0);
+        Self::new(&s)
+    }
+
+    /// The tool an alias names: `alab-trust` → `trust`; `None` for a plain name.
+    #[must_use]
+    pub fn alias_base(&self) -> Option<Self> {
+        self.0.strip_prefix(ALIAS_PREFIX).and_then(Self::new)
     }
 }
 
@@ -1527,6 +1581,48 @@ mod tests {
         for ok in ["ay", "ny", "trust-mc", "clean-certify"] {
             assert!(shim_allowed(ok), "{ok} should be allowed");
         }
+    }
+
+    /// The `alab-` alias prefix: admitted exactly when the BASE is — the sensitive-name
+    /// refusal applies to the base (`alab-sudo` is `sudo` wearing a hat), the bare prefix
+    /// has no base, and the prefix nests once, never twice.
+    #[test]
+    fn alias_names_admit_on_their_base_and_refuse_sensitive_bases() {
+        for ok in ["alab-ay", "alab-trust", "alab-trust-cg"] {
+            assert!(shim_allowed(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            "alab-sudo",
+            "alab-SSH",
+            "alab-git",
+            "alab-cargo",
+            "alab-",
+            "alab-alab-ay",
+            "alab-a/b",
+            "alab-..",
+        ] {
+            assert!(!shim_allowed(bad), "{bad:?} must be refused a shim");
+        }
+        let trust = ToolName::new("trust").unwrap();
+        assert!(!trust.is_alias());
+        let alias = trust.alias().expect("a plain admissible name has an alias");
+        assert_eq!(alias.as_str(), "alab-trust");
+        assert!(alias.is_alias());
+        assert_eq!(alias.alias_base(), Some(trust.clone()));
+        assert_eq!(trust.alias_base(), None, "a plain name has no base");
+        assert_eq!(alias.alias(), None, "an alias never gets an alias");
+        // Hyphenated tools alias like any other — and the shim/exe renderings carry the
+        // whole alias, never the base.
+        let cg = ToolName::new("trust-cg").unwrap();
+        let cg_alias = cg.alias().unwrap();
+        assert_eq!(cg_alias.as_str(), "alab-trust-cg");
+        assert_eq!(cg_alias.alias_base(), Some(cg));
+        assert_eq!(
+            cg_alias.shim_file(),
+            format!("alab-trust-cg{}", crate::platform::SHIM_SUFFIX)
+        );
+        assert_eq!(ToolName::new("alab-sudo"), None);
+        assert_eq!(ToolName::from_shim_file("alab-git"), None);
     }
 
     #[test]

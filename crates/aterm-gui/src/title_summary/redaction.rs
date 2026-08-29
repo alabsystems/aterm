@@ -230,7 +230,7 @@ pub(crate) fn endpoint_is_credential_free_absolute_url(endpoint: &str) -> bool {
     {
         return false;
     }
-    let Ok(uri) = endpoint.parse::<ureq::http::Uri>() else {
+    let Some(uri) = aterm_http::Uri::parse(endpoint) else {
         return false;
     };
     let Some((raw_scheme, rest)) = endpoint.split_once("://") else {
@@ -261,8 +261,11 @@ pub(crate) fn endpoint_is_credential_free_absolute_url(endpoint: &str) -> bool {
                     | b'@'
             )
     });
-    if uri.scheme_str() != Some(raw_scheme)
-        || uri.authority().map(|authority| authority.as_str()) != Some(raw_authority)
+    // The parse must agree with the naive textual split of the SAME string.
+    // An endpoint the two read differently is ambiguous, and an ambiguous
+    // endpoint is refused rather than guessed at.
+    if uri.scheme().as_str() != raw_scheme
+        || uri.authority_as_written() != raw_authority
         || !(uri.path() == raw_path || (raw_path.is_empty() && uri.path() == "/"))
         || !path_is_rfc3986_ascii
     {

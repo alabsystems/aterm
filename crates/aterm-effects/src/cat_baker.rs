@@ -328,10 +328,19 @@ impl CatBaker {
         self.bakes_left -= 1;
         // Free slot first; else evict the least-recently-used (lowest index
         // tiebreak — deterministic).
+        //
+        // NEVER A SLOT ALREADY SERVED THIS FRAME. One atlas is published per
+        // frame, so a tile handed out earlier in THIS frame is already queued
+        // as a quad pointing at that `(ax, ay)`; re-baking over it makes that
+        // quad sample the new art and the caller draws a sprite it never
+        // asked for. `last_used == self.clock` is exactly "served since the
+        // last `begin_frame`". Refusing yields `None`, which every caller
+        // already reads as "retry next frame" behind its last-good tile.
         let i = self.slots.iter().position(Option::is_none).or_else(|| {
             self.slots
                 .iter()
                 .enumerate()
+                .filter(|(_, s)| s.as_ref().is_none_or(|s| s.last_used != self.clock))
                 .min_by_key(|(idx, s)| (s.as_ref().map_or(0, |s| s.last_used), *idx))
                 .map(|(idx, _)| idx)
         })?;
@@ -402,10 +411,13 @@ impl CatBaker {
             return None;
         }
         self.bakes_left -= 1;
+        // Same law as `get_v4`: a slot served THIS frame is already queued as
+        // a quad and may not be re-baked under it.
         let i = self.slots.iter().position(Option::is_none).or_else(|| {
             self.slots
                 .iter()
                 .enumerate()
+                .filter(|(_, s)| s.as_ref().is_none_or(|s| s.last_used != self.clock))
                 .min_by_key(|(idx, s)| (s.as_ref().map_or(0, |s| s.last_used), *idx))
                 .map(|(idx, _)| idx)
         })?;
@@ -1469,6 +1481,63 @@ mod tests {
             w: 40,
             h: 24,
             eyes: EyesFrame::Open,
+        }
+    }
+
+    /// A SLOT SERVED THIS FRAME MAY NOT BE RE-BAKED UNDER ITS OWN QUAD.
+    ///
+    /// One atlas is published per frame, so a tile handed out earlier in this
+    /// frame is already queued as a quad pointing at that `(ax, ay)`. Evicting
+    /// it for a later bake in the SAME frame makes that quad sample the new
+    /// art — the caller draws a sprite it never asked for (the pet wearing a
+    /// word-cat's coat for one frame, and the strobe that follows when the
+    /// two keys trade the slot back and forth every frame).
+    ///
+    /// Reachable at ordinary HiDPI: `slot_count` falls to 8 at `ch = 90`
+    /// while the shared atlas serves the word cats, the animals, the kitty
+    /// cursor, the pet body, its ghosts and motes, the dog and Robi.
+    #[test]
+    fn a_slot_served_this_frame_is_never_evicted_under_its_own_quad() {
+        const CH: u16 = 90;
+        let slots = CatBaker::slot_count(CH);
+        assert_eq!(slots, 8, "fixture: a small-atlas geometry");
+
+        let mut baker = CatBaker::default();
+        // Fill every slot. `MAX_BAKES_PER_FRAME` is 2, so this takes frames.
+        let mut filled = 0usize;
+        while filled < slots {
+            baker.begin_frame(CH / 2, CH);
+            for coat in 0..slots as u8 {
+                if baker.get_v4(&vk(coat)).is_some() {
+                    filled = filled.max(usize::from(coat) + 1);
+                }
+            }
+        }
+
+        // ONE frame: serve every resident key (each stamps `last_used`), then
+        // ask for a stranger that must bake.
+        baker.begin_frame(CH / 2, CH);
+        let mut served = Vec::new();
+        for coat in 0..slots as u8 {
+            let tile = baker
+                .get_v4(&vk(coat))
+                .expect("a resident key is an exact hit and never needs a bake");
+            served.push(tile.ay);
+        }
+        let stranger = baker.get_v4(&vk(200));
+
+        assert!(
+            stranger.is_none(),
+            "every slot was served this frame, so the bake must be REFUSED \
+             (callers hold a last-good tile and retry); got {stranger:?}"
+        );
+        // …and belt-and-braces: had it baked, it must not have landed on a
+        // slot whose quad is already queued.
+        if let Some(t) = stranger {
+            assert!(
+                !served.contains(&t.ay),
+                "the stranger re-baked over a slot already drawn this frame"
+            );
         }
     }
 

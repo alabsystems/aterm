@@ -12,10 +12,11 @@ use std::sync::{Arc, Mutex};
 use aterm_containment::log_denial;
 use aterm_core::grid::extra::{ImageData, ImageFormat};
 use aterm_core::terminal::Terminal;
-use winit::event_loop::EventLoopProxy;
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 
 use super::{AUDIT_SUBSYSTEM, ImageQueue, ImageReq};
 use crate::control_auth;
+use crate::platform::AppRt;
 use crate::{Wake, term_lock};
 
 /// Main-loop turns are normally sub-millisecond, but a debug build's first native
@@ -56,6 +57,44 @@ pub(crate) fn call_main<T>(
             // not exist. A timeout cannot distinguish a wedged loop from a slow
             // turn from a request nobody ever settles, so it must not name one.
             Err("main-thread reply did not arrive within 30s")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("main-thread reply dropped"),
+    }
+}
+
+/// [`call_main`] with a CALLER-CHOSEN deadline instead of the 30 s cold-render
+/// allowance. The same one-shot channel and `recv_timeout`, but a verb that is
+/// itself under a tight external budget must not park its worker lane for 30 s
+/// when the main thread is momentarily busy. `sessions`/`ls` is the case that
+/// forced this: every discovery client probes a peer with a 2 s deadline (the
+/// menu-bar fleet scan, `aterm ctl ls`), so blocking the placement hop for 30 s
+/// turned a live-but-busy instance into "could not reach" — a false absence. A
+/// short deadline degrades to the verb's existing `Err` path (the roster prints
+/// `window=- active=- wfocus=-` and still lists the session) instead.
+pub(crate) fn call_main_within<T>(
+    proxy: &EventLoopProxy<Wake>,
+    within: std::time::Duration,
+    make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
+) -> Result<T, &'static str> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if proxy.send_event(make(tx)).is_err() {
+        return Err("event loop gone");
+    }
+    recv_within(&rx, within)
+}
+
+/// The recv half of [`call_main_within`], factored so the deadline behaviour is
+/// unit-testable without an event loop: a `Timeout` becomes the degrade signal
+/// (any `Err` drives the caller's dashes), a `Disconnected` reports the dropped
+/// reply.
+fn recv_within<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    within: std::time::Duration,
+) -> Result<T, &'static str> {
+    match rx.recv_timeout(within) {
+        Ok(v) => Ok(v),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err("main thread did not answer within the placement deadline")
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("main-thread reply dropped"),
     }
@@ -639,8 +678,8 @@ struct VideoFrameCandidate {
     file: String,
 }
 
-fn video_frame_candidates(index: &serde_json::Value) -> Vec<VideoFrameCandidate> {
-    let Some(frames) = index.get("frames").and_then(serde_json::Value::as_array) else {
+fn video_frame_candidates(index: &aterm_json::Value) -> Vec<VideoFrameCandidate> {
+    let Some(frames) = index.get("frames").and_then(aterm_json::Value::as_array) else {
         return Vec::new();
     };
     let mut candidates = frames
@@ -698,8 +737,8 @@ fn format_video_frame_rows<P>(rows: &[PinnedVideoFrame<P>]) -> String {
 mod confined_video_reader {
     use std::io::Read as _;
 
-    use rustix::fd::OwnedFd;
-    use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, fstat, openat};
+    use aterm_dirfd::OwnedFd;
+    use aterm_dirfd::{CWD, Dir, FileType, Mode, OFlags, fstat, openat};
 
     use super::{
         PinnedVideoFrame, VIDEO_INDEX_MAX_BYTES, VIDEO_RECORDING_SCAN_MAX, control_auth,
@@ -736,51 +775,51 @@ mod confined_video_reader {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
     }
 
-    fn open_directory_at<Fd: rustix::fd::AsFd>(
+    fn open_directory_at<Fd: aterm_dirfd::AsFd>(
         parent: Fd,
-        name: impl rustix::path::Arg,
+        name: impl aterm_dirfd::Arg,
     ) -> Option<OwnedFd> {
         openat(parent, name, directory_flags(), Mode::empty()).ok()
     }
 
-    fn open_file_at<Fd: rustix::fd::AsFd>(
+    fn open_file_at<Fd: aterm_dirfd::AsFd>(
         parent: Fd,
-        name: impl rustix::path::Arg,
+        name: impl aterm_dirfd::Arg,
     ) -> Option<OwnedFd> {
         openat(parent, name, file_flags(), Mode::empty()).ok()
     }
 
-    fn is_directory(fd: &impl rustix::fd::AsFd) -> bool {
+    fn is_directory(fd: &impl aterm_dirfd::AsFd) -> bool {
         fstat(fd)
             .ok()
             .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_dir())
     }
 
-    fn is_regular_file(fd: &impl rustix::fd::AsFd) -> bool {
+    fn is_regular_file(fd: &impl aterm_dirfd::AsFd) -> bool {
         fstat(fd)
             .ok()
             .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
     }
 
-    fn same_identity(left: &impl rustix::fd::AsFd, right: &impl rustix::fd::AsFd) -> bool {
+    fn same_identity(left: &impl aterm_dirfd::AsFd, right: &impl aterm_dirfd::AsFd) -> bool {
         let (Ok(left), Ok(right)) = (fstat(left), fstat(right)) else {
             return false;
         };
         left.st_dev == right.st_dev && left.st_ino == right.st_ino
     }
 
-    fn current_directory_matches<Fd: rustix::fd::AsFd>(
+    fn current_directory_matches<Fd: aterm_dirfd::AsFd>(
         parent: Fd,
-        name: impl rustix::path::Arg,
-        expected: &impl rustix::fd::AsFd,
+        name: impl aterm_dirfd::Arg,
+        expected: &impl aterm_dirfd::AsFd,
     ) -> bool {
         open_directory_at(parent, name).is_some_and(|current| same_identity(&current, expected))
     }
 
-    fn current_file_matches<Fd: rustix::fd::AsFd>(
+    fn current_file_matches<Fd: aterm_dirfd::AsFd>(
         parent: Fd,
-        name: impl rustix::path::Arg,
-        expected: &impl rustix::fd::AsFd,
+        name: impl aterm_dirfd::Arg,
+        expected: &impl aterm_dirfd::AsFd,
     ) -> bool {
         open_file_at(parent, name)
             .is_some_and(|current| is_regular_file(&current) && same_identity(&current, expected))
@@ -789,7 +828,7 @@ mod confined_video_reader {
     fn read_index(
         recording: &OwnedFd,
         hook: &mut impl FnMut(ReadStage),
-    ) -> Option<(std::fs::File, serde_json::Value)> {
+    ) -> Option<(std::fs::File, aterm_json::Value)> {
         let index_fd = open_file_at(recording, INDEX_NAME)?;
         hook(ReadStage::IndexPinned);
         if !is_regular_file(&index_fd) {
@@ -804,10 +843,10 @@ mod confined_video_reader {
         if bytes.len() > VIDEO_INDEX_MAX_BYTES {
             return None;
         }
-        let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        let value = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
         value
             .get("frames")
-            .is_some_and(serde_json::Value::is_array)
+            .is_some_and(aterm_json::Value::is_array)
             .then_some((file, value))
     }
 
@@ -1298,7 +1337,7 @@ mod confined_video_reader {
         Some(AbsoluteDirectory { root, components })
     }
 
-    fn read_index(recording: &PinnedDirectory) -> Option<(PinnedFile, serde_json::Value)> {
+    fn read_index(recording: &PinnedDirectory) -> Option<(PinnedFile, aterm_json::Value)> {
         let mut pinned = open_file_child(recording, INDEX_NAME)?;
         let mut bytes = Vec::new();
         (&mut pinned.file)
@@ -1308,10 +1347,10 @@ mod confined_video_reader {
         if bytes.len() > VIDEO_INDEX_MAX_BYTES {
             return None;
         }
-        let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        let value = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
         value
             .get("frames")
-            .is_some_and(serde_json::Value::is_array)
+            .is_some_and(aterm_json::Value::is_array)
             .then_some((pinned, value))
     }
 
@@ -2353,15 +2392,29 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 }
 
 /// The `spawn` verb's usage line — one string for every malformed form, naming
-/// the whole grammar (plain + connected) so a caller who got one token wrong
-/// sees the complete contract.
-const SPAWN_USAGE: &str = "ERR usage: spawn [connected=controlled|controller place=window|tab of=<sid>] [cwd=<path>] [split=<v|h>]\n";
+/// the whole grammar (plain + aimed + connected) so a caller who got one token
+/// wrong sees the complete contract.
+const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<true|false>] [cwd=<path>] [split=<v|h>] [connected=controlled|controller place=window|tab of=<sid>]\n";
 
-/// One parsed `spawn` request: the plain tab/split spawn, or the CONNECTED form
-/// (design §6) with every argument present and validated.
+/// The `tab` verb's usage line, shared by the front-window form
+/// ([`super::control_input::cmd_tab`]) and the aimed `@<sid> tab` form
+/// ([`cmd_tab_aimed`]) — one grammar, one sentence.
+const TAB_USAGE: &str = "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n";
+
+/// One parsed `spawn` request: the plain tab/split spawn (optionally AIMED at a
+/// window, design S3), or the CONNECTED form (design §6) with every argument
+/// present and validated.
 #[derive(Debug, PartialEq, Eq)]
 enum SpawnForm {
     Plain {
+        /// `window=<id>`: the window (one of the ids `inspect app/v1 tabs`
+        /// prints) the newborn lands in. `None` = the `@<sid>` selector's host
+        /// window when one was given, else the front window
+        /// ([`SpawnAim::from_request`]).
+        window: Option<u64>,
+        /// `raise=<true|false>`: an EXPLICIT raise verdict. `None` defers to
+        /// [`raise_after_spawn`]'s default — raise only when nothing was aimed.
+        raise: Option<bool>,
         cwd: Option<String>,
         split: Option<crate::pane::SplitDir>,
     },
@@ -2383,16 +2436,32 @@ enum SpawnForm {
 ///
 /// `split=` and `connected=` are mutually exclusive: `place=` already says
 /// where a connected newborn lands, and a pane split is not one of its two
-/// answers — so the pair is refused rather than silently resolved.
+/// answers — so the pair is refused rather than silently resolved. The same
+/// rule covers `window=` and `raise=` (design S3): the connected form places
+/// by `place=`/`of=`, so an aim or a raise verdict beside it is refused rather
+/// than one of the two silently winning.
+///
+/// `window=<id>` is the id `inspect app/v1 tabs` prints (a plain integer);
+/// `raise=` is exactly `true` or `false` — anything else is the usage line, so
+/// a misspelt verdict can never be read as "use the default".
 fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
+    let (mut window, mut raise) = (None, None);
     let Some(tokens) = split_quoted_tokens(rest) else {
         return Err(());
     };
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("cwd=") {
             cwd = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("window=") {
+            window = Some(v.parse::<u64>().map_err(|_| ())?);
+        } else if let Some(v) = tok.strip_prefix("raise=") {
+            raise = Some(match v {
+                "true" => true,
+                "false" => false,
+                _ => return Err(()),
+            });
         } else if let Some(v) = tok.strip_prefix("split=") {
             split = Some(match v {
                 "v" | "vertical" => crate::pane::SplitDir::Vertical,
@@ -2421,24 +2490,95 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
         }
     }
     match (kind, place, origin) {
-        (None, None, None) => Ok(SpawnForm::Plain { cwd, split }),
-        (Some(kind), Some(place), Some(origin)) if split.is_none() => Ok(SpawnForm::Connected {
-            kind,
-            place,
-            origin,
+        (None, None, None) => Ok(SpawnForm::Plain {
+            window,
+            raise,
             cwd,
+            split,
         }),
+        (Some(kind), Some(place), Some(origin))
+            if split.is_none() && window.is_none() && raise.is_none() =>
+        {
+            Ok(SpawnForm::Connected {
+                kind,
+                place,
+                origin,
+                cwd,
+            })
+        }
         // A partial connected form (connected= without of=/place=, or a stray
-        // place=/of=), or a connected form carrying split=, never guesses.
+        // place=/of=), or a connected form carrying split=/window=/raise=,
+        // never guesses.
         _ => Err(()),
     }
 }
 
-/// `spawn [cwd=<path>] [split=<v|h>]` -> mint ONE new session in the frontmost
-/// window and reply `OK <sid>` — birth as a socket primitive. The sid is live in
-/// the registry before the reply is sent, so `@<sid> …` works immediately: an
-/// orchestrator stands up a fleet with a loop of spawn calls and drives each
-/// newborn with `turn`/`send`/`subscribe`, no process management.
+/// Where an aimed `spawn` lands (design S3, finding F3): the FRONT window (the
+/// historical `aterm new-tab` contract), an EXPLICIT `window=<id>`, or the
+/// window HOSTING the `@<sid>` selector's session (the routing rule `@<sid>
+/// image` already uses). Carried by [`Wake::SpawnSession`] and resolved to
+/// a window on the main thread ([`crate::App::aimed_window`]) — the control
+/// thread knows neither the window table nor whether the instance is headless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnAim {
+    Front,
+    Window(u64),
+    Session(u64),
+}
+
+impl SpawnAim {
+    /// `window=` wins over `@<sid>` (the explicit spelling beats the implied
+    /// one); `@<sid>` alone aims at its host; neither means the front window.
+    const fn from_request(window: Option<u64>, session: Option<u64>) -> Self {
+        match (window, session) {
+            (Some(id), _) => Self::Window(id),
+            (None, Some(local)) => Self::Session(local),
+            (None, None) => Self::Front,
+        }
+    }
+
+    /// True when the caller NAMED a window, in either spelling — the input to
+    /// [`raise_after_spawn`].
+    pub(crate) const fn is_aimed(self) -> bool {
+        !matches!(self, Self::Front)
+    }
+}
+
+/// The raise policy, PURE. An explicit `raise=` always wins; otherwise a spawn
+/// that named NO window raises (today's `aterm new-tab` attach contract,
+/// unchanged) and one that DID name a window does not. An agent aiming at a
+/// background window is not asking to see it: in the drive recorded in the
+/// agent-experience report (§2.3) the unconditional raise flipped the human's
+/// keyboard focus to the agent's window twice while they were typing in the
+/// foreground one.
+pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -> bool {
+    match raise {
+        Some(explicit) => explicit,
+        None => !window_named,
+    }
+}
+
+/// `spawn [window=<id>] [raise=<true|false>] [cwd=<path>] [split=<v|h>]` ->
+/// mint ONE new session and reply `OK <sid>` — birth as a socket primitive.
+/// The sid is live in the registry before the reply is sent, so `@<sid> …`
+/// works immediately: an orchestrator stands up a fleet with a loop of spawn
+/// calls and drives each newborn with `turn`/`send`/`subscribe`, no process
+/// management.
+///
+/// AIMING (design S3). The newborn lands in the frontmost window unless the
+/// caller names one: `window=<id>` (an id from `inspect app/v1 tabs`) or the
+/// `@<sid>` selector, which means "the window hosting `<sid>`" — `session` is
+/// that selector's resolved local id, `None` for a flagless request, exactly
+/// as `image` receives it; only an Owner reaches here WITH a selector — the
+/// aimed forms keep the App authority verdict every other App-target selector
+/// gets (`control::aimed_app_lane`). `window=` wins over `@<sid>`. `split=` on an
+/// aimed spawn divides THAT window's focused pane. The main thread answers
+/// `ERR no such window <id>` for an id no window carries; a headless instance
+/// owns logical window 0 (the one `ls`/`dims` name), so `window=0` and `@<sid>`
+/// resolve there just as they do to a real window and only `window=<other>` is
+/// `ERR no such window`. The reply shape is otherwise unchanged. `raise=` is
+/// decided HERE, purely
+/// ([`raise_after_spawn`]): explicit wins, else only an un-aimed spawn raises.
 ///
 /// `cwd=<path>` sets the newborn's working directory (default: inherit the
 /// focused pane's cwd, like Cmd-T); a path containing spaces is quoted
@@ -2463,13 +2603,24 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
 /// `place=window` under headless with the NEW `ERR headless` reply (§1.4#7);
 /// `place=tab` works headless. cwd default for the connected form is the
 /// ORIGIN session's cwd.
-pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
     let sent = match parse_spawn_args(rest) {
-        Ok(SpawnForm::Plain { cwd, split }) => call_main(proxy, |tx| Wake::SpawnSession {
+        Ok(SpawnForm::Plain {
+            window,
+            raise,
             cwd,
             split,
-            reply: tx,
-        }),
+        }) => {
+            let aim = SpawnAim::from_request(window, session);
+            let raise = raise_after_spawn(aim.is_aimed(), raise);
+            call_main(proxy, |tx| Wake::SpawnSession {
+                aim,
+                cwd,
+                split,
+                raise,
+                reply: tx,
+            })
+        }
         Ok(SpawnForm::Connected {
             kind,
             place,
@@ -2491,12 +2642,167 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// `@<sid> tab new | <N> | next | prev | close [N] | move <from> <to>` -> drive
+/// the tabs of the window HOSTING the resolved session (design S3) and reply
+/// `OK <active_index> <tab_count>` — the aimed twin of
+/// [`super::control_input::cmd_tab`], which drives the FRONT window. Same
+/// grammar, same reply; only the aim can additionally fail — a session no
+/// window hosts cannot be driven through one, and an unknown `@<sid>` is
+/// `ERR no such session` — so the main-thread hop ([`Wake::TabCmdAimed`])
+/// replies a `Result` where its sibling replies a pair. A headless instance
+/// drives its one logical window like a real one (no `ERR headless`).
+pub(crate) fn cmd_tab_aimed(proxy: &EventLoopProxy<Wake>, rest: &str, session: u64) -> String {
+    let Some(action) = super::control_input::parse_tab(rest) else {
+        return TAB_USAGE.to_string();
+    };
+    match call_main(proxy, |reply| Wake::TabCmdAimed {
+        session,
+        action,
+        reply,
+    }) {
+        Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(error) => format!("ERR tab command failed: {error}\n"),
+    }
+}
+
+/// The MAIN-THREAD half of the aimed `spawn`/`tab` verbs (design S3). It sits
+/// beside the verbs' control-thread half rather than in `app_tabs.rs` because
+/// it is verb POLICY — which window a wire request means, and whether a spawn
+/// may take the foreground — not tab mechanics; the mechanics it calls
+/// (`spawn_tab_session`, `apply_tab_cmd_in`) stay window-parameterised in
+/// `app_tabs.rs`, where every other caller of theirs lives.
+impl crate::App {
+    /// Resolve a [`SpawnAim`] to the window it names. `Front` is `Ok(None)` —
+    /// "whatever is frontmost when the spawn runs", the historical contract;
+    /// a named window resolves through [`Self::named_window`] /
+    /// [`Self::hosting_window`], both of which refuse BEFORE anything is
+    /// created. A headless instance owns ONE logical window (id 0, the one
+    /// `ls`/`windows`/`dims` report) — so `window=0` and `@<sid>` resolve to it
+    /// there exactly as they do to a real window, and only `window=<other>` is
+    /// `ERR no such window`. The blanket `ERR headless` this used to answer for
+    /// every aim was inconsistent with the roster the same instance printed
+    /// (§1.4#7 review); raising the resolved window is simply a no-op headless
+    /// (it has no OS surface — [`Self::spawn_session_aimed`]).
+    pub(crate) fn aimed_window(&self, aim: SpawnAim) -> Result<Option<crate::WindowId>, String> {
+        match aim {
+            SpawnAim::Front => Ok(None),
+            SpawnAim::Window(id) => self.named_window(id).map(Some),
+            SpawnAim::Session(local) => self.hosting_window(local).map(Some),
+        }
+    }
+
+    /// `window=<id>`: one of the ids `inspect app/v1 tabs` prints (`dims`'
+    /// `window=` is the same number, and a headless instance's is `0`). An id
+    /// not in the table is refused by name — `ERR no such window <id>` — never
+    /// rounded to the front window.
+    fn named_window(&self, id: u64) -> Result<crate::WindowId, String> {
+        let wid = crate::WindowId(id);
+        if self.windows.contains_key(&wid) {
+            Ok(wid)
+        } else {
+            Err(format!("no such window {id}"))
+        }
+    }
+
+    /// `@<sid>`: the window whose pane trees contain the session (any tab, any
+    /// pane — [`Self::window_of_session`], the roster's front-else-lowest rule).
+    /// A registered session no window hosts cannot be aimed through; say so
+    /// rather than fall back to the front window the caller pointedly did not
+    /// name.
+    fn hosting_window(&self, local: u64) -> Result<crate::WindowId, String> {
+        self.window_of_session(local)
+            .ok_or_else(|| "no window hosts the target session".to_string())
+    }
+
+    /// `spawn` on the main thread: resolve the aim, spawn through the ONE
+    /// tab/split path ([`Self::spawn_tab_session`]), then apply the raise
+    /// verdict the control thread already decided ([`raise_after_spawn`]) —
+    /// only on a SUCCESSFUL spawn (a refused request must not steal the
+    /// foreground), and on the window the tab actually landed in, so an
+    /// explicit `raise=true` on an aimed spawn raises THAT window, not the
+    /// front one. The apprt decides what raising means (Windows: SW_RESTORE +
+    /// SetForegroundWindow); the default is nothing, so no other platform's
+    /// focus behaviour moves here.
+    pub(crate) fn spawn_session_aimed(
+        &mut self,
+        aim: SpawnAim,
+        cwd: Option<String>,
+        split: Option<crate::pane::SplitDir>,
+        raise: bool,
+    ) -> Result<String, String> {
+        let host = self.aimed_window(aim)?;
+        let sid = self.spawn_tab_session(host, cwd, split)?;
+        if raise
+            && let Some(window) = host
+                .or(self.frontmost_window)
+                .and_then(|wid| self.windows.get(&wid))
+                .and_then(|ws| ws.os_window.clone())
+        {
+            self.apprt.window_bring_to_front(&window);
+        }
+        Ok(sid)
+    }
+
+    /// `@<sid> tab …` on the main thread: the aimed twin of the
+    /// [`Wake::TabCmd`] arm — the same programmatic-close bracket (a
+    /// control-socket `tab close` is a deliberate, non-interactive instruction
+    /// and must NOT pop the blocking native confirm dialog; a last-tab close
+    /// flags `pending_close`, escalated here so the window really tears down)
+    /// applied to the window hosting `session` instead of the front one.
+    pub(crate) fn tab_cmd_aimed(
+        &mut self,
+        el: &ActiveEventLoop,
+        session: u64,
+        action: crate::TabAction,
+    ) -> Result<(usize, usize), String> {
+        let wid = self.hosting_window(session)?;
+        self.clear_tab_surface_move_license(None);
+        self.close_confirm_suppressed = true;
+        let state = self.apply_tab_cmd_in(wid, action);
+        self.escalate_pending_close(el);
+        self.close_confirm_suppressed = false;
+        Ok(state)
+    }
+}
+
 /// `@<sid> close` -> retire the resolved session by id (the death half of `spawn`):
 /// close the tab hosting it through the same teardown the ✕ uses. Reply
 /// `OK closed <sid>` on success, `ERR <why>` if unknown or the close was refused
 /// (a running job armed the last-tab quit-confirm). Main-thread hop like `spawn`.
-pub(crate) fn cmd_close(proxy: &EventLoopProxy<Wake>, session: u64, sid: &str) -> String {
-    match call_main(proxy, |tx| Wake::CloseSession { session, reply: tx }) {
+///
+/// `by` is the CALLER (`control_session::caller_actor`: the session an
+/// edge-scoped connection's token was granted to, `Unknown` for an anonymous
+/// owner-token connection) — it rides the wake so the exit ledger can say who
+/// closed the session (`exits` → `reason=ctl-close by=<by>`), the one fact the
+/// target's ctx cannot supply: the dispatch resolved `session`/`sid` from the
+/// selector, and the caller is somebody else.
+/// `close` takes NO argument — validate the tail before anything is retired.
+///
+/// The silent-ignore hole this release closed for `text` (F4's sub-finding) sat
+/// on `close` too, where the cost is not a wasted read but a dead tab: a driver
+/// guessing `@<sid> close --dry-run` (or `close 2`, aiming at a tab index the
+/// verb has never taken) got the session retired and an `OK closed` that looked
+/// like the guess had been honoured. A guess must fail, and say so.
+pub(crate) fn close_no_arg(rest: &str) -> Result<(), String> {
+    if rest.trim().is_empty() {
+        Ok(())
+    } else {
+        Err("ERR usage: close\n".to_string())
+    }
+}
+
+pub(crate) fn cmd_close(
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    sid: &str,
+    by: crate::session_store::ExitActor,
+) -> String {
+    match call_main(proxy, |tx| Wake::CloseSession {
+        session,
+        by,
+        reply: tx,
+    }) {
         Ok(Ok(())) => format!("OK closed {sid}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -2659,6 +2965,8 @@ mod spawn_parse_tests {
         assert_eq!(
             parse_spawn_args(""),
             Ok(SpawnForm::Plain {
+                window: None,
+                raise: None,
                 cwd: None,
                 split: None
             })
@@ -2666,6 +2974,8 @@ mod spawn_parse_tests {
         assert_eq!(
             parse_spawn_args("cwd=/tmp/x"),
             Ok(SpawnForm::Plain {
+                window: None,
+                raise: None,
                 cwd: Some("/tmp/x".to_string()),
                 split: None
             })
@@ -2673,6 +2983,8 @@ mod spawn_parse_tests {
         assert_eq!(
             parse_spawn_args("cwd=/tmp/x split=v"),
             Ok(SpawnForm::Plain {
+                window: None,
+                raise: None,
                 cwd: Some("/tmp/x".to_string()),
                 split: Some(crate::pane::SplitDir::Vertical)
             })
@@ -2681,6 +2993,8 @@ mod spawn_parse_tests {
         assert_eq!(
             parse_spawn_args(r#"cwd="C:\Program Files\Git""#),
             Ok(SpawnForm::Plain {
+                window: None,
+                raise: None,
                 cwd: Some(r"C:\Program Files\Git".to_string()),
                 split: None
             })
@@ -2736,13 +3050,135 @@ mod spawn_parse_tests {
     }
 
     /// The usage string the wire replies for every malformed form names the
-    /// WHOLE grammar (a caller sees the complete contract).
+    /// WHOLE grammar (a caller sees the complete contract) — the aimed knobs
+    /// included, in the order the design spells them.
     #[test]
     fn spawn_usage_names_the_connected_grammar() {
         assert!(super::SPAWN_USAGE.contains("connected=controlled|controller"));
         assert!(super::SPAWN_USAGE.contains("place=window|tab"));
         assert!(super::SPAWN_USAGE.contains("of=<sid>"));
         assert!(super::SPAWN_USAGE.contains("split=<v|h>"));
+        assert!(
+            super::SPAWN_USAGE.starts_with("ERR usage: spawn [window=<id>] [raise=<true|false>]")
+        );
+        assert!(super::SPAWN_USAGE.ends_with('\n'));
+        // The aimed `tab` form replies the SAME usage sentence its front-window
+        // twin does (control_input::cmd_tab), so the two never drift apart.
+        assert_eq!(
+            super::TAB_USAGE,
+            "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n"
+        );
+    }
+
+    /// The aimed form (design S3): `window=<id>` and `raise=<bool>` parse into
+    /// the plain form, alone, together, and in any order beside the old knobs.
+    #[test]
+    fn aimed_spawn_parses_window_and_raise() {
+        assert_eq!(
+            parse_spawn_args("window=1"),
+            Ok(SpawnForm::Plain {
+                window: Some(1),
+                raise: None,
+                cwd: None,
+                split: None
+            })
+        );
+        assert_eq!(
+            parse_spawn_args("raise=false"),
+            Ok(SpawnForm::Plain {
+                window: None,
+                raise: Some(false),
+                cwd: None,
+                split: None
+            })
+        );
+        assert_eq!(
+            parse_spawn_args("raise=true window=0 split=h cwd=/w"),
+            Ok(SpawnForm::Plain {
+                window: Some(0),
+                raise: Some(true),
+                cwd: Some("/w".to_string()),
+                split: Some(crate::pane::SplitDir::Horizontal)
+            })
+        );
+    }
+
+    /// A malformed aim or verdict is the usage line, never "use the default":
+    /// `raise=maybe` must not quietly become an un-aimed raise, and a window id
+    /// is a plain integer from `inspect app/v1 tabs`, nothing looser.
+    #[test]
+    fn aimed_spawn_rejects_bad_window_and_raise_values() {
+        for rest in [
+            "window=",
+            "window=abc",
+            "window=-1",
+            "window=0x1",
+            "window=1 window=x",
+            "raise=",
+            "raise=maybe",
+            "raise=1",
+            "raise=yes",
+            "raise=True",
+            "window=1 raise=maybe",
+        ] {
+            assert_eq!(parse_spawn_args(rest), Err(()), "{rest:?}");
+        }
+    }
+
+    /// The connected form places by `place=`/`of=`; an aim or a raise verdict
+    /// beside it is refused rather than one of the two silently winning — the
+    /// `split=` rule, applied to the new knobs.
+    #[test]
+    fn an_aim_or_raise_beside_the_connected_form_is_refused() {
+        assert_eq!(
+            parse_spawn_args("connected=controlled place=tab of=s-abc window=1"),
+            Err(())
+        );
+        assert_eq!(
+            parse_spawn_args("connected=controlled place=tab of=s-abc raise=false"),
+            Err(())
+        );
+    }
+
+    /// `window=` (the explicit spelling) beats `@<sid>` (the implied one); the
+    /// selector alone aims at its host; neither is the front window.
+    #[test]
+    fn spawn_aim_prefers_the_explicit_window_over_the_selector() {
+        use super::SpawnAim;
+        assert_eq!(SpawnAim::from_request(None, None), SpawnAim::Front);
+        assert_eq!(SpawnAim::from_request(None, Some(7)), SpawnAim::Session(7));
+        assert_eq!(SpawnAim::from_request(Some(2), None), SpawnAim::Window(2));
+        assert_eq!(
+            SpawnAim::from_request(Some(2), Some(7)),
+            SpawnAim::Window(2)
+        );
+        assert!(!SpawnAim::Front.is_aimed());
+        assert!(SpawnAim::Window(0).is_aimed());
+        assert!(SpawnAim::Session(0).is_aimed());
+    }
+
+    /// The raise policy, all four cells (design S3): an explicit verdict wins
+    /// either way; with none, an un-aimed spawn raises (the `aterm new-tab`
+    /// attach contract, unchanged) and an aimed one does not — the F3 fix.
+    #[test]
+    fn raise_after_spawn_all_four_cells() {
+        use super::raise_after_spawn;
+        assert!(
+            raise_after_spawn(false, None),
+            "un-aimed, no verdict: raise (attach)"
+        );
+        assert!(
+            !raise_after_spawn(true, None),
+            "aimed, no verdict: do NOT raise"
+        );
+        assert!(
+            raise_after_spawn(true, Some(true)),
+            "aimed, raise=true: insist"
+        );
+        assert!(
+            !raise_after_spawn(false, Some(false)),
+            "un-aimed, raise=false: hold"
+        );
     }
 
     /// `place=` already says where a connected newborn lands; a pane split is
@@ -2754,6 +3190,170 @@ mod spawn_parse_tests {
             parse_spawn_args("connected=controlled place=tab of=s-abc split=v"),
             Err(())
         );
+    }
+}
+
+#[cfg(test)]
+mod close_arg_tests {
+    use super::close_no_arg;
+
+    /// The bare verb (with or without whitespace) is the only accepted form,
+    /// and every guess a driver might make — a flag, a tab index, a repeated
+    /// selector — is a usage error rather than a retired session. The message
+    /// is the exact wire line, so the catalog's `ERR usage: close` promise and
+    /// the code cannot drift apart.
+    #[test]
+    fn close_takes_no_argument_and_a_guess_never_retires_a_session() {
+        assert_eq!(close_no_arg(""), Ok(()));
+        assert_eq!(close_no_arg("   "), Ok(()));
+        for bad in [
+            "--dry-run",
+            "2",
+            "now",
+            "force",
+            "@s-0123456789abcdef0123",
+            "trim",
+        ] {
+            assert_eq!(
+                close_no_arg(bad),
+                Err("ERR usage: close\n".to_string()),
+                "`close {bad}` must be refused, not honoured"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spawn_aim_app_tests {
+    use super::SpawnAim;
+    use crate::{App, TabAction, WindowId};
+
+    /// A headless App with two logical windows — the smallest fixture on which
+    /// "the aimed window is not the front one" is observable. Installing a
+    /// second window makes IT the front one (`install_window_state` focuses
+    /// what it installs), so window 1 is the front (one tab, session 1) and
+    /// window 0 becomes the BACKGROUND window, given a second tab: it hosts
+    /// sessions 0 and 2 with tab 1 (session 2) active.
+    fn two_windows() -> App {
+        let mut app = App::headless_for_test();
+        let front = app.insert_logical_window(crate::stub_session(1), 24, 80);
+        assert_eq!(front, WindowId(1));
+        assert_eq!(app.frontmost_window, Some(front));
+        let back = WindowId(0);
+        app.push_stub_tab(back, crate::stub_session(2));
+        assert_eq!(app.windows[&back].tab_set.len(), 2);
+        assert_eq!(app.windows[&back].tab_set.active_index(), Some(1));
+        assert_eq!(
+            app.frontmost_window,
+            Some(front),
+            "a background tab is not a focus change"
+        );
+        app
+    }
+
+    /// A headless instance resolves aims against its OWN window table — the
+    /// same logical windows `ls`/`windows`/`dims` report — instead of the old
+    /// blanket `ERR headless` that contradicted the roster (§1.4#7 review):
+    /// `window=<id>` and `@<sid>` resolve exactly as windowed, and only an id
+    /// no window carries is `ERR no such window`. The un-aimed form is still
+    /// `None` ("front"). Raising the resolved window is a headless no-op, so
+    /// resolution — not refusal — is the whole change.
+    #[test]
+    fn a_headless_aim_resolves_against_the_window_table_not_err_headless() {
+        let app = two_windows();
+        assert!(app.headless);
+        assert_eq!(app.aimed_window(SpawnAim::Front), Ok(None));
+        // The logical windows the roster names resolve, front or not.
+        assert_eq!(app.aimed_window(SpawnAim::Window(0)), Ok(Some(WindowId(0))));
+        assert_eq!(app.aimed_window(SpawnAim::Window(1)), Ok(Some(WindowId(1))));
+        // Only an id no window carries is refused — by name, never `headless`.
+        assert_eq!(
+            app.aimed_window(SpawnAim::Window(99)),
+            Err("no such window 99".to_string())
+        );
+        // `@<sid>` lands in the (background) window hosting the session.
+        assert_eq!(
+            app.aimed_window(SpawnAim::Session(2)),
+            Ok(Some(WindowId(0)))
+        );
+        assert_eq!(app.hosting_window(2), Ok(WindowId(0)));
+    }
+
+    /// Windowed: `window=<id>` names the table's ids (the ones `inspect app/v1
+    /// tabs` prints), an unknown id is refused BY NAME, and `@<sid>` resolves
+    /// to the window whose pane trees hold the session — a background window
+    /// included, which is the whole point of aiming.
+    #[test]
+    fn a_named_or_hosting_window_resolves_and_an_unknown_one_is_named_back() {
+        let mut app = two_windows();
+        app.headless = false;
+        assert_eq!(app.frontmost_window, Some(WindowId(1)));
+        assert_eq!(app.aimed_window(SpawnAim::Front), Ok(None));
+        assert_eq!(app.aimed_window(SpawnAim::Window(0)), Ok(Some(WindowId(0))));
+        assert_eq!(app.aimed_window(SpawnAim::Window(1)), Ok(Some(WindowId(1))));
+        assert_eq!(
+            app.aimed_window(SpawnAim::Window(7)),
+            Err("no such window 7".to_string())
+        );
+        assert_eq!(
+            app.aimed_window(SpawnAim::Session(0)),
+            Ok(Some(WindowId(0)))
+        );
+        assert_eq!(
+            app.aimed_window(SpawnAim::Session(1)),
+            Ok(Some(WindowId(1)))
+        );
+        assert_eq!(
+            app.aimed_window(SpawnAim::Session(2)),
+            Ok(Some(WindowId(0)))
+        );
+        assert_eq!(
+            app.aimed_window(SpawnAim::Session(99)),
+            Err("no window hosts the target session".to_string())
+        );
+    }
+
+    /// The aimed tab drive walks the BACKGROUND window's tabs and leaves the
+    /// front window untouched — the human's keyboard focus and active tab do
+    /// not move when an agent cycles its own window.
+    #[test]
+    fn aimed_tab_commands_drive_the_hosting_window_not_the_front_one() {
+        let mut app = two_windows();
+        app.headless = false;
+        let (front, back) = (WindowId(1), WindowId(0));
+        // next wraps 1 -> 0; prev wraps 0 -> 1; a bare index selects.
+        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Next), (0, 2));
+        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Prev), (1, 2));
+        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Select(0)), (0, 2));
+        assert_eq!(app.windows[&back].tab_set.active_index(), Some(0));
+        // The front window never moved: still one tab, still index 0, still front.
+        assert_eq!(app.windows[&front].tab_set.len(), 1);
+        assert_eq!(app.windows[&front].tab_set.active_index(), Some(0));
+        assert_eq!(app.frontmost_window, Some(front));
+        // The front-window form is the SAME entry on the front window.
+        assert_eq!(app.apply_tab_cmd(TabAction::Next), (0, 1));
+        // An unknown window reports the empty state instead of guessing.
+        assert_eq!(app.apply_tab_cmd_in(WindowId(9), TabAction::Next), (0, 0));
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// `@<sid> tab close` closes in the HOSTING window: window 1 drops to one
+    /// tab and window 0 keeps its only tab (the front form would have flagged
+    /// the front window's last-tab close instead).
+    #[test]
+    fn aimed_tab_close_closes_in_the_hosting_window() {
+        let mut app = two_windows();
+        app.headless = false;
+        let (front, back) = (WindowId(1), WindowId(0));
+        assert_eq!(
+            app.apply_tab_cmd_in(back, TabAction::Close(Some(1))),
+            (0, 1)
+        );
+        assert_eq!(app.windows[&back].tab_set.len(), 1);
+        assert!(!app.windows[&back].pending_close);
+        assert_eq!(app.windows[&front].tab_set.len(), 1);
+        assert!(!app.windows[&front].pending_close);
+        assert!(app.structural_invariants_ok());
     }
 }
 
@@ -3758,5 +4358,45 @@ mod video_parse_tests {
         for dir in [outer, outside] {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod call_main_within_tests {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::recv_within;
+
+    /// The whole reason `call_main_within` exists: a main thread that does not
+    /// answer within the deadline degrades PROMPTLY (any `Err` drives the
+    /// roster's `window=-` dashes), instead of parking the worker for the 30 s
+    /// `call_main` default. The sender is kept live so this is a genuine
+    /// TIMEOUT, not a disconnect.
+    #[test]
+    fn recv_within_degrades_on_timeout_at_the_deadline() {
+        let (_tx, rx) = mpsc::channel::<u8>();
+        let start = Instant::now();
+        let r = recv_within(&rx, Duration::from_millis(20));
+        assert_eq!(
+            r,
+            Err("main thread did not answer within the placement deadline")
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "returned at the deadline, not at the default"
+        );
+    }
+
+    /// A dropped sender (the event loop gone mid-hop) is reported distinctly
+    /// from a timeout, though both drive the same caller degrade.
+    #[test]
+    fn recv_within_reports_a_dropped_reply() {
+        let (tx, rx) = mpsc::channel::<u8>();
+        drop(tx);
+        assert_eq!(
+            recv_within(&rx, Duration::from_secs(5)),
+            Err("main-thread reply dropped")
+        );
     }
 }

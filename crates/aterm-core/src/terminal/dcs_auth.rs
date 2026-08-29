@@ -17,7 +17,7 @@
 //! payload is narrated / forwarded with the same authority as host-
 //! generated payload.
 //!
-//! # The structural fix — parallel to [`super::hyperlink_auth`]
+//! # The structural fix — parallel to [`super::window_auth`]
 //!
 //! The DCS unhook handler no longer reaches for `self.dcs.callback`
 //! directly. Instead, [`DcsAuth::try_mint_capability`] returns
@@ -98,7 +98,7 @@ impl DcsEmitCapability {
 ///
 /// Held implicitly by the terminal module — no field is required
 /// because the authority has no state. Named ZST for parity with
-/// [`super::hyperlink_auth::HyperlinkMintAuthority`] etc.
+/// [`super::window_auth::WindowMintAuthority`] etc.
 #[derive(Debug, Default)]
 pub(super) struct DcsEmitMintAuthority {
     _seal: (),

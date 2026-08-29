@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aterm_digest::Sha256;
-use base64::Engine as _;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -1490,7 +1489,7 @@ impl Journal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::new(format!("read {}: {e}", path.display()))),
         };
-        let journal: Journal = toml::from_str(&text)
+        let journal: Journal = aterm_toml::from_str(&text)
             .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
         journal.validate()?;
         Ok(Some(journal))
@@ -1500,8 +1499,8 @@ impl Journal {
     /// a torn journal that blocks its own recovery path.
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        let text =
-            toml::to_string(self).map_err(|e| Error::new(format!("serialize journal: {e}")))?;
+        let text = aterm_toml::to_string(self)
+            .map_err(|e| Error::new(format!("serialize journal: {e}")))?;
         // The journal's directory (dist/, git-ignored) may not exist yet: the
         // FIRST save happens the moment the claim is verified — before the
         // build step's create_dir_all ever runs — and a fresh clone (the spec
@@ -2766,7 +2765,7 @@ const APPCAST_ASSET_LIST_JQ: &str = r#".[] | . as $r |
 pub fn parse_appcast_asset_listing(listing: &str) -> Result<Vec<AppcastRelease>> {
     let mut releases = Vec::new();
     for (index, line) in listing.lines().enumerate() {
-        let release: AppcastRelease = serde_json::from_str(line).map_err(|error| {
+        let release: AppcastRelease = aterm_json::from_str(line).map_err(|error| {
             Error::new(format!(
                 "malformed GitHub appcast asset row {}: {error}",
                 index + 1
@@ -2922,8 +2921,7 @@ impl AppcastArchiveRemote for GhAppcastArchiveRemote<'_> {
 
 fn update_key_fingerprint(encoded: &str) -> Result<String> {
     let canonical = canonical_update_pubkey(encoded)?;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(canonical)
+    let raw = aterm_codec::base64::decode_strict(canonical.as_bytes())
         .map_err(|_| Error::new("canonical update key failed to decode for fingerprint"))?;
     Ok(sha256_bytes(&raw))
 }
@@ -3480,8 +3478,7 @@ pub fn channel_signature_policy(
 /// use one canonical identity rather than textual base64 aliases.
 pub fn canonical_update_pubkey(encoded: &str) -> Result<String> {
     let encoded = encoded.trim();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
+    let bytes = aterm_codec::base64::decode_strict(encoded.as_bytes())
         .map_err(|_| Error::new("ATERM_UPDATE_PUBKEY is not valid standard base64"))?;
     if bytes.len() != 32 {
         return Err(Error::new(format!(
@@ -3489,7 +3486,8 @@ pub fn canonical_update_pubkey(encoded: &str) -> Result<String> {
             bytes.len()
         )));
     }
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    aterm_codec::base64::encode(&bytes)
+        .map_err(|_| Error::new("ATERM_UPDATE_PUBKEY is too large to re-encode"))
 }
 
 /// Verify raw detached Ed25519 bytes against the canonical/persisted channel
@@ -3500,8 +3498,7 @@ pub fn verify_detached_manifest_signature(
     signature: &[u8],
 ) -> Result<()> {
     let canonical = canonical_update_pubkey(encoded_pubkey)?;
-    let pubkey = base64::engine::general_purpose::STANDARD
-        .decode(canonical)
+    let pubkey = aterm_codec::base64::decode_strict(canonical.as_bytes())
         .map_err(|_| Error::new("canonical update public key failed to decode"))?;
     if signature.len() != 64 {
         return Err(Error::new(format!(
@@ -3864,7 +3861,7 @@ pub fn parse_release_object_response(bytes: &[u8]) -> Result<ReleaseObjectIdenti
         draft: bool,
         target_commitish: String,
     }
-    let response: Response = serde_json::from_slice(bytes)
+    let response: Response = aterm_json::from_slice(bytes)
         .map_err(|error| Error::new(format!("parse GitHub release POST response: {error}")))?;
     if response.id == 0 || response.tag_name.is_empty() || response.target_commitish.is_empty() {
         return Err(Error::new(
@@ -8748,9 +8745,11 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // (codesign/staple rewrites included), so each twin is byte-identical to
     // the bytes its in-process digest covers. required_asset_names() lists
     // every one of them, so the mirror uploads them and refuses a channel head
-    // without them. The zip twin is the PRIMARY download: the alab.systems
-    // homepage is a single evergreen button pointed at
-    // `releases/latest/download/aterm-mac.zip`. The DMG twin `aterm.dmg` is a
+    // without them. The twins are the PERMANENT download names the README
+    // publishes and readers bookmark. (They are no longer what alab.systems
+    // links: since 2026-08-28 the site's button is the VERSIONED
+    // `aterm-<v>.dmg`, rewritten on every promote by `publish/post-promote`,
+    // so the button downloads exactly the file it names.) The DMG twin `aterm.dmg` is a
     // byte copy of manifest.dmg — the ONE lean DMG (RETIRED 2026-08-26: the
     // `-lite` twin it used to alias, and the `aterm-offline.dmg` alias of the
     // seeded image).
@@ -9753,7 +9752,7 @@ fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
         .map_err(|error| Error::new(format!("read draft release notes: {error}")))?;
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{}/releases", ctx.slug);
-    let payload = serde_json::to_vec(&serde_json::json!({
+    let payload = aterm_json::to_vec(&aterm_json::json!({
         "tag_name": ctx.tag.as_str(),
         "target_commitish": ctx.commit.as_str(),
         "name": title,
@@ -10989,7 +10988,7 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
         .map_err(|error| Error::new(format!("read mirror release notes: {error}")))?;
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases");
-    let payload = serde_json::to_vec(&serde_json::json!({
+    let payload = aterm_json::to_vec(&aterm_json::json!({
         "tag_name": ctx.tag.as_str(),
         "name": title,
         "body": notes,
@@ -11780,9 +11779,8 @@ mod roster_wiring_tests {
         // Nothing local: there is nothing to protect, so a recovery proceeds.
         assert!(refuse_roster_downgrade(&dir, 1).is_ok());
 
-        let engine = base64::engine::general_purpose::STANDARD;
-        let bytes = engine.decode(ROSTER_SEQ2.concat()).unwrap();
-        let sig = engine.decode(ROSTER_SEQ2_SIG).unwrap();
+        let bytes = aterm_codec::base64::decode_strict(ROSTER_SEQ2.concat().as_bytes()).unwrap();
+        let sig = aterm_codec::base64::decode_strict(ROSTER_SEQ2_SIG.as_bytes()).unwrap();
         std::fs::write(dir.join(roster::ROSTER_ASSET), &bytes).unwrap();
         std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), &sig).unwrap();
 

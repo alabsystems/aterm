@@ -74,8 +74,7 @@ impl Lcg {
 /// alphabetic), a CJK code point, an accented Latin letter, a newline for `.`
 /// and `(?m)`, and `K` for the KELVIN-SIGN fold orbit.
 const ALPHABET: &[&str] = &[
-    "a", "b", "c", "x", " ", "-", ".", "0", "9", "_", "\u{e9}", "\u{4f60}", "\n",
-    "\u{301}", "K",
+    "a", "b", "c", "x", " ", "-", ".", "0", "9", "_", "\u{e9}", "\u{4f60}", "\n", "\u{301}", "K",
 ];
 
 fn gen_atom(r: &mut Lcg, out: &mut String, depth: u32) {
@@ -90,9 +89,7 @@ fn gen_atom(r: &mut Lcg, out: &mut String, depth: u32) {
             for _ in 0..1 + r.below(3) {
                 match r.below(4) {
                     0 => out.push_str(r.pick(&[r"\d", r"\w", r"\s", r"\S"])),
-                    1 => out.push_str(r.pick(&[
-                        "a-c", "0-9", "x-z", "A-Z", "\u{e0}-\u{e9}",
-                    ])),
+                    1 => out.push_str(r.pick(&["a-c", "0-9", "x-z", "A-Z", "\u{e0}-\u{e9}"])),
                     2 => out.push_str(r.pick(&["[:alpha:]", "[:digit:]", "[:^space:]"])),
                     // No bare `]` and no bare `-`: both would compose into the
                     // nested-class and set-operation syntax this engine refuses
@@ -307,10 +304,14 @@ fn generated_patterns_match_the_oracle() {
 
         for haystack in &haystacks {
             cases += 1;
-            let a: Vec<(usize, usize)> =
-                mine.find_iter(haystack).map(|m| (m.start(), m.end())).collect();
-            let b: Vec<(usize, usize)> =
-                theirs.find_iter(haystack).map(|m| (m.start(), m.end())).collect();
+            let a: Vec<(usize, usize)> = mine
+                .find_iter(haystack)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            let b: Vec<(usize, usize)> = theirs
+                .find_iter(haystack)
+                .map(|m| (m.start(), m.end()))
+                .collect();
             // These two run on EVERY case, including the ones arbitration goes
             // on to excuse. Behind a `continue` they were silently skipped for
             // exactly the cases most likely to be wrong.
@@ -388,8 +389,16 @@ fn the_arbiter_reproduces_find_iter() {
     // The scoping regression, stated as a fact about `.` and `\n`. The old
     // arbiter answered `Some(vec![(0, 1)])` here while both real engines say
     // there is no match, which is precisely how it laundered a planted bug.
-    assert_eq!(arbiter_all(".", "\n"), Some(vec![]), "`.` must not match a newline");
-    assert_eq!(arbiter_all("(?s).", "\n"), Some(vec![(0, 1)]), "`(?s).` must");
+    assert_eq!(
+        arbiter_all(".", "\n"),
+        Some(vec![]),
+        "`.` must not match a newline"
+    );
+    assert_eq!(
+        arbiter_all("(?s).", "\n"),
+        Some(vec![(0, 1)]),
+        "`(?s).` must"
+    );
     // The haystack is never sliced, so the pattern's own anchors see real
     // context: `^` is start-of-text until the pattern itself says otherwise.
     assert_eq!(arbiter_all("^a", "b\na"), Some(vec![]));
@@ -398,7 +407,10 @@ fn the_arbiter_reproduces_find_iter() {
     assert_eq!(arbiter_all("a*", "aab"), Some(vec![(0, 2), (3, 3)]));
     assert_eq!(arbiter_all("", "ab"), Some(vec![(0, 0), (1, 1), (2, 2)]));
     // ...and over a multi-byte code point, where a byte-wise advance would slip.
-    assert_eq!(arbiter_all("", "a\u{4f60}"), Some(vec![(0, 0), (1, 1), (4, 4)]));
+    assert_eq!(
+        arbiter_all("", "a\u{4f60}"),
+        Some(vec![(0, 0), (1, 1), (4, 4)])
+    );
 
     let mut r = Lcg(0x2026_0826);
     let mut checked = 0usize;
@@ -414,10 +426,14 @@ fn the_arbiter_reproduces_find_iter() {
         };
         for _ in 0..3 {
             let haystack = gen_haystack(&mut r);
-            let a: Vec<(usize, usize)> =
-                mine.find_iter(&haystack).map(|m| (m.start(), m.end())).collect();
-            let b: Vec<(usize, usize)> =
-                theirs.find_iter(&haystack).map(|m| (m.start(), m.end())).collect();
+            let a: Vec<(usize, usize)> = mine
+                .find_iter(&haystack)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            let b: Vec<(usize, usize)> = theirs
+                .find_iter(&haystack)
+                .map(|m| (m.start(), m.end()))
+                .collect();
             // Where the engines already agree there is a known-good answer, and
             // the arbiter has to produce it.
             if a != b {
@@ -436,7 +452,10 @@ fn the_arbiter_reproduces_find_iter() {
             checked += 1;
         }
     }
-    assert!(checked > 500, "the arbiter corpus shrank to {checked} cases");
+    assert!(
+        checked > 500,
+        "the arbiter corpus shrank to {checked} cases"
+    );
     assert!(
         with_empty > 50,
         "only {with_empty} cases exercised the empty-match advance rule"

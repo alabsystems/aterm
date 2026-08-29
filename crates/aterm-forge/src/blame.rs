@@ -13,11 +13,15 @@
 //!   3. **Whether the fork is live.** A `[patch.crates-io]` entry replaces ONE
 //!      version. A dependant that asks for a different major gets the pristine
 //!      upstream copy from the registry, in the same build, with none of the
-//!      fork's fixes — and nothing in cargo says so. Measured on this tree:
-//!      `winnow 0.7.15` is forked under `vendor/winnow` while `winnow 1.0.3`
-//!      resolves UNPATCHED in the linux cell, reached through `zbus` and again
-//!      through the `zbus_macros` proc-macro, so the unforked code runs inside
-//!      the compiler on every Linux build. `blame winnow` prints that.
+//!      fork's fixes — and nothing in cargo says so. Measured on this tree
+//!      until 2026-08-27: `winnow 0.7.15` was forked under `vendor/winnow`
+//!      while `winnow 1.0.3` resolved UNPATCHED in the linux cell, reached
+//!      through `zbus` and again through the `zbus_macros` proc-macro, so the
+//!      unforked code ran inside the compiler on every Linux build, and
+//!      `blame winnow` printed that. Retiring `toml_edit` for the first-party
+//!      `aterm-toml` removed aterm's only winnow 0.7 edge and the fork with it;
+//!      no fork is shadowed today, and this verb is what will say so when one
+//!      is again.
 //!
 //! A bare `name` is never refused for ambiguity. `cargo pkgid -p winnow` errors
 //! "specification `winnow` is ambiguous" exactly when the answer is most
@@ -66,7 +70,7 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
         Some(_) => {
             return Err(format!(
                 "`{pkg}` is not a package spec — Fix: pass `name` or `name@version`, e.g. \
-                 `cargo forge blame winnow` or `cargo forge blame winnow@0.7.15`."
+                 `cargo forge blame indexmap` or `cargo forge blame indexmap@2.14.0`."
             ));
         }
         None => (pkg.to_string(), None),
@@ -758,7 +762,7 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
             manifest.display()
         )
     })?;
-    let doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    let doc = text.parse::<aterm_toml::edit::DocumentMut>().map_err(|e| {
         format!(
             "{} is not valid TOML: {e} — Fix: repair the manifest first.",
             manifest.display()
@@ -778,7 +782,7 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
         };
         let version = std::fs::read_to_string(root.join(rel).join("Cargo.toml"))
             .ok()
-            .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+            .and_then(|t| t.parse::<aterm_toml::edit::DocumentMut>().ok())
             .and_then(|d| {
                 d.get("package")
                     .and_then(|p| p.get("version"))
@@ -987,26 +991,26 @@ mod tests {
     fn the_workspace_patch_table_is_read_with_its_vendored_versions() {
         let forks = read_forks(&repo_root()).expect("the workspace manifest parses");
         assert!(
-            forks.contains_key("winnow"),
-            "vendor/winnow is patched in: {forks:?}"
+            forks.contains_key("indexmap"),
+            "vendor/indexmap is patched in: {forks:?}"
         );
-        let w = &forks["winnow"];
-        assert_eq!(w.path, "vendor/winnow");
+        let w = &forks["indexmap"];
+        assert_eq!(w.path, "vendor/indexmap");
         let v = w
             .version
             .clone()
-            .expect("vendor/winnow/Cargo.toml carries a literal version");
+            .expect("vendor/indexmap/Cargo.toml carries a literal version");
         assert_eq!(
-            patch_state(&forks, &PkgId::new("winnow", v.clone())),
+            patch_state(&forks, &PkgId::new("indexmap", v.clone())),
             PatchState::Fork {
-                path: "vendor/winnow".into()
+                path: "vendor/indexmap".into()
             }
         );
         // Any OTHER version of a forked name is the defect this verb exists
         // for. Asserted on a SYNTHETIC id on purpose: the shipped graph carries
         // no unpatched sibling today, and the detector must stay proved anyway.
         assert!(matches!(
-            patch_state(&forks, &PkgId::new("winnow", "1.0.3")),
+            patch_state(&forks, &PkgId::new("indexmap", "3.0.0")),
             PatchState::UnpatchedBesideFork { .. }
         ));
         assert_eq!(
@@ -1036,14 +1040,15 @@ mod tests {
     /// that it is FORKED, the fork's path, the cells it resolves in, its
     /// dominator cost, and the first-party edges responsible.
     ///
-    /// POLARITY, deliberately inverted 2026-08-25. This test used to require
-    /// that `winnow` resolved at TWO versions — the 0.7.15 fork plus an
-    /// unpatched 1.0.3 — and asserted `PATCH LIVENESS DEFECT` appeared. That
-    /// was the measured truth when it was written; dropping the
-    /// `a11y-accesskit` default removed `accesskit_unix → zbus`, the only edge
-    /// dragging the second major in, and winnow now resolves at exactly one
-    /// version in every cell. A test that requires a defect to be present turns
-    /// red when the defect is fixed, so it has to state a property instead.
+    /// POLARITY: this states a property, and did not always. It was pointed at
+    /// `winnow` and required TWO versions to resolve — the 0.7.15 fork plus an
+    /// unpatched registry 1.0.3 — asserting `PATCH LIVENESS DEFECT` appeared.
+    /// That was the measured truth when it was written. Retiring `toml_edit`
+    /// for the first-party `aterm-toml` on 2026-08-27 removed aterm's only
+    /// winnow 0.7 edge, so the fork is gone and there is nothing left for the
+    /// registry copy to shadow. A test that requires a defect to be present
+    /// turns red when the defect is fixed, so this one names a live fork —
+    /// `indexmap` — and asserts what blame OWES for any fork.
     ///
     /// The liveness reporting itself is still proved, without depending on the
     /// tree carrying a defect: `patch_state` is asserted to return
@@ -1053,13 +1058,13 @@ mod tests {
     /// _verb` plants a real one in a scratch tree and requires the gate to go
     /// RED on it.
     #[test]
-    fn blame_winnow_names_the_fork_its_path_and_its_cost_in_every_cell() {
+    fn blame_names_the_fork_its_path_and_its_cost_in_every_cell() {
         let root = repo_root();
         let cells = ["mac-arm".to_string(), "linux".to_string()];
-        let out = run(&root, "winnow", &cells).expect("blame runs");
+        let out = run(&root, "indexmap", &cells).expect("blame runs");
         assert!(out.ok, "{}", out.log);
         assert!(
-            out.log.contains("winnow 0.7.15"),
+            out.log.contains("indexmap 2.14.0"),
             "the version is named:\n{}",
             out.log
         );
@@ -1069,7 +1074,7 @@ mod tests {
             out.log
         );
         assert!(
-            out.log.contains("vendor/winnow"),
+            out.log.contains("vendor/indexmap"),
             "the fork's path is named:\n{}",
             out.log
         );
@@ -1090,25 +1095,14 @@ mod tests {
             "blame's whole job is naming the first-party edge:\n{}",
             out.log
         );
-        // TWO versions resolve again: the vendored fork at 0.7.15 and the
-        // registry 1.0.3 that accesskit_unix -> zbus drags into the linux graph.
-        // That returned on 2026-08-26 with the unconditional-AccessKit decision,
-        // and blame's job is precisely to SHOW it — so the assertion is that the
-        // report names both, not that the tree is clean.
+        // ONE version resolves, in every cell, so there is no liveness defect
+        // to report. Asserted as a property of THIS fork rather than of the tree
+        // as a whole — `policy::no_fork_is_shadowed_by_an_unpatched_registry_copy`
+        // owns the tree-wide claim, and `red_fixtures` owns the detector.
         assert!(
-            out.log.contains("0.7.15") && out.log.contains("1.0.3"),
-            "blame must name both resolved winnow versions:\n{}",
-            out.log
-        );
-        // The defect is REAL and blame must say so. `winnow 1.0.3` comes from the
-        // registry via accesskit_unix -> zbus on linux, and the fork is 0.7.15 —
-        // a `^1.0` requirement cannot reach it, so the `offset_from` underflow
-        // the fork exists to remove is absent from the copy that compiles there.
-        // This assertion used to demand SILENCE, which would have hidden a live
-        // defect the moment it returned; it now demands the report.
-        assert!(
-            out.log.contains("PATCH LIVENESS DEFECT"),
-            "blame must surface the unpatched winnow 1.0.3 sibling on linux:\n{}",
+            !out.log.contains("PATCH LIVENESS DEFECT"),
+            "indexmap resolves at one version, so blame must not report a \
+             liveness defect:\n{}",
             out.log
         );
         for line in out.log.lines() {
@@ -1168,7 +1162,7 @@ mod tests {
     fn a_malformed_spec_is_a_typed_refusal_naming_the_shape() {
         let root = repo_root();
         // `Outcome` carries no `Debug`, so the error arm is taken by pattern.
-        let Err(err) = run(&root, "winnow@", &["mac-arm".into()]) else {
+        let Err(err) = run(&root, "indexmap@", &["mac-arm".into()]) else {
             panic!("a spec with an empty version must be refused, not surveyed")
         };
         assert!(err.contains("name@version"), "{err}");

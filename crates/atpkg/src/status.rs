@@ -75,7 +75,7 @@ impl Status {
     /// # Errors
     /// The serializer's message, prefixed, when the map cannot be rendered.
     pub fn to_toml(&self) -> Result<String, String> {
-        toml::to_string(self).map_err(|e| {
+        aterm_toml::to_string(self).map_err(|e| {
             // Manual concat of the previous `format!("serialize status: {e}")` —
             // byte-identical (`{e}` is `Display`, which is what `to_string`
             // renders): the `format!` expansion embeds `fmt::Arguments`
@@ -137,7 +137,7 @@ pub fn read_checked(layout: &Layout) -> io::Result<Option<Status>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let status: Status = toml::from_str(&text).map_err(|error| {
+    let status: Status = aterm_toml::from_str(&text).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("status.toml is invalid: {error}"),
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(back.programs["ay"].tree_root, "abc123");
         // It is valid TOML on disk.
         let text = std::fs::read_to_string(l.status()).unwrap();
-        let _: toml::Value = toml::from_str(&text).expect("valid TOML");
+        let _: aterm_toml::Value = aterm_toml::from_str(&text).expect("valid TOML");
         assert!(text.contains("index_source = \"alabsystems/aterm-toolchain-index\""));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }

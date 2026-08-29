@@ -197,14 +197,14 @@ define_terminal_handler! {
     // super::shell_integration_auth.
     shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth
         => shell_integration_auth,
-    // Host-side OSC 8 hyperlink URI-acceptance authorization (CF-014).
-    // The only path to `HyperlinkCapability` is through this field's
-    // `try_mint_capability` method, which requires prior host-side
-    // authorization via `Terminal::authorize_hyperlinks` (defaults to
-    // authorized for backward-compat). Handlers cannot construct the
-    // zero-sized token directly (private `_seal: ()` field) — so the
-    // parser path cannot write `transient.current_hyperlink` without a
-    // host-issued capability. See super::hyperlink_auth.
+    // The host-minted EXTRA OSC 8 URI schemes (orca deep-links §7). The
+    // OSC 8 handler READS this to widen its scheme comparison; minting and
+    // revoking are `Terminal` API (`authorize_hyperlink_scheme`), which is
+    // where a host states the widening deliberately. That split is a
+    // DISCIPLINE and not a guarantee the type system makes: `authorize_scheme`
+    // is reachable from anywhere in this crate, so nothing stops a future
+    // handler calling it — only the reader of this line. See
+    // super::hyperlink_auth.
     hyperlink_auth: super::hyperlink_auth::HyperlinkAuth => hyperlink_auth,
     // Host-side raw DCS callback delivery authorization (CF-013).
     // The only path to `DcsEmitCapability` is through this field's

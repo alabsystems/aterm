@@ -3,12 +3,17 @@
 
 //! HUNT A probe: the flying head's DRAWN rect vs the rect the word-cat
 //! pixel-yield (`CatTick::companion_px`) is handed for it.
-use aterm_effects::word_decorations::{EffectGeom, KittyCursorLayout, WordDecorations};
 use aterm_effects::kitty_registry::KittyLook;
+use aterm_effects::word_decorations::{EffectGeom, KittyCursorLayout, WordDecorations};
 
 fn main() {
     for (cw, ch) in [(15u16, 28u16), (10, 20), (8, 16)] {
-        let geom = EffectGeom { cell_w: cw, cell_h: ch, rows: 24, cols: 80 };
+        let geom = EffectGeom {
+            cell_w: cw,
+            cell_h: ch,
+            rows: 24,
+            cols: 80,
+        };
         let wd = WordDecorations::default();
         for (crow, ccol) in [(3u16, 0u16), (3, 10), (10, 40)] {
             let fp = wd.kitty_cursor_footprint(KittyCursorLayout {
@@ -17,7 +22,10 @@ fn main() {
                 look: KittyLook::default(),
                 bob: 0.0,
             });
-            let Some(f) = fp else { println!("no footprint"); continue };
+            let Some(f) = fp else {
+                println!("no footprint");
+                continue;
+            };
             let hx0 = f.x;
             let hx1 = hx0 + i32::from(f.w);
             let hy0 = f.y;
@@ -32,7 +40,10 @@ fn main() {
             let head_area = (hx1 - hx0) * (hy1 - hy0);
             println!(
                 "cell {cw}x{ch} caret r{crow}c{ccol}: HEAD x[{hx0},{hx1}) y[{hy0},{hy1}) {}x{} | MODEL x[{mx0},{mx1}) y[{my0},{my1}) | overlap {}x{} = {:.1}% of the head",
-                f.w, f.h, iw, ih,
+                f.w,
+                f.h,
+                iw,
+                ih,
                 100.0 * f64::from(iw * ih) / f64::from(head_area.max(1)),
             );
         }

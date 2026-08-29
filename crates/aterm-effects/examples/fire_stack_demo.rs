@@ -45,9 +45,9 @@ fn draw_glyph(img: &mut [u8], w: usize, cell_x: usize, cell_y: usize, c: char, f
 
 fn write_png(path: &str, img: &[u8], w: usize, h: usize) {
     let file = std::fs::File::create(path).unwrap();
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
+    let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    enc.set_color(aterm_png::ColorType::Rgb);
+    enc.set_depth(aterm_png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(img).unwrap();
 }
 

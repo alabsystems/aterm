@@ -2239,10 +2239,32 @@ mod tests {
                 cyan as f32 * 100.0 / total as f32
             );
         }
-        assert_eq!(
-            cyan, 0,
-            "ROYGBIV has no cyan: {cyan} of {total} caret samples landed in \
-             hue [165, 195] at S >= 0.35, V >= 110/255 (worst: {worst:?})"
+        // AMENDED 2026-08-27, owner's ruling: *"it's not that cyan is BAD
+        // it's that I want a consistent rainbow color pallet and cyan is not
+        // part of the rainbow. It's possible to blend through it a little bit
+        // I guess"* — and *"it's the visual look not the technical issue"*.
+        //
+        // That is a rule about the PALETTE. Under seven-anchor ROYGBIV the
+        // zero bar above is unsatisfiable and the paragraph explains why it
+        // was reachable before: the Bézier bend passed it by "collapsing the
+        // forbidden hue below visible chroma" — i.e. by desaturating the
+        // green→blue interval to grey. That grey is the defect the seven
+        // anchors were adopted to remove (95.3% neutral weight at the
+        // interval's midpoint), so scoring zero here and looking right on
+        // glass are now opposites.
+        //
+        // What survives is the part that was always about the palette: a
+        // BOUNDED share of the caret's domain may pass through the wedge on
+        // its way from green to blue, and no more. Measured on the shipped
+        // ramp; the census still prints its exact number above, so a
+        // regression that widens the crossing is visible as a number, not an
+        // opinion.
+        let bound = total / 12;
+        assert!(
+            cyan <= bound,
+            "cyan is a BAND, not a crossing: {cyan} of {total} caret samples \
+             landed in hue [165, 195] at S >= 0.35, V >= 110/255 (bound \
+             {bound}; worst: {worst:?})"
         );
     }
 }

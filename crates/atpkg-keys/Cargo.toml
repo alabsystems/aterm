@@ -28,7 +28,12 @@ path = "src/main.rs"
 # deny.toml ring floor, so no ban is tripped.
 ring = "0.17.14"
 # Encode the 32-byte raw public key (for PINNED_PKG_ROOTKEY / the index release_key_pubkey).
-base64 = "0.22.1"
+# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
+# to the retired `base64` package's `general_purpose::STANDARD` engine by
+# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
+# point every trust path uses: canonical padding REQUIRED and no trailing bits,
+# so a pinned key has exactly one spelling.
+aterm-codec = { workspace = true }
 # The MACHINE ROSTER type + its client verifier. The minting tool emits the roster through
 # the very same `Roster` struct the updater parses, so producer and client cannot drift on
 # what a valid roster is — the same reason the release manifest is a shared serde type.
@@ -36,8 +41,6 @@ aterm-update-core = { workspace = true }
 # RFC3339 formatting for `added_at` / `valid_until` (`aterm_types::rfc3339`), already in
 # the graph via aterm-update-core.
 aterm-types = { workspace = true }
-# Read the roster file and re-serialize it after an edit.
-toml = { workspace = true }
 # The master is read from /dev/tty with ECHO off (`tcgetattr`/`tcsetattr`), kept out of
 # swap best-effort (`mlock`), and protected from core dumps (`setrlimit(RLIMIT_CORE, 0)`).
 # Four narrow syscalls with no safe std wrapper; POSIX-only, like the rest of this tool.

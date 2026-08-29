@@ -60,6 +60,19 @@
 //!     entry that no longer matches the patch table, whose path no longer
 //!     exists on disk, or whose registered platform-slice paths are gone is a
 //!     hard error (stale review). Every classification is printed every run.
+//!   * FIRST-PARTY `[patch.*]` targets (a patch whose path is under
+//!     `crates/`) are NOT vendored forks and get NO review row. The registry
+//!     above exists to track THIRD-PARTY code this repository must keep
+//!     re-reviewing; a patch entry pointing at a workspace member is aterm's
+//!     own crate, already inside every whole-tree gate (license headers,
+//!     lints, this closure derivation) and already scanned unnamespaced if it
+//!     links into the process. Keying the review registry on IS-PATCHED
+//!     rather than on IS-THIRD-PARTY was the bug: it would have demanded a
+//!     "reviewed vendored fork" row for code we wrote. The classification is
+//!     [`classify_patch_target`], and it is still fail-closed — a patch path
+//!     under neither `vendor/` nor `crates/` is a hard error, and a
+//!     first-party path that DOES carry a review row is a mis-registration
+//!     and a hard error too.
 //!   * DRIFT GUARD: every derived crate dir must actually contain `src/` —
 //!     a closure the walker cannot scan is a hard error, not a silent shrink.
 //!
@@ -217,19 +230,6 @@ pub const REVIEWED_VENDORED_CRATES: &[VendoredCrate] = &[
         },
     },
     VendoredCrate {
-        package: "winnow",
-        path: "vendor/winnow",
-        mode: VendoredMode::Scanned {
-            namespace: "winnow",
-            platform_slices: &[],
-            audit: "aterm-trust fork of upstream winnow (offset_from fix): three \
-                    `writer.lock()` stderr-stream sites (combinator/debug/internals.rs), \
-                    all behind the `debug` feature no aterm build activates — graphed \
-                    anyway as `winnow::writer` (over-approximation, fail-closed: \
-                    statement-shaped holds that nest nothing)",
-        },
-    },
-    VendoredCrate {
         package: "pkg-config",
         path: "vendor/pkg-config",
         mode: VendoredMode::BuildDepOnly {
@@ -252,6 +252,112 @@ pub const REVIEWED_VENDORED_CRATES: &[VendoredCrate] = &[
         },
     },
 ];
+
+/// What a `[patch.crates-io]` entry's replacement IS, which is what decides
+/// whether it owes a review row.
+///
+/// The two are told apart by the replacement PATH, because that is the thing
+/// the repository actually guarantees: `vendor/` holds upstream source we
+/// redistribute and must keep reviewing; `crates/` holds workspace members we
+/// wrote. Nothing else is accepted — a third location would be an
+/// unclassifiable patch, and the census fails closed rather than guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchTargetKind {
+    /// Under `vendor/`: third-party source, owes a [`REVIEWED_VENDORED_CRATES`]
+    /// row and the whole provenance family (`cargo forge attest`).
+    Vendored,
+    /// Under `crates/` AND carrying none of the marks of a redistribution:
+    /// a workspace member, code aterm wrote. Owes NO review row, NO NOTICE
+    /// line and no `vendor/forge.toml` block — it is not a redistribution of
+    /// anybody's work.
+    FirstParty,
+}
+
+/// The marks of a REDISTRIBUTION, checked against the repository's own records
+/// rather than inferred from where a directory sits.
+///
+/// Returns `Some(reason)` when `dir` looks like third-party source this
+/// repository redistributes. Two independent signals, either sufficient,
+/// because either one alone is enough to create the obligation:
+///
+/// * a RETAINED UPSTREAM LICENSE file in the crate root — the same signal
+///   `cargo forge attest` `[OB-5]` already uses to decide a vendored fork has
+///   kept its terms; and
+/// * a naming of the path in the top-level `NOTICE`, which is this repo's
+///   authoritative record of what it redistributes and under whose terms.
+fn redistribution_evidence(root: &std::path::Path, path: &str) -> Option<String> {
+    if let Ok(entries) = std::fs::read_dir(root.join(path)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let upper = name.to_uppercase();
+            if upper.starts_with("LICENSE") || upper.starts_with("COPYING") {
+                return Some(format!(
+                    "it retains an upstream license file (`{path}/{name}`)"
+                ));
+            }
+        }
+    }
+    let notice = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
+    if notice.contains(path) {
+        return Some(format!(
+            "the top-level NOTICE names `{path}` as redistributed"
+        ));
+    }
+    None
+}
+
+/// Classify a `[patch.crates-io]` replacement path.
+///
+/// LOCATION IS NOT THE TEST, and the correction matters. An earlier form of
+/// this function read `crates/` as "code aterm wrote" — but `crates/aterm-lz4`
+/// is a modified, block-mode-only subset DERIVED FROM lz4_flex 0.11.5, whose
+/// files carry `Copyright (c) 2020 Pascal Seitz et al.`, which retains
+/// `crates/aterm-lz4/LICENSE-MIT`, and which the top-level NOTICE records as a
+/// redistribution. So `crates/` already holds third-party source, and a patch
+/// pointed there would have skipped the entire provenance family — reopening,
+/// at a new address, exactly the hole this classifier exists to close.
+///
+/// The test is therefore EVIDENCE OF REDISTRIBUTION (see
+/// [`redistribution_evidence`]), and a `crates/` path that shows any is an
+/// ERROR rather than a silent reclassification: third-party source living
+/// outside `vendor/` is an anomaly a human must resolve, not something a gate
+/// should quietly decide either way.
+///
+/// Fail-closed throughout: any location other than `vendor/` or `crates/` is
+/// an error naming both.
+pub fn classify_patch_target(
+    pkg: &str,
+    path: &str,
+    root: &std::path::Path,
+) -> Result<PatchTargetKind, String> {
+    if path.starts_with("vendor/") {
+        return Ok(PatchTargetKind::Vendored);
+    }
+    if !path.starts_with("crates/") {
+        return Err(format!(
+            "[patch] entry `{pkg}` points at `{path}`, which is under neither `vendor/` \
+             (third-party source this repository redistributes and reviews) nor `crates/` \
+             (a first-party workspace member). The census cannot decide which obligations \
+             apply to a third location, so it refuses to guess (fail-closed): move the \
+             replacement under one of the two, or teach \
+             `aterm_census::scan_set::classify_patch_target` a new kind first"
+        ));
+    }
+    if let Some(why) = redistribution_evidence(root, path) {
+        return Err(format!(
+            "[patch] entry `{pkg}` points at `{path}`, which is under `crates/` but is NOT \
+             first-party code: {why}. Treating it as first-party would skip the whole \
+             provenance family (review row, NOTICE line, retained LICENSE, Apache-2.0 \
+             section 4(b) byte-diff) for source this repository redistributes on somebody \
+             else's terms. Fail-closed, because the two wrong answers are not symmetric: \
+             move the fork under `vendor/` where the obligations are enforced, or — if the \
+             evidence is a false positive — say why in \
+             `aterm_census::scan_set::redistribution_evidence`"
+        ));
+    }
+    Ok(PatchTargetKind::FirstParty)
+}
 
 /// One vendored crate the census SCANS (resolved from the registry against
 /// the tree): the walker's vendored-identity-mode input.
@@ -284,6 +390,13 @@ pub struct ScanSet {
     /// The reviewed vendored `[patch.*]` crates classified out as
     /// build-time-only: (package, path, justification).
     pub vendored_build_only: Vec<(String, String, &'static str)>,
+    /// `[patch.*]` entries pointing at a FIRST-PARTY workspace member
+    /// (`crates/…`), sorted: (package, path). Recorded and printed — never
+    /// review-registered, because they are not third-party code. A member
+    /// that links into the GUI process is already in `scan_dirs` through the
+    /// ordinary path-dependency closure, unnamespaced, like every other
+    /// workspace crate.
+    pub first_party_patches: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,7 +1179,31 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
     // BOTH ways.
     let mut vendored_scanned: Vec<ScannedVendored> = Vec::new();
     let mut vendored_build_only: Vec<(String, String, &'static str)> = Vec::new();
+    let mut first_party_patches: Vec<(String, String)> = Vec::new();
     for (pkg, path) in &tables.patches {
+        // FIRST, what KIND of replacement is this? Only third-party source
+        // owes a review row; a patch pointing at a workspace member is aterm's
+        // own crate and is covered by the closure derivation above.
+        if classify_patch_target(pkg, path, root)? == PatchTargetKind::FirstParty {
+            if REVIEWED_VENDORED_CRATES.iter().any(|r| r.package == pkg) {
+                return Err(format!(
+                    "[patch] entry `{pkg}` points at first-party `{path}` but ALSO has a \
+                     REVIEWED_VENDORED_CRATES row — that registry records third-party \
+                     code this repository redistributes and must keep reviewing, and a \
+                     workspace member is neither. Remove the row (fail-closed: a false \
+                     provenance claim is as wrong as a missing one)"
+                ));
+            }
+            if !root.join(path).join("Cargo.toml").is_file() {
+                return Err(format!(
+                    "[patch] entry `{pkg}` points at first-party `{path}`, which has no \
+                     Cargo.toml on disk — cargo cannot resolve this workspace at all \
+                     (fail-closed)"
+                ));
+            }
+            first_party_patches.push((pkg.clone(), path.clone()));
+            continue;
+        }
         let Some(reviewed) = REVIEWED_VENDORED_CRATES.iter().find(|r| r.package == pkg) else {
             return Err(format!(
                 "[patch] entry `{pkg}` (path `{path}`) is NOT in \
@@ -1174,11 +1311,14 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
         }
     }
 
+    first_party_patches.sort();
+
     Ok(ScanSet {
         scan_dirs,
         proc_macros,
         vendored_scanned,
         vendored_build_only,
+        first_party_patches,
     })
 }
 
@@ -1248,6 +1388,22 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             listed.join(", ")
         );
     }
+    if !set.first_party_patches.is_empty() {
+        let listed: Vec<String> = set
+            .first_party_patches
+            .iter()
+            .map(|(n, p)| format!("{n} ({p})"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "      FIRST-PARTY [patch] target(s) — workspace members that replace a \
+             crates.io package for every consumer at once, NOT vendored forks: no \
+             review row, no NOTICE line, no provenance obligations; each is scanned \
+             like any other member IF it is in the closure above, and invisible here \
+             if it is not: {}",
+            listed.join(", ")
+        );
+    }
     out
 }
 
@@ -1263,6 +1419,177 @@ pub(crate) mod test_fixtures {
     //! synthetic-tree tests.
 
     use super::{REVIEWED_VENDORED_CRATES, VendoredMode};
+
+    /// The derived GUI-process closure, pinned. A LEGITIMATE dependency
+    /// change (a new crate entering aterm-gui's graph, or one leaving it)
+    /// just updates this pin — that is the automation working; the diff in
+    /// review IS the audit trail. An UNEXPECTED delta (a crate vanishing
+    /// that should still be linked, or appearing that should not) means the
+    /// dependency graph or the derivation drifted: investigate before
+    /// touching the pin.
+    ///
+    /// Read by TWO tests: scan_set's `derived_closure_matches_the_pinned_canary`
+    /// (the member list, crate for crate) and lock_order's
+    /// `scanned_set_covers_the_full_gui_process_closure` (the crate COUNT the
+    /// census transcript must report — derived from this list's length, so a
+    /// new crate is reviewed exactly once, here, and never re-counted by hand).
+    ///
+    /// PROVENANCE of the current pin: equals, crate for crate, the manual
+    /// 42-crate list this derivation replaced (itself derived 2026-07-13
+    /// from `cargo tree -p aterm-gui --edges normal`, macOS host target) —
+    /// verified equal at the switchover, and re-verified against
+    /// `cargo tree --target all`.
+    ///
+    /// The cfg-deps-IN decision is NO LONGER a no-op. `aterm-shell-integration`
+    /// reaches `aterm-uds` through a `cfg(any(unix, windows))` target section
+    /// (the one audited entropy surface, for the capability-nonce mint), which
+    /// is the workspace's first cfg-gated workspace path dep. The derivation
+    /// deliberately OVER-approximates there — a cfg-gated edge is IN on every
+    /// platform — because the census's job is to scan every source file that
+    /// could be process code, and scanning a file that a given target does not
+    /// link is safe while missing one is not. `aterm-uds` was already in this
+    /// GUI closure through `aterm-session`/`aterm-control` anyway, so the
+    /// over-approximation costs this pin nothing; the wasm twin
+    /// (`wasm_census.rs`) is where it actually shows, and it is written up
+    /// there.
+    pub(crate) const PINNED_GUI_CLOSURE: &[&str] = &[
+        // Entered the closure with the embedded operator: aterm-gui now
+        // depends on aterm-agent for the durable queue/WAL, and aterm-agent
+        // on aterm-ctl for the one-binary fleet client. Both are normal
+        // [dependencies] edges, so both crates are GUI process code and
+        // their locks belong in the census.
+        "crates/aterm-agent/src",
+        "crates/aterm-alloc/src",
+        "crates/aterm-bidi/src",
+        "crates/aterm-bits/src",
+        "crates/aterm-buffer/src",
+        "crates/aterm-cap/src",
+        "crates/aterm-codec/src",
+        "crates/aterm-containment/src",
+        // Entered the closure with the SessionHost seam extraction (f2284d67):
+        // aterm-gui hosts the selection/block control verbs through
+        // `control_host::GuiHost`. A normal [dependencies] edge, so the
+        // whole crate is process code.
+        "crates/aterm-control/src",
+        "crates/aterm-core/src",
+        "crates/aterm-ctl/src",
+        // Entered the closure when the first-party SHA-256/HMAC-SHA256 crate
+        // replaced `sha2` + `hmac`: aterm-gui, aterm-net, aterm-agent, atpkg
+        // and aterm-update all hash through it now. A normal [dependencies]
+        // edge, so it is GUI process code — it holds no locks, but the census
+        // walks it for exactly that reason.
+        "crates/aterm-digest/src",
+        // Entered the closure when the first-party directory-handle crate
+        // replaced `rustix` (72,832 lines, 2 packages): aterm-gui opens its
+        // pinned-directory and media handles through it. A normal
+        // [dependencies] edge, so it is GUI process code. It holds no locks of
+        // its own — one syscall per entry point, names kept off the heap in a
+        // stack buffer — and the `flock` the pinned-directory lane takes lives
+        // in aterm-gui, where the census already sees it.
+        "crates/aterm-dirfd/src",
+        "crates/aterm-effects/src",
+        "crates/aterm-error/src",
+        "crates/aterm-ffi-types/src",
+        "crates/aterm-gpu/src",
+        "crates/aterm-grapheme/src",
+        "crates/aterm-grid/src",
+        "crates/aterm-gui/src",
+        "crates/aterm-hash/src",
+        // Entered the closure when the first-party HTTP/1.1 client replaced
+        // `ureq` and the ureq-proto/http/bytes/httparse stack behind it: the
+        // title-summary transport speaks to a local model server through it.
+        // A normal [dependencies] edge, so it is GUI process code. It holds no
+        // locks — a client owns its connection and nothing is shared across
+        // threads — but the census walks it because it runs on the worker the
+        // summary job spawns.
+        "crates/aterm-http/src",
+        // Entered the closure when the first-party JSON reader/writer replaced
+        // `serde_json` (and the `zmij` float formatter and `itoa` behind it):
+        // aterm-gui builds provider request bodies and reads their replies
+        // through it. A normal [dependencies] edge, so it is GUI process code.
+        // It holds NO synchronisation at all — the deserializer is a cursor
+        // over a borrowed slice and the serializer a `Vec<u8>`, neither shared
+        // across threads — so it can participate in no lock order; the census
+        // walks it because it runs on whatever thread parses the reply.
+        "crates/aterm-json/src",
+        "crates/aterm-lexicon/src",
+        "crates/aterm-log/src",
+        "crates/aterm-lz4/src",
+        "crates/aterm-net/src",
+        "crates/aterm-observe/src",
+        "crates/aterm-parser/src",
+        // Entered the closure when the first-party PNG codec replaced `png`
+        // and the second compression stack behind it (flate2 + miniz_oxide +
+        // fdeflate + simd-adler32 + adler2, 7 packages / 33,439 lines):
+        // aterm-render, aterm-gpu, aterm-effects and aterm-render-api all
+        // decode inline images through it. A normal [dependencies] edge, so it
+        // is GUI process code. Its only synchronisation is a `OnceLock` over
+        // the CRC tables — a pure function of nothing, acquiring no other lock
+        // inside its initialiser, so it cannot participate in an order.
+        "crates/aterm-png/src",
+        "crates/aterm-policy/src",
+        "crates/aterm-predict/src",
+        // Entered the closure with the agent auto-prime (2026-08-26): the
+        // window primes every detected coding agent itself, so the primer
+        // installer moved out of aterm-cli into this std-only leaf that
+        // aterm-gui depends on directly. A normal [dependencies] edge, so
+        // it is GUI process code; reviewed: pure string transforms plus
+        // std::fs writes under $HOME, run on a detached thread the spawn
+        // seam starts — never on the winit thread — and it holds no locks.
+        "crates/aterm-primer/src",
+        "crates/aterm-provenance/src",
+        "crates/aterm-pty/src",
+        // Entered the closure when the first-party regular-expression
+        // engine (a bounded Pike VM) replaced `regex` — and with it
+        // regex-automata, regex-syntax and aho-corasick, 4 packages /
+        // 158,471 lines. aterm-selection, aterm-observe and aterm-search
+        // compile patterns through it now. A normal [dependencies] edge, so
+        // it is GUI process code — it holds no locks (no interior mutability
+        // at all: the compiled program is immutable and the VM's state lives
+        // on the stack), but the census walks it for exactly that reason.
+        "crates/aterm-regex/src",
+        "crates/aterm-render/src",
+        "crates/aterm-render-api/src",
+        "crates/aterm-rle/src",
+        "crates/aterm-sandbox/src",
+        "crates/aterm-scene/src",
+        "crates/aterm-scrollback/src",
+        "crates/aterm-search/src",
+        "crates/aterm-selection/src",
+        "crates/aterm-session/src",
+        "crates/aterm-shell-integration/src",
+        "crates/aterm-sixel/src",
+        "crates/aterm-suggest/src",
+        "crates/aterm-tempfile/src",
+        // Entered the closure when the first-party clock replaced
+        // `web-time`: aterm-core, -types, -effects, -gpu, -predict,
+        // -policy, -observe and -agent all sample time through it now. A
+        // normal [dependencies] edge, so it is GUI process code — it holds
+        // no locks, but the census walks it for exactly that reason.
+        "crates/aterm-time/src",
+        // Entered the closure when the first-party TOML crate replaced `toml`
+        // and `toml_edit` — and the winnow fork behind them — retiring 130
+        // packages / 1,807,100 lines across five forks. Config, themes,
+        // keybindings and every toy pack parse through it, on the startup path
+        // before the window appears. A normal [dependencies] edge, so it is
+        // GUI process code. It holds no locks: a parse owns its document and
+        // shares nothing.
+        "crates/aterm-toml/src",
+        "crates/aterm-types/src",
+        "crates/aterm-uds/src",
+        "crates/aterm-update/src",
+        "crates/aterm-update-core/src",
+        "crates/aterm-vi/src",
+        // Entered the closure when the K-2 winit→engine key map was split
+        // out of aterm-types into its own crate: as an OPTIONAL FEATURE of
+        // aterm-types it was unified on for every consumer in the workspace
+        // resolve, which linked AppKit into the dependency-free aterm-ctl.
+        // A normal [dependencies] edge from aterm-gui, so the whole crate is
+        // process code — and the closure is unchanged in substance: the same
+        // code was already in it via aterm-types.
+        "crates/aterm-winit-keymap/src",
+        "crates/atpkg/src",
+    ];
 
     /// The `[patch.crates-io]` table + vendor stub trees satisfying the
     /// reviewed-classification checks: every registered entry present + on
@@ -1387,122 +1714,13 @@ mod tests {
     // THE CANARY: the derived closure on THIS tree, pinned.
     // ------------------------------------------------------------------
 
-    /// The derived GUI-process closure, pinned. A LEGITIMATE dependency
-    /// change (a new crate entering aterm-gui's graph, or one leaving it)
-    /// just updates this pin — that is the automation working; the diff in
-    /// review IS the audit trail. An UNEXPECTED delta (a crate vanishing
-    /// that should still be linked, or appearing that should not) means the
-    /// dependency graph or the derivation drifted: investigate before
-    /// touching the pin.
-    ///
-    /// PROVENANCE of the current pin: equals, crate for crate, the manual
-    /// 42-crate list this derivation replaced (itself derived 2026-07-13
-    /// from `cargo tree -p aterm-gui --edges normal`, macOS host target) —
-    /// verified equal at the switchover, and re-verified against
-    /// `cargo tree --target all`.
-    ///
-    /// The cfg-deps-IN decision is NO LONGER a no-op. `aterm-shell-integration`
-    /// reaches `aterm-uds` through a `cfg(any(unix, windows))` target section
-    /// (the one audited entropy surface, for the capability-nonce mint), which
-    /// is the workspace's first cfg-gated workspace path dep. The derivation
-    /// deliberately OVER-approximates there — a cfg-gated edge is IN on every
-    /// platform — because the census's job is to scan every source file that
-    /// could be process code, and scanning a file that a given target does not
-    /// link is safe while missing one is not. `aterm-uds` was already in this
-    /// GUI closure through `aterm-session`/`aterm-control` anyway, so the
-    /// over-approximation costs this pin nothing; the wasm twin
-    /// (`wasm_census.rs`) is where it actually shows, and it is written up
-    /// there.
+    /// The pin is [`test_fixtures::PINNED_GUI_CLOSURE`] — hoisted there so the
+    /// lock-order census's own transcript test derives its crate count from
+    /// the same reviewed list instead of a hand-typed literal that had to be
+    /// bumped in step with it (and was not, the day `aterm-primer` joined).
     #[test]
     fn derived_closure_matches_the_pinned_canary() {
-        const PINNED: &[&str] = &[
-            // Entered the closure with the embedded operator: aterm-gui now
-            // depends on aterm-agent for the durable queue/WAL, and aterm-agent
-            // on aterm-ctl for the one-binary fleet client. Both are normal
-            // [dependencies] edges, so both crates are GUI process code and
-            // their locks belong in the census.
-            "crates/aterm-agent/src",
-            "crates/aterm-alloc/src",
-            "crates/aterm-bidi/src",
-            "crates/aterm-bits/src",
-            "crates/aterm-buffer/src",
-            "crates/aterm-cap/src",
-            "crates/aterm-codec/src",
-            "crates/aterm-containment/src",
-            // Entered the closure with the SessionHost seam extraction (f2284d67):
-            // aterm-gui hosts the selection/block control verbs through
-            // `control_host::GuiHost`. A normal [dependencies] edge, so the
-            // whole crate is process code.
-            "crates/aterm-control/src",
-            "crates/aterm-core/src",
-            "crates/aterm-ctl/src",
-            // Entered the closure when the first-party SHA-256/HMAC-SHA256 crate
-            // replaced `sha2` + `hmac`: aterm-gui, aterm-net, aterm-agent, atpkg
-            // and aterm-update all hash through it now. A normal [dependencies]
-            // edge, so it is GUI process code — it holds no locks, but the census
-            // walks it for exactly that reason.
-            "crates/aterm-digest/src",
-            "crates/aterm-effects/src",
-            "crates/aterm-error/src",
-            "crates/aterm-ffi-types/src",
-            "crates/aterm-gpu/src",
-            "crates/aterm-grapheme/src",
-            "crates/aterm-grid/src",
-            "crates/aterm-gui/src",
-            "crates/aterm-hash/src",
-            "crates/aterm-lexicon/src",
-            "crates/aterm-log/src",
-            "crates/aterm-lz4/src",
-            "crates/aterm-net/src",
-            "crates/aterm-observe/src",
-            "crates/aterm-parser/src",
-            "crates/aterm-policy/src",
-            "crates/aterm-predict/src",
-            "crates/aterm-provenance/src",
-            "crates/aterm-pty/src",
-            // Entered the closure when the first-party regular-expression
-            // engine (a bounded Pike VM) replaced `regex` — and with it
-            // regex-automata, regex-syntax and aho-corasick, 4 packages /
-            // 158,471 lines. aterm-selection, aterm-observe and aterm-search
-            // compile patterns through it now. A normal [dependencies] edge, so
-            // it is GUI process code — it holds no locks (no interior mutability
-            // at all: the compiled program is immutable and the VM's state lives
-            // on the stack), but the census walks it for exactly that reason.
-            "crates/aterm-regex/src",
-            "crates/aterm-render/src",
-            "crates/aterm-render-api/src",
-            "crates/aterm-rle/src",
-            "crates/aterm-sandbox/src",
-            "crates/aterm-scene/src",
-            "crates/aterm-scrollback/src",
-            "crates/aterm-search/src",
-            "crates/aterm-selection/src",
-            "crates/aterm-session/src",
-            "crates/aterm-shell-integration/src",
-            "crates/aterm-sixel/src",
-            "crates/aterm-suggest/src",
-            "crates/aterm-tempfile/src",
-            // Entered the closure when the first-party clock replaced
-            // `web-time`: aterm-core, -types, -effects, -gpu, -predict,
-            // -policy, -observe and -agent all sample time through it now. A
-            // normal [dependencies] edge, so it is GUI process code — it holds
-            // no locks, but the census walks it for exactly that reason.
-            "crates/aterm-time/src",
-            "crates/aterm-types/src",
-            "crates/aterm-uds/src",
-            "crates/aterm-update/src",
-            "crates/aterm-update-core/src",
-            "crates/aterm-vi/src",
-            // Entered the closure when the K-2 winit→engine key map was split
-            // out of aterm-types into its own crate: as an OPTIONAL FEATURE of
-            // aterm-types it was unified on for every consumer in the workspace
-            // resolve, which linked AppKit into the dependency-free aterm-ctl.
-            // A normal [dependencies] edge from aterm-gui, so the whole crate is
-            // process code — and the closure is unchanged in substance: the same
-            // code was already in it via aterm-types.
-            "crates/aterm-winit-keymap/src",
-            "crates/atpkg/src",
-        ];
+        const PINNED: &[&str] = test_fixtures::PINNED_GUI_CLOSURE;
         let set = derive_gui_scan_set(&repo_root()).expect("derivation must succeed on HEAD");
         let mut pinned: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         pinned.sort();
@@ -1524,8 +1742,11 @@ mod tests {
             )],
             "proc-macro classification changed"
         );
-        // All six reviewed vendored forks classified: five scanned in
-        // vendored-identity mode, one (pkg-config) build-time-only.
+        // All five reviewed VENDORED forks classified: four scanned in
+        // vendored-identity mode, one (pkg-config) build-time-only. (The
+        // count read "six … five" until the winnow fork retired with
+        // toml_edit; the assertions below were right and the prose was not.)
+        // The other five [patch] entries are first-party and asserted separately.
         let scanned: Vec<&str> = set
             .vendored_scanned
             .iter()
@@ -1533,7 +1754,7 @@ mod tests {
             .collect();
         assert_eq!(
             scanned,
-            vec!["indexmap", "libm", "smol_str", "winit", "winnow"],
+            vec!["indexmap", "libm", "smol_str", "winit"],
             "the scanned vendored set changed"
         );
         assert_eq!(
@@ -1542,6 +1763,51 @@ mod tests {
             "pkg-config is the one build-dep-only patch"
         );
         assert_eq!(set.vendored_build_only[0].0, "pkg-config");
+        // The FIVE FIRST-PARTY patch targets — workspace members aterm wrote,
+        // reached only by third-party consumers through the patch table:
+        //   `arrayvec`  crates/aterm-arrayvec   re-export of aterm_alloc::ArrayVec
+        //   `cfg-if`    crates/aterm-cfg-if     the cfg_if! macro
+        //   `log`       crates/aterm-log-shim   no-op facade (NOT crates/aterm-log,
+        //                                       which is aterm's real logger)
+        //   `profiling` crates/aterm-profiling  no-op facade
+        //   `tracing`   crates/aterm-tracing    no-op facade
+        // Sorted, because `derive` sorts them. Each owes NO review row, and
+        // each is absent from `scan_dirs` above because no first-party crate
+        // depends on it.
+        assert_eq!(
+            set.first_party_patches,
+            vec![
+                ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
+                ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
+                ("log".to_string(), "crates/aterm-log-shim".to_string()),
+                (
+                    "profiling".to_string(),
+                    "crates/aterm-profiling".to_string()
+                ),
+                ("tracing".to_string(), "crates/aterm-tracing".to_string()),
+            ],
+            "the first-party [patch] target set changed"
+        );
+        // ASSERTED PER CRATE, not as a count: the hazard is one of them
+        // acquiring a first-party dependant and quietly becoming GUI process
+        // code whose locks nothing censuses. `crates/aterm-arrayvec` is the
+        // live risk — it is the only one of the five that is a real data
+        // structure a member could plausibly start using, and it already
+        // depends on `aterm-alloc`, which IS in the closure.
+        for dir in [
+            "crates/aterm-arrayvec/src",
+            "crates/aterm-cfg-if/src",
+            "crates/aterm-log-shim/src",
+            "crates/aterm-profiling/src",
+            "crates/aterm-tracing/src",
+        ] {
+            assert!(
+                !set.scan_dirs.contains(&dir.to_string()),
+                "{dir} is reached only through the patch table, never through a \
+                 first-party path dependency; if that changed, the crate is now GUI \
+                 process code and belongs in PINNED_GUI_CLOSURE"
+            );
+        }
         // winit's platform slices resolve on disk (checked in derive) and
         // cover exactly the six non-macOS backends.
         let winit = set
@@ -1578,6 +1844,122 @@ mod tests {
             err.contains("platform slice `linux` path `src/platform/x11.rs`")
                 && err.contains("STALE"),
             "err: {err}"
+        );
+    }
+
+    /// A `[patch]` entry pointing at a workspace member is FIRST-PARTY: it is
+    /// recorded, it is NOT demanded a review row, and — the direction that
+    /// matters — a review row for it is refused. The old code keyed the
+    /// registry on IS-PATCHED and would have hard-errored on the first line
+    /// of this test.
+    #[test]
+    fn a_first_party_patch_target_is_recorded_and_never_review_registered() {
+        let mut files = test_fixtures::workspace_manifests(&[("aterm-shim", "")]);
+        // Append a first-party patch entry to the fixture's patch table.
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                contents.push_str("shimmed = { path = \"crates/aterm-shim\" }\n");
+            }
+        }
+        let set = derive("firstparty", with_src(files)).expect("derivation must succeed");
+        assert_eq!(
+            set.first_party_patches,
+            vec![("shimmed".to_string(), "crates/aterm-shim".to_string())]
+        );
+        // And it is NOT counted as a vendored fork in either direction.
+        assert!(set.vendored_scanned.iter().all(|v| v.package != "shimmed"));
+        assert!(set.vendored_build_only.iter().all(|v| v.0 != "shimmed"));
+    }
+
+    /// Still fail-closed: a patch path under neither `vendor/` nor `crates/`
+    /// is unclassifiable, and the census stops rather than guess which
+    /// obligations apply.
+    #[test]
+    fn a_patch_target_outside_vendor_and_crates_fails_closed() {
+        let mut files = test_fixtures::workspace_manifests(&[]);
+        for (path, contents) in files.iter_mut() {
+            if path == "Cargo.toml" {
+                contents.push_str("elsewhere = { path = \"third_party/elsewhere\" }\n");
+            }
+        }
+        files.push((
+            "third_party/elsewhere/Cargo.toml".to_string(),
+            "[package]\nname = \"elsewhere\"\n".to_string(),
+        ));
+        let err = derive("oddpatch", with_src(files)).expect_err("must fail");
+        assert!(
+            err.contains("under neither `vendor/`") && err.contains("fail-closed"),
+            "err: {err}"
+        );
+    }
+
+    /// A first-party patch target that has been mis-filed in the vendored
+    /// registry is a FALSE provenance claim, and is refused by name.
+    #[test]
+    fn a_review_row_for_a_first_party_patch_target_is_refused() {
+        // The real tree's registry cannot be mutated from a test, so this
+        // asserts the invariant the derivation enforces over the REAL tree:
+        // no REVIEWED_VENDORED_CRATES row may point outside vendor/.
+        for r in REVIEWED_VENDORED_CRATES {
+            assert_eq!(
+                classify_patch_target(r.package, r.path, &repo_root()),
+                Ok(PatchTargetKind::Vendored),
+                "REVIEWED_VENDORED_CRATES row `{}` points at `{}`, which is not \
+                 third-party vendored source",
+                r.package,
+                r.path
+            );
+        }
+        for (pkg, path) in [
+            ("tracing", "crates/aterm-tracing"),
+            ("profiling", "crates/aterm-profiling"),
+            ("cfg-if", "crates/aterm-cfg-if"),
+            ("arrayvec", "crates/aterm-arrayvec"),
+            ("log", "crates/aterm-log-shim"),
+        ] {
+            assert_eq!(
+                classify_patch_target(pkg, path, &repo_root()),
+                Ok(PatchTargetKind::FirstParty),
+                "{pkg} -> {path}"
+            );
+        }
+    }
+
+    /// THE GUARD IS ARMED — proved against the real anomaly, not a fixture.
+    ///
+    /// `crates/aterm-lz4` is a modified subset derived from lz4_flex 0.11.5:
+    /// its files carry `Copyright (c) 2020 Pascal Seitz et al.`, it retains
+    /// `crates/aterm-lz4/LICENSE-MIT`, and the top-level NOTICE records it as
+    /// a redistribution. It is the living counter-example to "everything under
+    /// `crates/` is code we wrote", and the reason this classifier tests for
+    /// EVIDENCE instead of location.
+    ///
+    /// This test exists because the previous version of the refusal was
+    /// VACUOUS — it asserted the tree's current state and never reached the
+    /// branch. Here the branch is reached, on a path that really exists, and
+    /// the message must name why. If someone ever relicenses aterm-lz4 as
+    /// original work and drops its LICENSE-MIT and NOTICE entry, this test
+    /// fails and asks them to confirm that on purpose.
+    #[test]
+    fn a_redistribution_under_crates_is_refused_not_called_first_party() {
+        let err = classify_patch_target("lz4_flex", "crates/aterm-lz4", &repo_root())
+            .expect_err("aterm-lz4 is derived from lz4_flex and must not read as first-party");
+        assert!(
+            err.contains("LICENSE-MIT") || err.contains("NOTICE"),
+            "the refusal must NAME the evidence so the reader can check it; got: {err}"
+        );
+    }
+
+    /// The negative control for the test above: a crate with no retained
+    /// license file and no NOTICE line classifies FirstParty. Without this,
+    /// `redistribution_evidence` returning `Some` unconditionally would still
+    /// pass every assertion in this module.
+    #[test]
+    fn a_genuine_first_party_crate_is_not_mistaken_for_a_redistribution() {
+        assert_eq!(
+            redistribution_evidence(&repo_root(), "crates/aterm-hash"),
+            None,
+            "aterm-hash is original first-party code and must show no evidence"
         );
     }
 

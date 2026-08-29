@@ -58,6 +58,7 @@
 mod bitmap;
 mod bloom;
 mod budgeted;
+mod bytesearch;
 mod grapheme;
 mod index;
 mod iterators;

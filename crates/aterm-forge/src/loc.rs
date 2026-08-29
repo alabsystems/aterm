@@ -40,15 +40,29 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Where a package's source lives, in the order the contract fixes:
-/// the registry checkout, then `vendor/<name>` for a `[patch.crates-io]` fork,
-/// then the workspace `crates/<name>`.
+/// a WORKSPACE MEMBER first, then the registry checkout, then `vendor/<name>`
+/// for a `[patch.crates-io]` fork, then `crates/<name>`.
 ///
-/// Registry first is not an accident. Five of the six vendored forks also have
-/// a pristine registry copy of the same version, and measuring the pristine
-/// copy keeps the LOC ledger stable while a fork is being edited — a fork that
-/// deletes 400 lines has not shrunk the surface aterm depends on, it has
-/// shrunk the fork. [`crate::attest`] is where fork-vs-upstream drift is
+/// Registry-before-vendor is not an accident. Five of the six vendored forks
+/// also have a pristine registry copy of the same version, and measuring the
+/// pristine copy keeps the LOC ledger stable while a fork is being edited — a
+/// fork that deletes 400 lines has not shrunk the surface aterm depends on, it
+/// has shrunk the fork. [`crate::attest`] is where fork-vs-upstream drift is
 /// audited; this is where the surface is sized.
+///
+/// WORKSPACE-MEMBER-BEFORE-REGISTRY IS ALSO NOT AN ACCIDENT, and it was found
+/// by being wrong. That same "prefer the pristine copy" rule matches purely on
+/// `<name>-<version>`, so when aterm patched in a crate it WROTE — package
+/// `tracing 0.1.44` at `crates/aterm-tracing`, a 1,541-line no-op facade
+/// replacing the real one — the survey found
+/// `~/.cargo/registry/src/*/tracing-0.1.44` first and billed aterm 72,271
+/// lines of somebody else's source for code that is not in the build. The
+/// replacement's whole purpose is to delete 84,483 lines; measured through the
+/// registry it appeared to delete 12,212. The stability argument does not
+/// reach here: for a FIRST-PARTY member the lines we wrote ARE the surface,
+/// and the identically-named registry crate is a coincidence of how
+/// `[patch.crates-io]` matches (on package name). So members are resolved by
+/// their manifest's `[package] name`, not by directory, and they win.
 pub fn package_dir(root: &Path, id: &PkgId) -> Option<PathBuf> {
     package_dir_hinted(root, id, None)
 }
@@ -58,6 +72,23 @@ pub fn package_dir(root: &Path, id: &PkgId) -> Option<PathBuf> {
 /// caller holding the resolve output should pass it: it is cargo's own answer,
 /// and it is right even for a workspace laid out differently from this one.
 pub fn package_dir_hinted(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<PathBuf> {
+    // NAME AND VERSION, and the version half is the whole safety of this
+    // branch. Matching on name alone is FAIL-OPEN on the number this campaign
+    // is scored on: `[patch.crates-io]` cannot satisfy every requirement (a
+    // `=0.1.41` or a `^0.1.45` would resolve a SECOND, registry-sourced
+    // `tracing` alongside ours), and a name-only hit would then bill that real
+    // third-party package to `crates/aterm-tracing` and — because
+    // `is_third_party` is decided from the directory below — quietly drop it
+    // out of `third_party_packages` and `third_party_loc` entirely. The survey
+    // already reports 8 duplicate names on mac-arm, so a name resolving at two
+    // versions is routine, not hypothetical. With the version compared, the
+    // member wins only for the exact package it actually is, and any other
+    // version falls through to the registry branch where it belongs.
+    if let Some((version, member)) = workspace_members(root).get(&id.name)
+        && version == &id.version
+    {
+        return Some(member.clone());
+    }
     for src in registry_srcs() {
         let candidate = src.join(format!("{}-{}", id.name, id.version));
         if candidate.is_dir() {
@@ -73,6 +104,98 @@ pub fn package_dir_hinted(root: &Path, id: &PkgId, printed: Option<&Path>) -> Op
         return Some(member);
     }
     printed.filter(|p| p.is_dir()).map(Path::to_path_buf)
+}
+
+/// `[package] name` -> (version, directory) for every `crates/*` member.
+///
+/// Named because the raw type tripped `clippy::type_complexity` once it had to
+/// carry the version — and the version is the half that makes the lookup safe.
+type MemberIndex = BTreeMap<String, (String, PathBuf)>;
+
+/// `[package] name` → directory, for every `crates/*` member of THIS root.
+///
+/// Keyed on the manifest name rather than on the directory name because the
+/// two are allowed to differ, and one member deliberately makes them differ:
+/// `crates/aterm-tracing` is package `tracing`, since `[patch.crates-io]`
+/// matches on package name and nothing else would redirect the four
+/// third-party consumers at it. A directory-name lookup misses exactly the
+/// crate that needs to be found.
+///
+/// Memoized per root: `survey` measures four cells that share ~150 packages,
+/// and this is ~70 small manifest reads.
+fn workspace_members(root: &Path) -> &'static MemberIndex {
+    static MEMBERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
+    let cache = MEMBERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(map) = cache.lock()
+        && let Some(hit) = map.get(root)
+    {
+        return hit;
+    }
+    // Members overwhelmingly inherit `version.workspace = true`; only the
+    // patched-in facades state a literal, because a patch has to satisfy the
+    // consumers' semver. Resolve both so the caller can compare an exact
+    // version rather than trusting a name.
+    let workspace_version = std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| {
+            text.parse::<aterm_toml::edit::DocumentMut>()
+                .ok()
+                .and_then(|doc| {
+                    doc.get("workspace")
+                        .and_then(|w| w.get("package"))
+                        .and_then(|p| p.get("version"))
+                        .and_then(aterm_toml::edit::Item::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_default();
+    let mut found: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+                continue;
+            };
+            let name = package_name(&text);
+            if !name.is_empty() {
+                let version = package_version(&text).unwrap_or_else(|| workspace_version.clone());
+                found.insert(name, (version, dir));
+            }
+        }
+    }
+    let leaked: &'static BTreeMap<String, (String, PathBuf)> = Box::leak(Box::new(found));
+    if let Ok(mut map) = cache.lock() {
+        map.insert(root.to_path_buf(), leaked);
+    }
+    leaked
+}
+
+/// A member's LITERAL `[package] version`, or `None` when it inherits
+/// (`version.workspace = true` parses as a table, not a string).
+fn package_version(text: &str) -> Option<String> {
+    text.parse::<aterm_toml::edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            doc.get("package")
+                .and_then(|p| p.get("version"))
+                .and_then(aterm_toml::edit::Item::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// `[package] name` out of a manifest, parsed the same way
+/// [`manifest_facts`] parses its keys. Empty when the manifest states none (a
+/// virtual manifest; cargo forbids inheriting a package name).
+fn package_name(text: &str) -> String {
+    text.parse::<aterm_toml::edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            doc.get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(aterm_toml::edit::Item::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 /// `$CARGO_HOME/registry/src/index.crates.io-*`, discovered once. The hash
@@ -290,19 +413,19 @@ fn is_ident_byte(b: u8) -> bool {
 /// `license.workspace = true` yields an empty string rather than a lie —
 /// workspace members are not the licence-obligation surface, forks are.
 fn manifest_facts(text: &str) -> (String, bool) {
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+    let Ok(doc) = text.parse::<aterm_toml::edit::DocumentMut>() else {
         return (String::new(), false);
     };
     let license = doc
         .get("package")
         .and_then(|p| p.get("license"))
-        .and_then(toml_edit::Item::as_str)
+        .and_then(aterm_toml::edit::Item::as_str)
         .unwrap_or_default()
         .to_string();
     let is_proc_macro = doc
         .get("lib")
         .and_then(|l| l.get("proc-macro"))
-        .and_then(toml_edit::Item::as_bool)
+        .and_then(aterm_toml::edit::Item::as_bool)
         .unwrap_or(false);
     (license, is_proc_macro)
 }
@@ -366,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn package_dir_prefers_the_registry_then_vendor_then_the_workspace() {
+    fn package_dir_prefers_the_member_then_the_registry_then_vendor() {
         let root = repo_root();
         let registry = package_dir(&root, &PkgId::new("libc", "0.2.186"))
             .expect("libc 0.2.186 is unpacked in this checkout's registry");
@@ -388,6 +511,76 @@ mod tests {
         assert_eq!(
             package_dir(&root, &PkgId::new("no-such-crate-anywhere", "1.0.0")),
             None
+        );
+    }
+
+    /// THE COLLISION, on the real tree: package `tracing 0.1.44` is a
+    /// workspace member at `crates/aterm-tracing`, and a registry checkout of
+    /// upstream `tracing-0.1.44` also exists on this box. The member must win,
+    /// by MANIFEST name (the directory is called something else on purpose),
+    /// or the survey bills aterm 72,271 lines of source that is not in the
+    /// build and the replacement's whole 84,483-line win reads as 12,212.
+    #[test]
+    fn a_first_party_patch_target_is_measured_at_the_member_not_the_registry_copy() {
+        let root = repo_root();
+        let dir = package_dir(&root, &PkgId::new("tracing", "0.1.44"))
+            .expect("the patched `tracing` resolves");
+        assert_eq!(dir, root.join("crates").join("aterm-tracing"));
+        assert!(
+            measure(&root, &PkgId::new("tracing", "0.1.44"), None).loc < 5_000,
+            "the shim is ~1.5k lines; upstream tracing 0.1.44 is 72,271"
+        );
+        assert!(
+            !measure(&root, &PkgId::new("tracing", "0.1.44"), None).is_third_party,
+            "a workspace member is aterm's own code"
+        );
+    }
+
+    #[test]
+    fn a_member_is_found_by_its_manifest_name_not_its_directory_name() {
+        assert_eq!(
+            workspace_members(&repo_root()).get("tracing").cloned(),
+            Some((
+                "0.1.44".to_string(),
+                repo_root().join("crates").join("aterm-tracing")
+            ))
+        );
+        assert_eq!(package_name("[package]\nname = \"x\"\n"), "x");
+        assert_eq!(package_name("[workspace]\nmembers = []\n"), "");
+        assert_eq!(
+            package_version("[package]\nversion = \"1.2.3\"\n").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            package_version("[package]\nversion.workspace = true\n"),
+            None,
+            "an inherited version is not a literal and must fall back to the workspace"
+        );
+    }
+
+    /// THE MEMBER BRANCH IS VERSION-GATED, and this proves the gate is armed.
+    ///
+    /// A name-only match was fail-open on the campaign's headline number: a
+    /// second, registry-sourced `tracing` at a version `[patch.crates-io]`
+    /// cannot satisfy would have resolved to `crates/aterm-tracing` and, since
+    /// `is_third_party` is read off the directory, vanished from
+    /// `third_party_packages` and `third_party_loc` altogether. Ask for a
+    /// version the member is NOT, and the member must decline.
+    #[test]
+    fn a_member_does_not_answer_for_a_different_version_of_its_name() {
+        let root = repo_root();
+        let ours = package_dir(&root, &PkgId::new("tracing", "0.1.44"));
+        assert_eq!(
+            ours.as_deref(),
+            Some(root.join("crates").join("aterm-tracing").as_path()),
+            "control: the member DOES answer for its own version"
+        );
+        let other = package_dir(&root, &PkgId::new("tracing", "0.1.41"));
+        assert_ne!(
+            other.as_deref(),
+            Some(root.join("crates").join("aterm-tracing").as_path()),
+            "a DIFFERENT version of the same name must never resolve to the member — that \
+             would bill somebody else's source to us and delete it from the third-party count"
         );
     }
 
@@ -479,13 +672,13 @@ mod tests {
     #[test]
     fn the_vendored_forks_are_third_party_and_workspace_crates_are_not() {
         let s = survey(0);
-        let winnow = s
+        let fork = s
             .facts
             .iter()
-            .find(|(id, _)| id.name == "winnow")
-            .expect("the winnow fork is in the mac-arm graph");
+            .find(|(id, _)| id.name == "indexmap")
+            .expect("the indexmap fork is in the mac-arm graph");
         assert!(
-            winnow.1.is_third_party,
+            fork.1.is_third_party,
             "a [patch.crates-io] fork is still upstream code"
         );
         let core = s

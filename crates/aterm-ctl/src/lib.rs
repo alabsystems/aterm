@@ -122,14 +122,15 @@
 //!
 //! ## Cross-terminal verbs (client-side)
 //!
-//! Two verbs are answered by THIS CLIENT (no single server owns the answer):
+//! The discovery verbs are answered by THIS CLIENT (no single server owns the answer):
 //!
 //! * `instances`       — one line per LIVE same-user aterm instance:
 //!   `<pid> <sessions> <sock_path>[ self]` (`self` marks the instance hosting
 //!   the calling terminal). Discovers `<dir>/aterm-<pid>.sock` files and probes
 //!   each with its own token.
 //! * `ls`              — every session of every live instance, one line each:
-//!   `<pid> <local> <sid> <parent|-> <state> <title>[ *]` (the server's
+//!   `<pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> window=<id|none|->
+//!   active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]` (the server's
 //!   `sessions` line prefixed with the instance pid; `*` marks the calling
 //!   terminal's own session, from `$ATERM_PARENT_SESSION_ID`; the title is
 //!   pct-encoded and often mirrors the cwd via shell integration). The
@@ -137,8 +138,14 @@
 //!   drive; combine with `aterm-ctl "@<sid>" <verb>` to drive a session in
 //!   ANY instance — the server relays an unknown-but-published sid to its
 //!   hosting sibling.
+//! * `windows`         — one line per WINDOW across the fleet, folded from the
+//!   same `sessions` lines: `<pid> window=<id> focused=<0|1> sessions=<n>
+//!   active=<sid>[,<sid>…]`, then `window=none` / `window=-` rows for the
+//!   sessions no window holds / the instances that could not say. A headless
+//!   instance folds under its one logical window 0. Like `ls` and `instances`
+//!   it takes no argument: a trailing word is `ERR usage: <verb>` (exit 1).
 //!
-//!   `ls`/`instances` are answered CLIENT-side, but they still honour
+//!   `ls`/`instances`/`windows` are answered CLIENT-side, but they still honour
 //!   `--sock`/`--pid`, which SCOPE the listing to the addressed instance. That
 //!   matters for isolation: an automated caller that launched its own instance
 //!   under a private `$ATERM_CONTROL_SOCK` gets back only that instance, never
@@ -195,11 +202,23 @@ OPTIONS:
     -V, --version print version information and exit.
 
 EXIT CODES:
-    0    OK — the server answered OK.
-    1    failure — a usage/connect error, or the server replied ERR.
+    0    OK — the server answered OK. For the client-answered discovery verbs
+         (`ls`, `instances`, `windows`): at least one instance answered.
+    1    failure — a usage/connect error, or the server replied ERR. For
+         `ls`/`instances`/`windows`: the control-socket directory was readable
+         and held NO instance socket — a truly empty fleet, and the ONLY case
+         that prints `no live aterm instances found`.
+    2    `ls`/`instances`/`windows` only — could not LOOK, or could not REACH:
+         sockets were found but none answered (a sandbox refusing AF_UNIX
+         connect(), stale sockets of exited pids, an unreadable or rejected
+         token), or the directory is missing, unreadable, or unresolvable
+         ($HOME and $XDG_RUNTIME_DIR unset). The report on stderr names every
+         socket and its cause, plus one hint for the dominant cause — never
+         the false claim that the fleet is empty.
     124  timeout — the client's --timeout deadline fired, OR the server
          reported a timeout (a `turn` verdict status=timeout, or an
-         await/ready/wait `OK timeout`). Additive: still nonzero, so existing
+         await/ready/wait `OK timeout`); for `ls`/`instances`/`windows`,
+         EVERY found socket timed out. Additive: still nonzero, so existing
          `nonzero == failure` scripts are unaffected.
 
 STDIN PAYLOADS (multi-line, whitespace-preserving; each <= 256 KiB):
@@ -229,6 +248,15 @@ SOCKET RESOLUTION:
     (macOS). The default is a symlink the server atomically points at the
     newest instance's aterm-<pid>.sock, so the flagless flow reaches a live
     instance.
+
+    DISCOVERY (`ls`, `instances`, `windows`): the client enumerates <dir>/aterm-<pid>.sock
+    (plus the <dir>/graph entries of explicit-$ATERM_CONTROL_SOCK instances)
+    and dials each one with a 2 s deadline. When $XDG_RUNTIME_DIR is set,
+    ~/Library/Application Support/aterm is NOT consulted, so a missing
+    $XDG_RUNTIME_DIR/aterm reports the environment, not an empty fleet. A
+    stale socket (its pid exited without cleanup) is skipped silently while
+    another instance answers, and named — with its cause — only in the
+    failure report when nothing does (see EXIT CODES 1 vs 2).
 
 CROSS-TERMINAL DRIVING:
     Every session of every same-user instance is addressable by its stable
@@ -288,26 +316,54 @@ fn help_text() -> String {
     s
 }
 
-/// The two CLIENT-answered discovery verbs, documented in a FIXED block appended
-/// to `--help` AFTER the generated protocol catalog. `ls` and `instances` are
+/// The CLIENT-answered discovery verbs, documented in a FIXED block appended
+/// to `--help` AFTER the generated protocol catalog. `ls`, `instances` and `windows` are
 /// intercepted by aterm-ctl itself (no server round-trip), so they are NOT in the
 /// protocol verb table [`aterm_types::control_verbs::catalog_lines`] renders and
 /// would otherwise be invisible to an AI reading `--help`. Hand-written (they are
 /// hand-implemented in this same file, in `run_discovery`, so this cannot drift).
+/// Also the source `help <client verb>` is answered from ([`client_help_reply`]),
+/// entry by entry — so an entry here is a verb line at the 4-column indent plus
+/// continuation lines at the 18-column gutter, and nothing else in between.
 const CLIENT_VERBS: &str = "\
 \n\
 CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     ls            every session of every live instance, one per line:
-                  <pid> <local> <sid> <parent|-> <state> <title>[ *]
-                  (* = the calling terminal's own session).
+                  <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1>
+                  window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]
+                  (* = the calling terminal's own session; window= is the
+                  hosting window — a headless instance reports its one logical
+                  window 0; none = a session no window holds; - = the instance
+                  could not ask its main thread; active= the session is on that
+                  window's active tab; wfocus= that window is aterm's most
+                  recently focused one (unchanged by a minimize or by the app
+                  deactivating); detail= the sanitized running command, never
+                  its arguments — e.g. claude, codex, targo%20test — so read it
+                  before typing into a peer).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
+    windows       one line per WINDOW across the fleet, folded from `sessions`:
+                  <pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]
+                  (focused= aterm's most recently focused window — one per
+                  instance, unchanged by a minimize or by the app deactivating;
+                  active= the sids on that window's active tab, - when none;
+                  a headless instance folds under its one logical window 0),
+                  then <pid> window=none sessions=<n> for sessions no window
+                  holds, and <pid> window=- sessions=<n> for an instance that
+                  could not say (an older server, or its main thread did not
+                  answer) — never silently folded into a window.
 
-    Both HONOUR --sock/--pid, which SCOPE the listing to the addressed
+    None of the three takes an argument: `ls 1` is `ERR usage: ls`,
+    `instances 1` is `ERR usage: instances`, `windows 1` is `ERR usage:
+    windows` (exit 1) — never a listing the caller did not ask for.
+    These HONOUR --sock/--pid, which SCOPE the listing to the addressed
     instance instead of the whole fleet. Use that to keep an automated
     caller's own instance isolated from the user's real terminals. A
     scoped listing that finds nothing reports that distinctly (exit 1).
+    `help ls` / `help instances` / `help windows` / `help mux` print the
+    entry from this block, answered here as well (the server's `help`
+    knows only the protocol table, so it cannot).
 
     mux           whether a MULTIPLEXER (screen/tmux) sits between this shell
                   and its aterm session, and what that costs:
@@ -329,8 +385,8 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
 ";
 
 /// The verbs a completion script offers as the FIRST argument: every protocol
-/// verb from the shared table (`aterm_types::control_verbs::VERBS`) PLUS the two
-/// CLIENT-answered discovery verbs (`ls`/`instances`), which aterm-ctl intercepts
+/// verb from the shared table (`aterm_types::control_verbs::VERBS`) PLUS the
+/// CLIENT-answered discovery verbs (`ls`/`instances`/`windows`), which aterm-ctl intercepts
 /// itself ([`run_discovery`]) and are therefore ABSENT from the protocol table.
 /// Space-joined in table order. Sourced from the table so the completion list can
 /// never drift from the protocol this build speaks — the single-source discipline
@@ -344,7 +400,7 @@ fn completion_verb_list() -> String {
     // The client-only verbs, answered here and never framed on the socket
     // (`run_discovery`, `run_mux_report`), so the protocol table above does not
     // carry them.
-    s.push_str("ls instances mux");
+    s.push_str("ls instances windows mux");
     s
 }
 
@@ -1141,7 +1197,7 @@ fn mux_nesting_from_env() -> Option<MuxNesting> {
 /// Verbs answered by this CLIENT, which never reach a server and so are not in
 /// the shared verb table [`addresses_no_session`] consults. They address no
 /// session and cannot be mis-targeted by a multiplexer.
-const MUX_EXEMPT_VERBS: [&str; 3] = ["instances", "ls", "mux"];
+const MUX_EXEMPT_VERBS: [&str; 4] = ["instances", "ls", "windows", "mux"];
 
 /// Whether `verb` addresses NO SESSION, and so has nothing a multiplexer could
 /// silently redirect.
@@ -1511,44 +1567,237 @@ fn resolve_path(
     }
 }
 
+/// The per-socket deadline discovery dials with. Discovery dials EVERY socket
+/// in the shared dir sequentially, so one stuck peer must never hang the whole
+/// sweep; 2 s is generous for a main-thread `sessions` answer.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One socket's answer to the discovery probe, with every failure class KEPT
+/// DISTINCT. `ls`/`instances` used to fold all of them into `None` and then,
+/// with zero survivors, print the fleet-wide claim "no live aterm instances
+/// found". Under Codex CLI's seatbelt that claim was FALSE: readdir found the
+/// sockets and `connect()` was refused with `EPERM` (finding F8). An agent that
+/// reads "empty" stops looking; one that reads "could not reach: Operation not
+/// permitted" asks for the socket allowance. So the probe classifies, and
+/// [`discovery_report`] says which.
+#[derive(Debug)]
+enum Probe {
+    /// `OK <n>` and its `n` body lines.
+    Answered(Vec<String>),
+    /// `ECONNREFUSED`: the socket file exists but nothing accepts on it — the
+    /// leftover of a pid that exited without cleanup, or a pid still booting.
+    /// `pid_running` is the liveness verdict on the pid the socket names
+    /// (`None` when it names none), resolved HERE so the report stays pure.
+    Refused { pid_running: Option<bool> },
+    /// `EPERM`/`EACCES`/`ENOTCONN` on `connect()`: a sandbox (Codex CLI's
+    /// seatbelt allows AF_UNIX connect only under its writable roots) or
+    /// another user's 0600 socket. NOT "not running" — the remedy differs.
+    Denied(io::Error),
+    /// The token beside the socket could not be read, so no `AUTH` line went
+    /// out and the server answered `ERR auth`. Carries the file it looked for.
+    NoToken(PathBuf, io::Error),
+    /// A token WAS sent and the server still answered `ERR auth`: the file on
+    /// disk is not the token the server holds (a restarted instance rewrote it).
+    AuthRejected,
+    /// The [`PROBE_DEADLINE`] fired on a read or a write.
+    Timeout,
+    /// Anything else, with the raw cause: a socket file that vanished between
+    /// readdir and dial, a non-auth `ERR`, a malformed header, a connection
+    /// closed without a reply.
+    Other(io::Error),
+}
+
 /// One framed request→response against the socket at `path` WITHOUT printing:
 /// authenticate, send `verb`, read the `OK <n>` header + `n` body lines, and
-/// return them. Errors (connect refused, `ERR …`, malformed header, a read or
-/// write past the deadline) map to `None` so discovery can skip a dead, wedged,
-/// or hostile instance and keep going — discovery dials EVERY socket in the
-/// shared dir sequentially, so one stuck peer must never hang the whole sweep.
-/// Lines are read through [`read_bounded_line`]: the deadline alone cannot
-/// stop a peer that STREAMS newline-less bytes (each read succeeds, so the
-/// clock keeps resetting), so the accumulation cap is what bounds memory.
-fn query_lines(path: &str, verb: &str) -> Option<Vec<String>> {
-    let stream = CtlStream::connect(path).ok()?;
-    let deadline = Some(std::time::Duration::from_secs(2));
-    stream.set_read_timeout(deadline).ok()?;
-    stream.set_write_timeout(deadline).ok()?;
-    if let Some(token) = read_token_for(path) {
-        (&stream)
-            .write_all(format!("AUTH {token}\n").as_bytes())
-            .ok()?;
+/// return them as [`Probe::Answered`] — or the CLASSIFIED failure, never a
+/// bare `None`. `pid` is the instance pid the socket names (`0` = unknown),
+/// consulted only to label a refused connect as stale-or-booting. Lines are
+/// read through [`read_bounded_line`]: the deadline alone cannot stop a peer
+/// that STREAMS newline-less bytes (each read succeeds, so the clock keeps
+/// resetting), so the accumulation cap is what bounds memory.
+fn probe_lines(path: &str, verb: &str, pid: u32) -> Probe {
+    let stream = match CtlStream::connect(path) {
+        Ok(stream) => stream,
+        Err(e) => return classify_connect_error(e, pid),
+    };
+    if let Err(e) = stream
+        .set_read_timeout(Some(PROBE_DEADLINE))
+        .and_then(|()| stream.set_write_timeout(Some(PROBE_DEADLINE)))
+    {
+        return Probe::Other(e);
     }
-    (&stream).write_all(format!("{verb}\n").as_bytes()).ok()?;
-    (&stream).flush().ok()?;
+    // An unreadable token is not fatal YET: the request still goes out without
+    // an `AUTH` line, and only the server's `ERR auth` proves the miss mattered
+    // (an instance that answers anyway is simply answered).
+    let token_miss = match read_token_at(path) {
+        Ok(token) => {
+            if let Err(e) = (&stream).write_all(format!("AUTH {token}\n").as_bytes()) {
+                return io_probe(e);
+            }
+            None
+        }
+        Err((token_path, e)) => Some(Probe::NoToken(token_path, e)),
+    };
+    if let Err(e) = (&stream)
+        .write_all(format!("{verb}\n").as_bytes())
+        .and_then(|()| (&stream).flush())
+    {
+        return io_probe(e);
+    }
     let mut reader = BufReader::new(&stream);
     let mut status = String::new();
-    read_bounded_line(&mut reader, &mut status).ok()?;
-    let count: usize = stream_count(status.trim_end().strip_prefix("OK ")?)?;
+    match read_bounded_line(&mut reader, &mut status) {
+        Err(e) => return io_probe(e),
+        Ok(0) => {
+            return Probe::Other(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the server closed the connection without replying",
+            ));
+        }
+        Ok(_) => {}
+    }
+    let status = status.trim_end();
+    let Some(tail) = status.strip_prefix("OK ") else {
+        return if status.starts_with("ERR auth") {
+            token_miss.unwrap_or(Probe::AuthRejected)
+        } else if status.starts_with("ERR") {
+            Probe::Other(io::Error::other(format!("server replied: {status}")))
+        } else {
+            Probe::Other(malformed_header_error(status))
+        };
+    };
+    let Some(count) = stream_count(tail) else {
+        return Probe::Other(malformed_header_error(status));
+    };
     let mut lines = Vec::with_capacity(count);
     for _ in 0..count {
         let mut line = String::new();
-        if read_bounded_line(&mut reader, &mut line).ok()? == 0 {
-            break;
+        match read_bounded_line(&mut reader, &mut line) {
+            Err(e) => return io_probe(e),
+            Ok(0) => break,
+            Ok(_) => lines.push(line.trim_end_matches(['\r', '\n']).to_string()),
         }
-        lines.push(line.trim_end_matches(['\r', '\n']).to_string());
     }
-    Some(lines)
+    Probe::Answered(lines)
+}
+
+/// Map a failed `connect()` to its [`Probe`] class. `ECONNREFUSED` is a stale
+/// (or still-booting) instance, labelled by whether `pid` is alive;
+/// `EPERM`/`EACCES`/`ENOTCONN` are a refusal by the caller's sandbox or by a
+/// foreign user's socket mode — NOT "not running", and the report never says
+/// so. Everything else keeps the raw cause, framed like [`connect_error`].
+fn classify_connect_error(e: io::Error, pid: u32) -> Probe {
+    match e.kind() {
+        io::ErrorKind::ConnectionRefused => Probe::Refused {
+            pid_running: (pid != 0).then(|| aterm_uds::process::pid_alive(pid)),
+        },
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotConnected => Probe::Denied(e),
+        _ if is_timeout_error(&e) => Probe::Timeout,
+        _ => Probe::Other(io::Error::new(e.kind(), format!("connect: {e}"))),
+    }
+}
+
+/// A read/write failure after the connect: the deadline firing is
+/// [`Probe::Timeout`]; anything else is [`Probe::Other`] with the raw cause.
+fn io_probe(e: io::Error) -> Probe {
+    if is_timeout_error(&e) {
+        Probe::Timeout
+    } else {
+        Probe::Other(e)
+    }
+}
+
+/// What the rendezvous directory turned out to be — the OTHER half of "could
+/// not look" the old fleet claim hid: `$HOME` unset, `$XDG_RUNTIME_DIR` naming
+/// a directory that does not exist, a readdir the sandbox refuses. Only
+/// [`DirOutcome::Empty`] licenses the words "no live aterm instances found".
+#[derive(Debug)]
+enum DirOutcome {
+    /// No environment variable that names the directory is set.
+    Unresolvable,
+    /// The resolved directory does not exist; `why` says which variable it was
+    /// resolved from (and, under `$XDG_RUNTIME_DIR`, that the default was
+    /// therefore NOT consulted).
+    Missing { path: PathBuf, why: String },
+    /// `read_dir` failed for a reason other than absence — a sandbox refusing
+    /// readdir, or a mode that excludes this user.
+    Unreadable { path: PathBuf, err: io::Error },
+    /// Readable and holding no instance socket and no graph entry: a truly
+    /// empty fleet.
+    Empty(PathBuf),
+    /// Readable, with `n` instances (readdir + graph entries) to dial.
+    Found { path: PathBuf, n: usize },
+    /// `--sock`/`--pid` named the target; the directory was not the question.
+    Scoped,
+}
+
+/// The variables [`socket_dir`] resolves from, for the message that says none
+/// of them is set (`aterm_uds::control_socket_dir`'s two on Unix, its three on
+/// Windows).
+#[cfg(not(windows))]
+const DIR_ENV_UNSET: &str = "$XDG_RUNTIME_DIR and $HOME are both unset";
+#[cfg(windows)]
+const DIR_ENV_UNSET: &str = "%TMP%, %TEMP% and %LOCALAPPDATA% are all unset";
+
+/// Why a resolved-but-absent directory was the one looked in. Under
+/// `$XDG_RUNTIME_DIR` this must name the default that was NOT consulted: an
+/// agent whose harness exports the variable otherwise reads "no such
+/// directory" as "no aterm", while the human's instance sits in
+/// `~/Library/Application Support/aterm` untouched.
+#[cfg(not(windows))]
+fn missing_dir_reason() -> String {
+    if env::var_os("XDG_RUNTIME_DIR").is_some() {
+        "resolved from $XDG_RUNTIME_DIR, which is set — so \
+         ~/Library/Application Support/aterm was NOT consulted"
+            .to_string()
+    } else {
+        "resolved from $HOME; no aterm instance has published a socket there".to_string()
+    }
+}
+#[cfg(windows)]
+fn missing_dir_reason() -> String {
+    "resolved from %TMP%/%TEMP% (else %LOCALAPPDATA%\\Temp); no aterm instance has \
+     published a socket there"
+        .to_string()
+}
+
+/// Resolve and CLASSIFY the rendezvous directory, enumerating its instances in
+/// the same readdir: `(what the directory is, every instance to dial)`. The
+/// list is empty unless the outcome is [`DirOutcome::Found`].
+fn inspect_fleet() -> (DirOutcome, Vec<(u32, String)>) {
+    let Some(dir) = socket_dir() else {
+        return (DirOutcome::Unresolvable, Vec::new());
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let why = missing_dir_reason();
+            return (DirOutcome::Missing { path: dir, why }, Vec::new());
+        }
+        Err(err) => return (DirOutcome::Unreadable { path: dir, err }, Vec::new()),
+    };
+    let instances = enumerate_instances(&dir, entries);
+    let outcome = if instances.is_empty() {
+        DirOutcome::Empty(dir)
+    } else {
+        DirOutcome::Found {
+            n: instances.len(),
+            path: dir,
+        }
+    };
+    (outcome, instances)
 }
 
 /// Every live same-user aterm instance: `(pid, sock_path)`, discovered two ways
 /// and DEDUPED by socket path so no instance is listed twice. Sorted by pid.
+/// Empty whenever the directory could not be looked in — a caller that must
+/// tell that apart from an empty fleet uses [`inspect_fleet`].
+fn live_instances() -> Vec<(u32, String)> {
+    inspect_fleet().1
+}
+
+/// The enumeration behind [`live_instances`], over an already-open readdir of
+/// `dir`:
 ///
 /// 1. Per-instance sockets living directly in the default dir
 ///    (`<dir>/aterm-<pid>.sock`; the `latest` symlink and non-instance names are
@@ -1559,12 +1808,9 @@ fn query_lines(path: &str, verb: &str) -> Option<Vec<String>> {
 ///    the absolute socket path + the hosting pid. Without this pass such an
 ///    instance would be invisible to `ls`/`instances` even though `@<sid>` can
 ///    reach it (FINDING #2). The entry's `sock` is used verbatim (an absolute
-///    out-of-dir path), so `query_lines` dials the real socket and `read_token_for`
+///    out-of-dir path), so `probe_lines` dials the real socket and `read_token_at`
 ///    finds that socket's own token beside it.
-fn live_instances() -> Vec<(u32, String)> {
-    let Some(dir) = socket_dir() else {
-        return Vec::new();
-    };
+fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, String)> = Vec::new();
     // Dedup by the CANONICAL socket path, not the raw string: a default instance
     // appears both in the readdir (raw `<dir>/aterm-<pid>.sock`) and, once it has
@@ -1579,19 +1825,17 @@ fn live_instances() -> Vec<(u32, String)> {
         seen.insert(key)
     };
     // (1) Per-instance sockets directly in the default dir.
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(pid) = control_socket::instance_pid(&name) else {
-                continue; // non-instance name (latest symlink, sibling token, …)
-            };
-            if !name.ends_with(".sock") {
-                continue; // token files carry pids too; sockets only
-            }
-            let sock = dir.join(&name).to_string_lossy().into_owned();
-            if remember(&mut seen, &sock) {
-                out.push((pid, sock));
-            }
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = control_socket::instance_pid(&name) else {
+            continue; // non-instance name (latest symlink, sibling token, …)
+        };
+        if !name.ends_with(".sock") {
+            continue; // token files carry pids too; sockets only
+        }
+        let sock = dir.join(&name).to_string_lossy().into_owned();
+        if remember(&mut seen, &sock) {
+            out.push((pid, sock));
         }
     }
     // (2) Explicit-socket instances registered via the default dir's graph entries.
@@ -1701,52 +1945,57 @@ fn run_discovery(
     let self_sock = self_instance_sock(self_sid.as_deref());
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut any = false;
-    let targets = match discovery_targets(sock, pid) {
-        Ok(t) => t,
-        Err(msg) => {
-            eprintln!("aterm-ctl: {msg}");
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-    let scoped = sock.is_some() || pid.is_some();
-    for (pid, sock) in targets {
-        let Some(sessions) = query_lines(&sock, "sessions") else {
-            continue; // unreachable/dead instance — skip, keep discovering
-        };
-        any = true;
-        let is_self_instance = self_sock
-            .as_deref()
-            .is_some_and(|self_s| same_socket_path(self_s, &sock));
-        if verb == "instances" {
-            let marker = if is_self_instance { " self" } else { "" };
-            writeln!(out, "{pid} {} {sock}{marker}", sessions.len())?;
-        } else {
-            for line in sessions {
-                // The calling terminal's own session: its sid (2nd field of the
-                // `sessions` line) equals $ATERM_PARENT_SESSION_ID.
-                let sid = line.split_whitespace().nth(1);
-                let marker = if sid.is_some() && sid == self_sid.as_deref() {
-                    " *"
-                } else {
-                    ""
-                };
-                writeln!(out, "{pid} {line}{marker}")?;
+    // `--sock`/`--pid` name the target, so the directory is not the question
+    // there; unscoped discovery classifies the directory itself, because "no
+    // such directory" and "an empty directory" are different answers.
+    let (dir, targets) = if sock.is_some() || pid.is_some() {
+        match discovery_targets(sock, pid) {
+            Ok(t) => (DirOutcome::Scoped, t),
+            Err(msg) => {
+                eprintln!("aterm-ctl: {msg}");
+                return Ok(ExitCode::FAILURE);
             }
         }
-    }
-    if !any {
-        // Distinguish "the fleet is empty" from "the instance YOU named did not
-        // answer" — the scoped case must never read as a fleet-wide result.
-        if scoped {
-            eprintln!(
-                "aterm-ctl: the addressed instance did not answer \
-                 (wrong --sock/--pid, not running, or a different user)"
-            );
-        } else {
-            eprintln!("aterm-ctl: no live aterm instances found");
+    } else {
+        inspect_fleet()
+    };
+    // Every probe is kept, answered or not: the rows print as they arrive, and
+    // when NOTHING answered the classified misses ARE the report. A miss beside
+    // an instance that answered stays silent — the success path gains no noise.
+    let mut probes: Vec<(u32, String, Probe)> = Vec::with_capacity(targets.len());
+    for (pid, sock) in targets {
+        let probe = probe_lines(&sock, "sessions", pid);
+        if let Probe::Answered(sessions) = &probe {
+            let is_self_instance = self_sock
+                .as_deref()
+                .is_some_and(|self_s| same_socket_path(self_s, &sock));
+            if verb == "instances" {
+                let marker = if is_self_instance { " self" } else { "" };
+                writeln!(out, "{pid} {} {sock}{marker}", sessions.len())?;
+            } else if verb == "windows" {
+                for line in window_rows_from_sessions(pid, sessions) {
+                    writeln!(out, "{line}")?;
+                }
+            } else {
+                for line in sessions {
+                    // The calling terminal's own session: its sid (2nd field of the
+                    // `sessions` line) equals $ATERM_PARENT_SESSION_ID.
+                    let sid = line.split_whitespace().nth(1);
+                    let marker = if sid.is_some() && sid == self_sid.as_deref() {
+                        " *"
+                    } else {
+                        ""
+                    };
+                    writeln!(out, "{pid} {line}{marker}")?;
+                }
+            }
         }
-        return Ok(ExitCode::FAILURE);
+        probes.push((pid, sock, probe));
+    }
+    let (report, code) = discovery_report(dir, &probes);
+    if code != 0 {
+        stderr_line(&report)?;
+        return Ok(ExitCode::from(code));
     }
     // The ` self` / ` *` markers mean "hosts the calling terminal", and inside a
     // multiplexer that terminal is the one RUNNING screen/tmux — an honest note
@@ -1760,6 +2009,386 @@ fn run_discovery(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The `windows` rows for one instance, folded from its `sessions` lines — PURE,
+/// so the fold is table-testable. One row per window id in ascending order:
+/// `<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]` (`active=-`
+/// when nothing is on the active tab), then `<pid> window=none sessions=<n>` for
+/// the sessions no window hosts, then `<pid> window=- sessions=<n>` for the lines
+/// that could not say — an older server with no `window=` token, or one whose
+/// main thread did not answer (`window=-`). The last two are kept apart on
+/// purpose: "detached" is a fact about the session, "could not say" is a fact
+/// about the listing, and folding either into a window would be a lie. (A
+/// `--headless` instance owns one logical window, id 0, and its sessions fold
+/// under `window=0` like any other's; `none` is a session no window holds.)
+///
+/// The tokens are read by [`roster_tail`] — from the END of the line back to
+/// the `meta=` anchor — never by column position. The fifth column is the
+/// title: pct-encoded by a codec that leaves `=` alone, settable by any program
+/// in the pane, and possibly EMPTY (two spaces, which a whitespace split
+/// collapses, so a column count would slide every key one place left). A
+/// title spelling `window=7` sits before `meta=` and is never reached; a server
+/// that appends more `key=value` columns after `detail=` changes nothing here.
+fn window_rows_from_sessions(pid: u32, sessions: &[String]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    struct Fold {
+        focused: bool,
+        sessions: usize,
+        active: Vec<String>,
+    }
+    let mut windows: BTreeMap<u64, Fold> = BTreeMap::new();
+    let mut detached = 0usize;
+    let mut unknown = 0usize;
+    for line in sessions {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(_local), Some(sid)) = (fields.first(), fields.get(1)) else {
+            continue;
+        };
+        let tail = roster_tail(&fields);
+        let token = |key: &str| tail.iter().find_map(|f| f.strip_prefix(key));
+        match token("window=") {
+            Some("none") => detached += 1,
+            Some(id) => match id.parse::<u64>() {
+                Ok(id) => {
+                    let fold = windows.entry(id).or_insert(Fold {
+                        focused: false,
+                        sessions: 0,
+                        active: Vec::new(),
+                    });
+                    fold.sessions += 1;
+                    fold.focused |= token("wfocus=") == Some("1");
+                    if token("active=") == Some("1") {
+                        fold.active.push((*sid).to_string());
+                    }
+                }
+                Err(_) => unknown += 1,
+            },
+            None => unknown += 1,
+        }
+    }
+    let mut rows = Vec::with_capacity(windows.len() + 2);
+    for (id, fold) in windows {
+        let active = if fold.active.is_empty() {
+            "-".to_string()
+        } else {
+            fold.active.join(",")
+        };
+        rows.push(format!(
+            "{pid} window={id} focused={} sessions={} active={active}",
+            u8::from(fold.focused),
+            fold.sessions
+        ));
+    }
+    if detached > 0 {
+        rows.push(format!("{pid} window=none sessions={detached}"));
+    }
+    if unknown > 0 {
+        rows.push(format!("{pid} window=- sessions={unknown}"));
+    }
+    rows
+}
+
+/// The additive `key=value` columns of one whitespace-split `sessions` line:
+/// walked BACKWARDS from the end until the `meta=` token that closes the
+/// positional columns, and EMPTY when that anchor is never met — so nothing
+/// before it (the title above all, which any program can set to `window=7`)
+/// is ever taken for a column, and a pre-roster server with no `meta=` at all
+/// recognises no tail whatever its title spells. Reading from the end is what
+/// lets an empty title (two spaces, collapsed by the split) cost nothing.
+fn roster_tail<'a>(fields: &[&'a str]) -> Vec<&'a str> {
+    let mut tail = Vec::new();
+    for field in fields.iter().rev() {
+        if field.starts_with("meta=") {
+            return tail;
+        }
+        if !field.contains('=') {
+            break;
+        }
+        tail.push(*field);
+    }
+    Vec::new()
+}
+
+/// Exit code for "could not LOOK, or could not REACH": sockets (or a named
+/// instance) were found and none answered, or the directory is missing,
+/// unreadable or unresolvable. DISTINCT from 1, which `ls`/`instances`/`windows`
+/// now reserve for a readable directory holding no instance socket. Additive over
+/// the 0/1/124 contract: still nonzero for `nonzero == failure` scripts.
+const EXIT_UNREACHABLE: u8 = 2;
+
+/// The `ls`/`instances`/`windows` verdict — PURE, so every line is table-testable: `dir`
+/// is what the directory turned out to be, `probes` every socket dialled with
+/// its classified outcome, and the result is the stderr message (without the
+/// `aterm-ctl: ` prefix [`stderr_line`] adds) plus the exit code. Any probe
+/// that `Answered` is the success path: `("", 0)`, nothing to report.
+///
+/// The fleet-wide claim "no live aterm instances found" comes from exactly ONE
+/// arm — a readable directory with nothing in it. Every other arm names the
+/// directory or the socket AND the cause, and the found-but-unreached arms end
+/// with ONE hint chosen by the dominant cause (ties go to the most actionable).
+/// The code is 124 only when EVERY probe timed out — a wedged fleet, not an
+/// unreachable one.
+fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String, u8) {
+    if probes
+        .iter()
+        .any(|(_, _, p)| matches!(p, Probe::Answered(_)))
+    {
+        return (String::new(), 0);
+    }
+    let (mut msg, in_dir): (String, Option<&Path>) = match &dir {
+        DirOutcome::Unresolvable => {
+            return (
+                format!("cannot resolve the control-socket directory ({DIR_ENV_UNSET})"),
+                EXIT_UNREACHABLE,
+            );
+        }
+        DirOutcome::Missing { path, why } => {
+            let shown = path.display();
+            return (
+                format!("control-socket directory {shown} does not exist ({why})"),
+                EXIT_UNREACHABLE,
+            );
+        }
+        DirOutcome::Unreadable { path, err } => {
+            let shown = path.display();
+            return (
+                format!(
+                    "control-socket directory {shown} exists but cannot be read: {err} \
+                     — a sandbox may be refusing readdir(), or the directory belongs to \
+                     another user"
+                ),
+                EXIT_UNREACHABLE,
+            );
+        }
+        DirOutcome::Empty(path) => {
+            let shown = path.display();
+            return (
+                format!("no live aterm instances found (looked in {shown})"),
+                1,
+            );
+        }
+        DirOutcome::Found { path, n } => {
+            let shown = path.display();
+            let plural = if *n == 1 { "" } else { "s" };
+            (
+                format!("found {n} control socket{plural} in {shown} but could not reach any:"),
+                Some(path.as_path()),
+            )
+        }
+        DirOutcome::Scoped => (
+            "the addressed instance did not answer (wrong --sock/--pid, not running, \
+             or a different user):"
+                .to_string(),
+            None,
+        ),
+    };
+    let labels: Vec<String> = probes
+        .iter()
+        .map(|(_, sock, _)| socket_label(sock, in_dir))
+        .collect();
+    let width = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    for ((pid, _, probe), label) in probes.iter().zip(&labels) {
+        msg.push_str("\n  ");
+        msg.push_str(label);
+        msg.push_str(&" ".repeat(width.saturating_sub(label.chars().count())));
+        msg.push_str("  ");
+        msg.push_str(&probe_cause(*pid, probe));
+    }
+    if let Some(hint) = dominant_hint(probes, in_dir) {
+        msg.push_str("\n  hint: ");
+        msg.push_str(&hint);
+    }
+    let all_timed_out =
+        !probes.is_empty() && probes.iter().all(|(_, _, p)| matches!(p, Probe::Timeout));
+    let code = if all_timed_out {
+        EXIT_TIMEOUT
+    } else {
+        EXIT_UNREACHABLE
+    };
+    (msg, code)
+}
+
+/// How a socket is named in the report: its file name when it lives in the
+/// directory the report is about, else its full path (an explicit-socket
+/// instance's out-of-dir socket, or a `--sock` target).
+fn socket_label(sock: &str, in_dir: Option<&Path>) -> String {
+    let p = Path::new(sock);
+    match (in_dir, p.file_name()) {
+        (Some(dir), Some(name)) if p.parent() == Some(dir) => name.to_string_lossy().into_owned(),
+        _ => sock.to_string(),
+    }
+}
+
+/// The one-line cause for a socket that did not answer. `pid` is the pid the
+/// socket names (`0` = none). A refused connect is labelled by liveness, and a
+/// denied one by errno: `EPERM` (1) is what a seatbelt hands back, so it names
+/// the sandbox outright; anything else (`EACCES`, `ENOTCONN`) could as well be
+/// another user's socket mode, and says so.
+fn probe_cause(pid: u32, probe: &Probe) -> String {
+    match probe {
+        Probe::Answered(lines) => {
+            let n = lines.len();
+            format!("answered ({n} lines)")
+        }
+        Probe::Refused {
+            pid_running: Some(false),
+        } => format!("connect: Connection refused — stale, pid {pid} is not running"),
+        Probe::Refused {
+            pid_running: Some(true),
+        } => format!(
+            "connect: Connection refused — pid {pid} is running but nothing is serving this socket"
+        ),
+        Probe::Refused { pid_running: None } => {
+            "connect: Connection refused — nothing is serving this socket (it names no pid)"
+                .to_string()
+        }
+        Probe::Denied(e) => {
+            if e.raw_os_error() == Some(1) {
+                format!("connect: {e} — a sandbox is refusing AF_UNIX connect()")
+            } else {
+                format!(
+                    "connect: {e} — another user's socket, or a sandbox refusing AF_UNIX connect()"
+                )
+            }
+        }
+        Probe::NoToken(path, e) => {
+            let shown = path.display();
+            format!("token {shown} unreadable: {e}")
+        }
+        Probe::AuthRejected => {
+            "server rejected the token (ERR auth) — a restarted instance rewrites its token; re-run"
+                .to_string()
+        }
+        Probe::Timeout => "timed out after 2s".to_string(),
+        Probe::Other(e) => e.to_string(),
+    }
+}
+
+/// The failure classes a hint is chosen among, in PRIORITY order: when two
+/// classes tie for the most sockets, the earlier one wins because its remedy
+/// is the one the reader can act on (a denied connect is fixed by an
+/// allowance; a stale socket beside it is fixed by nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    Denied,
+    NoToken,
+    AuthRejected,
+    Timeout,
+    Refused,
+    Other,
+}
+
+const CAUSE_PRIORITY: [Cause; 6] = [
+    Cause::Denied,
+    Cause::NoToken,
+    Cause::AuthRejected,
+    Cause::Timeout,
+    Cause::Refused,
+    Cause::Other,
+];
+
+fn cause_of(probe: &Probe) -> Option<Cause> {
+    match probe {
+        Probe::Answered(_) => None,
+        Probe::Refused { .. } => Some(Cause::Refused),
+        Probe::Denied(_) => Some(Cause::Denied),
+        Probe::NoToken(..) => Some(Cause::NoToken),
+        Probe::AuthRejected => Some(Cause::AuthRejected),
+        Probe::Timeout => Some(Cause::Timeout),
+        Probe::Other(_) => Some(Cause::Other),
+    }
+}
+
+/// The cause most sockets share, ties broken by [`CAUSE_PRIORITY`].
+fn dominant_cause(probes: &[(u32, String, Probe)]) -> Option<Cause> {
+    let mut best: Option<(usize, Cause)> = None;
+    for cause in CAUSE_PRIORITY {
+        let n = probes
+            .iter()
+            .filter(|(_, _, p)| cause_of(p) == Some(cause))
+            .count();
+        if n > 0 && best.is_none_or(|(best_n, _)| n > best_n) {
+            best = Some((n, cause));
+        }
+    }
+    best.map(|(_, cause)| cause)
+}
+
+/// The ONE hint block for the dominant cause. For a denied connect the
+/// directories to allow are the parents of the sockets that were actually
+/// refused — each named once, in probe order — so the Codex flag can be pasted
+/// as printed and covers every refused socket: an explicit-`$ATERM_CONTROL_SOCK`
+/// instance publishes its socket outside the fleet directory (discovery finds it
+/// through `graph/<sid>`), and a hint that always named the fleet directory left
+/// that socket refused after the paste. The fleet directory is only the fallback
+/// for a socket path with no parent to name.
+fn dominant_hint(probes: &[(u32, String, Probe)], in_dir: Option<&Path>) -> Option<String> {
+    let hint = match dominant_cause(probes)? {
+        Cause::Denied => {
+            let mut dirs: Vec<String> = Vec::new();
+            for (_, sock, probe) in probes {
+                if !matches!(probe, Probe::Denied(_)) {
+                    continue;
+                }
+                let Some(parent) = Path::new(sock)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                else {
+                    continue;
+                };
+                let shown = parent.display().to_string();
+                if !dirs.contains(&shown) {
+                    dirs.push(shown);
+                }
+            }
+            if dirs.is_empty() {
+                dirs.push(in_dir.map(|d| d.display().to_string()).unwrap_or_default());
+            }
+            let flags: Vec<String> = dirs
+                .iter()
+                .map(|d| format!("--allow-unix-socket \"{d}\""))
+                .collect();
+            format!(
+                "inside Codex CLI run with {} or ask for the command to be escalated;\n        \
+                 `aterm ctl --sock <path> sessions` shows one socket's own answer",
+                flags.join(" ")
+            )
+        }
+        Cause::NoToken => "the token beside a socket must be readable by THIS user (it is \
+                           mode 0600); another user's instance cannot be driven"
+            .to_string(),
+        Cause::AuthRejected => "re-run once (a restarting instance rewrites its token); if it \
+                                persists, `aterm ctl --sock <path> sessions` shows one socket's \
+                                own answer"
+            .to_string(),
+        Cause::Timeout => "no answer within 2s — the instance may be wedged or busy; \
+                           `aterm ctl --sock <path> --timeout 30 sessions` waits longer"
+            .to_string(),
+        Cause::Refused => {
+            let booting = probes.iter().any(|(_, _, p)| {
+                matches!(
+                    p,
+                    Probe::Refused {
+                        pid_running: Some(true)
+                    }
+                )
+            });
+            if booting {
+                "a pid that is running but not serving is still starting up (or exited \
+                 without cleanup); retry in a moment"
+                    .to_string()
+            } else {
+                "nothing is serving these sockets — leftovers of exited instances; launch \
+                 aterm.app (`open -a aterm`) and retry"
+                    .to_string()
+            }
+        }
+        Cause::Other => {
+            "`aterm ctl --sock <path> sessions` shows one socket's own answer".to_string()
+        }
+    };
+    Some(hint)
+}
+
 /// Read the per-launch capability token sitting beside the socket at `path`.
 /// A per-instance socket (reached directly or through the `latest` symlink)
 /// pairs with its `aterm-<pid>.token`; anything else falls back to the
@@ -1767,15 +2396,40 @@ fn run_discovery(
 /// user, or aterm not running); the connection is then attempted without an
 /// `AUTH` line and the server refuses it with `ERR auth`.
 fn read_token_for(path: &str) -> Option<String> {
+    read_token_at(path).ok()
+}
+
+/// [`read_token_for`] with the miss KEPT: which file was looked for, and why
+/// it could not be read (absent, another user's 0600, empty). Discovery
+/// reports that per socket instead of letting the server's bare `ERR auth`
+/// stand in for "the token file is unreadable".
+fn read_token_at(path: &str) -> Result<String, (PathBuf, io::Error)> {
     let p = Path::new(path);
-    let dir = p.parent()?;
+    let (Some(dir), Some(file_name)) = (p.parent(), p.file_name()) else {
+        return Err((
+            PathBuf::from(path),
+            io::Error::new(io::ErrorKind::NotFound, "socket path names no directory"),
+        ));
+    };
     // `latest::target_name` is `read_link` + final component on Unix, and the
     // pointer file's validated contents on Windows — the same relative name.
-    let sock_name = aterm_uds::latest::target_name(p).unwrap_or(p.file_name()?.to_os_string());
-    let token_name = control_socket::token_name_for_sock(&sock_name.to_string_lossy());
-    let raw = std::fs::read_to_string(dir.join(token_name)).ok()?;
+    let sock_name = aterm_uds::latest::target_name(p).unwrap_or_else(|| file_name.to_os_string());
+    let token_path = dir.join(control_socket::token_name_for_sock(
+        &sock_name.to_string_lossy(),
+    ));
+    let raw = match std::fs::read_to_string(&token_path) {
+        Ok(raw) => raw,
+        Err(e) => return Err((token_path, e)),
+    };
     let t = raw.trim().to_string();
-    if t.is_empty() { None } else { Some(t) }
+    if t.is_empty() {
+        Err((
+            token_path,
+            io::Error::new(io::ErrorKind::InvalidData, "token file is empty"),
+        ))
+    } else {
+        Ok(t)
+    }
 }
 
 /// The distinct exit code for a TIMEOUT, additive over the 0=OK / 1=failure
@@ -1850,6 +2504,105 @@ fn dial_needs_verb_error() -> io::Error {
         io::ErrorKind::InvalidInput,
         "ERR dial: give a verb to run on the remote (dial <name> <verb...>)",
     )
+}
+
+/// The discovery verbs this CLIENT answers, none of which takes an argument —
+/// the fleet is the scope, `--sock`/`--pid` narrow it. Read by the dispatch
+/// that intercepts them and by [`discovery_given_arguments`].
+const DISCOVERY_VERBS: [&str; 3] = ["ls", "instances", "windows"];
+
+/// The discovery verb in `parts` when it carries arguments it has no use for;
+/// `None` for a bare one, and for any request that is not a discovery verb. An
+/// agent that types `windows 1` — or `ls 1`, `instances --all` — meant something
+/// (one window? one instance?) that a silently ignored argument would have let
+/// it believe it got; `ls` and `instances` let trailing words through for as
+/// long as they existed, which is exactly the hole the house rule names.
+/// Rejected up front, before any socket is dialled.
+fn discovery_given_arguments(parts: &[String]) -> Option<&'static str> {
+    let verb = parts.first().map(String::as_str)?;
+    let verb = DISCOVERY_VERBS.iter().copied().find(|v| *v == verb)?;
+    (parts.len() > 1).then_some(verb)
+}
+
+/// The usage error for a discovery verb given arguments: the synopsis, in the
+/// `ERR usage: <verb>` shape every server-side usage error takes. Composed with
+/// `push_str` like the other client errors. Exits FAILURE.
+fn discovery_usage_error(verb: &str) -> io::Error {
+    let mut msg = String::from("ERR usage: ");
+    msg.push_str(verb);
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// The verbs the CLIENT VERBS block of `--help` documents — the set `help <verb>`
+/// is answered from that block, here. None of them is in the protocol table, so
+/// the server's `help` cannot know them: `help ls` came back `ERR unknown verb
+/// 'ls' (help lists them)` while `ls` itself worked, which told an agent the
+/// listing verb it had just been taught did not exist.
+const CLIENT_HELP_VERBS: [&str; 4] = ["ls", "instances", "windows", "mux"];
+
+/// The `--help` entry for one client verb, as [`CLIENT_VERBS`] prints it: the
+/// verb's own line plus its continuation lines (the block's 18-column gutter),
+/// up to the next entry or the blank line before the prose — with the 4-column
+/// `--help` indent removed, so the rows read like the server's `help <verb>`
+/// rows. `None` for a verb the block does not document.
+fn client_verb_entry(verb: &str) -> Option<Vec<String>> {
+    const HELP_INDENT: &str = "    ";
+    const CONTINUATION: &str = "                  ";
+    // A verb line is the `--help` indent, the verb padded out to the block's
+    // gutter, then its text starting IN the gutter column. A prose line at the
+    // same indent (`None of the three takes an argument …`) never pads a word
+    // out to the gutter, so it is never taken for a verb — nor is a verb whose
+    // name is a prefix of another's.
+    let head_prefix = format!(
+        "{HELP_INDENT}{verb:<width$}",
+        width = CONTINUATION.len() - HELP_INDENT.len()
+    );
+    let mut lines = CLIENT_VERBS.lines();
+    let head = lines.find(|l| {
+        l.strip_prefix(head_prefix.as_str())
+            .is_some_and(|text| !text.is_empty() && !text.starts_with(' '))
+    })?;
+    let mut entry = vec![head[HELP_INDENT.len()..].to_string()];
+    entry.extend(
+        lines
+            .take_while(|l| l.starts_with(CONTINUATION))
+            .map(|l| l[HELP_INDENT.len()..].to_string()),
+    );
+    Some(entry)
+}
+
+/// The client-side answer to `help <client verb>`; `None` for every other request,
+/// which goes to the server as before (`help`, `help text`, `help --full`, and a
+/// `help ls extra` the server rejects as `ERR usage`). Framed exactly as the
+/// server frames its own `help <verb>` — `OK <n>` + n rows — so the reply prints
+/// through the same shape the server's does and reads the same to a parser.
+fn client_help_reply(parts: &[String]) -> Option<String> {
+    let [verb, name] = parts else {
+        return None;
+    };
+    if verb != "help" || !CLIENT_HELP_VERBS.contains(&name.as_str()) {
+        return None;
+    }
+    let lines = client_verb_entry(name)?;
+    let mut reply = format!("OK {}\n", lines.len());
+    for line in lines {
+        reply.push_str(&line);
+        reply.push('\n');
+    }
+    Some(reply)
+}
+
+/// Print a line-framed reply (`OK <n>` + n rows) the way [`exchange`] prints a
+/// server's: the rows to stdout, the header consumed. One buffered write, flushed
+/// explicitly so a broken pipe surfaces as the error it is.
+fn print_framed_lines(reply: &str) -> io::Result<()> {
+    let stdout = stdout_handle();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for line in reply.lines().skip(1) {
+        out.write_all(line.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
 }
 
 /// The command-line arguments (already past `argv[0]`) as UTF-8 strings. The CLI
@@ -2040,10 +2793,22 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     // which is the footgun this closes: an agent that launched an isolated
     // instance under its own `$XDG_RUNTIME_DIR` and then ran `--sock <that> ls`
     // was handed the USER'S REAL terminals and could go on to drive them).
-    if request_parts.first().map(String::as_str) == Some("instances")
-        || request_parts.first().map(String::as_str) == Some("ls")
+    if let Some(verb) = request_parts
+        .first()
+        .map(String::as_str)
+        .filter(|v| DISCOVERY_VERBS.contains(v))
     {
-        return run_discovery(&request_parts[0], sock.as_deref(), pid, nesting.as_ref());
+        if let Some(verb) = discovery_given_arguments(&request_parts) {
+            return Err(discovery_usage_error(verb));
+        }
+        return run_discovery(verb, sock.as_deref(), pid, nesting.as_ref());
+    }
+    // `help <client verb>` is answered here as well, from the same CLIENT VERBS
+    // block `--help` prints — the server's `help` knows only the protocol table
+    // and would call `ls` an unknown verb. No socket is needed for it.
+    if let Some(reply) = client_help_reply(&request_parts) {
+        print_framed_lines(&reply)?;
+        return Ok(ExitCode::SUCCESS);
     }
 
     let path = resolve_path(
@@ -2482,7 +3247,7 @@ const MAX_BODY_BYTES: usize = 256 << 20; // 256 MiB
 const MAX_LINE_BYTES: usize = 8 << 20; // 8 MiB
 
 /// Hard deadline on each socket read/write in [`exchange`]. This CANNOT be
-/// [`query_lines`]' 2 s discovery deadline: the blocking verbs (`await`,
+/// [`probe_lines`]' 2 s discovery deadline: the blocking verbs (`await`,
 /// `ready`, `wait`) legitimately hold their reply until the server-side
 /// timeout, and the server clamps that timeout to 600 000 ms
 /// (control_session.rs / control_selection.rs); `update check` is answered
@@ -2859,7 +3624,7 @@ fn receive_guarded_artifact_reply(
 /// or whatever `--timeout SECS` set — `None` disables it) and every reply line
 /// under the [`MAX_LINE_BYTES`] cap, so a wedged or regressed server surfaces as
 /// a clear error instead of an indefinite stall or an unboundedly growing String
-/// — the same defenses [`query_lines`] applies to discovery.
+/// — the same defenses [`probe_lines`] applies to discovery.
 ///
 /// `timeout_explicit` distinguishes a user-supplied `--timeout` from the default:
 /// it matters only for `subscribe`, whose default watches FOREVER but whose
@@ -2878,7 +3643,7 @@ fn exchange(
     let path = &aterm_uds::latest::resolve(path);
     let stream = connect_stream(path)?;
 
-    // Bound every socket operation, as `query_lines` already does for
+    // Bound every socket operation, as `probe_lines` already does for
     // discovery: a wedged server (or one that stalls mid-reply) must surface
     // as a timeout error, never hang aterm-ctl forever. The default deadline is
     // [`EXCHANGE_DEADLINE`], not discovery's 2 s — it has to clear the blocking
@@ -3922,7 +4687,7 @@ mod tests {
         );
     }
 
-    /// The two CLIENT-answered discovery verbs (`ls`, `instances`) — intercepted
+    /// The CLIENT-answered discovery verbs (`ls`, `instances`, `windows`) — intercepted
     /// by aterm-ctl, so NOT in the generated protocol catalog — are documented in
     /// `--help` with their output shapes, and the subscribe PUSH-FRAME grammar is
     /// spelled out (an AI reading `--help` must not reverse-engineer either).
@@ -3939,6 +4704,64 @@ mod tests {
         assert!(
             help.contains("<pid> <session-count> <sock>"),
             "instances output shape documented"
+        );
+        // The roster's window/detail columns and the per-window fold (F2/F5).
+        assert!(
+            help.contains("window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->"),
+            "ls trailing columns documented"
+        );
+        assert!(
+            help.contains("<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]"),
+            "windows output shape documented"
+        );
+        for (verb, sentence) in [
+            ("ls", "`ls 1` is `ERR usage: ls`"),
+            ("instances", "`instances 1` is `ERR usage: instances`"),
+            ("windows", "`windows 1` is `ERR usage:\n    windows`"),
+        ] {
+            assert!(
+                help.contains(sentence),
+                "{verb} documents that it takes no argument"
+            );
+        }
+        // A headless instance is NOT `window=none`: it owns logical window 0,
+        // and both listings say so, so a reader of `ls` on a headless peer is
+        // not sent looking for a detached session.
+        assert!(
+            help.contains(
+                "a headless instance reports its one logical
+                  window 0"
+            ) && help.contains("a headless instance folds under its one logical window 0"),
+            "ls and windows both document headless placement as window 0"
+        );
+        // What `focused=`/`wfocus=` mean — the question a driver asks first when
+        // two windows are open: aterm's most recently focused window, which a
+        // minimize or an app deactivation does not change (the OS key window is
+        // a different fact). Both listings say so.
+        assert!(
+            help.contains(
+                "wfocus= that window is aterm's most
+                  recently focused one (unchanged by a minimize or by the app
+                  deactivating)"
+            ),
+            "ls documents wfocus="
+        );
+        assert!(
+            help.contains(
+                "focused= aterm's most recently focused window — one per
+                  instance, unchanged by a minimize or by the app deactivating"
+            ),
+            "windows documents focused="
+        );
+        assert!(
+            help.contains("`help ls` / `help instances` / `help windows` / `help mux` print the"),
+            "the block says help <client verb> is answered from it"
+        );
+        assert!(
+            completion_verb_list()
+                .split_whitespace()
+                .any(|v| v == "windows"),
+            "windows completes like ls/instances"
         );
         // The push-frame wire grammar names every frame shape.
         assert!(help.contains("PUSH FRAMES"), "push-frame section present");
@@ -4166,6 +4989,796 @@ mod tests {
             discovery_targets(None, None).expect("unscoped never errors"),
             live_instances()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // DISCOVERY MUST NEVER SAY "EMPTY" WHEN IT MEANS "COULD NOT LOOK" (F8)
+    //
+    // Fixture: the two tables in docs/AGENT-EXPERIENCE-2026-08-26.md §2.8 —
+    // five unrelated conditions that all printed `no live aterm instances
+    // found` against a live five-session instance, plus the honest `--sock`
+    // control. Every row below is one of them, then the remaining causes.
+    // -----------------------------------------------------------------------
+
+    /// A pid no host hands out (above every pid_max), so `pid_alive` is false.
+    const DEAD_PID: u32 = 0x7fff_fff0;
+
+    /// The fleet-wide claim, licensed by exactly one condition.
+    const FLEET_CLAIM: &str = "no live aterm instances found";
+
+    fn strings(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    /// `help <client verb>` is answered from the CLIENT VERBS block, framed like
+    /// the server's own `help <verb>`: `OK <n>` then exactly the entry's rows —
+    /// the verb line and its continuation lines, nothing from the neighbouring
+    /// entry or the prose paragraph, each row present verbatim in `--help`.
+    #[test]
+    fn help_for_a_client_verb_is_answered_from_the_client_block() {
+        let help = help_text();
+        for verb in CLIENT_HELP_VERBS {
+            let reply = client_help_reply(&strings(&["help", verb]))
+                .unwrap_or_else(|| panic!("help {verb} is client-answered"));
+            let mut lines = reply.lines();
+            let header = lines.next().expect("framed");
+            let rows: Vec<&str> = lines.collect();
+            assert_eq!(header, format!("OK {}", rows.len()), "{verb}: {reply}");
+            assert!(rows.len() > 1, "{verb}: an entry has continuation rows");
+            assert!(
+                rows[0].starts_with(&format!("{verb} ")),
+                "{verb}: the first row is the verb line: {}",
+                rows[0]
+            );
+            for row in &rows[1..] {
+                assert!(
+                    row.starts_with("              "),
+                    "{verb}: continuation rows keep the gutter: {row}"
+                );
+                assert!(
+                    !row.trim_start().starts_with("None of the three"),
+                    "{verb}: the prose paragraph is not part of an entry"
+                );
+            }
+            for row in &rows {
+                assert!(
+                    help.contains(&format!("    {row}\n")),
+                    "{verb}: every row is a `--help` line verbatim: {row}"
+                );
+            }
+        }
+        // The specific reply an agent reading the F2 finding asked for.
+        let windows = client_help_reply(&strings(&["help", "windows"])).unwrap();
+        assert!(
+            windows.contains("<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]"),
+            "{windows}"
+        );
+        assert!(windows.contains("could not say"), "{windows}");
+        let ls = client_help_reply(&strings(&["help", "ls"])).unwrap();
+        assert!(ls.contains("detail=<pct|->[ *]"), "{ls}");
+        assert!(!ls.contains("instances     one line per"), "{ls}");
+    }
+
+    /// Everything that is not exactly `help <client verb>` still reaches the
+    /// server: a bare `help`, `help <table verb>`, `help --full`, an unknown
+    /// name (the server's `ERR unknown verb` is the right answer there), a
+    /// trailing argument (the server's `ERR usage`), and a selector form.
+    #[test]
+    fn help_for_a_server_verb_still_reaches_the_server() {
+        for parts in [
+            vec!["help"],
+            vec!["help", "text"],
+            vec!["help", "sessions"],
+            vec!["help", "--full"],
+            vec!["help", "nonesuch"],
+            vec!["help", "ls", "extra"],
+            vec!["@s-abc", "help", "ls"],
+            vec!["ls"],
+            vec!["text", "ls"],
+        ] {
+            assert_eq!(
+                client_help_reply(&strings(&parts)),
+                None,
+                "{parts:?} is the server's to answer"
+            );
+        }
+        // And every client verb the block documents is one the table lacks —
+        // the reason the interception exists — while `help` itself is a table verb
+        // framed as lines, the shape the client reply copies.
+        for verb in CLIENT_HELP_VERBS {
+            assert!(
+                aterm_types::control_verbs::spec(verb).is_none(),
+                "{verb} must stay out of the protocol table"
+            );
+        }
+        assert_eq!(
+            aterm_types::control_verbs::framing_of("help", "help ls"),
+            aterm_types::control_verbs::Framing::Lines
+        );
+    }
+
+    /// A verb the block does not document has no entry, and the parser reads an
+    /// entry as verb line + gutter rows only — a prose line at the 4-column
+    /// indent (`None of the three …`) is never mistaken for a verb.
+    #[test]
+    fn client_verb_entry_reads_only_documented_verbs() {
+        assert_eq!(client_verb_entry("text"), None);
+        assert_eq!(client_verb_entry("None"), None);
+        assert_eq!(client_verb_entry("l"), None, "a prefix is not a verb");
+        let ls = client_verb_entry("ls").expect("documented");
+        assert!(
+            ls[0].starts_with("ls            every session"),
+            "{}",
+            ls[0]
+        );
+    }
+
+    /// The Codex allowance names the directory of every socket that was actually
+    /// refused, once each and in probe order — never a blanket fleet directory:
+    /// an explicit-`$ATERM_CONTROL_SOCK` instance publishes its socket elsewhere,
+    /// and a hint the agent pastes must cover that socket too.
+    #[test]
+    fn the_codex_hint_names_each_denied_directory_once() {
+        let probes = vec![
+            (1, fleet_sock(1), Probe::Denied(eperm())),
+            (2, fleet_sock(2), Probe::Denied(eperm())),
+            (
+                3,
+                "/private/tmp/agent/aterm-3.sock".to_string(),
+                Probe::Denied(eperm()),
+            ),
+            (
+                4,
+                "/elsewhere/aterm-4.sock".to_string(),
+                Probe::Refused {
+                    pid_running: Some(false),
+                },
+            ),
+        ];
+        let hint = dominant_hint(&probes, Some(Path::new(FLEET))).expect("denied dominates");
+        assert!(
+            hint.contains(&format!(
+                "--allow-unix-socket \"{FLEET}\" --allow-unix-socket \"/private/tmp/agent\""
+            )),
+            "{hint}"
+        );
+        assert_eq!(hint.matches("--allow-unix-socket").count(), 2, "{hint}");
+        assert!(
+            !hint.contains("/elsewhere"),
+            "a refused (not denied) socket's dir is not offered: {hint}"
+        );
+        // A scoped probe (no fleet dir) names the denied socket's own parent.
+        let scoped = vec![(
+            6,
+            "/tmp/run/aterm-6.sock".to_string(),
+            Probe::Denied(eacces()),
+        )];
+        let hint = dominant_hint(&scoped, None).unwrap();
+        assert!(hint.contains("--allow-unix-socket \"/tmp/run\""), "{hint}");
+        assert_eq!(hint.matches("--allow-unix-socket").count(), 1, "{hint}");
+    }
+
+    fn eperm() -> io::Error {
+        io::Error::from_raw_os_error(1)
+    }
+
+    fn eacces() -> io::Error {
+        io::Error::from_raw_os_error(13)
+    }
+
+    /// One row: what the directory and the probes were, what the report must
+    /// say, what it must NEVER say, and the exit code.
+    struct Row {
+        name: &'static str,
+        dir: DirOutcome,
+        probes: Vec<(u32, String, Probe)>,
+        code: u8,
+        says: &'static [&'static str],
+        never_says: &'static [&'static str],
+    }
+
+    fn check_row(row: Row) {
+        let with_probes = !row.probes.is_empty();
+        let (msg, code) = discovery_report(row.dir, &row.probes);
+        assert_eq!(code, row.code, "[{}] exit code; report:\n{msg}", row.name);
+        for s in row.says {
+            assert!(
+                msg.contains(s),
+                "[{}] must say {s:?}; report:\n{msg}",
+                row.name
+            );
+        }
+        for s in row.never_says {
+            assert!(
+                !msg.contains(s),
+                "[{}] must never say {s:?}; report:\n{msg}",
+                row.name
+            );
+        }
+        // Exactly ONE hint block whenever sockets were dialled, none otherwise.
+        let hints = msg.matches("hint:").count();
+        assert_eq!(
+            hints,
+            usize::from(with_probes),
+            "[{}] hint blocks; report:\n{msg}",
+            row.name
+        );
+    }
+
+    const FLEET: &str = "/Users//someone/Library/Application Support/aterm";
+
+    fn fleet_sock(pid: u32) -> String {
+        format!("{FLEET}/aterm-{pid}.sock")
+    }
+
+    /// The five-condition table of §2.8, plus its `--sock` control row: every
+    /// condition that used to print the fleet claim now names ITS cause, and
+    /// the claim itself survives only for a readable, empty directory.
+    #[test]
+    fn discovery_report_names_the_cause_for_every_row_of_the_f8_table() {
+        let rows = vec![
+            Row {
+                name: "XDG_RUNTIME_DIR set, $XDG_RUNTIME_DIR/aterm does not exist",
+                dir: DirOutcome::Missing {
+                    path: PathBuf::from("/nonexistent/aterm"),
+                    why: "resolved from $XDG_RUNTIME_DIR, which is set — so \
+                          ~/Library/Application Support/aterm was NOT consulted"
+                        .to_string(),
+                },
+                probes: vec![],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "control-socket directory /nonexistent/aterm does not exist",
+                    "$XDG_RUNTIME_DIR",
+                    "~/Library/Application Support/aterm was NOT consulted",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "HOME pointed elsewhere",
+                dir: DirOutcome::Missing {
+                    path: PathBuf::from("/elsewhere/Library/Application Support/aterm"),
+                    why: "resolved from $HOME; no aterm instance has published a socket there"
+                        .to_string(),
+                },
+                probes: vec![],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "control-socket directory /elsewhere/Library/Application Support/aterm does not exist",
+                    "$HOME",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "env -i (no HOME, no XDG_RUNTIME_DIR)",
+                dir: DirOutcome::Unresolvable,
+                probes: vec![],
+                code: EXIT_UNREACHABLE,
+                says: &["cannot resolve the control-socket directory", DIR_ENV_UNSET],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "sandbox denies connect() (EPERM) — the Codex case, beside a stale socket",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 2,
+                },
+                probes: vec![
+                    (10718, fleet_sock(10718), Probe::Denied(eperm())),
+                    (
+                        10274,
+                        fleet_sock(10274),
+                        Probe::Refused {
+                            pid_running: Some(false),
+                        },
+                    ),
+                ],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "found 2 control sockets in /Users//someone/Library/Application Support/aterm but could not reach any:",
+                    "\n  aterm-10718.sock  connect: Operation not permitted (os error 1) — a sandbox is refusing AF_UNIX connect()",
+                    "\n  aterm-10274.sock  connect: Connection refused — stale, pid 10274 is not running",
+                    "hint: inside Codex CLI run with --allow-unix-socket \"/Users//someone/Library/Application Support/aterm\"",
+                    "ask for the command to be escalated",
+                    "`aterm ctl --sock <path> sessions` shows one socket's own answer",
+                ],
+                never_says: &[FLEET_CLAIM, "aterm isn't running"],
+            },
+            Row {
+                name: "token file unreadable → the server answers ERR auth",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 1,
+                },
+                probes: vec![(
+                    10718,
+                    fleet_sock(10718),
+                    Probe::NoToken(
+                        PathBuf::from(format!("{FLEET}/aterm-10718.token")),
+                        eacces(),
+                    ),
+                )],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "found 1 control socket in",
+                    "\n  aterm-10718.sock  token /Users//someone/Library/Application Support/aterm/aterm-10718.token unreadable: Permission denied (os error 13)",
+                    "hint: the token beside a socket must be readable by THIS user",
+                ],
+                never_says: &[FLEET_CLAIM, "sockets in"],
+            },
+            Row {
+                name: "(control) stale socket of a dead pid, --sock form",
+                dir: DirOutcome::Scoped,
+                probes: vec![(
+                    10274,
+                    "/tmp/aterm-10274.sock".to_string(),
+                    Probe::Refused {
+                        pid_running: Some(false),
+                    },
+                )],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "the addressed instance did not answer (wrong --sock/--pid, not running, or a different user):",
+                    "\n  /tmp/aterm-10274.sock  connect: Connection refused — stale, pid 10274 is not running",
+                    "open -a aterm",
+                ],
+                never_says: &[FLEET_CLAIM, "found 1 control socket"],
+            },
+        ];
+        for row in rows {
+            check_row(row);
+        }
+    }
+
+    /// The remaining causes, the exit-code ladder, and the report's shape rules:
+    /// `Empty` is the ONE arm that says the claim (and names where it looked),
+    /// every timeout is 124, one timeout beside a refusal is 2, an out-of-dir
+    /// socket keeps its full path, ties for the hint go to the actionable cause,
+    /// and an answered fleet reports nothing.
+    #[test]
+    fn discovery_report_covers_stale_running_auth_timeout_and_empty() {
+        let rows = vec![
+            Row {
+                name: "readable, empty directory — the one honest fleet claim",
+                dir: DirOutcome::Empty(PathBuf::from(FLEET)),
+                probes: vec![],
+                code: 1,
+                says: &[
+                    "no live aterm instances found (looked in /Users//someone/Library/Application Support/aterm)",
+                ],
+                never_says: &["could not"],
+            },
+            Row {
+                name: "directory exists but readdir is refused",
+                dir: DirOutcome::Unreadable {
+                    path: PathBuf::from(FLEET),
+                    err: eperm(),
+                },
+                probes: vec![],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "control-socket directory /Users//someone/Library/Application Support/aterm exists but cannot be read: Operation not permitted (os error 1)",
+                    "readdir()",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "refused, but the pid IS running (still booting)",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 1,
+                },
+                probes: vec![(
+                    4242,
+                    fleet_sock(4242),
+                    Probe::Refused {
+                        pid_running: Some(true),
+                    },
+                )],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "\n  aterm-4242.sock  connect: Connection refused — pid 4242 is running but nothing is serving this socket",
+                    "hint: a pid that is running but not serving is still starting up",
+                ],
+                never_says: &[FLEET_CLAIM, "stale"],
+            },
+            Row {
+                name: "refused, pid unknown (a --sock name that encodes none)",
+                dir: DirOutcome::Scoped,
+                probes: vec![(
+                    0,
+                    "/tmp/run/c.sock".to_string(),
+                    Probe::Refused { pid_running: None },
+                )],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "\n  /tmp/run/c.sock  connect: Connection refused — nothing is serving this socket (it names no pid)",
+                ],
+                never_says: &[FLEET_CLAIM, "pid 0"],
+            },
+            Row {
+                name: "the token on disk is not the one the server holds",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 1,
+                },
+                probes: vec![(10718, fleet_sock(10718), Probe::AuthRejected)],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "\n  aterm-10718.sock  server rejected the token (ERR auth) — a restarted instance rewrites its token; re-run",
+                    "hint: re-run once",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "every socket timed out → 124",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 2,
+                },
+                probes: vec![
+                    (1, fleet_sock(1), Probe::Timeout),
+                    (2, fleet_sock(2), Probe::Timeout),
+                ],
+                code: EXIT_TIMEOUT,
+                says: &[
+                    "\n  aterm-1.sock  timed out after 2s",
+                    "\n  aterm-2.sock  timed out after 2s",
+                    "hint: no answer within 2s",
+                    "--timeout 30 sessions",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "one timeout beside a refusal → 2, not 124",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 2,
+                },
+                probes: vec![
+                    (1, fleet_sock(1), Probe::Timeout),
+                    (
+                        2,
+                        fleet_sock(2),
+                        Probe::Refused {
+                            pid_running: Some(false),
+                        },
+                    ),
+                ],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "timed out after 2s",
+                    "stale, pid 2 is not running",
+                    "hint: no answer within 2s",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "an explicit-socket instance keeps its out-of-dir path; Other passes the cause through",
+                dir: DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 1,
+                },
+                probes: vec![(
+                    77,
+                    "/private/tmp/agent/x.sock".to_string(),
+                    Probe::Other(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "connect: No such file or directory (os error 2)",
+                    )),
+                )],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "\n  /private/tmp/agent/x.sock  connect: No such file or directory (os error 2)",
+                    "hint: `aterm ctl --sock <path> sessions`",
+                ],
+                never_says: &[FLEET_CLAIM],
+            },
+            Row {
+                name: "tie for the hint: one denied, one stale → the Codex allowance wins",
+                dir: DirOutcome::Scoped,
+                probes: vec![
+                    (
+                        5,
+                        "/tmp/run/aterm-5.sock".to_string(),
+                        Probe::Refused {
+                            pid_running: Some(false),
+                        },
+                    ),
+                    (
+                        6,
+                        "/tmp/run/aterm-6.sock".to_string(),
+                        Probe::Denied(eacces()),
+                    ),
+                ],
+                code: EXIT_UNREACHABLE,
+                says: &[
+                    "\n  /tmp/run/aterm-6.sock  connect: Permission denied (os error 13) — another user's socket, or a sandbox refusing AF_UNIX connect()",
+                    "hint: inside Codex CLI run with --allow-unix-socket \"/tmp/run\"",
+                ],
+                never_says: &[FLEET_CLAIM, "open -a aterm"],
+            },
+        ];
+        for row in rows {
+            check_row(row);
+        }
+
+        // An answered probe is the success path: nothing to report, exit 0 —
+        // and a stale neighbour is NOT mentioned (no noise on success).
+        let (msg, code) = discovery_report(
+            DirOutcome::Found {
+                path: PathBuf::from(FLEET),
+                n: 2,
+            },
+            &[
+                (
+                    10718,
+                    fleet_sock(10718),
+                    Probe::Answered(vec!["r s-1".to_string()]),
+                ),
+                (
+                    10274,
+                    fleet_sock(10274),
+                    Probe::Refused {
+                        pid_running: Some(false),
+                    },
+                ),
+            ],
+        );
+        assert_eq!((msg.as_str(), code), ("", 0));
+    }
+
+    /// The per-socket label is aligned into a column so the causes line up.
+    #[test]
+    fn discovery_report_aligns_the_cause_column() {
+        let (msg, _) = discovery_report(
+            DirOutcome::Found {
+                path: PathBuf::from(FLEET),
+                n: 2,
+            },
+            &[
+                (7, fleet_sock(7), Probe::Timeout),
+                (10718, fleet_sock(10718), Probe::Timeout),
+            ],
+        );
+        assert!(msg.contains("\n  aterm-7.sock      timed out"), "{msg}");
+        assert!(msg.contains("\n  aterm-10718.sock  timed out"), "{msg}");
+    }
+
+    /// `connect()` failures classify by KIND, never by guess: a permission
+    /// error is Denied (a sandbox or a foreign user), a refusal is Refused with
+    /// no liveness verdict for a pid-less socket, a deadline is Timeout, and
+    /// the rest keep the raw cause under the `connect:` frame.
+    #[test]
+    fn connect_failures_classify_by_kind_not_by_guess() {
+        assert!(matches!(
+            classify_connect_error(eperm(), 0),
+            Probe::Denied(_)
+        ));
+        assert!(matches!(
+            classify_connect_error(eacces(), 0),
+            Probe::Denied(_)
+        ));
+        assert!(matches!(
+            classify_connect_error(io::Error::new(io::ErrorKind::NotConnected, "x"), 0),
+            Probe::Denied(_)
+        ));
+        assert!(matches!(
+            classify_connect_error(io::Error::new(io::ErrorKind::ConnectionRefused, "x"), 0),
+            Probe::Refused { pid_running: None }
+        ));
+        assert!(matches!(
+            classify_connect_error(
+                io::Error::new(io::ErrorKind::ConnectionRefused, "x"),
+                DEAD_PID
+            ),
+            Probe::Refused {
+                pid_running: Some(false)
+            }
+        ));
+        assert!(matches!(
+            classify_connect_error(io::Error::new(io::ErrorKind::WouldBlock, "x"), 0),
+            Probe::Timeout
+        ));
+        match classify_connect_error(io::Error::new(io::ErrorKind::NotFound, "gone"), 0) {
+            Probe::Other(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::NotFound);
+                assert_eq!(e.to_string(), "connect: gone");
+            }
+            other => panic!("a vanished socket is Other, got {other:?}"),
+        }
+        assert!(matches!(
+            io_probe(io::Error::new(io::ErrorKind::WouldBlock, "x")),
+            Probe::Timeout
+        ));
+        assert!(matches!(
+            io_probe(io::Error::new(io::ErrorKind::TimedOut, "x")),
+            Probe::Timeout
+        ));
+        assert!(matches!(
+            io_probe(io::Error::new(io::ErrorKind::BrokenPipe, "x")),
+            Probe::Other(_)
+        ));
+    }
+
+    /// A token miss names the FILE it looked for (the per-instance mirror,
+    /// resolved in the socket's own directory), so the report can print it;
+    /// the `Option` wrapper other callers use is unchanged.
+    #[test]
+    fn a_token_miss_names_the_file_it_looked_for() {
+        let (path, err) =
+            read_token_at("/nonexistent-aterm-dir/aterm-77.sock").expect_err("no such token");
+        assert_eq!(path, Path::new("/nonexistent-aterm-dir/aterm-77.token"));
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(read_token_for("/nonexistent-aterm-dir/aterm-77.sock").is_none());
+    }
+
+    /// A mock instance at `dir/<name>` that accepts ONE connection, reads
+    /// request lines past any `AUTH` line, answers `reply` (an EMPTY reply
+    /// hangs up instead), then drains until the client closes. Returns the
+    /// socket path and the thread, whose value is the request line it saw.
+    #[cfg(unix)]
+    fn mock_instance(
+        dir: &Path,
+        name: &str,
+        reply: &'static [u8],
+    ) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, Read, Write};
+        let sock = dir.join(name);
+        let _ = std::fs::remove_file(&sock);
+        let listener = aterm_uds::CtlListener::bind(&sock).expect("bind mock instance");
+        let srv = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = r.read_line(&mut line).expect("read request line");
+                if n == 0 || !line.starts_with("AUTH ") {
+                    break;
+                }
+            }
+            if reply.is_empty() {
+                return line; // hang up without a word
+            }
+            let mut w = conn;
+            w.write_all(reply).expect("write reply");
+            w.flush().expect("flush");
+            let mut sink = Vec::new();
+            let _ = r.read_to_end(&mut sink);
+            line
+        });
+        (sock.to_str().expect("utf8 path").to_string(), srv)
+    }
+
+    /// The probe against REAL sockets: a bound-then-abandoned socket file is
+    /// Refused (labelled by the pid's liveness), a missing file is Other,
+    /// `ERR auth` is NoToken when nothing was on disk and AuthRejected when a
+    /// token WAS sent, `OK n` is Answered, a non-auth `ERR` keeps the server's
+    /// words, and a hang-up is Other(UnexpectedEof). UNIX ONLY: the mock is a
+    /// std `UnixListener`.
+    #[cfg(unix)]
+    #[test]
+    fn probe_lines_classifies_real_sockets() {
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-f8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("private dir");
+
+        // Refused: a socket FILE with nobody accepting — bind, then drop the
+        // listener; the file stays behind exactly like a crashed instance's.
+        let stale = dir.join(control_socket::instance_sock_name(DEAD_PID));
+        drop(aterm_uds::CtlListener::bind(&stale).expect("bind then abandon"));
+        let stale_s = stale.to_str().expect("utf8").to_string();
+        assert!(matches!(
+            probe_lines(&stale_s, "sessions", DEAD_PID),
+            Probe::Refused {
+                pid_running: Some(false)
+            }
+        ));
+        assert!(matches!(
+            probe_lines(&stale_s, "sessions", 0),
+            Probe::Refused { pid_running: None }
+        ));
+        assert!(matches!(
+            probe_lines(&stale_s, "sessions", std::process::id()),
+            Probe::Refused {
+                pid_running: Some(true)
+            }
+        ));
+
+        // Vanished: no such file at all.
+        let gone = dir.join("aterm-1.sock");
+        match probe_lines(gone.to_str().expect("utf8"), "sessions", 1) {
+            Probe::Other(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::NotFound);
+                assert!(e.to_string().starts_with("connect: "), "{e}");
+            }
+            other => panic!("a missing socket file is Other(NotFound), got {other:?}"),
+        }
+
+        // NoToken: a live mock with NO token beside it answers ERR auth, and
+        // the request went out with no AUTH line.
+        let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
+        match probe_lines(&sock, "sessions", 0) {
+            Probe::NoToken(path, _) => assert_eq!(path, dir.join("aterm.token")),
+            other => panic!("no token on disk + ERR auth is NoToken, got {other:?}"),
+        }
+        assert_eq!(srv.join().expect("mock"), "sessions\n");
+
+        // AuthRejected: the token IS on disk, was sent, and still ERR auth.
+        std::fs::write(dir.join("aterm.token"), "deadbeef\n").expect("token");
+        let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
+        assert!(matches!(
+            probe_lines(&sock, "sessions", 0),
+            Probe::AuthRejected
+        ));
+        assert_eq!(srv.join().expect("mock"), "sessions\n");
+
+        // Answered: the happy path, body rows trimmed of CR/LF.
+        let (sock, srv) = mock_instance(&dir, "mock.sock", b"OK 2\nalpha\r\nbeta\n");
+        match probe_lines(&sock, "sessions", 0) {
+            Probe::Answered(lines) => assert_eq!(lines, vec!["alpha", "beta"]),
+            other => panic!("OK 2 + two rows is Answered, got {other:?}"),
+        }
+        srv.join().expect("mock");
+
+        // Other: a non-auth ERR keeps the server's words.
+        let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR usage: sessions\n");
+        match probe_lines(&sock, "sessions", 0) {
+            Probe::Other(e) => assert_eq!(e.to_string(), "server replied: ERR usage: sessions"),
+            other => panic!("a non-auth ERR is Other, got {other:?}"),
+        }
+        srv.join().expect("mock");
+
+        // Other: hung up without a reply.
+        let (sock, srv) = mock_instance(&dir, "mock.sock", b"");
+        match probe_lines(&sock, "sessions", 0) {
+            Probe::Other(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("a hang-up is Other(UnexpectedEof), got {other:?}"),
+        }
+        srv.join().expect("mock");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--help` documents the discovery exit-code ladder (1 = truly empty,
+    /// 2 = could not look / could not reach, 124 = every socket timed out) and
+    /// the directory rule that makes a missing `$XDG_RUNTIME_DIR/aterm` an
+    /// environment fact rather than a fleet fact.
+    #[test]
+    fn help_documents_the_discovery_exit_codes_and_the_dir_rule() {
+        let help = help_text();
+        assert!(
+            help.contains("could not LOOK, or could not REACH"),
+            "exit 2 is explained"
+        );
+        assert!(
+            help.contains("`no live aterm instances found`"),
+            "exit 1's one meaning is named"
+        );
+        assert!(
+            help.contains("for `ls`/`instances`/`windows`,\n         EVERY found socket timed out"),
+            "124 for discovery, every discovery verb named"
+        );
+        // The ladder is three verbs tall on every rung, not two: `windows` shares
+        // `ls`/`instances`' codes and used to be missing from all four lines.
+        assert!(
+            help.contains("(`ls`, `instances`, `windows`): at least one instance answered"),
+            "exit 0 names windows"
+        );
+        assert!(
+            help.contains("`ls`/`instances`/`windows`: the control-socket directory was readable"),
+            "exit 1 names windows"
+        );
+        assert!(
+            help.contains("`ls`/`instances`/`windows` only — could not LOOK, or could not REACH"),
+            "exit 2 names windows"
+        );
+        assert!(
+            help.contains("DISCOVERY (`ls`, `instances`, `windows`)"),
+            "the resolution rule has a paragraph naming every discovery verb"
+        );
+        assert!(help.contains("is NOT consulted"), "the XDG rule is stated");
     }
 
     /// The mirror must resolve in the socket's OWN directory — the concrete
@@ -4888,5 +6501,208 @@ mod tests {
         // …and the `None` nesting is a no-op, not a panic.
         announce_mux_boundary(None, false);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `windows` fold over real `sessions` lines: windows in id order, the
+    /// front bit from `wfocus=`, the active-tab sids joined, the detached count
+    /// apart from the could-not-say count — and a pre-`window=` server folds
+    /// into `window=-`, never into a window.
+    #[test]
+    fn windows_rows_fold_sessions_per_window_and_keep_unknown_apart_from_none() {
+        let lines: Vec<String> = [
+            "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude",
+            "1 s-b s-a alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
+            "2 s-c - alive sh meta=0 window=0 active=1 wfocus=0 detail=codex",
+            "3 s-d - alive sh meta=0 window=none active=0 wfocus=0 detail=-",
+            "4 s-e - alive sh meta=0 window=- active=- wfocus=- detail=-",
+            "5 s-f - alive sh meta=0",
+            "6 s-g - alive sh meta=0 window=1 active=1 wfocus=1 detail=-",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        assert_eq!(
+            window_rows_from_sessions(42, &lines),
+            vec![
+                "42 window=0 focused=0 sessions=1 active=s-c".to_string(),
+                "42 window=1 focused=1 sessions=3 active=s-a,s-g".to_string(),
+                "42 window=none sessions=1".to_string(),
+                "42 window=- sessions=2".to_string(),
+            ]
+        );
+        // A window with nothing on its active tab says so.
+        let lines = vec!["0 s-a - alive sh meta=0 window=2 active=0 wfocus=0 detail=-".to_string()];
+        assert_eq!(
+            window_rows_from_sessions(7, &lines),
+            vec!["7 window=2 focused=0 sessions=1 active=-".to_string()]
+        );
+        // No sessions: no rows (the instance is still listed by `instances`).
+        assert!(window_rows_from_sessions(7, &[]).is_empty());
+    }
+
+    /// The title is the fifth field and any program can set it; `pct_encode`
+    /// leaves `=` alone, so a title of `window=none` / `window=7` / `active=1`
+    /// / `wfocus=1` / `meta=1` is a legal title token. The fold must read the
+    /// SERVER's tokens (after `meta=`), never the title's: a session on
+    /// window 3 titled `window=none` stays on window 3, one titled `active=1`
+    /// is not on the active tab, one titled `wfocus=1` does not front its
+    /// window, and one titled `window=7` files under the window the server
+    /// named. The relay side (`ls`) prints the line verbatim and is unaffected.
+    #[test]
+    fn windows_rows_never_read_the_title_as_a_token() {
+        let lines: Vec<String> = [
+            "0 s-a - alive window=none meta=0 window=3 active=0 wfocus=0 detail=-",
+            "1 s-b - alive active=1 meta=0 window=3 active=0 wfocus=0 detail=-",
+            "2 s-c - alive wfocus=1 meta=0 window=3 active=1 wfocus=0 detail=-",
+            "3 s-d - alive window=7 meta=0 window=none active=0 wfocus=0 detail=-",
+            "4 s-e - alive window=7 meta=1 window=5 active=1 wfocus=1 detail=-",
+            "5 s-f - alive meta=1 meta=0 window=5 active=0 wfocus=1 detail=-",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        assert_eq!(
+            window_rows_from_sessions(9, &lines),
+            vec![
+                "9 window=3 focused=0 sessions=3 active=s-c".to_string(),
+                "9 window=5 focused=1 sessions=2 active=s-e".to_string(),
+                "9 window=none sessions=1".to_string(),
+            ]
+        );
+        // A pre-`window=` server whose title happens to be `window=1` (or
+        // `wfocus=1`, or `detail=x`): still "could not say", never window 1.
+        for title in ["window=1", "wfocus=1", "detail=x"] {
+            let lines = vec![format!("0 s-a - alive {title} meta=0")];
+            assert_eq!(
+                window_rows_from_sessions(9, &lines),
+                vec!["9 window=- sessions=1".to_string()],
+                "{title}"
+            );
+        }
+        // No `meta=` anchor at all (a pre-roster server): no tail is
+        // recognised, whatever `=`-bearing words the title carries.
+        let lines = vec!["0 s-a - alive window=1".to_string()];
+        assert_eq!(
+            window_rows_from_sessions(9, &lines),
+            vec!["9 window=- sessions=1".to_string()]
+        );
+    }
+
+    /// An EMPTY title is two spaces on the wire (`pct_encode("")` is empty), and
+    /// a whitespace split collapses it: the tokens are read from the end, so
+    /// the keys still land — and so does a column a later server appends after
+    /// `detail=`.
+    #[test]
+    fn windows_rows_tolerate_an_empty_title_and_trailing_new_columns() {
+        let lines: Vec<String> = [
+            "0 s-a - alive  meta=0 window=2 active=1 wfocus=1 detail=-",
+            "1 s-b - alive  meta=0",
+            "2 s-c - alive sh meta=0 window=2 active=0 wfocus=1 detail=- extra=1 more=x",
+            "3 s-d - alive  meta=0 window=none active=0 wfocus=0 detail=- extra=1",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        assert_eq!(
+            window_rows_from_sessions(9, &lines),
+            vec![
+                "9 window=2 focused=1 sessions=2 active=s-a".to_string(),
+                "9 window=none sessions=1".to_string(),
+                "9 window=- sessions=1".to_string(),
+            ]
+        );
+    }
+
+    /// `roster_tail` is the anchor rule on its own: the `key=value` run behind
+    /// `meta=` in end-first order, nothing when the anchor is missing, and the
+    /// walk stops at the first `=`-less word so it can never reach the
+    /// positional columns.
+    #[test]
+    fn roster_tail_reads_back_to_the_meta_anchor_or_nothing() {
+        let f = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let full = f("0 s-a - alive window=7 meta=0 window=1 active=1 wfocus=0 detail=-");
+        let fields: Vec<&str> = full.iter().map(String::as_str).collect();
+        assert_eq!(
+            roster_tail(&fields),
+            vec!["detail=-", "wfocus=0", "active=1", "window=1"]
+        );
+        let bare = f("0 s-a - alive x=1 meta=0");
+        let fields: Vec<&str> = bare.iter().map(String::as_str).collect();
+        assert!(roster_tail(&fields).is_empty(), "nothing after the anchor");
+        let old = f("0 s-a - alive window=1 active=1");
+        let fields: Vec<&str> = old.iter().map(String::as_str).collect();
+        assert!(roster_tail(&fields).is_empty(), "no anchor, no tail");
+        assert!(roster_tail(&[]).is_empty());
+    }
+
+    /// `windows` takes no argument: `windows 1` is `ERR usage: windows` (exit
+    /// FAILURE), not a fleet listing the caller did not ask for; a bare
+    /// `windows` is fine, and a request that is no discovery verb at all is
+    /// not this check's to judge.
+    #[test]
+    fn windows_rejects_trailing_arguments_with_the_usage_shape() {
+        let parts = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            discovery_given_arguments(&parts(&["windows", "1"])),
+            Some("windows")
+        );
+        assert_eq!(
+            discovery_given_arguments(&parts(&["windows", "--all"])),
+            Some("windows")
+        );
+        assert_eq!(discovery_given_arguments(&parts(&["windows"])), None);
+        assert_eq!(discovery_given_arguments(&parts(&["sessions", "1"])), None);
+        assert_eq!(discovery_given_arguments(&parts(&[])), None);
+        let e = discovery_usage_error("windows");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(e.to_string(), "ERR usage: windows");
+        assert!(
+            !is_timeout_error(&e),
+            "a usage error exits FAILURE, not 124"
+        );
+    }
+
+    /// `ls` never took an argument and used to ignore one silently — `ls 1`
+    /// listed the whole fleet as if the `1` had been read. It is `ERR usage: ls`
+    /// (exit FAILURE) now, the `windows` shape exactly; a bare `ls` is fine.
+    #[test]
+    fn ls_rejects_trailing_arguments_with_the_usage_shape() {
+        let parts = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(discovery_given_arguments(&parts(&["ls", "1"])), Some("ls"));
+        assert_eq!(
+            discovery_given_arguments(&parts(&["ls", "--json"])),
+            Some("ls")
+        );
+        assert_eq!(discovery_given_arguments(&parts(&["ls"])), None);
+        let e = discovery_usage_error("ls");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(e.to_string(), "ERR usage: ls");
+        assert!(
+            !is_timeout_error(&e),
+            "a usage error exits FAILURE, not 124"
+        );
+    }
+
+    /// The same for `instances`: `instances 1` is `ERR usage: instances`, not
+    /// the fleet; a bare `instances` is fine.
+    #[test]
+    fn instances_rejects_trailing_arguments_with_the_usage_shape() {
+        let parts = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            discovery_given_arguments(&parts(&["instances", "1"])),
+            Some("instances")
+        );
+        assert_eq!(
+            discovery_given_arguments(&parts(&["instances", "self"])),
+            Some("instances")
+        );
+        assert_eq!(discovery_given_arguments(&parts(&["instances"])), None);
+        let e = discovery_usage_error("instances");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(e.to_string(), "ERR usage: instances");
+        assert!(
+            !is_timeout_error(&e),
+            "a usage error exits FAILURE, not 124"
+        );
     }
 }

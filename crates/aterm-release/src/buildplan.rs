@@ -856,7 +856,14 @@ pub fn validate_cli_app_version(expected: &str, stdout: &[u8]) -> Result<(), Str
     validate_named_cli_app_version("aterm", expected, stdout)
 }
 
-/// Require an argv0 alias identity to be exactly `<name> <claimed>`.
+/// Require an argv0 alias identity to be exactly `<name> <claimed>` on LINE ONE.
+///
+/// `aterm --version` says which copy runs after its identity line (S12 of
+/// `docs/DESIGN-which-copy-runs-2026-08-27.md`): `running: <path>` and, per other
+/// `aterm.app` in the usual places, `another copy: …`. Those lines are path-dependent
+/// by design — a staged universal binary names its own path — so the gate pins the
+/// identity line byte for byte and admits ONLY the S12 lines after it: anything else
+/// (a stale cached library slice's chatter, alias-routing drift) still fails.
 pub fn validate_named_cli_app_version(
     name: &str,
     expected: &str,
@@ -865,13 +872,34 @@ pub fn validate_named_cli_app_version(
     let observed =
         std::str::from_utf8(stdout).map_err(|_| format!("{name} --version output is not UTF-8"))?;
     let wanted = format!("{name} {expected}\n");
-    if observed != wanted {
+    let Some(rest) = observed.strip_prefix(wanted.as_str()) else {
         return Err(format!(
-            "{name} --version output {observed:?} differs from {wanted:?}"
+            "{name} --version output {observed:?} does not open with {wanted:?}"
         ));
+    };
+    if !rest.is_empty() && !rest.ends_with('\n') {
+        return Err(format!(
+            "{name} --version output {observed:?} does not end with a newline"
+        ));
+    }
+    for line in rest.split_terminator('\n') {
+        if !WHICH_COPY_LINE_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            return Err(format!(
+                "{name} --version output {observed:?} carries {line:?} after the identity \
+                 line {wanted:?} — only the which-copy lines ({}) may follow it",
+                WHICH_COPY_LINE_PREFIXES.join(", ")
+            ));
+        }
     }
     Ok(())
 }
+
+/// The only lines `aterm --version` may print after its identity line — the S12
+/// "which copy runs" report, spelled by `aterm_update::which_copy::WhichCopy::lines`.
+const WHICH_COPY_LINE_PREFIXES: &[&str] = &["running: ", "another copy: "];
 
 /// Pure report validator used by the native-slice and final-universal runtime
 /// cross-checks. Each report must contain exactly one stable diagnostics field
@@ -1263,6 +1291,37 @@ mod tests {
         assert!(validate_named_cli_app_version("aterm-ctl", "0.2.0", b"aterm-ctl 0.2.0\n").is_ok());
         assert!(
             validate_named_cli_app_version("aterm-ctl", "0.2.0", b"aterm-gui 0.2.0\n").is_err()
+        );
+        // The S12 which-copy lines may follow the identity line — and only those.
+        assert!(
+            validate_cli_app_version(
+                "0.2.0",
+                b"aterm 0.2.0\nrunning: /Applications/aterm.app\nanother copy: \
+                  /Users//ana/Applications/aterm.app (0.1.0) \xe2\x80\x94 not the one running; \
+                  the updater updates only this one\n"
+            )
+            .is_ok()
+        );
+        assert!(validate_cli_app_version("0.2.0", b"aterm 0.2.0\nrunning: /x/aterm\n").is_ok());
+        assert!(
+            validate_cli_app_version("0.2.1", b"aterm 0.2.0\nrunning: /x/aterm\n").is_err(),
+            "the identity line is still exact"
+        );
+        assert!(
+            validate_cli_app_version("0.2.0", b"aterm 0.2.0\nwarning: stale slice\n").is_err(),
+            "anything but the which-copy lines still fails"
+        );
+        assert!(
+            validate_cli_app_version("0.2.0", b"aterm 0.2.0\n\nrunning: /x/aterm\n").is_err(),
+            "a blank line is not a which-copy line"
+        );
+        assert!(
+            validate_cli_app_version("0.2.0", b"aterm 0.2.0\nrunning: /x/aterm").is_err(),
+            "the report is newline-terminated"
+        );
+        assert!(
+            validate_cli_app_version("0.2.0", b"running: /x/aterm\naterm 0.2.0\n").is_err(),
+            "the identity line comes first"
         );
     }
 

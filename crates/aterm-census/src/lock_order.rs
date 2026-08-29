@@ -4198,13 +4198,20 @@ mod tests {
     fn a_vendored_fn_name_cannot_capture_an_aterm_one_hop_call() {
         // THE LOADED GUN the namespace boundary disarms. Vendored-identity mode
         // namespaces the vendored crates' lock IDENTITIES, but their fn NAMES
-        // land in the same by-name callee table as aterm's — and the real
-        // winnow does define `fn start` and `fn end` (combinator/debug/
-        // internals.rs), both of which take `writer.lock()`, while aterm has its
-        // own `start`/`end` with hop-eligible call sites. Each side must resolve
-        // to ITS OWN definition: an aterm hold that inherited `winnow::writer`
-        // could close a cycle NOTHING could repair, because vendored sources may
-        // not be edited and OB-7 has no waiver channel.
+        // land in the same by-name callee table as aterm's. Each side must
+        // resolve to ITS OWN definition: an aterm hold that inherited a
+        // vendored lock identity could close a cycle NOTHING could repair,
+        // because vendored sources may not be edited and OB-7 has no waiver
+        // channel.
+        //
+        // The instance that motivated this was winnow, which defined `fn start`
+        // and `fn end` (combinator/debug/internals.rs) both taking
+        // `writer.lock()`, against aterm's own `start`/`end` with hop-eligible
+        // call sites. That fork left the tree with `toml`/`toml_edit`, so the
+        // fixture is planted under a fork that is still here. The hazard did
+        // not leave with it — it belongs to ANY vendored crate sharing a
+        // function name with aterm — and a fixture pinned to a deleted
+        // directory tests nothing at all.
         //
         // The complementary case — a name the caller's namespace does NOT define,
         // which must still resolve across the boundary — is
@@ -4215,9 +4222,9 @@ mod tests {
              fn aterm_hold_and_call() {\n    let g = alpha_lock.lock().unwrap();\n    \
              start();\n}\n",
             &[(
-                "vendor/winnow/src/planted.rs",
+                "vendor/smol_str/src/planted.rs",
                 "fn start() {\n    writer.lock().unwrap().push(1);\n}\n\
-                 fn winnow_hold_and_call() {\n    let g = stream.lock().unwrap();\n    \
+                 fn vendored_hold_and_call() {\n    let g = stream.lock().unwrap();\n    \
                  start();\n}\n",
             )],
         );
@@ -4228,18 +4235,18 @@ mod tests {
             out.log
         );
         assert!(
-            !out.log.contains("alpha_lock -> winnow::writer"),
+            !out.log.contains("alpha_lock -> smol_str::writer"),
             "an aterm hold must NOT inherit a vendored lock identity through a \
              shared fn name:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("winnow::stream -> winnow::writer"),
-            "the vendored call site must resolve to WINNOW's `start`:\n{}",
+            out.log.contains("smol_str::stream -> smol_str::writer"),
+            "the vendored call site must resolve to the VENDORED `start`:\n{}",
             out.log
         );
         assert!(
-            !out.log.contains("winnow::stream -> aterm_trace"),
+            !out.log.contains("smol_str::stream -> aterm_trace"),
             "and the boundary holds in both directions — a vendored hold must \
              not reach an aterm fn of the same name:\n{}",
             out.log
@@ -4708,23 +4715,37 @@ mod tests {
     #[test]
     fn scanned_set_covers_the_full_gui_process_closure() {
         // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface, currently 52 crates (46 until the K-2
-        // winit→engine key map moved out of aterm-types into its own
-        // `aterm-winit-keymap` crate, then +2 when the embedded operator put
-        // `aterm-agent` — and through it `aterm-ctl` — on the GUI's own
-        // dependency edge, then +1 when `aterm-digest` replaced the `sha2` +
-        // `hmac` third-party pair, then +1 when `aterm-time` replaced
-        // `web-time`, then +1 when `aterm-regex` replaced `regex` and its three
-        // companions). The exact member list is pinned by scan_set's
-        // derived_closure_matches_the_pinned_canary; this asserts the census
-        // actually WALKS the derived set and reports its provenance +
-        // exclusions in the transcript.
+        // aterm-gui process surface. The exact member list is pinned by
+        // scan_set's derived_closure_matches_the_pinned_canary, and the crate
+        // COUNT the transcript must report is that pin's length — never a
+        // literal retyped here: the literal sat at 51 while the pin (and the
+        // tree) were at 52, so this test failed for a crate the canary had
+        // already been made to review. One reviewed list, one count. This
+        // asserts the census actually WALKS the derived set and reports its
+        // provenance + exclusions in the transcript.
+        // The closure grew as first-party crates replaced third-party ones
+        // (aterm-winit-keymap out of aterm-types, aterm-agent + aterm-ctl with
+        // the embedded operator, aterm-digest for sha2+hmac, aterm-time for
+        // web-time, aterm-regex for regex, aterm-primer with the agent
+        // auto-prime) — which is exactly why the count is derived, not typed.
+        let pinned = crate::scan_set::test_fixtures::PINNED_GUI_CLOSURE.len();
+        // DERIVED for the same reason, and it had drifted the same way: the
+        // vendored half stayed a literal `5` while the winnow fork left the
+        // tree with `toml`/`toml_edit`, so this test failed for a retirement
+        // the registry had already been made to review. Count the registry's
+        // Scanned entries — the build-time-only ones are excluded from the
+        // process and reported separately.
+        let scanned_vendored = crate::scan_set::REVIEWED_VENDORED_CRATES
+            .iter()
+            .filter(|v| matches!(v.mode, crate::scan_set::VendoredMode::Scanned { .. }))
+            .count();
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log
-                .contains("across 52 workspace crate(s) + 5 vendored crate(s)"),
-            "the census must report the full derived closure + the scanned vendored \
-             crates:\n{}",
+            out.log.contains(&format!(
+                "across {pinned} workspace crate(s) + {scanned_vendored} vendored crate(s)"
+            )),
+            "the census must report the full derived closure ({pinned} crates, the \
+             canary's pin) + the {scanned_vendored} scanned vendored crate(s):\n{}",
             out.log
         );
         assert!(
@@ -4764,11 +4785,12 @@ mod tests {
         // macos/window_delegate.rs scale-factor round-trip) — note they are
         // the SAME Arc<Mutex> reached through two receiver names, so they
         // SPLIT (the stated lexical posture, under-reporting the pair as two
-        // identities; harmless here since neither nests). winnow's three
-        // stderr-stream locks are graphed as `winnow::writer` (behind the
-        // never-activated `debug` feature — over-approximation, stated).
-        // libm/smol_str: zero sites, the walker re-checks that claim every
-        // run. The non-macOS winit backends are labeled slices, counted and
+        // identities; harmless here since neither nests). winnow used to
+        // contribute three stderr-stream locks here as `winnow::writer`; that
+        // fork left the tree when `toml`/`toml_edit` were retired for
+        // aterm-toml, so the identity is gone with it and the assertion below
+        // no longer names it. indexmap/libm/smol_str: zero sites, the walker
+        // re-checks that claim every run. The non-macOS winit backends are labeled slices, counted and
         // never graphed.
         let out = run_lock_order_census(&repo_root());
         assert!(
@@ -4779,9 +4801,7 @@ mod tests {
             out.log
         );
         assert!(
-            out.log.contains("winit::inner(1)")
-                && out.log.contains("winit::new_inner_size(1)")
-                && out.log.contains("winnow::writer(3)"),
+            out.log.contains("winit::inner(1)") && out.log.contains("winit::new_inner_size(1)"),
             "the vendored identities must be namespaced in the ledger:\n{}",
             out.log
         );

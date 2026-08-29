@@ -29,7 +29,6 @@
 // than failing the build (so a source tarball without a .git still compiles).
 
 use aterm_digest::Sha256;
-use base64::Engine as _;
 use std::process::Command;
 
 /// Fixed 64-byte lowercase record used only by unpinned development builds.
@@ -81,8 +80,7 @@ fn main() {
     // with the anchor it actually trusts.
     let update_pin_sha256 = match aterm_update_core::pins::update_channel_signing_pubkey() {
         encoded if !encoded.is_empty() => {
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
+            let raw = aterm_codec::base64::decode_strict(encoded.as_bytes())
                 .expect("UPDATE_CHANNEL_PUBKEYS[0] must be standard base64");
             assert_eq!(
                 raw.len(),

@@ -35,7 +35,7 @@ def D(ident, note, **kw):
     return replace(STAND, ident=ident, note=note, **kw)
 
 
-# ── walk: a four-beat lateral gait, one full cycle in four frames ──────────
+# ── walk: a diagonal trot, one full cycle in four frames ───────────────────
 # Reach forward with a nearly straight leg; trail back with a bent one — the
 # asymmetry is what makes a cycle read as walking rather than scissoring.
 REACH = leg(26.0, 12.0)
@@ -70,9 +70,28 @@ RUN = [
     # The two suspension frames of the gallop are the moments no paw is on the
     # floor. The brain adds no lift during a run (only a pounce arcs), so the
     # clearance has to live in the art or the gallop reads as a shuffle.
+    #
+    # AND IT HAS TO LIVE THERE, measured: the motion doc's `RUN_BOB 0.05·ramp`
+    # was refused "until a pixel-domain test exists at cell_h in {16,24,32}".
+    # That test was written (`the_gaits_vertical_survives_the_pixel_grid_at_
+    # every_cell_height`) and it kills the bob rather than admitting it —
+    # `body_px` rounds the lift to whole pixels, so 0.05·ramp is IDENTICALLY
+    # 0 px at cell_h 16 for every ramp under 0.67, i.e. two thirds of the
+    # gallop band including the whole walk->run boundary its continuity
+    # argument was about. The art's clearance is sub-pixel and anti-aliased
+    # at every size because `registration()` bakes it into the geometry, so
+    # the vertical belongs here and the brain keeps `lift == 0.0` on a run
+    # (pinned by `the_gallop_keeps_its_lift_out_of_the_pixel_grid`).
+    #
+    # 7.0 -> 11.0 and 8.0 -> 13.0 (2026-08-27): the shipped clearance was
+    # 1.29 / 1.47 px at cell_h 16 and the cycle read as a shuffle beside its
+    # own contact frames. One viewbox unit is ART_ROWS·cell_h/148 px, so
+    # this is 2.02 / 2.39 px at 16, 2.53 / 2.99 at the 20 px ship cell and
+    # 4.04 / 4.78 at 32 — roughly double, still a small fraction of body
+    # height, and still far past PLANT_TOL so the AIRBORNE assertion holds.
     D("pet_run_1", "Run, extension: the body stretches long, every paw off the floor.",
       yaw=1.0,
-      airborne=7.0,
+      airborne=11.0,
       by=68.0, brx=45.0, bry=20.0, brot=-4.0, hy=44.0, hx=157.0,
       ear_flat=0.7, eyes="wide", mouth="open",
       fl_near=leg(48.0, 40.0, 18.0, 14.0), fl_far=leg(38.0, 34.0, 18.0, 14.0),
@@ -87,7 +106,7 @@ RUN = [
       tail=(-80.0, -92.0, -104.0, -118.0), tail_len=15.0),
     D("pet_run_3", "Run, suspension: every paw is off the ground at once.",
       yaw=1.0,
-      airborne=8.0,
+      airborne=13.0,
       by=60.0, brx=40.0, bry=22.0, brot=2.0, hy=40.0, hx=150.0,
       ear_flat=0.6, eyes="wide", mouth="open",
       fl_near=leg(-18.0, 34.0, 16.0, 13.0), fl_far=leg(-26.0, 28.0, 16.0, 13.0),
@@ -240,6 +259,24 @@ ADDRESS = [
       fl_near=leg(0.0, 0.0, 20.0, 14.0), fl_far=leg(0.0, 0.0, 20.0, 14.0),
       tail_root=(121.0, 104.0),
       tail=(95.0, 100.0, 108.0, 125.0), tail_len=11.0, tail_thick=8.0),
+    # THE FACE-ON BLINK. `pet_sit_front` is the most-worn awake frame in the
+    # whole roster — measured over a 368 506-frame sample of five realistic
+    # session shapes, 33 265 frames (9.0 % of everything) across 641 onsets
+    # averaging 0.86 s apiece, and worn on 88.8 % of all settled frames —
+    # and it had no beat of its own. The side-on blink is drawn on SIT_BASE,
+    # so before this frame the only way to break eye contact was to look
+    # away. ONE FIELD departs from the pose above (`eyes`), which is the
+    # swap-in-place rule holding by construction: nothing in the silhouette
+    # can move but the lids.
+    D("pet_sit_front_blink", "Sit, face-on, blink: eye contact, both lids down.",
+      front=True, hide_hind=True, show_far_legs=False,
+      bx=104.0, by=80.0, brx=23.0, bry=27.0, brot=0.0,
+      haunch_at=(104.0, 86.0, 29.0),
+      hx=104.0, hy=42.0, eyes="closed",
+      fl_root=(116.0, 78.0),
+      fl_near=leg(0.0, 0.0, 20.0, 14.0), fl_far=leg(0.0, 0.0, 20.0, 14.0),
+      tail_root=(121.0, 104.0),
+      tail=(95.0, 100.0, 108.0, 125.0), tail_len=11.0, tail_thick=8.0),
     # The over-the-shoulder glance, reconstructed on body/head OPPOSITION
     # (adversarial review, finding 3): the read comes from the body facing
     # AWAY while the head comes BACK, not from the face alone. The hip mass
@@ -314,6 +351,31 @@ FLIGHT = [
       # reading one-eyed at ship size — see `Pose.far_eye`
       far_eye=(-1.1, -2.4, 1.238, 1.143),
       tail=(-125.0, -140.0, -155.0, -170.0), tail_len=14.5),
+    # THE APEX: the top of a BIG bound, and the answer to the longest frozen
+    # sprite in the product. On a bound the pose schedule holds the hero
+    # frame for `dur - LEAP_RISE_T - LEAP_DESC_T` = 0.27 s at the base
+    # flight and 0.67 s at the max — and through that window nothing else
+    # moves either: the hang keeps the lift within 10 % of the apex for
+    # u in [0.268, 0.69] (42 % of the flight) and the asymmetric stretch is
+    # exactly zero at u = 0.5. Pose, lift and scale all static, for up to
+    # forty ticks. Measured on glass: `pet_leap` holds a mean unbroken run
+    # of 15.4 / 19.0 / 29.4 ticks in the typist / shell / editor sessions.
+    #
+    # The gesture is the top of the arc, not another stretch: the back
+    # ROUNDS off the hero's full extension, the hind pair swings under and
+    # the fore begin to fold, the nose comes down over the landing. At 34 px
+    # it separates from the hero because the silhouette changes shape — the
+    # hero is long and low with the legs extended fore-and-aft, the apex is
+    # compact and high with the legs gathered under. A true mid-air frame,
+    # so it carries authored clearance and is listed in AIRBORNE.
+    D("pet_apex", "Flight, apex: the top of the bound — the back rounds, the hind legs swing under.",
+      yaw=1.0,
+      airborne=9.0,
+      by=58.0, brx=40.0, bry=24.0, brot=0.0, hx=150.0, hy=34.0, hrot=-6.0,
+      ear_flat=0.4, eyes="wide", mouth="open", gaze=(1.0, 1.0),
+      fl_near=leg(24.0, 74.0, 13.0, 10.0), fl_far=leg(14.0, 66.0, 13.0, 10.0),
+      hl_near=leg(-18.0, -62.0, 15.0, 12.0), hl_far=leg(-10.0, -56.0, 15.0, 12.0),
+      tail=(-88.0, -104.0, -122.0, -140.0), tail_len=15.0),
 ]
 
 # ── the wiggle and the loaf ────────────────────────────────────────────────
@@ -406,7 +468,178 @@ ROLL = [
       tail=(-100.0, -112.0, -122.0, -110.0), tail_len=12.0, tail_thick=8.0),
 ]
 
-CAT_POSES = [STAND] + WALK + RUN + SETTLED + SLEEP + REACTIVE + ADDRESS + FLIGHT + LOW + ROLL
+# ── lateral walk: the slow gait, one paw at a time ─────────────────────────
+# The WALK block above is a diagonal couplet (near-fore with far-hind), which
+# is a trot and reads as one at any speed. A cat that is merely strolling
+# beside the caret moves one leg at a time in the lateral order LH -> LF ->
+# RH -> RF, three paws planted while the fourth swings. Each frame is sampled
+# mid-swing so it lifts exactly one folded leg over three planted ones; the
+# body rides a half-unit lower on the two frames where the swinging leg is a
+# foreleg. The brain drives it by distance like the trot.
+LW_FWD = leg(19.0, 10.0)
+LW_MID = leg(1.0, -1.0)
+LW_BACK = leg(-18.0, -6.0)
+LW_SWING = leg(10.0, -58.0)
+
+LWALK = [
+    D("pet_lwalk_0", "Lateral walk: near-hind swings under, far-fore leads.",
+      yaw=1.0, hl_near=LW_SWING, fl_near=LW_BACK, hl_far=LW_MID, fl_far=LW_FWD,
+      by=64.0, hy=41.0, tail=(-108.0, -136.0, -168.0, -202.0)),
+    D("pet_lwalk_1", "Lateral walk: near-fore swings, near-hind just planted ahead.",
+      yaw=1.0, hl_near=LW_FWD, fl_near=LW_SWING, hl_far=LW_BACK, fl_far=LW_MID,
+      by=63.5, hy=42.0, tail=(-114.0, -142.0, -174.0, -208.0)),
+    D("pet_lwalk_2", "Lateral walk: far-hind swings, near-fore reaches ahead.",
+      yaw=1.0, hl_near=LW_MID, fl_near=LW_FWD, hl_far=LW_SWING, fl_far=LW_BACK,
+      by=64.0, hy=41.0, tail=(-120.0, -148.0, -180.0, -214.0)),
+    D("pet_lwalk_3", "Lateral walk: far-fore swings, near side trails.",
+      yaw=1.0, hl_near=LW_BACK, fl_near=LW_MID, hl_far=LW_FWD, fl_far=LW_SWING,
+      by=63.5, hy=42.0, tail=(-114.0, -142.0, -174.0, -208.0)),
+]
+
+# ── launch, hop, skid: the beats around a flight ───────────────────────────
+LOCO = [
+    # The release between the crouch and the rise: the hind legs are still
+    # driving off the floor, so the frame is PLANTED — on the hind paws, the
+    # forepaws already clear — and plays where the brain's lift is zero (the
+    # last coil tick and the first flight tick). Not an AIRBORNE frame.
+    D("pet_launch", "Pounce, launch: hind legs driving off the floor, chest up, forepaws lifting.",
+      yaw=1.0,
+      by=68.0, brx=42.0, bry=21.0, brot=-25.0, hx=146.0, hy=43.0, hrot=-8.0,
+      ear_flat=0.2, eyes="wide", mouth="open",
+      fl_near=leg(30.0, 14.0, 19.0, 15.0), fl_far=leg(22.0, 6.0, 19.0, 15.0),
+      hl_near=leg(-18.0, -32.0, 19.0, 15.0), hl_far=leg(-26.0, -40.0, 19.0, 15.0),
+      tail=(-60.0, -72.0, -84.0, -96.0), tail_len=14.5),
+    # The row hop's tuck: every paw gathered under the body, the tail up as a
+    # counterweight, the eyes already on the landing. A short vertical flight
+    # never stretches long the way a pounce does, so it gets its own mid-air
+    # frame with authored clearance — listed in AIRBORNE beside the gallop's
+    # suspension frames and the rise/descend pair.
+    D("pet_hop", "Hop: a tight tuck, every paw gathered, tail up, eyes on the landing.",
+      yaw=1.0,
+      airborne=6.0,
+      by=62.0, brx=37.0, bry=24.0, brot=-8.0, hx=148.0, hy=40.0, hrot=-2.0,
+      ear_flat=0.3, eyes="wide", mouth="smile", gaze=(1.0, 1.0),
+      fl_near=leg(-36.0, 46.0, 13.0, 10.0), fl_far=leg(-44.0, 38.0, 13.0, 10.0),
+      hl_near=leg(48.0, -44.0, 14.0, 11.0), hl_far=leg(40.0, -52.0, 14.0, 11.0),
+      tail=(-128.0, -144.0, -156.0, -166.0), tail_len=13.5),
+    # The drift-brake's frame: the run overshoots, the forelegs brace ahead
+    # and the rump drops. Planted on the forepaws; the folded hind pair sits
+    # under a unit above the ground line, inside PLANT_TOL, so the
+    # registration does not re-plant on it.
+    D("pet_skid", "Skid: forelegs braced ahead, rump dropped, ears pinned — the drift-brake.",
+      yaw=1.0,
+      by=78.0, brx=42.0, bry=21.0, brot=-14.0, hx=156.0, hy=50.0, hrot=-4.0,
+      ear_flat=0.85, eyes="wide", mouth="flat",
+      fl_near=leg(34.0, 20.0, 20.0, 16.0), fl_far=leg(26.0, 12.0, 20.0, 16.0),
+      hl_near=leg(48.0, -56.0, 18.0, 14.0), hl_far=leg(40.0, -64.0, 18.0, 14.0),
+      tail=(-140.0, -160.0, -185.0, -210.0), tail_len=14.0),
+]
+
+# ── idle: the small beats of a settled cat ─────────────────────────────────
+# Every frame here is a one- or two-field departure from a shipped base — the
+# stand, SIT_BASE, the loaf, the peek, the perk — so the swap-in-place rule
+# holds by construction: an ear flick moves an ear and nothing else, a blink
+# moves the lids and nothing else. The brain deals these on the settle
+# ladder's timers; none of them carries lift.
+IDLE = [
+    # The sulk. The code has borrowed the loaf for `Droop` since the first
+    # roster ("until the art wave lands a flat-ears frame"): a sphinx flat to
+    # the floor, ears pinned, head hung — plainly not the contented loaf.
+    D("pet_droop", "Droop: the sulk — flat to the floor, ears pinned, head hung, tail limp behind.",
+      by=84.0, brx=42.0, bry=20.0, brot=0.0,
+      hx=150.0, hy=68.0, hrot=14.0,
+      ear_flat=1.0, ear_near=-10.0, ear_far=-8.0,
+      eyes="halflid", mouth="flat", blush=False,
+      fl_near=leg(20.0, -20.0, 12.0, 10.0), fl_far=leg(12.0, -26.0, 12.0, 10.0),
+      hl_near=leg(30.0, -30.0, 12.0, 10.0), hl_far=leg(22.0, -36.0, 12.0, 10.0),
+      tail_root=(50.0, 92.0),
+      tail=(-35.0, -65.0, -90.0, -95.0), tail_len=13.0, tail_thick=8.0),
+    # The same sulk from the seat, so a seated cat does not have to lie down
+    # to be disappointed in you.
+    D("pet_droop_sit", "Droop, seated: the seat, head hung, ears pinned, tail flat forward.",
+      **{**SIT_BASE, "hy": 50.0, "hx": 131.0, "hrot": 12.0, "brot": -4.0, "ear_flat": 1.0,
+         "eyes": "halflid", "mouth": "flat", "blush": False,
+         "tail": (88.0, 84.0, 82.0, 80.0)}),
+    # Ear flicks. A +70 sweep on the near ear is what survives 34 px — the
+    # -16 degree twitch the brain used to fake with a head-scale bob does not
+    # move a single device pixel at ship size.
+    D("pet_sit_ear", "Sit, ear flick: the near ear swivelled out sideways.",
+      **{**SIT_BASE, "ear_near": 70.0}),
+    D("pet_sit_ear_far", "Sit, ear flick: the far ear swung out.",
+      **{**SIT_BASE, "ear_far": -60.0}),
+    D("pet_stand_ear", "Stand, ear flick: the near ear swivelled out sideways.", ear_near=70.0),
+    D("pet_loaf_ear", "Loaf, ear flick: the near ear swivelled out.",
+      curl=True, hide_legs=True, show_far_legs=False,
+      bx=101.0, by=87.0, brx=45.5, bry=27.5,
+      hx=128.0, hy=60.0, hrot=0.0, ear_flat=0.12, ear_near=55.0,
+      eyes="happy", mouth="smile", whisker_far=False,
+      tail_root=(68.0, 98.0),
+      tail=(-62.0, -82.0, -100.0, -114.0), tail_len=8.5, tail_thick=7.5),
+    # The blink: `closed` lids on the seat. The sleeper's objection to
+    # `closed` (a fat downward arc reads as a scowl) does not apply to a frame
+    # held for a tenth of a second between two open-eyed ones.
+    D("pet_sit_blink", "Sit, blink: the seat with both lids down.",
+      **{**SIT_BASE, "eyes": "closed"}),
+    # The yawn before the loaf. `yawn` is the one mouth the rig paints twice
+    # (see `nose_paths`): the bake culls the mouth role under 40 px and the
+    # ship tile is 34.
+    D("pet_yawn", "Yawn: head tipped back, eyes squeezed, the gape wide.",
+      **{**SIT_BASE, "eyes": "happy", "mouth": "yawn", "hrot": -18.0, "hy": 36.0, "hx": 133.0,
+         "ear_flat": 0.35}),
+    # The tail the other way: swept BEHIND the seat instead of round to the
+    # forepaws, resting and with the tip flicked up, so the sitting cat's tail
+    # beat has a second side to deal.
+    D("pet_sit_tail_low", "Sit, tail behind: swept back along the floor.",
+      **{**SIT_BASE, "tail_root": (80.0, 108.0), "tail": (-85.0, -90.0, -98.0, -110.0)}),
+    D("pet_sit_tail_back", "Sit, tail behind, tip flicked up.",
+      **{**SIT_BASE, "tail_root": (78.0, 106.0), "tail": (-95.0, -115.0, -150.0, -178.0)}),
+    # The loaf's drowsy check: the same bread with the eyes open a moment.
+    D("pet_loaf_open", "Loaf, eyes open: the drowsy check.",
+      curl=True, hide_legs=True, show_far_legs=False,
+      bx=101.0, by=87.0, brx=45.5, bry=27.5,
+      hx=128.0, hy=60.0, hrot=0.0, ear_flat=0.12,
+      eyes="open", gaze=(0.6, 0.4), mouth="smile", whisker_far=False,
+      tail_root=(68.0, 98.0),
+      tail=(-62.0, -82.0, -100.0, -114.0), tail_len=8.5, tail_thick=7.5),
+    # The gaze rows: a seated cat whose caret is on the line above or below
+    # looks there — chin and pupils together, the ears following a hair.
+    D("pet_sit_lookup", "Sit, look up: chin lifted, pupils raised to the line above.",
+      **{**SIT_BASE, "hrot": -20.0, "hy": 36.0, "gaze": (0.6, -2.4), "ear_near": 4.0, "ear_far": 2.0}),
+    D("pet_sit_lookdown", "Sit, look down: chin tucked, pupils dropped to the line below.",
+      **{**SIT_BASE, "hrot": 16.0, "hy": 42.0, "gaze": (0.4, 2.2)}),
+    # The second groom: the peek's body (facing away, one foreleg edge) with
+    # the head turned back and DOWN into the shoulder — the flank lick that
+    # pairs with the paw-to-muzzle `pet_groom`.
+    D("pet_groom_flank", "Groom, flank: seated facing away, head turned back and down into the shoulder.",
+      hide_hind=True, haunch_at=(84.0, 88.0, 34.0, 27.0, -12.0),
+      bx=112.0, by=60.0, brx=21.0, bry=25.0, brot=22.0,
+      hx=112.0, hy=52.0, hrot=14.0, yaw=0.8,
+      show_far_legs=False, fl_root=(124.0, 74.0),
+      fl_near=leg(-4.0, 3.0, 21.0, 16.0), fl_far=leg(8.0, -4.0, 21.0, 16.0),
+      ear_near=10.0, ear_far=-8.0, bar_site="haunch", whisker_far=False,
+      eyes="happy", mouth="open",
+      tail_root=(74.0, 112.0), tail=(-72.0, -88.0, -99.0, -107.0), tail_len=9.0, tail_thick=7.5),
+    # The second half of the wake-up: after the forelegs-out `pet_stretch`,
+    # the rump comes up and one hind leg reaches straight back. Planted on
+    # the forepaws and the other hind paw.
+    D("pet_stretch_hind", "Stretch, hind: forepaws planted, rump up, a hind leg reaching straight back.",
+      yaw=0.6, by=72.0, brx=44.0, bry=20.0, brot=10.0, hy=50.0, hx=158.0, hrot=-4.0,
+      eyes="happy", mouth="smile",
+      fl_near=leg(4.0, -2.0, 16.0, 12.0), fl_far=leg(-4.0, 4.0, 16.0, 12.0),
+      hl_near=leg(-45.0, -42.0, 24.0, 22.0), hl_far=leg(-10.0, 10.0, 18.0, 14.0),
+      tail=(-140.0, -155.0, -165.0, -170.0), tail_len=14.0),
+    # The perk with the head yawed INTO the facing: the notice a settled cat
+    # gives before a hop or a bound, looking where it is about to go rather
+    # than at you.
+    D("pet_perk_turn", "Alert, turned: the perk with the head yawed into the facing.",
+      yaw=1.0, by=63.0, hy=39.0, hx=152.0, eyes="wide",
+      ear_near=6.0, ear_far=4.0,
+      fl_near=leg(2.0, -1.0), fl_far=leg(-6.0, 2.0),
+      hl_near=leg(-6.0, 6.0), hl_far=leg(4.0, -4.0),
+      tail=(-172.0, -182.0, -190.0, -198.0), tail_len=14.5),
+]
+
+CAT_POSES = [STAND] + WALK + RUN + SETTLED + SLEEP + REACTIVE + ADDRESS + FLIGHT + LOW + ROLL + LWALK + LOCO + IDLE
 
 # THE DOG IS THE SAME POSE SHEET, RE-SKINNED. Owner, 2026-08-11: "make a dog
 # like the walking cat … you can use the same code." Taking that literally is

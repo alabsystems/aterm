@@ -6,8 +6,8 @@
 # license, and how the lock-order census classifies it.
 #
 # THE COMMENTS ARE THE RECORD. A fork's reason to exist is not a key here — it is the
-# comment block above it. forge round-trips this file with toml_edit precisely so that no
-# future write can eat one. Unknown KEYS are refused by name (fail-closed, the way
+# comment block above it. forge round-trips this file with aterm-toml precisely so that
+# no future write can eat one. Unknown KEYS are refused by name (fail-closed, the way
 # aterm-census's vendored-crate registry is); unknown COMMENTS are kept verbatim.
 #
 # Every version below is cross-checked against Cargo.lock: a vendored version that drifts
@@ -89,26 +89,6 @@ license = "Apache-2.0 OR MIT"
 apache_notice = false
 census.mode = "scanned"
 census.namespace = "indexmap"
-
-# --- winnow 0.7.15 ------------------------------------------------------------
-# census review: aterm-trust fork of upstream winnow (offset_from fix): three
-#   `writer.lock()` stderr-stream sites (combinator/debug/internals.rs), all behind the
-#   `debug` feature no aterm build activates — graphed anyway as `winnow::writer`
-#   (over-approximation, fail-closed: statement-shaped holds that nest nothing)
-# LICENSE: MIT — no Apache-2.0 term applies, so there is no §4(b) modification-notice
-#   obligation. The retained LICENSE file and the copyright notice still are obligations;
-#   `cargo forge attest` checks those.
-# PATCH LIVENESS: the fork is live at 0.7.15, but the lock ALSO carries registry winnow
-#   1.0.3 — the fix is not everywhere the name is. Anything resolving that other major runs
-#   unpatched.
-[[fork]]
-name = "winnow"
-version = "0.7.15"
-path = "vendor/winnow"
-license = "MIT"
-apache_notice = false
-census.mode = "scanned"
-census.namespace = "winnow"
 
 # --- pkg-config 0.3.33 --------------------------------------------------------
 # census review: aterm-trust fork of upstream pkg-config: a build-script host helper.

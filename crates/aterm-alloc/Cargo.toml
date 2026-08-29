@@ -13,7 +13,46 @@ description = "Inline-optimized collections for aterm: SmallVec + ArrayVec with 
 # None — pure std
 
 [dev-dependencies]
-# None — tests use only std
+# THE DIFFERENTIAL ORACLE for `ArrayVec` — the real crates.io `arrayvec`,
+# a dev-dependency so it is invisible to the shipped graph, exactly as
+# aterm-digest keeps sha2/hmac and aterm-toml keeps toml/toml_edit.
+# `tests/arrayvec_differential.rs` runs both types through the same operation
+# scripts and asserts they agree.
+#
+# IT LIVES ON THIS PACKAGE, NOT ON THE `arrayvec` SHIM, and both halves of that
+# are measured rather than preferred:
+#
+#   * NOT ON THE SHIM, because a dev-dep on the registry `arrayvec` declared by
+#     the package that is itself named `arrayvec` makes `cargo test -p arrayvec`
+#     fail with "specification `arrayvec` is ambiguous" — cargo cannot tell the
+#     member from the registry copy. Declared here it does not: probed both
+#     ways in this worktree. The subject under test is `aterm_alloc::ArrayVec`
+#     either way; the shim contains no code.
+#   * `=0.7.7`, NOT a caret requirement, because `[patch.crates-io] arrayvec =
+#     { path = "crates/aterm-arrayvec" }` captures dev edges too: any
+#     requirement the shim satisfies resolves AT the shim, and every assertion
+#     below would compare it with itself. Measured in a probe workspace — with
+#     the patch row live, a dev-dep on `arrayvec 0.7.6` resolved to
+#     `path+…/shim`. A `=` requirement the shim cannot satisfy is what keeps the
+#     oracle real, and `tests/arrayvec_differential.rs` re-checks the oracle's
+#     identity at runtime rather than trusting this comment.
+#   * `=0.7.7` and not `=0.7.8`, and this is the half that had to be MEASURED
+#     rather than reasoned about. The pin does not merely add a node: it forces
+#     a real `0.7.x` into the graph, and cargo then satisfies the six consumers'
+#     `^0.7.x` from that same node rather than carrying two semver-compatible
+#     copies. Pinned at `=0.7.8` against a shim declaring 0.7.6, that is exactly
+#     what happened — `cargo tree -p aterm -e normal -i arrayvec` printed
+#     `arrayvec v0.7.8` with NO path under naga, the patch row did nothing, and
+#     cargo warned about none of it. So the oracle's pin must sit BELOW the
+#     shim's version (0.7.8), not above it.
+#
+# 0.7.7 costs nothing in fidelity against the 0.7.8 it replaces: `diff -r` over
+# the two extracted `src/` trees is EMPTY — the crates are byte-identical there,
+# and the release differs only outside `src/`. The oracle stays in Cargo.lock as
+# a dev-only node, exactly as aterm-digest keeps sha2/hmac and aterm-toml keeps
+# toml/toml_edit; it is invisible to the shipped graph, which is what
+# `cargo forge survey` measures.
+arrayvec_upstream = { package = "arrayvec", version = "=0.7.7" }
 
 [lints]
 workspace = true

@@ -11,8 +11,11 @@
 //! Keystrokes arrive as `ReadConsoleInputW` records on an input thread, and
 //! `WINDOW_BUFFER_SIZE_EVENT` is the SIGWINCH analogue — it rides the same
 //! single input source the way SIGWINCH rides the unix poll loop: the ConPTY
-//! is resized promptly (it must repaint), and the engine applies the new size
-//! on the output loop's next wake (the unix drain-flag-then-apply shape).
+//! is resized promptly (it must repaint), and an ARMED engine applies the new
+//! size on the output loop's next wake (the unix drain-flag-then-apply shape).
+//! The ConPTY half is unconditional, exactly as the unix `TIOCSWINSZ` is: the
+//! session model is demand-driven and normally absent (`$ATERM_SESSION_MODEL`),
+//! and a console app must reflow either way.
 //! Direct `unsafe extern "system"` kernel32 FFI only — the approved std-only
 //! pattern; no ConPTY calls live here (those are aterm-pty's seam).
 
@@ -370,8 +373,18 @@ fn pump_piped_input(master: i32) {
 /// Input runs on a detached thread (it parks in `ReadConsoleInputW`/`read`
 /// with no portable cancellation; process exit reclaims it — the same way the
 /// unix driver's blocked reader ends). Output runs here: blocking ConPTY
-/// reads → host stdout passthrough + the engine model.
-pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose: bool) -> i32 {
+/// reads → host stdout passthrough, plus the engine model when one is armed.
+///
+/// `engine` is `None` for an ordinary session (the demand-driven model, off by
+/// default — `$ATERM_SESSION_MODEL`). The unix twin's rule holds here: only the
+/// two `if let` arms below depend on it, and everything the CHILD can observe
+/// (the stdout passthrough, and the `aterm_pty::resize` the input thread
+/// already performed) is unconditional.
+pub(crate) fn run(
+    shell: aterm_pty::SpawnedShell,
+    mut engine: Option<&mut Terminal>,
+    verbose: bool,
+) -> i32 {
     let master = shell.master;
     let guard = RawGuard::install();
     let stdout = guard.stdout;
@@ -396,25 +409,34 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose
     let mut buf = [0u8; 8192];
     loop {
         // Apply a pending resize before blocking (the unix drain shape); the
-        // ConPTY itself was already resized promptly on the input thread.
+        // ConPTY itself was already resized promptly on the input thread, so
+        // geometry reaches the child whether or not a model exists here. The
+        // flag is DRAINED either way — the two arms differ only in what they do
+        // with the size, never in whether the event is consumed.
         if GOT_WINCH.swap(false, Ordering::Acquire) {
             let (rows, cols) = (
                 WINCH_ROWS.load(Ordering::Relaxed),
                 WINCH_COLS.load(Ordering::Relaxed),
             );
-            if rows > 0 && cols > 0 {
+            if rows > 0
+                && cols > 0
+                && let Some(engine) = engine.as_deref_mut()
+            {
                 engine.resize(rows, cols);
             }
         }
 
-        // shell output -> host console (passthrough) AND the engine (model).
+        // shell output -> host console (passthrough), and the engine (model)
+        // only when one is armed. The write comes FIRST either way.
         let r = aterm_pty::read(master, &mut buf);
         if r <= 0 {
             break; // shell exited / ConPTY closed
         }
         let out = &buf[..r as usize];
         stdout_write_all(stdout, out);
-        engine.process(out);
+        if let Some(engine) = engine.as_deref_mut() {
+            engine.process(out);
+        }
         bytes_in += out.len() as u64;
     }
 
@@ -428,7 +450,14 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, engine: &mut Terminal, verbose
     let code = aterm_pty::exit_code(shell.pid).unwrap_or(1);
     aterm_pty::close_master(master);
     if verbose {
-        eprintln!("\r\n[aterm] session ended — engine processed {bytes_in} bytes via the VT core.");
+        // The unix twin's wording, for the same reason: the old line claimed the
+        // VT core had processed every byte, which is true only when armed.
+        let modelled = if engine.is_some() {
+            "and into the armed VT core"
+        } else {
+            "(session model off: nothing modelled)"
+        };
+        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through {modelled}.");
     }
     code
 }

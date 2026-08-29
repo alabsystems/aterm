@@ -104,7 +104,7 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
         staged_commit: ready.and_then(|r| r.commit),
         outcome,
     };
-    let Ok(text) = toml::to_string(&status) else {
+    let Ok(text) = aterm_toml::to_string(&status) else {
         return;
     };
     let tmp = temp_path(staging);
@@ -141,7 +141,7 @@ mod tests {
         assert!(text.contains("current_build = 42"), "got: {text}");
         assert!(text.contains("up to date (test)"), "got: {text}");
         // It must be valid TOML.
-        let _: toml::Value = toml::from_str(&text).expect("status is valid TOML");
+        let _: aterm_toml::Value = aterm_toml::from_str(&text).expect("status is valid TOML");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -220,8 +220,8 @@ mod tests {
         std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
 
         record(&staging, 53, "staged marker observed");
-        let without_app: toml::Value =
-            toml::from_str(&std::fs::read_to_string(&staging.status).unwrap()).unwrap();
+        let without_app: aterm_toml::Value =
+            aterm_toml::from_str(&std::fs::read_to_string(&staging.status).unwrap()).unwrap();
         assert!(
             without_app.get("staged_build").is_none(),
             "status cannot grant readiness from marker metadata alone"
@@ -229,8 +229,8 @@ mod tests {
 
         std::fs::create_dir_all(&staging.staged_app).unwrap();
         record(&staging, 53, "staged bundle observed");
-        let empty_app: toml::Value =
-            toml::from_str(&std::fs::read_to_string(&staging.status).unwrap()).unwrap();
+        let empty_app: aterm_toml::Value =
+            aterm_toml::from_str(&std::fs::read_to_string(&staging.status).unwrap()).unwrap();
         assert!(
             empty_app.get("staged_build").is_none(),
             "empty app directory cannot grant status readiness"
@@ -245,12 +245,12 @@ mod tests {
         )
         .unwrap();
         record(&staging, 53, "staged bundle observed");
-        let with_app: toml::Value =
-            toml::from_str(&std::fs::read_to_string(&staging.status).unwrap()).unwrap();
+        let with_app: aterm_toml::Value =
+            aterm_toml::from_str(&std::fs::read_to_string(&staging.status).unwrap()).unwrap();
         assert_eq!(
             with_app
                 .get("staged_build")
-                .and_then(toml::Value::as_integer),
+                .and_then(aterm_toml::Value::as_integer),
             Some(54)
         );
         let _ = std::fs::remove_dir_all(root);

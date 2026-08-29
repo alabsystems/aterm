@@ -309,6 +309,16 @@ pub struct PkgManifest {
     /// dependency edge.
     #[serde(default)]
     pub requires: Vec<String>,
+    /// `shim_env = ["NAME=VALUE", …]` — the environment EVERY shim of this program
+    /// (primary and `alab-` alias) exports before it execs the store binary (design S7,
+    /// `crates/atpkg/src/shim_env.rs`): a managed vendor tool runs with its own updater
+    /// off (`DISABLE_AUTOUPDATER=1` for Claude Code) and the index re-pin is its update
+    /// path. Only the MANAGED copy is affected — a system copy never runs through the
+    /// shim. SIGNED metadata, validated at parse ([`crate::shim_env::ShimEnv::admit`],
+    /// [`Reject::ShimEnv`]); absent on every manifest published before the key existed,
+    /// whose shims are byte-identical to before. Read through [`PkgManifest::shim_env`].
+    #[serde(default)]
+    pub shim_env: Vec<String>,
     /// `[[artifact]]` — one row per target triple. "No row for my triple" is a clean
     /// fail-closed skip, never an error (§6).
     #[serde(default, rename = "artifact")]
@@ -492,6 +502,15 @@ pub struct Cost {
 }
 
 impl PkgManifest {
+    /// The ADMITTED shim environment ([`crate::shim_env::ShimEnv`]). Total: [`parse_pkg`]
+    /// already refused a manifest whose list breaks the rule, so this cannot fail on a
+    /// parsed manifest; a hand-built one that would is read as no environment (fail-closed
+    /// — a shim laid with no env, never a half-parsed one).
+    #[must_use]
+    pub fn shim_env(&self) -> crate::shim_env::ShimEnv {
+        crate::shim_env::ShimEnv::admit(&self.shim_env).unwrap_or_default()
+    }
+
     /// The artifact for `target`, if this build ships one for that triple. `None` is the
     /// clean fail-closed skip (§6) — not an error.
     #[must_use]
@@ -670,7 +689,19 @@ pub fn parse_pkg(verified: &VerifiedBytes) -> Result<PkgManifest, Reject> {
         return Err(Reject::Schema);
     }
     validate_rows(&m)?;
+    validate_shim_env(&m)?;
     Ok(m)
+}
+
+/// The `shim_env` list must be one a shim can honour ([`crate::shim_env::ShimEnv::admit`]),
+/// checked ONCE at parse so no writer ever meets an entry it cannot embed. A refusal is
+/// [`Reject::ShimEnv`] carrying the entry and the reason — post-verify, never a crypto
+/// oracle — and it refuses the WHOLE manifest: a program whose declared environment
+/// cannot be laid must not be installed with a different one.
+fn validate_shim_env(m: &PkgManifest) -> Result<(), Reject> {
+    crate::shim_env::ShimEnv::admit(&m.shim_env)
+        .map(|_| ())
+        .map_err(Reject::ShimEnv)
 }
 
 /// The post-parse shape rules `serde` alone cannot express now that `asset`/`sha256` are
@@ -711,7 +742,7 @@ fn parse_toml<T: serde::de::DeserializeOwned>(verified: &VerifiedBytes) -> Resul
     #[cfg(test)]
     PARSE_CALLS.with(|c| c.set(c.get() + 1));
     let text = std::str::from_utf8(verified.as_slice()).map_err(|_| Reject::Malformed)?;
-    toml::from_str(text).map_err(|_| Reject::Malformed)
+    aterm_toml::from_str(text).map_err(|_| Reject::Malformed)
 }
 
 #[cfg(test)]
@@ -984,6 +1015,60 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         assert!(a.links.is_empty() && a.vendor.is_empty());
         assert!(a.signer_team.is_empty() && !a.elevated && a.provides.is_empty());
         assert!(a.manager.is_empty() && a.package.is_empty() && a.label_prefix.is_empty());
+    }
+
+    /// `shim_env` (design S7) parses as SIGNED data and is validated at parse: the
+    /// accepted shape reads back through `PkgManifest::shim_env`, a manifest without the
+    /// key reads as no environment, and every entry the rule refuses refuses the WHOLE
+    /// manifest as `Reject::ShimEnv` naming the entry — never `Malformed`, never a shim
+    /// laid with half an environment.
+    #[test]
+    fn shim_env_is_signed_validated_and_refused_by_name() {
+        let head = "schema = 2\nprogram = \"claude\"\nversion = \"2.1.231\"\n\
+                    build_number = 2026082601\nexposes = [\"claude\"]\n";
+        let row = "[[artifact]]\ntarget = \"aarch64-apple-darwin\"\nkind = \"binary\"\n\
+                   protocol = \"https\"\nurl = \"https://downloads.claude.ai/c/claude\"\n\
+                   payload = \"raw-binary\"\nentry = \"claude\"\nasset = \"claude-arm64\"\n\
+                   sha256 = \"d\"\ntree_root = \"abc\"\nsize = 1\n";
+        let with = format!("{head}shim_env = [\"DISABLE_AUTOUPDATER=1\"]\n{row}");
+        let m = parse_pkg(&verified(&with)).expect("a valid shim_env parses");
+        assert_eq!(m.shim_env, vec!["DISABLE_AUTOUPDATER=1".to_string()]);
+        assert_eq!(m.shim_env().spelled(), "DISABLE_AUTOUPDATER=1");
+        assert_eq!(
+            m.shim_env().fix_line().as_deref(),
+            Some("self-update off (DISABLE_AUTOUPDATER=1)")
+        );
+        // Absent: no environment, exactly as every manifest published before the key.
+        let without = parse_pkg(&verified(&format!("{head}{row}"))).unwrap();
+        assert!(without.shim_env.is_empty() && without.shim_env().is_empty());
+        // Refused, each by name, as ShimEnv — the publisher's verify-pkg spells the fix.
+        for (list, why) in [
+            ("[\"DISABLE_AUTOUPDATER\"]", "not NAME=VALUE"),
+            ("[\"disable_autoupdater=1\"]", "name is not [A-Z0-9_]+"),
+            ("[\"PATH=/tmp\"]", "never sets"),
+            ("[\"X=\"]", "empty value"),
+            ("[\"X=1\", \"X=2\"]", "duplicate name"),
+            (
+                "[\"A=1\", \"B=1\", \"C=1\", \"D=1\", \"E=1\", \"F=1\", \"G=1\", \"H=1\", \"I=1\"]",
+                "at most 8",
+            ),
+        ] {
+            let body = format!("{head}shim_env = {list}\n{row}");
+            match parse_pkg(&verified(&body)) {
+                Err(Reject::ShimEnv(m)) => assert!(m.contains(why), "{list}: {m}"),
+                other => panic!("{list}: expected Reject::ShimEnv, got {other:?}"),
+            }
+        }
+        // A control byte inside the TOML string is refused the same way (the string
+        // escape carries it through the parser; the rule refuses it after).
+        let body = format!("{head}shim_env = [\"X=a\\nb\"]\n{row}");
+        assert!(matches!(
+            parse_pkg(&verified(&body)),
+            Err(Reject::ShimEnv(m)) if m.contains("control byte")
+        ));
+        // The wrong TYPE is the parser's own refusal, as for any key.
+        let body = format!("{head}shim_env = \"DISABLE_AUTOUPDATER=1\"\n{row}");
+        assert_eq!(parse_pkg(&verified(&body)).unwrap_err(), Reject::Malformed);
     }
 
     /// A `softwareupdate` row (Apple's Command Line Tools) parses with its own keys and

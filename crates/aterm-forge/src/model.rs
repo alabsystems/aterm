@@ -9,8 +9,9 @@
 //!
 //!   1. A package is `(name, version)` and NEVER a bare name. `cargo pkgid -p
 //!      winnow` errors "specification `winnow` is ambiguous" the moment a second
-//!      major version enters the graph — and one already has (`winnow 0.7.15`
-//!      forked in `vendor/`, `winnow 1.0.3` unpatched from the registry).
+//!      major version enters the graph — and winnow did exactly that here, at
+//!      0.7.15 (forked in `vendor/` until 2026-08-27) beside an unpatched
+//!      registry 1.0.3 that is still in the Linux graph today.
 //!   2. Cost is a DOMINATOR, not a subtree. Measured: `softbuffer`'s subtree is
 //!      39–45 packages in isolation and 8 in the real Linux graph, because winit
 //!      already shares wayland-client and x11rb. [`crate::dominator`] is the only

@@ -44,10 +44,12 @@ a fresh clone of this tree.
 
 There is no hosted CI: nothing runs automatically on a pull request, so paste
 the output of the tests you ran into the description.
-`cargo run -q -p xtask -- gate` is the local gate ladder the project uses in
-place of CI; run at least the lanes touching your change. If a change affects
-how the window looks or feels, also run a real aterm instance, capture the
-rendered frame through `aterm ctl image`, and include before/after evidence.
+`cargo run -q -p xtask -- gate <check>` is the local gate ladder the project
+uses in place of CI (a bare `gate` only prints the list of checks and fails);
+run at least the lanes touching your change, or `gate all` for the whole
+ladder. If a change affects how the window looks or feels, also run a real
+aterm instance, capture the rendered frame through `aterm ctl image`, and
+include before/after evidence.
 
 ## Issues and pull requests
 

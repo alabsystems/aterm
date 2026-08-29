@@ -764,6 +764,8 @@ pub struct MenuSection {
 
 use MenuEntry::{Item, Separator};
 
+use crate::update_apply_trouble::ApplyTrouble;
+
 const APP_MENU: &[MenuEntry] = &[
     Item {
         label: "About aterm",
@@ -1158,12 +1160,31 @@ pub(crate) fn version_menu_bar_title(attention: bool) -> String {
 ///
 /// So: name the version when it actually differs, and fall back to the build number
 /// — the thing the updater is really comparing — when it does not.
+///
+/// # The tail is not always "restart now"
+///
+/// `trouble` is the apply lane's standing failure for this exact build
+/// (`App::apply_trouble_for`). While one is present the call-to-action tail is
+/// REPLACED by [`crate::update_apply_trouble::ApplyTrouble::row_tail`], because
+/// "restart now" beside a build that has already refused to start twice is an
+/// instruction the machine has no reason to believe. On 2026-08-21 this row read
+/// "⬆️ Update to v0.56.0 — restart now" for hours while `aterm ctl update status`
+/// carried `failing_applies=2` and the reason both attempts died — the whole defect,
+/// in one label. The tail still ends on what the row DOES, so a manual-only latch
+/// keeps "restart now to retry" and a scheduled retry says so instead of demanding
+/// an action that is already queued.
 #[must_use]
-pub(crate) fn staged_apply_label(arrow: &str, build: u64, version: &str) -> String {
+pub(crate) fn staged_apply_label(
+    arrow: &str,
+    build: u64,
+    version: &str,
+    trouble: Option<&ApplyTrouble>,
+) -> String {
+    let tail = trouble.map_or_else(|| "restart now".to_string(), ApplyTrouble::row_tail);
     if version == crate::build_info::version_display() {
-        format!("{arrow} Update to build {build} — restart now")
+        format!("{arrow} Update to build {build} — {tail}")
     } else {
-        format!("{arrow} Update to v{version} — restart now")
+        format!("{arrow} Update to v{version} — {tail}")
     }
 }
 
@@ -1257,7 +1278,13 @@ pub fn install(_proxy: &winit::event_loop::EventLoopProxy<crate::Wake>) -> Optio
 /// Non-macOS stub: no native menu bar, so there is no Version menu to retitle/rebuild.
 /// The palette's Version-section rows are the cross-platform mirror of this state.
 #[cfg(not(target_os = "macos"))]
-pub fn update_version_menu(_handle: &MenuHandle, _staged: Option<(u64, &str)>, _realized: bool) {}
+pub fn update_version_menu(
+    _handle: &MenuHandle,
+    _staged: Option<(u64, &str)>,
+    _trouble: Option<&ApplyTrouble>,
+    _realized: bool,
+) {
+}
 
 /// Windows: the shell's own Common Item Dialog (`IFileOpenDialog`), with the
 /// macOS panel's exact semantics — one existing local file, aliases resolved, no
@@ -1486,7 +1513,7 @@ mod macos {
             mtm,
             &main,
             &super::version_menu_bar_title(false),
-            build_version_menu(mtm, &target, None, false),
+            build_version_menu(mtm, &target, None, None, false),
         );
 
         app.setMainMenu(Some(&main));
@@ -1511,13 +1538,18 @@ mod macos {
     /// still lives INSIDE the menu — its "Updated to v… just now" row — and in the
     /// transient LEVEL-UP notice / palette twin, both of which self-dismiss; only the
     /// always-visible bar badge is gated to the action-needed state.
-    pub fn update_version_menu(handle: &MenuHandle, staged: Option<(u64, &str)>, realized: bool) {
+    pub fn update_version_menu(
+        handle: &MenuHandle,
+        staged: Option<(u64, &str)>,
+        trouble: Option<&super::ApplyTrouble>,
+        realized: bool,
+    ) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
         let title =
             super::version_menu_bar_title(super::bar_title_attention(staged.is_some(), realized));
-        let submenu = build_version_menu(mtm, &handle.target, staged, realized);
+        let submenu = build_version_menu(mtm, &handle.target, staged, trouble, realized);
         // Set the title on BOTH the bar item and the submenu: AppKit takes a top-level
         // bar title from whichever is authoritative for the toolkit version in play
         // (historically the submenu's title), so writing both is the robust retitle.
@@ -1616,6 +1648,7 @@ mod macos {
         mtm: MainThreadMarker,
         target: &MenuTarget,
         staged: Option<(u64, &str)>,
+        trouble: Option<&super::ApplyTrouble>,
         realized: bool,
     ) -> Retained<NSMenu> {
         let menu = NSMenu::new(mtm);
@@ -1624,7 +1657,7 @@ mod macos {
                 mtm,
                 &menu,
                 target,
-                &super::staged_apply_label("\u{2B06}\u{FE0F}", build, version),
+                &super::staged_apply_label("\u{2B06}\u{FE0F}", build, version, trouble),
                 MenuAction::ApplyUpdate,
                 "",
                 false,
@@ -2358,7 +2391,7 @@ mod tests {
         let badge = version_menu_bar_title(true);
 
         // The colliding case: staged build carries the SAME version string.
-        let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running);
+        let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running, None);
         assert!(
             same.contains("build 1785910394"),
             "a same-version staged build must be identified by its build number: {same}"
@@ -2370,10 +2403,64 @@ mod tests {
         );
 
         // The ordinary case is untouched: a genuinely different version is named.
-        let newer = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, "9.9.9");
+        let newer = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, "9.9.9", None);
         assert!(
             newer.contains("v9.9.9") && !newer.contains("build"),
             "a differing version is still named directly: {newer}"
+        );
+    }
+
+    /// THE ALWAYS-VISIBLE OFFER MUST CARRY THE APPLY LANE'S VERDICT ON ITSELF.
+    ///
+    /// This row is the affordance the owner actually looked at for hours on
+    /// 2026-08-21: "⬆️ Update to v0.56.0 — restart now", above a control socket
+    /// reporting `failing_applies=2` and the reason both attempts died. A row that
+    /// tells you to restart, over a build that has already refused to start twice, is
+    /// not merely incomplete — it is instructing you to repeat something the program
+    /// privately knows has not worked.
+    #[test]
+    fn the_apply_row_admits_when_restarting_has_already_been_tried() {
+        use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
+
+        let clean = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None);
+        assert_eq!(clean, "\u{2191} Update to v9.9.9 \u{2014} restart now");
+
+        let trouble = ApplyTrouble::new(
+            2,
+            "overlap handoff failed safely: handoff proof ended ChildDied",
+            ApplyRetry::Scheduled,
+        )
+        .expect("two failed applies");
+        let troubled = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&trouble));
+        assert!(
+            troubled.contains("v9.9.9"),
+            "the offer still names what it is offering: {troubled}"
+        );
+        assert!(
+            troubled.contains("twice"),
+            "…and how many attempts have already died: {troubled}"
+        );
+        assert!(
+            troubled.contains("didn\u{2019}t start"),
+            "…and why, in words: {troubled}"
+        );
+        assert!(
+            !troubled.contains("ChildDied"),
+            "never the proof-outcome enum name: {troubled}"
+        );
+        assert!(
+            !troubled.contains("restart now"),
+            "a scheduled retry must not demand an action that is already queued: \
+             {troubled}"
+        );
+
+        // The latched lane keeps the call to action, because there it is true.
+        let latched = ApplyTrouble::new(2, "handoff proof ended ChildDied", ApplyRetry::ManualOnly)
+            .expect("two failed applies");
+        let latched = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&latched));
+        assert!(
+            latched.contains("restart now to retry"),
+            "a lane that has stopped names the action that restarts it: {latched}"
         );
     }
 

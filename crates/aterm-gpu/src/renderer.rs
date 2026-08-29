@@ -13532,10 +13532,11 @@ impl GpuRenderer {
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 let dw = if is_wide_lead { 2 * ccw } else { ccw };
                 // W5b: decorations route through the SAME floors as the glyph
-                // fg via the shared `effective_deco_color`/`effective_glyph_fg`,
-                // fed the INK/CHAR_FG-substituted base_fg (Sparkle Words v2 /
-                // EMBERFORGE) — identical to the CPU Pass 3, so the quads stay
-                // parity (SGR 58 still wins).
+                // fg via the shared `deco_inks` resolver, fed the
+                // INK/CHAR_FG-substituted base_fg (Sparkle Words v2 /
+                // EMBERFORGE) — the CPU Pass 3 calls that one function too, so
+                // the quads stay parity by construction rather than by two
+                // edits agreeing (an explicit per-band colour still wins).
                 let base_fg = match ink_walk.at(c as u16) {
                     Some(ink) => aterm_render::rgb_to_u32(ink),
                     None => char_fg_walk
@@ -13548,15 +13549,15 @@ impl GpuRenderer {
                     bg: theme_selection,
                     fg: selection_fg,
                 } = selection_palette.at_hit(hit);
-                let ucolor = rgb4_u32(aterm_render::effective_deco_color(
+                let inks = aterm_render::deco_inks(
+                    cell,
                     selection_fg,
                     min_contrast,
-                    cell.underline_color.map(aterm_render::rgb_to_u32),
                     base_fg,
-                    aterm_render::rgb_to_u32(cell.bg),
                     cell_selected,
                     theme_selection,
-                ));
+                );
+                let ucolor = rgb4_u32(inks.underline);
                 let is_curly = matches!(cell.underline, UnderlineStyle::Curly);
                 aterm_render::underline_rects_into(
                     &mut deco_rects,
@@ -13659,28 +13660,29 @@ impl GpuRenderer {
                         }
                     }
                 }
-                // Strike/overline follow the SAME shared floor as the glyph fg
-                // (W5b), fed the ink/char_fg-substituted base_fg — parity with
-                // the CPU.
-                let fgc = rgb4_u32(aterm_render::effective_glyph_fg(
-                    selection_fg,
-                    min_contrast,
-                    base_fg,
-                    aterm_render::rgb_to_u32(cell.bg),
-                    cell_selected,
-                    theme_selection,
-                ));
-                aterm_render::strike_overline_rects_into(
-                    &mut deco_rects,
-                    cell.strikethrough,
-                    cell.overline,
-                    x,
-                    y0,
-                    dw,
-                    ch,
-                    dm,
-                );
-                for &[rx, ry, rw, rh] in &deco_rects {
+                // Strike and overline are pushed band-by-band, each with its
+                // OWN resolved ink — the strike has no colour channel anywhere
+                // and always wears the glyph fg, while the overline wears the
+                // chrome seam channel when one is set. Strike first, matching
+                // the CPU pass 3 and `strike_overline_rects`'s composition
+                // order; each band is one quad, so no scratch is spent.
+                for (rect, ink) in [
+                    (
+                        cell.strikethrough
+                            .then(|| aterm_render::strike_rect(x, y0, dw, ch, dm))
+                            .flatten(),
+                        inks.strike,
+                    ),
+                    (
+                        cell.overline
+                            .then(|| aterm_render::overline_rect(x, y0, dw, ch, dm))
+                            .flatten(),
+                        inks.overline,
+                    ),
+                ] {
+                    let Some([rx, ry, rw, rh]) = rect else {
+                        continue;
+                    };
                     // Same run-box clip as the underline rects above.
                     let clipped = match run {
                         None => Some((rx, rw)),
@@ -13691,7 +13693,7 @@ impl GpuRenderer {
                     };
                     self.inst.deco.push(BgInstance {
                         rect: [sat_pos_u16(rx), sat_pos_u16(ry), rw as u16, rh as u16],
-                        color: fgc,
+                        color: rgb4_u32(ink),
                     });
                 }
             }

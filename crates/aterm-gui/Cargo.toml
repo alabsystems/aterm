@@ -44,11 +44,14 @@ required-features = ["control-conformance"]
 #     third-party package count: accesskit_unix drags an entire D-Bus IPC
 #     runtime (zbus, zvariant, atspi) with its own async executor into a
 #     terminal.
-#   * And it removes the ONLY path by which an UNPATCHED `winnow 1.0.3` reached
-#     the shipped Linux graph. aterm forks winnow at 0.7.15 to fix an
-#     `offset_from` underflow; a 0.7 fork cannot satisfy `^1.0`, so the unfixed
-#     copy linked in through accesskit_unix -> zbus. `forge check`'s
-#     patch-liveness obligation was RED on exactly this.
+#   * And it removed one path by which an UNPATCHED `winnow 1.0.3` reached the
+#     shipped Linux graph, back when aterm forked winnow at 0.7.15 to fix an
+#     `offset_from` underflow: a 0.7 fork cannot satisfy `^1.0`, so the unfixed
+#     copy linked in through accesskit_unix -> zbus and `forge check`'s
+#     patch-liveness obligation was RED on exactly this. That finding is closed
+#     from the other end as of 2026-08-27 — retiring `toml_edit` for the
+#     first-party `aterm-toml` retired the winnow fork itself — so it is no
+#     longer a reason to keep AccessKit off.
 #
 # WHAT THIS COSTS, stated plainly: no cross-platform screen-reader tree. On
 # Linux and Windows that is the whole of it. On macOS the aterm-owned
@@ -151,6 +154,10 @@ aterm-net = { workspace = true }
 # Portable control-socket stream (std Unix sockets on Unix, AF_UNIX-over-winsock
 # on Windows) + the latest-alias/CSPRNG/pid-liveness helpers control_auth uses.
 aterm-uds = { workspace = true }
+# The coding-agent primer installer: every fresh session spawn runs its
+# fail-soft `auto_prime` on a detached thread (spawn.rs), so the primer is
+# installed by aterm itself and never by a manual step nobody runs.
+aterm-primer = { workspace = true }
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-sandbox = { workspace = true }
 aterm-containment = { workspace = true }
@@ -214,26 +221,32 @@ serde = { workspace = true }
 # Seamless-update screen carry: the checkpoint meta rides the TOML manifest as a
 # JSON string (TOML cannot represent its `None` fields). Same workspace version
 # aterm-update already uses.
-serde_json = { workspace = true }
+# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
+# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
+# behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
+aterm-json = { workspace = true }
 # SHA-256 for the operator/seamless/config-completion proof digests and the
 # managed-model blob check. First-party; no third-party crypto in this binary.
 aterm-digest = { workspace = true }
-toml = { workspace = true }
-# Smart-title inference runs on one bounded worker, never the UI thread. ureq gives
-# both the local Ollama and opt-in OpenAI-compatible providers a native, portable
-# HTTP client; TLS stays enabled for remote endpoints and JSON bodies are bounded.
-ureq = { version = "=3.3.0", default-features = false, features = ["json", "rustls", "platform-verifier"] }
-# NON-DESTRUCTIVE config writes from the Preferences window's Save button
-# (prefs::apply_prefs_edits): edit only the touched keys in `aterm.toml` while
-# preserving every other key, comment, and the file's formatting. `toml_edit` 0.22 is
-# ALREADY in this binary's tree (the `toml` 0.8 dep re-exports it), so this adds the
-# format-preserving DOM API surface, not a new dep to the lockfile.
-toml_edit = "0.22"
-# PNG encode for the control-socket `window` verb (the macOS full-window capture):
-# it draws the front NSWindow's on-screen pixels into a tightly-packed RGBA8 buffer
-# and encodes them here. Same crate (and version) aterm-render already uses for the
-# `image` verb's framebuffer PNG, so this adds bindings, not a new dep to the tree.
-png = "0.17"
+aterm-toml = { workspace = true }
+# Smart-title inference runs on one bounded worker, never the UI thread. The
+# first-party HTTP/1.1 client serves both the local Ollama and the opt-in
+# OpenAI-compatible provider; TLS stays enabled for remote endpoints and JSON
+# bodies are bounded. It replaced `ureq`, which was this binary's largest single
+# third-party import at 12 packages / 89,080 lines. THE TRUST MODEL IS
+# UNCHANGED: `platform-verifier` was requested here on purpose so remote
+# certificates verify against the OS trust store, and aterm-http keeps exactly
+# that (`rustls-platform-verifier`, now a direct dependency). What left is
+# ureq's own HTTP stack — ureq, ureq-proto, http, bytes, httparse, utf8-zero,
+# percent-encoding — plus the bundled `webpki-roots` it carried: 8 packages,
+# 69,546 lines.
+aterm-http = { workspace = true }
+# PNG encode/decode for the control-socket `window` verb (the macOS full-window
+# capture): it draws the front NSWindow's on-screen pixels into a tightly-packed
+# RGBA8 buffer and encodes them here, and decodes AppKit's own PNG normalization
+# on the way in. The SAME first-party crate aterm-render uses for the `image`
+# verb's framebuffer PNG, so this adds no dep to the tree.
+aterm-png = { workspace = true }
 # Glyph rasterization for the widget-tray text labels (free-positioned, multi-size).
 # The SAME crate + version aterm-render uses, so it adds no new dep to the tree.
 fontdue = "0.9"
@@ -245,7 +258,12 @@ fontdue = "0.9"
 # the committed anchor in `aterm-update-core::pins`, never from the environment,
 # so the embedded record cannot disagree with the key actually trusted.
 aterm-update-core = { workspace = true }
-base64 = "0.22.1"
+# Standard padded Base64 — first-party, zero-dependency, and held byte-identical
+# to the retired `base64` package's `general_purpose::STANDARD` engine by
+# `crates/aterm-codec/tests/base64_oracle.rs`. `decode_strict` is the entry
+# point every trust path uses: canonical padding REQUIRED and no trailing bits,
+# so a pinned key has exactly one spelling.
+aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
 # Windows only: compile + link the application .ico (assets/aterm.rc → assets/
 # aterm.ico) into the exe so the shell shows the aterm icon (taskbar button,
@@ -255,6 +273,9 @@ aterm-digest = { workspace = true }
 embed-resource = "3"
 
 [dev-dependencies]
+# Scratch home directories for the auto-prime pass test (spawn.rs): the pass
+# must be driven against a directory that is NOT the developer's real $HOME.
+aterm-tempfile = { workspace = true }
 # Re-declared with `conformance` ON so this crate's TEST build carries the
 # verb-matrix suite (`aterm_control::conformance::run_all`) and can be run against
 # `GuiHost`. Production `cargo build -p aterm-gui` keeps the feature off.
@@ -264,8 +285,9 @@ aterm-control = { workspace = true, features = ["conformance"] }
 aterm-effects = { workspace = true, features = ["test-open-probe"] }
 # VISUAL CAPTURE (`find_panel_visual_capture`, #[ignore]d): dump a real rendered
 # find-panel frame to a PNG so the chrome can be reviewed as pixels, not asserts —
-# the same pattern `aterm-gpu`'s rain screenshot harness uses.
-png = "0.17"
+# the same pattern `aterm-gpu`'s rain screenshot harness uses. (Redundant with the
+# hard dependency above, but kept explicit so the dev target's need is recorded.)
+aterm-png = { workspace = true }
 
 # The GUI's physical-key Tier-1 test drives `App::on_key` itself. Winit's native
 # platform payload is intentionally private, so its narrowly gated synthetic
@@ -332,10 +354,13 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-# `video frames` opens every media-namespace component relative to a retained
-# directory descriptor. rustix supplies safe openat/readdir/fstat wrappers; this
-# exact version is already in the workspace lockfile and dependency graph.
-rustix = { version = "=1.1.4", features = ["fs"] }
+# `video frames` and the confined artifact store (`pinned_dir.rs`) open every
+# path component relative to a RETAINED directory descriptor and never re-resolve
+# a name afterwards. aterm-dirfd supplies those fd-relative `*at` wrappers over
+# libc; it retired `rustix`, which cost 72,832 lines across two packages to serve
+# these two files and nothing else. `rustix` lives on as aterm-dirfd's
+# [dev-dependencies] differential oracle.
+aterm-dirfd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Native X11 clipboard (clipboard_x11.rs) over the pure-Rust x11rb RustConnection,
@@ -389,10 +414,18 @@ objc2-app-kit = { version = "0.2", features = ["block2", "NSGraphics", "NSColorS
 objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults", "NSDictionary", "NSValue", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop", "NSData"] }
 objc2 = { version = "0.5" }
 block2 = "0.5"
-# macOS Keychain storage for network-drive tokens (net_connections.rs): a saved
-# connection's drive secret lives in the Keychain (generic password), never in
-# aterm.toml. Only the small `passwords` API is used (Security.framework is an
-# OS dylib — no C build).
+
+# ORACLE ONLY (never in a shipped build). `security-framework` used to be a hard
+# macOS dependency for exactly two calls — Keychain get/set of the network-drive
+# token. Those are now `net_connections::keychain`, ~200 lines of direct
+# Security.framework `SecItem*` FFI, and the crate stays here purely as the
+# differential test's
+# reference implementation: `net_connections::keychain::tests` drives both
+# implementations against a live login keychain, in both directions, and asserts
+# they agree on stored bytes, on the add-vs-update branch, and on the exact
+# OSStatus of every failure. Retiring it removed 10,503 lines / 1 package from
+# the mac-arm graph.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 security-framework = "3"
 
 # The per-presented-frame cost of the GUI frame path, measured headless off the

@@ -103,8 +103,6 @@
 //!     terminal is REFUSED before a master is generated. A redirect can no longer capture
 //!     it and a discarded stream can no longer swallow it.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -234,7 +232,8 @@ impl MasterSeed {
     /// The master's base64 PUBLIC key — the value that goes into
     /// `pins::PAPER_MASTER_PUBKEYS`. Public identity only; safe to print, commit and log.
     pub fn pubkey_b64(&self) -> Result<String, String> {
-        Ok(STANDARD.encode(self.keypair()?.public_key().as_ref()))
+        aterm_codec::base64::encode(self.keypair()?.public_key().as_ref())
+            .map_err(|_| "public key too large to encode".to_string())
     }
 
     /// The short public [`fingerprint`] the owner eyeballs against the paper.
@@ -964,7 +963,12 @@ mod tests {
             .pubkey_b64()
             .unwrap();
         assert_eq!(a, b);
-        assert_eq!(STANDARD.decode(&a).unwrap().len(), 32);
+        assert_eq!(
+            aterm_codec::base64::decode_strict(a.as_bytes())
+                .unwrap()
+                .len(),
+            32
+        );
         // A different phrase is a different master.
         let other = parse_master(&SYNTHETIC.replace('3', "x")).unwrap();
         assert_ne!(other.seed().pubkey_b64().unwrap(), a);

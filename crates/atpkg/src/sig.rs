@@ -179,6 +179,14 @@ pub enum Reject {
     /// adversary's — and a client refuses the whole index rather than plan an order it
     /// could not satisfy. (`String`, so the enum is no longer `Copy`; nothing copied it.)
     Requires(String),
+    /// A `pkg-*.toml` whose `shim_env` list breaks the rule a shim can honour
+    /// ([`crate::shim_env::ShimEnv::admit`]: too many entries, not `NAME=VALUE`, a name
+    /// outside `[A-Z0-9_]+` or one the shim never sets, an empty or un-embeddable
+    /// value, a duplicate). Post-verify, like [`Reject::Malformed`]; it carries the
+    /// entry and the reason so the publisher's own `atpkg verify-pkg` names the fix.
+    /// SIGNED metadata, so only ever an authoring mistake — and the whole manifest is
+    /// refused rather than a shim laid with half an environment.
+    ShimEnv(String),
 }
 
 /// Translate the roster tier's verdict into atpkg's. One-to-one and total, deliberately:
@@ -510,8 +518,6 @@ impl TrustedIndex {
 pub(crate) mod testkit {
     use super::{Anchor, TrustedRoster, VerifiedBytes, admit_roster};
     use aterm_update_core::roster::{Machine, Roster};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     /// Obviously synthetic, and shared with `sig`'s own tests so one fixture describes
@@ -533,7 +539,7 @@ pub(crate) mod testkit {
     }
 
     pub(crate) fn pubkey_b64(seed: &[u8; 32]) -> String {
-        STANDARD.encode(keypair(seed).public_key().as_ref())
+        aterm_codec::base64::encode(keypair(seed).public_key().as_ref()).expect("32-byte key")
     }
 
     pub(crate) fn sign(seed: &[u8; 32], msg: &[u8]) -> Vec<u8> {
@@ -888,8 +894,6 @@ impl Floor {
 mod tests {
     use super::*;
     use aterm_update_core::roster::Machine;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -910,7 +914,7 @@ mod tests {
     }
 
     fn pubkey_b64(kp: &Ed25519KeyPair) -> String {
-        STANDARD.encode(kp.public_key().as_ref())
+        aterm_codec::base64::encode(kp.public_key().as_ref()).expect("32-byte key")
     }
 
     fn sign(seed: &[u8; 32], msg: &[u8]) -> Vec<u8> {

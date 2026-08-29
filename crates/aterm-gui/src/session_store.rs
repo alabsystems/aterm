@@ -283,14 +283,14 @@ impl SessionHandoff {
 
     /// Serialize to the handoff blob (TOML — same format the updater's markers use).
     pub fn to_toml(&self) -> Result<String, String> {
-        toml::to_string(self).map_err(|e| format!("serialize handoff: {e}"))
+        aterm_toml::to_string(self).map_err(|e| format!("serialize handoff: {e}"))
     }
 
     /// Parse a handoff blob; `None` on unreadable/incompatible input (fail-safe: the
     /// new process starts a fresh session rather than restoring a corrupt manifest).
     #[must_use]
     pub fn from_toml(s: &str) -> Option<Self> {
-        let h: Self = toml::from_str(s).ok()?;
+        let h: Self = aterm_toml::from_str(s).ok()?;
         (h.schema == Self::SCHEMA).then_some(h)
     }
 
@@ -417,6 +417,86 @@ pub enum RosterChange {
     Exited,
 }
 
+/// WHY a session left the registry — the `reason=` token of an `exits` row, a
+/// `closing` timeline event and a `session-exited` push. The dead used to tell no
+/// tale: a driver whose peer vanished learned it from `ERR no such session` and
+/// could never ask whether the shell ended, a human clicked ✕, a sibling ran
+/// `close`, or the window went away. Every close path now says which, and
+/// `Unknown` is the honest answer for a path that did not (never a guess).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitReason {
+    /// The child ended on its own (reader EOF → `Wake::Exit`).
+    ShellExit,
+    /// A control-socket `close` retired it (`by=` names the caller's sid).
+    CtlClose,
+    /// A human closed the tab/pane (✕, Cmd-W, the tab menu).
+    UiClose,
+    /// The window hosting it was closed (the red button).
+    WindowClose,
+    /// The application quit. RESERVED — not produced today: `app-quit` is in
+    /// the wire vocabulary, but no path constructs it — quit is `el.exit()` and
+    /// the process, ledger included, goes with it, so nothing deregisters
+    /// through the store. A quit path that tears sessions down through the
+    /// store is where this gets its first use; until then the `exits` and
+    /// `subscribe` entries say "reserved".
+    #[allow(dead_code)]
+    AppQuit,
+    /// The close path did not say.
+    Unknown,
+}
+
+impl ExitReason {
+    /// Every reason, in wire order — the `exits` formatting test walks this so a
+    /// variant added without a wire token cannot compile past it.
+    #[cfg(test)]
+    pub const ALL: [ExitReason; 6] = [
+        ExitReason::ShellExit,
+        ExitReason::CtlClose,
+        ExitReason::UiClose,
+        ExitReason::WindowClose,
+        ExitReason::AppQuit,
+        ExitReason::Unknown,
+    ];
+
+    /// The stable wire token (`reason=<token>`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitReason::ShellExit => "shell-exit",
+            ExitReason::CtlClose => "ctl-close",
+            ExitReason::UiClose => "ui-close",
+            ExitReason::WindowClose => "window-close",
+            ExitReason::AppQuit => "app-quit",
+            ExitReason::Unknown => "unknown",
+        }
+    }
+}
+
+/// WHO retired a session — the `by=` token. A control-socket close names the
+/// caller's own session; a UI/window close is the human at the keyboard; a path
+/// that cannot say writes `-`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExitActor {
+    /// The sid of the control connection that issued the close.
+    Sid(String),
+    /// The human, through the window chrome or a keyboard shortcut.
+    Human,
+    /// Not attributable on that path.
+    Unknown,
+}
+
+impl ExitActor {
+    /// The stable wire token (`by=<sid|human|->`).
+    #[must_use]
+    pub fn as_wire(&self) -> &str {
+        match self {
+            ExitActor::Sid(sid) => sid.as_str(),
+            ExitActor::Human => "human",
+            ExitActor::Unknown => "-",
+        }
+    }
+}
+
 /// One entry on the roster lifecycle journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RosterRecord {
@@ -425,8 +505,28 @@ pub struct RosterRecord {
     pub seq: u64,
     /// The stable sid that entered or left.
     pub sid: String,
+    /// The process-local id it was routed by (`local=` on an `exits` row — the
+    /// number `sessions` listed it under while it lived).
+    pub local_id: u64,
     /// Which way it moved.
     pub change: RosterChange,
+    /// When, in milliseconds since the process epoch — the SAME monotonic clock
+    /// the session timeline and turn ledger stamp with
+    /// ([`crate::turn_ledger::now_ms`]), so an `exit` row aligns against a
+    /// `timeline` row without a wall-clock conversion.
+    pub t_ms: u64,
+    /// Why it left. Meaningful iff `change == Exited`; a `Created` record carries
+    /// the neutral [`ExitReason::Unknown`].
+    pub reason: ExitReason,
+    /// The child's exit status when the shell-exit path recovered one (see
+    /// [`SessionStore::note_exit_code`]); `None` (`exit_code=-` on the wire) when
+    /// it did not: the child was hung up by a close rather than exiting, died by
+    /// signal, was not this process's to reap, or had not yet become reapable at
+    /// either of the ledger's two non-blocking looks (`App::shell_exit_code`).
+    pub exit_code: Option<i32>,
+    /// Who retired it. Meaningful iff `change == Exited`; neutral
+    /// [`ExitActor::Unknown`] on a `Created` record.
+    pub actor: ExitActor,
 }
 
 /// The process-wide registry. Keyed canonically by [`SessionId`]; a second index
@@ -465,6 +565,13 @@ pub struct SessionStore {
     /// Monotone source of journal seqs. Keeps counting past eviction, so a
     /// consumer's watermark stays meaningful even after the ring has rolled.
     roster_seq: u64,
+    /// Exit statuses noted by the shell-exit path (`Wake::Exit`), keyed by local
+    /// id and CONSUMED by the deregister that follows. A side table rather than a
+    /// handle field because the handle is cloned out per control request and its
+    /// constructors are many; the status is known for the short window between
+    /// the reader's EOF and the pane's teardown (indefinitely under `--hold`),
+    /// which is exactly the window this table spans.
+    exit_codes: HashMap<u64, i32>,
 }
 
 /// Shared handle to the registry, cloned into the control thread alongside the
@@ -497,18 +604,33 @@ impl SessionStore {
         // a registry and a journal that disagree. A REPLACE is not a membership
         // change and records nothing — which is precisely the rule the old
         // set-diff enforced implicitly by comparing sets of sids.
-        let journal = first.then(|| handle.sid.as_str().to_string());
+        let journal = first.then(|| (handle.sid.as_str().to_string(), handle.local_id));
         self.by_local.insert(handle.local_id, handle.sid.clone());
         self.by_id.insert(handle.sid.clone(), handle);
-        if let Some(sid) = journal {
-            self.record_roster(sid, RosterChange::Created);
+        if let Some((sid, local_id)) = journal {
+            self.record_roster(
+                sid,
+                local_id,
+                RosterChange::Created,
+                ExitReason::Unknown,
+                None,
+                ExitActor::Unknown,
+            );
         }
     }
 
     /// Append one roster lifecycle record, evicting the oldest past
     /// [`ROSTER_JOURNAL_CAP`]. Private and `&mut self`, so the ONLY way to reach
     /// it is through a mutator that already holds the store's write lock.
-    fn record_roster(&mut self, sid: String, change: RosterChange) {
+    fn record_roster(
+        &mut self,
+        sid: String,
+        local_id: u64,
+        change: RosterChange,
+        reason: ExitReason,
+        exit_code: Option<i32>,
+        actor: ExitActor,
+    ) {
         self.roster_seq += 1;
         if self.roster.len() == ROSTER_JOURNAL_CAP {
             self.roster.pop_front();
@@ -516,8 +638,37 @@ impl SessionStore {
         self.roster.push_back(RosterRecord {
             seq: self.roster_seq,
             sid,
+            local_id,
             change,
+            t_ms: crate::turn_ledger::now_ms(),
+            reason,
+            exit_code,
+            actor,
         });
+    }
+
+    /// Note the exited child's status for the session with local id `local_id`,
+    /// ahead of its deregistration. The shell-exit path calls this the instant
+    /// the status is answerable (`Wake::Exit`, before teardown reaps and discards
+    /// it); the deregister that follows moves it onto the journal row. A `None`
+    /// records nothing — the row then says `exit_code=-`, which is the truth.
+    pub fn note_exit_code(&mut self, local_id: u64, code: Option<i32>) {
+        if let Some(code) = code {
+            self.exit_codes.insert(local_id, code);
+        }
+    }
+
+    /// Deregister with NO attribution — the reason and actor are `Unknown`, except
+    /// that a session whose shell already `Exited` is journalled as a shell exit
+    /// (the store knows that much on its own). TEST-ONLY: every production close
+    /// reaches the registry through `App::retire_session_registration`, which
+    /// always passes the gesture's attribution to
+    /// [`deregister_local_as`](Self::deregister_local_as); this bare form exists
+    /// for the lifecycle fixtures, and its `cfg(test)` is what keeps a new
+    /// production path from deregistering without saying why.
+    #[cfg(test)]
+    pub fn deregister_local(&mut self, local_id: u64) -> Option<SessionId> {
+        self.deregister_local_as(local_id, ExitReason::Unknown, ExitActor::Unknown)
     }
 
     /// Deregister the session with process-local id `local_id`, removing it from
@@ -525,29 +676,67 @@ impl SessionStore {
     /// retire external artifacts keyed by it — e.g. the sibling-discovery graph
     /// entry). `None` if it is unknown — a late deregister mirrors the existing
     /// `is_active_session` miss.
-    pub fn deregister_local(&mut self, local_id: u64) -> Option<SessionId> {
-        match self.by_local.remove(&local_id) {
-            Some(sid) => {
-                // The death mark: record it on the (shared, Arc-held) timeline
-                // BEFORE the handle drops out of the registry, so a holder that
-                // kept the ctx (pool teardown races, a live subscribe watch)
-                // still reads an honest final event.
-                if let Some(h) = self.by_id.remove(&sid) {
-                    h.ctx
-                        .timeline
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .record("state-change", "state=closed".to_string());
-                    // Journalled ONLY when the handle was really there, so the
-                    // journal records exactly the set transitions `by_id`
-                    // performed — a late/duplicate deregister writes nothing,
-                    // matching the `None` arm below.
-                    self.record_roster(sid.as_str().to_string(), RosterChange::Exited);
-                }
-                Some(sid)
+    ///
+    /// `reason`/`actor` say why and by whom (the exit ledger's tale). A caller
+    /// that passes [`ExitReason::Unknown`] on a session whose shell has already
+    /// `Exited` gets [`ExitReason::ShellExit`] — the state is the evidence; an
+    /// explicit reason always wins (under `--hold` a human closes an exited pane
+    /// and that close IS a `ui-close`). The `closing` timeline event is recorded
+    /// only when the resolved reason is known, immediately before the death mark
+    /// and BEFORE the handle leaves either index, so a holder of the (Arc-shared)
+    /// timeline that outlives the registry entry reads why the session went
+    /// before it reads that it is gone. Exactly one such holder exists on the
+    /// wire: a live `subscribe @<sid> events` watch, whose final pass pushes the
+    /// row as `EVENT <local> closing reason= by=` ahead of `EVENT <local> exited`.
+    /// The `timeline` verb cannot be asked for it after the close — the sid
+    /// stops resolving in this very write; only a request that resolved its ctx
+    /// just before it can still read the row — and the journal row (`exits`) is
+    /// where the same facts stay answerable afterwards.
+    pub fn deregister_local_as(
+        &mut self,
+        local_id: u64,
+        reason: ExitReason,
+        actor: ExitActor,
+    ) -> Option<SessionId> {
+        // The status is consumed whether or not the handle is still here: a late
+        // duplicate deregister must not leave a stale code to be pinned on a
+        // session that later reuses the local id.
+        let exit_code = self.exit_codes.remove(&local_id);
+        let sid = self.by_local.remove(&local_id)?;
+        // The death mark, written WHILE the handle is still registered: the
+        // timeline is Arc-shared, so a holder that kept the ctx (pool teardown
+        // races, a live subscribe watch) reads the `closing` row and the final
+        // `state-change` from the same object — and this write precedes the
+        // index removal in program order, not merely inside the same lock hold,
+        // so "before it is gone" is literally the code's order too.
+        let resolved = self.by_id.get(&sid).map(|h| {
+            let reason = if reason == ExitReason::Unknown && h.state == SessionState::Exited {
+                ExitReason::ShellExit
+            } else {
+                reason
+            };
+            let mut tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            if reason != ExitReason::Unknown {
+                tl.record("closing", closing_payload(reason, &actor));
             }
-            None => None,
+            tl.record("state-change", "state=closed".to_string());
+            reason
+        });
+        if let Some(reason) = resolved {
+            self.by_id.remove(&sid);
+            // Journalled ONLY when the handle was really there, so the journal
+            // records exactly the set transitions `by_id` performed — a
+            // late/duplicate deregister writes nothing, matching the `?` above.
+            self.record_roster(
+                sid.as_str().to_string(),
+                local_id,
+                RosterChange::Exited,
+                reason,
+                exit_code,
+                actor,
+            );
         }
+        Some(sid)
     }
 
     /// Mark the session's lifecycle state (e.g. `Exited` on `Wake::Exit`). A no-op
@@ -714,6 +903,156 @@ impl SessionStore {
     /// confused.
     pub fn live_handles(&self) -> impl Iterator<Item = &SessionHandle> {
         self.by_id.values()
+    }
+}
+
+/// The `closing` event's payload: `reason=<token> by=<sid|human|->`. The sid is
+/// pct-encoded like every other free value on a timeline row (a sid is plain
+/// ASCII, so this is the identity today — the encode is the one-line guarantee).
+fn closing_payload(reason: ExitReason, actor: &ExitActor) -> String {
+    format!(
+        "reason={} by={}",
+        reason.as_str(),
+        crate::control::pct_encode(actor.as_wire())
+    )
+}
+
+thread_local! {
+    /// The attribution the CURRENT close gesture carries (main thread only — every
+    /// deregistration happens there), read by the one deregister funnel in
+    /// `App::retire_session_registration`. See [`CloseAttribution`].
+    static CLOSE_ATTRIBUTION: std::cell::RefCell<Option<(ExitReason, ExitActor)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A scoped statement of WHY the sessions retired inside it are being retired.
+///
+/// Every close reaches the registry through one funnel
+/// (`teardown_session` → `retire_session_registration` → `deregister_local_as`),
+/// but the gesture that started it is several calls up: a control-socket `close`,
+/// the red window button, a tab ✕, Cmd-W, the `tab close` verb. Threading a
+/// reason argument down through each of those chains would touch every
+/// intermediate signature in the two busiest files of the crate; a scope the
+/// INITIATOR enters, read at the funnel, names the reason with one line per
+/// gesture and nothing in between.
+///
+/// The OUTERMOST initiator wins: `enter` is a no-op when a scope is already open,
+/// so a `close` verb that lands in the same `close_tab_at` a tab ✕ uses keeps
+/// its `ctl-close` even though `close_tab_at` claims `ui-close` for the gestures
+/// that reach it directly. Dropping the guard that opened the scope closes it;
+/// a close that happens with no scope open is `Unknown`, never a stale one.
+pub(crate) struct CloseAttribution {
+    /// Whether THIS guard opened the scope (and so must close it).
+    opened: bool,
+}
+
+impl CloseAttribution {
+    /// Open the scope for the current gesture unless one is already open. Bind the
+    /// result (`let _closing = …`): the attribution lasts exactly as long as it.
+    #[must_use = "the attribution lasts exactly as long as this guard lives"]
+    pub(crate) fn enter(reason: ExitReason, actor: ExitActor) -> Self {
+        let opened = CLOSE_ATTRIBUTION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some((reason, actor));
+                true
+            } else {
+                false
+            }
+        });
+        Self { opened }
+    }
+}
+
+impl Drop for CloseAttribution {
+    fn drop(&mut self) {
+        if self.opened {
+            CLOSE_ATTRIBUTION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+}
+
+/// The attribution of the close gesture in progress on this thread, or
+/// `(Unknown, Unknown)` when none is open.
+#[must_use]
+pub(crate) fn current_close_attribution() -> (ExitReason, ExitActor) {
+    CLOSE_ATTRIBUTION
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or((ExitReason::Unknown, ExitActor::Unknown))
+}
+
+impl crate::App {
+    /// Capture the exited child's status for the exit ledger. Called on the
+    /// shell-exit path (`exit_session_logical`) — the one instant the status is
+    /// answerable: the reader hit EOF, the child is a zombie or was just reaped
+    /// by the status classifier, and teardown (which reaps and DISCARDS it) has
+    /// not run. The deregister that follows moves the code onto the journal row.
+    pub(crate) fn note_shell_exit_for_ledger(&mut self, session: u64) {
+        let code = self.shell_exit_code(session);
+        self.store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_exit_code(session, code);
+    }
+
+    /// The exited child's status code, from whichever party reaped it.
+    ///
+    /// `None` is the honest `exit_code=-`: the child died by signal, is not this
+    /// process's to reap (an adopted session), or had not yet become a zombie at
+    /// EITHER non-blocking look. That last one is a real window, not a
+    /// hypothetical: the reader reports EOF the instant the child's last pty
+    /// descriptor closes, and the kernel closes a dying process's descriptors
+    /// before it retires the process, so the classifier's `WNOHANG` probe at
+    /// `Wake::Exit` can find nothing to reap yet. This is the ONE bounded retry:
+    /// the same non-blocking probe again, a few statements later in the SAME
+    /// `Wake::Exit` dispatch (the classifier looks first, then the ledger), which
+    /// in practice closes the window; a child still not reapable by then writes
+    /// `-`, and the ledger says so rather than blocking the UI thread to find out.
+    fn shell_exit_code(&self, session: u64) -> Option<i32> {
+        use crate::session_status::{Outcome, Phase};
+        // `tab_status` on (the default): `note_session_exit` already reaped the
+        // child and published an EXACT lifecycle classification. Read the code
+        // back from it — a second `waitpid` would answer ECHILD for a pid that is
+        // no longer ours to wait for, and the classifier's answer is the same
+        // status, not a guess. Only an `Exited` phase is that answer; any other
+        // phase is a stale pre-exit observation and says nothing about the exit.
+        if let Some(status) = self.session_status.status(session)
+            && matches!(status.phase, Phase::Exited)
+        {
+            match status.last_outcome {
+                Outcome::Success => return Some(0),
+                Outcome::Failure { exit_code } => return Some(exit_code),
+                // Killed by a signal: no code, and the child IS reaped.
+                Outcome::Signal { .. } => return None,
+                // The classifier's probe found nothing to reap (the window in
+                // the doc above). Fall through to the retry: `child_reaped` is
+                // still clear on this path, so the probe below is never a
+                // second `waitpid` on a pid that was already collected.
+                Outcome::None => {}
+            }
+        }
+        // `tab_status` off, or the classifier's probe came up empty: nobody has
+        // reaped yet, so the zombie — once it exists — still holds its status.
+        // Take it with the same reap-and-latch the classifier uses —
+        // `collect_exit_status` frees the pid, and a session that outlives the
+        // reap (`--hold`) must never `killpg` a number the kernel has reissued.
+        let pooled = self.pool.get(session)?;
+        if pooled
+            .child_reaped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        let collected = aterm_pty::collect_exit_status(pooled.pid);
+        if collected.is_some() {
+            pooled
+                .child_reaped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        match collected {
+            Some(aterm_pty::ChildExit::Code(code)) => Some(code),
+            Some(aterm_pty::ChildExit::Signal(_)) | None => None,
+        }
     }
 }
 
@@ -1050,7 +1389,12 @@ mod tests {
                 (2, "state-change", "state=alive"),
                 (3, "title-change", "title=vim%20main.rs"),
                 (4, "state-change", "state=exited"),
-                (5, "state-change", "state=closed"),
+                // A deregister of a session whose shell already `Exited` says
+                // why before it says it is gone — the `closing` row is the
+                // exit ledger's tale, recorded in the same store write as
+                // the death mark (see `deregister_local_as`).
+                (5, "closing", "reason=shell-exit by=-"),
+                (6, "state-change", "state=closed"),
             ],
             "one ordered, monotonic-id event per ACTUAL lifecycle change"
         );
@@ -1160,6 +1504,251 @@ mod tests {
             store.is_empty(),
             "every session registered was deregistered"
         );
+    }
+
+    /// The timeline of a handle's ctx, as `(kind, payload)` pairs, oldest-first.
+    fn timeline_of(h: &SessionHandle) -> Vec<(&'static str, String)> {
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .since(None)
+            .map(|e| (e.kind, e.payload.clone()))
+            .collect()
+    }
+
+    /// THE EXIT LEDGER'S TALE: an attributed deregister journals WHY (reason),
+    /// WHO (actor), WHEN (`t_ms`, on the timeline's clock) and the exit status
+    /// the shell-exit path noted — and writes the `closing` event on the
+    /// session's own timeline immediately before the death mark, so an `events`
+    /// watch that outlives the registry entry reads the reason first.
+    #[test]
+    fn attributed_deregister_records_reason_actor_clock_and_exit_code() {
+        let mut store = SessionStore::default();
+        let h = handle(7, None);
+        let sid = h.sid.as_str().to_string();
+        store.register(h.clone());
+        let before = crate::turn_ledger::now_ms();
+        store.note_exit_code(7, Some(3));
+        assert_eq!(
+            store.deregister_local_as(7, ExitReason::CtlClose, ExitActor::Sid("s-caller".into())),
+            Some(h.sid.clone())
+        );
+        let rec = store
+            .roster_since(0)
+            .find(|r| r.change == RosterChange::Exited)
+            .expect("the exit was journalled")
+            .clone();
+        assert_eq!(rec.sid, sid);
+        assert_eq!(rec.local_id, 7);
+        assert_eq!(rec.reason, ExitReason::CtlClose);
+        assert_eq!(rec.actor, ExitActor::Sid("s-caller".into()));
+        assert_eq!(rec.exit_code, Some(3));
+        assert!(
+            rec.t_ms >= before && rec.t_ms <= crate::turn_ledger::now_ms(),
+            "stamped on the process-epoch clock: {} not in [{before}, now]",
+            rec.t_ms
+        );
+        // A `Created` row carries the neutral values, never an invented reason.
+        let created = store
+            .roster_since(0)
+            .find(|r| r.change == RosterChange::Created)
+            .expect("the birth was journalled");
+        assert_eq!(
+            (created.reason, created.exit_code, &created.actor),
+            (ExitReason::Unknown, None, &ExitActor::Unknown)
+        );
+        // The session's timeline: spawned, then `closing` with the reason, THEN
+        // the death mark — in that order.
+        let tl = timeline_of(&h);
+        assert_eq!(tl[0].0, "spawned");
+        assert_eq!(
+            &tl[1..],
+            &[
+                ("closing", "reason=ctl-close by=s-caller".to_string()),
+                ("state-change", "state=closed".to_string()),
+            ]
+        );
+    }
+
+    /// An UNATTRIBUTED deregister of a session whose shell already `Exited` is a
+    /// shell exit — the state is the evidence and the store knows it on its own.
+    /// One that was still alive stays `Unknown` (no guess), and an unknown reason
+    /// records NO `closing` event: the timeline says only what is known.
+    #[test]
+    fn unattributed_deregister_infers_shell_exit_from_the_exited_state_only() {
+        let mut store = SessionStore::default();
+        let exited = handle_in_state(1, None, SessionState::Exited);
+        let alive = handle(2, None);
+        store.register(exited.clone());
+        store.register(alive.clone());
+        store.deregister_local(1);
+        store.deregister_local(2);
+        let reasons: Vec<(String, ExitReason, ExitActor)> = store
+            .roster_since(0)
+            .filter(|r| r.change == RosterChange::Exited)
+            .map(|r| (r.sid.clone(), r.reason, r.actor.clone()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (
+                    exited.sid.as_str().to_string(),
+                    ExitReason::ShellExit,
+                    ExitActor::Unknown
+                ),
+                (
+                    alive.sid.as_str().to_string(),
+                    ExitReason::Unknown,
+                    ExitActor::Unknown
+                ),
+            ]
+        );
+        assert!(
+            timeline_of(&exited)
+                .iter()
+                .any(|(k, p)| *k == "closing" && p == "reason=shell-exit by=-"),
+            "the inferred shell exit is a known reason: {:?}",
+            timeline_of(&exited)
+        );
+        assert!(
+            !timeline_of(&alive).iter().any(|(k, _)| *k == "closing"),
+            "an unknown reason records no closing event: {:?}",
+            timeline_of(&alive)
+        );
+    }
+
+    /// An EXPLICIT reason outranks the `Exited` state: under `--hold` a human
+    /// closes a pane whose shell ended minutes ago, and that close is a
+    /// `ui-close` by the human, not a re-reported shell exit.
+    #[test]
+    fn an_explicit_reason_outranks_the_exited_state() {
+        let mut store = SessionStore::default();
+        store.register(handle_in_state(4, None, SessionState::Exited));
+        store.deregister_local_as(4, ExitReason::UiClose, ExitActor::Human);
+        let rec = store
+            .roster_since(0)
+            .find(|r| r.change == RosterChange::Exited)
+            .unwrap();
+        assert_eq!(
+            (rec.reason, &rec.actor),
+            (ExitReason::UiClose, &ExitActor::Human)
+        );
+    }
+
+    /// A noted exit code is consumed by the deregister that follows and never
+    /// bleeds onto a later session that reuses the local id; a `None` note
+    /// records nothing (the row honestly says `-`).
+    #[test]
+    fn a_noted_exit_code_is_consumed_exactly_once() {
+        let mut store = SessionStore::default();
+        store.register(handle(9, None));
+        store.note_exit_code(9, None);
+        store.deregister_local(9);
+        store.register(handle(9, None));
+        store.note_exit_code(9, Some(7));
+        store.deregister_local(9);
+        store.register(handle(9, None));
+        store.deregister_local(9);
+        let codes: Vec<Option<i32>> = store
+            .roster_since(0)
+            .filter(|r| r.change == RosterChange::Exited)
+            .map(|r| r.exit_code)
+            .collect();
+        assert_eq!(codes, vec![None, Some(7), None]);
+    }
+
+    /// The ledger stays BOUNDED with the richer rows: past the cap the oldest
+    /// exits are dropped, the newest `ROSTER_JOURNAL_CAP` survive intact (their
+    /// attribution included), and `since=` keyed on a journal seq yields exactly
+    /// the newer rows — the cursor the `exits` verb pages with.
+    #[test]
+    fn attributed_exits_stay_bounded_and_page_by_seq() {
+        let mut store = SessionStore::default();
+        let n = ROSTER_JOURNAL_CAP as u64 + 5;
+        for i in 0..n {
+            store.register(handle(i, None));
+            store.note_exit_code(i, Some(i32::try_from(i % 256).unwrap()));
+            store.deregister_local_as(i, ExitReason::CtlClose, ExitActor::Sid(format!("s-{i}")));
+        }
+        let exits: Vec<&RosterRecord> = store
+            .roster_since(0)
+            .filter(|r| r.change == RosterChange::Exited)
+            .collect();
+        // Two rows per session; the retained window holds the newest CAP rows,
+        // half of which are exits.
+        assert_eq!(exits.len(), ROSTER_JOURNAL_CAP / 2);
+        let newest = exits.last().unwrap();
+        assert_eq!(newest.seq, store.roster_seq());
+        assert_eq!(newest.actor, ExitActor::Sid(format!("s-{}", n - 1)));
+        assert_eq!(
+            newest.exit_code,
+            Some(i32::try_from((n - 1) % 256).unwrap())
+        );
+        // `since=<seq of the third-newest exit>` → exactly the two newer exits.
+        let third = exits[exits.len() - 3].seq;
+        let newer: Vec<u64> = store
+            .roster_since(third)
+            .filter(|r| r.change == RosterChange::Exited)
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(newer, vec![exits[exits.len() - 2].seq, newest.seq]);
+        assert_eq!(store.roster_since(newest.seq).count(), 0, "caught up");
+    }
+
+    /// The close-attribution scope: absent → `Unknown`; the OUTERMOST initiator
+    /// wins over an inner claim (a `close` verb reaching the tab ✕'s
+    /// `close_tab_at` keeps `ctl-close`); and dropping the opener restores
+    /// `Unknown` — never a stale attribution for the next unrelated close.
+    #[test]
+    fn close_attribution_scope_is_outermost_wins_and_restores() {
+        assert_eq!(
+            current_close_attribution(),
+            (ExitReason::Unknown, ExitActor::Unknown)
+        );
+        {
+            let _outer =
+                CloseAttribution::enter(ExitReason::CtlClose, ExitActor::Sid("s-a".into()));
+            {
+                let _inner = CloseAttribution::enter(ExitReason::UiClose, ExitActor::Human);
+                assert_eq!(
+                    current_close_attribution(),
+                    (ExitReason::CtlClose, ExitActor::Sid("s-a".into())),
+                    "the inner claim does not override the initiator"
+                );
+            }
+            assert_eq!(
+                current_close_attribution().0,
+                ExitReason::CtlClose,
+                "dropping the inner (non-opener) guard leaves the scope open"
+            );
+        }
+        assert_eq!(
+            current_close_attribution(),
+            (ExitReason::Unknown, ExitActor::Unknown),
+            "dropping the opener closes the scope"
+        );
+    }
+
+    /// Every reason has a distinct wire token and the actor's tokens are the
+    /// documented three — the vocabulary the `exits`/`subscribe` docs promise.
+    #[test]
+    fn exit_reason_and_actor_wire_tokens() {
+        let tokens: Vec<&str> = ExitReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            tokens,
+            [
+                "shell-exit",
+                "ctl-close",
+                "ui-close",
+                "window-close",
+                "app-quit",
+                "unknown"
+            ]
+        );
+        assert_eq!(ExitActor::Sid("s-z".into()).as_wire(), "s-z");
+        assert_eq!(ExitActor::Human.as_wire(), "human");
+        assert_eq!(ExitActor::Unknown.as_wire(), "-");
     }
 
     #[test]

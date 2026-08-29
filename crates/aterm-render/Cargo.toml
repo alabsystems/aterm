@@ -48,7 +48,11 @@ aterm-types = { workspace = true }
 # safe choice (matches the engine's grid/core caches, which already use it).
 aterm-hash = { workspace = true }
 fontdue = "0.9"
-png = "0.17"
+# First-party PNG (crates/aterm-png), which retired `png` and the flate2/
+# miniz_oxide/fdeflate/simd-adler32/crc32fast/adler2 compression stack behind
+# it — 7 packages / 33,439 lines. Decode is the inline-image and colour-emoji
+# path (`decode_png_rgba8`); encode is the `image` verb's framebuffer dump.
+aterm-png = { workspace = true }
 rustybuzz = "0.20.1"
 # Color-emoji (Apple Color Emoji `sbix` table) glyph extraction. fontdue is a
 # monochrome rasterizer; ttf-parser reads the embedded per-glyph PNG bitmaps.

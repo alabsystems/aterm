@@ -519,6 +519,12 @@ pub(crate) fn cell(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool, seam: bool) -
         strikethrough: false,
         overline: seam,
         underline_color: None,
+        // A band whose cells all share one ink needs no seam colour: the
+        // overline already paints in `fg`. A band that varies its ink sets this
+        // per row (see `link_target::caption_row`), because a seam is a
+        // STRUCTURAL edge and must not brighten under the words it happens to
+        // pass beneath.
+        overline_color: None,
     }
 }
 

@@ -2431,7 +2431,71 @@ impl SettingsApp {
                 );
                 EventResult::Handled
             }
-            _ => EventResult::Bubble,
+            _ => {
+                // The per-row Install controls. Each is admitted ONLY against the live
+                // projection — a stale or forged action id for a name that is not an
+                // extra awaiting consent, or not waiting on an administrator, is
+                // answered in user voice and never becomes an argv.
+                if let Some(name) = action.strip_prefix("packages/extras/install/") {
+                    let packages = self.packages.projection();
+                    if let Some(row) = packages
+                        .programs
+                        .iter()
+                        .find(|row| row.name == name && row.offers_extra_install())
+                    {
+                        // The consent line names the VENDOR (S9: "Install codex (OpenAI
+                        // Codex CLI, Apache-2.0, ~90 MB)?") — the same facts the row
+                        // carries, said again at the moment of the press.
+                        let feedback = match row.facts.as_ref() {
+                            Some(facts) => format!("Installing {name} ({})…", facts.line()),
+                            None => format!("Installing {name}…"),
+                        };
+                        self.reduce_packages_verb(
+                            view,
+                            cx,
+                            PackagesRequest::InstallExtra {
+                                name: name.to_string(),
+                            },
+                            &feedback,
+                        );
+                    } else {
+                        view.feedback =
+                            Some(format!("{name} is not an extra waiting for consent."));
+                        cx.repaint(crate::native_app::DamageRegion::All);
+                    }
+                    return EventResult::Handled;
+                }
+                if let Some(name) = action.strip_prefix("packages/admin/install/") {
+                    let packages = self.packages.projection();
+                    let Some(end) = packages.needs_admin.iter().position(|n| n == name) else {
+                        view.feedback = Some(format!("{name} is not waiting on an administrator."));
+                        cx.repaint(crate::native_app::DamageRegion::All);
+                        return EventResult::Handled;
+                    };
+                    if !packages.admin_door {
+                        view.feedback = Some(format!(
+                            "Run `aterm pkg install {name}` in a terminal — the administrator dialog is macOS-only."
+                        ));
+                        cx.repaint(crate::native_app::DamageRegion::All);
+                        return EventResult::Handled;
+                    }
+                    // The door installs this program AND every admin-waiting program
+                    // before it in door order (`clt` before `brew`), one dialog each.
+                    let names = packages.needs_admin[..=end].to_vec();
+                    let feedback = format!(
+                        "Installing {} — macOS will ask for your password…",
+                        names.join(", then ")
+                    );
+                    self.reduce_packages_verb(
+                        view,
+                        cx,
+                        PackagesRequest::InstallElevated { names },
+                        &feedback,
+                    );
+                    return EventResult::Handled;
+                }
+                EventResult::Bubble
+            }
         }
     }
 
@@ -2954,7 +3018,7 @@ fn manual_override_preview(
         }
         ConfigSchemaKind::StringList | ConfigSchemaKind::TextOrStringList => {
             let count = raw
-                .parse::<toml_edit::Value>()
+                .parse::<aterm_toml::edit::Value>()
                 .ok()
                 .and_then(|value| value.as_array().map(|array| array.len()))
                 .unwrap_or(1);
@@ -3968,14 +4032,17 @@ fn setting_choice_label(key: &str, value: &str) -> String {
             };
         }
     }
-    // The trail picker's UNDERLINE alternate is the one spelling in the family
+    // The trail picker's UNDERLINE row is the one spelling in the family
     // whose sentence-cased form does not fit the control: "Rainbow kitty
     // underline" measures 133.6 pt inside a 132.0 pt button at 1.0× text scale
     // and paints clipped ("Rainbow kitty underl…"). It reads as the shorter
     // spelling the engine already accepts for exactly this style — honest about
-    // what it selects (the thin under-baseline strip rather than the default
-    // full-height body) and still a valid `cursor_trail_style` value, so a user
-    // who copies the button into `aterm.toml` lands back on this same option.
+    // what it selects (the highlighter-plus-under-baseline mark, which since
+    // 2026-08-28 is also what the unqualified rows draw) and still a valid
+    // `cursor_trail_style` value, so a user who copies the button into
+    // `aterm.toml` lands back on this same option. The row is kept as a
+    // SPELLING, not a second look: removing it would break the configs and the
+    // alias table that name it.
     // The config spelling and the picker rows are untouched; this is the
     // button's paint label, like `EDIT_MOTION`'s above.
     if key == prefs::EDIT_CURSOR_TRAIL_STYLE
@@ -7888,8 +7955,11 @@ fn top_music_suppression_reason_for_output(
     if top_projected_trail_value(state).eq_ignore_ascii_case("off") {
         return Some("On, currently silent because Cursor trail is Off.");
     }
+    // The STYLE, not the spelling: an unrecognized value falls back to the
+    // default and still plays, so only a resolution that draws nothing — a
+    // `pack:` naming no loaded pack — silences the synth.
     let trail = candidate_trail_resolution(state, None);
-    if trail.issue.is_some() || trail.style.is_none() {
+    if trail.style.is_none() {
         return Some("On, currently silent because Cursor trail style is unavailable.");
     }
     if field_number(state, prefs::EDIT_TRAIL_SOUND_VOLUME, 0.4_f32) <= f32::EPSILON {
@@ -11795,23 +11865,44 @@ fn parent_or_motion_inactivity(
             || music_switch_enabling
         {
             if let Some(issue) = trail_resolution.issue {
-                return Some(match issue {
-                    crate::app_config::TrailStyleIssue::Unknown => unavailable(
-                        "The configured Cursor trail style is unknown, so the renderer disables the trail and this setting has no current consumer",
-                        "Invalid trail style · No effect",
-                        "Cursor trail style is unknown; trail remains disabled",
-                    ),
-                    crate::app_config::TrailStyleIssue::EmptyPackId => unavailable(
-                        "The configured Trail Pack id is empty, so the renderer disables the trail until a concrete pack is selected",
-                        "Empty Trail Pack id · No effect",
-                        "Trail Pack id is empty; trail remains disabled",
-                    ),
-                    crate::app_config::TrailStyleIssue::MissingPack => unavailable(
-                        "The configured Trail Pack is not present in the admitted pack catalog, so the renderer disables the trail",
-                        "Trail Pack missing · No effect",
-                        "Selected Trail Pack is missing; trail remains disabled",
-                    ),
-                });
+                // AN UNKNOWN STYLE DISABLES NOTHING. `resolve_trail_style`
+                // substitutes the default style and the trail RENDERS, so every
+                // other row in this block still governs the drawn wake: the
+                // master switch turns it on, the Music-effects switch sounds
+                // it, and each TRAIL_TUNING_KEYS row shapes it — duration,
+                // length, wake, intensity, radius, ring, colour, accent,
+                // sprite, the bloom trio, shimmer, HDR glow and SDR boost. The
+                // STYLE row's own authored value is the only unusable one, so
+                // it alone takes the Unavailable shape; the rest fall through
+                // to the gates that really do silence them (master off, Music
+                // effects off, pack ownership, Fire-only shimmer, bloom off,
+                // motion) and pick up a live-effect-preserving note below.
+                // Same shape as the invalid theme selector's
+                // `Constraint`-beside-a-live-effect projection. The PACK issues
+                // are not this case: they disable the trail outright, so they
+                // keep the Unavailable shape on every row.
+                let unknown_elsewhere =
+                    matches!(issue, crate::app_config::TrailStyleIssue::Unknown)
+                        && key != prefs::EDIT_CURSOR_TRAIL_STYLE;
+                if !unknown_elsewhere {
+                    return Some(match issue {
+                        crate::app_config::TrailStyleIssue::Unknown => unavailable(
+                            "The configured Cursor trail style is outside this setting's registered choices, so the runtime draws its default trail instead; open Manual to repair the authored value",
+                            "Invalid trail style · Runtime fallback active",
+                            "Cursor trail style is unknown; the default trail is drawn instead",
+                        ),
+                        crate::app_config::TrailStyleIssue::EmptyPackId => unavailable(
+                            "The configured Trail Pack id is empty, so the renderer disables the trail until a concrete pack is selected",
+                            "Empty Trail Pack id · No effect",
+                            "Trail Pack id is empty; trail remains disabled",
+                        ),
+                        crate::app_config::TrailStyleIssue::MissingPack => unavailable(
+                            "The configured Trail Pack is not present in the admitted pack catalog, so the renderer disables the trail",
+                            "Trail Pack missing · No effect",
+                            "Selected Trail Pack is missing; trail remains disabled",
+                        ),
+                    });
+                }
             }
             if !candidate_setting_bool(
                 state,
@@ -11873,6 +11964,22 @@ fn parent_or_motion_inactivity(
                     "Inactive · Bloom Off",
                     "Currently inactive: Cursor trail bloom is Off",
                 ));
+            }
+            // The tuning row survived every gate, so it IS live — and the only
+            // issue that reaches here is an unrecognized style, whose fallback
+            // trail is the thing this row tunes. The note names which trail that
+            // is; it must stay a `Constraint` so `has_live_effect` holds, and it
+            // is stated after motion suppression, which really does stop the
+            // drawing.
+            if trail_tuning && trail_resolution.issue.is_some() {
+                return motion_suppression(state, patch, motion).or_else(|| {
+                    Some(EffectDisclosure::new(
+                        EffectNoteKind::Constraint,
+                        "The configured Cursor trail style is outside its registered choices, so the runtime draws its default trail; this tuning applies to that fallback trail. Open Manual to repair the authored style",
+                        "Tuning the fallback trail · Invalid style",
+                        "Cursor trail style is unknown; this tuning applies to the default trail that is drawn instead",
+                    ))
+                });
             }
             return motion_suppression(state, patch, motion);
         }
@@ -13826,7 +13933,91 @@ fn about_page(
         // build metadata below the fold. This is the same reducer action as
         // compact About, so pointer, keyboard, switch control, and a11y all
         // move the identical `page_scroll` state.
-        let mut sections = vec![hero, details];
+        // AND THE DETAILS SECTION MUST ITSELF FIT. Paginating hero away buys
+        // `content_height - page_navigation_height()`, and the metadata card is
+        // laid out at a FIXED height with FIXED 28pt rows — so when the card is
+        // taller than that, the layout engine absorbs the whole deficit into the
+        // last row and paints it at ~1pt. Measured on the ordinary 849x513
+        // desktop viewport with two installs present: card 410pt against a 377pt
+        // section, and the `another copy` row rendered 1pt tall with 69pt of
+        // viewport still free below it — invisible, and precisely the row the
+        // which-copy feature exists to show. It is not that row's fault: it was
+        // simply the eleventh line, and any eleventh line does it.
+        //
+        // Chunk the facts across further sections rather than squeezing, which
+        // is what compact About already does with the same helper. A fact never
+        // splits across cards, so every row keeps its full height and its
+        // accessibility contract.
+        let section_budget = (content_height - page_navigation_height()).max(0.0);
+        let mut sections = vec![hero];
+        if card_height <= section_budget {
+            sections.push(details);
+        } else {
+            let rows_budget =
+                ((section_budget - ABOUT_METADATA_CARD_PADDING * 2.0 - metadata_heading_height)
+                    / (metadata_row_height + 4.0))
+                    .floor()
+                    .max(1.0) as usize;
+            // Each chunk is its own SECTION, and only one section is ever in the
+            // rendered tree (`swap_remove` below), so every chunk keeps the
+            // `about/details` wrapper the page's semantic contract is written
+            // against — same key, never two of them live at once.
+            let chunk_card = |key: String, heading: &str, rows: &[(String, String)]| {
+                let height = ABOUT_METADATA_CARD_PADDING * 2.0
+                    + metadata_heading_height
+                    + metadata_line_count(rows, metadata_value_width) as f32
+                        * (metadata_row_height + 4.0);
+                UiNode::new(
+                    "about/details",
+                    UiContent::Group(GroupSpec::new("About details")),
+                )
+                .layout(Layout::column().gap(12.0))
+                .children(vec![metadata_card(
+                    &key,
+                    heading,
+                    rows,
+                    height,
+                    metadata_value_width,
+                )])
+            };
+            for (index, rows) in chunk_metadata_rows(&build_rows, rows_budget, metadata_value_width)
+                .iter()
+                .enumerate()
+            {
+                let key = if index == 0 {
+                    "about/provenance".to_string()
+                } else {
+                    format!("about/provenance/continued-{index}")
+                };
+                let heading = if index == 0 {
+                    build_heading
+                } else if large_type_narrow {
+                    "BUILD INFO \u{00b7} MORE"
+                } else {
+                    "BUILD INFORMATION \u{00b7} CONTINUED"
+                };
+                sections.push(chunk_card(key, heading, rows));
+            }
+            for (index, rows) in
+                chunk_metadata_rows(&support_rows, rows_budget, metadata_value_width)
+                    .iter()
+                    .enumerate()
+            {
+                let key = if index == 0 {
+                    "about/support".to_string()
+                } else {
+                    format!("about/support/continued-{index}")
+                };
+                let heading = if index == 0 {
+                    support_heading
+                } else if large_type_narrow {
+                    "SUPPORT \u{00b7} MORE"
+                } else {
+                    "RUNTIME & SUPPORT \u{00b7} CONTINUED"
+                };
+                sections.push(chunk_card(key, heading, rows));
+            }
+        }
         let total = sections.len();
         state.record_result_page_limit(total.saturating_sub(1));
         let section = state.page_scroll.min(total.saturating_sub(1));
@@ -14437,10 +14628,25 @@ fn update_release_notes_card(
     ])
 }
 
-fn compact_update_headline(update: &UpdateProjection) -> String {
+/// "The engine has tried this stage and it did not work" — the state every compact
+/// rung of the page must refuse to call "Ready".
+///
+/// TWO CARRIERS, BOTH REQUIRED. [`UpdateProjection::apply_trouble`] is the precise
+/// one — it names the artifact, the count and the cause, and it speaks from the
+/// FIRST failure, which is the window the page used to spend saying "Ready".
+/// `apply_is_failing` is the ESCALATION streak, which cannot name an artifact and
+/// therefore survives a ledger this build cannot pin to the stage on offer (an
+/// upgrade from before `apply_failure_build` existed). Keying on the precise one
+/// alone would have made a loudly-failing lane read as ready again on exactly those
+/// machines — the old bug, relocated.
+fn not_applying(update: &UpdateProjection) -> bool {
+    update.apply_trouble.is_some() || (update.staged.is_some() && update.apply_is_failing)
+}
+
+pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
     if update.checking {
         "Checking".to_string()
-    } else if update.staged.is_some() && update.apply_is_failing {
+    } else if not_applying(update) {
         "Not applying".to_string()
     } else if update.staged.is_some() {
         "Ready".to_string()
@@ -14461,10 +14667,17 @@ fn compact_update_headline(update: &UpdateProjection) -> String {
     }
 }
 
-fn compact_update_detail(update: &UpdateProjection) -> String {
+pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
     if update.checking {
         "Contacting service…".to_string()
-    } else if update.staged.is_some() && update.apply_is_failing {
+    } else if let Some(trouble) = update.apply_trouble.as_ref() {
+        // The count and the cause survive the squeeze to a phone column; the whole
+        // sentence stays the card's semantic value for assistive tech.
+        trouble.compact()
+    } else if not_applying(update) {
+        // Escalated, but the ledger cannot pin the streak to THIS artifact (see
+        // `UpdateState::apply_failure_build`): no count, no cause, but still not
+        // "Ready to install."
         "Ready, but it keeps failing to apply.".to_string()
     } else if update.staged.is_some() && update.failing_persistent {
         "Ready to install; update checks are failing.".to_string()
@@ -14487,10 +14700,15 @@ fn compact_update_detail(update: &UpdateProjection) -> String {
 /// phone-width status card at 2× native text gives the line ~16 characters,
 /// where even "No update staged." runs past the box. The complete sentence
 /// stays the card's semantic value; this is only what paints.
-fn compact_update_detail_minimum(update: &UpdateProjection) -> String {
+pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String {
+    if let Some(trouble) = update.apply_trouble.as_ref().filter(|_| !update.checking) {
+        // The tersest rung keeps the COUNT rather than a mood word: "2 tries failed"
+        // is the one fact that separates this from a stage waiting its turn.
+        return trouble.micro();
+    }
     if update.checking {
         "Contacting…"
-    } else if update.staged.is_some() && update.apply_is_failing {
+    } else if not_applying(update) {
         "Apply failing."
     } else if update.staged.is_some() && update.failing_persistent {
         "Checks failing."
@@ -14532,7 +14750,7 @@ fn fit_native_bold_label(value: &str, max_width: f32, px: f32) -> String {
 fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     if update.checking {
         "Checking…"
-    } else if update.staged.is_some() && update.apply_is_failing {
+    } else if not_applying(update) {
         "Not applying"
     } else if update.staged.is_some() && update.failing_persistent {
         "Ready · checks failing"
@@ -14590,7 +14808,11 @@ fn compact_update_summary(update: &UpdateProjection, available_width: f32) -> (U
         identity_width,
         11.0 * crate::native_appearance::text_scale(),
     );
-    let headline_style = if update.failing_persistent {
+    // A STAGE THE ENGINE HAS ALREADY FAILED TO APPLY IS NOT A CELEBRATION. The
+    // accent is the same argument the wording makes: `failing_persistent` is the
+    // ESCALATION verdict and stays quiet through the first two attempts, so "Not
+    // applying" rendered in the identical Hero accent as "You're up to date."
+    let headline_style = if update.failing_persistent || not_applying(update) {
         StyleRef::Danger
     } else if large_type {
         StyleRef::Plain
@@ -14949,6 +15171,27 @@ fn update_status_card(
     } else {
         full_detail.clone()
     };
+    // THE DETAIL IS AUTHORED PROSE NOW TOO, and it grew: "Version 0.5.15 · build
+    // 830 · every attempt to start it has failed; see aterm.log" was ~80 characters
+    // and the apply-trouble sentence is half as long again. It was painted as ONE
+    // fixed-height, non-wrapping node, so the clipped tail was "It will try again by
+    // itself." — the half that decides whether the reader has to do anything. Same
+    // treatment as the `updates/outcome` node below, which has wrapped and bounded
+    // for exactly this reason since it was authored.
+    let detail_lines = {
+        let mut lines = wrap_native_lines(
+            std::slice::from_ref(&visual_detail),
+            text_width,
+            13.0 * crate::native_appearance::text_scale(),
+        );
+        bound_outcome_lines(&mut lines, text_width);
+        // A measure too small to fit anything still owes the card one row; an empty
+        // vector would collapse the node and silently drop the line.
+        if lines.is_empty() {
+            lines.push(visual_detail.clone());
+        }
+        lines
+    };
     let outcome = update_outcome_line(update);
     // The outcome is authored prose of unknown length. Wrap it to the card's
     // real measure, bounded, instead of painting one line off the edge — the
@@ -14991,8 +15234,11 @@ fn update_status_card(
                 role: SemanticRole::Heading,
                 // A persistent failure is a warning, not a hero: the same treatment
                 // the configuration-reload warning gets, so it cannot be mistaken
-                // for the accent "You're up to date" line it replaces.
-                style: if update.failing_persistent {
+                // for the accent "You're up to date" line it replaces. A stage that
+                // has already failed to apply gets it too, from the FIRST failure —
+                // the headline says "Update ready, but applying it failed" and it
+                // must not be painted in the colour of good news.
+                style: if update.failing_persistent || not_applying(update) {
                     StyleRef::Danger
                 } else {
                     StyleRef::Hero
@@ -15014,13 +15260,33 @@ fn update_status_card(
         .layout(Layout::default().height(Length::Fixed(current_height))),
         UiNode::new(
             "updates/detail",
-            UiContent::Text(TextSpec {
-                text: visual_detail,
+            UiContent::Group(GroupSpec {
+                // The COMPLETE sentence stays the semantic value — assistive tech and
+                // `controls update` read it whole however narrow the card paints.
+                label: Some(visual_detail.clone()),
                 role: SemanticRole::Text,
                 style: StyleRef::Quiet,
             }),
         )
-        .layout(Layout::default().height(Length::Fixed(detail_height))),
+        .layout(Layout::column().height(Length::Fixed(detail_lines.len() as f32 * detail_height)))
+        .children(
+            detail_lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    UiNode::new(
+                        format!("updates/detail/line-{index}"),
+                        UiContent::Text(TextSpec {
+                            text: line.clone(),
+                            role: SemanticRole::Text,
+                            style: StyleRef::Quiet,
+                        }),
+                    )
+                    .layout(Layout::default().height(Length::Fixed(detail_height)))
+                    .paint_only()
+                })
+                .collect(),
+        ),
     ]);
     if outcome.is_some() {
         children.push(
@@ -15072,7 +15338,7 @@ fn update_status_card(
     let height = if titled { title_height } else { 0.0 }
         + headline_height
         + current_height
-        + detail_height
+        + detail_lines.len() as f32 * detail_height
         + outcome_lines.len() as f32 * detail_height
         + if has_action { action_height } else { 0.0 }
         + 40.0
@@ -15655,7 +15921,222 @@ fn packages_sections(_packages: &PackagesProjection) -> usize {
     3
 }
 
-const MAX_PACKAGE_PROGRAM_ROWS: usize = 8;
+/// Bounded PROGRAM rows across the three groups (headings are not counted). 16 holds
+/// the whole shipped index — the ALab set, `gh`/`emacs`, the two extras and the two
+/// admin rows — so the Extras and Needs-admin groups are never the part elided.
+const MAX_PACKAGE_PROGRAM_ROWS: usize = 16;
+
+/// One line of the Packages program list: a group heading, a program row (its
+/// canonical state verbatim), or the overflow/empty/loading line — plus, on a row
+/// that offers one, the Install control the line carries beside its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramLine {
+    key: String,
+    text: String,
+    heading: bool,
+    install: Option<ProgramInstall>,
+}
+
+/// The Install control on a program row: the action id the reducer admits and the
+/// busy label whose worker makes the control paint busy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramInstall {
+    action: String,
+    busy: PackagesBusy,
+}
+
+fn packages_group_slug(group: crate::packages_screen::RowGroup) -> &'static str {
+    match group {
+        crate::packages_screen::RowGroup::Default => "default-set",
+        crate::packages_screen::RowGroup::Extras => "extras",
+        crate::packages_screen::RowGroup::NeedsAdmin => "needs-admin",
+    }
+}
+
+/// The grouped program list — Default set, Extras (vendor · license · size, an Install
+/// control per extra awaiting consent), Needs admin (who installs it; an Install control
+/// that runs the osascript door on macOS, the terminal command elsewhere). Pure: the
+/// wide page, the compact page and the row counts all read this one derivation.
+fn packages_program_lines(packages: &PackagesProjection) -> Vec<ProgramLine> {
+    use crate::packages_screen::RowGroup;
+    let plain = |key: &str, text: String| ProgramLine {
+        key: key.to_string(),
+        text,
+        heading: false,
+        install: None,
+    };
+    if !packages.observed {
+        return vec![plain(
+            "packages/programs/loading",
+            "Reading package status…".to_string(),
+        )];
+    }
+    if packages.programs.is_empty() {
+        return vec![plain(
+            "packages/programs/empty",
+            "No managed programs installed.".to_string(),
+        )];
+    }
+    let mut lines = Vec::new();
+    let mut shown = 0usize;
+    let groups = [RowGroup::Default, RowGroup::Extras, RowGroup::NeedsAdmin];
+    // A list with ONE group needs no group heading: a store holding only the
+    // default set reads exactly as it did before the groups existed, and the
+    // card keeps its height (the wide page paginates the moment a card grows).
+    let grouped = groups
+        .iter()
+        .filter(|group| packages.programs.iter().any(|row| row.group == **group))
+        .count()
+        > 1;
+    for group in groups {
+        let rows: Vec<&crate::packages_screen::PackagesProgramRow> = packages
+            .programs
+            .iter()
+            .filter(|row| row.group == group)
+            .collect();
+        if rows.is_empty() || shown >= MAX_PACKAGE_PROGRAM_ROWS {
+            continue;
+        }
+        if grouped {
+            lines.push(ProgramLine {
+                key: format!("packages/programs/group/{}", packages_group_slug(group)),
+                text: group.heading().to_string(),
+                heading: true,
+                install: None,
+            });
+        }
+        for row in rows {
+            if shown >= MAX_PACKAGE_PROGRAM_ROWS {
+                break;
+            }
+            shown += 1;
+            let mut text = package_program_display_name(&row.name);
+            if let Some(build) = row.installed_build {
+                text.push_str("  ·  build ");
+                text.push_str(&build.to_string());
+            }
+            if !row.state.is_empty() {
+                text.push_str("  ·  ");
+                text.push_str(&row.state);
+            }
+            if let Some(facts) = row.facts.as_ref() {
+                text.push_str("  ·  ");
+                text.push_str(&facts.line());
+            }
+            if group == RowGroup::NeedsAdmin {
+                text.push_str("  ·  ");
+                text.push_str(&crate::packages_screen::admin_vendor_line(&row.name));
+            }
+            if let Some(annotation) = row.annotation.as_deref() {
+                text.push_str("  ·  ");
+                text.push_str(annotation);
+            }
+            let install = if row.offers_extra_install() {
+                Some(ProgramInstall {
+                    action: format!("packages/extras/install/{}", row.name),
+                    busy: PackagesBusy::InstallExtra,
+                })
+            } else if group == RowGroup::NeedsAdmin {
+                if packages.admin_door {
+                    Some(ProgramInstall {
+                        action: format!("packages/admin/install/{}", row.name),
+                        busy: PackagesBusy::InstallAdmin,
+                    })
+                } else {
+                    text.push_str("  ·  run in a terminal: aterm pkg install ");
+                    text.push_str(&row.name);
+                    None
+                }
+            } else {
+                None
+            };
+            lines.push(ProgramLine {
+                key: format!("packages/programs/{}", row.name),
+                text,
+                heading: false,
+                install,
+            });
+        }
+    }
+    let total = packages.programs.len();
+    if total > shown {
+        lines.push(plain(
+            "packages/programs/more",
+            format!("… and {} more (atpkg list has the full set)", total - shown),
+        ));
+    }
+    lines
+}
+
+/// The node for one program line: a quiet heading, a status text, or — for a row that
+/// carries an Install control — a row group of the text beside the control (the text
+/// keeps the `packages/programs/<name>` key so the row's identity is stable).
+fn packages_program_line_node(
+    line: &ProgramLine,
+    packages: &PackagesProjection,
+    row_height: f32,
+) -> UiNode {
+    if line.heading {
+        return UiNode::new(
+            line.key.clone(),
+            UiContent::Text(TextSpec {
+                text: line.text.clone(),
+                role: SemanticRole::Heading,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::default().height(Length::Fixed(row_height)));
+    }
+    let text = UiNode::new(
+        line.key.clone(),
+        UiContent::Text(TextSpec {
+            text: line.text.clone(),
+            role: SemanticRole::Status,
+            style: StyleRef::Primary,
+        }),
+    );
+    let Some(install) = line.install.as_ref() else {
+        return text.layout(Layout::default().height(Length::Fixed(row_height)));
+    };
+    let name = line.key.rsplit('/').next().unwrap_or_default().to_string();
+    UiNode::new(
+        format!("packages/programs/row/{name}"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(Layout::row().height(Length::Fixed(row_height)).gap(6.0))
+    .children(vec![
+        text.layout(Layout::default().height(Length::Fill)),
+        packages_install_button(install, &name, packages).layout(
+            Layout::default()
+                .width(Length::Fixed(88.0 * settings_text_scale().min(1.5)))
+                .height(Length::Fill),
+        ),
+    ])
+}
+
+/// The Install control itself — enabled exactly when the page's other actions are,
+/// busy while its own worker runs.
+fn packages_install_button(
+    install: &ProgramInstall,
+    name: &str,
+    packages: &PackagesProjection,
+) -> UiNode {
+    UiNode::new(
+        install.action.clone(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(format!("Install {name}")).visual_label("Install"),
+                ActionId::new(install.action.clone()),
+            )
+            .state(ControlState {
+                enabled: packages.actions_enabled,
+                busy: packages.busy == Some(install.busy),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Primary),
+        ),
+    )
+}
 
 /// atpkg's status ledger names its whole-toolset pseudo-program `*toolset*` —
 /// terminal-flavoured emphasis that a native page paints as literal asterisks
@@ -15673,13 +16154,12 @@ fn package_program_display_name(name: &str) -> String {
         .to_string()
 }
 
+/// The compact page's atomic item count for the program list: every line (headings
+/// and the overflow line included) plus one item per Install control, which the
+/// compact page stacks under its row.
 fn packages_program_row_count(packages: &PackagesProjection) -> usize {
-    if !packages.observed || packages.programs.is_empty() {
-        1
-    } else {
-        packages.programs.len().min(MAX_PACKAGE_PROGRAM_ROWS)
-            + usize::from(packages.programs.len() > MAX_PACKAGE_PROGRAM_ROWS)
-    }
+    let lines = packages_program_lines(packages);
+    lines.len() + lines.iter().filter(|line| line.install.is_some()).count()
 }
 
 fn packages_has_service_line(packages: &PackagesProjection) -> bool {
@@ -16235,7 +16715,9 @@ fn packages_page(
     )
     .children(consent_children);
 
-    // Managed-program list (read-only). Bounded rows keep the card height
+    // The program list, GROUPED — Default set / Extras / Needs admin (§17.2's canonical
+    // states verbatim; S9's extras rows with vendor, license, size and an Install
+    // control; §17.8's admin rows with the door). Bounded rows keep the card height
     // deterministic; the overflow line says exactly how much is elided.
     let row_height = 24.0_f32.max(20.0 * text_scale);
     let programs_heading_height = 22.0_f32.max(16.0 * text_scale);
@@ -16243,63 +16725,20 @@ fn packages_page(
         UiNode::new(
             "packages/programs-heading",
             UiContent::Text(TextSpec {
-                text: "MANAGED PROGRAMS".to_string(),
+                text: "PROGRAMS".to_string(),
                 role: SemanticRole::Heading,
                 style: StyleRef::Quiet,
             }),
         )
         .layout(Layout::default().height(Length::Fixed(programs_heading_height))),
     ];
-    let mut program_lines: Vec<(String, String)> = Vec::new();
-    if !packages.observed {
-        program_lines.push((
-            "packages/programs/loading".to_string(),
-            "Reading package status…".to_string(),
-        ));
-    } else if packages.programs.is_empty() {
-        program_lines.push((
-            "packages/programs/empty".to_string(),
-            "No managed programs installed.".to_string(),
-        ));
-    } else {
-        for row in packages.programs.iter().take(MAX_PACKAGE_PROGRAM_ROWS) {
-            let mut line = package_program_display_name(&row.name);
-            if let Some(build) = row.installed_build {
-                line.push_str("  ·  build ");
-                line.push_str(&build.to_string());
-            }
-            if !row.state.is_empty() {
-                line.push_str("  ·  ");
-                line.push_str(&row.state);
-            }
-            if let Some(annotation) = row.annotation.as_deref() {
-                line.push_str("  ·  ");
-                line.push_str(annotation);
-            }
-            program_lines.push((format!("packages/programs/{}", row.name), line));
-        }
-        if packages.programs.len() > MAX_PACKAGE_PROGRAM_ROWS {
-            program_lines.push((
-                "packages/programs/more".to_string(),
-                format!(
-                    "… and {} more (atpkg list has the full set)",
-                    packages.programs.len() - MAX_PACKAGE_PROGRAM_ROWS
-                ),
-            ));
-        }
-    }
+    let program_lines = packages_program_lines(packages);
     let program_rows = program_lines.len();
-    program_children.extend(program_lines.iter().cloned().map(|(key, line)| {
-        UiNode::new(
-            key,
-            UiContent::Text(TextSpec {
-                text: line,
-                role: SemanticRole::Status,
-                style: StyleRef::Primary,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(row_height)))
-    }));
+    program_children.extend(
+        program_lines
+            .iter()
+            .map(|line| packages_program_line_node(line, packages, row_height)),
+    );
     let programs_height = 40.0
         + programs_heading_height
         + program_rows as f32 * row_height
@@ -16404,8 +16843,22 @@ fn packages_page(
                 ),
                 compact_note_height,
             ));
-            for (key, line) in program_lines {
-                items.push(compact_packages_status_row(key, "Managed program", line));
+            for line in program_lines {
+                let label = if line.heading {
+                    "Program group"
+                } else {
+                    "Managed program"
+                };
+                let name = line.key.rsplit('/').next().unwrap_or_default().to_string();
+                items.push(compact_packages_status_row(line.key, label, line.text));
+                // The compact page stacks the row's Install control under its row as
+                // its own reachable item (counted in `packages_program_row_count`).
+                if let Some(install) = line.install.as_ref() {
+                    let mut button = packages_install_button(install, &name, packages);
+                    button.layout.width = Length::Fill;
+                    button.layout.height = Length::Fixed(action_control_height);
+                    items.push((button, action_control_height));
+                }
             }
             let mut sections = atomic_compact_sections(
                 "packages/compact-sections",
@@ -16806,7 +17259,7 @@ mod tests {
         availability: SettingsAvailability,
         motion: crate::native_app::ViewMotionCx,
     ) -> SettingEffectProjection {
-        let config: Config = toml::from_str(source).unwrap();
+        let config: Config = aterm_toml::from_str(source).unwrap();
         let state = SettingsViewState::new(&config);
         let patch = test_patch(edits);
         setting_effect_projection(&state, Some(&patch), key, availability, motion)
@@ -16831,7 +17284,7 @@ mod tests {
     fn trail_pack_config(paths: &[String], style: &str) -> String {
         let paths = paths
             .iter()
-            .map(|path| toml::Value::String(path.clone()).to_string())
+            .map(|path| aterm_toml::Value::String(path.clone()).to_string())
             .collect::<Vec<_>>()
             .join(", ");
         format!(
@@ -17238,7 +17691,7 @@ mod tests {
         let emberfall_path = trail_pack_asset("emberfall.toml");
         let synthwave_text =
             trail_pack_config(std::slice::from_ref(&synthwave_path), "pack:synthwave");
-        let synthwave_config: Config = toml::from_str(&synthwave_text).unwrap();
+        let synthwave_config: Config = aterm_toml::from_str(&synthwave_text).unwrap();
 
         let direct = SettingsViewState::new(&synthwave_config);
         assert!(
@@ -17296,7 +17749,7 @@ mod tests {
     // absent one is not.
     #[test]
     fn fallback_raw_projection_covers_dotted_keys() {
-        let config: Config = toml::from_str(
+        let config: Config = aterm_toml::from_str(
             "[matrix_rain]\nenabled = true\n[packages]\nenabled = false\nauto_update = false\nauto_install = true\n\
              [sparkle_words.profanity]\nenabled = false\n[sparkle_words.feline]\nenabled = true\n\
              [sparkle_words.ink]\nloop = true\n",
@@ -17560,7 +18013,7 @@ mod tests {
     #[test]
     fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semantics() {
         let state_with_themes = |source: &str, themes: Arc<crate::app_config::ThemeCatalog>| {
-            let config: Config = toml::from_str(source).unwrap();
+            let config: Config = aterm_toml::from_str(source).unwrap();
             let mut assets = (*crate::app_config::ConfigAssetCatalog::empty()).clone();
             assets.themes = themes;
             SettingsViewState::from_config_and_assets(&config, Arc::new(assets))
@@ -17768,7 +18221,7 @@ mod tests {
             ),
             ("rainbow kitty flying", PreviewTrailCompanion::FlyingKitty),
         ] {
-            let config: Config = toml::from_str(&format!(
+            let config: Config = aterm_toml::from_str(&format!(
                 "cursor_trail = true\ncursor_trail_style = {raw:?}\n"
             ))
             .unwrap();
@@ -17858,7 +18311,7 @@ mod tests {
             ("Underline", PreviewCursorStyle::Bar),
             ("hidden", PreviewCursorStyle::Block),
         ] {
-            let config: Config = toml::from_str(&format!(
+            let config: Config = aterm_toml::from_str(&format!(
                 "cursor_style = {authored:?}\ncursor_blink = false\ncursor_trail = false\n"
             ))
             .unwrap();
@@ -17874,7 +18327,7 @@ mod tests {
             );
         }
 
-        let hidden: Config = toml::from_str(
+        let hidden: Config = aterm_toml::from_str(
             "cursor_style = \"hidden\"\ncursor_blink = true\ncursor_trail = false\n",
         )
         .unwrap();
@@ -17886,9 +18339,10 @@ mod tests {
             "an unknown configured cursor style falls back to the runtime's blinking Block"
         );
 
-        let blink: Config =
-            toml::from_str("cursor_style = \"block\"\ncursor_blink = true\ncursor_trail = false\n")
-                .unwrap();
+        let blink: Config = aterm_toml::from_str(
+            "cursor_style = \"block\"\ncursor_blink = true\ncursor_trail = false\n",
+        )
+        .unwrap();
         let mut blink = SettingsViewState::new(&blink);
         blink.navigate(SettingsRoute::CursorMotion);
         assert_eq!(
@@ -17896,7 +18350,7 @@ mod tests {
             PreviewAnimation::BlinkEdge { after_ms: 430 }
         );
 
-        let zero: Config = toml::from_str(
+        let zero: Config = aterm_toml::from_str(
             "cursor_blink = false\ncursor_trail = true\ncursor_trail_style = \"phaser\"\ncursor_trail_intensity = 0.0\n",
         )
         .unwrap();
@@ -17912,7 +18366,7 @@ mod tests {
     #[test]
     fn canonical_non_cursor_previews_are_pixel_static_across_live_blink_edges() {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-        let config: Config = toml::from_str(
+        let config: Config = aterm_toml::from_str(
             "cursor_style = \"bar\"\ncursor_blink = true\ncursor_trail = true\ncursor_trail_style = \"phaser\"\n",
         )
         .unwrap();
@@ -17953,7 +18407,7 @@ mod tests {
 
     #[test]
     fn serious_mode_suppresses_native_preview_trails_post_fx_and_cadence() {
-        let config: Config = toml::from_str(
+        let config: Config = aterm_toml::from_str(
             "cursor_blink = true\n\
              cursor_trail = true\n\
              cursor_trail_style = \"fire\"\n\
@@ -18008,7 +18462,7 @@ mod tests {
 
     #[test]
     fn serious_mode_trail_picker_previews_the_atomic_post_commit_candidate() {
-        let config: Config = toml::from_str(
+        let config: Config = aterm_toml::from_str(
             "serious_mode = true\ncursor_trail = true\ncursor_trail_style = \"fire\"\n",
         )
         .unwrap();
@@ -18276,7 +18730,7 @@ mod tests {
             Some("On, currently silent because Cursor trail is Off."),
             "trail Off has priority over every later runtime suppression"
         );
-        for style in ["not-a-trail", "pack:missing"] {
+        for style in ["pack:", "pack:missing"] {
             let reason = top_music_suppression_reason_for_output(
                 &state(Config {
                     cursor_trail_style: Some(style.to_string()),
@@ -18295,6 +18749,21 @@ mod tests {
                 Some("Trail unavailable")
             );
         }
+        // A TYPO IS NOT A SILENCER. It resolves to the default style and the
+        // trail renders, so the synth keeps its voice — only a resolution that
+        // draws nothing takes it away.
+        assert_eq!(
+            top_music_suppression_reason_for_output(
+                &state(Config {
+                    cursor_trail_style: Some("not-a-trail".to_string()),
+                    ..Config::default()
+                }),
+                motion,
+                true,
+            ),
+            None,
+            "an unknown style falls back to the default trail and still plays"
+        );
         assert_eq!(
             top_music_suppression_reason_for_output(
                 &state(Config {
@@ -18589,7 +19058,7 @@ mod tests {
 
     #[test]
     fn highlighted_motion_candidate_resolves_against_live_host_facts_before_commit() {
-        let config: Config = toml::from_str("motion = \"reduced\"\n").unwrap();
+        let config: Config = aterm_toml::from_str("motion = \"reduced\"\n").unwrap();
         let mut state = SettingsViewState::new(&config);
         state.navigate(SettingsRoute::CursorMotion);
         let field = state
@@ -18719,6 +19188,65 @@ mod tests {
             panic!("Settings view");
         };
         **state = SettingsViewState::from_snapshot(&snapshot).expect("project Settings fixture");
+    }
+
+    /// EVERY RUNG OF THE SOFTWARE UPDATE PAGE ADMITS THE FAILED APPLIES.
+    ///
+    /// The page collapses as the host narrows — hero label, headline, detail,
+    /// minimum-detail — and each rung is authored separately, which is how the
+    /// `installable` work once fixed a headline and left the card underneath
+    /// contradicting it. So the assertion runs the whole ladder: on the owner's
+    /// 2026-08-21 state (staged 0.56.0, two dead applies, `ChildDied`) none of them
+    /// may read as "Ready", and the widest rungs must name the count AND the cause.
+    #[test]
+    fn every_rung_of_the_update_page_admits_a_stage_that_failed_to_apply() {
+        use crate::update_apply_trouble::ApplyRetry;
+
+        let mut status = update_status(true);
+        status.failing_applies = 2;
+        status.outcome = "staged 0.2.0 (build 2) \u{2014} verified and ready to apply".to_string();
+        let troubled = UpdateState::from_status(1, "0.1.0", Some(&status), false)
+            .with_apply_lane(
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+                ApplyRetry::Scheduled,
+            )
+            .projection();
+
+        assert!(
+            !troubled.apply_is_failing,
+            "two is below the escalation threshold — the window the page used to \
+             spend saying \"Ready\""
+        );
+        assert_eq!(compact_update_headline(&troubled), "Not applying");
+        assert_eq!(compact_update_summary_detail(&troubled), "Not applying");
+        let detail = compact_update_detail(&troubled);
+        assert!(
+            detail.contains("Tried twice") && detail.contains("didn\u{2019}t start"),
+            "the compact detail names the count and the cause: {detail}"
+        );
+        assert!(
+            !detail.contains("ChildDied"),
+            "never the proof-outcome enum name: {detail}"
+        );
+        let minimum = compact_update_detail_minimum(&troubled);
+        assert!(
+            minimum.contains('2'),
+            "the count survives to the tersest rung: {minimum}"
+        );
+
+        // A CLEAN STAGE IS UNCHANGED. Waiting for a quiet window records refusals,
+        // never failures, so every rung must still read as plain readiness.
+        let clean = UpdateState::from_status(1, "0.1.0", Some(&update_status(true)), false)
+            .with_apply_lane(
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+                ApplyRetry::Scheduled,
+            )
+            .projection();
+        assert!(clean.apply_trouble.is_none());
+        assert_eq!(compact_update_headline(&clean), "Ready");
+        assert_eq!(compact_update_summary_detail(&clean), "Ready");
+        assert_eq!(compact_update_detail(&clean), "Ready to install.");
+        assert_eq!(compact_update_detail_minimum(&clean), "Ready.");
     }
 
     fn update_status(staged: bool) -> aterm_update::UpdateStatus {
@@ -20806,7 +21334,7 @@ mod tests {
                 .is_some_and(|note| note.contains("0 hides the plume"))
         );
 
-        let config: Config = toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
+        let config: Config = aterm_toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
         let glow = crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
                 enabled: true,
@@ -21865,6 +22393,217 @@ mod tests {
         );
     }
 
+    /// The grouped program list and its controls (§17.2 states verbatim; S9's extras
+    /// with vendor · license · size; §17.8's door): a store with a default member, an
+    /// extra awaiting consent and the two admin rows derives three group headings, an
+    /// Install control on the extra and on each admin row (macOS) — and the controls
+    /// dispatch the typed doors: the extra's `InstallExtra { codex }`, the admin control
+    /// on `brew` the door for `clt` THEN `brew`. A forged action id for a name that is
+    /// not waiting is refused in user voice without an effect.
+    #[test]
+    fn packages_grouped_rows_offer_install_controls_that_dispatch_the_doors() {
+        fn grouped_state() -> PackagesState {
+            let mut programs = std::collections::BTreeMap::new();
+            for (name, state, build) in [
+                ("ay", atpkg::state::managed(1971, 41), Some(1971)),
+                ("codex", atpkg::state::extra_not_installed("codex"), None),
+                ("clt", atpkg::state::needs_admin("clt"), None),
+                (
+                    "brew",
+                    atpkg::state::blocked("clt", &atpkg::state::needs_admin("clt")),
+                    None,
+                ),
+            ] {
+                programs.insert(
+                    name.to_string(),
+                    atpkg::ProgramStatus {
+                        installed_build: build,
+                        state,
+                        tree_root: String::new(),
+                    },
+                );
+            }
+            let status = atpkg::Status {
+                schema: 1,
+                updated_at: "2026-08-27T00:00:00Z".to_string(),
+                enabled: true,
+                index_source: "alabsystems/aterm".to_string(),
+                outcome: "up to date".to_string(),
+                programs,
+            };
+            let mut service = crate::packages_screen::PackagesService::new();
+            let sequence = service.begin(None).unwrap();
+            assert!(service.finish(
+                sequence,
+                crate::packages_screen::PackagesWorkerCompletion::refresh(
+                    crate::packages_screen::PackagesStatusReport::from_parts(
+                        true,
+                        true,
+                        "fp".to_string(),
+                        Some(&status),
+                        &[],
+                    ),
+                ),
+            ));
+            service.state(true, true, true, false, true)
+        }
+
+        // The derivation every rendering reads.
+        let projection = grouped_state().projection();
+        let lines = packages_program_lines(&projection);
+        let keys: Vec<&str> = lines.iter().map(|line| line.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "packages/programs/group/default-set",
+                "packages/programs/ay",
+                "packages/programs/group/extras",
+                "packages/programs/codex",
+                "packages/programs/group/needs-admin",
+                "packages/programs/brew",
+                "packages/programs/clt",
+            ]
+        );
+        let line = |key: &str| lines.iter().find(|line| line.key == key).unwrap();
+        assert!(line("packages/programs/group/extras").heading);
+        assert_eq!(line("packages/programs/group/extras").text, "EXTRAS");
+        assert_eq!(
+            line("packages/programs/ay").text,
+            "ay  ·  build 1971  ·  managed 1971 — pinned by index 41"
+        );
+        assert!(line("packages/programs/ay").install.is_none());
+        let codex = line("packages/programs/codex");
+        assert_eq!(
+            codex.text,
+            "codex  ·  extra — not installed (opt in: aterm pkg install codex)  ·  OpenAI Codex CLI  ·  Apache-2.0  ·  ~90 MB"
+        );
+        assert_eq!(
+            codex.install,
+            Some(ProgramInstall {
+                action: "packages/extras/install/codex".to_string(),
+                busy: PackagesBusy::InstallExtra,
+            })
+        );
+        let clt = line("packages/programs/clt");
+        assert!(
+            clt.text
+                .contains("needs admin — run: aterm pkg install clt")
+        );
+        assert!(clt.text.contains("Apple Command Line Tools"));
+        let brew = line("packages/programs/brew");
+        assert!(
+            brew.text
+                .contains("blocked by clt: needs admin — run: aterm pkg install clt")
+        );
+        assert!(brew.text.contains("Homebrew"));
+        if cfg!(target_os = "macos") {
+            for (row, name) in [(clt, "clt"), (brew, "brew")] {
+                assert_eq!(
+                    row.install,
+                    Some(ProgramInstall {
+                        action: format!("packages/admin/install/{name}"),
+                        busy: PackagesBusy::InstallAdmin,
+                    })
+                );
+            }
+        } else {
+            assert!(clt.install.is_none());
+            assert!(
+                clt.text
+                    .contains("run in a terminal: aterm pkg install clt")
+            );
+        }
+        assert_eq!(
+            packages_program_row_count(&projection),
+            lines.len() + if cfg!(target_os = "macos") { 3 } else { 1 },
+            "the compact page stacks one item per control"
+        );
+        // One group needs no heading — the single-member store reads as before.
+        let single = live_packages_state(None).projection();
+        assert_eq!(
+            packages_program_lines(&single)
+                .iter()
+                .map(|line| line.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["packages/programs/ay"]
+        );
+
+        // The controls dispatch the typed doors through the host executor.
+        let (mut runtime, instance, view) = setup();
+        assert!(runtime.replace_settings_packages(grouped_state(), 2));
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::Packages),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let press = |runtime: &mut NativeRuntime, id: &str| {
+            let out = runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(id),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            out.effects.iter().find_map(|effect| match effect {
+                AppEffect::Packages { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+        };
+        let feedback = |runtime: &NativeRuntime| -> String {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!();
+            };
+            state.feedback.clone().unwrap_or_default()
+        };
+        assert_eq!(
+            press(&mut runtime, "packages/extras/install/codex"),
+            Some(crate::native_app::PackagesRequest::InstallExtra {
+                name: "codex".to_string()
+            })
+        );
+        assert_eq!(
+            feedback(&runtime),
+            "Installing codex (OpenAI Codex CLI  ·  Apache-2.0  ·  ~90 MB)…",
+            "the press names the vendor"
+        );
+        assert_eq!(
+            press(&mut runtime, "packages/extras/install/ay"),
+            None,
+            "a default-set member is not an extra"
+        );
+        assert!(feedback(&runtime).contains("not an extra"));
+        assert_eq!(press(&mut runtime, "packages/admin/install/ay"), None);
+        assert!(feedback(&runtime).contains("not waiting on an administrator"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                press(&mut runtime, "packages/admin/install/brew"),
+                Some(crate::native_app::PackagesRequest::InstallElevated {
+                    names: vec!["clt".to_string(), "brew".to_string()]
+                }),
+                "the door installs the dependency first"
+            );
+            assert!(feedback(&runtime).contains("clt, then brew"));
+            assert!(feedback(&runtime).contains("password"));
+            assert_eq!(
+                press(&mut runtime, "packages/admin/install/clt"),
+                Some(crate::native_app::PackagesRequest::InstallElevated {
+                    names: vec!["clt".to_string()]
+                })
+            );
+        } else {
+            assert_eq!(press(&mut runtime, "packages/admin/install/brew"), None);
+            assert!(feedback(&runtime).contains("macOS-only"));
+        }
+    }
+
     /// The maintenance switches on the special page are ordinary registry rows:
     /// activation flips the RESOLVED value through the dotted-key ConfigPatch
     /// (auto_update defaults ON → first flip writes false; auto_install
@@ -22562,14 +23301,106 @@ mod tests {
             .compile(wide.viewport)
             .unwrap();
         let hero = about.semantic(&UiKey::new("about/hero")).unwrap();
-        let details = about.semantic(&UiKey::new("about/details")).unwrap();
-        assert!(hero.rect.y <= 40.0, "About starts at the page rhythm");
-        assert!(details.rect.y > hero.rect.bottom());
-        assert!(details.rect.bottom() <= wide.viewport.bottom());
         assert!(
             about.semantic(&UiKey::new("about/principles")).is_none(),
             "the short viewport keeps every shown card whole"
         );
+        // WHETHER THIS VIEWPORT STACKS OR PAGES IS THE CONTENT'S DECISION, and
+        // it sits right on the line: hero 238 + gap 12 + card 346 = 596 against
+        // 594 of content. TWO POINTS. It stacked until `about_fields` learned to
+        // name the running copy and, when a second install exists, the other one
+        // — 64pt of new facts. The page concedes by paging, the same ladder it
+        // already walks when it drops `about/principles` at short heights.
+        //
+        // `hero.rect.y <= 40` and "details sit below the hero" together say ONE
+        // thing: this viewport does not paginate. That was an arithmetic
+        // coincidence, not a contract, and pinning it meant the test reported a
+        // missing node the moment the facts outgrew it. Assert instead what the
+        // page still owes: the hero opens its section, the details are whole and
+        // inside the viewport, and they follow the hero when the two do share a
+        // page.
+        let details_bottom = if let Some(details) = about.semantic(&UiKey::new("about/details")) {
+            assert!(
+                hero.rect.y <= 40.0,
+                "an unpaged About starts at the page rhythm"
+            );
+            assert!(
+                details.rect.y > hero.rect.bottom(),
+                "details follow the hero"
+            );
+            details.rect.bottom()
+        } else {
+            let next = about
+                .hits
+                .iter()
+                .find(|hit| hit.key.as_str() == "about/pagination/next")
+                .expect("a paged About exports a semantic Next");
+            let action = next.action.clone();
+            // The rhythm claim, without an arithmetic bound to keep in step with
+            // the pager. The hero is the FIRST CONTENT of its section: nothing
+            // but the pagination chrome may sit above it. That is what
+            // "About starts at the page rhythm" means, and unlike a `y <= 40`
+            // it stays true whether or not a pager is present.
+            let chrome = |key: &str| key.starts_with("about/pagination") || key == "about/range";
+            for node in about
+                .semantics
+                .iter()
+                .filter(|node| node.key.as_str().starts_with("about/"))
+                .filter(|node| !chrome(node.key.as_str()))
+            {
+                assert!(
+                    node.rect.y >= hero.rect.y,
+                    "{} starts above the hero at {} vs {} — the hero must open its \
+                     section, with only the pager above it",
+                    node.key.as_str(),
+                    node.rect.y,
+                    hero.rect.y,
+                );
+            }
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: action,
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let paged = runtime
+                .render(instance, view, &wide)
+                .unwrap()
+                .compile(wide.viewport)
+                .unwrap();
+            let bottom = paged
+                .semantic(&UiKey::new("about/details"))
+                .expect("the details card is on the next About page")
+                .rect
+                .bottom();
+            // Back to the first section the way we left it — page UP, the
+            // inverse of the page-down above. Re-dispatching the About route
+            // does NOT rewind `page_scroll`, so the compact assertions further
+            // down would have started on section two.
+            let previous = paged
+                .hits
+                .iter()
+                .find(|hit| hit.key.as_str() == "about/pagination/previous")
+                .expect("the second About section exports a semantic Previous");
+            let back = previous.action.clone();
+            assert_eq!(back.as_str(), "settings/page-up");
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: back,
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            bottom
+        };
+        assert!(details_bottom <= wide.viewport.bottom());
 
         let tall = view_cx_at(1_424.0, 900.0);
         let tall_about = runtime
@@ -22765,24 +23596,96 @@ mod tests {
         details.validate_parity().unwrap();
         let details_card = details.semantic(&UiKey::new("about/details")).unwrap();
         assert!(details_card.rect.bottom() <= cx.viewport.bottom() + 0.01);
+        // WALK EVERY SECTION. The provenance facts no longer all live on one
+        // page: when the card cannot fit the section budget the medium path
+        // chunks them across further sections, exactly as compact About does.
+        // So the contract is "every fact is reachable at its full height on
+        // SOME page", not "every fact is on page two" — and collecting them
+        // this way is strictly stronger, because a fact that silently vanished
+        // from every page now fails here instead of passing on a machine that
+        // happens not to have it.
+        let mut seen: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for page in 0..8usize {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.page_scroll = page;
+            let Ok(tree) = runtime
+                .render(instance, view, &cx)
+                .unwrap()
+                .compile(cx.viewport)
+            else {
+                break;
+            };
+            tree.validate_parity().unwrap();
+            for (label, _) in crate::build_info::about_fields() {
+                if matches!(label, "tagline" | "author" | "company" | "site") {
+                    continue;
+                }
+                let key = format!("about/provenance/row/{}", key_fragment(label));
+                if let Some(node) = tree.semantic(&UiKey::new(key.clone())) {
+                    seen.insert(key, node.rect.height);
+                    // Every rendered row must also sit inside the viewport.
+                    let node = tree
+                        .semantic(&UiKey::new(format!(
+                            "about/provenance/row/{}",
+                            key_fragment(label)
+                        )))
+                        .unwrap();
+                    assert!(
+                        node.rect.bottom() <= cx.viewport.bottom() + 0.01,
+                        "About row {label} on page {page} extends past the viewport"
+                    );
+                }
+            }
+            for label in ["Project", "Interface", "Capture", "Accessibility"] {
+                let key = format!("about/support/row/{}", key_fragment(label));
+                if let Some(node) = tree.semantic(&UiKey::new(key.clone())) {
+                    seen.insert(key, node.rect.height);
+                    assert!(
+                        node.rect.bottom() <= cx.viewport.bottom() + 0.01,
+                        "Support row {label} on page {page} extends past the viewport"
+                    );
+                }
+            }
+        }
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.page_scroll = 1;
         let provenance = crate::build_info::about_fields()
             .into_iter()
             .filter(|(key, _)| !matches!(*key, "tagline" | "author" | "company" | "site"));
         for (label, _) in provenance {
             let key = format!("about/provenance/row/{}", key_fragment(label));
-            let node = details
-                .semantic(&UiKey::new(key.clone()))
-                .unwrap_or_else(|| panic!("missing complete Medium metadata {key}"));
-            assert!(node.rect.height >= 28.0);
-            assert!(node.rect.bottom() <= cx.viewport.bottom() + 0.01);
+            let height = seen
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| panic!("missing complete Medium metadata {key} on every page"));
+
+            // Names the row, because this loop walks KEYS THAT VARY BY MACHINE:
+            // `about_fields` appends `running` and, when a second install
+            // exists, `another copy`. A bare `assert!` here reports only
+            // "assertion failed" for a row the reader cannot identify and may
+            // not even have.
+            assert!(
+                height >= 28.0,
+                "About row {key} collapsed to {:.1}pt (rows are 28pt at a 32pt \
+                 pitch). The card is laid out at a FIXED height with FIXED rows, \
+                 so a card taller than its section pushes the whole deficit into \
+                 the last row rather than clipping — chunk the facts instead.",
+                height,
+            );
         }
         for label in ["Project", "Interface", "Capture", "Accessibility"] {
             let key = format!("about/support/row/{}", key_fragment(label));
-            let node = details
-                .semantic(&UiKey::new(key.clone()))
-                .unwrap_or_else(|| panic!("missing complete Medium support metadata {key}"));
-            assert!(node.rect.height >= 28.0);
-            assert!(node.rect.bottom() <= cx.viewport.bottom() + 0.01);
+            let height = seen.get(&key).copied().unwrap_or_else(|| {
+                panic!("missing complete Medium support metadata {key} on every page")
+            });
+            assert!(
+                height >= 28.0,
+                "Support row {key} collapsed to {height:.1}pt (rows are 28pt)"
+            );
         }
         let previous = details
             .hits
@@ -28112,8 +29015,7 @@ mod tests {
         // drifting from it.
         let (auto_value, auto_note) = prefs::motion_auto_copy(std::env::consts::OS);
         assert!(
-            motion_semantic.label.contains(auto_value)
-                || motion_semantic.label.contains(auto_note),
+            motion_semantic.label.contains(auto_value) || motion_semantic.label.contains(auto_note),
             "the Motion label must carry this platform's own motion copy, got {:?}",
             motion_semantic.label
         );
@@ -28649,7 +29551,7 @@ mod tests {
                 (568.0, 320.0),
             ],
         };
-        let quote = |value: &str| toml::Value::String(value.to_string()).to_string();
+        let quote = |value: &str| aterm_toml::Value::String(value.to_string()).to_string();
         let cases = [
             (
                 prefs::EDIT_THEME,
@@ -30850,9 +31752,10 @@ enabled = true
     ///
     /// The fix is a PAINT LABEL, like `EDIT_MOTION`'s, not a narrower control
     /// and not a renamed config value: the button reads the family's shorter
-    /// spelling, which stays honest (it names the thin under-baseline strip
-    /// rather than the default full-height body) and stays a legal
-    /// `cursor_trail_style` — pinned below by canonicalising the label itself.
+    /// spelling, which stays honest (it names the highlighter-plus-strip mark,
+    /// the geometry that spelling selects — and, since 2026-08-28, the family
+    /// default) and stays a legal `cursor_trail_style` — pinned below by
+    /// canonicalising the label itself.
     /// The committed value, the semantics and the open picker's rows keep the
     /// complete spelling.
     #[test]
@@ -31805,7 +32708,7 @@ enabled = true
     #[test]
     fn minimum_contrast_row_and_feedback_disclose_the_translucent_floor() {
         let glass: Config =
-            toml::from_str("minimum_contrast = 1.0\nbackground_opacity = 0.7\n").unwrap();
+            aterm_toml::from_str("minimum_contrast = 1.0\nbackground_opacity = 0.7\n").unwrap();
         let state = SettingsViewState::new(&glass);
         assert_eq!(constrained_minimum_contrast(&state), Some((1.0, 4.5)));
         let (index, field) = state
@@ -31853,7 +32756,7 @@ enabled = true
             ("minimum_contrast = 7.0\nbackground_opacity = 0.7\n", None),
             ("minimum_contrast = 1.0\nbackground_opacity = 1.0\n", None),
         ] {
-            let config: Config = toml::from_str(source).unwrap();
+            let config: Config = aterm_toml::from_str(source).unwrap();
             assert_eq!(
                 constrained_minimum_contrast(&SettingsViewState::new(&config)),
                 expected,
@@ -32271,7 +33174,7 @@ enabled = true
                 "Currently inactive: Motion Reduced",
             ),
         ] {
-            let config: Config = toml::from_str(source).unwrap();
+            let config: Config = aterm_toml::from_str(source).unwrap();
             let state = SettingsViewState::new(&config);
             let projection =
                 config_application_projection(&state, &patch(&[(key, "true")]), availability);
@@ -32286,7 +33189,7 @@ enabled = true
             }
         }
 
-        let config: Config = toml::from_str("serious_mode = true\n").unwrap();
+        let config: Config = aterm_toml::from_str("serious_mode = true\n").unwrap();
         let state = SettingsViewState::new(&config);
         let mixed = config_application_projection(
             &state,
@@ -32539,6 +33442,177 @@ enabled = true
         }
     }
 
+    /// A TYPO'D STYLE TAKES NO TUNING ROW OFF THE AIR. The sweep above only ever
+    /// exercised `cursor_trail = false`, which is why the silent-disable
+    /// semantics could be replaced by a rendering fallback while fourteen rows
+    /// kept projecting `has_live_effect = false` beside a sentence that told a
+    /// float or colour row ITS value was unregistered.
+    ///
+    /// The constraint is stated as an EQUALITY against a valid-style baseline:
+    /// an unrecognized `cursor_trail_style` must not change whether a tuning row
+    /// is live, because `resolve_trail_style` substitutes the default style and
+    /// the trail renders. The style row itself is the one row whose authored
+    /// value really is unusable, and it keeps the Unavailable shape.
+    #[test]
+    fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
+        let availability = audited_availability();
+        let motion = crate::native_app::ViewMotionCx::default();
+        let sample = |kind: EditKind| match kind {
+            EditKind::Bool => "true",
+            EditKind::Integer => "5",
+            EditKind::Float => "0.7",
+            EditKind::Color => "#44ccff",
+            EditKind::Enum { options } => options
+                .first()
+                .copied()
+                .expect("registered native enum has an option"),
+            EditKind::Text | EditKind::Theme => "matrix",
+        };
+        let typo = "phasr";
+        assert_eq!(
+            crate::prefs::cursor_trail_style_canonical(typo),
+            None,
+            "the probe value must really be unrecognized"
+        );
+        let good = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
+
+        let mut any_live = 0usize;
+        for key in TRAIL_TUNING_KEYS {
+            let kind = prefs::edit_kind(key);
+            let project = |style: &str| {
+                projected_effect(
+                    &format!("cursor_trail = true\ncursor_trail_style = \"{style}\"\n"),
+                    &[(key, sample(kind))],
+                    key,
+                    availability,
+                    motion,
+                )
+            };
+            let baseline = project(good);
+            let fallback = project(typo);
+            assert_eq!(
+                fallback.has_live_effect, baseline.has_live_effect,
+                "{key}: the unrecognized style changed the live verdict\n  valid: {baseline:?}\n  typo: {fallback:?}"
+            );
+            assert!(
+                !effect_note_contains(&fallback, "outside this setting's registered choices"),
+                "{key}: a tuning row must not be told ITS value is unregistered: {fallback:?}"
+            );
+            if fallback.has_live_effect {
+                any_live += 1;
+                assert!(
+                    effect_note_contains(&fallback, "this tuning applies to that fallback trail"),
+                    "{key}: a live tuning row must name the trail it is tuning: {fallback:?}"
+                );
+            } else {
+                // The one honest exception, and it must be dark for ITS OWN
+                // reason — the resolved fallback is the rainbow pet, not Fire.
+                assert_eq!(*key, prefs::EDIT_CURSOR_FIRE_SHIMMER, "{fallback:?}");
+                assert!(
+                    effect_note_contains(&fallback, "Fire style only"),
+                    "{fallback:?}"
+                );
+            }
+        }
+        // Non-vacuity: all but one of the table stays live. The exception is
+        // `cursor_fire_shimmer`, which is correctly gated on the RESOLVED style
+        // being Fire — the fallback is the rainbow pet, so it is genuinely
+        // inactive and says so for the right reason.
+        assert_eq!(
+            any_live,
+            TRAIL_TUNING_KEYS.len() - 1,
+            "{any_live} of {} tuning rows stayed live",
+            TRAIL_TUNING_KEYS.len()
+        );
+        for key in [
+            prefs::EDIT_CURSOR_TRAIL_INTENSITY,
+            prefs::EDIT_HDR_GLOW,
+            prefs::EDIT_CURSOR_TRAIL_MS,
+            prefs::EDIT_CURSOR_TRAIL_COLOR,
+        ] {
+            let effect = projected_effect(
+                &format!("cursor_trail = true\ncursor_trail_style = \"{typo}\"\n"),
+                &[(key, sample(prefs::edit_kind(key)))],
+                key,
+                availability,
+                motion,
+            );
+            assert!(effect.has_live_effect, "{key}: {effect:?}");
+        }
+
+        // The two switches that govern the same fallback trail are not tuning
+        // rows, so the sweep above cannot see them — and that shape is exactly
+        // how they kept the silent-disable projection after the fallback
+        // landed. Their own values stay valid, so a typo must not move their
+        // verdict either.
+        for key in [prefs::EDIT_CURSOR_TRAIL, prefs::EDIT_TRAIL_SOUNDS] {
+            let project = |style: &str| {
+                projected_effect(
+                    &format!("cursor_trail = true\ncursor_trail_style = \"{style}\"\n"),
+                    &[(key, "true")],
+                    key,
+                    availability,
+                    motion,
+                )
+            };
+            let baseline = project(good);
+            let fallback = project(typo);
+            assert_eq!(
+                fallback.has_live_effect, baseline.has_live_effect,
+                "{key}: the unrecognized style changed the live verdict\n  valid: {baseline:?}\n  typo: {fallback:?}"
+            );
+            assert!(fallback.has_live_effect, "{key}: {fallback:?}");
+            assert!(
+                !effect_note_contains(&fallback, "outside this setting's registered choices"),
+                "{key}: a switch must not be told ITS value is unregistered: {fallback:?}"
+            );
+        }
+
+        // The STYLE row is the one row whose authored value is genuinely
+        // unusable, and it keeps the generic invalid-choice shape.
+        let style_row = projected_effect(
+            "cursor_trail = true\n",
+            &[(prefs::EDIT_CURSOR_TRAIL_STYLE, typo)],
+            prefs::EDIT_CURSOR_TRAIL_STYLE,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&style_row, "Invalid trail style · Runtime fallback active"),
+            "{style_row:?}"
+        );
+        assert!(!style_row.has_live_effect, "{style_row:?}");
+
+        // The master switch still owns the whole family, typo or not.
+        for key in TRAIL_TUNING_KEYS {
+            let effect = projected_effect(
+                &format!("cursor_trail = false\ncursor_trail_style = \"{typo}\"\n"),
+                &[(key, sample(prefs::edit_kind(key)))],
+                key,
+                availability,
+                motion,
+            );
+            assert!(
+                effect_note_contains(&effect, "Cursor trail is Off"),
+                "{key}: {effect:?}"
+            );
+            assert!(!effect.has_live_effect, "{key}");
+        }
+
+        // A `pack:<id>` that is not loaded still fails closed — there is nothing
+        // to fall back to, so those rows stay dark.
+        for key in TRAIL_TUNING_KEYS {
+            let effect = projected_effect(
+                "cursor_trail = true\ncursor_trail_style = \"pack:not-loaded\"\n",
+                &[(key, sample(prefs::edit_kind(key)))],
+                key,
+                availability,
+                motion,
+            );
+            assert!(!effect.has_live_effect, "{key}: {effect:?}");
+        }
+    }
+
     #[test]
     fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
         let availability = audited_availability();
@@ -32754,7 +33828,7 @@ enabled = true
             "[[sparkle_words.custom]]\nwords = [\"sameword\"]\n",
             "graphic = { collection = \"cats\" }\n",
         );
-        let state = SettingsViewState::new(&toml::from_str(shadowed).unwrap());
+        let state = SettingsViewState::new(&aterm_toml::from_str(shadowed).unwrap());
         assert_eq!(
             state.sparkle_spec_consumers,
             Some(aterm_effects::spec::SpecConsumerCapabilities::default()),
@@ -32776,13 +33850,11 @@ enabled = true
     fn trail_dependencies_use_the_admitted_style_resolution() {
         let availability = audited_availability();
         let motion = crate::native_app::ViewMotionCx::default();
+        // THE THREE RESOLUTIONS THAT REALLY DO LEAVE A TUNING ROW DARK. An
+        // unknown style is NOT among them any more — it resolves to the default
+        // style and renders — so it is asserted separately below and pinned in
+        // full by `an_unknown_trail_style_leaves_the_tuning_rows_live`.
         let cases = [
-            (
-                "cursor_trail = true\ncursor_trail_style = \"not-a-style\"\n",
-                prefs::EDIT_CURSOR_TRAIL_RADIUS,
-                "1.0",
-                "style is unknown",
-            ),
             (
                 "cursor_trail = true\ncursor_trail_style = \"pack:missing\"\n",
                 prefs::EDIT_CURSOR_TRAIL_RADIUS,
@@ -32811,6 +33883,22 @@ enabled = true
             assert!(!projected.has_live_effect);
         }
 
+        // An unknown style substitutes the default and DRAWS, so the crown
+        // radius it is tuning is on screen: the row stays live and its note
+        // names the fallback rather than claiming the radius is unregistered.
+        let unknown = projected_effect(
+            "cursor_trail = true\ncursor_trail_style = \"not-a-style\"\n",
+            &[(prefs::EDIT_CURSOR_TRAIL_RADIUS, "1.0")],
+            prefs::EDIT_CURSOR_TRAIL_RADIUS,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&unknown, "this tuning applies to that fallback trail"),
+            "{unknown:?}"
+        );
+        assert!(unknown.has_live_effect, "{unknown:?}");
+
         for (value, expected) in [
             ("not-a-style", "style is unknown"),
             ("pack:missing", "Trail Pack is missing"),
@@ -32827,6 +33915,9 @@ enabled = true
             assert!(!projected.has_live_effect);
         }
 
+        // The master switch is not the row with the unusable value: turning it
+        // on draws the fallback trail, so it keeps its live effect and is never
+        // told that its own `true` is outside the style's registered choices.
         let master = projected_effect(
             "cursor_trail = false\ncursor_trail_style = \"not-a-style\"\n",
             &[(prefs::EDIT_CURSOR_TRAIL, "true")],
@@ -32834,8 +33925,11 @@ enabled = true
             availability,
             motion,
         );
-        assert!(effect_note_contains(&master, "style is unknown"));
-        assert!(!master.has_live_effect);
+        assert!(master.has_live_effect, "{master:?}");
+        assert!(
+            !effect_note_contains(&master, "outside this setting's registered choices"),
+            "{master:?}"
+        );
     }
 
     #[test]
@@ -33006,7 +34100,7 @@ enabled = true
             )
         };
 
-        let rainbow: Config = toml::from_str(&source("ink = \"rainbow\"")).unwrap();
+        let rainbow: Config = aterm_toml::from_str(&source("ink = \"rainbow\"")).unwrap();
         let rainbow = SettingsViewState::new(&rainbow)
             .sparkle_spec_consumers
             .unwrap();
@@ -33014,7 +34108,7 @@ enabled = true
         assert!(!rainbow.twotone_ink);
 
         let twotone_source = source("ink = \"twotone:#112233,#445566\"");
-        let twotone: Config = toml::from_str(&twotone_source).unwrap();
+        let twotone: Config = aterm_toml::from_str(&twotone_source).unwrap();
         let twotone = SettingsViewState::new(&twotone)
             .sparkle_spec_consumers
             .unwrap();
@@ -33022,7 +34116,7 @@ enabled = true
         assert!(!twotone.rainbow_ink);
 
         let graphic: Config =
-            toml::from_str(&source("graphic = { collection = \"cats\" }")).unwrap();
+            aterm_toml::from_str(&source("graphic = { collection = \"cats\" }")).unwrap();
         assert_eq!(
             SettingsViewState::new(&graphic).sparkle_spec_consumers,
             Some(aterm_effects::spec::SpecConsumerCapabilities::default())
@@ -33187,7 +34281,7 @@ enabled = true
             sparkle_spec_consumers: Some(Arc::new(consumers)),
         });
         let config: Config =
-            toml::from_str("[sparkle_words.profanity]\nstyle = \"rainbow\"\n").unwrap();
+            aterm_toml::from_str("[sparkle_words.profanity]\nstyle = \"rainbow\"\n").unwrap();
         let state = SettingsViewState::from_config_and_assets(&config, assets);
         let projected = setting_effect_projection(
             &state,
@@ -33208,7 +34302,7 @@ enabled = true
             themes: crate::app_config::ThemeCatalog::empty(),
             sparkle_spec_consumers: Some(Arc::new(Default::default())),
         });
-        let inline_nova: Config = toml::from_str(concat!(
+        let inline_nova: Config = aterm_toml::from_str(concat!(
             "[sparkle_words.profanity]\nstyle = \"rainbow\"\n",
             "[[sparkle_words.custom]]\nwords = [\"shadowed\"]\n",
             "burst = { kind = \"nova\", chance = 100 }\n",
@@ -33250,7 +34344,7 @@ enabled = true
         );
         assert!(!effect_note_contains(&projected, "Nova style"));
 
-        let product_off: Config = toml::from_str(
+        let product_off: Config = aterm_toml::from_str(
             "[sparkle_words.profanity]\nenabled = false\n\
              [sparkle_words.emphasis]\nenabled = false\n",
         )
@@ -33288,7 +34382,7 @@ enabled = true
             ));
         }
 
-        let unresolved_recipes: Config = toml::from_str(
+        let unresolved_recipes: Config = aterm_toml::from_str(
             "[sparkle_words.profanity]\nenabled = true\nstyle = \"rainbow\"\n\
              [sparkle_words.emphasis]\nenabled = false\n",
         )
@@ -33327,7 +34421,7 @@ enabled = true
         assert!(strength.has_live_effect);
         assert!(!effect_note_contains(&strength, "recipe admission pending"));
 
-        let ink_off: Config = toml::from_str(
+        let ink_off: Config = aterm_toml::from_str(
             "[sparkle_words.profanity]\nenabled = true\n\
              [sparkle_words.ink]\nenabled = false\n\
              [sparkle_words.emphasis]\nenabled = true\n",
@@ -33420,7 +34514,8 @@ enabled = true
 
     #[test]
     fn row_and_completion_share_the_exact_effect_projection() {
-        let config: Config = toml::from_str("stream_fade = false\nstream_fade_ms = 120\n").unwrap();
+        let config: Config =
+            aterm_toml::from_str("stream_fade = false\nstream_fade_ms = 120\n").unwrap();
         let state = SettingsViewState::new(&config);
         let (index, field) = state
             .legacy

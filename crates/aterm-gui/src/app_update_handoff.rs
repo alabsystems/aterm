@@ -235,6 +235,13 @@ struct HandoffWorkerCleanup {
 struct HandoffCommitFacts {
     exact_sessions: bool,
     exact_layout: bool,
+    /// The activity epoch is unchanged since the attempt was armed.
+    ///
+    /// MODE-BLIND ON PURPOSE, and mandatory in every lane — including
+    /// `AutomaticPastGrace`. That lane drops the idle WAIT at the entry; it does
+    /// not get to commit against a snapshot that activity has already moved out
+    /// from under. (Several comments in this tree used to claim otherwise; they
+    /// were corrected on 2026-08-28, and this is the sentence to trust.)
     exact_activity: bool,
     teardown_allows_commit: bool,
     parent_still_parked: bool,
@@ -471,6 +478,9 @@ fn emergency_reap_and_report(
             reconcile: None,
             detail,
             input_drain_spins: 0,
+            // WE ended this candidate, off a bare pid from the completion wire.
+            // Nothing here witnessed a death of its own.
+            child_death: crate::ChildDeathEvidence::Unobserved,
         },
     ));
 }
@@ -876,20 +886,69 @@ pub(crate) fn contain_own_process_group() -> ProcessGroupContainment {
 /// pid.
 /// Is `pid` still a CHILD of this process, and therefore pinned to its number?
 ///
-/// `waitid` with `WNOHANG | WNOWAIT` is the only probe that answers without
-/// changing anything: `WNOWAIT` leaves an already-exited child in its waitable
-/// state, so the reaper's own `waitpid` still collects it afterwards. ECHILD is
-/// the discriminator — measured on this platform, it is what both a launchd-owned
-/// process and an already-reaped one answer.
-///
-/// `false` is the safe direction: it only ever withholds a signal.
+/// `false` is the safe direction: it only ever withholds a signal. A child that
+/// has already EXITED is still pinned — an unreaped zombie owns its number — so
+/// both affirmative answers of [`probe_handoff_candidate`] count here; only
+/// `ECHILD` withholds.
 #[cfg(unix)]
 fn candidate_is_our_child(pid: libc::pid_t) -> bool {
+    matches!(
+        probe_handoff_candidate(pid),
+        HandoffCandidateProbe::Running | HandoffCandidateProbe::Exited
+    )
+}
+
+/// What this process can say about a candidate WITHOUT changing anything.
+///
+/// One `waitid(WNOHANG | WNOWAIT)` answers two questions, and both have a caller:
+///   * IS IT OURS — `ECHILD` is the discriminator, and measured on this platform
+///     it is what both a launchd-owned process and an already-reaped one answer.
+///     [`candidate_is_our_child`] needs it before a process-group sweep;
+///   * HAS IT DIED YET — [`worker_reject_and_reap_handoff_child`] needs it to know
+///     whether the status it is about to reap belongs to the CANDIDATE or to the
+///     SIGKILL it is about to send.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffCandidateProbe {
+    /// `waitid` refused: not a child of ours (the launched lane), or already
+    /// reaped. Nothing may be concluded, and nothing is pinned.
+    NotOurChild,
+    /// Our child, and it has not exited: whatever ends it has not happened yet.
+    ///
+    /// NOT "IT REFUSED", however tempting. A candidate observed alive at proof EOF
+    /// really has closed the readiness channel without dying — which is what a
+    /// deliberate refusal does — but it is also what a process being torn down
+    /// looks like for the microseconds between the kernel closing its descriptors
+    /// and its zombie state becoming visible. Under exactly the pathological load
+    /// this classification exists for, a dying candidate is likelier to be caught
+    /// in that window, so reading `Running` as a refusal would put a race back at
+    /// the seam a race already broke once.
+    Running,
+    /// Our child, already exited, and still waitable — so its status is intact for
+    /// the reap that follows.
+    Exited,
+}
+
+/// NON-DESTRUCTIVE BY CONSTRUCTION. `WNOWAIT` leaves an already-exited child in
+/// its waitable state, so the reaper's own `wait` still collects it — and still
+/// collects the status this probe deliberately does not read.
+///
+/// `si_signo` rather than `si_pid`/`si_status` is the portability decision: it is
+/// a PUBLIC FIELD of libc's `siginfo_t` on both platforms this crate builds for,
+/// while the other two are fields on the BSDs and union accessors on Linux. A
+/// child that has not changed state leaves the zeroed struct untouched, so
+/// `si_signo == 0`; a reportable exit writes `SIGCHLD` there, which is non-zero
+/// everywhere. The exit STATUS is read later, in safe Rust, from the
+/// `Child::wait` this lane already performs.
+#[cfg(unix)]
+fn probe_handoff_candidate(pid: libc::pid_t) -> HandoffCandidateProbe {
     let Ok(id) = libc::id_t::try_from(pid) else {
-        return false;
+        return HandoffCandidateProbe::NotOurChild;
     };
     // SAFETY: `info` is a zeroed out-parameter of exactly the type waitid fills,
-    // and WNOWAIT means this call consumes no child.
+    // and WNOWAIT means this call consumes no child. Zeroing FIRST is what makes
+    // the `si_signo` read below meaningful: POSIX does not require an
+    // implementation to write that field when WNOHANG finds nothing to report.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::waitid(
@@ -899,7 +958,178 @@ fn candidate_is_our_child(pid: libc::pid_t) -> bool {
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )
     };
-    rc == 0
+    if rc != 0 {
+        return HandoffCandidateProbe::NotOurChild;
+    }
+    if info.si_signo == 0 {
+        HandoffCandidateProbe::Running
+    } else {
+        HandoffCandidateProbe::Exited
+    }
+}
+
+/// A NON-PARENT'S WITNESS TO HOW A CANDIDATE DIED.
+///
+/// THE LAUNCHED LANE HAS NO `wait`, and that is not a gap in this file — it is
+/// what "launchd's child" means. `waitid` answers `ECHILD` about somebody else's
+/// child, so on the SHIPPING macOS lane the parent could observe nothing whatever
+/// about a `ChildDied` and every one of them had to be classified from inference.
+/// That is precisely how a starved candidate came to be charged as a refusing
+/// successor (see [`crate::ChildDeathEvidence`]).
+///
+/// DARWIN HAS A SECOND CHANNEL FOR EXACTLY THIS FACT. `kqueue`'s `EVFILT_PROC`
+/// with `NOTE_EXIT | NOTE_EXITSTATUS` delivers a process's FULL `wait(2)`-encoded
+/// status to a watcher that is not its parent. XNU's `filt_procattach` gates
+/// `NOTE_EXITSTATUS` on being the parent, the tracer, OR being permitted to
+/// `SIGKILL` the target — and this lane SIGKILLs the candidate a few lines later,
+/// so the permission it needs is one it demonstrably already holds.
+///
+/// MEASURED ON THIS PLATFORM (Darwin 25.5.0) against a process deliberately
+/// reparented to launchd, i.e. the exact shape of a LaunchServices-launched
+/// successor, watched by a process that is not its parent:
+///   * `exit(7)` → `fflags` carries `NOTE_EXIT|NOTE_EXITSTATUS` and `data` is
+///     `0x0700`: `WIFEXITED`, code 7;
+///   * `SIGKILL` → `data` is `0x9`: `WIFSIGNALED`, signal 9.
+///
+/// Registration succeeded on the orphan in both cases. The failing direction is a
+/// registration `ESRCH` — the candidate is already gone — which answers `None` and
+/// leaves the verdict exactly where it was before this type existed.
+///
+/// TWO PROPERTIES MAKE IT STRICTLY BETTER THAN [`probe_handoff_candidate`], not a
+/// substitute for it:
+///   * THE EVENT IS DURABLE. XNU queues the knote inside `proc_exit` and it stays
+///     in THIS process's queue until read, so launchd reaping the candidate cannot
+///     take the fact away. A zombie probe loses the same fact to a reap it does
+///     not control.
+///   * ASKING LATE COSTS NOTHING. So [`observe_candidate_death`] reads it once
+///     BEFORE its own SIGKILL — anything there is unambiguously the candidate's
+///     own death — and again after the candidate is provably gone, which is sound
+///     for every status except a bare `SIGKILL`, the only signal this process
+///     ever sends.
+#[cfg(target_os = "macos")]
+struct CandidateExitWatch {
+    kq: std::os::fd::OwnedFd,
+    ident: libc::uintptr_t,
+}
+
+#[cfg(target_os = "macos")]
+impl CandidateExitWatch {
+    /// Register WHILE THE CANDIDATE IS STILL ALIVE. On the launched lane that is
+    /// the rendezvous accept — the one instant the kernel has just attested the
+    /// pid — and the registration is the last thing that has to happen before the
+    /// candidate can start dying.
+    ///
+    /// Every failure answers `None`, and every failure is SAFE: it costs the
+    /// evidence, never the reap, and the classification degrades to
+    /// [`crate::ChildDeathEvidence::Unobserved`], which retries on a bounded
+    /// budget.
+    fn watch(pid: u32) -> Option<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        // 0, -1 and launchd are `kill`'s special targets and the init process;
+        // none is ever a candidate, and none is a process to attach a filter to.
+        if pid <= 1 {
+            return None;
+        }
+        let ident = libc::uintptr_t::try_from(pid).ok()?;
+        // SAFETY: `kqueue()` takes no arguments and returns a new descriptor or -1.
+        let raw = unsafe { libc::kqueue() };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is a fresh descriptor this process exclusively owns.
+        let kq = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // CLOSE-ON-EXEC BY HOUSE RULE RATHER THAN BY NECESSITY: Darwin does not
+        // inherit a kqueue across `fork` at all, so nothing this process spawns can
+        // carry it and the non-atomic gap after `kqueue()` cannot leak. Set it
+        // anyway, so an audit of "which descriptors can leave this process" needs
+        // no platform footnote.
+        // SAFETY: `F_SETFD` takes an int and touches only this descriptor's flags.
+        unsafe { libc::fcntl(kq.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        let change = libc::kevent {
+            ident,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE,
+            fflags: libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // NO OUTPUT SLOT, ON PURPOSE. With `nevents == 0` a registration failure
+        // comes back through `kevent`'s own return value instead of being buried in
+        // an `EV_ERROR` event, which is what keeps "the candidate is already gone"
+        // from being confused with "the candidate exited while we were registering".
+        // SAFETY: one change entry, live for the call; no event list is requested.
+        let rc = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        (rc == 0).then_some(Self { kq, ident })
+    }
+
+    /// The candidate's own `wait(2)` status IF THE KERNEL HAS ALREADY RECORDED
+    /// ONE. Never blocks (zero timeout) and never reaps — the candidate is not
+    /// this process's child to reap.
+    fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        // SAFETY: a zeroed out-parameter of exactly the type `kevent` fills.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: one event slot and one timespec, both live for the call; no
+        // changes are submitted.
+        let rc = unsafe {
+            libc::kevent(
+                self.kq.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                &timeout,
+            )
+        };
+        if rc != 1 || event.flags & libc::EV_ERROR != 0 {
+            return None;
+        }
+        // ABOUT THE RIGHT PROCESS, AND ABOUT AN EXIT. Neither can currently be
+        // otherwise — one registration, one filter — and both are cheap to keep
+        // true if a second registration is ever added to this queue.
+        if event.ident != self.ident
+            || event.fflags & libc::NOTE_EXIT == 0
+            || event.fflags & libc::NOTE_EXITSTATUS == 0
+        {
+            return None;
+        }
+        // The status is the low 32 bits of `data`, in the same `wait(2)` encoding
+        // `Child::wait` yields. MEASURED: `exit(7)` gives `0x0700`, `SIGKILL`
+        // gives `0x9`.
+        let raw = i32::try_from(event.data & 0xffff_ffff).ok()?;
+        Some(std::process::ExitStatus::from_raw(raw))
+    }
+}
+
+/// Off macOS every handoff candidate is a fork child of this process, so `wait`
+/// always answers and there is no lane for a non-parent witness to serve. The
+/// type stays so the decision tail is ONE function on every unix; nothing here
+/// can produce one, because the `watch` constructor is macOS-only and there is no
+/// other.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[allow(dead_code)]
+struct CandidateExitWatch;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl CandidateExitWatch {
+    fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -941,8 +1171,28 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
             // "not pinned".
             if candidate_is_our_child(pid) {
                 // SAFETY: SIGKILL to the candidate's process group, whose number
-                // the kernel just confirmed is still held by a child of ours.
-                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                // the kernel just confirmed is still held by a child of ours, and
+                // then to the candidate ITSELF.
+                //
+                // The group sweep alone reaches a candidate only while it leads a
+                // group of its own, which is true of the lane's own `pre_exec`
+                // children and of nothing else: a child that inherited this
+                // process's group has no group numbered `pid`, so `-pid` finds
+                // nothing and the candidate lives. Nothing downstream survives
+                // that — the reject path's `wait` has no deadline, and
+                // `wait_for_handoff_candidate_to_terminate` is unbounded ON
+                // PURPOSE, so a candidate that is never signalled parks the
+                // terminal for as long as it chooses to run.
+                //
+                // The direct signal needs no argument the sweep did not already
+                // need: `candidate_is_our_child` just pinned this number, and a
+                // pinned pid is exactly what makes `kill(pid, …)` land on the
+                // candidate rather than on a stranger. It is the same pair the
+                // corroborated arm sends, for the same reason.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
             } else {
                 aterm_log::warn!(
                     "handoff candidate {pid} is not our child, so its pid is not pinned and \
@@ -991,6 +1241,22 @@ fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> Hando
     }
 }
 
+/// The reap's two products: the rollback warrant, and — when this process's own
+/// `wait` answered for the CANDIDATE — the status that `wait` collected.
+///
+/// THE STATUS USED TO BE DISCARDED (`child.wait().is_ok()`), which threw away the
+/// only direct statement a candidate ever makes about why it stopped. It is
+/// carried now, and it is an `Option` because on the launched lane nobody's `wait`
+/// answers, and because a launcher-shaped child's status belongs to the launcher.
+/// It is only ever READ once [`HandoffCandidateProbe::Exited`] has proved the
+/// candidate was already dead before this lane signalled it — see
+/// [`worker_reject_and_reap_handoff_child`].
+#[cfg(unix)]
+struct ReapedHandoffCandidate {
+    warrant: HandoffRollbackWarrant,
+    status: Option<std::process::ExitStatus>,
+}
+
 /// Kill the rejected candidate and prove it gone. Runs only on the handoff
 /// worker, and the returned warrant is what licenses [`App::rollback_overlap`]
 /// to resume the parked readers.
@@ -1004,14 +1270,16 @@ fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> Hando
 /// assuming otherwise. The warrant returned here never rests on the sweep either
 /// way: it comes from `wait` on our own child, or from
 /// [`wait_for_handoff_candidate_to_terminate`]'s outside proof.
+/// Also hands back the candidate's own exit status when our `wait` answered for
+/// it; see [`ReapedHandoffCandidate`].
 #[cfg(unix)]
 fn kill_and_reap_handoff_child(
     candidate: HandoffCandidate,
     handle: &mut HandoffCandidateHandle,
-) -> HandoffRollbackWarrant {
+) -> ReapedHandoffCandidate {
     let child = match handle {
         HandoffCandidateHandle::Forked(child) => child,
-        HandoffCandidateHandle::Launched => {
+        HandoffCandidateHandle::Launched(_) => {
             // NOBODY'S `wait` ANSWERS FOR THIS ONE. `waitpid` is not an
             // authority about somebody else's child (it says `ECHILD`, which is
             // not evidence of anything), so the outside proof stands in for it —
@@ -1019,7 +1287,10 @@ fn kill_and_reap_handoff_child(
             // for. The signal still goes first, for the same reason it does
             // below: descendants must be condemned before anything blocks.
             signal_handoff_candidate(candidate);
-            return wait_for_handoff_candidate_to_terminate(candidate);
+            return ReapedHandoffCandidate {
+                warrant: wait_for_handoff_candidate_to_terminate(candidate),
+                status: None,
+            };
         }
     };
     // Signal BEFORE any wait, so descendants are already condemned when the
@@ -1033,13 +1304,22 @@ fn kill_and_reap_handoff_child(
     // candidate — a launcher-shaped child (`open -n`, which exits as soon as
     // LaunchServices holds the successor) would be reaped here while proving
     // nothing about the process holding the masters.
-    let reaped = child.wait().is_ok();
-    if reaped && child_is_candidate {
-        return HandoffRollbackWarrant::Reaped;
+    let reaped = child.wait().ok();
+    if let Some(status) = reaped
+        && child_is_candidate
+    {
+        return ReapedHandoffCandidate {
+            warrant: HandoffRollbackWarrant::Reaped,
+            status: Some(status),
+        };
     }
     // FALLBACK: no `wait` of ours answers for the candidate. Prove it terminated
-    // from the outside instead.
-    wait_for_handoff_candidate_to_terminate(candidate)
+    // from the outside instead. The status is withheld with it: a launcher-shaped
+    // child's exit describes the launcher, not the process holding the masters.
+    ReapedHandoffCandidate {
+        warrant: wait_for_handoff_candidate_to_terminate(candidate),
+        status: None,
+    }
 }
 
 /// WHAT THIS PROCESS MAY DO TO THE CANDIDATE — which is a property of how the
@@ -1057,8 +1337,30 @@ enum HandoffCandidateHandle {
     Forked(std::process::Child),
     /// launchd's, not ours. Nothing here may `wait`, and the warrant comes from
     /// [`handoff_candidate_terminated`]'s outside proof.
+    ///
+    /// The [`CandidateExitWatch`] is this lane's ONLY possible statement about how
+    /// the candidate died, registered at the rendezvous accept. `None` whenever it
+    /// could not be registered, and always `None` off macOS, where nothing
+    /// launches a candidate at all.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Launched,
+    Launched(Option<CandidateExitWatch>),
+}
+
+#[cfg(unix)]
+impl HandoffCandidateHandle {
+    /// The candidate's own status IF the kernel has already recorded one, WITHOUT
+    /// blocking and without reaping.
+    ///
+    /// `None` on the fork lane by construction: its status comes from `wait`,
+    /// which is a stronger authority and the one [`kill_and_reap_handoff_child`]
+    /// already collects. Only the launched lane, which has no `wait` to collect,
+    /// answers from a witness.
+    fn witnessed_exit_status(&self) -> Option<std::process::ExitStatus> {
+        match self {
+            Self::Forked(_) => None,
+            Self::Launched(watch) => watch.as_ref().and_then(CandidateExitWatch::exit_status),
+        }
+    }
 }
 
 /// Acquire the worker's unique reaper capability.  Losing to `Committing`
@@ -1241,7 +1543,20 @@ impl crate::UpdateHandoffCompletion {
             reconcile: None,
             detail: detail.into(),
             input_drain_spins: 0,
+            // NOTHING OBSERVED is the right default for every producer but one.
+            // Preparation failures and cancels have no candidate at all, and every
+            // other returned outcome describes a candidate THIS process ended — a
+            // status that is ours, not evidence. Only the `ChildDied` producer
+            // overrides it, and only with what it actually saw.
+            child_death: crate::ChildDeathEvidence::Unobserved,
         }
+    }
+
+    /// Attach what the worker observed about a candidate that died on its own.
+    #[must_use]
+    fn with_child_death(mut self, death: crate::ChildDeathEvidence) -> Self {
+        self.child_death = death;
+        self
     }
 }
 
@@ -1296,27 +1611,22 @@ fn worker_reject_and_reap_handoff_child(
     if !worker_claim_handoff_reaper(&job.arbiter) {
         return false;
     }
-    let warrant = kill_and_reap_handoff_child(candidate, handle);
+    let (warrant, child_death) = observe_candidate_death(outcome, candidate, handle);
     let completed = job.arbiter.finish_reap(crate::HandoffReaperOwner::Worker);
     debug_assert!(
         completed,
         "the worker must retain its unique reaper ownership"
     );
-    // WE ended this candidate — it did not crash. Its boot observed a trial launch of
-    // the target build (a swapped candidate arms the sentinel and re-execs; an
-    // activation candidate finds it already armed by an earlier swap), and left
-    // counted, the bounded automatic re-attempts a busy machine legitimately makes
-    // (TimedOut / ActivityRevoked are scheduling facts, not evidence against the
-    // artifact) reach `MAX_BOOT_ATTEMPTS`, revert to the OLD bundle and poison a
-    // build that never failed. `ChildDied` is the one outcome that IS the crash
-    // signal and keeps its count. Real apply only: the QA seam has no target.
-    if outcome != crate::UpdateHandoffOutcome::ChildDied && job.target_build > job.current_build {
-        // …and only a launch THIS candidate observed: the count must have advanced
-        // past the snapshot taken before it was launched. A candidate killed in its
-        // first milliseconds (a revoking event lands while it is still exec'ing)
-        // counted nothing, and forgiving then would erase an earlier candidate's
-        // genuine crash observation.
-        aterm_update::forgive_trial_launch_if_advanced(job.target_build, job.trial_launches_before);
+    if outcome == crate::UpdateHandoffOutcome::ChildDied {
+        // WRITE THE EVIDENCE DOWN. The completion detail paints a pill and stays
+        // short, so the durable log is where a future field report finds out which
+        // of the three `ChildDied` events this was — and, when the answer is
+        // `Unobserved`, that the answer is genuinely unknown rather than assumed.
+        aterm_log::warn!(
+            "update apply: candidate {} died before proving adoption; observed {child_death:?} \
+             (this decides whether the automatic lane retries these bytes or converges on them)",
+            candidate.pid
+        );
     }
     send_warranted_handoff_failure(
         warrant,
@@ -1329,9 +1639,184 @@ fn worker_reject_and_reap_handoff_child(
             Some(candidate.pid),
             outcome,
             detail,
-        ),
+        )
+        .with_child_death(child_death),
     );
+    // GIVE THE COUNTED TRIAL LAUNCH BACK unless the bytes answer for this death —
+    // see `forgives_the_counted_trial_launch`, which is the whole of the decision.
+    //
+    // AFTER THE WAKE, DELIBERATELY, and for the same reason
+    // `send_warranted_handoff_failure` publishes before it collects reconcile
+    // facts: the rollback resumes the user's parked readers and is
+    // latency-critical, while this is a durable ledger edit nothing is waiting on.
+    // It is not a free read — `forgive_trial_launch_if_advanced` resolves the
+    // staging root (a `mkdir` + `stat` + `chmod`), reads the sentinel, and takes
+    // the apply lock to write — and it now runs on the `ChildDied` path too, which
+    // is precisely the path a machine under pathological load reaches. The
+    // candidate is already dead and the next attempt is minutes away, so nothing
+    // depends on this having happened first.
+    if forgives_the_counted_trial_launch(child_death, job.current_build, job.target_build) {
+        aterm_update::forgive_trial_launch_if_advanced(job.target_build, job.trial_launches_before);
+    }
     true
+}
+
+/// KILL THE CANDIDATE, PROVE IT TERMINATED, AND SAY WHAT KILLED IT — the whole of
+/// the reject path's evidence gathering, in one place so a test can drive it end
+/// to end against a real process.
+///
+/// It was three statements inlined in [`worker_reject_and_reap_handoff_child`],
+/// which needs a worker job, an event-loop proxy and an arbiter to call at all;
+/// nothing could reach them, and a one-token mutation in any of them inverted the
+/// field classification with the whole suite green.
+///
+/// THE ORDER IS THE PROTOCOL, and each step is here because the step before it
+/// destroys something:
+///
+///  1. BEFORE ANY SIGNAL, ask what is already known. On the fork lane that is
+///     [`probe_handoff_candidate`]'s `waitid(WNOWAIT)`; on the launched lane it is
+///     the [`CandidateExitWatch`] registered at the accept. Whatever answers here
+///     is UNAMBIGUOUSLY the candidate's own death, because this process has not
+///     yet touched it.
+///  2. THE KILL AND THE TERMINATION PROOF, unchanged, and still the thing that
+///     licenses the parked readers to resume.
+///  3. AFTER IT IS PROVABLY GONE, ask again. This is not a second guess at step 1
+///     — it is a strictly later question with a strictly weaker answer, and
+///     [`handoff_child_death`] is what knows which parts of that answer survive.
+///     On the fork lane it is the status `wait` just collected; on the launched
+///     lane the kqueue knote, which XNU queued inside `proc_exit` and which is
+///     therefore GUARANTEED to be there once termination is proven — no race, only
+///     an attribution question.
+///
+/// Only [`crate::UpdateHandoffOutcome::ChildDied`] has a death of the candidate's
+/// OWN to describe. Every other outcome is a candidate this process decided to
+/// end, so its status is our SIGKILL and is evidence about nothing.
+#[cfg(unix)]
+fn observe_candidate_death(
+    outcome: crate::UpdateHandoffOutcome,
+    candidate: HandoffCandidate,
+    handle: &mut HandoffCandidateHandle,
+) -> (HandoffRollbackWarrant, crate::ChildDeathEvidence) {
+    if outcome != crate::UpdateHandoffOutcome::ChildDied {
+        let reaped = kill_and_reap_handoff_child(candidate, handle);
+        return (reaped.warrant, crate::ChildDeathEvidence::Unobserved);
+    }
+    let witnessed_before_the_kill = handle.witnessed_exit_status();
+    let died_before_we_signalled = witnessed_before_the_kill.is_some()
+        || libc::pid_t::try_from(candidate.pid)
+            .is_ok_and(|pid| probe_handoff_candidate(pid) == HandoffCandidateProbe::Exited);
+    let reaped = kill_and_reap_handoff_child(candidate, handle);
+    // FIRST ANSWER WINS, in the order they were asked: the pre-kill witness is the
+    // only one that needs no attribution argument at all, `wait` is this process's
+    // own authority over its own child, and the post-termination knote is the
+    // launched lane's last resort.
+    let status = witnessed_before_the_kill
+        .or(reaped.status)
+        .or_else(|| handle.witnessed_exit_status());
+    (
+        reaped.warrant,
+        handoff_child_death(died_before_we_signalled, status),
+    )
+}
+
+/// Does the reject path GIVE BACK the boot-trial launch this candidate counted?
+///
+/// Which is one question with the polarity that matters here: the launch stays
+/// counted only when the NEW BYTES ANSWER FOR THE DEATH, and every other answer —
+/// including "we could not tell" — hands it back.
+///
+/// ONE QUESTION, ASKED ONCE, so the retry budget and the boot sentinel can never
+/// drift apart. Both are counters over the same artifact and both end in the same
+/// place if they disagree: the retry schedule keeps launching a candidate, every
+/// launch stays counted, and on the third one `check_boot_health` reverts the
+/// bundle and marks the build failed — poisoning bytes that never failed, which is
+/// exactly what `forgive_trial_launch_if_advanced` was added to prevent.
+///
+/// The answer is the SHAPE, not the outcome. Gating on `outcome != ChildDied`
+/// (what this used to do) exempted the whole of `ChildDied` on the argument that
+/// it "IS the crash signal", and that argument died with the classification above
+/// it: a starved candidate produces proof EOF as readily as a faulting one, and
+/// its launch must be given back. The exemption was SAFE only while `ChildDied`
+/// was also capped at two attempts; the moment the classification could retry one
+/// six or nine times, an unforgiven count reached `MAX_BOOT_ATTEMPTS` on the third
+/// and the retry lane itself became the thing that reverted a healthy bundle.
+///
+/// EVERY OTHER OUTCOME KEEPS THE ANSWER IT ALWAYS HAD, through the same predicate
+/// rather than beside it: a candidate THIS process ended carries
+/// [`crate::ChildDeathEvidence::Unobserved`], which is never `Structural`, so the
+/// bounded automatic re-attempts a busy machine legitimately makes (`TimedOut` and
+/// `ActivityRevoked` are scheduling facts, not evidence against the artifact) go
+/// on forgiving exactly as before.
+///
+/// `false` for everything the parent could not attribute — `Unobserved` above all
+/// — because forgiving costs the sentinel nothing it can prove it is owed
+/// (`forgive_trial_launch_if_advanced` gives back only a launch that MOVED past
+/// this attempt's pre-launch snapshot), while withholding it spends a budget
+/// against bytes nobody has evidence against. And the sentinel keeps working
+/// either way: the swap is already durable, so a successor that truly cannot boot
+/// counts its launches on the user's ordinary relaunches, where nothing forgives.
+///
+/// THE WHOLE DECISION LIVES HERE, real-apply guard included, so none of it is left
+/// at a call site no test can reach: the reject path either calls this and acts on
+/// it, or the sentinel keeps the launch.
+#[cfg(unix)]
+#[must_use]
+fn forgives_the_counted_trial_launch(
+    death: crate::ChildDeathEvidence,
+    current_build: u64,
+    target_build: u64,
+) -> bool {
+    // REAL APPLY ONLY. The QA seam authorizes no newer target, so nothing armed a
+    // sentinel for it and there is no counted launch to give back.
+    target_build > current_build
+        && crate::app_native::PhysicalFailureShape::of_child_death(death)
+            != crate::app_native::PhysicalFailureShape::Structural
+}
+
+/// TURN ONE `wait(2)` STATUS INTO EVIDENCE, or refuse to.
+///
+/// THIS PROCESS ONLY EVER SENDS `SIGKILL` (`signal_handoff_candidate`, every arm),
+/// and that single fact decides the whole function:
+///
+///   * AN EXIT CODE CANNOT BE OURS. `SIGKILL` is uncatchable and never yields
+///     `WIFEXITED`, so `status.code()` being `Some` is by itself proof that the
+///     candidate reached an `exit` instruction — which a starved process never
+///     does. This is the tree's COMMONEST refusal (`main_entry` returns without a
+///     window when the overlap authority is incomplete, exit code `0`) and it is
+///     read unconditionally.
+///   * A SIGNAL THAT IS NOT `SIGKILL` CANNOT BE OURS EITHER. `SIGSEGV`, `SIGBUS`,
+///     `SIGABRT` and friends arrive from the image executing itself into a wall;
+///     nothing in this file sends them.
+///   * A BARE `SIGKILL` IS THE ONLY AMBIGUOUS ANSWER, and it is the one
+///     `died_before_we_signalled` exists for. With it, the kill is the machine's
+///     (macOS jetsam reclaiming memory — the field case). Without it, the honest
+///     answer is that we cannot tell ours from theirs, so nothing is claimed.
+///
+/// THE PRECONDITION USED TO GUARD ALL THREE, and that is what this function's
+/// previous version got wrong: it discarded status bits that provably could not be
+/// this process's own signal, so a deliberate `exit(0)` — the refusal the whole
+/// classification most wants to catch — degraded to `Unobserved` whenever the
+/// parent lost a race it deliberately refuses to wait out. The gate now guards
+/// exactly the one arm that needs it.
+#[cfg(unix)]
+#[must_use]
+fn handoff_child_death(
+    died_before_we_signalled: bool,
+    status: Option<std::process::ExitStatus>,
+) -> crate::ChildDeathEvidence {
+    use std::os::unix::process::ExitStatusExt as _;
+    let Some(status) = status else {
+        return crate::ChildDeathEvidence::Unobserved;
+    };
+    if let Some(code) = status.code() {
+        return crate::ChildDeathEvidence::Exited { code };
+    }
+    if let Some(signal) = status.signal()
+        && (died_before_we_signalled || signal != libc::SIGKILL)
+    {
+        return crate::ChildDeathEvidence::Signalled { signal };
+    }
+    crate::ChildDeathEvidence::Unobserved
 }
 
 #[cfg(unix)]
@@ -2118,6 +2603,21 @@ fn run_out_of_band_handoff(
     // plus the kernel's birth stamp for it. Together they survive pid reuse,
     // which a bare pid from a completion wire does not.
     let candidate = HandoffCandidate::of_attested_peer(pid_for_completion(peer.pid()));
+    // AND THE ONLY DEATH-WITNESS THIS LANE CAN EVER HAVE, registered at the same
+    // instant and for the same reason: the candidate is provably alive right now
+    // (it just dialled and was accepted), and `EVFILT_PROC` can only be attached to
+    // a process that still exists. Registered BEFORE the descriptor transfer, so
+    // there is no window in which the successor holds the readiness channel and
+    // nothing is watching it. `None` costs only evidence — see
+    // [`CandidateExitWatch`].
+    let exit_watch = CandidateExitWatch::watch(candidate.pid);
+    if exit_watch.is_none() {
+        aterm_log::warn!(
+            "update apply: could not watch launched candidate {} for exit; a death on this \
+             lane will be reported as Unobserved",
+            candidate.pid
+        );
+    }
     // `job.live` is `(local_id, child-owned master duplicate, shell pid)`; the
     // transfer wants `(local_id, shell pid, master)` in the order it will send
     // them, and that order is what addresses the descriptors on arrival.
@@ -2164,7 +2664,7 @@ fn run_out_of_band_handoff(
     drop(peer);
     drop(proof_wr);
     drop(commit_rd);
-    let mut handle = HandoffCandidateHandle::Launched;
+    let mut handle = HandoffCandidateHandle::Launched(exit_watch);
     run_handoff_decision(
         &job,
         proxy,
@@ -2251,21 +2751,24 @@ fn run_handoff_decision(
         deadline,
     );
     if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
-        // `ChildDied` IS proof EOF and nothing more, and a successor that REFUSES
-        // this handoff closes the readiness channel exactly as one that crashed
-        // does — the verdict cannot tell them apart, and for five field failures
-        // it did not have to, because the refusing successor said nothing at all.
-        // It says so now (`seamless::take_target_identity`, and the degraded-
-        // authority exit in `main_entry`), so point the next reader at it rather
-        // than leaving `ChildDied` looking like an accusation against the bytes.
-        // Log-only: the completion detail stays short because it paints a pill.
+        // `ChildDied` IS proof EOF and nothing more: a successor that REFUSES this
+        // handoff, one that CRASHED, and one the machine STARVED all close the
+        // readiness channel identically. For five field failures the verdict did
+        // not have to tell them apart, because the refusing successor said nothing
+        // at all; it says so now (`seamless::take_target_identity`, and the
+        // degraded-authority exit in `main_entry`), and the reject path below adds
+        // what the PARENT saw (`handoff_child_death`). Point the next reader at
+        // both rather than leaving `ChildDied` looking like an accusation against
+        // the bytes. Log-only: the completion detail stays short because it paints
+        // a pill.
         if proof_outcome == crate::UpdateHandoffOutcome::ChildDied {
             aterm_log::warn!(
                 "update apply: the successor closed the readiness channel without proving \
-                 adoption. A REFUSAL looks identical here — read this log just above for the \
-                 successor's own `seamless handoff refused:` / `overlap handoff:` line, which \
-                 names the reason (most often: it never became the authorized build because \
-                 its boot apply could not swap)."
+                 adoption. A REFUSAL, a CRASH and a STARVED child look identical here — read \
+                 this log just above for the successor's own `seamless handoff refused:` / \
+                 `overlap handoff:` line, which names the reason (most often: it never became \
+                 the authorized build because its boot apply could not swap), and just below \
+                 for the death this process could witness (`observed …`)."
             );
         }
         let rejected = worker_reject_and_reap_handoff_child(
@@ -2292,6 +2795,9 @@ fn run_handoff_decision(
         reconcile: None,
         detail: "child painted and proved exact readerless adoption".to_string(),
         input_drain_spins: 0,
+        // A candidate that PROVED adoption is alive and holding the masters; it
+        // has no death to describe.
+        child_death: crate::ChildDeathEvidence::Unobserved,
     });
     if proxy.send_event(ready).is_err() {
         // No main-thread final validation occurred, therefore Commit is impossible.
@@ -2642,12 +3148,17 @@ impl App {
 
         let live: Vec<(u64, i32, i32)> =
             self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
-        // Watching this epoch is what lets activity REVOKE a parked handoff
-        // mid-flight. `AutomaticPastGrace` deliberately opts out: it exists
-        // precisely because the machine never went quiet, so arming a revocation
-        // on activity would guarantee the rollback it is supposed to avoid.
-        // The rollback stays lossless either way — this only decides whether a
-        // keystroke is allowed to cancel an update that is already landing.
+        // THIS EPOCH GATES THE ENTRY, NOT THE FLIGHT — and the comment that
+        // stood here said the opposite, four lines above the code that refutes
+        // it. `automatic_activity_epoch` reaches exactly two places, both BEFORE
+        // the readers park: the quiet-epoch admission just below, and the
+        // pre-park TOCTOU re-check. The watcher that can revoke a parked handoff
+        // mid-flight is `pending.activity_epoch`, armed UNCONDITIONALLY when the
+        // attempt is stored, and read at Commit as the mandatory `exact_activity`
+        // fact. So `AutomaticPastGrace` opts out of WAITING for a quiet moment;
+        // it does not, and cannot, opt out of being revoked by one that arrives.
+        // That is deliberate: the forced lane's job is to land on a machine that
+        // is never quiet, not to outrank what the adoption proof must compare.
         let automatic_activity_epoch = (mode
             == crate::native_updater_service::ApplyMode::Automatic)
             .then_some(self.update_handoff_activity_epoch);
@@ -3272,7 +3783,8 @@ impl App {
         // it against the free post-park projection, `exact_layout` went false, and
         // the attempt was reported as "window/tab/pane topology changed during
         // async preparation" — a wrong cause, on a lane (`AutomaticPastGrace`,
-        // `Manual`, `Immediate`) that has no activity guard at all, burning an
+        // `Immediate`) whose ENTRY is not gated on a quiet epoch — the guard
+        // itself still applies to all of them — burning an
         // `ActivityRevoked` cycle every time. A shell writing OSC 7 during the park
         // did the same thing with no lock contention involved.
         //
@@ -3726,6 +4238,7 @@ impl App {
                 reconcile: _reconcile,
                 detail: _detail,
                 input_drain_spins: _input_drain_spins,
+                child_death: _child_death,
             } = completion;
             // Quiesce the resident operator only for the final admission seam.
             // A rejection drops this reversible token; a successful Commit
@@ -4033,6 +4546,7 @@ impl App {
             reconcile,
             detail,
             input_drain_spins: _input_drain_spins,
+            child_death,
         } = completion;
         let pending = self.pending_update_handoff.take()?;
         // Lane classification for the bounded automatic retry budgets, from the two
@@ -4053,9 +4567,17 @@ impl App {
         // the budget indistinguishable and were charged the same nine attempts
         // across fourteen hours. `classify` now sees the kind and
         // `PhysicalFailureShape` decides what it costs.
+        //
+        // …AND `child_death` IS THE THIRD FACT, for the one outcome that is not a
+        // classification of anything: `ChildDied` is proof EOF, which a successor
+        // that refused, one that faulted and one the machine starved all produce
+        // identically. What the worker SAW at that instant travels here beside the
+        // outcome rather than being re-inferred from a message string. See
+        // [`crate::ChildDeathEvidence`].
         let lane = crate::app_native::HandoffFailureLane::classify(
             pending.mode,
             outcome,
+            child_death,
             pending.revoked_by_activity,
         );
         let teardown = match (pending.mode, pending.teardown) {
@@ -4647,6 +5169,611 @@ mod pinnedness_tests {
 }
 
 #[cfg(all(test, unix))]
+mod candidate_death_evidence_tests {
+    use super::{
+        HandoffCandidate, HandoffCandidateHandle, HandoffCandidateProbe, handoff_child_death,
+        observe_candidate_death, probe_handoff_candidate,
+    };
+    use crate::ChildDeathEvidence as Death;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    /// One `wait(2)` status in the encoding `ExitStatus` carries, so the unit
+    /// tests below can state a signal death and a clean exit without a real corpse.
+    fn signalled(signal: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(signal)
+    }
+
+    /// Spin until `probe` agrees, or fail. Bounded HERE ONLY, so a broken probe
+    /// fails a test instead of hanging the suite; nothing in production polls this.
+    fn wait_for_probe(pid: libc::pid_t, want: HandoffCandidateProbe) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while probe_handoff_candidate(pid) != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kernel must reach {want:?} for {pid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// THE THREE ANSWERS THE PRE-KILL PROBE HAS TO SEPARATE, against real
+    /// processes, because the whole value of the probe is that it is the KERNEL
+    /// talking and not us.
+    ///
+    /// `Running` versus `Exited` is the load-bearing pair: it is what tells the
+    /// reject path whether a bare `SIGKILL` in the status it collects belongs to
+    /// the candidate or to the signal it is about to send.
+    #[test]
+    fn the_pre_kill_probe_separates_a_running_candidate_from_a_dead_one() {
+        let mut alive = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a live candidate");
+        let alive_pid = libc::pid_t::try_from(alive.id()).expect("pid fits");
+        assert_eq!(
+            probe_handoff_candidate(alive_pid),
+            HandoffCandidateProbe::Running,
+            "a child that has not exited has nothing to report yet"
+        );
+
+        let mut dead = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("spawn a candidate that exits at once");
+        let dead_pid = libc::pid_t::try_from(dead.id()).expect("pid fits");
+        wait_for_probe(dead_pid, HandoffCandidateProbe::Exited);
+
+        assert_eq!(
+            probe_handoff_candidate(1),
+            HandoffCandidateProbe::NotOurChild,
+            "launchd is nobody's child of ours, and ECHILD is evidence of nothing"
+        );
+
+        // WNOWAIT IS LOAD-BEARING, and this is the assertion that proves it: the
+        // probe ran against an exited child and the status is STILL collectable,
+        // which is exactly what `kill_and_reap_handoff_child` does next.
+        assert_eq!(
+            dead.wait().expect("the probe consumed nothing").code(),
+            Some(3),
+            "the probe must leave the candidate's own status intact"
+        );
+        alive.kill().expect("kill the live fixture");
+        alive.wait().expect("reap the live fixture");
+    }
+
+    /// WHICH STATUS BITS CAN POSSIBLY BE OURS, stated as the whole of the
+    /// attribution rule, because this process sends exactly one signal ever.
+    ///
+    /// THE BUG THIS PINS: an earlier draft made `died_before_we_signalled` a
+    /// precondition on reading the status AT ALL. That threw away bits that
+    /// provably could not be our SIGKILL — an exit code above all — so this tree's
+    /// commonest refusal (a deliberate `exit(0)`) degraded to `Unobserved`
+    /// whenever the parent lost a race it deliberately refuses to wait out, and
+    /// the refusal the classification most wants to catch became the one it could
+    /// least often see.
+    #[test]
+    fn only_a_bare_sigkill_needs_proof_that_the_candidate_died_first() {
+        assert_eq!(
+            handoff_child_death(false, Some(signalled(libc::SIGKILL))),
+            Death::Unobserved,
+            "the candidate was still alive when the channel closed, so this \
+             SIGKILL can only be ours"
+        );
+        assert_eq!(
+            handoff_child_death(true, Some(signalled(libc::SIGKILL))),
+            Death::Signalled {
+                signal: libc::SIGKILL
+            },
+            "…and once the candidate is proven to have died first, the same \
+             status IS its own death — the field case"
+        );
+        assert_eq!(
+            handoff_child_death(false, Some(std::process::ExitStatus::from_raw(0))),
+            Death::Exited { code: 0 },
+            "SIGKILL is uncatchable and never yields WIFEXITED, so an exit code \
+             cannot be ours however the race went — and `0` is the refusal"
+        );
+        assert_eq!(
+            handoff_child_death(false, Some(signalled(libc::SIGSEGV))),
+            Death::Signalled {
+                signal: libc::SIGSEGV
+            },
+            "nothing in this file sends SIGSEGV either: a fault is always the \
+             image's own"
+        );
+        assert_eq!(
+            handoff_child_death(true, None),
+            Death::Unobserved,
+            "no status is no evidence, however certain the death"
+        );
+    }
+
+    /// THE PRODUCTION ASSEMBLY, against a REAL child, through the same function
+    /// the reject path calls — probe, kill, reap, classify.
+    ///
+    /// Every other test here hands [`handoff_child_death`] three facts it made up.
+    /// This one makes the kernel produce them, which is the only way the ORDER of
+    /// the steps is under test at all: swap the pre-kill probe for anything that
+    /// answers "already dead" too eagerly and the `exit(0)` below turns into
+    /// `Signalled { SIGKILL }` — the machine — with every hand-built assertion in
+    /// this module still green.
+    #[test]
+    fn a_candidate_that_exits_on_its_own_is_read_as_its_own_exit_not_our_kill() {
+        // A child that ends itself with the tree's commonest refusal code, then a
+        // wait for the kernel to agree it is dead — which is the state the reject
+        // path finds a refusing successor in.
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a refusing candidate");
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        let pid = libc::pid_t::try_from(candidate.pid).expect("pid fits");
+        let mut handle = HandoffCandidateHandle::Forked(child);
+        wait_for_probe(pid, HandoffCandidateProbe::Exited);
+
+        let (warrant, death) = observe_candidate_death(
+            crate::UpdateHandoffOutcome::ChildDied,
+            candidate,
+            &mut handle,
+        );
+        assert_eq!(
+            warrant,
+            super::HandoffRollbackWarrant::Reaped,
+            "our own fork child is still reaped by the strongest authority"
+        );
+        assert_eq!(
+            death,
+            Death::Exited { code: 0 },
+            "THE REFUSAL: the candidate reached an `exit` instruction before this \
+             process signalled anything, and the SIGKILL sent afterwards must not \
+             overwrite that"
+        );
+    }
+
+    /// THE OTHER HALF OF THE SAME ASSEMBLY: a candidate somebody ELSE killed.
+    ///
+    /// This is the field shape — macOS jetsam reclaiming memory from a process the
+    /// machine was starving — reproduced with the one signal that is
+    /// indistinguishable from the reject path's own, so the pre-kill probe is the
+    /// only thing that can tell them apart.
+    #[test]
+    fn a_candidate_the_machine_killed_is_read_as_the_machine_s_kill() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a candidate to starve");
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        let pid = libc::pid_t::try_from(candidate.pid).expect("pid fits");
+        let mut handle = HandoffCandidateHandle::Forked(child);
+        // SOMEBODY ELSE'S SIGKILL, delivered before the reject path runs — exactly
+        // what a machine out of memory does, and exactly what the parent's own
+        // rejection would look like if the order of the steps were wrong.
+        // SAFETY: `pid` names our own unreaped child, so the number is pinned.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        wait_for_probe(pid, HandoffCandidateProbe::Exited);
+
+        let (_, death) = observe_candidate_death(
+            crate::UpdateHandoffOutcome::ChildDied,
+            candidate,
+            &mut handle,
+        );
+        assert_eq!(
+            death,
+            Death::Signalled {
+                signal: libc::SIGKILL
+            },
+            "THE FIELD CASE: the candidate was already dead when the reject path \
+             looked, so the SIGKILL in its status is the machine's and the lane \
+             must retry"
+        );
+    }
+
+    /// AND THE CANDIDATE THIS PROCESS ENDED ITSELF, which must claim nothing.
+    ///
+    /// A live candidate, rejected: the reject path SIGKILLs it and reaps a status
+    /// that says `SIGKILL` — its own signal, wearing the candidate's clothes.
+    /// Reading that as evidence would file every deliberate rejection as "the
+    /// machine reclaimed it" and hand a broken successor the transient lane's nine
+    /// attempts.
+    #[test]
+    fn a_kill_this_process_sends_is_never_read_as_the_candidate_s_own_death() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a live candidate");
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        let mut handle = HandoffCandidateHandle::Forked(child);
+
+        let (_, death) = observe_candidate_death(
+            crate::UpdateHandoffOutcome::ChildDied,
+            candidate,
+            &mut handle,
+        );
+        assert_eq!(
+            death,
+            Death::Unobserved,
+            "it was alive when we looked, so the SIGKILL we then sent is ours and \
+             claims nothing"
+        );
+    }
+
+    /// EVERY OTHER OUTCOME DESCRIBES A CANDIDATE THIS PROCESS DECIDED TO END, so
+    /// the assembly must not even ask — and must not spend a probe on it.
+    ///
+    /// The child here exits on its own with a code the classifier would happily
+    /// call STRUCTURAL; the outcome is what makes that irrelevant.
+    #[test]
+    fn a_non_child_died_outcome_gathers_no_evidence_at_all() {
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 74")
+            .spawn()
+            .expect("spawn a candidate that exits at once");
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        let pid = libc::pid_t::try_from(candidate.pid).expect("pid fits");
+        let mut handle = HandoffCandidateHandle::Forked(child);
+        wait_for_probe(pid, HandoffCandidateProbe::Exited);
+
+        let (warrant, death) = observe_candidate_death(
+            crate::UpdateHandoffOutcome::TimedOut,
+            candidate,
+            &mut handle,
+        );
+        assert_eq!(
+            warrant,
+            super::HandoffRollbackWarrant::Reaped,
+            "the reap is unconditional; only the evidence is not"
+        );
+        assert_eq!(
+            death,
+            Death::Unobserved,
+            "a candidate WE ended has no death of its own to describe, whatever \
+             its status happens to say"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod trial_launch_forgiveness_tests {
+    use super::forgives_the_counted_trial_launch;
+    use crate::ChildDeathEvidence as Death;
+
+    /// The shape of a real apply: a strictly newer authorized target.
+    const CURRENT: u64 = 1_787_699_398;
+    const TARGET: u64 = 1_787_699_399;
+
+    /// Forgive, or keep the count, for a real apply.
+    fn forgives(death: Death) -> bool {
+        forgives_the_counted_trial_launch(death, CURRENT, TARGET)
+    }
+
+    /// THE DEFECT THIS TABLE EXISTS TO STOP, stated before the table: a `ChildDied`
+    /// whose launch stays counted spends the SAME counter the boot sentinel
+    /// reverts on. Retry it more times than `MAX_BOOT_ATTEMPTS` and the automatic
+    /// lane reverts the bundle and marks the build failed — for bytes that never
+    /// failed. `ChildDied` used to be exempted from forgiveness wholesale, which
+    /// was safe only while it was also capped at two attempts; the moment it could
+    /// be retried six or nine times, the exemption became the bug.
+    ///
+    /// So forgiveness follows the SHAPE, and only the shape that converges under
+    /// `MAX_BOOT_ATTEMPTS` may keep its count.
+    #[test]
+    fn only_a_death_the_bytes_answer_for_keeps_its_counted_trial_launch() {
+        for (death, keeps_its_count, why) in [
+            (
+                Death::Exited { code: 0 },
+                true,
+                "the image reached an `exit` instruction: it ran, it decided, and \
+                 a launch that ended that way is the sentinel's to keep",
+            ),
+            (
+                Death::Exited { code: 74 },
+                true,
+                "same reading; the code is recorded, not judged",
+            ),
+            (
+                Death::Signalled {
+                    signal: libc::SIGSEGV,
+                },
+                true,
+                "a fault is the image executing itself into a wall",
+            ),
+            (
+                Death::Signalled {
+                    signal: libc::SIGKILL,
+                },
+                false,
+                "THE FIELD CASE: macOS jetsam reclaiming memory says nothing about \
+                 the bytes, so the launch goes back — otherwise three busy \
+                 afternoons revert a healthy build",
+            ),
+            (
+                Death::Unobserved,
+                false,
+                "and an unattributed death least of all: this is the majority \
+                 answer on the shipping lane, and it is retried six times",
+            ),
+        ] {
+            assert_eq!(forgives(death), !keeps_its_count, "{death:?}: {why}");
+        }
+    }
+
+    /// AND THE REAL-APPLY GUARD, which is part of the same decision: with no
+    /// strictly newer authorized target nothing armed a sentinel, so there is no
+    /// counted launch to give back and the answer is no whatever the death was.
+    #[test]
+    fn an_attempt_that_authorizes_no_newer_build_has_no_launch_to_forgive() {
+        for death in [
+            Death::Unobserved,
+            Death::Exited { code: 0 },
+            Death::Signalled {
+                signal: libc::SIGKILL,
+            },
+        ] {
+            assert!(
+                !forgives_the_counted_trial_launch(death, CURRENT, CURRENT),
+                "{death:?}: an installed activation is its own target, and the QA \
+                 seam authorizes none at all"
+            );
+            assert!(
+                !forgives_the_counted_trial_launch(death, CURRENT, CURRENT - 1),
+                "{death:?}: and an older target is never applied"
+            );
+        }
+    }
+
+    /// THE INVARIANT THAT MAKES THE TABLE ABOVE SAFE, checked against the real
+    /// constant rather than restated. Mirrors the compile-time assert beside
+    /// `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`, so a reader of this module sees WHY
+    /// only the structural shape may keep its count.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_one_shape_that_keeps_its_count_converges_before_the_sentinel_reverts() {
+        assert!(
+            u32::from(crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS)
+                < aterm_update::MAX_BOOT_ATTEMPTS,
+            "a shape whose launches stay counted must be finished with the \
+             artifact before the boot sentinel would revert it; {} vs {}",
+            crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS,
+            aterm_update::MAX_BOOT_ATTEMPTS
+        );
+        for shape in [
+            crate::app_native::PhysicalFailureShape::Transient,
+            crate::app_native::PhysicalFailureShape::Unexplained,
+        ] {
+            assert!(
+                u32::from(shape.lifetime_attempts()) >= aterm_update::MAX_BOOT_ATTEMPTS,
+                "{shape:?} is retried far enough to reach the revert threshold, \
+                 which is precisely why its deaths must forgive"
+            );
+        }
+    }
+}
+
+/// THE NON-PARENT WITNESS, against real processes reparented to launchd — the
+/// exact shape of a LaunchServices-launched successor, which is what the shipping
+/// macOS lane hands this file.
+#[cfg(all(test, target_os = "macos"))]
+mod candidate_exit_watch_tests {
+    use super::CandidateExitWatch;
+
+    /// Make a process that is NOT our child: fork a middle process, let IT fork the
+    /// orphan, then reap the middle so the orphan reparents to launchd. Returns the
+    /// orphan's pid, which `waitid` will answer `ECHILD` about forever after.
+    fn spawn_orphan(script: &str) -> u32 {
+        // THE ORPHAN'S STANDARD STREAMS GO TO `/dev/null`, not to the pipe this
+        // reads: a background job inherits the pipe's write end, so leaving it
+        // open would make `read_to_string` below wait for the ORPHAN to exit and
+        // hand back a pid that is already gone — which is a fixture that silently
+        // tests nothing.
+        let mut middle = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{{ {script} ; }} >/dev/null 2>&1 & echo $!"))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the middle process");
+        let mut pid = String::new();
+        {
+            use std::io::Read as _;
+            middle
+                .stdout
+                .as_mut()
+                .expect("piped")
+                .read_to_string(&mut pid)
+                .expect("the middle process reports the orphan's pid");
+        }
+        middle.wait().expect("reap the middle process");
+        pid.trim().parse().expect("a pid")
+    }
+
+    /// Wait for the watch to answer, or fail. Bounded HERE ONLY; the production
+    /// reads are both single zero-timeout polls.
+    fn wait_for_status(watch: &CandidateExitWatch) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = watch.exit_status() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an exited process must report through EVFILT_PROC"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// THE CAPABILITY THE SHIPPING LANE HAD NO SUBSTITUTE FOR: a full `wait(2)`
+    /// status for a process this one did not fork and may not reap.
+    ///
+    /// Both halves matter and they are the two verdicts that used to be
+    /// indistinguishable there — a candidate that CHOSE to stop, and a candidate
+    /// something else stopped.
+    #[test]
+    fn a_non_parent_can_read_an_orphan_s_own_exit_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let refused = spawn_orphan("sleep 0.3; exit 7");
+        let watch = CandidateExitWatch::watch(refused)
+            .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL");
+        let status = wait_for_status(&watch);
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "a clean exit reaches a watcher that is nobody's parent — which is \
+             what lets the launched lane tell a refusal from a kill at all"
+        );
+
+        let starved = spawn_orphan("sleep 30");
+        let watch = CandidateExitWatch::watch(starved)
+            .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL");
+        assert!(
+            watch.exit_status().is_none(),
+            "a LIVE candidate must report nothing: the pre-kill read is what \
+             makes a SIGKILL attributable, so a false positive there would call \
+             every rejection a machine kill"
+        );
+        let pid = libc::pid_t::try_from(starved).expect("pid fits");
+        // SAFETY: `kill` against a positive pid we just created and still see.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let status = wait_for_status(&watch);
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "and the machine's kill arrives with the same fidelity — this is the \
+             field shape the launched lane could previously observe nothing about"
+        );
+    }
+
+    /// THE SHIPPING macOS LANE, END TO END, WITH THE FIELD SHAPE.
+    ///
+    /// A LaunchServices successor is launchd's child: `waitid` answers `ECHILD`
+    /// forever, so before the witness above this assembly could observe NOTHING
+    /// here and every `ChildDied` on the lane the defect was reported on was
+    /// classified from inference. This drives the real
+    /// [`super::observe_candidate_death`] against a real orphan that a real
+    /// external `SIGKILL` ended — macOS jetsam reclaiming memory from a process
+    /// the machine was starving — and asserts the two things that have to follow:
+    /// the death is read as the MACHINE's, and the automatic lane RETRIES.
+    #[test]
+    fn a_starved_candidate_on_the_launched_lane_takes_the_retry_lane() {
+        use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
+        use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
+
+        let starved = spawn_orphan("sleep 30");
+        // Registered while it is alive, exactly as the rendezvous accept does.
+        let watch = CandidateExitWatch::watch(starved).expect("the candidate is alive");
+        let pid = libc::pid_t::try_from(starved).expect("pid fits");
+        // SOMEBODY ELSE'S SIGKILL — the field shape, and the one signal that is
+        // indistinguishable from this lane's own rejection.
+        // SAFETY: `pid` is a positive pid we created and can still see.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // SAFETY: signal 0 performs the existence check only.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "the orphan must die");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let candidate = HandoffCandidate::of_attested_peer(starved);
+        let mut handle = HandoffCandidateHandle::Launched(Some(watch));
+        let (_, death) = observe_candidate_death(
+            crate::UpdateHandoffOutcome::ChildDied,
+            candidate,
+            &mut handle,
+        );
+        assert_eq!(
+            death,
+            crate::ChildDeathEvidence::Signalled {
+                signal: libc::SIGKILL
+            },
+            "THE FIELD CASE ON THE SHIPPING LANE: a candidate this process never \
+             forked, ended by the machine, and the parent can finally say so"
+        );
+        assert_eq!(
+            Lane::classify(
+                crate::native_updater_service::ApplyMode::AutomaticPastGrace,
+                crate::UpdateHandoffOutcome::ChildDied,
+                death,
+                false
+            ),
+            Lane::Physical(Shape::Transient),
+            "…and it must reach the RETRY lane. `Structural` here is the defect: \
+             two of these converged the automatic lane on bytes that applied \
+             perfectly once the machine stopped being busy"
+        );
+    }
+
+    /// AND THE OTHER HALF OF THE SAME ASSEMBLY: an exit this process did NOT
+    /// witness before it acted, recovered after the candidate is provably gone.
+    ///
+    /// A launched candidate whose kernel birth stamp cannot be read is
+    /// `Unwitnessed`, and this lane deliberately signals such a candidate NOTHING
+    /// (a `-pid` group kill on an unpinned number can land on a stranger). So the
+    /// termination proof waits the candidate out and the witness is read AFTER it
+    /// — which is sound for an exit code, because `SIGKILL` is the only signal
+    /// this process sends and it never yields `WIFEXITED`.
+    ///
+    /// Deleting that second read leaves this `Unobserved`: six bounded retries for
+    /// a successor that stated in as many words that it had decided to stop.
+    #[test]
+    fn an_exit_the_parent_did_not_see_coming_is_still_recovered_after_the_wait() {
+        use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
+
+        let refusing = spawn_orphan("sleep 0.3; exit 0");
+        let watch = CandidateExitWatch::watch(refusing).expect("the candidate is alive");
+        // A bare pid carries no birth stamp, so nothing is signalled and the
+        // candidate reaches its own `exit` — the deterministic form of the race
+        // this read exists to widen.
+        let candidate = HandoffCandidate::from_bare_pid(refusing);
+        let mut handle = HandoffCandidateHandle::Launched(Some(watch));
+        assert!(
+            handle.witnessed_exit_status().is_none(),
+            "it is alive right now: the pre-kill read must claim nothing"
+        );
+        let (_, death) = observe_candidate_death(
+            crate::UpdateHandoffOutcome::ChildDied,
+            candidate,
+            &mut handle,
+        );
+        assert_eq!(
+            death,
+            crate::ChildDeathEvidence::Exited { code: 0 },
+            "the knote XNU queued inside `proc_exit` is still there once \
+             termination is proven, and an exit code can never be our SIGKILL"
+        );
+    }
+
+    /// THE FAILING DIRECTION, which must cost only evidence. A pid that names
+    /// nothing cannot be attached to, and the answer has to be `None` rather than
+    /// an error path the reject lane would have to handle.
+    #[test]
+    fn watching_a_candidate_that_is_already_gone_answers_none() {
+        let gone = spawn_orphan("exit 0");
+        let pid = libc::pid_t::try_from(gone).expect("pid fits");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // SAFETY: signal 0 performs the existence check only and delivers nothing.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the orphan must be reaped by launchd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            CandidateExitWatch::watch(gone).is_none(),
+            "ESRCH is not an error here: it is the launched lane losing its \
+             witness, which degrades to Unobserved and a bounded retry"
+        );
+        assert!(
+            CandidateExitWatch::watch(1).is_none(),
+            "and launchd itself is never a candidate"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
 mod handoff_process_group_tests {
     use super::{
         HandoffCandidate, HandoffCandidateHandle, HandoffCommitFacts, HandoffRejectDelivery,
@@ -5161,7 +6288,7 @@ mod handoff_process_group_tests {
         let candidate = HandoffCandidate::of_unreaped_child(&child);
         let mut handle = HandoffCandidateHandle::Forked(child);
         assert_eq!(
-            kill_and_reap_handoff_child(candidate, &mut handle),
+            kill_and_reap_handoff_child(candidate, &mut handle).warrant,
             HandoffRollbackWarrant::Reaped,
             "our own fork child must be licensed by the strongest authority"
         );
@@ -5264,7 +6391,7 @@ mod handoff_process_group_tests {
         let candidate = HandoffCandidate::of_unreaped_child(&child);
         let mut handle = HandoffCandidateHandle::Forked(child);
         assert_eq!(
-            kill_and_reap_handoff_child(candidate, &mut handle),
+            kill_and_reap_handoff_child(candidate, &mut handle).warrant,
             HandoffRollbackWarrant::Reaped,
             "an exited-but-unreaped fork child is still ours to wait"
         );
@@ -5603,6 +6730,9 @@ mod returned_handoff_completion_lane_tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    apply_failure: String::new(),
+                    apply_failure_build: 0,
+                    apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
                 },
@@ -5626,12 +6756,17 @@ mod returned_handoff_completion_lane_tests {
     /// The OUTCOME is a parameter because it is now load-bearing twice over — it
     /// carries the activity classification AND the physical shape — so a fixture
     /// that pinned it to one kind could only ever exercise one of the budgets.
+    ///
+    /// So is the DEATH EVIDENCE, for the same reason one level down: `ChildDied`
+    /// alone decides nothing now, and a fixture that pinned the evidence to
+    /// `Unobserved` could only ever exercise the unexplained budget.
     fn reduce_one_returned_failure(
         app: &mut App,
         mode: ApplyMode,
         build: u64,
         digest: &str,
         outcome: crate::UpdateHandoffOutcome,
+        child_death: crate::ChildDeathEvidence,
     ) {
         let ticket = ApplyAttemptTicket::for_test(build, TEST_COMMIT, digest);
         ticket.make_current_apply_for_test(&mut app.native_updater_service);
@@ -5669,6 +6804,7 @@ mod returned_handoff_completion_lane_tests {
                 reconcile: None,
                 detail: format!("handoff proof ended {outcome:?}"),
                 input_drain_spins: 0,
+                child_death,
             })
             .expect("a matching pending attempt is always reduced");
         assert_eq!(
@@ -5690,6 +6826,7 @@ mod returned_handoff_completion_lane_tests {
     /// that only drove one of them would pass with the mode dropped.
     #[test]
     fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         assert!(
@@ -5707,6 +6844,7 @@ mod returned_handoff_completion_lane_tests {
             build,
             &"ab".repeat(32),
             crate::UpdateHandoffOutcome::TimedOut,
+            crate::ChildDeathEvidence::Unobserved,
         );
         assert_eq!(
             app.auto_apply_physical_retry.map(|retry| retry.cycles),
@@ -5734,6 +6872,7 @@ mod returned_handoff_completion_lane_tests {
             build,
             &"ab".repeat(32),
             crate::UpdateHandoffOutcome::TimedOut,
+            crate::ChildDeathEvidence::Unobserved,
         );
         assert_eq!(
             app.auto_apply_physical_retry.map(|retry| retry.cycles),
@@ -5764,6 +6903,7 @@ mod returned_handoff_completion_lane_tests {
     /// automatic apply on a schedule nobody asked for.
     #[test]
     fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         let ticket = ApplyAttemptTicket::for_test(build, TEST_COMMIT, &"ab".repeat(32));
@@ -5801,6 +6941,7 @@ mod returned_handoff_completion_lane_tests {
             reconcile: None,
             detail: "activity revoked handoff during physical preparation".to_string(),
             input_drain_spins: 0,
+            child_death: crate::ChildDeathEvidence::Unobserved,
         });
         assert!(
             app.auto_overlap_retry.is_none(),
@@ -5827,6 +6968,7 @@ mod returned_handoff_completion_lane_tests {
     /// verdict.
     #[test]
     fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         let deadline = |app: &App| {
@@ -5845,6 +6987,7 @@ mod returned_handoff_completion_lane_tests {
                 build,
                 &"ab".repeat(32),
                 crate::UpdateHandoffOutcome::AdoptionMismatch,
+                crate::ChildDeathEvidence::Unobserved,
             );
         }
         assert_eq!(
@@ -5866,6 +7009,7 @@ mod returned_handoff_completion_lane_tests {
                 build,
                 &"cd".repeat(32),
                 crate::UpdateHandoffOutcome::TimedOut,
+                crate::ChildDeathEvidence::Unobserved,
             );
         }
         let transient = deadline(&app)
@@ -5880,10 +7024,17 @@ mod returned_handoff_completion_lane_tests {
 
     /// The classification itself, stated as a table so a future outcome variant
     /// has to be placed deliberately rather than falling into whichever arm the
-    /// compiler allows. Two axes, and both used to be lossy: WHO asked (the mode)
-    /// and WHAT happened (the worker's typed outcome).
+    /// compiler allows. Three axes now, and every one of them used to be lossy:
+    /// WHO asked (the mode), WHAT happened (the worker's typed outcome), and — for
+    /// the one outcome that is not itself a classification — WHAT THE WORKER SAW.
+    ///
+    /// The whole table is driven with `Unobserved` evidence, which is the honest
+    /// default for every outcome except `ChildDied` (no candidate died, or this
+    /// process is the one that ended it). `ChildDied` therefore lands in
+    /// `Unexplained` HERE, and its evidence-bearing arms are the table below.
     #[test]
     fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
+        use crate::ChildDeathEvidence as Death;
         use crate::UpdateHandoffOutcome as Outcome;
         use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
 
@@ -5893,7 +7044,9 @@ mod returned_handoff_completion_lane_tests {
                 Outcome::PreparationFailed,
                 Lane::Physical(Shape::Structural),
             ),
-            (Outcome::ChildDied, Lane::Physical(Shape::Structural)),
+            // NOT `Structural` any more, and not `Transient` either: with nothing
+            // observed, proof EOF is a failure whose KIND is unknown.
+            (Outcome::ChildDied, Lane::Physical(Shape::Unexplained)),
             (Outcome::TimedOut, Lane::Physical(Shape::Transient)),
             (Outcome::Rejected, Lane::Physical(Shape::Transient)),
             (Outcome::ActivityRevoked, Lane::ActivityRevoked),
@@ -5903,7 +7056,12 @@ mod returned_handoff_completion_lane_tests {
             (Outcome::ProofReady, Lane::Physical(Shape::Transient)),
         ] {
             assert_eq!(
-                Lane::classify(ApplyMode::AutomaticPastGrace, outcome, false),
+                Lane::classify(
+                    ApplyMode::AutomaticPastGrace,
+                    outcome,
+                    Death::Unobserved,
+                    false
+                ),
                 expected,
                 "{outcome:?} in the background lane"
             );
@@ -5911,7 +7069,7 @@ mod returned_handoff_completion_lane_tests {
             // shape decides how much an AUTOMATIC failure costs, never whether a
             // human's click may converge the background lane.
             assert_eq!(
-                Lane::classify(ApplyMode::Immediate, outcome, false),
+                Lane::classify(ApplyMode::Immediate, outcome, Death::Unobserved, false),
                 Lane::Manual,
                 "{outcome:?} from a person"
             );
@@ -5919,9 +7077,321 @@ mod returned_handoff_completion_lane_tests {
             // the activity observation and dominates the physical shape: a lossless
             // rollback the terminal caused is not evidence about the artifact.
             assert_eq!(
-                Lane::classify(ApplyMode::AutomaticPastGrace, outcome, true),
+                Lane::classify(
+                    ApplyMode::AutomaticPastGrace,
+                    outcome,
+                    Death::Unobserved,
+                    true
+                ),
                 Lane::ActivityRevoked,
                 "{outcome:?} with a main-thread activity revocation"
+            );
+        }
+    }
+
+    /// A STARVED CHILD RETRIES. The field defect, stated as the smallest thing
+    /// that has to be true.
+    ///
+    /// 2026-08-21, owner's desk: build 1787699398 staged, verified,
+    /// `relaunch_ready=true`, and twice `apply_failure = "overlap handoff failed
+    /// safely: handoff proof ended ChildDied"` — recorded while the machine carried
+    /// a load average of 140-160. When that load stopped, THE SAME BUILDS applied
+    /// with no intervention. The old classification charged `ChildDied` the
+    /// structural budget, so by the second failure the automatic lane was finished
+    /// with those bytes and the user was left on "staged, applies on relaunch" —
+    /// the exact state the seamless lane exists to delete — for a machine that was
+    /// merely busy.
+    ///
+    /// `SIGKILL` is what that looks like when the parent CAN see it (macOS jetsam
+    /// reclaiming memory; no process raises it on itself), so this drives the
+    /// structural budget's worth of them and asserts the lane is still coming back.
+    /// Then it spends the rest, because a lane that retried forever would be the
+    /// opposite defect.
+    #[test]
+    fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
+        use crate::app_native::{
+            PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS,
+        };
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let starved = crate::ChildDeathEvidence::Signalled {
+            signal: libc::SIGKILL,
+        };
+        let deadline = |app: &App| {
+            app.auto_apply_manual_only
+                .expect("an automatic physical failure always latches manual-only")
+                .retry_at
+        };
+
+        for _ in 0..STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS {
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"ab".repeat(32),
+                crate::UpdateHandoffOutcome::ChildDied,
+                starved,
+            );
+        }
+        let still_coming = deadline(&app)
+            .expect(
+                "THE REGRESSION: a machine that killed our candidate has said \
+                 nothing about the new bytes, so the automatic lane must still be \
+                 scheduled — `None` here is the converged latch the old \
+                 unconditional Structural classification minted after two of these",
+            )
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            still_coming > std::time::Duration::from_secs(1700)
+                && still_coming <= std::time::Duration::from_secs(1800),
+            "and it rides the epoch schedule's second rung (~1800s), which is what \
+             proves it took the machine-shaped lane rather than a shortened one: \
+             got {still_coming:?}"
+        );
+
+        // BOUNDED ALL THE SAME. Spend the rest of the transient lifetime and the
+        // answer becomes the deadline-less latch: nine failures across three
+        // independent epochs is evidence about the artifact however each one died.
+        for _ in STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS..PHYSICAL_FAILURE_LIFETIME_ATTEMPTS {
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"ab".repeat(32),
+                crate::UpdateHandoffOutcome::ChildDied,
+                starved,
+            );
+        }
+        assert_eq!(
+            deadline(&app),
+            None,
+            "a lane that retries a starved child forever is the opposite defect; \
+             the transient budget still ends"
+        );
+    }
+
+    /// A SUCCESSOR THAT REFUSES CONVERGES, on the structural budget, and the FIRST
+    /// failure is not what converges it.
+    ///
+    /// `Exited { code: 0 }` is the refusal this tree actually produces: a candidate
+    /// whose boot apply could not swap stays the OLD build, refuses the authorized
+    /// target identity, closes every adopted master and RETURNS from `main_entry`
+    /// — a clean exit that the parent sees only as proof EOF. Five field failures
+    /// in 2026-08 were exactly that. Reaching an `exit` instruction is what
+    /// separates it from the starved child above: a process that never ran decides
+    /// nothing.
+    #[test]
+    fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
+        use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let refused = crate::ChildDeathEvidence::Exited { code: 0 };
+        let deadline = |app: &App| {
+            app.auto_apply_manual_only
+                .expect("an automatic physical failure always latches manual-only")
+                .retry_at
+        };
+
+        reduce_one_returned_failure(
+            &mut app,
+            ApplyMode::AutomaticPastGrace,
+            build,
+            &"ab".repeat(32),
+            crate::UpdateHandoffOutcome::ChildDied,
+            refused,
+        );
+        let confirming = deadline(&app)
+            .expect("ONE unlucky handoff never converges a lane, whatever it said")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            confirming > std::time::Duration::from_secs(500)
+                && confirming <= std::time::Duration::from_secs(600),
+            "the confirming retry is the schedule's first rung (~600s), got \
+             {confirming:?}"
+        );
+
+        for _ in 1..STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS {
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"ab".repeat(32),
+                crate::UpdateHandoffOutcome::ChildDied,
+                refused,
+            );
+        }
+        assert_eq!(
+            deadline(&app),
+            None,
+            "twice told that this successor will not become our successor is not a \
+             busy afternoon: the lane is done with these bytes, and `retry_at: \
+             None` is what `arm` reads as SuppressManualOnly"
+        );
+    }
+
+    /// AND THE ONE IN THE MIDDLE — a death nobody witnessed, which is where a
+    /// `ChildDied` lands whenever the evidence runs out
+    /// ([`crate::ChildDeathEvidence::Unobserved`]). Reachable on both lanes and
+    /// still the commonest answer on the shipping macOS one: a successor that
+    /// refuses closes the readiness channel and keeps running, so the pre-kill
+    /// look often finds it alive and the status that comes back afterwards is this
+    /// process's own SIGKILL, which claims nothing.
+    ///
+    /// That verdict must be weaker than both of the ones above: it converges, but
+    /// only after a genuinely independent sample of the machine. The stand-down at
+    /// the end of the first epoch is that sample, and it is what the field case
+    /// needed — the retry that finally worked came HOURS later, not at the 600 s
+    /// and 1800 s rungs that re-ran the same pathological hour.
+    #[test]
+    fn an_unexplained_child_died_gets_a_second_epoch_and_then_stops() {
+        use crate::app_native::{
+            PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, PHYSICAL_FAILURES_PER_EPOCH,
+            UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS,
+        };
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let deadline = |app: &App| {
+            app.auto_apply_manual_only
+                .expect("an automatic physical failure always latches manual-only")
+                .retry_at
+        };
+        let spend = |app: &mut App, times: u8| {
+            for _ in 0..times {
+                reduce_one_returned_failure(
+                    app,
+                    ApplyMode::AutomaticPastGrace,
+                    build,
+                    &"ab".repeat(32),
+                    crate::UpdateHandoffOutcome::ChildDied,
+                    crate::ChildDeathEvidence::Unobserved,
+                );
+            }
+        };
+
+        spend(&mut app, PHYSICAL_FAILURES_PER_EPOCH);
+        let stand_down = deadline(&app)
+            .expect("the first epoch ends in a stand-down, not in convergence")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            stand_down > std::time::Duration::from_secs(5 * 60 * 60),
+            "and the stand-down is hours, because re-sampling the SAME loaded hour \
+             is what the in-epoch rungs already did: got {stand_down:?}"
+        );
+
+        spend(
+            &mut app,
+            UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS - PHYSICAL_FAILURES_PER_EPOCH,
+        );
+        assert_eq!(
+            deadline(&app),
+            None,
+            "two independent samples of the machine is where 'the machine was \
+             having a bad hour' stops being a credible explanation — and \
+             {UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS} attempts is strictly under \
+             the {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS} a named transient failure \
+             gets, which the compile-time assert beside the constants pins"
+        );
+    }
+
+    /// THE EVIDENCE AXIS, as its own total table: every `ChildDeathEvidence` a
+    /// worker can produce, and the shape it earns.
+    ///
+    /// THE FINDING: `ChildDied` was `Structural` unconditionally, on the argument
+    /// that a candidate which exits before writing its readiness proof "is the
+    /// successor image refusing to boot as a successor … the strongest statement
+    /// about the new bytes available at this seam". A child starved of CPU exits
+    /// before writing a readiness proof too — it never ran — and the owner's desk
+    /// produced exactly that on 2026-08-21: two `ChildDied` applies under a load
+    /// average of 140-160, then the SAME builds applying with no intervention once
+    /// the load stopped. The verdict was about the machine and was charged to the
+    /// bytes.
+    ///
+    /// Every arm below is a fact the worker OBSERVED, never a duration threshold
+    /// and never a message string.
+    #[test]
+    fn a_dead_candidate_is_classified_by_what_the_worker_saw() {
+        use crate::ChildDeathEvidence as Death;
+        use crate::UpdateHandoffOutcome as Outcome;
+        use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
+
+        for (death, expected, why) in [
+            (
+                Death::Unobserved,
+                Shape::Unexplained,
+                "no witnessed status, or one that could only have been our own \
+                 SIGKILL — and a verdict nobody witnessed must not be filed as \
+                 one somebody did",
+            ),
+            (
+                Death::Exited { code: 0 },
+                Shape::Structural,
+                "a clean exit is this tree's COMMONEST refusal — `main_entry` \
+                 returns without a window when the overlap authority is \
+                 incomplete — and reaching an exit instruction at all is proof \
+                 the image ran",
+            ),
+            (
+                Death::Exited { code: 74 },
+                Shape::Structural,
+                "the fail-stop exit a candidate takes when it can never become \
+                 authoritative; same reading, which is why the CODE is recorded \
+                 and not judged",
+            ),
+            (
+                Death::Signalled {
+                    signal: libc::SIGSEGV,
+                },
+                Shape::Structural,
+                "a fault is the image executing itself into a wall, which is the \
+                 bytes",
+            ),
+            (
+                Death::Signalled {
+                    signal: libc::SIGABRT,
+                },
+                Shape::Structural,
+                "so is an abort",
+            ),
+            (
+                Death::Signalled {
+                    signal: libc::SIGKILL,
+                },
+                Shape::Transient,
+                "THE FIELD CASE: no process raises SIGKILL on itself, and macOS \
+                 jetsam sends it to reclaim memory. The next attempt on a calmer \
+                 machine is the one that wins",
+            ),
+            (
+                Death::Signalled {
+                    signal: libc::SIGTERM,
+                },
+                Shape::Transient,
+                "and any other signal from outside the image is equally not a \
+                 statement about the bytes",
+            ),
+        ] {
+            assert_eq!(
+                Lane::classify(
+                    ApplyMode::AutomaticPastGrace,
+                    Outcome::ChildDied,
+                    death,
+                    false
+                ),
+                Lane::Physical(expected),
+                "{death:?}: {why}"
+            );
+            // THE EVIDENCE IS READ FOR `ChildDied` AND FOR NOTHING ELSE. Every
+            // other outcome describes a candidate THIS process ended, so its exit
+            // status is our SIGKILL and says nothing about the artifact.
+            assert_eq!(
+                Lane::classify(
+                    ApplyMode::AutomaticPastGrace,
+                    Outcome::TimedOut,
+                    death,
+                    false
+                ),
+                Lane::Physical(Shape::Transient),
+                "{death:?} must not move a TimedOut, whose candidate we killed"
             );
         }
     }

@@ -74,8 +74,7 @@ pub(crate) const SHADOW_MARGIN: f32 = 12.0;
 /// beside the loop has always claimed these stay inside [`SHADOW_MARGIN`]; until this
 /// was a table, nothing checked it, and a fourth layer or a bigger spread would have
 /// been cropped by the compositor's paint region with no test to say so.
-const SHADOW_LAYERS: [(f32, f32, u8); 3] =
-    [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
+const SHADOW_LAYERS: [(f32, f32, u8); 3] = [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
 
 /// The alpha below which the card stops being a click target. The exit tail runs the
 /// card down to nothing, and an all-but-invisible thing that swallows clicks — or worse,
@@ -109,7 +108,21 @@ pub(crate) enum NoticeKind {
     /// created and the undo (`connections::first_use_notice_text`). Not
     /// clickable; the authored text already carries the caption grammar.
     SessionConnection { text: String },
+    /// The FIRST-LAUNCH ADMIN STEP (`docs/TOOLCHAIN-PACKAGE-MANAGER.md` §17.8): one or
+    /// more index programs read `needs admin — run: aterm pkg install <name>` (Apple's
+    /// Command Line Tools, Homebrew) and the unattended pass can never supply the
+    /// password. The card names what waits and who installs it, and carries TWO
+    /// controls — Install (the `--elevate=osascript` door, macOS's own dialog) and
+    /// Not now (a dismissal marker for this exact set). `names` is the door order.
+    /// Held for [`ADMIN_STEP_TTL`], not the transient [`TTL`]; a body click dismisses
+    /// it for now without recording anything.
+    AdminStep { names: Vec<String> },
 }
+
+/// How long the admin card waits before it lifts away on its own — an unanswered card
+/// is re-raised by the next pass anyway (only "Not now" records a dismissal), so this
+/// is a ceiling on how long it may float over the terminal, not the offer's lifetime.
+pub(crate) const ADMIN_STEP_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// A single transient, self-expiring notice.
 pub(crate) struct TransientNotice {
@@ -159,11 +172,7 @@ impl TransientNotice {
     /// and none at all over the ready deadline's ceiling, and its last 800 ms
     /// are the fade ramp — so the card explaining the freeze would visibly
     /// dissolve part-way through the freeze it is explaining.
-    pub(crate) fn update_status_for(
-        text: impl Into<String>,
-        ttl: Duration,
-        now: Instant,
-    ) -> Self {
+    pub(crate) fn update_status_for(text: impl Into<String>, ttl: Duration, now: Instant) -> Self {
         Self {
             kind: NoticeKind::UpdateStatus { text: text.into() },
             spawned: now,
@@ -215,6 +224,32 @@ impl TransientNotice {
             spawned: now,
             anchor: None,
             ttl: TTL,
+        }
+    }
+
+    /// The first-launch admin card for `names` (door order, `clt` before `brew`).
+    /// A STILL card: `animates` is false whatever the sparkle setting, so the hold
+    /// costs exactly one wake (the fade boundary, [`ADMIN_STEP_TTL`] − [`FADE`] away)
+    /// and a stable fingerprint — FL-1 holds while it waits.
+    pub(crate) fn admin_step(names: Vec<String>, now: Instant) -> Self {
+        Self {
+            kind: NoticeKind::AdminStep { names },
+            spawned: now,
+            anchor: None,
+            ttl: ADMIN_STEP_TTL,
+        }
+    }
+
+    /// Whether this is the admin card (the two-control variant).
+    pub(crate) fn is_admin_step(&self) -> bool {
+        matches!(self.kind, NoticeKind::AdminStep { .. })
+    }
+
+    /// The admin card's programs, in door order; `None` for every other kind.
+    pub(crate) fn admin_step_names(&self) -> Option<&[String]> {
+        match &self.kind {
+            NoticeKind::AdminStep { names } => Some(names.as_slice()),
+            _ => None,
         }
     }
 
@@ -354,6 +389,10 @@ impl TransientNotice {
                 4u8.hash(&mut h);
                 text.hash(&mut h);
             }
+            NoticeKind::AdminStep { names } => {
+                5u8.hash(&mut h);
+                names.hash(&mut h);
+            }
         }
         // Quantize BOTH animated quantities so a moving card re-rasterizes on each step
         // while a held one hashes stable. 48 steps over a ≤0.8s ramp is finer than the
@@ -420,6 +459,9 @@ impl TransientNotice {
             // Authored in `connections::first_use_notice_text`, already in the
             // `"<marker> <title> — <detail>"` grammar this module documents.
             NoticeKind::SessionConnection { text } => text.clone(),
+            // Authored beside the rows it describes (`packages_screen::admin_step_caption`):
+            // the vendor and the admin prompt, named honestly, in the same grammar.
+            NoticeKind::AdminStep { names } => crate::packages_screen::admin_step_caption(names),
         }
     }
 }
@@ -543,6 +585,9 @@ impl Tone {
             // The first-use disclosure informs (authority + undo); it asks for
             // no press, so it must not wear the actionable badge.
             NoticeKind::SessionConnection { .. } => Self::Quiet,
+            // The admin card asks for a press (two of them, painted as controls), so
+            // it wears the actionable badge — the same accent its Install capsule uses.
+            NoticeKind::AdminStep { .. } => Self::Action,
         }
     }
 
@@ -652,9 +697,24 @@ struct Pill {
     title_x: f32,
     detail: Option<(String, f32)>,
     chevron_cx: Option<f32>,
+    /// The admin card's two controls; `None` on every other kind.
+    buttons: Option<AdminButtons>,
     baseline: f32,
     tone: Tone,
 }
+
+/// The admin card's Install / Not now capsules — `(x, w)` each on the trailing edge,
+/// sharing one `y`/`h`. Laid out and hit-tested from the same numbers ([`notice_hit`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AdminButtons {
+    pub(crate) install: (f32, f32),
+    pub(crate) not_now: (f32, f32),
+    pub(crate) y: f32,
+    pub(crate) h: f32,
+}
+
+const INSTALL_LABEL: &str = "Install";
+const NOT_NOW_LABEL: &str = "Not now";
 
 /// Lay one notice out.
 ///
@@ -708,13 +768,35 @@ fn layout(
     } else {
         (0.0, 0.0)
     };
+    // The admin card's two controls ride the trailing edge in place of the chevron:
+    // "Install" as a filled accent capsule, "Not now" as a quiet outlined one. They are
+    // never dropped by the fit order below — a card whose only exits have been elided
+    // is a trap — so the sentence gives way first.
+    let admin = n.is_admin_step();
+    let btn_pad = s * 0.55;
+    let btn_gap = s * 0.40;
+    let install_w = if admin {
+        ui_text_width_for(TextFace::UiBold, INSTALL_LABEL, s) + 2.0 * btn_pad
+    } else {
+        0.0
+    };
+    let not_now_w = if admin {
+        ui_text_width_for(TextFace::Ui, NOT_NOW_LABEL, s) + 2.0 * btn_pad
+    } else {
+        0.0
+    };
+    let buttons_w = if admin {
+        s * 1.15 + install_w + btn_gap + not_now_w
+    } else {
+        0.0
+    };
 
     let h = (2.0 * badge_r).max(s) + s * 1.10;
     let radius = (h * 0.5).min(16.0);
     // The card may not exceed the tray minus a cell of air on each side.
     let max_w = (tray_w - 2.0 * cw).max(0.0);
     let lead = pad_x + 2.0 * badge_r + gap_badge;
-    let trail = chev_gap + chev_w + pad_x;
+    let trail = chev_gap + chev_w + buttons_w + pad_x;
 
     let title_w = |t: &str| ui_text_width_for(TextFace::UiBold, t, s);
     let detail_w = |t: &str| ui_text_width_for(TextFace::Ui, t, s);
@@ -767,6 +849,17 @@ fn layout(
     let detail_x = title_x + title_w(&title) + gap_detail;
     let detail = detail.map(|d| (d, detail_x));
     let chevron_cx = n.is_update_ready().then_some(x + w - pad_x - chev_w * 0.5);
+    let buttons = (admin && w > 0.0).then(|| {
+        let bh = s * 1.55;
+        let not_now_x = x + w - pad_x - not_now_w;
+        let install_x = not_now_x - btn_gap - install_w;
+        AdminButtons {
+            install: (install_x, install_w),
+            not_now: (not_now_x, not_now_w),
+            y: y + (h - bh) * 0.5,
+            h: bh,
+        }
+    });
 
     Pill {
         x,
@@ -784,9 +877,50 @@ fn layout(
         title_x,
         detail,
         chevron_cx,
+        buttons,
         baseline: row_baseline(y, h, s),
         tone,
     }
+}
+
+/// What a press at `(px, py)` (tray px, the painter's coordinates) lands on: one of the
+/// admin card's two controls, the card body, or nothing. The SAME `layout` the painter
+/// uses, so the targets are the pixels. The controls are tested across the card's full
+/// height — a 1.55 em capsule on a 2.5 em card would otherwise miss a press a few px
+/// above its rim, on the one card whose presses matter.
+pub(crate) fn notice_hit(
+    n: &TransientNotice,
+    g: &SettingsGeom,
+    now: Instant,
+    motion: f32,
+    clear_rows: f32,
+    px: f32,
+    py: f32,
+) -> Option<NoticeHit> {
+    let p = layout(n, g, now, motion, clear_rows);
+    if p.w <= 0.0 || px < p.x || px >= p.x + p.w || py < p.y || py >= p.y + p.h {
+        return None;
+    }
+    if let Some(b) = p.buttons.as_ref() {
+        if px >= b.install.0 && px < b.install.0 + b.install.1 {
+            return Some(NoticeHit::Install);
+        }
+        if px >= b.not_now.0 && px < b.not_now.0 + b.not_now.1 {
+            return Some(NoticeHit::NotNow);
+        }
+    }
+    Some(NoticeHit::Body)
+}
+
+/// Where a press on a notice card landed (see [`notice_hit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoticeHit {
+    /// The caption or the badge — dismiss (and, on "Update ready", apply).
+    Body,
+    /// The admin card's Install capsule.
+    Install,
+    /// The admin card's Not now capsule.
+    NotNow,
 }
 
 /// `text` shortened with a trailing ellipsis until its UI-face measure fits `max_w`.
@@ -811,9 +945,11 @@ fn elided(text: &str, max_w: f32, px: f32) -> String {
     String::new()
 }
 
-/// The card rect `(x, y, w, h)` in tray px — where [`notice_tray`] draws it and where a
-/// click on an `UpdateReady` notice is tested. `now`/`motion` are part of the geometry
-/// because the card MOVES: the hit region must track the pixels through the slide.
+/// The card rect `(x, y, w, h)` in tray px — where [`notice_tray`] draws it. The click
+/// path resolves presses through [`notice_hit`] (the same `layout`, plus the admin
+/// card's controls); this rect is what the geometry tests pin. `now`/`motion` are part
+/// of the geometry because the card MOVES: the region tracks the pixels through the slide.
+#[cfg(test)]
 pub(crate) fn notice_rect(
     n: &TransientNotice,
     g: &SettingsGeom,
@@ -1129,6 +1265,52 @@ pub(crate) fn notice_tray(
             color,
         });
     }
+    // The admin card's controls: Install as a filled accent capsule with contrast-picked
+    // ink, Not now as a hairline-outlined quiet one. Same accent the badge wears, so the
+    // card reads as one thing asking for one decision.
+    if let Some(b) = p.buttons.as_ref() {
+        let s = p.size.get();
+        let fill = legible_on(r.accent, r.elevated);
+        let capsule_r = (b.h * 0.5).min(12.0);
+        prims.push(DrawPrim::Panel {
+            x: b.install.0,
+            y: b.y,
+            w: b.install.1,
+            h: b.h,
+            radius: capsule_r,
+            fill: rgba(fill, sa(0xFF)),
+            blur: false,
+        });
+        let install_tw = ui_text_width_for(TextFace::UiBold, INSTALL_LABEL, s);
+        prims.push(text_prim(
+            b.install.0 + (b.install.1 - install_tw) * 0.5,
+            p.baseline,
+            INSTALL_LABEL.to_string(),
+            p.size,
+            TextWeight::Bold,
+            TextFace::UiBold,
+            rgba(on_fill(fill), sa(0xFF)),
+        ));
+        prims.push(DrawPrim::Stroke {
+            x: b.not_now.0,
+            y: b.y,
+            w: b.not_now.1,
+            h: b.h,
+            radius: capsule_r,
+            width: 1.0,
+            color: rgba(r.separator, sa(0xCC)),
+        });
+        let not_now_tw = ui_text_width_for(TextFace::Ui, NOT_NOW_LABEL, s);
+        prims.push(text_prim(
+            b.not_now.0 + (b.not_now.1 - not_now_tw) * 0.5,
+            p.baseline,
+            NOT_NOW_LABEL.to_string(),
+            p.size,
+            TextWeight::Regular,
+            TextFace::Ui,
+            rgba(r.text_secondary, sa(0xFF)),
+        ));
+    }
 
     TrayInput {
         prims,
@@ -1138,6 +1320,134 @@ pub(crate) fn notice_tray(
 
 #[cfg(test)]
 mod tests {
+
+    /// The first-launch admin card (§17.8): it names the vendors and the password
+    /// dialog honestly; it HOLDS STILL — one wake at the fade boundary, never a
+    /// per-frame cadence, sparkles on or off, and a fingerprint that does not move
+    /// through the hold (FL-1: a settled window with the card up wakes for nothing);
+    /// under reduced motion (amplitude 0) its rect is the rest rect from the first
+    /// instant; and its two controls hit-test from the same layout the painter draws.
+    #[test]
+    fn the_admin_step_card_holds_still_and_its_two_controls_resolve() {
+        use super::{
+            ADMIN_STEP_TTL, FADE, FRAME, NoticeHit, SettingsGeom, TransientNotice, layout,
+            notice_hit, notice_rect,
+        };
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let names = vec!["clt".to_string(), "brew".to_string()];
+        let n = TransientNotice::admin_step(names.clone(), t0);
+        assert!(n.is_admin_step());
+        assert!(!n.is_update_ready());
+        assert_eq!(n.admin_step_names(), Some(names.as_slice()));
+        let text = n.text();
+        assert!(
+            text.starts_with("\u{2699} Admin step waiting \u{2014} "),
+            "{text}"
+        );
+        assert!(text.contains("Apple Command Line Tools"), "{text}");
+        assert!(text.contains("Homebrew"), "{text}");
+        assert!(text.contains("then"), "door order is spelled: {text}");
+        assert!(text.contains("password dialog"), "{text}");
+        let parts = super::caption_parts(&text);
+        assert_eq!(parts.marker.as_deref(), Some("\u{2699}"));
+        assert_eq!(parts.title, "Admin step waiting");
+        assert!(parts.detail.is_some());
+
+        // THE HOLD WAKES NOTHING: the deadline is the single fade boundary, not
+        // `now + FRAME`, whatever the sparkle setting says; the fingerprint is stable
+        // two minutes apart; alpha is 1 and nothing has expired.
+        let hold = t0 + Duration::from_secs(30);
+        let fade_start = t0 + (ADMIN_STEP_TTL - FADE);
+        for sparkling in [false, true] {
+            assert!(!n.animates(sparkling));
+            assert_eq!(n.deadline(hold, sparkling), fade_start);
+            assert_ne!(n.deadline(hold, sparkling), hold + FRAME);
+            assert_eq!(
+                n.fingerprint(hold, sparkling),
+                n.fingerprint(hold + Duration::from_secs(120), sparkling)
+            );
+        }
+        assert_eq!(n.alpha(hold), 1.0);
+        assert!(!n.is_expired(hold));
+        assert!(n.is_expired(t0 + ADMIN_STEP_TTL));
+
+        // REDUCED MOTION (amplitude 0): the card never slides — the rect at spawn IS
+        // the rest rect. With motion, it drops in from above and then rests there.
+        let g = SettingsGeom {
+            cw: 8.0,
+            ch: 16.0,
+            font_px: 14.0,
+            cols: 200,
+            panel_rows: 0,
+        };
+        let at_spawn_still = notice_rect(&n, &g, t0, 0.0, 1.0);
+        let at_hold = notice_rect(&n, &g, hold, 0.0, 1.0);
+        assert_eq!(at_spawn_still, at_hold);
+        let at_spawn_moving = notice_rect(&n, &g, t0, 1.0, 1.0);
+        assert!(
+            at_spawn_moving.1 < at_hold.1,
+            "the entrance comes from above"
+        );
+        assert_eq!(notice_rect(&n, &g, hold, 1.0, 1.0), at_hold);
+
+        // THE CONTROLS: laid out inside the card, in order, and resolved by the hit
+        // test from the same numbers; the body is the body; outside is nothing.
+        let (x, y, w, h) = at_hold;
+        assert!(w > 0.0, "a 200-column window fits the card");
+        let cy = y + h * 0.5;
+        let p = layout(&n, &g, hold, 0.0, 1.0);
+        let b = p.buttons.expect("the admin card lays out its two controls");
+        assert!(b.install.0 > p.title_x, "controls trail the caption");
+        assert!(b.install.0 + b.install.1 <= b.not_now.0);
+        assert!(b.not_now.0 + b.not_now.1 <= x + w);
+        assert!(b.y >= y && b.y + b.h <= y + h);
+        let hit = |px: f32| notice_hit(&n, &g, hold, 0.0, 1.0, px, cy);
+        assert_eq!(hit(x - 1.0), None);
+        assert_eq!(hit(x + w + 1.0), None);
+        assert_eq!(hit(p.title_x + 2.0), Some(NoticeHit::Body));
+        assert_eq!(
+            hit(b.install.0 + b.install.1 * 0.5),
+            Some(NoticeHit::Install)
+        );
+        assert_eq!(
+            hit(b.not_now.0 + b.not_now.1 * 0.5),
+            Some(NoticeHit::NotNow)
+        );
+        assert_eq!(
+            notice_hit(&n, &g, hold, 0.0, 1.0, b.install.0 + 1.0, y - 1.0),
+            None,
+            "above the card is not a press on Install"
+        );
+
+        // A plain status card lays out NO controls and is all body.
+        let plain = TransientNotice::update_status("\u{21e3} Installing", t0);
+        assert!(!plain.is_admin_step());
+        assert_eq!(plain.admin_step_names(), None);
+        assert!(layout(&plain, &g, hold, 0.0, 1.0).buttons.is_none());
+        let (qx, qy, qw, qh) = notice_rect(&plain, &g, hold, 0.0, 1.0);
+        assert_eq!(
+            notice_hit(&plain, &g, hold, 0.0, 1.0, qx + qw - 2.0, qy + qh * 0.5),
+            Some(NoticeHit::Body)
+        );
+
+        // The controls survive the fit order: a narrow window drops the detail and
+        // elides the title before it touches Install / Not now.
+        let narrow = SettingsGeom {
+            cw: 8.0,
+            ch: 16.0,
+            font_px: 14.0,
+            cols: 40,
+            panel_rows: 0,
+        };
+        let np = layout(&n, &narrow, hold, 0.0, 1.0);
+        if np.w > 0.0 {
+            let nb = np.buttons.expect("controls stay on a narrow card");
+            assert!(nb.not_now.0 + nb.not_now.1 <= np.x + np.w);
+            assert!(np.detail.is_none(), "the qualifier goes first");
+        }
+    }
 
     /// The chevron is the clickable notice's ONLY affordance, and it lands on the
     /// card's `elevated` surface, not on the page `text_tertiary` is conditioned

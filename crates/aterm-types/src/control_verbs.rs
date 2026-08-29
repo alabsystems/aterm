@@ -3,11 +3,13 @@
 
 //! The control-protocol VERB TABLE: the single, typed source of truth for every
 //! control-socket verb. One [`VerbSpec`] row per verb carries its op-class,
-//! reply framing, targeting class, and help synopsis. Everything else projects
-//! from here: the server maps `op` to its auth `Op` and generates its help
-//! catalog from `help`; the aterm-ctl client parses replies by `framing`. So the
-//! server (which produces a reply) and the client (which parses it) — plus the
-//! catalog and the router — can never disagree. Lives in `aterm-types` because
+//! reply framing, targeting class, and help text — a first-sentence `summary`
+//! plus the `detail` that completes it. Everything else projects from here: the
+//! server maps `op` to its auth `Op` and generates BOTH help catalogs from the
+//! two fields (the short one from the summaries, the full one from
+//! [`VerbSpec::help_line`]); the aterm-ctl client parses replies by `framing`.
+//! So the server (which produces a reply) and the client (which parses it) —
+//! plus both catalogs and the router — can never disagree. Lives in `aterm-types` because
 //! both binaries depend on it (alongside the `control_socket` shared-protocol
 //! module).
 
@@ -97,8 +99,94 @@ pub struct VerbSpec {
     /// The connection-scope gate (orthogonal to `op`): `Scoped` for the common case,
     /// `AnyScopeMeta` / `OwnerOnly` for the exceptions the dispatch used to hardcode.
     pub access: Access,
-    /// One-line catalog synopsis (the server's help catalog is generated from these).
-    pub help: &'static str,
+    /// The FIRST SENTENCE of the verb's help, at most [`SUMMARY_MAX_CHARS`] chars:
+    /// the whole of this verb's row in the SHORT catalog (a bare `help`) and the head
+    /// of its full entry. Short because the catalog an agent reads to FIND a verb must
+    /// stay under [`SHORT_CATALOG_MAX_BYTES`] — with one string per verb it cost the
+    /// whole of the `image`/`video`/`metrics` detail to find `text`.
+    pub summary: &'static str,
+    /// The rest of the entry — everything the summary does not say — or `""`. Shown
+    /// by `help <verb>` and in the full catalog only. [`VerbSpec::help_line`] re-joins
+    /// it after the summary with one space, so a full row whose split was a pure cut
+    /// is the one-string help it came from, unchanged.
+    pub detail: &'static str,
+}
+
+/// The cap on a [`VerbSpec::summary`] as a literal: the `help`/`verbs` rows quote it
+/// through `concat!`, so the number an agent reads in the catalog and the number the
+/// summary-length test enforces are one token that cannot drift apart.
+macro_rules! summary_max_chars {
+    () => {
+        96
+    };
+}
+/// The cap on a [`VerbSpec::summary`]: one readable row after the
+/// [`CATALOG_TEXT_COLUMN`] gutter on a 125-column line.
+pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
+/// The budget for the short catalog's rows put together (every [`catalog_lines`] row,
+/// `\n`-terminated): what discovering a verb costs, whatever the table grows to.
+pub const SHORT_CATALOG_MAX_BYTES: usize = 8192;
+/// The column a catalog row's text starts in: a 28-wide name plus one space.
+pub const CATALOG_TEXT_COLUMN: usize = 29;
+/// The width a `help <verb>` entry is wrapped to.
+pub const ENTRY_WRAP_COLUMNS: usize = 100;
+
+impl VerbSpec {
+    /// The verb's FULL help text: `summary`, then `detail` after one space when there
+    /// is any. Where the split was a pure cut this is exactly the one-string help the
+    /// two fields came from, so the full catalog reads as before the split (the golden
+    /// test pins every row, the six reworded ones included).
+    #[must_use]
+    pub fn help_line(&self) -> String {
+        if self.detail.is_empty() {
+            self.summary.to_string()
+        } else {
+            format!("{} {}", self.summary, self.detail)
+        }
+    }
+
+    /// The verb's full entry as `help <verb>` prints it: `<name padded> <text…>`, the
+    /// text greedily word-wrapped at [`ENTRY_WRAP_COLUMNS`] with every continuation
+    /// line indented to [`CATALOG_TEXT_COLUMN`], so a 900-char entry reads as one
+    /// aligned paragraph instead of one line. Deterministic and lossless: it breaks
+    /// only at single spaces (the table carries no run of spaces), so re-joining the
+    /// lines' text with spaces reproduces [`Self::help_line`] exactly; a word longer
+    /// than the text width stands alone on its own line, never split, never dropped.
+    #[must_use]
+    // Skip: iterator absent std bodies.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn entry_lines(&self) -> Vec<String> {
+        let text_width = ENTRY_WRAP_COLUMNS - CATALOG_TEXT_COLUMN;
+        let mut chunks: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_chars = 0usize;
+        for word in self.help_line().split(' ') {
+            let w = word.chars().count();
+            if !cur.is_empty() && cur_chars + 1 + w > text_width {
+                chunks.push(std::mem::take(&mut cur));
+                cur_chars = 0;
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_chars += 1;
+            }
+            cur.push_str(word);
+            cur_chars += w;
+        }
+        chunks.push(cur);
+        let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                if i == 0 {
+                    catalog_row(self.name, text)
+                } else {
+                    format!("{gutter}{text}")
+                }
+            })
+            .collect()
+    }
 }
 
 use Access::{AnyScopeMeta, OwnerOnly, Scoped};
@@ -113,7 +201,8 @@ const fn v(
     op: OpClass,
     framing: Framing,
     target: Target,
-    help: &'static str,
+    summary: &'static str,
+    detail: &'static str,
 ) -> VerbSpec {
     VerbSpec {
         name,
@@ -121,7 +210,8 @@ const fn v(
         framing,
         target,
         access: Scoped,
-        help,
+        summary,
+        detail,
     }
 }
 
@@ -135,7 +225,8 @@ const fn va(
     framing: Framing,
     target: Target,
     access: Access,
-    help: &'static str,
+    summary: &'static str,
+    detail: &'static str,
 ) -> VerbSpec {
     VerbSpec {
         name,
@@ -143,11 +234,15 @@ const fn va(
         framing,
         target,
         access,
-        help,
+        summary,
+        detail,
     }
 }
 
-/// THE TABLE. Ordered by function for a readable generated catalog.
+/// THE TABLE. Ordered by function for a readable generated catalog. Each row's
+/// help is two literals: the `summary` (its first sentence, the short catalog's
+/// whole row — at most [`SUMMARY_MAX_CHARS`]) and the `detail` that completes it
+/// (`""` when the summary says it all); `help_line` joins them with one space.
 pub const VERBS: &[VerbSpec] = &[
     // build & meta — answered for ANY authenticated scope BEFORE target resolution
     // (non-sensitive global provenance); the `AnyScopeMeta` access declares that.
@@ -158,6 +253,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "build + compiler provenance (version, commit, rustc, flavor, signature)",
+        "",
     ),
     va(
         "update",
@@ -166,6 +262,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "self-updater [status|check|apply]: staged build state; apply re-execs a staged build",
+        "",
     ),
     va(
         "help",
@@ -173,7 +270,13 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         AnyScopeMeta,
-        "this catalog (alias: verbs)",
+        "help [<verb> | --full]: this catalog (alias: verbs).",
+        concat!(
+            "Bare = one summary row per verb (first sentence, <= ",
+            summary_max_chars!(),
+            " chars); help <verb> = that verb's full entry, wrapped; help --full = the \
+             complete catalog with the protocol header"
+        ),
     ),
     va(
         "verbs",
@@ -181,7 +284,13 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         AnyScopeMeta,
-        "this catalog (alias: help)",
+        "verbs [<verb> | --full]: this catalog (alias: help).",
+        concat!(
+            "Bare = one summary row per verb (first sentence, <= ",
+            summary_max_chars!(),
+            " chars); help <verb> = that verb's full entry, wrapped; help --full = the \
+             complete catalog with the protocol header"
+        ),
     ),
     // screen / terminal state
     v(
@@ -189,7 +298,11 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "the visible screen, one row per line",
+        "text [trim]: the visible screen, one row per line",
+        "trim drops the trailing all-blank rows: the header becomes `OK <n> trimmed=<k>` with n = \
+         the rows actually sent (interior blanks stay, so row i is still screen row i); `--json` \
+         adds \"trimmed\":k and keeps dims.rows = the grid. Off by default (scripts count rows). \
+         Any other argument is `ERR usage: text [trim]` — nothing is silently ignored",
     ),
     v(
         "screen",
@@ -197,6 +310,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "the full styled grid as one lossless JSON frame",
+        "",
     ),
     v(
         "line",
@@ -204,14 +318,23 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "line <n>: one physical line of scrollback+screen",
+        "",
     ),
-    v("lines", Read, Status, Session, "OK <scrollback-line-count>"),
+    v(
+        "lines",
+        Read,
+        Status,
+        Session,
+        "OK <scrollback-line-count>",
+        "",
+    ),
     v(
         "cell",
         Read,
         Status,
         Session,
         "cell <r> <c>: OK <grapheme%enc> <fg> <bg> <attrs>[ link=]",
+        "",
     ),
     v(
         "cursor",
@@ -219,6 +342,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "OK <row> <col> <visible> <style>",
+        "",
     ),
     v(
         "dims",
@@ -226,6 +350,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "OK <rows> <cols> <px_w> <px_h>",
+        "",
     ),
     v(
         "modes",
@@ -233,6 +358,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "DEC modes: alt_screen=, cursor_visible=, ...",
+        "",
     ),
     v(
         "title",
@@ -240,6 +366,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "OK <title> (from shell integration)",
+        "",
     ),
     v(
         "cwd",
@@ -247,15 +374,16 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "OK <cwd> (from shell integration)",
+        "",
     ),
-    v("colors", Read, Status, Session, "OK fg= bg= cursor="),
+    v("colors", Read, Status, Session, "OK fg= bg= cursor=", ""),
     v(
         "search",
         Read,
         Lines,
         Session,
-        "search <pat> [case] [regex]: full-history find, one \"<row> <col> <len>\" per match \
-         (a hit straddling a SOFT WRAP is one match whose col+len runs past the grid width \
+        "search <pat> [case] [regex]: full-history find, one \"<row> <col> <len>\" per match",
+        "(a hit straddling a SOFT WRAP is one match whose col+len runs past the grid width \
          and continues at column 0 of the next row; regex ^ and $ bind to the reader's \
          LOGICAL line, so a continuation row has no ^ of its own)",
     ),
@@ -265,6 +393,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "OK <n> + the selected text",
+        "",
     ),
     // `copy` is the EXFIL BOUNDARY: it moves the selection OUT of the process onto
     // the system clipboard, so it is `ClipboardWrite`, not `Read`. `scroll`/`select`
@@ -276,6 +405,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "copy the selection to the system clipboard, OK <bytes>",
+        "",
     ),
     v(
         "blocks",
@@ -283,13 +413,16 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "shell-integration command blocks (exit codes, command text, state)",
+        "",
     ),
     v(
         "blocktext",
         Read,
         Lines,
         Session,
-        "blocktext <id>: one command block's output",
+        "blocktext <id> [trim]: one command block's output",
+        "trim drops the trailing all-blank rows (`OK <n> trimmed=<k>`, n = the rows sent); any \
+         other tail is `ERR usage: blocktext <id> [trim]`",
     ),
     // seeing: pixels, recording, history
     v(
@@ -297,21 +430,36 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "image [path] : capture the APPLICATION-RENDERED CLIENT FRAME -> PNG, reply OK <w> <h> <path> (bare filename confined to the runtime images/ dir; auto-named when omitted). In a window the frame is bound to a successful application-present transaction; headless is a semantic-renderer artifact. Platform compositor visibility and scanout are not observed. image --bytes = return the PNG base64'd OVER THE WIRE (OK 1 + `<w> <h> <nbytes> <base64>`) instead of a server-local path — the form a REMOTE (dial/TLS) driver uses. image --meta = opt into an additive captured-frame pixel fingerprint plus terminal/native/composite phase, raster, paint, geometry, theme, and per-leaf metadata (existing replies stay byte-for-byte unchanged; with --bytes the reply is OK 2 + metadata and PNG rows). image plain = bare pixels; image read = inline OSC-1337 images as base64. @<sid> captures the app-render frame of the window showing that session",
+        "image [path] : capture the APPLICATION-RENDERED CLIENT FRAME -> PNG, reply OK <w> <h> \
+         <path>",
+        "(bare filename confined to the runtime images/ dir; auto-named when omitted). In a \
+         window the frame is bound to a successful application-present transaction; headless is a \
+         semantic-renderer artifact. Platform compositor visibility and scanout are not observed. \
+         image --bytes = return the PNG base64'd OVER THE WIRE (OK 1 + `<w> <h> <nbytes> \
+         <base64>`) instead of a server-local path — the form a REMOTE (dial/TLS) driver uses. \
+         image --meta = opt into an additive captured-frame pixel fingerprint plus \
+         terminal/native/composite phase, raster, paint, geometry, theme, and per-leaf metadata \
+         (existing replies stay byte-for-byte unchanged; with --bytes the reply is OK 2 + \
+         metadata and PNG rows). image plain = bare pixels; image read = inline OSC-1337 images \
+         as base64. @<sid> captures the app-render frame of the window showing that session",
     ),
     v(
         "window",
         Read,
         Status,
         App,
-        "window [<target>] [path] : assemble a full-window artifact (platform-owned chrome + the exact submitted client destination) -> PNG, reply OK <w> <h> <path> (target: front|prefs|about|menu|update, default front; bare filename confined to images/). Compositor visibility and scanout are not observed",
+        "window [<target>] [path] : assemble a full-window artifact",
+        "(platform-owned chrome + the exact submitted client destination) -> PNG, reply OK <w> \
+         <h> <path> (target: front|prefs|about|menu|update, default front; bare filename confined \
+         to images/). Compositor visibility and scanout are not observed",
     ),
     v(
         "video",
         Read,
         Status,
         App,
-        "record N seconds (0.5..=60) of the front window's WSI-SUBMITTED destination frames -> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input aimed at the tab ON SCREEN — `key`, `ctrl`, `send`, `feed`, `paste`, flagless OR an explicit `@<sid>` naming the front tab — each stamped on the frame clock. A verb aimed at a BACKGROUND session egresses on the control thread and CANNOT be logged (`@self` expands to that when the driving session is not front), and input that lands on a WINDOW this take is not capturing (the front window changed mid-take — an `aterm ctl spawn` alone does it) has no frame here that could answer it; those attempts are COUNTED instead and reported as `unlogged_inputs=` on the reply line, live as `unlogged=` on `video status`, and in index.json meta (with the window share broken out as `unlogged_other_window`), so an empty inputs[] is never ambiguous and a logged row is never a key the recorded window never saw. Drive the FRONT tab when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; retention converges to 8 eligible completed recordings while preserving fresh/live handoffs. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized= keys=, and for a keys take the RUNNING inputs= unlogged= so a driver learns mid-take that it is driving an unloggable path); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms, plus keys_requested/inputs_logged/unlogged_inputs. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us (an inputs[] row is `ch` for a character or `key` for a named key like ArrowUp/Escape); cadence gaps = frames[].t_us deltas vs ~16667",
+        "record N seconds (0.5..=60) of the front window's WSI-SUBMITTED destination frames",
+        "-> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input aimed at the tab ON SCREEN — `key`, `ctrl`, `send`, `feed`, `paste`, flagless OR an explicit `@<sid>` naming the front tab — each stamped on the frame clock. A verb aimed at a BACKGROUND session egresses on the control thread and CANNOT be logged (`@self` expands to that when the driving session is not front), and input that lands on a WINDOW this take is not capturing (the front window changed mid-take — an `aterm ctl spawn` alone does it) has no frame here that could answer it; those attempts are COUNTED instead and reported as `unlogged_inputs=` on the reply line, live as `unlogged=` on `video status`, and in index.json meta (with the window share broken out as `unlogged_other_window`), so an empty inputs[] is never ambiguous and a logged row is never a key the recorded window never saw. Drive the FRONT tab when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; retention converges to 8 eligible completed recordings while preserving fresh/live handoffs. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized= keys=, and for a keys take the RUNNING inputs= unlogged= so a driver learns mid-take that it is driving an unloggable path); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms, plus keys_requested/inputs_logged/unlogged_inputs. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us (an inputs[] row is `ch` for a character or `key` for a named key like ArrowUp/Escape); cadence gaps = frames[].t_us deltas vs ~16667",
     ),
     v(
         "chrome",
@@ -319,6 +467,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         App,
         "the front window's native macOS UI (toolbar + menu bar)",
+        "",
     ),
     v(
         "controls",
@@ -326,41 +475,52 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         App,
         "GUI controls as text (front|prefs|about|menu|update)",
+        "",
     ),
     v(
         "panes",
         Read,
         Lines,
         App,
-        "the front window's ACTIVE-tab split-pane layout: `layout tab=<i> panes=<n> zoomed=<bool>` header, then one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>` row per visible pane (cell coords; 1-cell divider gaps between rects). @<sid> describes the window whose ACTIVE tab displays that session, and errors when none does (background tab?)",
+        "the front window's ACTIVE-tab split-pane layout: `layout tab=<i> panes=<n> zoomed=<bool>`",
+        "header, then one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> \
+         focused=<bool>` row per visible pane (cell coords; 1-cell divider gaps between rects). \
+         @<sid> describes the window whose ACTIVE tab displays that session, and errors when none \
+         does (background tab?)",
     ),
     v(
         "inspect",
         Read,
         Lines,
         App,
-        "versioned native tab-app semantics: inspect app/v1 tabs | inspect app/v1 view <view-id> <text|controls|tree|audit>",
+        "versioned native tab-app semantics: inspect app/v1 tabs",
+        "| inspect app/v1 view <view-id> <text|controls|tree|audit>",
     ),
     v(
         "cast",
         Read,
         Bytes,
         Session,
-        "asciicast v2 recording (compact, sendable); `cast frames [count=N]` expands it to a keyframe flipbook",
+        "asciicast v2 recording (compact, sendable);",
+        "`cast frames [count=N]` expands it to a keyframe flipbook",
     ),
     v(
         "temporal",
         Read,
         Bytes,
         Session,
-        "the screen reconstructed at a past instant (needs temporal_recording=true)",
+        "temporal [status|<tick>] [trim]: the screen reconstructed at a past instant",
+        "(needs temporal_recording=true; `temporal status` reports the reachable tick range). trim \
+         drops the trailing all-blank rows — byte-framed, so `OK <nbytes> trimmed=<k>` counts the \
+         trimmed body; `status` has no rows, so `status trim` is `ERR usage`",
     ),
     v(
         "history",
         Read,
         Lines,
         Session,
-        "history [<n>] [since=<id>]: the turn LEDGER - id/submitted/status/dur_ms/seq/hash/text per completed turn",
+        "history [<n>] [since=<id>]: the turn LEDGER",
+        "- id/submitted/status/dur_ms/seq/hash/text per completed turn",
     ),
     // `meta` reads/writes the USER-settable session metadata. Base op-class Read
     // (the bare form is a pure metadata readout); the `meta set`/`meta unset`
@@ -372,7 +532,14 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "meta -> OK title= user_title= description= icon= role= attention= cwd= state= (pct-encoded; '-' = unset). `meta set <title|description|icon|role|attention> <text...>` / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks the OSC title in tab labels; `role operator` names the fleet operator and a non-empty `attention` is the typed needs-human escalation the menu-bar status item badges; caps: title 120B, description 1024B, icon 64B, role 64B, attention 256B)",
+        "meta -> OK title= user_title= description= icon= role= attention= cwd= state=",
+        "(pct-encoded; '-' = unset). `meta set <title|description|icon|role|attention> <text...>` \
+         / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks \
+         the OSC title in tab labels; `role operator` names the fleet operator and a non-empty \
+         `attention` is the typed needs-human escalation the menu-bar status item badges; caps: \
+         title 120B, description 1024B, icon 64B, role 64B, attention 256B). No `window=` here, \
+         for the reason `status` gives: `meta` is polled and the window lives on the main thread \
+         — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
     ),
     // `status` is the READ-ONLY Subject+Status record (RFC: Tab Subject &
     // Status §8) — what a session IS and what it is DOING, classified entirely
@@ -383,21 +550,67 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "status -> OK schema=1 sid= subject= subject_source=pin|osc|cwd|unavailable observed= phase=unknown|starting|idle|running|quiet|exited since_ms= outcome=none|success|failure|signal exit_code= signal= detail= confidence=exact|strong|heuristic|unknown reasons= conflict= revision= enabled= : the session's SUBJECT + classified STATUS (pct-encoded; '-' = unset). Read-only. `observed=false` means never classified, which is NOT `phase=unknown` (classified, no evidence); `subject_source=unavailable` means the terminal lock was contended, never a silent fall to a lower rung. Fields are ADDITIVE and never bump the schema, so reject an unknown schema MAJOR rather than best-effort parsing, and treat an unknown phase/outcome/reason token as unknown rather than an error. `enabled=false` means `tab_status` is off and every phase will read unknown",
+        "status: the session's SUBJECT + classified STATUS (pct-encoded; '-' = unset).",
+        "Reply: OK schema=1 sid= subject= subject_source=pin|osc|cwd|unavailable observed= \
+         phase=unknown|starting|idle|running|quiet|exited since_ms= \
+         outcome=none|success|failure|signal exit_code= signal= detail= \
+         confidence=exact|strong|heuristic|unknown reasons= conflict= revision= enabled=. \
+         Read-only. `observed=false` means never classified, which is NOT `phase=unknown` \
+         (classified, no evidence); `subject_source=unavailable` means the terminal lock was \
+         contended, never a silent fall to a lower rung. Fields are ADDITIVE and never bump the \
+         schema, so reject an unknown schema MAJOR rather than best-effort parsing, and treat an \
+         unknown phase/outcome/reason token as unknown rather than an error. `enabled=false` \
+         means `tab_status` is off and every phase will read unknown. `detail=` is the \
+         sanitized RUNNING command — the command's FIRST word reduced to its basename, plus \
+         an allow-listed subcommand, never an argument (`claude`, `codex`, `targo%20test`); a \
+         COMPOUND command's first word is the shell keyword that opens it, so `for i in 1 2 \
+         3; do ...; done` reads `detail=for`, not the program inside — while the \
+         shell-integration block executes, `-` otherwise or when the terminal lock was \
+         contended: how an agent tells that a peer is another agent before typing into it. No `window=` here: `status` is \
+         polled, and the window lives on the main thread, so a per-poll hop would be a \
+         latency regression — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
     ),
     v(
         "timeline",
         Read,
         Lines,
         Session,
-        "timeline [<n>] [since=<id>]: the session EVENT TIMELINE - one `event <id> t=<ms> kind=<k> ...` line per lifecycle event (spawned/state-change/title-change/cwd-change/meta-change), monotonic ids, drop-oldest ring",
+        "timeline [<n>] [since=<id>]: the session EVENT TIMELINE",
+        "- one `event <id> t=<ms> kind=<k> ...` line per lifecycle event \
+         (spawned/state-change/title-change/cwd-change/meta-change), monotonic ids, drop-oldest \
+         ring. The two rows a session records as it is retired — `closing reason= by=` and the \
+         final `state-change state=closed` — cannot be asked for here after the close: the sid \
+         stops resolving in the same store write (only a request that resolved the session just \
+         before that write can still read them). A live `subscribe @<sid> events` watch is what \
+         delivers `closing` \
+         (as `EVENT <local> closing reason= by=`, ahead of `exited`); `exits` keeps the same facts \
+         afterwards",
     ),
     v(
         "metrics",
         Read,
         Status,
         App,
-        "render/latency counters [reset|percentiles] - percentiles: p50/p95/p99 input->application-present-return / output->application-present-return / frame-render distributions; plain line carries max_frame_gap_ms= (worst successful-present-return gap since reset), rust_main_to_first_present_ms= and rust_main_to_first_visible_ms= (Rust entry->the FIRST window's actual reveal — time-to-visible; on a warm Windows launch the reveal precedes the backend join, so it runs well under first-present) plus startup_phase_schema=1/startup_phase_valid= and eight exclusive startup_*_ms phases (router, GUI prepare, winit dispatch, initial surface attach, successful-redraw wait/compose/surface/finalize); startup_attach_schema=1/startup_attach_valid= drills the attach parent into dispatch/prepare/window-create/window-setup/backend-finalize/chrome-geometry/surface-create/finish, effect_pipeline_builds=/effect_pipeline_build_ms= report the EFFECT-only cell pipelines this process compiled ON DEMAND (the nine that only ever draw a cursor trail / fire / rain / sparkle / sprite layer are built the first frame that binds one, never at launch — a default `cursor_trail = false` run reads 0/0.00 for its whole life, and a non-zero reading with no effect enabled means the demand gate has re-eagerised), and the line ends first_present_ms= (compatibility GUI main_entry->the same successful-present publication; dyld/compositor/scanout unobserved) first_visible_ms= (GUI main_entry->the same reveal instant)",
+        "render/latency counters [reset|percentiles]",
+        "- percentiles: p50/p95/p99 input->application-present-return / \
+         output->application-present-return / frame-render distributions; plain line carries \
+         max_frame_gap_ms= (worst successful-present-return gap since reset), \
+         rust_main_to_first_present_ms= and rust_main_to_first_visible_ms= (Rust entry->the FIRST \
+         window's actual reveal — time-to-visible; on a warm Windows launch the reveal precedes \
+         the backend join, so it runs well under first-present) plus \
+         startup_phase_schema=1/startup_phase_valid= and eight exclusive startup_*_ms phases \
+         (router, GUI prepare, winit dispatch, initial surface attach, successful-redraw \
+         wait/compose/surface/finalize); startup_attach_schema=1/startup_attach_valid= drills the \
+         attach parent into \
+         dispatch/prepare/window-create/window-setup/backend-finalize/chrome-geometry/surface-create/finish, \
+         effect_pipeline_builds=/effect_pipeline_build_ms= report the EFFECT-only cell pipelines \
+         this process compiled ON DEMAND (the nine that only ever draw a cursor trail / fire / \
+         rain / sparkle / sprite layer are built the first frame that binds one, never at launch \
+         — a default `cursor_trail = false` run reads 0/0.00 for its whole life, and a non-zero \
+         reading with no effect enabled means the demand gate has re-eagerised), and the line \
+         ends first_present_ms= (compatibility GUI main_entry->the same successful-present \
+         publication; dyld/compositor/scanout unobserved) first_visible_ms= (GUI main_entry->the \
+         same reveal instant)",
     ),
     // drive input
     v(
@@ -405,21 +618,38 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Lines,
         Session,
-        "turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] <text>: ONE HUMAN TURN - type <text>, verified submit (submit=none types WITHOUT submitting; default 'enter', and any key-verb name is a valid submit key), wait for the screen to settle (idle for idle=<ms>, cap timeout=<ms>), return the settled screen. Reply: verdict line (id=/submitted=<0|1>/status=settled|timeout/seq=/dur_ms=/hash=<FNV16 of settled screen>) then the rows. App-agnostic; humans can interject",
+        "turn [option=value ...] <text>: ONE HUMAN TURN",
+        "- type <text>, verified submit (submit=none types WITHOUT submitting; default 'enter', \
+         and any key-verb name is a valid submit key), wait for the screen to settle (idle for \
+         idle=<ms>, cap timeout=<ms>), return the settled screen. Options: [idle=<ms>] \
+         [timeout=<ms>] [submit=<key|none>] [settle=match:<re>] [submit_window=<ms>] \
+         [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>]. Reply: verdict line \
+         (id=/submitted=<0|1>/status=settled|timeout/seq=/dur_ms=/hash=<FNV16 of settled screen>) \
+         then the rows; trim=1 drops the trailing all-blank rows and closes the verdict with \
+         trimmed=<k> — hash= stays the FNV of the UNTRIMMED screen (a screen identity, the value \
+         `history` reports), not of the bytes sent. App-agnostic; humans can interject",
     ),
     v(
         "lease",
         Write,
         Status,
         Session,
-        "lease [status] | lease acquire [ttl=<ms>] [holder=<name>] | lease release [holder=<name>] [force] : a COOPERATIVE drive lease for raw (non-turn) drivers — one holder at a time, TTL-expiring (default 30000ms, max 600000), surfaced in `who` as driving=lease:<holder>. acquire refuses a live `turn` or a DIFFERENT holder's live lease (steals a lapsed one; same holder renews); a live lease also blocks a `turn` from stomping it. ADVISORY for raw send/key/feed (use `turn` for HARD arbitration) — the coordination signal cooperating agents check before driving",
+        "lease [status|acquire|release ...]: a COOPERATIVE drive lease for raw (non-turn) drivers",
+        "— one holder at a time, TTL-expiring (default 30000ms, max 600000), surfaced in `who` as \
+         driving=lease:<holder>. Forms: lease [status] | lease acquire [ttl=<ms>] [holder=<name>] \
+         | lease release [holder=<name>] [force]. acquire refuses a live `turn` or a DIFFERENT \
+         holder's live lease (steals a lapsed one; same holder renews); a live lease also blocks \
+         a `turn` from stomping it. ADVISORY for raw send/key/feed (use `turn` for HARD \
+         arbitration) — the coordination signal cooperating agents check before driving",
     ),
     v(
         "send",
         Write,
         Status,
         Session,
-        "write text to the PTY; reply `OK seq=<n>` — the content baseline, so `await seq <n+1>` waits for the output this input causes (same seq= on key/ctrl/feed/mouse/paste)",
+        "write text to the PTY; reply `OK seq=<n>`",
+        "— the content baseline, so `await seq <n+1>` waits for the output this input causes \
+         (same seq= on key/ctrl/feed/mouse/paste)",
     ),
     v(
         "paste",
@@ -427,6 +657,14 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "bracketed-paste text to the PTY",
+        "the payload rides the engine's PASTE seam — bracket guards when the app has set \
+         DEC 2004, control-byte sanitize, LF->CR — but NOT the `confirm_multiline_paste` \
+         prompt a person's paste answers. A driver that asked for a paste has already \
+         decided, and parking this reply on a window banner would hang the caller; so an \
+         unbracketed multi-line payload reaches the shell here without the confirmation \
+         the same text raises from the keyboard, and its first line can run. Same-uid, \
+         token-gated and owner-scoped — whoever can send this can already run commands — \
+         so the difference is stated rather than left to be discovered",
     ),
     v(
         "key",
@@ -434,44 +672,55 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "send a named key (enter/tab/up/...)",
+        "",
     ),
-    v("ctrl", Write, Status, Session, "send a control char"),
-    v("feed", Write, Status, Session, "write raw bytes to the PTY"),
+    v("ctrl", Write, Status, Session, "send a control char", ""),
+    v(
+        "feed",
+        Write,
+        Status,
+        Session,
+        "write raw bytes to the PTY",
+        "",
+    ),
     v(
         "feed-bin",
         Write,
         Status,
         Session,
         "length-prefixed raw bytes to the PTY",
+        "",
     ),
     v(
         "paste-bin",
         Write,
         Status,
         Session,
-        "length-prefixed bytes to the PTY with PASTE semantics (bracketed-paste guards + control-byte sanitize + LF->CR); the binary twin of `paste`",
+        "length-prefixed bytes to the PTY with PASTE semantics",
+        "(bracketed-paste guards + control-byte sanitize + LF->CR); the binary twin of `paste`",
     ),
-    v("mouse", Write, Status, Session, "inject a mouse event"),
+    v("mouse", Write, Status, Session, "inject a mouse event", ""),
     v(
         "resize",
         Write,
         Status,
         Session,
-        "resize <r> <c>: resize the engine + PTY (grid first, window echoed to match). \
-         `resize px <w> <h>` instead resizes the WINDOW in physical pixels and lets the \
-         grid follow from the platform resize event — the same path an edge drag takes, \
-         so it is the form that exercises the live-resize width throttle (the cell form \
-         pre-applies the grid, so the window event never sees a column change). Drive \
-         several back to back to reproduce a drag's event pressure; read the result with \
-         `metrics` (`resize_present`) and `dims` (`layer_*`)",
+        "resize <r> <c>: resize the engine + PTY (grid first, window echoed to match).",
+        "`resize px <w> <h>` instead resizes the WINDOW in physical pixels and lets the grid \
+         follow from the platform resize event — the same path an edge drag takes, so it is the \
+         form that exercises the live-resize width throttle (the cell form pre-applies the grid, \
+         so the window event never sees a column change). Drive several back to back to reproduce \
+         a drag's event pressure; read the result with `metrics` (`resize_present`) and `dims` \
+         (`layer_*`)",
     ),
-    v("focus", Write, Status, Session, "send focus in/out"),
+    v("focus", Write, Status, Session, "send focus in/out", ""),
     v(
         "scroll",
         Read,
         Status,
         Session,
         "scroll the view (up|down|top|bottom|N)",
+        "",
     ),
     v(
         "select",
@@ -479,6 +728,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "select a region / word <r> <c> / line <r> / clear",
+        "",
     ),
     v(
         "signal",
@@ -486,6 +736,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "signal <sig>: send a signal to the foreground process group",
+        "",
     ),
     // app / GUI drive (selector routes to the instance's front window)
     v(
@@ -493,21 +744,27 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "drive the front window's tabs (new|N|next|prev)",
+        "drive a window's tabs (new|N|next|prev|close [N]|move <from> <to>)",
+        "- flagless drives the FRONT window; `@<sid> tab …` drives the window hosting <sid> \
+         (the same aim as `@<sid> spawn`), so an agent in a background window walks its own \
+         tabs without touching the human's. Replies `OK <active> <count>`; a --headless \
+         instance drives its one logical window like a real one (no `ERR headless`)",
     ),
     v(
         "open",
         Write,
         Status,
         App,
-        "open a native tab app: `open app settings [/route]` or `open app markdown|editor <local-file-uri>`; compatibility aux targets remain available",
+        "open a native tab app: `open app settings [/route]`",
+        "or `open app markdown|editor <local-file-uri>`; compatibility aux targets remain available",
     ),
     v(
         "act",
         Write,
         Status,
         App,
-        "dispatch an exact semantic native-app action: act app/v1 view <view-id> <ui-key> <action> [value]",
+        "dispatch an exact semantic native-app action: act app/v1 view <view-id> <ui-key> <action>",
+        "[value]",
     ),
     // `settings set|unset` atomically REWRITES the durable on-disk `aterm.toml`
     // (flipping default-OFF security knobs), so it is `ConfigWrite` — a strictly
@@ -519,6 +776,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "settings [open|close|toggle], or `settings set|unset <key> [value...]`",
+        "",
     ),
     v(
         "invoke",
@@ -526,6 +784,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "invoke <action>: fire a menu action by name (enabled-gated; names via `controls menu`)",
+        "",
     ),
     // Runtime-only per-session visual toggle (nothing durable is written); the
     // observability face scripts/tests read (`status` = one Status line).
@@ -534,10 +793,10 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "rain [status|on|off|toggle]: matrix rain for the focused window's front session \
-         (status prints config_enabled= session_override= effective= engine= active= \
-         scope=window|focused-pane focused= animating=, plus a live engine's \
-         weather= density= tick= scanned= material= emitting= vis= drain= seq= streak= diag)",
+        "rain [status|on|off|toggle]: matrix rain for the focused window's front session",
+        "(status prints config_enabled= session_override= effective= engine= active= \
+         scope=window|focused-pane focused= animating=, plus a live engine's weather= density= \
+         tick= scanned= material= emitting= vis= drain= seq= streak= diag)",
     ),
     // Read-only observability for an effect that is otherwise audible-only: the
     // tone-of-typing mood steering the trail synth's melody. No write form —
@@ -547,11 +806,11 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "tone [status]: tone-of-typing state for the focused window (prints \
-         tone= effective= knob= sounds= volume= audio=live|inert active= \
-         window_chars= inferences=; `effective` is what the synth is stamping, \
-         `inferences` separates \"the model ran and said technical\" from \
-         \"the model never ran\". The typed window's TEXT is never reported)",
+        "tone [status]: tone-of-typing state for the focused window",
+        "(prints tone= effective= knob= sounds= volume= audio=live|inert active= window_chars= \
+         inferences=; `effective` is what the synth is stamping, `inferences` separates \"the \
+         model ran and said technical\" from \"the model never ran\". The typed window's TEXT is \
+         never reported)",
     ),
     // Read-only observability for the cursor-trail engine: the last N
     // licensed/declined verdicts from the fixed-size admission diagnosis ring,
@@ -564,8 +823,8 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         App,
-        "trail [<n>]: the focused window's last <n> (default all, ring cap 32) cursor-trail \
-         spawn-seam verdicts, newest last — one `admission seq= phase=licensed|declined \
+        "trail [<n>]: the focused window's last <n> cursor-trail spawn-seam verdicts",
+        "(default all, ring cap 32), newest last — one `admission seq= phase=licensed|declined \
          reason= age_ms= origin= target= alt=` row per judged cursor move, from the engine's \
          fixed-size DIAGNOSTIC ring. A move paints only if a keypress LICENSED it, so a \
          decline carries one of three reasons: `no-fresh-hint` (no key hint was fresh — the \
@@ -604,17 +863,16 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "custody: why the reading position or the highlight last moved — one \
-         `last=<transition|none> event=<0-7|-> changed=<transition|none> offset= \
-         owner=user|tail selection=yes|no scrollback=` line naming the PressCustody \
-         transition the engine recorded: a press (TypingPress, RepeatPress, \
-         InertPress, ReleaseEvent), a gesture (UserScroll, UserSelect, UserClear), or \
-         output (OutputAtLive, OutputWhileReading, OutputDamagesTheSelectedRows, \
-         OutputInvalidatesTheCoordinateSpace, OutputTookTheSelectionUnattributed). \
-         `last` is the most recent event of any kind; `changed` is the most recent one \
-         that actually TOOK the offset or the highlight, so ordinary shell output \
-         cannot bury the answer. `none` means nothing has moved custody yet. \
-         Read-only; reports no screen content",
+        "custody: why the reading position or the highlight last moved",
+        "— one `last=<transition|none> event=<0-7|-> changed=<transition|none> offset= \
+         owner=user|tail selection=yes|no scrollback=` line naming the PressCustody transition \
+         the engine recorded: a press (TypingPress, RepeatPress, InertPress, ReleaseEvent), a \
+         gesture (UserScroll, UserSelect, UserClear), or output (OutputAtLive, \
+         OutputWhileReading, OutputDamagesTheSelectedRows, OutputInvalidatesTheCoordinateSpace, \
+         OutputTookTheSelectionUnattributed). `last` is the most recent event of any kind; \
+         `changed` is the most recent one that actually TOOK the offset or the highlight, so \
+         ordinary shell output cannot bury the answer. `none` means nothing has moved custody \
+         yet. Read-only; reports no screen content",
     ),
     v(
         "hover",
@@ -622,6 +880,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "toggle the drop-target highlight",
+        "",
     ),
     // session lifecycle
     v(
@@ -629,7 +888,22 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [connected=controlled|controller place=window|tab of=<sid>] [cwd=<path>] [split=<v|h>]: mint a new session (a tab, or split the focused pane), reply OK <sid> - immediately addressable. connected= also mints a `both` session connection with of=<sid> (controlled: of= drives the newborn; controller: the newborn drives of=, its shell gets ATERM_OBSERVE_SESSION_ID) - Owner-only, of= mandatory, place=window is `ERR headless` with no GUI",
+        "spawn [window=<id>] [raise=<true|false>] [cwd=<path>] [split=<v|h>] [connected=...]:",
+        "mint a new session (a tab, or split the focused pane), reply OK <sid> - immediately \
+         addressable. AIM it with window=<id> (an id from `inspect app/v1 tabs`) or `@<sid> \
+         spawn` (the window hosting <sid>; window= wins); split= then divides THAT window's \
+         focused pane. raise= defaults to true when no window was named (the `aterm new-tab` \
+         attach contract) and FALSE when one was - an agent aiming at a background window is \
+         not asking to see it; say raise=true to insist. Unknown id: `ERR no such window <id>`. \
+         A --headless instance owns logical window 0 (the one `ls`/`windows`/`dims` name), so \
+         `window=0` and `@<sid>` aim there exactly as at a real window - only `window=<other>` \
+         is `ERR no such window` - and the raise is simply a no-op (no OS surface). The \
+         connected form, `spawn \
+         connected=controlled|controller place=window|tab of=<sid> [cwd=<path>]`, also mints a \
+         `both` session connection with of=<sid> (controlled: of= drives the newborn; \
+         controller: the newborn drives of=, its shell gets ATERM_OBSERVE_SESSION_ID) - \
+         Owner-only, of= mandatory, no window=/raise=/split= beside it, place=window is `ERR \
+         headless` with no GUI",
     ),
     v(
         "close",
@@ -637,6 +911,27 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "@<sid> close: retire that session (close its tab) - the death half of spawn",
+        "`OK closed <sid>` means the session LEFT the registry: its tab is gone, its PTY was hung \
+         up, and the ledger has the row (`exits` -> `reason=ctl-close by=<caller>`). An \
+         unresolvable sid, or one no window holds, is `ERR no such session`. `ERR close refused \
+         (a running job armed the last-tab confirm)` = the destructive-close confirm did not let \
+         a LAST-tab close through and the tab is still there (a `--headless` instance never \
+         confirms, so it never answers this). Closing a window's LAST tab DEFERS the window \
+         teardown that retires the session (that teardown needs the event loop), so the verb \
+         waits for the escalation before answering; if the session is still registered after it, the \
+         reply names WHICH deferral it is looking at: `ERR close deferred (the window teardown \
+         has not run)` - its window is still standing, a native or document close barrier held \
+         it; `ERR close deferred (another window still displays this session)` - a Cmd-Shift-O \
+         co-viewer still holds a pool view, so retiring this tab did not retire the session (the \
+         torn-down window is gone, so a repeat aims at the next viewer: one close per viewer); \
+         `ERR close deferred (the session outlived its window's teardown)` \
+         - the window is gone and no window shows the session. `ERR session view changed during \
+         close` = the tab was a heterogeneous one (a terminal beside a native view) and its \
+         shape moved under the close; nothing was retired, so retry. The verb takes NO \
+         argument: anything after it is `ERR usage: close`, never a close. And when that LAST tab is the \
+         LAST window's, the teardown ENDS THE PROCESS: `OK closed <sid>` is this instance's \
+         final reply, the memory-only `exits` ledger and any `subscribe` watch's `closing` / \
+         `exited` frames go with it, and the next verb gets a connect error, not an `ERR` line",
     ),
     // waits
     v(
@@ -645,13 +940,16 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "block until the session is alive and idle",
+        "",
     ),
     v(
         "await",
         Read,
         Status,
         Session,
-        "await <idle <ms>|seq [<n>]|match <re>|block> [timeout=<ms>]: block until a predicate latches",
+        "await <idle <ms>|seq [<n>]|match <re>|block> [timeout=<ms>]: block until a predicate \
+         latches",
+        "",
     ),
     v(
         "wait",
@@ -659,6 +957,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "block until the running command completes (OSC-133)",
+        "",
     ),
     // streaming
     v(
@@ -666,7 +965,26 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Push,
         Session,
-        "subscribe @<sel>[,...] <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES; streams=screen,cursor,cells,bytes,events,sessions, at least one of them (a modifier-only list is `ERR usage`); sessions = instance lifecycle (`EVENT * session-created/exited <sid>` for sibling spawns/exits, no `ls` polling) and is OWNER-ONLY because it reports the whole roster, not just your targets — a scoped edge asking for it gets `ERR denied`; add `timestamps` (alias `ts`) INSIDE <streams> (`cells,ts`; trailing is `ERR unknown subscribe arg`) to prefix frames with `T <local|*> <t_us>` lines (video's clock) so the stream is a timed frame source — at most one per channel per wake, tagged `<local>` for session frames and `*` for `sessions` events, so the second token is not always numeric",
+        "subscribe @<sel>[,...] <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES;",
+        "streams=screen,cursor,cells,bytes,events,sessions, at least one of them (a modifier-only \
+         list is `ERR usage`); events = the per-target digest (`EVENT <local> turn|block-complete|\
+         meta|title|bell …`, then, as the session is retired, `EVENT <local> closing reason= by=` \
+         — the `exits` row, and this watch is the only wire path that carries it — before its \
+         one `EVENT <local> exited`, not necessarily adjacent: a title or bell frame of the same \
+         watch can land between the two); sessions = instance lifecycle (`EVENT * \
+         session-created <sid>` / \
+         `EVENT * session-exited <sid> reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|\
+         unknown>` for sibling spawns/exits, no `ls` polling — the reason is the `exits` ledger's, \
+         a trailing additive token; `app-quit` is reserved, not produced today) and is OWNER-ONLY \
+         because it reports \
+         the whole roster, not just your targets — a scoped edge asking for it gets `ERR denied`; \
+         add `timestamps` (alias `ts`) INSIDE <streams> (`cells,ts`; trailing is `ERR unknown \
+         subscribe arg`) to prefix frames with `T <local|*> <t_us>` lines (video's clock) so the \
+         stream is a timed frame source — at most one per channel per wake, tagged `<local>` for \
+         session frames and `*` for `sessions` events, so the second token is not always numeric; \
+         add `trim` INSIDE <streams> too (`screen,trim`; trailing is `ERR unknown subscribe arg`) \
+         to stop each screen DELTA after its last non-blank row — `screen <nrows>` is then the \
+         count sent (inert without screen)",
     ),
     // sessions, presence & capability — the OwnerOnly access declares the owner
     // gate IN the table (the dispatch reads it, no hardcoded verb list). `who`
@@ -679,7 +997,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "embedded opt-in operator: status|inspect|manage|unmanage|next|extend|ack|reconcile|clear-fault (Owner-only)",
+        "embedded opt-in operator: \
+         status|inspect|manage|unmanage|next|extend|ack|reconcile|clear-fault",
+        "(Owner-only)",
     ),
     va(
         "operator-propose-bin",
@@ -688,14 +1008,38 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "length-prefixed JSON proposal on stdin for the embedded operator actuator (Owner-only)",
+        "",
     ),
+    // `sessions` is the fleet roster. Its trailing tokens are ADDITIVE: `meta=`
+    // (stage 1), then `window=`/`active=`/`wfocus=` from ONE main-thread hop per
+    // call (F2: windows on the session verbs) and `detail=` from each engine's
+    // executing block (F5: who lives in a session). Old clients key on the sid
+    // field and ignore the tail.
     va(
         "sessions",
         Owner,
         Lines,
         Meta,
         OwnerOnly,
-        "OK <n> + one line per session (local/sid/parent/state/title). Owner-only",
+        "OK <n> + per session: local sid parent state title meta= window= active= wfocus= detail=",
+        "Owner-only. `window=<id|none|->`: the hosting window (the `dims` rule — the front \
+         window when it shows the session, else the lowest window id); `none` = a session no \
+         window holds; `-` = the main thread could not be asked (the line is still printed). \
+         A `--headless` instance owns one logical window, id 0 — the one `dims` reports as \
+         `window=0 geometry=headless` — so its sessions read `window=0`, never `none`. \
+         `active=<1|0|->`: on that window's active tab. `wfocus=<1|0|->`: that window is \
+         aterm's MOST RECENTLY FOCUSED window — set when a window gains focus and never \
+         cleared on blur, minimize or app deactivate, so exactly one window reads `1` for as \
+         long as aterm runs (it is NOT \"the OS key window right now\"). `detail=<pct|->`: the \
+         sanitized RUNNING command — the command's FIRST word reduced to its basename, \
+         plus an allow-listed subcommand, never an argument (`claude`, `codex`, \
+         `targo%20test`); a COMPOUND command's first word is the shell keyword that opens \
+         it (`for i in 1 2 3; do ...; done` reads `for`), not the program inside. The same \
+         value `status` carries; `-` when idle or the engine lock was contended. One main-thread hop per call, not per session; the client `ls` \
+         relays these lines verbatim and `windows` folds them per window. The menu-bar \
+         status item's fleet scan reads this on every open under a 2 s per-peer budget, so \
+         a peer whose main thread cannot answer inside it drops out of that menu rather \
+         than being listed from the registry alone — one hop per open, never a poll",
     ),
     va(
         "who",
@@ -703,7 +1047,40 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "PRESENCE: per session driving=<turn-id|-> watchers=<n> turns=<n> - the hand + the eye. Owner-only",
+        "PRESENCE: per session driving=<turn-id|-> watchers=<n> turns=<n> - the hand + the eye.",
+        "Owner-only",
+    ),
+    // `exits` reads the instance's roster journal — every sid the instance ever
+    // hosted — so it is Owner-gated like `sessions`, whose past it is.
+    va(
+        "exits",
+        Owner,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "exits [<n>] [since=<id>]: the instance EXIT LEDGER - why each session went. Owner-only",
+        "- one `exit <id> t=<ms> sid=<sid> local=<n> \
+         reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown> exit_code=<n|-> \
+         by=<sid|human|->` line per session that left the registry (`app-quit` is reserved, not \
+         produced today: quit ends the process, ledger included, and deregisters nothing), \
+         oldest-first, monotonic ids, \
+         drop-oldest ring (`OK 0` = none retained); `<n>` keeps the newest n, `since=<id>` keeps \
+         ids strictly greater (page with the last id you saw); the ring is MEMORY-ONLY and \
+         per instance - nothing is written to disk, so a `close` that retires the LAST session \
+         of the LAST window ends the process and takes the whole ledger with it (read it \
+         before that close, not after); `t=` is the `timeline`/`history` \
+         clock; `by=` is the closing CALLER: an edge-scoped client's own sid (the session its token \
+         was granted to), `human` for a UI/window close, `-` when the connection carried no session \
+         identity (an owner-token client is anonymous; never the front tab, never the closed \
+         session); `exit_code=-` = \
+         the child was hung up by a close, died by signal, was not aterm's to reap, or had not \
+         yet exited at either of the ledger's two non-blocking looks. The same facts reach a live \
+         watcher as they happen: a `subscribe @<sid> events` watch on the closing session gets \
+         `EVENT <local> closing reason= by=` ahead of its `EVENT <local> exited`, and a \
+         `subscribe … sessions` watch gets `EVENT * session-exited <sid> reason=`; the `timeline` \
+         verb cannot be asked for the `closing` row after the close (the sid stops resolving in \
+         the store write that records it; only a request that resolved the session just before \
+         that write can still read it)",
     ),
     va(
         "whoami",
@@ -712,6 +1089,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "OK <session> <nonce> <scope>",
+        "",
     ),
     // `family` is `Read`/`Scoped`: the no-arg form walks the RESOLVED (already
     // gated) session. Its EXPLICIT-sid sub-form (`family <sid>`) additionally
@@ -724,6 +1102,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "the session's parent + direct children",
+        "",
     ),
     v(
         "edges",
@@ -731,6 +1110,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "inbound capability edges (--json). alias: grants",
+        "",
     ),
     v(
         "grants",
@@ -738,6 +1118,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "inbound capability edges (--json). alias: edges",
+        "",
     ),
     va(
         "grant",
@@ -746,6 +1127,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "mint a cross-session edge (Owner only)",
+        "",
     ),
     va(
         "revoke",
@@ -753,7 +1135,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "revoke a cross-session edge: revoke <edge-hex> removes one; revoke src=<sid> sweeps every edge from that source and replies OK <removed> (Owner only)",
+        "revoke a cross-session edge: revoke <edge-hex> removes one;",
+        "revoke src=<sid> sweeps every edge from that source and replies OK <removed> (Owner only)",
     ),
     // Session connections (design §6): the connection-grain verbs over the
     // `grant`/`revoke` op-level primitives. All Owner-only, all self-scoped —
@@ -764,7 +1147,10 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "connect dst=<sid> src=<sid> [kind=pull|push|both]: declaratively SET the session connection src->dst (mint the missing ops, revoke the excess, so the rows equal exactly kind; default both), reply `OK read-screen=<hex> write-input=<hex> signal=<hex>` with only the minted ops present (Owner only)",
+        "connect dst=<sid> src=<sid> [kind=pull|push|both]:",
+        "declaratively SET the session connection src->dst (mint the missing ops, revoke the \
+         excess, so the rows equal exactly kind; default both), reply `OK read-screen=<hex> \
+         write-input=<hex> signal=<hex>` with only the minted ops present (Owner only)",
     ),
     va(
         "disconnect",
@@ -772,7 +1158,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "disconnect dst=<sid> src=<sid> [kind=pull|push|both]: dissolve the session connection src->dst (kind-filtered ok: kind=pull revokes only the pull half), reply OK <removed> (Owner only)",
+        "disconnect dst=<sid> src=<sid> [kind=pull|push|both]: dissolve the session connection \
+         src->dst",
+        "(kind-filtered ok: kind=pull revokes only the pull half), reply OK <removed> (Owner only)",
     ),
     va(
         "flows",
@@ -780,7 +1168,9 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "the instance's aggregated session-connection graph: OK <n> + one `<src> <dst> <op>` row per live edge across EVERY session's table (--json groups per pair: {\"flows\":[{src,dst,ops:[..]}]}). Owner-only",
+        "the instance's aggregated session-connection graph:",
+        "OK <n> + one `<src> <dst> <op>` row per live edge across EVERY session's table (--json \
+         groups per pair: {\"flows\":[{src,dst,ops:[..]}]}). Owner-only",
     ),
     va(
         "raise",
@@ -788,7 +1178,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "raise <sid>: raise the window hosting that session and select its tab (the session-connection Show twin; Owner only)",
+        "raise <sid>: raise the window hosting that session and select its tab",
+        "(the session-connection Show twin; Owner only)",
     ),
     va(
         "dial",
@@ -796,7 +1187,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "dial <name>: relay this connection over TLS to the saved network-drive peer <name> - subsequent verbs run on the remote (owner-only; a pre-relay failure answers one ERR line, success sends no local reply)",
+        "dial <name>: relay this connection over TLS to the saved network-drive peer <name>",
+        "- subsequent verbs run on the remote (owner-only; a pre-relay failure answers one ERR \
+         line, success sends no local reply)",
     ),
     va(
         "dial-list",
@@ -805,6 +1198,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "list saved network-drive connections",
+        "",
     ),
     va(
         "dial-token",
@@ -813,6 +1207,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "token for a saved network-drive connection",
+        "",
     ),
 ];
 
@@ -956,11 +1351,26 @@ pub const JSON_CAPABLE_VERBS: &[&str] = &[
     "text", "screen", "cursor", "dims", "blocks", "edges", "grants", "metrics",
 ];
 
-/// The generated per-verb catalog lines (`<name padded>  <help>`), in table order.
-/// The server's help catalog is its fixed header followed by these — so the
-/// catalog cannot drift from the table (it IS the table).
+/// One catalog row: the verb name in the [`CATALOG_TEXT_COLUMN`] gutter, then `text`.
+fn catalog_row(name: &str, text: &str) -> String {
+    format!("{name:<w$} {text}", w = CATALOG_TEXT_COLUMN - 1)
+}
+
+/// The SHORT catalog: one `<name padded> <summary>` row per verb, in table order —
+/// what the server answers a bare `help` with, bounded by
+/// [`SHORT_CATALOG_MAX_BYTES`] in total. [`catalog_lines_full`] is the full form.
+/// Both project the one table, so neither can drift from it (they ARE the table).
 pub fn catalog_lines() -> impl Iterator<Item = String> {
-    VERBS.iter().map(|s| format!("{:<28} {}", s.name, s.help))
+    VERBS.iter().map(|s| catalog_row(s.name, s.summary))
+}
+
+/// The FULL catalog: one `<name padded> <summary detail>` row per verb, in table
+/// order — `help --full`, and the `aterm help introspection` manual. Row for row
+/// the catalog from before the summary/detail split, except the six rows (`help`,
+/// `verbs`, `status`, `turn`, `lease`, `trail`) reworded on purpose so their first
+/// sentence fits a summary (the golden test pins every row).
+pub fn catalog_lines_full() -> impl Iterator<Item = String> {
+    VERBS.iter().map(|s| catalog_row(s.name, &s.help_line()))
 }
 
 #[cfg(test)]
@@ -1086,7 +1496,9 @@ mod tests {
     /// the catalog honest about the semantics the engine actually implements.
     #[test]
     fn search_help_states_where_a_wrapped_match_runs_and_where_anchors_bind() {
-        let help = spec("search").unwrap().help;
+        // `help_line()` is summary + detail: the soft-wrap semantics live in the
+        // detail half, which `help --full` and `help search` both render.
+        let help = spec("search").unwrap().help_line();
         assert!(
             help.contains("SOFT WRAP") && help.contains("col+len"),
             "the help must say a straddling hit's col+len runs past the width"
@@ -1100,8 +1512,128 @@ mod tests {
     #[test]
     fn every_verb_has_a_nonempty_help_line() {
         assert_eq!(catalog_lines().count(), VERBS.len());
-        assert!(VERBS.iter().all(|s| !s.help.is_empty()));
-        assert!(spec("image").unwrap().help.contains("image --meta"));
+        assert_eq!(catalog_lines_full().count(), VERBS.len());
+        assert!(VERBS.iter().all(|s| !s.summary.is_empty()));
+        assert!(spec("image").unwrap().help_line().contains("image --meta"));
+    }
+
+    /// The two-tier contract: every summary fits one catalog row, and the whole
+    /// short catalog fits the discovery budget — COMPUTED from the table, so a row
+    /// that grows past either bound fails here rather than in an agent's context
+    /// window. Also the split's hygiene: no summary is padded or doubled-spaced (the
+    /// wrap and the re-join both rely on single spaces), and `help_line` is exactly
+    /// `summary`, one space, `detail`.
+    #[test]
+    fn summaries_fit_the_short_catalog_budget() {
+        let mut total = 0usize;
+        for s in VERBS {
+            let n = s.summary.chars().count();
+            assert!(
+                n <= SUMMARY_MAX_CHARS,
+                "{}: summary is {n} chars, over the {SUMMARY_MAX_CHARS} cap: {:?}",
+                s.name,
+                s.summary
+            );
+            for (field, text) in [("summary", s.summary), ("detail", s.detail)] {
+                assert!(
+                    !text.contains("  "),
+                    "{}: {field} has a run of spaces",
+                    s.name
+                );
+                assert_eq!(text.trim(), text, "{}: {field} is padded", s.name);
+            }
+            assert!(
+                !s.detail.starts_with(' '),
+                "{}: detail starts with a space",
+                s.name
+            );
+            let expect = if s.detail.is_empty() {
+                s.summary.to_string()
+            } else {
+                format!("{} {}", s.summary, s.detail)
+            };
+            assert_eq!(
+                s.help_line(),
+                expect,
+                "{}: help_line is not summary + ' ' + detail",
+                s.name
+            );
+            total += catalog_row(s.name, s.summary).len() + 1;
+        }
+        let short: usize = catalog_lines().map(|l| l.len() + 1).sum();
+        assert_eq!(short, total);
+        assert!(
+            short <= SHORT_CATALOG_MAX_BYTES,
+            "the short catalog is {short} bytes, over the {SHORT_CATALOG_MAX_BYTES} budget"
+        );
+        // Non-vacuity: the split is real — the table carries detail somewhere, and the
+        // full catalog is far larger than the short one.
+        assert!(VERBS.iter().any(|s| !s.detail.is_empty()));
+        let full: usize = catalog_lines_full().map(|l| l.len() + 1).sum();
+        assert!(full > 2 * short, "full {full} B vs short {short} B");
+    }
+
+    /// `entry_lines` is the `help <verb>` body: first row `<name padded> <text>`, every
+    /// continuation row indented to the text column, no row wider than the wrap
+    /// width unless a single word is, and re-joining the text reproduces `help_line`
+    /// byte-for-byte — for EVERY verb, so the wrap is provably lossless and stable.
+    #[test]
+    fn entry_lines_wrap_every_verb_deterministically_and_losslessly() {
+        let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
+        let text_width = ENTRY_WRAP_COLUMNS - CATALOG_TEXT_COLUMN;
+        for s in VERBS {
+            let lines = s.entry_lines();
+            assert!(!lines.is_empty());
+            let head = format!("{:<28} ", s.name);
+            assert!(
+                lines[0].starts_with(&head),
+                "{}: first row leads with the name",
+                s.name
+            );
+            let mut texts = vec![lines[0][head.len()..].to_string()];
+            for l in &lines[1..] {
+                assert!(
+                    l.starts_with(&gutter),
+                    "{}: continuation row not indented",
+                    s.name
+                );
+                assert!(
+                    !l[gutter.len()..].starts_with(' '),
+                    "{}: doubled indent",
+                    s.name
+                );
+                texts.push(l[gutter.len()..].to_string());
+            }
+            for l in &lines {
+                let chars = l.chars().count();
+                let one_word = !l.trim_start().contains(' ');
+                assert!(
+                    chars <= ENTRY_WRAP_COLUMNS || one_word,
+                    "{}: row of {chars} chars breaks the {ENTRY_WRAP_COLUMNS}-column wrap: {l:?}",
+                    s.name
+                );
+            }
+            for t in &texts {
+                assert!(
+                    !t.is_empty() && t.trim() == t,
+                    "{}: ragged wrap chunk {t:?}",
+                    s.name
+                );
+                // Greedy: a chunk only ends because the next word would not fit.
+                assert!(t.chars().count() <= text_width || !t.contains(' '));
+            }
+            assert_eq!(texts.join(" "), s.help_line(), "{}: wrap lost text", s.name);
+            assert_eq!(
+                s.entry_lines(),
+                lines,
+                "{}: wrap is not deterministic",
+                s.name
+            );
+        }
+        // A short verb is exactly its one full-catalog row; a long one wraps.
+        let one = spec("lines").unwrap();
+        assert_eq!(one.entry_lines(), vec![catalog_row("lines", one.summary)]);
+        assert!(spec("image").unwrap().entry_lines().len() > 5);
     }
 
     /// The §6 terminology rule: the catalog uses "connection" for BOTH network
@@ -1111,16 +1643,79 @@ mod tests {
     #[test]
     fn connection_help_terminology_never_overloads_the_bare_word() {
         for v in ["connect", "disconnect", "flows", "raise", "spawn"] {
+            let help = spec(v).unwrap().help_line();
             assert!(
-                spec(v).unwrap().help.contains("session connection")
-                    || spec(v).unwrap().help.contains("session-connection"),
+                help.contains("session connection") || help.contains("session-connection"),
                 "{v} help must say \"session connection\""
             );
         }
         for v in ["dial-list", "dial-token"] {
             assert!(
-                spec(v).unwrap().help.contains("network-drive connection"),
+                spec(v)
+                    .unwrap()
+                    .help_line()
+                    .contains("network-drive connection"),
                 "{v} help must say \"network-drive connection\""
+            );
+        }
+    }
+
+    /// The placement columns are documented where the wire is (F2/F5): `sessions`
+    /// spells every `window=` value, says a headless instance is `window=0` (it
+    /// owns logical window 0, the one `dims` names) and NOT `none`, and names
+    /// the sanitized `detail=`; `status` says why it carries no `window=` (it is
+    /// polled, and the window lives on the main thread). Pinned so the help a
+    /// reader is handed cannot drift from what the verbs do.
+    #[test]
+    fn placement_columns_are_documented_on_the_roster_and_not_on_status() {
+        let sessions = spec("sessions").expect("sessions is in the table");
+        assert!(
+            sessions
+                .summary
+                .ends_with("meta= window= active= wfocus= detail="),
+            "{}",
+            sessions.summary
+        );
+        for phrase in [
+            "`window=<id|none|->`",
+            "`none` = a session no window holds",
+            "`-` = the main thread could not be asked",
+            "A `--headless` instance owns one logical window, id 0",
+            "`window=0 geometry=headless`",
+            "so its sessions read `window=0`, never `none`",
+            "`active=<1|0|->`",
+            "`wfocus=<1|0|->`",
+            "`detail=<pct|->`",
+            "never an argument",
+            "a COMPOUND command's first word is the shell keyword that opens",
+        ] {
+            assert!(
+                sessions.detail.contains(phrase),
+                "sessions detail lacks {phrase:?}"
+            );
+        }
+        let status = spec("status").expect("status is in the table");
+        assert!(
+            status
+                .detail
+                .contains("No `window=` here: `status` is polled"),
+            "status must say why it carries no window="
+        );
+        assert!(
+            status
+                .detail
+                .contains("`detail=` is the sanitized RUNNING command"),
+            "status documents the populated detail="
+        );
+        // Honesty (Phase 4): `detail=` is the first WORD, and for a compound
+        // command that word is the shell keyword — measured `for i in 1 2 3;
+        // do ...; done` → `detail=for`. Both entries must say so, or the help
+        // promises a program name the reducer never produces.
+        for entry in [sessions, status] {
+            assert!(
+                entry.detail.contains("`for i in 1 2 3; do ...; done`"),
+                "{} must name the measured compound-command reading",
+                entry.name
             );
         }
     }
@@ -1143,6 +1738,7 @@ mod tests {
                 "operator-propose-bin",
                 "sessions",
                 "who",
+                "exits",
                 "whoami",
                 "grant",
                 "revoke",
@@ -1192,5 +1788,64 @@ mod tests {
         // scroll/select stay Read — viewport nav is part of reading, nothing leaves.
         assert_eq!(spec("scroll").unwrap().op, OpClass::Read);
         assert_eq!(spec("select").unwrap().op, OpClass::Read);
+    }
+
+    /// The FULL catalog is a wire surface (`help --full`, `aterm help introspection`),
+    /// pinned byte-for-byte to a GENERATED fixture. The fixture was first captured
+    /// from the one-string `help` field before it was split into `summary` + `detail`,
+    /// then regenerated ON PURPOSE once the split reworded six rows (`help`, `verbs`,
+    /// `status`, `turn`, `lease`, `trail`) whose first sentence ran past the summary
+    /// cap; every other row is that capture verbatim, so the pin is the proof that the
+    /// split lost nothing anywhere else. Regenerate ONLY after a deliberate wording
+    /// change, with the `#[ignore]`d writer below.
+    const HELP_CATALOG_FULL_GOLDEN: &str = include_str!("../tests/fixtures/help_catalog_full.txt");
+
+    /// The fixture's exact shape: every full catalog line, `\n`-terminated.
+    fn rendered_full_catalog() -> String {
+        let mut s = String::new();
+        for line in catalog_lines_full() {
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn full_catalog_matches_the_generated_golden() {
+        let got = rendered_full_catalog();
+        assert!(
+            !HELP_CATALOG_FULL_GOLDEN.is_empty(),
+            "the golden fixture is empty — it was never generated"
+        );
+        // Name the first differing line so a failure reads as a diff, not a wall.
+        for (i, (g, w)) in got
+            .lines()
+            .zip(HELP_CATALOG_FULL_GOLDEN.lines())
+            .enumerate()
+        {
+            assert_eq!(
+                g,
+                w,
+                "full catalog line {} drifted from the golden (regenerate on purpose with \
+                 `targo --unverified test -p aterm-types --lib -- --ignored regen_help_catalog_golden`)",
+                i + 1
+            );
+        }
+        assert_eq!(
+            got, HELP_CATALOG_FULL_GOLDEN,
+            "full catalog and the golden differ in length"
+        );
+    }
+
+    /// Writes the golden. Ignored so a routine test run can never rewrite the pin;
+    /// run it by name after a DELIBERATE change to a verb's wording.
+    #[test]
+    #[ignore = "rewrites tests/fixtures/help_catalog_full.txt; run by name on purpose"]
+    fn regen_help_catalog_golden() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/help_catalog_full.txt"
+        );
+        std::fs::write(path, rendered_full_catalog()).expect("write the golden fixture");
     }
 }

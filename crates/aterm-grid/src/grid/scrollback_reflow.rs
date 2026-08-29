@@ -13,7 +13,7 @@
 //! per-character attributes, and hyperlinks in both directions.
 
 use aterm_rle::Rle;
-use aterm_scrollback::{CellAttrs, HyperlinkSpan, Line, UnderlineColorSpan};
+use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
 
 use super::Grid;
 
@@ -379,7 +379,10 @@ pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -
 ///     `rewrap_preserves_stored_ambiguous_width_with_narrow_control`,
 ///   * no hyperlink / SGR-58 underline-colour spans: rebuild re-derives and
 ///     may re-coalesce span lists; keeping them out makes clone == rebuild
-///     cell-for-cell with no normalization questions.
+///     cell-for-cell with no normalization questions,
+///   * no inline-image spans: a clone would carry a footprint UNCLIPPED past
+///     the new right margin, while the rebuild path clips it there — the same
+///     rule a live placement follows at a narrower window.
 ///
 /// Everything else takes the full decompose+rebuild path unchanged. Attribute
 /// CONTENT needs no gating: the rebuild copies per-cell attrs verbatim, so a
@@ -390,6 +393,7 @@ fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
         || line
             .underline_colors()
             .is_some_and(|spans| !spans.is_empty())
+        || line.has_images()
     {
         return false;
     }
@@ -418,6 +422,10 @@ fn emit_logical_line<'a>(
     out: &mut Vec<Line>,
 ) {
     units.clear();
+    // Where THIS logical line's output starts, so its inline images can be
+    // re-attached to the segment that keeps their columns (see
+    // `carry_image_spans`).
+    let first_out = out.len();
     for line in run {
         collect_units(line, units);
         if units.len() >= MAX_LOGICAL_WIDTH {
@@ -426,8 +434,12 @@ fn emit_logical_line<'a>(
     }
 
     if units.is_empty() {
-        // Preserve a blank logical line (e.g. an empty hard-newline row).
+        // Preserve a blank logical line (e.g. an empty hard-newline row) —
+        // which is also exactly what an IMAGE row is: `place_image` writes no
+        // glyph, so a row carrying only a picture decomposes into no units at
+        // all and its whole content is the image spans carried below.
         out.push(Line::new());
+        carry_image_spans(run, new_cols, out, first_out);
         return;
     }
 
@@ -449,6 +461,52 @@ fn emit_logical_line<'a>(
         idx += 1;
     }
     out.push(build_line(&units[seg_start..], !first));
+    carry_image_spans(run, new_cols, out, first_out);
+}
+
+/// Re-attach a logical line's inline-image spans to the rewrapped output,
+/// clipped to the new width.
+///
+/// The FIRST output segment is the one that keeps logical columns
+/// `[0, new_cols)`, which is where the image was: a placement is anchored at an
+/// absolute column of the row it was stamped on, and the rewrap's first segment
+/// re-emits exactly that prefix. Clipping the end column there matches what the
+/// live grid does at a narrower window — the tail tiles clip at the right
+/// margin rather than wrapping onto a row nobody placed them on (the rule
+/// `place_image` already documents for an over-wide footprint).
+///
+/// SCOPE — a multi-line logical run (a soft-wrapped paragraph that ALSO carries
+/// a picture) drops the images of its continuation lines. Those lines' columns
+/// are re-bucketed by the wrap, so there is no segment whose column range still
+/// describes the footprint, and inventing one would move the picture. It cannot
+/// arise from a placement on its own rows — `place_image` line-feeds between
+/// footprint rows, a hard newline, so every image row is its own logical line
+/// (`run.len() == 1`, the exact case this handles) — only from an image stamped
+/// onto a row whose TEXT then soft-wrapped.
+fn carry_image_spans(run: &[Line], new_cols: u16, out: &mut [Line], first_out: usize) {
+    let [line] = run else {
+        return;
+    };
+    let Some(spans) = line.images() else {
+        return;
+    };
+    let Some(target) = out.get_mut(first_out) else {
+        return;
+    };
+    let clipped: Vec<ImageSpan> = spans
+        .iter()
+        .filter(|span| span.start_col < new_cols)
+        .map(|span| {
+            ImageSpan::new(
+                span.start_col,
+                span.end_col.min(new_cols),
+                span.image_row,
+                span.first_cell_col,
+                std::sync::Arc::clone(&span.image),
+            )
+        })
+        .collect();
+    target.set_images(clipped);
 }
 
 /// Decompose a [`Line`] into per-display-cell units (text + attrs + hyperlink).

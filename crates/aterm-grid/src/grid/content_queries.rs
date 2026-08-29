@@ -37,8 +37,12 @@ impl Grid {
         total += self.storage.ring_extras.capacity()
             * std::mem::size_of::<Option<Box<super::scroll_convert::ScrolledRowExtras>>>();
         for entry in &self.storage.ring_extras {
-            if entry.is_some() {
+            if let Some(extras) = entry {
                 total += std::mem::size_of::<super::scroll_convert::ScrolledRowExtras>();
+                // Shallow is fine for the tens of bytes a hyperlink adds and
+                // wrong by megabytes for a picture, so an image-bearing ring row
+                // charges its share of the payload (see `image_bytes`).
+                total += extras.image_bytes();
             }
         }
         // Staged-but-undrained scroll-off lines (Wave-3 adversarial review):

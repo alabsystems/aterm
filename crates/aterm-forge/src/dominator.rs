@@ -18,14 +18,23 @@ use crate::model::{CellSurvey, PkgId};
 use std::collections::BTreeSet;
 
 /// What falls if one package falls.
+///
+/// THIRD-PARTY ONLY, and the qualifier had to be added the hard way. See
+/// [`dom_against`]: a first-party workspace member reached ONLY through
+/// third-party parents is a real thing now — `[patch.crates-io]` puts
+/// `crates/aterm-profiling` and `crates/aterm-arrayvec` under `wgpu` and
+/// nowhere else — and counting those lines billed aterm's own code to the
+/// dependency that "costs" it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DomCost {
-    /// Packages removed, INCLUDING the target. A leaf nobody else needs costs
-    /// 1, never 0 — `dom(libc) = 1 / 127,772` is a real, quotable number.
+    /// THIRD-PARTY packages removed, INCLUDING the target when the target is
+    /// itself third-party. A leaf nobody else needs costs 1, never 0 —
+    /// `dom(libc) = 1 / 127,772` is a real, quotable number.
     pub pkgs: usize,
     /// Physical `*.rs` lines summed over those packages.
     pub loc: u64,
-    /// The other packages that fall with it, sorted. Empty for a leaf.
+    /// The other THIRD-PARTY packages that fall with it, sorted. Empty for a
+    /// leaf.
     pub also: Vec<PkgId>,
 }
 
@@ -60,6 +69,29 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
     // `BTreeSet::difference` yields ascending order, so `also` is sorted by
     // construction rather than by a second pass.
     for id in base.difference(&without) {
+        // FIRST-PARTY REMOVALS ARE NOT A THIRD-PARTY COST, and this filter is
+        // the whole of that correction. It did not matter until a workspace
+        // member could be reached ONLY through third-party parents, which is
+        // exactly what `[patch.crates-io]` creates: `crates/aterm-profiling`
+        // and `crates/aterm-arrayvec` hang under `wgpu`/`naga` and under
+        // nothing else, so blocking `wgpu` removed them too and their 1,815
+        // lines were added to wgpu's bill. Two symptoms, both real: `wgpu` was
+        // reported 1,815 lines and 2 packages more expensive than it is, and
+        // the survey's own PARTITION CHECK went red — 37 non-nested rows
+        // covering 103 packages / 1,489,245 LOC against a cell holding 101 /
+        // 1,487,430. The check was right; the arithmetic was wrong.
+        //
+        // This is the same class of error `measured::MAC_ARM_DOMINATORS`
+        // records for `loc::package_dir` (measuring our facade as upstream's
+        // crate): first-party lines counted as third-party surface. Both
+        // directions of it flatter the campaign, so both are worth a comment.
+        //
+        // A package with no `facts` entry is counted IN, unchanged: that is a
+        // measurement gap, not evidence of first-partyness, and treating it as
+        // ours would hide it.
+        if s.facts.get(id).is_some_and(|f| !f.is_third_party) {
+            continue;
+        }
         cost.pkgs += 1;
         cost.loc += s.facts.get(id).map_or(0, |f| f.loc);
         if id != target {
@@ -94,11 +126,24 @@ mod tests {
     }
 
     fn find(s: &CellSurvey, name: &str) -> PkgId {
-        let mut hits: Vec<&PkgId> = s.graph.nodes.iter().filter(|p| p.name == name).collect();
+        find_at(s, name, None)
+    }
+
+    /// `find`, with an optional version for the names that resolve twice.
+    /// Passing `None` still ASSERTS uniqueness rather than picking one: a name
+    /// that quietly became ambiguous is a graph change worth failing on.
+    fn find_at(s: &CellSurvey, name: &str, version: Option<&str>) -> PkgId {
+        let mut hits: Vec<&PkgId> = s
+            .graph
+            .nodes
+            .iter()
+            .filter(|p| p.name == name && version.is_none_or(|v| p.version == v))
+            .collect();
         assert_eq!(
             hits.len(),
             1,
-            "`{name}` must be unambiguous in this cell, got {hits:?}"
+            "`{name}`{} must be unambiguous in this cell, got {hits:?}",
+            version.map_or(String::new(), |v| format!(" {v}"))
         );
         hits.pop().expect("checked above").clone()
     }
@@ -106,7 +151,7 @@ mod tests {
     /// Check one anchor against its row in `measured`, plus the shape rules
     /// every `DomCost` owes regardless of the numbers.
     fn assert_dom(s: &CellSurvey, want: Dom) {
-        let id = find(s, want.name);
+        let id = find_at(s, want.name, want.version);
         let cost = dom(s, &id);
         assert_eq!((cost.pkgs, cost.loc), (want.pkgs, want.loc), "dom({id})");
         assert_eq!(
@@ -189,10 +234,52 @@ mod tests {
         assert_eq!(dom(&s, &PkgId::new("shared", "1.0.0")).pkgs, 1);
     }
 
+    /// Blocking the root frees the WHOLE THIRD-PARTY SURFACE — 4 of the 5
+    /// nodes, not 5.
+    ///
+    /// It asserted 5 until `dom_against` stopped counting first-party
+    /// packages. The root is `aterm` itself, so the fifth node was aterm being
+    /// billed as a cost of depending on aterm. The new number is also the
+    /// stronger statement: `dom(root)` is now exactly `third_party().count()`,
+    /// which is asserted here rather than spelled as a literal, so the two
+    /// definitions of "the surface" cannot drift apart.
     #[test]
-    fn blocking_the_root_costs_the_whole_graph() {
+    fn blocking_the_root_costs_the_whole_third_party_surface() {
         let s = synthetic();
-        assert_eq!(dom(&s, &s.graph.root).pkgs, 5);
+        let d = dom(&s, &s.graph.root);
+        assert_eq!(d.pkgs, 4);
+        assert_eq!(d.pkgs, s.third_party().count());
+        assert_eq!(d.loc, s.third_party_loc());
+        assert!(
+            d.also.iter().all(|id| id.name != "root"),
+            "the root is not a third-party package that falls with itself"
+        );
+    }
+
+    /// THE FILTER IS ARMED. A first-party node reached only through a
+    /// third-party parent is precisely the shape `[patch.crates-io]` creates
+    /// (`crates/aterm-profiling` under `wgpu` and nothing else), and it is the
+    /// shape that made the real survey's partition check go red. Without a
+    /// fixture that HAS one, `dom_against`'s skip could be deleted and every
+    /// other test here would still pass.
+    #[test]
+    fn a_first_party_node_under_a_third_party_parent_is_not_billed_to_it() {
+        let mut s = synthetic();
+        // `only_b` is reachable from `b` alone; make it first-party, the way a
+        // patched-in replacement is.
+        let shim = PkgId::new("only_b", "1.0.0");
+        s.facts
+            .get_mut(&shim)
+            .expect("fixture has only_b")
+            .is_third_party = false;
+        // CONTROL: with it third-party (above), `b` costs 2 / 200.
+        let b = dom(&s, &PkgId::new("b", "1.0.0"));
+        assert_eq!(
+            (b.pkgs, b.loc),
+            (1, 100),
+            "a first-party package that falls with `b` is not part of what `b` costs"
+        );
+        assert!(b.also.is_empty(), "nor is it listed as also-removed");
     }
 
     #[test]
@@ -241,42 +328,6 @@ mod tests {
         assert!(dom(&s, &find(&s, "libc")).also.is_empty(), "libc is a leaf");
     }
 
-    /// DISCREPANCY, recorded rather than smoothed over. The design note records
-    /// `dom(ureq@3.3.0)` one package smaller than this checkout measures. The
-    /// whole difference is `percent-encoding 2.3.2`, whose ONLY parent in the
-    /// mac-arm graph is ureq itself — so it must fall with ureq. This test pins
-    /// both halves of that claim (`measured::MAC_ARM_UREQ` and
-    /// `measured::UREQ_DESIGN_NOTE`) so the next person to re-measure sees the
-    /// reason, not just a number that moved.
-    #[test]
-    fn ureq_costs_the_design_note_figure_plus_percent_encoding() {
-        let s = survey(0);
-        let ureq = find(&s, "ureq");
-        let pe = find(&s, "percent-encoding");
-        let parents: Vec<&PkgId> = s
-            .graph
-            .edges
-            .iter()
-            .filter(|(_, kids)| kids.contains(&pe))
-            .map(|(parent, _)| parent)
-            .collect();
-        assert_eq!(
-            parents,
-            vec![&ureq],
-            "percent-encoding hangs off ureq alone"
-        );
-
-        assert_dom(&s, measured::MAC_ARM_UREQ);
-        let cost = dom(&s, &ureq);
-        assert!(cost.also.contains(&pe));
-        // Subtracting the one contested package reproduces the recorded figure
-        // exactly, which is what makes this a bookkeeping delta and not a
-        // different graph.
-        let note = measured::UREQ_DESIGN_NOTE;
-        assert_eq!(cost.pkgs - 1, note.pkgs);
-        assert_eq!(cost.loc - s.facts[&pe].loc, note.loc);
-    }
-
     /// The linux anchors. `accesskit_unix` and `accesskit_winit` used to be
     /// pinned here too; dropping the `a11y-accesskit` default removed them from
     /// the graph outright, so this asserts they are ABSENT rather than cheap —
@@ -308,8 +359,10 @@ mod tests {
             );
         }
         assert!(
-            !s.graph.nodes.iter().any(|p| p.name == "accesskit"
-                && s.cell.triple.contains("darwin")),
+            !s.graph
+                .nodes
+                .iter()
+                .any(|p| p.name == "accesskit" && s.cell.triple.contains("darwin")),
             "macOS must not carry AccessKit — it has the native a11y-appkit path"
         );
     }

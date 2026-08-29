@@ -76,7 +76,19 @@ const SHIPPED_METRICS: &[&str] = &[
 ];
 /// Metrics measured for the `lock` scope (the whole `Cargo.lock`, every target).
 const LOCK_METRICS: &[&str] = &["packages", "third_party_packages"];
-/// Metrics measured for the `patch` scope (`[patch.crates-io]`).
+/// Metrics measured for the `patch` scope — the VENDORED arm of
+/// `[patch.crates-io]`.
+///
+/// SCOPE, deliberately: a fork is third-party code aterm took over and must
+/// keep reviewing forever, and bounding that is what this ratchet is for. A
+/// patch entry pointing at a first-party workspace member is aterm's own
+/// crate; counting it here would fire the gate on the growth of aterm itself
+/// and demand an 80-character justification for it — the exact failure the
+/// `shipped.<triple> packages` and `lock packages` rows are left unseeded to
+/// avoid (see the module docs above). A first-party replacement is still
+/// checked end to end elsewhere: `cargo forge attest` [OB-1]/[OB-2] and
+/// `cargo forge check` [OB-12] hold it to existing and to being live in every
+/// cell, and a NOT-LIVE note is emitted below for every patch entry alike.
 const PATCH_METRICS: &[&str] = &["entries", "live_entries"];
 
 /// One ratchet row.
@@ -380,13 +392,37 @@ fn measure(root: &Path) -> Result<Live, String> {
 
     let lock = crate::policy::lock_entries(root)?;
     let patches = crate::policy::patch_entries(root)?;
-    let patch_names: Vec<&str> = patches.iter().map(|p| p.name.as_str()).collect();
-    // A lock entry with no `source` is a PATH package: a workspace member, or a
-    // `[patch]` fork. The forks are third-party code aterm now maintains, so
-    // they count as third-party here exactly as they do in a shipped cell.
+    // A lock entry with no `source` is a PATH package, and there are now THREE
+    // kinds of those, not two.
+    //
+    //   * an ordinary workspace member                     -> aterm's own
+    //   * a VENDORED `[patch]` fork under vendor/          -> THIRD-PARTY
+    //   * a FIRST-PARTY `[patch]` replacement under crates/ -> aterm's own
+    //
+    // A vendored fork is upstream source aterm now maintains and must keep
+    // reviewing, so it counts as third-party here exactly as it does in a
+    // shipped cell. A first-party replacement is a crate aterm WROTE, and
+    // counting it as third-party was the same category error this ratchet's
+    // `patch entries` row was rescoped for on 2026-08-28 (see the reason column
+    // on that row in tools/forge-budget.tsv). It was invisible while `tracing`
+    // was the only such target — 513 was measured WITH it counted — and it
+    // surfaced the moment four more landed: the row read 514 and went RED for a
+    // change that removed four third-party packages from the lock and added
+    // none.
+    //
+    // SCOPE RESTATED, not silently moved, per this file's own protocol: under
+    // the OLD definition the live value is 514 against a ceiling of 513 and the
+    // row is RED; under this one it is 509 and GREEN with slack 4. The ceiling
+    // is deliberately NOT lowered here — `--update` is the only thing that
+    // edits the file, and lowering it is a separate, deliberate act.
+    let vendored_patch_names: Vec<&str> = patches
+        .iter()
+        .filter(|p| p.is_vendored())
+        .map(|p| p.name.as_str())
+        .collect();
     let workspace = lock
         .iter()
-        .filter(|e| e.source.is_none() && !patch_names.contains(&e.name.as_str()))
+        .filter(|e| e.source.is_none() && !vendored_patch_names.contains(&e.name.as_str()))
         .count();
     live.scopes.push("lock".to_string());
     live.set("lock", "packages", u(lock.len()));
@@ -397,12 +433,28 @@ fn measure(root: &Path) -> Result<Live, String> {
     );
 
     live.scopes.push("patch".to_string());
-    live.set("patch", "entries", u(patches.len()));
+    let vendored: Vec<&crate::policy::PatchEntry> =
+        patches.iter().filter(|p| p.is_vendored()).collect();
+    live.set("patch", "entries", u(vendored.len()));
     live.set(
         "patch",
         "live_entries",
-        u(patches.iter().filter(|p| p.is_live()).count()),
+        u(vendored.iter().filter(|p| p.is_live()).count()),
     );
+    for p in patches.iter().filter(|p| !p.is_vendored()) {
+        live.notes.push(format!(
+            "FIRST-PARTY PATCH (not counted in the `patch` ratchet, which bounds third-party \
+             fork surface): {} → {} at {}, {}. It is aterm's own crate; `cargo forge attest` \
+             [OB-1]/[OB-2] and `cargo forge check` [OB-12] are what hold it to being present \
+             and live.",
+            p.name,
+            p.path,
+            p.manifest_version,
+            if p.is_live() { "LIVE" } else { "NOT LIVE" }
+        ));
+    }
+    // Liveness notes below cover EVERY entry: a dead patch compiles into
+    // nothing whoever wrote it.
     for p in &patches {
         if !p.is_live() {
             live.notes.push(format!(

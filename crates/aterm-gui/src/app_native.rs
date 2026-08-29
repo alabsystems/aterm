@@ -216,9 +216,16 @@ pub(crate) const NATIVE_UPDATE_WORKER_CAPACITY: usize = 1;
 /// Result of reducing worker-collected disk facts on the event loop. Active updater
 /// work defers the owned facts without rereading disk; otherwise presentation must use
 /// only the returned effective reducer stage, never the stale trigger payload.
+///
+/// `Deferred` carries its facts BOXED. The parked observation is the rare arm — it
+/// happens only while a check or an apply is already in flight — and the whole
+/// [`NativeUpdateReconcileFacts`] payload is several hundred bytes of durable-status
+/// and installed-bundle strings, which every `IgnoredStale`/`Reduced` return would
+/// otherwise have to move too. One allocation on the rare path in exchange for a
+/// small return value on the common ones.
 pub(crate) enum NativeUpdateFactsResult {
     IgnoredStale,
-    Deferred(NativeUpdateReconcileFacts),
+    Deferred(Box<NativeUpdateReconcileFacts>),
     Reduced {
         effective_stage: Option<crate::native_updater_service::StagedUpdate>,
     },
@@ -410,7 +417,7 @@ const MAX_PHYSICAL_FAILURE_CYCLES: u8 = 2;
 
 /// Physical failures counted in ONE epoch: the initial failure plus its
 /// [`MAX_PHYSICAL_FAILURE_CYCLES`] retries.
-const PHYSICAL_FAILURES_PER_EPOCH: u8 = MAX_PHYSICAL_FAILURE_CYCLES + 1;
+pub(crate) const PHYSICAL_FAILURES_PER_EPOCH: u8 = MAX_PHYSICAL_FAILURE_CYCLES + 1;
 
 /// How many whole epochs an artifact gets before automatic apply gives up on
 /// those exact bytes.
@@ -441,7 +448,7 @@ const MAX_PHYSICAL_FAILURE_EPOCHS: u8 = 3;
 /// Nine, and after the ninth [`App::spend_physical_failure_budget`] answers
 /// `retry_at: None` — the deadline-less latch that `arm` reads as
 /// `SuppressManualOnly` until a strictly newer build ships or the app relaunches.
-const PHYSICAL_FAILURE_LIFETIME_ATTEMPTS: u8 =
+pub(crate) const PHYSICAL_FAILURE_LIFETIME_ATTEMPTS: u8 =
     PHYSICAL_FAILURES_PER_EPOCH * MAX_PHYSICAL_FAILURE_EPOCHS;
 
 /// Total physical failures a STRUCTURALLY-shaped artifact may cost before
@@ -470,12 +477,88 @@ const PHYSICAL_FAILURE_LIFETIME_ATTEMPTS: u8 =
 /// losing a race with a resize reports. One retry, ten minutes out, separates
 /// those at a cost of one round trip. A third would be spending round trips to
 /// re-confirm a verdict already confirmed.
-const STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS: u8 = 2;
+pub(crate) const STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS: u8 = 2;
+
+/// Whole epochs an artifact gets when its handoff failure is UNEXPLAINED — the
+/// candidate closed the readiness channel and the parent could observe nothing
+/// about why (see [`crate::ChildDeathEvidence::Unobserved`]).
+///
+/// THIS IS THE LANE A `ChildDied` LANDS IN WHENEVER THE EVIDENCE RUNS OUT, and on
+/// the shipping macOS lane that is still the commonest outcome: a candidate that
+/// refuses closes the readiness channel and then keeps running for as long as it
+/// takes to unwind, so the pre-kill look often finds it alive and the status that
+/// comes back afterwards is this process's own SIGKILL. Sizing it is therefore
+/// sizing the DEFAULT, not an exotic corner.
+///
+/// TWO, AND THE SECOND ONE IS THE ENTIRE POINT. An epoch is a re-sample of the
+/// MACHINE, and the machine is exactly what an unexplained `ChildDied` might be
+/// about: the field case that produced this classification was a child starved on
+/// a desk carrying a load average of 140-160, and the retry that finally worked
+/// was the one taken after that load stopped — HOURS later, not the 600 s and
+/// 1800 s rungs inside the first epoch, which sampled the same pathological hour
+/// three times. One [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`] is the minimum that can
+/// separate "this machine was having a bad hour" from "this successor will not
+/// boot", and it is also the maximum worth spending on a verdict this weak: a
+/// third epoch would be re-asking a question two independent samples have already
+/// answered.
+const UNEXPLAINED_FAILURE_EPOCHS: u8 = 2;
+
+/// Total physical failures an artifact may cost while every one of them is
+/// UNEXPLAINED. Six, across ~7.7 hours (40 min of epoch, one 6 h stand-down, then
+/// 40 min more), after which automatic apply is done with those exact bytes.
+///
+/// STRICTLY BETWEEN THE OTHER TWO, WHICH IS THE WHOLE OF THE POLICY. An
+/// unexplained failure is not a `TimedOut` — nothing about it says the machine
+/// merely missed a deadline, and it may perfectly well be a successor that refuses
+/// to boot — so it does not get the transient lane's nine attempts and fourteen
+/// hours. Nor is it an `AdoptionMismatch` — no observation supports converging
+/// after one confirming retry — so it does not get the structural lane's two. The
+/// asserts below are what stop a later edit from collapsing it into either.
+///
+/// AND IT FORGIVES ITS COUNTED TRIAL LAUNCH, which is what makes six attempts
+/// safe to spend at all: `MAX_BOOT_ATTEMPTS` is 3, so a shape that both retried
+/// six times AND kept every counted launch would revert the bundle and poison the
+/// build on its third attempt — the precise defect `forgive_trial_launch_if_advanced`
+/// exists to prevent, arriving through the new lane instead of the old one. Only
+/// [`PhysicalFailureShape::Structural`] keeps its count, and the assert above ties
+/// that budget to `MAX_BOOT_ATTEMPTS` so the two can never diverge again.
+pub(crate) const UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS: u8 =
+    PHYSICAL_FAILURES_PER_EPOCH * UNEXPLAINED_FAILURE_EPOCHS;
+
+/// A `ChildDied` this lane calls STRUCTURAL keeps its counted boot-trial launch
+/// (`app_update_handoff`'s reject path forgives every other shape), so its whole
+/// lifetime budget is spent against the SAME counter the boot sentinel reverts on.
+/// Converging strictly sooner than `MAX_BOOT_ATTEMPTS` is what makes those two
+/// budgets composable instead of adversarial: without it a retry schedule can walk
+/// a build to the revert threshold and poison bytes that never failed, which is
+/// exactly what `forgive_trial_launch_if_advanced` was added to prevent.
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    (STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS as u32) < aterm_update::MAX_BOOT_ATTEMPTS,
+    "a structural handoff failure keeps its counted trial launch, so its budget \
+     must converge before the boot sentinel would revert the bundle"
+);
 
 const _: () = assert!(
     STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS < PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
     "the structural lane exists to converge SOONER than the transient one; at \
      parity the classification is decoration"
+);
+
+const _: () = assert!(
+    STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS < UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS
+        && UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS < PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+    "an unexplained failure is a weaker verdict than either of the ones the \
+     parent can actually prove; its budget has to sit between them or the \
+     three-way classification is decoration"
+);
+
+const _: () = assert!(
+    UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS > PHYSICAL_FAILURES_PER_EPOCH,
+    "an unexplained failure must be able to REACH the stand-down. Its whole \
+     premise is that the machine may be what failed, and only a second epoch \
+     samples a different machine; a budget that converges inside the first epoch \
+     re-asks the same bad hour and calls the answer evidence"
 );
 
 const _: () = assert!(
@@ -624,10 +707,18 @@ pub(crate) enum PhysicalFailureShape {
     /// belongs to the bytes rather than to the afternoon. Converges after
     /// [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`].
     Structural,
+    /// SOMETHING ENDED THE CANDIDATE AND THE PARENT DID NOT SEE WHAT. Not a third
+    /// kind of failure — a failure whose kind is UNKNOWN, which is a different
+    /// thing and must not be filed as either of the two the parent can prove.
+    /// Rides the epoch machinery (the machine is one of the things it may be) on
+    /// the shorter [`UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS`] budget (a successor
+    /// that will not boot is the other).
+    Unexplained,
 }
 
 impl PhysicalFailureShape {
-    /// Classify one worker outcome.
+    /// Classify one worker outcome, with whatever the worker OBSERVED about a
+    /// candidate that died.
     ///
     /// STRUCTURAL, and why each one earns it:
     ///   * `AdoptionMismatch` — the child proved a PTY set the parent does not
@@ -638,11 +729,7 @@ impl PhysicalFailureShape {
     ///   * `PreparationFailed` — raised entirely BEFORE the spawn, and its
     ///     dominant producer is the staged candidate failing pre-park
     ///     verification. A bundle that fails `codesign` fails it again in six
-    ///     hours;
-    ///   * `ChildDied` — the candidate exited before writing its readiness proof.
-    ///     That is the successor image refusing to boot as a successor (a
-    ///     malformed inherited handoff, a prearm refusal), which is the strongest
-    ///     statement about the new bytes available at this seam.
+    ///     hours.
     ///
     /// TRANSIENT is the rest, and deliberately includes the two that are facts
     /// about a moment: `TimedOut` (a 15 s deadline covering a cold boot, a
@@ -652,18 +739,134 @@ impl PhysicalFailureShape {
     /// `ProofReady` cannot reach a failure lane at all; it fails closed to the
     /// forgiving shape rather than converging an artifact on a state nobody
     /// understands.
+    ///
+    /// `ChildDied` IS NOT IN EITHER LIST ANY MORE, and that is this function's
+    /// finding. It used to be the third structural member, arguing that a
+    /// candidate which exited before writing its readiness proof was "the successor
+    /// image refusing to boot as a successor … the strongest statement about the
+    /// new bytes available at this seam". The field refuted it as a UNIVERSAL
+    /// reading (see [`crate::ChildDeathEvidence`]): a child starved of CPU also
+    /// exits before writing a readiness proof — it never ran — and the same bytes
+    /// that produced two `ChildDied` verdicts under a load average of 140-160
+    /// applied with no intervention once the load stopped. The doc immediately
+    /// above had ALREADY conceded the general point for `TimedOut`; `ChildDied` was
+    /// simply never revisited. So the outcome no longer decides on its own —
+    /// [`Self::of_child_death`] reads the evidence, and the absence of evidence is
+    /// itself a state rather than a verdict.
     #[must_use]
-    fn of_outcome(outcome: crate::UpdateHandoffOutcome) -> Self {
+    fn of_outcome(outcome: crate::UpdateHandoffOutcome, death: crate::ChildDeathEvidence) -> Self {
         match outcome {
             crate::UpdateHandoffOutcome::AdoptionMismatch
-            | crate::UpdateHandoffOutcome::PreparationFailed
-            | crate::UpdateHandoffOutcome::ChildDied => Self::Structural,
+            | crate::UpdateHandoffOutcome::PreparationFailed => Self::Structural,
+            crate::UpdateHandoffOutcome::ChildDied => Self::of_child_death(death),
             crate::UpdateHandoffOutcome::TimedOut
             | crate::UpdateHandoffOutcome::Rejected
             | crate::UpdateHandoffOutcome::ActivityRevoked
             | crate::UpdateHandoffOutcome::ProofReady => Self::Transient,
         }
     }
+
+    /// THE ONE QUESTION THE EVIDENCE HAS TO ANSWER: did the successor IMAGE run
+    /// and DECIDE, or did something end a candidate that never got that far?
+    ///
+    ///   * `Exited` — the candidate reached an `exit` instruction, which a starved
+    ///     process never does. The CODE is not read: this tree's commonest refusal
+    ///     is a clean `0` (`main_entry` returns without a window when the overlap
+    ///     authority is incomplete), so treating a non-zero code as the structural
+    ///     one would classify exactly the wrong half. STRUCTURAL.
+    ///   * `Signalled` — split by WHO raised it. A fault is the image executing
+    ///     itself into a wall, which is the bytes; every other signal arrives from
+    ///     outside the image (macOS jetsam SIGKILLs under memory pressure, which is
+    ///     precisely the pathological-load state this classification exists for),
+    ///     which is the machine.
+    ///   * `Unobserved` — no statement either way. UNEXPLAINED: retried, bounded,
+    ///     converging.
+    ///
+    /// THERE IS NO ARM FOR "THE IMAGE STARTED", and its absence is deliberate. The
+    /// only fact the shipping macOS lane can gather without a witnessed status is
+    /// the boot sentinel's launch counter, and that counter moves at the FIRST
+    /// statement of the target's `main` — long before the rendezvous dial that a
+    /// `ChildDied` on that lane presupposes. It is therefore true of a starved
+    /// candidate and a refusing one alike, and filing it as STRUCTURAL reproduced
+    /// the field defect exactly. See [`crate::ChildDeathEvidence`].
+    ///
+    /// ALSO THE FORGIVENESS RULE. `app_update_handoff`'s reject path keeps a
+    /// counted boot-trial launch only for the deaths this function calls
+    /// `Structural` — the ones the bytes answer for — and the compile-time assert
+    /// beside [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`] keeps that budget strictly
+    /// under `MAX_BOOT_ATTEMPTS`, so no retry schedule can walk a healthy build
+    /// into a revert.
+    #[must_use]
+    pub(crate) fn of_child_death(death: crate::ChildDeathEvidence) -> Self {
+        match death {
+            crate::ChildDeathEvidence::Unobserved => Self::Unexplained,
+            crate::ChildDeathEvidence::Exited { .. } => Self::Structural,
+            crate::ChildDeathEvidence::Signalled { signal } => {
+                if signal_is_the_image_faulting(signal) {
+                    Self::Structural
+                } else {
+                    Self::Transient
+                }
+            }
+        }
+    }
+
+    /// How many failures for one artifact this shape may cost before automatic
+    /// apply is done with those exact bytes. The counter these are compared against
+    /// is shared and shape-blind (see [`App::spend_physical_failure_budget`]); only
+    /// the CEILING is a property of what the parent proved.
+    #[must_use]
+    pub(crate) const fn lifetime_attempts(self) -> u8 {
+        match self {
+            Self::Transient => PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+            Self::Structural => STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS,
+            Self::Unexplained => UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS,
+        }
+    }
+}
+
+/// Whether `signal` is one an image raises ON ITSELF by executing — a fault —
+/// rather than one delivered to it from outside.
+///
+/// THE DISTINCTION IS THE WHOLE CLASSIFICATION, so it is drawn by NAME and not by
+/// number: `SIGBUS` is 10 on macOS and 7 on Linux, and 7 on macOS is `SIGEMT`. A
+/// hand-rolled numeric set would have silently swapped "the image faulted" for
+/// "something killed it" on one of the two platforms this crate builds for.
+///
+/// The set is the synchronous exceptions both platforms name: an illegal
+/// instruction, a trap, an `abort()`, a floating-point exception, a bad memory
+/// access, an invalid address, and a bad system call. (`SIGEMT` is deliberately
+/// absent — libc defines it only for mips/sparc Linux, so naming it would cost the
+/// portability this function exists for, and no x86/ARM image raises it.)
+///
+/// Everything else — `SIGKILL` above all, which is what macOS jetsam sends a
+/// process it is reclaiming memory from, and which no process can raise on itself
+/// — is somebody else's decision about a process that may never have executed an
+/// instruction of its own.
+#[cfg(unix)]
+#[must_use]
+fn signal_is_the_image_faulting(signal: i32) -> bool {
+    matches!(
+        signal,
+        libc::SIGILL
+            | libc::SIGTRAP
+            | libc::SIGABRT
+            | libc::SIGFPE
+            | libc::SIGBUS
+            | libc::SIGSEGV
+            | libc::SIGSYS
+    )
+}
+
+/// Unreachable off unix — [`crate::ChildDeathEvidence::Signalled`] is produced only
+/// by the unix worker, and no other platform has a handoff candidate to reap. The
+/// answer is the FORGIVING one for the same reason `ProofReady` is: a shape
+/// invented for a state nobody understands must not be the one that converges an
+/// artifact.
+#[cfg(not(unix))]
+#[must_use]
+fn signal_is_the_image_faulting(_signal: i32) -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -688,12 +891,23 @@ impl HandoffFailureLane {
     /// observation (an activity-shaped rejection it recorded against this
     /// attempt); the worker's half is the `ActivityRevoked` outcome, and either
     /// one is enough. Both are meaningful only for a background attempt — a
-    /// person's apply deliberately does not arm the revocation watcher at all.
+    /// person's apply deliberately does not WAIT for a quiet epoch first. (It
+    /// still arms the revocation watcher: `Immediate` stamps `activity_epoch`,
+    /// hands the worker a live `cancel`, and gates Commit on `exact_activity`
+    /// exactly like every other lane.)
     ///
     /// THE OUTCOME IS NOW READ RATHER THAN DISCARDED. It used to reach this
     /// decision as a single `activity_revoked: bool` and stop there, so all four
     /// physical kinds were charged one schedule — the one written for the
     /// transient member of the set. See [`PhysicalFailureShape`].
+    ///
+    /// AND `death` IS THE SAME CORRECTION ONE LEVEL FURTHER DOWN. The outcome is a
+    /// total classification of what the WORKER did, but `ChildDied` is not a
+    /// classification of anything — it is proof EOF, which a refusing successor, a
+    /// faulting one and a starved one all produce identically. The evidence the
+    /// worker gathered at that instant is what separates them; see
+    /// [`crate::ChildDeathEvidence`]. Every other outcome ignores it, because every
+    /// other outcome describes a candidate THIS process ended.
     ///
     /// `CleanQuit` counts as person-initiated: it exists only because a human just
     /// quit the app, nothing re-attempts it on a timer, and the process is on its
@@ -704,6 +918,7 @@ impl HandoffFailureLane {
     pub(crate) fn classify(
         mode: crate::native_updater_service::ApplyMode,
         outcome: crate::UpdateHandoffOutcome,
+        death: crate::ChildDeathEvidence,
         revoked_by_activity: bool,
     ) -> Self {
         if !mode.is_automatic() {
@@ -712,7 +927,7 @@ impl HandoffFailureLane {
         if revoked_by_activity || outcome == crate::UpdateHandoffOutcome::ActivityRevoked {
             Self::ActivityRevoked
         } else {
-            Self::Physical(PhysicalFailureShape::of_outcome(outcome))
+            Self::Physical(PhysicalFailureShape::of_outcome(outcome, death))
         }
     }
 
@@ -823,7 +1038,17 @@ pub(crate) fn load_native_updater_service() -> NativeUpdaterService {
 }
 
 /// Bounded, owned result suitable for a typed event-loop wake.
+///
+/// Runs ONLY on a worker thread (the facts worker and the check worker), which is
+/// what lets it take the second ledger read below. `aterm_update` deliberately keeps
+/// the apply lane's REASONS out of `UpdateStatus` — the check lane and the apply lane
+/// fail independently — and exposes them through `apply_lane_report` instead. Every
+/// consumer that needs both is expected to read them side by side; this is that read,
+/// done once, here, so the event loop and every surface downstream see one owned value
+/// carrying the failure COUNT and the failure REASON together. Without it the window
+/// could say "two applies failed" but never why (2026-08-21 field report).
 pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> DurableUpdateStatus {
+    let apply_lane = aterm_update::apply_lane_report(status.current_build).unwrap_or_default();
     DurableUpdateStatus {
         enabled: status.enabled,
         current_build: status.current_build,
@@ -837,6 +1062,9 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         failing_persistent: status.failing_persistent,
         failing_kind: status.failing_kind,
         failing_applies: status.failing_applies,
+        apply_failure: apply_lane.last_failure,
+        apply_failure_build: apply_lane.last_failure_target_build,
+        apply_failures_for_target: apply_lane.failures_for_target,
         installable: status.installable,
         channel_unreadable: status.channel_unreadable,
     }
@@ -856,6 +1084,11 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         failing_persistent: false,
         failing_kind: String::new(),
         failing_applies: 0,
+        // Likewise: a worker that could not start says nothing about the apply lane,
+        // and inventing a reason here would attach it to a streak of zero.
+        apply_failure: String::new(),
+        apply_failure_build: 0,
+        apply_failures_for_target: 0,
         // A worker failure says nothing about the bundle; the installable claim is
         // only ever made by a real observation.
         installable: true,
@@ -1560,6 +1793,7 @@ impl App {
                 }
             }
             NativeUpdateFactsResult::Deferred(facts) => {
+                let facts = *facts;
                 self.deferred_native_update_reconcile =
                     Some(match self.deferred_native_update_reconcile.take() {
                         None => (purpose, facts),
@@ -4466,13 +4700,14 @@ impl App {
     /// Admit one Packages verb. Physical work (spawning the CO-LOCATED `atpkg`
     /// binary, reading its `status.toml`) always happens on a worker thread —
     /// this admission is memory-only plus one `current_exe`-sibling stat.
-    fn execute_native_packages(&mut self, request: PackagesRequest) -> PackagesOutcome {
+    /// `pub(crate)`: the first-launch admin card (`App::notice_click`) is the second
+    /// caller besides the Settings effect executor — same seam, same argv table.
+    pub(crate) fn execute_native_packages(&mut self, request: PackagesRequest) -> PackagesOutcome {
         let atpkg = crate::co_located_atpkg();
-        let verb: &[&str] = match request {
-            PackagesRequest::CheckUpdate => &["update"],
-            PackagesRequest::InstallDefaultSet => &["install", "--default-set"],
-            PackagesRequest::UninstallAll => &["uninstall", "--all"],
-        };
+        if let Err(message) = packages_request_admissible(&request) {
+            return PackagesOutcome::Failed { message };
+        }
+        let processes = packages_argv(&request);
         let Some(atpkg) = atpkg else {
             return PackagesOutcome::Failed {
                 message: "no co-located atpkg binary beside this executable".to_string(),
@@ -4491,11 +4726,7 @@ impl App {
                 message: "a packages operation is already running".to_string(),
             };
         }
-        let busy = match request {
-            PackagesRequest::CheckUpdate => PackagesBusy::Check,
-            PackagesRequest::InstallDefaultSet => PackagesBusy::Install,
-            PackagesRequest::UninstallAll => PackagesBusy::Uninstall,
-        };
+        let busy = packages_busy(&request);
         let Some(proxy) = self.proxy.clone() else {
             return PackagesOutcome::Failed {
                 message: "packages verbs require the event-loop service".to_string(),
@@ -4511,7 +4742,6 @@ impl App {
         };
         // The busy flip is observable: publish before the worker starts.
         self.publish_native_packages_state();
-        let verb: Vec<String> = verb.iter().map(ToString::to_string).collect();
         let spawn = std::thread::Builder::new()
             .name("aterm-packages-verb".into())
             .spawn(move || {
@@ -4525,50 +4755,72 @@ impl App {
                 // multi-GB download. Discarding it turned an explainable wait into
                 // "atpkg update exited with exit status: 1", repeated on every retry
                 // for as long as the download ran (2026-08-20 round-8 audit).
-                let result = std::process::Command::new(&atpkg)
-                    .args(&verb)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .output();
-                let said = result
-                    .as_ref()
-                    .ok()
-                    .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
-                    .unwrap_or_default();
-                let result = result.map(|out| out.status);
-                let command = match result {
-                    Ok(status) if status.success() => {
-                        PackagesCommandOutcome::Succeeded { operation: busy }
-                    }
-                    // EXIT 2 = "ran fine, installed nothing, and never will here"
-                    // (atpkg `cmd_install_default_set`: the signed index pins no
-                    // build for this machine's architecture). It is neither a
-                    // success nor a retryable failure, and reporting it as either
-                    // lies to the user — "install completed" over an empty store,
-                    // or a red error they will keep re-clicking. Give it its own
-                    // words.
-                    Ok(status) if status.code() == Some(2) => PackagesCommandOutcome::Failed {
-                        operation: busy,
-                        message: "Nothing was installed: the registry served no package \
-                                  this machine can run. This is not a temporary error — \
-                                  retrying will not change it."
-                            .to_string(),
-                    },
-                    Ok(status) => PackagesCommandOutcome::Failed {
-                        operation: busy,
-                        message: if said.is_empty() {
+                //
+                // ONE PROCESS PER ARGV, IN ORDER, STOPPING AT THE FIRST FAILURE: the
+                // admin door runs `clt` then `brew` as two `atpkg install` children
+                // (atpkg takes one program per invocation), and Homebrew's installer
+                // refuses without the Command Line Tools, so a failed first step
+                // ends the sequence with its own sentence rather than a second dialog.
+                let mut command = PackagesCommandOutcome::Succeeded { operation: busy };
+                for verb in &processes {
+                    // NO STDIN: a windowed child inherits whatever the app was launched
+                    // with (a Terminal's tty when run from one), and atpkg's door reads a
+                    // tty on stdin as "sudo may prompt here". The argv table always says
+                    // `--elevate=…` outright, and a null stdin makes the fallback the
+                    // deferred one too — a child can never sit on a prompt nobody sees.
+                    let result = std::process::Command::new(&atpkg)
+                        .args(verb)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .output();
+                    let said = result
+                        .as_ref()
+                        .ok()
+                        .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
+                        .unwrap_or_default();
+                    let result = result.map(|out| out.status);
+                    let failed = match result {
+                        Ok(status) if status.success() => None,
+                        // EXIT 2 = "ran fine, installed nothing, and never will here"
+                        // (atpkg `cmd_install_default_set`: the signed index pins no
+                        // build for this machine's architecture). It is neither a
+                        // success nor a retryable failure, and reporting it as either
+                        // lies to the user — "install completed" over an empty store,
+                        // or a red error they will keep re-clicking. Give it its own
+                        // words. (A single-program door exits 2 only for a usage
+                        // error, which the admission gate above already refused.)
+                        Ok(status)
+                            if status.code() == Some(2)
+                                && verb.iter().any(|v| v == "--default-set") =>
+                        {
+                            Some(
+                                "Nothing was installed: the registry served no package \
+                                 this machine can run. This is not a temporary error — \
+                                 retrying will not change it."
+                                    .to_string(),
+                            )
+                        }
+                        Ok(status) => Some(if said.is_empty() {
                             format!("atpkg {} exited with {status}", verb.join(" "))
                         } else {
                             // atpkg's own sentence, which names the cause and often
                             // the remedy — better than the exit code every time.
                             said.lines().last().unwrap_or(&said).to_string()
-                        },
-                    },
-                    Err(error) => PackagesCommandOutcome::Failed {
-                        operation: busy,
-                        message: format!("could not launch atpkg {}: {error}", verb.join(" ")),
-                    },
-                };
+                        }),
+                        Err(error) => Some(format!(
+                            "could not launch atpkg {}: {error}",
+                            verb.join(" ")
+                        )),
+                    };
+                    if let Some(message) = failed {
+                        command = PackagesCommandOutcome::Failed {
+                            operation: busy,
+                            message,
+                        };
+                        break;
+                    }
+                }
                 let report = crate::packages_screen::collect_packages_status(true);
                 let completion = PackagesWorkerCompletion::command(report, command);
                 let _ = proxy.send_event(Wake::NativePackagesFinished {
@@ -5207,7 +5459,10 @@ impl App {
         intent.build = attempt_build;
         self.auto_apply_intent = None;
         // A still-busy machine takes the lane that neither waits for idleness
-        // nor lets activity revoke the parked window; both are automatic.
+        // the same activity revocation every other lane does; both are automatic.
+        // (It used to say this lane does not let activity revoke the parked window.
+        // It does: `note_update_handoff_activity` is mode-blind by design, and
+        // `exact_activity` is a mandatory conjunct of Commit in every lane.)
         let outcome = self.apply_native_update(if quiet {
             ApplyMode::Automatic
         } else {
@@ -5569,7 +5824,7 @@ impl App {
         }
     }
 
-    fn publish_native_update_state(&mut self) {
+    pub(crate) fn publish_native_update_state(&mut self) {
         let snapshot = self.native_updater_service.snapshot();
         let revision = snapshot.revision;
         let checking = matches!(
@@ -5655,7 +5910,7 @@ impl App {
         if self.native_updater_service.snapshot().active.is_some()
             || self.native_updater_service.snapshot().phase == UpdaterPhase::Applying
         {
-            return NativeUpdateFactsResult::Deferred(facts);
+            return NativeUpdateFactsResult::Deferred(Box::new(facts));
         }
         // A READ THAT BEGAN BEFORE THIS PROCESS'S OWN STAGE IMPORT describes a disk
         // without that stage (the read spans a codesign; the check's wake can land
@@ -6105,25 +6360,34 @@ impl App {
     ///   * mid-epoch — retry in 600 s, then 1800 s;
     ///   * epoch spent — stand down [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`] and start
     ///     the next epoch with the full in-epoch schedule;
-    ///   * [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] spent — `retry_at: None`, the
-    ///     latch `arm` reads as `SuppressManualOnly` for these exact bytes until a
-    ///     strictly newer build ships or the app relaunches. Nine failures across
-    ///     three independent epochs and ~14 hours is evidence about the artifact,
-    ///     not about the machine's afternoon, and the user is told once (see
+    ///   * this SHAPE's [`PhysicalFailureShape::lifetime_attempts`] spent —
+    ///     `retry_at: None`, the latch `arm` reads as `SuppressManualOnly` for
+    ///     these exact bytes until a strictly newer build ships or the app
+    ///     relaunches. Nine failures across three independent epochs and ~14 hours
+    ///     is evidence about the artifact, not about the machine's afternoon, and
+    ///     the user is told once (see
     ///     [`App::physical_failure_deserves_a_pill`]) instead of every 40 minutes
-    ///     forever.
+    ///     forever. A shape that proved more converges sooner; one that proved
+    ///     less — [`PhysicalFailureShape::Unexplained`] — converges in between.
     ///
     /// Keyed by (build, dmg) so a different artifact starts clean, and gated by
     /// [`PHYSICAL_RETRY_BUDGET_REPLENISH`] so half a day with no physical failure
     /// at all for these bytes starts the whole schedule over.
     ///
-    /// `shape` chooses WHICH of the two answers above this failure has earned. The
-    /// counter itself is shared and shape-blind on purpose — it counts physical
-    /// failures for these exact bytes, which is a fact neither lane disputes — so
-    /// evidence carries across the classification in the direction that matters: a
-    /// structural failure arriving on an artifact that has already burned its
-    /// transient budget converges immediately rather than buying a fresh pair of
-    /// attempts.
+    /// `shape` chooses WHICH of the answers above this failure has earned, and it
+    /// does so ONLY through [`PhysicalFailureShape::lifetime_attempts`] and the
+    /// structural early return. The counter itself is shared and shape-blind on
+    /// purpose — it counts physical failures for these exact bytes, which is a fact
+    /// no shape disputes — so evidence carries across the classification in the
+    /// direction that matters: a structural failure arriving on an artifact that
+    /// has already burned its transient budget converges immediately rather than
+    /// buying a fresh pair of attempts, and six unexplained failures followed by a
+    /// proven structural one do not buy two more.
+    ///
+    /// [`PhysicalFailureShape::Unexplained`] rides the epoch machinery below rather
+    /// than the structural early return, and that is the point of it: an epoch is a
+    /// re-sample of the MACHINE, and an unexplained candidate death is exactly the
+    /// verdict that might be about the machine. It simply gets fewer epochs.
     fn spend_physical_failure_budget(
         &mut self,
         build: u64,
@@ -6149,23 +6413,25 @@ impl App {
         // one, so it is also this failure's 0-based lifetime index. Saturating
         // arithmetic keeps a `u8` that somehow ran away pinned at Converged rather
         // than wrapping back into a fresh budget.
-        if spent >= PHYSICAL_FAILURE_LIFETIME_ATTEMPTS.saturating_sub(1) {
+        if spent >= shape.lifetime_attempts().saturating_sub(1) {
             return PhysicalFailureSchedule::Converged;
         }
         if shape == PhysicalFailureShape::Structural {
-            // ONE CONFIRMING RETRY, THEN THE LANE IS DONE WITH THESE BYTES. The
-            // epoch machinery below is deliberately skipped rather than
-            // parameterized: an epoch is a re-sample of the MACHINE, and there is
-            // nothing about the machine left to re-sample once the candidate has
-            // told us twice that it cannot become this process's successor.
-            if spent >= STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS.saturating_sub(1) {
-                return PhysicalFailureSchedule::Converged;
-            }
-            // The same first rung as the transient schedule: the difference
-            // between the lanes is how many rungs there are, not how far apart the
-            // first two sit. Fail-closed if that rung is ever legislated away —
-            // converging is the safe answer for a structural failure with no
-            // schedule to ride.
+            // ONE CONFIRMING RETRY, THEN THE LANE IS DONE WITH THESE BYTES —
+            // and by now the retry is the only thing left to decide, because the
+            // shape's own ceiling was applied above.
+            //
+            // THE EPOCH MACHINERY BELOW IS SKIPPED, deliberately and only for this
+            // shape: an epoch is a re-sample of the MACHINE, and there is nothing
+            // about the machine left to re-sample once the candidate has told us
+            // twice that it cannot become this process's successor. (An UNEXPLAINED
+            // failure does ride it, precisely because the machine is still one of
+            // the things it might have been.)
+            //
+            // The same first rung as the transient schedule: the difference between
+            // the lanes is how many rungs there are, not how far apart the first two
+            // sit. Fail-closed if that rung is ever legislated away — converging is
+            // the safe answer for a structural failure with no schedule to ride.
             return automatic_retry_delay(0, AutomaticRetryKind::PhysicalFailure)
                 .map_or(PhysicalFailureSchedule::Converged, |delay| {
                     PhysicalFailureSchedule::Retry(now + delay)
@@ -6850,6 +7116,212 @@ impl App {
             && let Some(tab) = window.tab_set.tab_at_mut(index)
         {
             tab.presentation = presentation;
+        }
+    }
+}
+
+/// The exact argv of every `atpkg` process a [`PackagesRequest`] runs, one inner list
+/// per process, in order. THE table the Settings verbs and the first-launch admin card
+/// both go through; pinned verbatim by `packages_argv_is_pinned_per_request`, so a
+/// re-spelling of a flag is a red test rather than a door that quietly stops opening.
+pub(crate) fn packages_argv(request: &PackagesRequest) -> Vec<Vec<String>> {
+    let spell = |parts: &[&str]| -> Vec<String> { parts.iter().map(ToString::to_string).collect() };
+    match request {
+        PackagesRequest::CheckUpdate => vec![spell(&["update"])],
+        PackagesRequest::InstallDefaultSet => vec![spell(&["install", "--default-set"])],
+        PackagesRequest::UninstallAll => vec![spell(&["uninstall", "--all"])],
+        // The explicit door records the opt-in itself; `--elevate=never` keeps a
+        // windowed child off any password prompt (an extra never needs one).
+        PackagesRequest::InstallExtra { name } => {
+            vec![spell(&["install", name, "--elevate=never"])]
+        }
+        // One process per program, dependency order kept: `aterm pkg install clt
+        // --elevate=osascript`, then `brew`. atpkg takes one program per invocation.
+        PackagesRequest::InstallElevated { names } => names
+            .iter()
+            .map(|name| spell(&["install", name, "--elevate=osascript"]))
+            .collect(),
+    }
+}
+
+/// The busy label a request reserves on the packages service.
+pub(crate) fn packages_busy(request: &PackagesRequest) -> PackagesBusy {
+    match request {
+        PackagesRequest::CheckUpdate => PackagesBusy::Check,
+        PackagesRequest::InstallDefaultSet => PackagesBusy::Install,
+        PackagesRequest::UninstallAll => PackagesBusy::Uninstall,
+        PackagesRequest::InstallExtra { .. } => PackagesBusy::InstallExtra,
+        PackagesRequest::InstallElevated { .. } => PackagesBusy::InstallAdmin,
+    }
+}
+
+/// A program name that may ride the argv as ONE operand: index program names are bare
+/// lowercase words (`clt`, `brew`, `codex`, `trust-mc`); anything else — a flag shape,
+/// a path, whitespace, a control byte — is refused before a child is spawned, so a
+/// forged action id can never become `atpkg install --default-set` or a path.
+pub(crate) fn valid_program_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// The structural admission a request must pass before the busy gate: well-formed
+/// names, a non-empty admin sequence, and the osascript door only where it exists.
+pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(), String> {
+    match request {
+        PackagesRequest::CheckUpdate
+        | PackagesRequest::InstallDefaultSet
+        | PackagesRequest::UninstallAll => Ok(()),
+        PackagesRequest::InstallExtra { name } => {
+            if valid_program_name(name) {
+                Ok(())
+            } else {
+                Err(format!("{name:?} is not a program name"))
+            }
+        }
+        PackagesRequest::InstallElevated { names } => {
+            if names.is_empty() {
+                return Err("nothing is waiting on an administrator".to_string());
+            }
+            if let Some(bad) = names.iter().find(|n| !valid_program_name(n)) {
+                return Err(format!("{bad:?} is not a program name"));
+            }
+            if cfg!(target_os = "macos") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the administrator dialog is macOS-only; run `aterm pkg install {}` in a terminal (sudo asks there)",
+                    names.join("`, then `aterm pkg install `")
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod packages_argv_tests {
+    use super::*;
+
+    /// The argv table, verbatim — the three verbs that existed before the door, the
+    /// extras door with `--elevate=never`, and the admin door as one process per
+    /// program in the order given (`clt` then `brew`).
+    #[test]
+    fn packages_argv_is_pinned_per_request() {
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<String>>();
+        assert_eq!(
+            packages_argv(&PackagesRequest::CheckUpdate),
+            vec![s(&["update"])]
+        );
+        assert_eq!(
+            packages_argv(&PackagesRequest::InstallDefaultSet),
+            vec![s(&["install", "--default-set"])]
+        );
+        assert_eq!(
+            packages_argv(&PackagesRequest::UninstallAll),
+            vec![s(&["uninstall", "--all"])]
+        );
+        assert_eq!(
+            packages_argv(&PackagesRequest::InstallExtra {
+                name: "codex".to_string()
+            }),
+            vec![s(&["install", "codex", "--elevate=never"])]
+        );
+        assert_eq!(
+            packages_argv(&PackagesRequest::InstallElevated {
+                names: vec!["clt".to_string(), "brew".to_string()]
+            }),
+            vec![
+                s(&["install", "clt", "--elevate=osascript"]),
+                s(&["install", "brew", "--elevate=osascript"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_request_reserves_its_own_busy_label() {
+        assert_eq!(
+            packages_busy(&PackagesRequest::CheckUpdate),
+            PackagesBusy::Check
+        );
+        assert_eq!(
+            packages_busy(&PackagesRequest::InstallDefaultSet),
+            PackagesBusy::Install
+        );
+        assert_eq!(
+            packages_busy(&PackagesRequest::UninstallAll),
+            PackagesBusy::Uninstall
+        );
+        assert_eq!(
+            packages_busy(&PackagesRequest::InstallExtra {
+                name: "codex".into()
+            }),
+            PackagesBusy::InstallExtra
+        );
+        assert_eq!(
+            packages_busy(&PackagesRequest::InstallElevated {
+                names: vec!["clt".into()]
+            }),
+            PackagesBusy::InstallAdmin
+        );
+    }
+
+    /// A name that could change the verb's meaning never reaches a child: flags,
+    /// paths, whitespace, empties — and an empty admin sequence is refused too.
+    #[test]
+    fn forged_names_are_refused_before_any_child_spawns() {
+        for good in ["clt", "brew", "codex", "trust-mc", "ay", "gh_2", "v1.2"] {
+            assert!(valid_program_name(good), "{good}");
+            assert!(
+                packages_request_admissible(&PackagesRequest::InstallExtra { name: good.into() })
+                    .is_ok()
+            );
+        }
+        for bad in [
+            "",
+            "--default-set",
+            "-x",
+            "../evil",
+            "/usr/bin/x",
+            "a b",
+            "a\nb",
+            "über",
+            ".hidden",
+        ] {
+            assert!(!valid_program_name(bad), "{bad:?}");
+            assert!(
+                packages_request_admissible(&PackagesRequest::InstallExtra { name: bad.into() })
+                    .is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                packages_request_admissible(&PackagesRequest::InstallElevated {
+                    names: vec!["clt".into(), bad.into()]
+                })
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            packages_request_admissible(&PackagesRequest::InstallElevated { names: vec![] })
+                .is_err()
+        );
+        let door = packages_request_admissible(&PackagesRequest::InstallElevated {
+            names: vec!["clt".into(), "brew".into()],
+        });
+        if cfg!(target_os = "macos") {
+            assert!(door.is_ok());
+        } else {
+            assert!(
+                door.as_ref()
+                    .is_err_and(|m| m.contains("aterm pkg install clt")),
+                "{door:?}"
+            );
         }
     }
 }
@@ -8422,6 +8894,9 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            apply_failure: String::new(),
+            apply_failure_build: 0,
+            apply_failures_for_target: 0,
             installable: true,
             channel_unreadable: false,
         }
@@ -8556,6 +9031,9 @@ mod tests {
                 failing_persistent: false,
                 failing_kind: String::new(),
                 failing_applies: 0,
+                apply_failure: String::new(),
+                apply_failure_build: 0,
+                apply_failures_for_target: 0,
                 installable: true,
                 channel_unreadable: false,
             }),
@@ -8615,6 +9093,9 @@ mod tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    apply_failure: String::new(),
+                    apply_failure_build: 0,
+                    apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
                 }),
@@ -9873,6 +10354,9 @@ mod tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    apply_failure: String::new(),
+                    apply_failure_build: 0,
+                    apply_failures_for_target: 0,
                     installable: true,
                     channel_unreadable: false,
                 },
@@ -9942,6 +10426,9 @@ mod tests {
                         failing_persistent: false,
                         failing_kind: String::new(),
                         failing_applies: 0,
+                        apply_failure: String::new(),
+                        apply_failure_build: 0,
+                        apply_failures_for_target: 0,
                         installable: true,
                         channel_unreadable: false,
                     }),
@@ -10511,6 +10998,7 @@ mod tests {
 
     #[test]
     fn a_busy_user_eventually_gets_the_update() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let (_, settings) = park_a_settings_draft_in_a_background_tab(&mut app);
@@ -10748,6 +11236,9 @@ mod tests {
                 failing_persistent: false,
                 failing_kind: String::new(),
                 failing_applies: 0,
+                apply_failure: String::new(),
+                apply_failure_build: 0,
+                apply_failures_for_target: 0,
                 installable: true,
                 channel_unreadable: false,
             }),
@@ -10909,6 +11400,7 @@ mod tests {
     /// event-loop caller paints it.
     #[test]
     fn the_async_physical_lane_converges_and_stops_nagging() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         // Relative to the running build: `arm` answers `Clear` for anything not
         // strictly newer, which would make the two `arm_native_auto_apply`
@@ -11220,6 +11712,7 @@ mod tests {
 
     #[test]
     fn debug_reexec_and_menu_feedback_cannot_bypass_dirty_native_state() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let dir = std::env::temp_dir().join(format!(
             "aterm-update-dirty-preflight-{}",
             std::process::id()

@@ -209,6 +209,20 @@ pub fn is_managed(state: &str) -> bool {
     state.starts_with(MANAGED_PREFIX)
 }
 
+/// The fix-line that rides AFTER a SHADOWED row on the surfaces that speak to a person
+/// (the pass log, `doctor`, `which`): `type alab-<tool> for the managed one`. `alias` is
+/// the alias shim that actually resolves (`crate::store::ToolName::alias`), so the
+/// sentence is printed only when typing it works. NEVER part of the canonical state
+/// string — [`shadowed`] stays exactly as spelled, `status.toml` and the Packages row
+/// carry the state alone, and the parsers above never see this text.
+#[must_use]
+pub fn alias_hint(alias: &str) -> String {
+    let mut s = String::from("type ");
+    s.push_str(alias);
+    s.push_str(" for the managed one");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +274,19 @@ mod tests {
         assert_eq!(
             blocked("codex", &extra_not_installed("codex")),
             "blocked by codex: extra — not installed (opt in: aterm pkg install codex)"
+        );
+        // The alias fix-line is a SEPARATE sentence: the SHADOWED state never carries it,
+        // so a row that was written and read back stays byte-identical.
+        assert_eq!(
+            alias_hint("alab-trust"),
+            "type alab-trust for the managed one"
+        );
+        let row = shadowed(6808, Path::new("/opt/homebrew/bin/trust"));
+        assert!(!row.contains("alab-"));
+        assert_eq!(
+            shadowed_by(&row),
+            Some((6808, "/opt/homebrew/bin/trust")),
+            "the parser reads the bare row"
         );
     }
 
