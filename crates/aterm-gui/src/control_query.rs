@@ -564,6 +564,37 @@ pub(crate) fn cmd_dims(
 /// inside your measurement window. Nothing is discarded: `n_present +
 /// n_present_tainted` still accounts for every content present.
 ///
+/// WHAT THESE SLICES INCLUDE — READ BEFORE QUOTING ONE AS "LATENCY". Both
+/// key→present slices are OPEN INTERVALS closed by the next qualifying present,
+/// so any time in which nothing presented is INSIDE the number. They are not
+/// floored by a sampling rate (that is the `video … keys` failure mode; see
+/// `crate::video_key_analysis`), but they have their own two:
+///
+///  * `present_*` (`output→application-present-return`) opens on the LEADING
+///    EDGE of a PTY output burst — a `compare_exchange(0, …)`, first edge wins —
+///    and closes on the next content present that books it. Output that moves
+///    no pixels opens the interval and does not close it, so the wait until
+///    something else presents is published as if it were render time. The only
+///    bound is a 5 s discard (`PRESENT_LATENCY_CAP_NS`), so a multi-SECOND
+///    reading means "nothing presented for that long", NOT "a frame took that
+///    long". Read it with `n_present` and the percentiles beside it, never as a
+///    lone `last_`/`max_`.
+///  * `input_*` (`key-arrival→content-present-return`) has the mirror problem in
+///    the other direction, already stated at `INPUT_STAMP_NS`: a keystroke that
+///    produces no output is discarded after 5 s rather than booked, and under
+///    CONCURRENT streaming output the closing present may be a log-line frame
+///    rather than the key's own echo — so it reads LOW, never high. It is a
+///    starvation detector, not an echo-attribution profiler.
+///
+///  * `resize_present` has the same shape with a 2 s bound
+///    (`RESIZE_SLICE_CAP_NS`) and closes on ANY successful present, not only a
+///    content one — deliberately, since what ends a compositor rescale is a
+///    frame at the new size, whatever drew it. Same caveat: idle inside the
+///    interval is inside the number.
+///
+/// None of them is key→photon: all stop at application-present return, upstream
+/// of compositor selection, scanout and display.
+///
 /// FRAME-EXTRACTION ATTRIBUTION. `frame_refills_scoped` / `frame_refills_full`
 /// split the presented-path refills between the damage-scoped arm and the full
 /// O(rows x cols) walk, and `frame_refill_full_causes=<clause>:<frames>,...` (a
@@ -639,6 +670,12 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // stall could only be estimated as `redraw_total - compose - render`, mixed
         // with the post-present tail — so a regression in it moved no published number.
         let acquire = crate::metrics::acquire_wait_distribution();
+        // …and the two scalars the distribution cannot express. A p99 over
+        // thousands of ~0.02 ms acquires absorbs a single 200 ms park; the max
+        // is the only field that reports it. Published HERE beside the
+        // percentiles it qualifies (and on the summary line, which is the read
+        // most drivers actually take).
+        let (last_acquire_ns, max_acquire_ns) = crate::metrics::acquire_wait_last_max_ns();
         // The live-drag STALE-FRAME window: bounds change → first frame submitted
         // at the new size. For that interval the compositor has new bounds and an
         // old drawable, so it shows the previous frame rescaled — the smear a drag
@@ -665,6 +702,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              key_write_p99_ms={:.2} n_pre_present={} pre_present_p50_ms={:.2} \
              pre_present_p95_ms={:.2} pre_present_p99_ms={:.2} \
              n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2} \
+             last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
              n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
              n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
              n_present_tainted={} present_tainted_p50_ms={:.2} \
@@ -693,6 +731,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(acquire, 0.50),
             p(acquire, 0.95),
             p(acquire, 0.99),
+            ms(last_acquire_ns),
+            ms(max_acquire_ns),
             resize.count(),
             p(resize, 0.50),
             p(resize, 0.95),
@@ -753,6 +793,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          frame_refill_full_causes={} \
          pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
          max_pre_present_ms={:.2} \
+         last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
          present_drops={} last_present_drop_reason={} last_present_drop_parked={} \
          present_tainted={} last_present_tainted_ms={:.2} max_present_tainted_ms={:.2} \
          capture_episodes={} capture_active={} \
@@ -841,6 +882,14 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
         ms(m.max_pre_present_ns),
+        // THE DRAWABLE PARK, AS A SCALAR. `acquire_p99_ms` (the `percentiles`
+        // verb) is a statement about the bulk of thousands of ~0.02 ms samples;
+        // a single 200 ms `nextDrawable` park cannot move it. These two were
+        // recorded on every present and reset with the window since the slice
+        // was instrumented, and no snapshot had ever read them — so the worst
+        // acquire of a run was, until now, unpublishable.
+        ms(m.last_acquire_wait_ns),
+        ms(m.max_acquire_wait_ns),
         m.present_drops,
         m.last_present_drop_reason.as_str(),
         u8::from(m.last_present_drop_parked),
@@ -1087,6 +1136,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         // driver could not read the drawable-park slice at all; `resize` is new.
         // Both forms now carry the same set.
         let acquire = crate::metrics::acquire_wait_distribution();
+        // Twin of the text form's park scalars (see there).
+        let (last_acquire_ns, max_acquire_ns) = crate::metrics::acquire_wait_last_max_ns();
         let resize = crate::metrics::resize_present_distribution();
         let tainted = crate::metrics::tainted_present_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
@@ -1100,7 +1151,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"pre_present_p50_ms\":{:.2},\"pre_present_p95_ms\":{:.2},\
              \"pre_present_p99_ms\":{:.2},\"n_acquire\":{},\
              \"acquire_p50_ms\":{:.2},\"acquire_p95_ms\":{:.2},\
-             \"acquire_p99_ms\":{:.2},\"n_resize\":{},\
+             \"acquire_p99_ms\":{:.2},\
+             \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
+             \"n_resize\":{},\
              \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
              \"resize_p99_ms\":{:.2},\"n_present_tainted\":{},\
              \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
@@ -1129,6 +1182,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(acquire, 0.50),
             p(acquire, 0.95),
             p(acquire, 0.99),
+            ms(last_acquire_ns),
+            ms(max_acquire_ns),
             resize.count(),
             p(resize, 0.50),
             p(resize, 0.95),
@@ -1178,7 +1233,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"frame_refills_skipped\":{},\
          \"frame_refill_full_causes\":{},\"pre_present_attempts\":{},\
          \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
-         \"max_pre_present_ms\":{:.2},\"present_drops\":{},\
+         \"max_pre_present_ms\":{:.2},\
+         \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
+         \"present_drops\":{},\
          \"last_present_drop_reason\":\"{}\",\"last_present_drop_parked\":{},\
          \"present_tainted\":{},\"last_present_tainted_ms\":{:.2},\
          \"max_present_tainted_ms\":{:.2},\"capture_episodes\":{},\
@@ -1268,6 +1325,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
         ms(m.max_pre_present_ns),
+        // Field-for-field twin of the text form's drawable-park scalars.
+        ms(m.last_acquire_wait_ns),
+        ms(m.max_acquire_wait_ns),
         m.present_drops,
         m.last_present_drop_reason.as_str(),
         m.last_present_drop_parked,
@@ -3124,10 +3184,14 @@ fn push_bool(out: &mut String, v: bool) {
 /// attribute, and a `String` for the escaped glyph — then the result was copied
 /// into a per-row `String` and again into the frame. Writing straight into the
 /// destination removes all of it; the bytes are unchanged.
-fn write_styled_cell_json(out: &mut String, snap: &StyledCellSnap) {
+///
+/// `glyph` is borrowed from its row's shared grapheme buffer
+/// ([`StyledRowSnap::glyph`]) instead of being read off the cell, so the GATHER
+/// no longer owns a `String` per cell either.
+fn write_styled_cell_json(out: &mut String, snap: &StyledCellSnap, glyph: &str) {
     let cell = &snap.cell;
     out.push_str("{\"glyph\":\"");
-    crate::control::json_escape_into(out, &snap.glyph);
+    crate::control::json_escape_into(out, glyph);
     out.push_str("\",\"fg\":\"");
     push_hex_rgb(out, cell.fg);
     out.push_str("\",\"bg\":\"");
@@ -3225,11 +3289,29 @@ fn row_line_size(t: &Terminal, r: usize) -> aterm_core::grid::LineSize {
 /// anchor `(row, col)` (deduplicated by payload identity). Shared shape with
 /// `cmd_image_read`'s screen mode; consumed by the styled frame (audit finding F1)
 /// so a `subscribe cells` / `screen` watcher sees images, not blank cells.
+///
+/// ROW-MAJOR, ascending column within a row: a socket client indexes into this
+/// array, so the order is part of the wire contract
+/// (`distinct_images_are_row_major_regardless_of_placement_order` pins it) and
+/// NOT free to follow the extras map, whose `FxHashMap` iteration order is
+/// arbitrary and is not insertion order either.
+///
+/// [`images_frame`](Terminal::images_frame) is the batch reader: ONE pass over
+/// the extras map, each row sorted by column, instead of the `rows x cols`
+/// `cell_extra` probes the per-row accessor costs. Its emptiness gate only
+/// rescues a screen with NO extras at all, so before this every gather of a
+/// screen carrying a single hyperlink — an `ls --hyperlink` listing, a TUI
+/// status line — swept the whole grid looking for pictures that were not there.
+///
+/// The extras store's `any_image()` flag is deliberately NOT used as a second
+/// gate: a Kitty Unicode placeholder shows its picture through
+/// `transient.kitty_images` without ever attaching an image ref to a cell, so
+/// that flag is false on screens that really do show images.
 fn distinct_images(t: &Terminal) -> Vec<(usize, usize, std::sync::Arc<ImageData>)> {
     let mut seen: Vec<*const ImageData> = Vec::new();
     let mut out: Vec<(usize, usize, std::sync::Arc<ImageData>)> = Vec::new();
-    for r in 0..t.rows() as usize {
-        for (col, iref) in t.images_row(r) {
+    for (r, row) in t.images_frame(t.rows() as usize).into_iter().enumerate() {
+        for (col, iref) in row {
             let ptr = std::sync::Arc::as_ptr(&iref.image);
             if seen.contains(&ptr) {
                 continue;
@@ -3264,7 +3346,10 @@ pub(crate) fn styled_image_json(anchor_r: usize, anchor_c: usize, img: &ImageDat
 /// copied under the terminal lock; serialized without it.
 struct StyledCellSnap {
     cell: RenderCell,
-    glyph: String,
+    /// Byte range of this cell's grapheme inside its row's
+    /// [`StyledRowSnap::glyphs`] buffer — read back through
+    /// [`StyledRowSnap::glyph`], never on its own.
+    glyph: std::ops::Range<usize>,
     wide_lead: bool,
     hyperlink: Option<String>,
     /// The OSC-8 `id=` grouping key, if the link carried one. Two adjacent runs with
@@ -3272,6 +3357,40 @@ struct StyledCellSnap {
     /// renderer groups hover/click spans by id, so a lossless mirror needs it to
     /// reproduce the grouping — the url alone cannot. `None` when the link had no id.
     hyperlink_id: Option<String>,
+}
+
+/// One row's cells plus the ONE buffer their graphemes live in.
+///
+/// The retired shape gave every cell its own `String`: rows x cols heap
+/// allocations per gather — 1,920 on a 24x80 screen, 10,000 on 50x200 — and the
+/// gather runs with the terminal lock HELD, so an agent polling `screen` (or a
+/// `subscribe … cells` watcher waking on every frame) stalled the engine for all
+/// of them. Even a blank cell allocated: the grapheme of a materialized blank is
+/// a single SPACE, not the empty string.
+///
+/// The graphemes are written once and read once, by one serializer, in column
+/// order — so one buffer per row plus a byte range per cell carries them for ONE
+/// allocation per row. The buffer lives INSIDE the row rather than in a parallel
+/// `Vec<String>` on the frame, and [`StyledRowSnap::glyph`] takes a COLUMN
+/// rather than a cell — together those make a range-against-the-wrong-row
+/// pairing something a caller cannot spell, not merely something unlikely.
+struct StyledRowSnap {
+    /// Every cell's grapheme in this row, concatenated in column order.
+    glyphs: String,
+    cells: Vec<StyledCellSnap>,
+}
+
+impl StyledRowSnap {
+    /// Column `col`'s grapheme — byte-for-byte the `String` the retired per-cell
+    /// field held. Takes the COLUMN, not a `&StyledCellSnap`, so a cell borrowed
+    /// from some other row cannot be paired with this row's buffer — the caller
+    /// never holds a range without the buffer it indexes. Indexing (not `get`)
+    /// on purpose: the ranges are handed out by the gather as it appends to this
+    /// very buffer, so a range outside it is a code defect that must not be able
+    /// to hide as an empty glyph on the wire.
+    fn glyph(&self, col: usize) -> &str {
+        &self.glyphs[self.cells[col].glyph.clone()]
+    }
 }
 
 /// Side-adjusted selection geometry for the styled control frame.
@@ -3314,7 +3433,7 @@ pub(crate) struct StyledFrameSnapshot {
     /// OSC 12 cursor colour, or `None` for the renderer/theme default.
     cursor_color: Option<[u8; 3]>,
     /// `rows × cols` cells, blank-padded to the full grid width (no trim).
-    cells: Vec<Vec<StyledCellSnap>>,
+    cells: Vec<StyledRowSnap>,
     line_sizes: Vec<&'static str>,
     /// The selection's LOGICAL span and kind — see [`StyledSelectionSnap`] for
     /// where it parts company with the painted cells — or `None`.
@@ -3325,6 +3444,25 @@ pub(crate) struct StyledFrameSnapshot {
     selection_fg: Option<[u8; 3]>,
     /// Distinct inline images as `Arc` clones; base64 happens at serialize time.
     images: Vec<(usize, usize, std::sync::Arc<ImageData>)>,
+}
+
+impl StyledFrameSnapshot {
+    /// Cells in the gathered frame — `rows × cols` by the lossless no-trim
+    /// contract. The serializer's reserve input, and the bench seam's REACH
+    /// guard (a fixture that failed to paint, or a frame that trimmed, must not
+    /// be priced as a fast one).
+    pub(crate) fn cell_count(&self) -> usize {
+        self.cells.iter().map(|row| row.cells.len()).sum()
+    }
+}
+
+#[cfg(test)]
+impl StyledFrameSnapshot {
+    /// `(row, col)`'s grapheme read exactly as the serializer reads it — the
+    /// test-facing spelling of the per-row buffer + per-cell range pair.
+    fn glyph(&self, row: usize, col: usize) -> &str {
+        self.cells[row].glyph(col)
+    }
 }
 
 /// Stable wire name for one selection kind.
@@ -3375,7 +3513,7 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
     let rows = t.rows() as usize;
     let cols = t.cols() as usize;
     let blank = t.implicit_blank_render_cell();
-    let mut cells: Vec<Vec<StyledCellSnap>> = Vec::with_capacity(rows);
+    let mut cells: Vec<StyledRowSnap> = Vec::with_capacity(rows);
     let mut line_sizes: Vec<&'static str> = Vec::with_capacity(rows);
     // Both hyperlink fields come from ONE `Grid::cell_extra` entry, and that
     // lookup is `CellExtras::get` — a probe of the extras MAP alone, which
@@ -3400,6 +3538,13 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
         // instead of once per column.
         let view = t.grid().screen_row_view(r as u16);
         let mut row_cells: Vec<StyledCellSnap> = Vec::with_capacity(cols);
+        // ONE grapheme buffer for the whole row; each cell keeps its byte range
+        // into it (see `StyledRowSnap`). `cols` bytes is the EXACT size of an
+        // ASCII row and a tight lower bound otherwise, so an ordinary row lands
+        // in a single allocation instead of doubling up from zero — the same
+        // reserve rule `visible_row_bounds_to_string` uses before its identical
+        // per-column push loop.
+        let mut glyphs = String::with_capacity(cols);
         for c in 0..cols {
             let rc = rendered.get(c).copied();
             // ONE extras probe for both hyperlink fields: `hyperlink_at` and
@@ -3410,9 +3555,17 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
             } else {
                 None
             };
+            // Byte-for-byte the retired `cell_grapheme(r, c).unwrap_or_default()`
+            // — the same `push_cell_text` produces both — with the per-cell
+            // `String` replaced by a range into the row buffer. An out-of-range
+            // cell appends nothing, which is that call's `unwrap_or_default()`
+            // empty string; in-range is all this loop can reach anyway (`rows`
+            // and `cols` are the grid's own).
+            let glyph_start = glyphs.len();
+            t.cell_grapheme_into(r, c, &mut glyphs);
             row_cells.push(StyledCellSnap {
                 cell: rc.unwrap_or(blank),
-                glyph: t.cell_grapheme(r, c).unwrap_or_default(),
+                glyph: glyph_start..glyphs.len(),
                 // Raw WIDE lead bit straight off the live cell. Identical to the
                 // retired `cell_attrs(..).contains(WIDE)`, not an approximation:
                 // `attrs_to_cell_flags` can never emit WIDE (`StyleAttrs` carries no
@@ -3424,7 +3577,10 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
                 hyperlink_id: extra.and_then(|e| e.hyperlink_id()).map(|u| u.to_string()),
             });
         }
-        cells.push(row_cells);
+        cells.push(StyledRowSnap {
+            glyphs,
+            cells: row_cells,
+        });
         line_sizes.push(line_size_name(row_line_size(t, r))); // F2: DEC double-width/height
     }
     // F3: text selection highlight (a human/peer-initiated selection a watcher
@@ -3488,7 +3644,7 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
     // Reserving up front and writing straight through removes all of it.
     // ~180 bytes/cell is the measured shape of an ordinary cell; a short read is
     // just one realloc, never wrong.
-    let cell_count = snap.cells.iter().map(Vec::len).sum::<usize>();
+    let cell_count = snap.cell_count();
     let mut out = String::with_capacity(256 + cell_count * 180);
     // Every row-INDEPENDENT field is built first so the header, the streamed
     // rows, and the tail can be emitted in that order into the single buffer.
@@ -3529,16 +3685,16 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         snap.cursor_visible,
         json_str_field("style", snap.cursor_style),
     );
-    for (r, row_cells) in snap.cells.iter().enumerate() {
+    for (r, row) in snap.cells.iter().enumerate() {
         if r > 0 {
             out.push(',');
         }
         out.push('[');
-        for (c, cell) in row_cells.iter().enumerate() {
+        for (c, cell) in row.cells.iter().enumerate() {
             if c > 0 {
                 out.push(',');
             }
-            write_styled_cell_json(&mut out, cell);
+            write_styled_cell_json(&mut out, cell, row.glyph(c));
         }
         out.push(']');
     }
@@ -3779,10 +3935,79 @@ mod tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        cmd_cell, cmd_custody, cmd_search, gather_styled_frame, serialize_dims,
+        cmd_cell, cmd_custody, cmd_search, distinct_images, gather_styled_frame, serialize_dims,
         serialize_dims_json, styled_frame_payload,
     };
     use crate::term_lock;
+
+    /// The styled frame's image array is ROW-MAJOR, ascending column within a row
+    /// — the order a socket client indexes into, and the one thing a "just iterate
+    /// the extras map" rewrite of `distinct_images` would destroy silently:
+    /// `FxHashMap` iteration order is arbitrary, is not insertion order, and is
+    /// free to change under a rehash.
+    ///
+    /// Six pictures placed in deliberately wrong order — the bottom one first,
+    /// and FOUR sharing one row at columns whose raw `FxHashMap` iteration order
+    /// is provably non-ascending (measured on this key set: {2, 8, 20, 33}
+    /// 1-based iterates as [7, 1, 19, 32]) — must come back sorted by
+    /// `(row, col)`, each anchor still carrying ITS OWN payload. The shared-row
+    /// spread is what makes the COLUMN half of the claim real: with only two
+    /// images on a row the map can hand them back ascending by luck, and an
+    /// earlier two-image form of this test kept passing with the column sort
+    /// deleted. Mutation-checked: removing `sort_unstable_by_key` from
+    /// `images_frame_into` turns this red. An order test that checked anchors
+    /// alone would also pass on a shuffle that paired the right positions with
+    /// the wrong pictures, so the tag byte rides along.
+    ///
+    /// Kitty `a=T` rather than iTerm2 OSC 1337 because the iTerm2 path is
+    /// LEFT-ANCHORED at the margin by spec (`place_image(.., 0)`) and so cannot
+    /// put two images on one row; kitty transmits-and-displays at the CURSOR.
+    #[test]
+    fn distinct_images_are_row_major_regardless_of_placement_order() {
+        /// Display one 1x1-cell kitty image, filled with `tag`, at 1-based
+        /// `row`/`col`. `s`/`v` are the raster's pixel size — one cell each at the
+        /// 10x20 cell metric below — and `f=32` requires exactly `s * v * 4` bytes.
+        fn place(t: &mut Terminal, row: u16, col: u16, id: u8, tag: u8) {
+            t.process(format!("\x1b[{row};{col}H").as_bytes());
+            let raster = vec![tag; 10 * 20 * 4];
+            let b64 = aterm_codec::base64::encode(&raster).expect("encode");
+            let mut apc = format!("\x1b_Ga=T,f=32,s=10,v=20,i={id};").into_bytes();
+            apc.extend_from_slice(b64.as_bytes());
+            apc.extend_from_slice(b"\x1b\\");
+            t.process(&apc);
+        }
+
+        let mut t = Terminal::new(10, 40);
+        t.set_cell_pixel_size(10, 20);
+        place(&mut t, 5, 3, 1, b'F');
+        // Row 1 carries FOUR images at {2, 8, 20, 33}: raw map order for these
+        // keys is [7, 1, 19, 32] (non-ascending), so an unsorted emit cannot
+        // pass by accident.
+        place(&mut t, 1, 33, 2, b'E');
+        place(&mut t, 1, 8, 3, b'B');
+        place(&mut t, 1, 2, 4, b'A');
+        place(&mut t, 1, 20, 5, b'D');
+        place(&mut t, 3, 10, 6, b'C');
+
+        // The tag byte identifies WHICH picture landed at each anchor; the raster
+        // itself is uniform, so its first byte is the whole identity.
+        let got: Vec<(usize, usize, u8)> = distinct_images(&t)
+            .into_iter()
+            .map(|(r, c, img)| (r, c, img.bytes[0]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1, b'A'),
+                (0, 7, b'B'),
+                (0, 19, b'D'),
+                (0, 32, b'E'),
+                (2, 9, b'C'),
+                (4, 2, b'F'),
+            ],
+            "images must be reported row-major, not in placement or map order"
+        );
+    }
 
     /// The `custody` verb's whole reason to exist: it separates events that leave
     /// IDENTICAL state behind.
@@ -4038,11 +4263,14 @@ mod tests {
         {
             let t = term_lock(&term);
             let snap = gather_styled_frame(&t);
-            assert_eq!(snap.cells[0][0].cell.fg, [0x11, 0x22, 0x33]);
-            assert_eq!(snap.cells[0][0].cell.bg, [0x44, 0x55, 0x66]);
-            assert_eq!(snap.cells[0][7].cell.fg, snap.cells[0][0].cell.fg);
+            assert_eq!(snap.cells[0].cells[0].cell.fg, [0x11, 0x22, 0x33]);
+            assert_eq!(snap.cells[0].cells[0].cell.bg, [0x44, 0x55, 0x66]);
             assert_eq!(
-                snap.cells[0][7].cell.bg, snap.cells[0][0].cell.bg,
+                snap.cells[0].cells[7].cell.fg,
+                snap.cells[0].cells[0].cell.fg
+            );
+            assert_eq!(
+                snap.cells[0].cells[7].cell.bg, snap.cells[0].cells[0].cell.bg,
                 "materialized and implicit default-colour cells agree"
             );
         }
@@ -4056,10 +4284,16 @@ mod tests {
         {
             let t = term_lock(&term);
             let snap = gather_styled_frame(&t);
-            assert_eq!(snap.cells[0][0].cell.fg, [0x44, 0x55, 0x66]);
-            assert_eq!(snap.cells[0][0].cell.bg, [0x11, 0x22, 0x33]);
-            assert_eq!(snap.cells[0][7].cell.fg, snap.cells[0][0].cell.fg);
-            assert_eq!(snap.cells[0][7].cell.bg, snap.cells[0][0].cell.bg);
+            assert_eq!(snap.cells[0].cells[0].cell.fg, [0x44, 0x55, 0x66]);
+            assert_eq!(snap.cells[0].cells[0].cell.bg, [0x11, 0x22, 0x33]);
+            assert_eq!(
+                snap.cells[0].cells[7].cell.fg,
+                snap.cells[0].cells[0].cell.fg
+            );
+            assert_eq!(
+                snap.cells[0].cells[7].cell.bg,
+                snap.cells[0].cells[0].cell.bg
+            );
         }
     }
 
@@ -4082,12 +4316,87 @@ mod tests {
             t.process(b"\x1b]110\x07\x1b]111\x07");
             let snap = gather_styled_frame(&t);
             assert_eq!(
-                snap.cells[0][7].cell.fg,
+                snap.cells[0].cells[7].cell.fg,
                 [configured.0.r, configured.0.g, configured.0.b]
             );
             assert_eq!(
-                snap.cells[0][7].cell.bg,
+                snap.cells[0].cells[7].cell.bg,
                 [configured.1.r, configured.1.g, configured.1.b]
+            );
+        }
+    }
+
+    /// EQUIVALENCE GATE for the per-row grapheme buffer: every glyph the frame
+    /// puts ON THE WIRE is byte-for-byte `Terminal::cell_grapheme` for that cell
+    /// — the single-cell API the gather used to call once per cell, and the one
+    /// the `cell` verb still answers with, so the two introspection surfaces
+    /// cannot drift apart.
+    ///
+    /// One row carrying each hazard a shared buffer + byte ranges could confuse:
+    /// an ASCII run; a written BLANK (whose grapheme is a single SPACE, not the
+    /// empty string, so a "skip the blanks" shortcut would change the wire); a
+    /// double-width CJK pair, where the lead owns the glyph and the continuation
+    /// owns NOTHING (a zero-length range in the middle of the buffer); a
+    /// combining cluster, whose byte length and char length disagree; and the
+    /// untouched tail, which materializes as more spaces. Exact strings, because
+    /// an off-by-one range still yields a plausible-looking glyph.
+    #[test]
+    fn styled_frame_glyphs_are_cell_grapheme_across_a_mixed_row() {
+        // The wire arm below compares JSON-ESCAPED "glyph" fields against RAW
+        // `cell_grapheme` strings. That only works because this fixture is
+        // deliberately escape-free — no quote, backslash or control char —
+        // so the escaper is the identity here. `json_escape_into`'s own
+        // behaviour is covered by its unit tests; this test is about WHERE the
+        // bytes come from, not how they are escaped.
+        let mut term = Terminal::new(2, 12);
+        term.process("ab \u{754C}e\u{0301}".as_bytes());
+        let snap = gather_styled_frame(&term);
+
+        assert_eq!(snap.glyph(0, 0), "a");
+        assert_eq!(snap.glyph(0, 1), "b");
+        assert_eq!(snap.glyph(0, 2), " ", "a written blank is a SPACE");
+        assert_eq!(snap.glyph(0, 3), "\u{754C}", "the wide LEAD owns the glyph");
+        assert_eq!(snap.glyph(0, 4), "", "the wide continuation owns nothing");
+        assert_eq!(
+            snap.glyph(0, 5),
+            "e\u{0301}",
+            "combining mark kept with base"
+        );
+        assert_eq!(snap.glyph(0, 6), " ", "the untouched tail is blank cells");
+
+        // Every cell, against the single-cell API — the frame is a sweep of it.
+        for r in 0..snap.rows {
+            for c in 0..snap.cols {
+                assert_eq!(
+                    snap.glyph(r, c),
+                    term.cell_grapheme(r, c).expect("in-range cell"),
+                    "snapshot glyph at ({r},{c})"
+                );
+            }
+        }
+
+        // And the SERIALIZED frame, which is the actual contract: the `glyph`
+        // fields in row-major order are those same graphemes.
+        let frame = styled_frame_payload(&term);
+        let wire: Vec<&str> = frame
+            .match_indices("\"glyph\":\"")
+            .map(|(at, key)| {
+                let rest = &frame[at + key.len()..];
+                let end = rest.find("\",\"fg\"").expect("glyph field precedes fg");
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(
+            wire.len(),
+            snap.rows * snap.cols,
+            "one glyph field per cell, no trim"
+        );
+        for (i, got) in wire.iter().enumerate() {
+            let (r, c) = (i / snap.cols, i % snap.cols);
+            assert_eq!(
+                *got,
+                term.cell_grapheme(r, c).expect("in-range cell"),
+                "wire glyph at ({r},{c}) of {frame}"
             );
         }
     }
@@ -4098,21 +4407,21 @@ mod tests {
         term.process("界".as_bytes());
         let snap = gather_styled_frame(&term);
 
-        assert_eq!(snap.cells[0][0].glyph, "界");
+        assert_eq!(snap.glyph(0, 0), "界");
         assert!(
-            snap.cells[0][0].wide_lead,
+            snap.cells[0].cells[0].wide_lead,
             "the raw WIDE flag belongs to the glyph's lead cell"
         );
         assert!(
-            !snap.cells[0][0].cell.wide,
+            !snap.cells[0].cells[0].cell.wide,
             "RenderCell::wide is not the lead marker"
         );
         assert!(
-            !snap.cells[0][1].wide_lead,
+            !snap.cells[0].cells[1].wide_lead,
             "the continuation must not duplicate the lead marker"
         );
         assert!(
-            snap.cells[0][1].cell.wide,
+            snap.cells[0].cells[1].cell.wide,
             "the resolved continuation retains its right-half marker"
         );
     }
@@ -4903,6 +5212,52 @@ mod tests {
                 text_pct.contains(field),
                 "text percentiles omitted `{field}`: {text_pct}"
             );
+        }
+    }
+
+    /// TIER-1 ITEM 3 (2026-08 draw-path audit): THE DRAWABLE-PARK MAX IS
+    /// PUBLISHED.
+    ///
+    /// `metrics::note_acquire_wait` had recorded `LAST_ACQUIRE_WAIT_NS` and
+    /// `MAX_ACQUIRE_WAIT_NS` on every present — and `reset` had cleared them —
+    /// since the swapchain-acquire slice was first instrumented, while no
+    /// snapshot ever read either one. The only acquire figures a reader could
+    /// obtain were the histogram's percentiles, and a single 200 ms
+    /// `nextDrawable` park (the largest known macOS typing stall: it blocks the
+    /// winit main thread while keyDowns queue in the OS event queue) is
+    /// arithmetically invisible in a p99 taken over thousands of ~0.02 ms
+    /// samples. This pins both scalars into all four published forms — the
+    /// summary a driver reads by default and the `percentiles` line they qualify
+    /// — so the stall can never go dark again.
+    #[test]
+    fn the_acquire_wait_max_is_published_in_every_metrics_form() {
+        let text = super::cmd_metrics(None, "");
+        for field in ["last_acquire_wait_ms=", "max_acquire_wait_ms="] {
+            assert!(
+                text.contains(field),
+                "summary text metrics omitted `{field}`: {text}"
+            );
+        }
+        let text_pct = super::cmd_metrics(None, "percentiles");
+        for field in ["last_acquire_wait_ms=", "max_acquire_wait_ms="] {
+            assert!(
+                text_pct.contains(field),
+                "text percentiles omitted `{field}`: {text_pct}"
+            );
+        }
+        for command in ["", "percentiles"] {
+            let reply = super::cmd_metrics_json(None, command);
+            let body = reply
+                .strip_prefix("OK 1\n")
+                .expect("status frame")
+                .trim_end();
+            let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+            for key in ["last_acquire_wait_ms", "max_acquire_wait_ms"] {
+                assert!(
+                    value.get(key).is_some(),
+                    "metrics JSON (`{command}`) omitted `{key}`: {reply}"
+                );
+            }
         }
     }
 

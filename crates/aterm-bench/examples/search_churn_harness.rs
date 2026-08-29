@@ -24,7 +24,7 @@
 //      the same differential contract the in-crate tests pin per-step.
 //
 // Keys are INFORMATIONAL (not in xtask's SEARCH_LANE floor set): recording a
-// floor requires a measured baseline (ATERM_PERF_RECORD), which this
+// floor requires a measured baseline (gate perf --record), which this
 // environment cannot produce honestly. The in-harness guards are the
 // non-negotiable part; the owner can ratchet the keys into the lane after one
 // recorded run. Same non-flake discipline as the sibling harnesses:

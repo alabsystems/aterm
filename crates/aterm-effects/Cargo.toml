@@ -47,6 +47,13 @@ aterm-time = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# THE SHIPPED THEMES, ENUMERATED RATHER THAN TRANSCRIBED. `the_caret_never_wears_cyan`
+# has to sweep the base the product actually hands the block — the theme's
+# `cursor_color` — for every theme aterm ships, and a hand-copied list of hex
+# triples is exactly how that pin came to test three achromatic bases while the
+# shipped one (`#50FA7B`, green) sat outside its domain. Dev-only, and already in
+# the graph transitively via aterm-core/aterm-render.
+aterm-types = { workspace = true }
 # ORACLE ONLY — never in the shipped graph. The 499 glyphs PHOSPHOR's literal
 # material ROM draws with are PUBLIC-DOMAIN DATA, now carried in-tree
 # (src/matrix_rain/bitmap_font.rs) instead of reached through ~10.6k lines of
@@ -58,7 +65,9 @@ libc = { workspace = true }
 font8x8 = { workspace = true }
 # The ty models the sparkle tests run (identity episodes, flash limiter).
 aterm-spec = { workspace = true }
-# Atlas PNG dumps for visual iteration (gated behind ATERM_CAT_DUMP); dev-only.
+# Atlas PNG dumps for visual iteration (`ATERM_CAT_ART_DUMP_DIR` in
+# tests/cat_art_quality.rs, `PET_LOD_DUMP_DIR` in src/pet_baker.rs); dev-only.
+# (The `ATERM_CAT_DUMP` this comment used to name was never implemented.)
 aterm-png = { workspace = true }
 # The per-frame effect benchmarks. Until these landed the crate had NO bench
 # target at all — 130k lines on the frame path with no instrument, which is how

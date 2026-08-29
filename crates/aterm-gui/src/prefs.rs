@@ -5149,7 +5149,17 @@ mod trail_style_tests {
         for &s in CURSOR_TRAIL_STYLES {
             assert_eq!(
                 GlowStyle::style_names_kitty_pet(s),
-                s == "rainbow kitty pet" || s == "rainbow kitty",
+                // …and `rainbow kitty underline` since 2026-08-27: it is a
+                // GEOMETRY of `rainbow kitty`, and the engine's own
+                // `style_names_underline_ribbon` docstring already promised the
+                // companion was shared. It answered `false` here only because
+                // the predicate is a whole-string equality it did not match, so
+                // one appended geometry word swapped the animal on glass
+                // (`pet_active=true cat_active=false` tall vs
+                // `pet_active=false cat_active=true` underline, same input).
+                s == "rainbow kitty pet"
+                    || s == "rainbow kitty"
+                    || s == "rainbow kitty underline",
                 "style {s:?}"
             );
         }
@@ -5207,7 +5217,10 @@ mod trail_style_tests {
             );
             assert_eq!(
                 GlowStyle::style_names_any_pet(s),
-                s == "rainbow dog pet" || s == "rainbow kitty pet" || s == "rainbow kitty",
+                s == "rainbow dog pet"
+                    || s == "rainbow kitty pet"
+                    || s == "rainbow kitty"
+                    || s == "rainbow kitty underline",
                 "any-pet union, style {s:?}"
             );
         }

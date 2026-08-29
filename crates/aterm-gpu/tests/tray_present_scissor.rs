@@ -213,6 +213,8 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(0x00FF_6A00, 220),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
     }
     let (fw, fh) = gpu.frame_size(rows, cols);

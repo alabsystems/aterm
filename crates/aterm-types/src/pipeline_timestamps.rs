@@ -38,12 +38,29 @@ pub struct PipelineTimestamps {
     /// can detect whether timestamps are stale (render without new input).
     pub process_sequence: u32,
     /// When false, `process()` skips per-stage `Instant::now()` calls
-    /// (6 syscalls per invocation) to maximize throughput. Enabled by
-    /// `ATERM_PROFILING=1` or the profiling API. Part of Wave 1
+    /// (6 syscalls per invocation) to maximize throughput. Part of Wave 1
     /// throughput optimization.
+    ///
+    /// TRUE ONLY IN A DEBUG BUILD. This used to be
+    /// `cfg!(debug_assertions) || std::env::var("ATERM_PROFILING").is_ok()`,
+    /// which let an ambient variable move a RELEASE binary onto the second,
+    /// hand-maintained copy of the hot `process()` loop
+    /// (`aterm-core/src/terminal/processing.rs` — ~45 duplicated lines of
+    /// parser-reset / `post_process` / `observe_at` that differ from the else
+    /// arm only by six `Instant::now()` calls). A shipped build could take a
+    /// code path no release test covers, and the fields it fills
+    /// (`parse_duration_ns`, `grid_duration_ns`, `process_total_ns`) are
+    /// written at processing.rs and read NOWHERE in the workspace: no `ctl`
+    /// verb, no FFI reader, no bench. The env arm is gone; a debug build still
+    /// populates the decomposition for anyone wiring up a consumer.
     pub profiling_enabled: bool,
 }
 
+// NOT derivable, despite how it reads in a release build: `profiling_enabled`
+// defaults to `cfg!(debug_assertions)`, so the derive's `false` would silently
+// turn profiling off in debug builds. Clippy evaluates the macro under the
+// profile it lints in, which is why the release lane calls this derivable.
+#[allow(clippy::derivable_impls)]
 impl Default for PipelineTimestamps {
     fn default() -> Self {
         Self {
@@ -55,7 +72,7 @@ impl Default for PipelineTimestamps {
             snapshot_total_ns: 0,
             last_process_bytes: 0,
             process_sequence: 0,
-            profiling_enabled: cfg!(debug_assertions) || std::env::var("ATERM_PROFILING").is_ok(),
+            profiling_enabled: cfg!(debug_assertions),
         }
     }
 }

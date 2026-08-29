@@ -32,7 +32,8 @@ use aterm_digest::Sha256;
 use std::process::Command;
 
 /// Fixed 64-byte lowercase record used only by unpinned development builds.
-/// A release always supplies a valid `ATERM_UPDATE_PUBKEY`, so the release
+/// A release always has a non-empty committed pin
+/// (`aterm_update_core::pins::update_channel_signing_pubkey`), so the release
 /// cutter compares the Mach-O record against the permanent authority and
 /// rejects this sentinel.
 const UNPINNED_UPDATE_PIN_SENTINEL: &str =
@@ -185,22 +186,19 @@ fn main() {
     let vv = run(&compiler_path, &["-vV"]).unwrap_or_default();
     let compiler = parse_rustc_vv(&vv);
     // Flavor ('r' = upstream Rust, 't' = Trust fork), in priority order:
-    //   1. explicit ATERM_COMPILER_FLAVOR env override ('r'|'t'; junk ignored);
-    //   2. the -vV self-identification ('binary: trustc' / '(trustc)' version line
-    //      — the 2026-07 toolchains stamp both; covers the ATERM_CARGO=targo lane,
-    //      where a bare PATH-resolved `rustc` sets no env hint at all);
-    //   3. RUSTC path containing '/trust/' (the fork lives in $HOME/trust/build/...);
-    //   4. RUSTUP_TOOLCHAIN == 'trust' (a linked `rustup run trust` lane);
-    //   5. default 'r'.
+    //   1. the -vV self-identification ('binary: trustc' / '(trustc)' version line
+    //      — the 2026-07 toolchains stamp both; covers the lane where a bare
+    //      PATH-resolved `rustc` sets no env hint at all);
+    //   2. RUSTC path containing '/trust/' (the fork lives in $HOME/trust/build/...);
+    //   3. RUSTUP_TOOLCHAIN == 'trust' (a linked `rustup run trust` lane);
+    //   4. default 'r'.
     // NOT inferred from '-dev' in the release — any local rustc build reports -dev.
-    let explicit = std::env::var("ATERM_COMPILER_FLAVOR").ok();
+    // There is NO env override: an ATERM_COMPILER_FLAVOR that outranked the
+    // compiler's own self-report let a shell claim trustc provenance for a
+    // binary upstream rustc built, in the one field About and `ctl version` ship
+    // AS evidence. The three signals above cover every lane it was added for.
     let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
-    let flavor = detect_flavor(
-        explicit.as_deref(),
-        &vv,
-        &compiler_path,
-        toolchain.as_deref(),
-    );
+    let flavor = detect_flavor(&vv, &compiler_path, toolchain.as_deref());
     println!(
         "cargo:rustc-env=ATERM_COMPILER_VERSION_LINE={}",
         compiler.version_line
@@ -222,7 +220,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
-    println!("cargo:rerun-if-env-changed=ATERM_COMPILER_FLAVOR");
 
     // Re-stamp when HEAD moves (new commit / checkout) or the workspace source
     // version changes. The release build number comes from SOURCE_DATE_EPOCH;

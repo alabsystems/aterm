@@ -2134,6 +2134,8 @@ mod tests {
                         blinking: true,
                         base: None,
                         head_rgb: None,
+                        paint: None,
+                        ground: None,
                     },
                     &mut quads,
                 );

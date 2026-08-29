@@ -2974,7 +2974,7 @@ impl App {
         // QA SEAM: `ATERM_DEBUG_SEAMLESS_REEXEC=1` re-execs the SAME binary (no staged
         // build, no bundle swap) but exercises the FULL seamless handoff + adopt path, so
         // the shell-survives-an-update contract is testable end-to-end without a release.
-        let debug_seamless = std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
+        let debug_seamless = crate::app_update_screen::debug_seamless_reexec_armed();
         if !debug_seamless && apply_attempt.is_none() {
             let message = "no exact verified update authority was supplied".to_string();
             aterm_log::info!("update apply: {message}");
@@ -3182,10 +3182,29 @@ impl App {
                 }
             },
         );
+        // ONE name for one boolean. `ATERM_NO_OVERLAP_HANDOFF` used to sit two
+        // lines below this, AND-ed into the same value: two spellings of the same
+        // opt-out, only one of which appeared in any document, neither of which
+        // said anything when honoured. It is gone; this is the opt-out.
+        //
+        // And it is LOUD. Suppressing the overlap sends the update down the
+        // legacy restart path — a different route from the one the release was
+        // tested on — so a binary that takes it says so, once, by name. A silent
+        // env var that reroutes an update is how a shipped binary comes to
+        // behave differently from the one that was proven.
+        let seamless_opt_out = std::env::var_os("ATERM_NO_SEAMLESS_UPDATE").is_some();
+        if seamless_opt_out {
+            aterm_log::warn!(
+                "update apply: $ATERM_NO_SEAMLESS_UPDATE is set — the seamless \
+                 overlap handoff is DISABLED for this process. Live shells will NOT \
+                 survive the update; it falls back to the legacy restart path, which \
+                 is not the path this build's handoff proofs cover. Unset it to \
+                 restore the default."
+            );
+        }
         let overlap_available = !self.headless
-            && std::env::var_os("ATERM_NO_SEAMLESS_UPDATE").is_none()
+            && !seamless_opt_out
             && std::env::var_os("ATERM_CONTROL_SOCK").is_none()
-            && std::env::var_os("ATERM_NO_OVERLAP_HANDOFF").is_none()
             && self.proxy.is_some();
         let facts = crate::native_update_admission::AdmissionFacts {
             staged_verified: debug_seamless || apply_attempt.is_some(),

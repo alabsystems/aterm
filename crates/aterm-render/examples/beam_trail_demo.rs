@@ -27,6 +27,7 @@ const COLS: usize = 68;
 
 fn cfg() -> GlowConfig {
     GlowConfig {
+        ribbon_tall: false,
         enabled: true,
         style: GlowStyle::Beam,
         color: BEAM_DEFAULT_COLOR,
@@ -41,7 +42,6 @@ fn cfg() -> GlowConfig {
         head_dx: 0.5,
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
-        ribbon_tall: false,
         dark_theme: true,
         // `cfg()` takes no arguments, so there is no theme to derive from.
         // `Theme::default()` is what `main` renders with.

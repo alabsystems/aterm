@@ -71,6 +71,15 @@ pub struct TrailCell {
 /// row — so the row-scoped dirty gate + GPU scissor cover it exactly. `row` is
 /// a grid-row DAMAGE HINT: an above-grid quad tags row 0, which opens the top
 /// band on both presenters.
+///
+/// **AND THE OPACITY THAT MAKES IT A BED RATHER THAN A LAMP** ([`GlowQuad::alpha`]).
+/// A quad may composite in either of two modes, chosen per quad, and the mode
+/// is read off `alpha` alone — `0` is the historical additive light and every
+/// legacy stream leaves it there, so `Default` and every pre-existing emitter
+/// are byte-identical to the pre-`alpha` path. The two are ONE blend equation
+/// (`src + dst·(1 − a)`, premultiplied source-over) evaluated at `a = 0` and at
+/// `a > 0`, which is why the renderers need no second pipeline, no second pass,
+/// and no draw reorder to carry both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GlowQuad {
     /// The viewport row band this quad lives in — a grid-row DAMAGE HINT for
@@ -87,8 +96,53 @@ pub struct GlowQuad {
     pub w: u16,
     /// Quad height in pixels (kept within the single `row` cell band).
     pub h: u16,
-    /// PREMULTIPLIED light colour `0x00RRGGBB` — added (saturating) onto the dest.
+    /// PREMULTIPLIED light colour `0x00RRGGBB`. Its meaning is the SAME in both
+    /// compositing modes — the colour already multiplied by the coverage that
+    /// produced it — which is why [`alpha`](GlowQuad::alpha) is a separate field
+    /// and not packed into this word: every emitted-pixel pin that reads
+    /// `color` as a premultiplied product keeps reading exactly that.
     pub color: u32,
+    /// THE SOURCE-OVER OPACITY, `0..=255`, and the MODE SELECTOR with it.
+    ///
+    /// The one blend both modes are: `out = color + dst·(255 − alpha)/255`.
+    ///
+    /// * `alpha == 0` — PREMULTIPLIED ADDITIVE light, `out = dst + color`
+    ///   (saturating). The historical mode and the default: the destination
+    ///   keeps ALL of its own luminance and the quad only ever brightens.
+    ///   Order-independent, so overlap order is irrelevant.
+    /// * `alpha > 0` — PREMULTIPLIED SOURCE-OVER paint: the destination is
+    ///   attenuated by `1 − alpha/255` before the light lands, so the quad
+    ///   REPLACES that fraction of the ground instead of adding to it.
+    ///
+    /// **WHY THE SECOND MODE EXISTS.** An additive bed is charged the ground's
+    /// own luminance against its legibility budget: the composite is
+    /// `ground + light`, so every level the ground already spends is a level
+    /// the light may not. Source-over spends `ground·(1 − a)` instead, and the
+    /// difference is real saturation at the SAME certified contrast — measured
+    /// on the shipped dark ground, the rainbow bed's per-hue ceiling rises
+    /// 12–29 % (`certify_rainbow_band_cov_caps`) with the 5.25:1 bar untouched.
+    ///
+    /// Note the asymmetry the mode buys and the one it costs: additive light is
+    /// invisible over white and can never darken; source-over paint reads on any
+    /// ground and CAN darken a ground brighter than itself. A stream that must
+    /// not darken anything stays at `0`.
+    pub alpha: u8,
+}
+
+/// Which compositing mode a [`GlowQuad`] emitter stamps on the quads it
+/// produces — the NAME of the [`GlowQuad::alpha`] convention, so a rasterizer
+/// shared by an additive stream and a source-over one says which it is being
+/// asked for instead of being handed a bare `0`/`cov`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GlowBlend {
+    /// PREMULTIPLIED ADDITIVE light: every emitted quad carries `alpha == 0`.
+    /// The historical mode and the default — byte-identical to the pre-`alpha`
+    /// rasterizers.
+    #[default]
+    Add,
+    /// PREMULTIPLIED SOURCE-OVER paint: every emitted quad carries the coverage
+    /// that premultiplied its colour as its `alpha`.
+    Over,
 }
 
 /// How a [`RainHalo`]'s radially-weighted colour composites onto the frame.
@@ -4194,6 +4248,8 @@ mod rain_channel_tests {
             w: 12,
             h: 10,
             color: 0x0060_2008,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }
     }
 

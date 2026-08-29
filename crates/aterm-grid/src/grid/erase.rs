@@ -847,6 +847,152 @@ impl Grid {
         }
     }
 
+    /// Rewrite the attribute flags of every cell in a rectangle through `edit`.
+    ///
+    /// The one place a rectangular attribute op walks its cells, so the DECCARA
+    /// (set/clear) and DECRARA (reverse) entry points below cannot drift apart
+    /// on the clamping, the empty-rectangle guard, the `len` maintenance these
+    /// `get_mut` flag writes bypass, or the damage marking — the last two of
+    /// which no screen-text assertion would catch.
+    ///
+    /// REQUIRES: self.storage.visible_rows > 0
+    /// REQUIRES: self.storage.cols > 0
+    fn edit_attrs_rect(
+        &mut self,
+        top: u16,
+        left: u16,
+        bottom: u16,
+        right: u16,
+        edit: impl Fn(super::CellFlags) -> super::CellFlags,
+    ) {
+        // Attribute changes don't move the cursor — deferred wrap survives (xterm).
+        // Clamp to visible area
+        let top = top.min(self.storage.visible_rows.saturating_sub(1));
+        let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
+        let left = left.min(self.storage.cols.saturating_sub(1));
+        let right = right.min(self.storage.cols.saturating_sub(1));
+
+        // Validate rectangle
+        if top > bottom || left > right {
+            return;
+        }
+
+        let end_col = right.saturating_add(1);
+
+        for row_idx in top..=bottom {
+            if let Some(row) = self.row_mut(row_idx) {
+                for col in left..end_col {
+                    if let Some(cell) = row.get_mut(col) {
+                        let flags = edit(cell.flags());
+                        cell.set_flags(flags);
+                    }
+                }
+                // These get_mut flag writes bypass len maintenance. Setting an
+                // attribute flag on a blank cell makes it non-empty (is_empty
+                // requires flags==0), so len must grow to include a styled tail;
+                // clearing the last flag can empty the tail, so len must shrink.
+                // recompute_len corrects both directions and never over-shrinks
+                // (#7522 — DECCARA/DECRARA attribute-rect ops).
+                row.recompute_len();
+            }
+            self.storage.mark_content_row(row_idx);
+        }
+    }
+
+    /// Rewrite the attribute flags of every cell in a character stream through
+    /// `edit` (DECSACE stream mode).
+    ///
+    /// Stream sibling of [`Self::edit_attrs_rect`], and the one place the stream
+    /// extent rule lives: the first row starts at `left`, middle rows span the
+    /// full width (0..cols-1), and the last row ends at `right`.
+    ///
+    /// REQUIRES: self.storage.visible_rows > 0
+    /// REQUIRES: self.storage.cols > 0
+    fn edit_attrs_stream(
+        &mut self,
+        top: u16,
+        left: u16,
+        bottom: u16,
+        right: u16,
+        edit: impl Fn(super::CellFlags) -> super::CellFlags,
+    ) {
+        // Attribute changes don't move the cursor — deferred wrap survives (xterm).
+        // Clamp to visible area
+        let top = top.min(self.storage.visible_rows.saturating_sub(1));
+        let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
+        let left = left.min(self.storage.cols.saturating_sub(1));
+        let right = right.min(self.storage.cols.saturating_sub(1));
+
+        if top > bottom {
+            return;
+        }
+
+        let max_col = self.storage.cols.saturating_sub(1);
+
+        for row_idx in top..=bottom {
+            // Stream extent: first row starts at `left`, last row ends at
+            // `right`, middle rows span 0..max_col.
+            let start = if row_idx == top { left } else { 0 };
+            let end = if row_idx == bottom { right } else { max_col };
+
+            if start > end {
+                continue;
+            }
+
+            if let Some(row) = self.row_mut(row_idx) {
+                for col in start..=end {
+                    if let Some(cell) = row.get_mut(col) {
+                        let flags = edit(cell.flags());
+                        cell.set_flags(flags);
+                    }
+                }
+                // Same len maintenance as edit_attrs_rect: get_mut flag writes
+                // can make the tail non-empty (attr set) or empty (attr cleared),
+                // which len must reflect (#7522 — DECCARA/DECRARA stream mode).
+                row.recompute_len();
+            }
+            self.storage.mark_content_row(row_idx);
+        }
+    }
+
+    /// Reverse one cell's attribute flags for DECRARA.
+    ///
+    /// `toggle` holds only single-bit attributes (bold, blink, inverse, hidden),
+    /// which reverse by XOR. Underline is deliberately NOT among them: the style
+    /// is a three-bit family (`UNDERLINE`, `DOUBLE_UNDERLINE`, `CURLY_UNDERLINE`,
+    /// whose combinations also spell dotted and dashed), so XOR-ing the
+    /// `UNDERLINE` bit alone would silently turn a curly underline into a dotted
+    /// one — a style the application never named. "Reverse mode 4" therefore
+    /// means any-underline → none and none → single, the only reading that stays
+    /// inside the set of styles the SGR 4 that DECRARA names can itself produce.
+    #[inline]
+    fn reverse_cell_attrs(
+        flags: super::CellFlags,
+        toggle: super::CellFlags,
+        toggle_underline: bool,
+    ) -> super::CellFlags {
+        // Every bit any underline style can occupy. Spelled out here rather than
+        // reached for as `CellFlags::ALL_UNDERLINES`, which exists only under the
+        // `alacritty-compat` feature: this module compiles without it (aterm-grid's
+        // own test build), so naming the alias would make the crate's tests fail to
+        // build while its dependents kept compiling.
+        const UNDERLINE_BITS: super::CellFlags = super::CellFlags::from_bits(
+            super::CellFlags::UNDERLINE.bits()
+                | super::CellFlags::DOUBLE_UNDERLINE.bits()
+                | super::CellFlags::CURLY_UNDERLINE.bits(),
+        );
+
+        let mut flags = super::CellFlags::from_bits(flags.bits() ^ toggle.bits());
+        if toggle_underline {
+            if flags.intersects(UNDERLINE_BITS) {
+                flags = flags.difference(UNDERLINE_BITS);
+            } else {
+                flags = flags.union(super::CellFlags::UNDERLINE);
+            }
+        }
+        flags
+    }
+
     /// Change attributes in rectangular area (DECCARA - VT420+).
     ///
     /// Applies SGR attribute flags to all cells in the rectangular area defined
@@ -875,49 +1021,17 @@ impl Grid {
         flags_to_set: super::CellFlags,
         flags_to_clear: super::CellFlags,
     ) {
-        // Attribute changes don't move the cursor — deferred wrap survives (xterm).
-        // Clamp to visible area
-        let top = top.min(self.storage.visible_rows.saturating_sub(1));
-        let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
-        let left = left.min(self.storage.cols.saturating_sub(1));
-        let right = right.min(self.storage.cols.saturating_sub(1));
-
-        // Validate rectangle
-        if top > bottom || left > right {
-            return;
-        }
-
-        let end_col = right.saturating_add(1);
-
-        for row_idx in top..=bottom {
-            if let Some(row) = self.row_mut(row_idx) {
-                for col in left..end_col {
-                    if let Some(cell) = row.get_mut(col) {
-                        let mut flags = cell.flags();
-                        // Clear first, then set (so set takes priority)
-                        flags = flags.difference(flags_to_clear);
-                        flags = flags.union(flags_to_set);
-                        cell.set_flags(flags);
-                    }
-                }
-                // These get_mut flag writes bypass len maintenance. Setting an
-                // attribute flag on a blank cell makes it non-empty (is_empty
-                // requires flags==0), so len must grow to include a styled tail;
-                // clearing the last flag can empty the tail, so len must shrink.
-                // recompute_len corrects both directions and never over-shrinks
-                // (#7522 — DECCARA/DECRARA attribute-rect ops).
-                row.recompute_len();
-            }
-            self.storage.mark_content_row(row_idx);
-        }
+        // Clear first, then set (so set takes priority)
+        self.edit_attrs_rect(top, left, bottom, right, |flags| {
+            flags.difference(flags_to_clear).union(flags_to_set)
+        });
     }
 
     /// Change attributes in a character stream (DECSACE stream mode).
     ///
     /// When DECSACE stream mode is active, DECCARA operates on a contiguous
     /// character stream from (top, left) to (bottom, right) rather than a
-    /// rectangle. The first row starts at `left`, middle rows span the full
-    /// width (0..cols-1), and the last row ends at `right`.
+    /// rectangle.
     ///
     /// All coordinates are 0-indexed.
     pub fn change_attrs_stream(
@@ -929,45 +1043,59 @@ impl Grid {
         flags_to_set: super::CellFlags,
         flags_to_clear: super::CellFlags,
     ) {
-        // Attribute changes don't move the cursor — deferred wrap survives (xterm).
-        // Clamp to visible area
-        let top = top.min(self.storage.visible_rows.saturating_sub(1));
-        let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
-        let left = left.min(self.storage.cols.saturating_sub(1));
-        let right = right.min(self.storage.cols.saturating_sub(1));
+        self.edit_attrs_stream(top, left, bottom, right, |flags| {
+            flags.difference(flags_to_clear).union(flags_to_set)
+        });
+    }
 
-        if top > bottom {
-            return;
-        }
+    /// Reverse attributes in rectangular area (DECRARA - VT400+).
+    ///
+    /// Sibling of [`Self::change_attrs_rect`] over the same rectangle: each named
+    /// attribute is REVERSED per cell rather than set or cleared uniformly, so
+    /// the result depends on what each cell already carried (xterm ctlseqs,
+    /// `CSI Pt ; Pl ; Pb ; Pr ; Pm $ t`: "Pm denotes the attributes to reverse").
+    ///
+    /// `toggle` is XOR-ed into each cell's flags; `toggle_underline` reverses the
+    /// underline family as a whole — see [`Self::reverse_cell_attrs`].
+    ///
+    /// REQUIRES: self.storage.visible_rows > 0
+    /// REQUIRES: self.storage.cols > 0
+    /// SELECTION CUSTODY Phase 4 — records NO selection damage, for the reason
+    /// spelled out on [`Self::change_attrs_rect`]: the characters are untouched,
+    /// so a selection over these cells still names exactly the text it named
+    /// before.
+    pub fn reverse_attrs_rect(
+        &mut self,
+        top: u16,
+        left: u16,
+        bottom: u16,
+        right: u16,
+        toggle: super::CellFlags,
+        toggle_underline: bool,
+    ) {
+        self.edit_attrs_rect(top, left, bottom, right, |flags| {
+            Self::reverse_cell_attrs(flags, toggle, toggle_underline)
+        });
+    }
 
-        let max_col = self.storage.cols.saturating_sub(1);
-
-        for row_idx in top..=bottom {
-            // Stream extent: first row starts at `left`, last row ends at
-            // `right`, middle rows span 0..max_col.
-            let start = if row_idx == top { left } else { 0 };
-            let end = if row_idx == bottom { right } else { max_col };
-
-            if start > end {
-                continue;
-            }
-
-            if let Some(row) = self.row_mut(row_idx) {
-                for col in start..=end {
-                    if let Some(cell) = row.get_mut(col) {
-                        let mut flags = cell.flags();
-                        flags = flags.difference(flags_to_clear);
-                        flags = flags.union(flags_to_set);
-                        cell.set_flags(flags);
-                    }
-                }
-                // Same len maintenance as change_attrs_rect: get_mut flag writes
-                // can make the tail non-empty (attr set) or empty (attr cleared),
-                // which len must reflect (#7522 — DECCARA/DECRARA stream mode).
-                row.recompute_len();
-            }
-            self.storage.mark_content_row(row_idx);
-        }
+    /// Reverse attributes in a character stream (DECSACE stream mode).
+    ///
+    /// Stream sibling of [`Self::reverse_attrs_rect`], with the same extent rule
+    /// as [`Self::change_attrs_stream`].
+    ///
+    /// All coordinates are 0-indexed.
+    pub fn reverse_attrs_stream(
+        &mut self,
+        top: u16,
+        left: u16,
+        bottom: u16,
+        right: u16,
+        toggle: super::CellFlags,
+        toggle_underline: bool,
+    ) {
+        self.edit_attrs_stream(top, left, bottom, right, |flags| {
+            Self::reverse_cell_attrs(flags, toggle, toggle_underline)
+        });
     }
 
     /// Copy rectangular area (DECCRA - VT420+).
@@ -2521,12 +2649,76 @@ mod tests {
             "styled (non-empty) tail cells must be counted in len (stale-low fixed)"
         );
 
-        // DECRARA: clear BOLD again → cells become empty → len shrinks back.
+        // Clear BOLD again → cells become empty → len shrinks back.
         grid.change_attrs_rect(0, 5, 0, 9, CellFlags::empty(), CellFlags::BOLD);
         assert_eq!(
             grid.row_len(0),
             Some(0),
             "len must shrink when the tail becomes empty again (stale-high fixed)"
+        );
+    }
+
+    #[test]
+    fn reverse_attrs_rect_maintains_len_both_directions() {
+        // The same #7522 obligation on the DECRARA path: reversing an attribute
+        // onto blank trailing cells makes them non-empty and reversing it back
+        // empties them, so len must move in both directions. Both paths walk
+        // through `edit_attrs_rect`, and this is what would break first if a
+        // future reverse path grew its own walk.
+        let mut grid = Grid::new(3, 10);
+        assert_eq!(grid.row_len(0), Some(0), "precondition: row 0 blank");
+
+        grid.reverse_attrs_rect(0, 5, 0, 9, CellFlags::BOLD, false);
+        assert_eq!(
+            grid.row_len(0),
+            Some(10),
+            "reversing BOLD onto blank cells makes them non-empty"
+        );
+
+        grid.reverse_attrs_rect(0, 5, 0, 9, CellFlags::BOLD, false);
+        assert_eq!(
+            grid.row_len(0),
+            Some(0),
+            "reversing it back empties the tail again"
+        );
+    }
+
+    #[test]
+    fn reverse_attrs_of_underline_family_never_yields_an_unnamed_style() {
+        // Underline is three bits spelling five styles, so DECRARA's "reverse
+        // mode 4" cannot be an XOR of the UNDERLINE bit: that turns curly
+        // (CURLY alone) into dotted (UNDERLINE|CURLY). Any underline reverses to
+        // none; none reverses to single.
+        for start in [
+            CellFlags::UNDERLINE,
+            CellFlags::DOUBLE_UNDERLINE,
+            CellFlags::CURLY_UNDERLINE,
+            CellFlags::DOTTED_UNDERLINE,
+            CellFlags::DASHED_UNDERLINE,
+        ] {
+            let got = Grid::reverse_cell_attrs(start, CellFlags::empty(), true);
+            assert_eq!(
+                got.bits(),
+                0,
+                "every underline style reverses to no underline, got {got:?} from {start:?}"
+            );
+        }
+        let got = Grid::reverse_cell_attrs(CellFlags::empty(), CellFlags::empty(), true);
+        assert_eq!(
+            got,
+            CellFlags::UNDERLINE,
+            "no underline reverses to the single underline SGR 4 itself sets"
+        );
+        // Other attributes on the cell ride through untouched.
+        let got = Grid::reverse_cell_attrs(
+            CellFlags::BOLD.union(CellFlags::CURLY_UNDERLINE),
+            CellFlags::empty(),
+            true,
+        );
+        assert_eq!(
+            got,
+            CellFlags::BOLD,
+            "reversing the underline family leaves unrelated attributes alone"
         );
     }
 

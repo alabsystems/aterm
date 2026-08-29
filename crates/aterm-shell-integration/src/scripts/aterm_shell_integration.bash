@@ -147,9 +147,6 @@ if [ -d "$HOME/.aterm/shell.d" ]; then
     done
 fi
 
-# Package suite version
-export ATERM_SUITE_VERSION="${ATERM_SUITE_VERSION:-}"
-
 # Store the real PROMPT_COMMAND before we modify it.
 # Detect array vs scalar to preserve bash 5.1+ array-style PROMPT_COMMAND.
 __aterm_prompt_cmd_is_array=0
@@ -365,13 +362,6 @@ __aterm_prompt_command() {
         __aterm_mark_exec_finish $last_status
     fi
 
-    # One-shot banner (between 133;D and 133;A — outside the semantic
-    # prompt region so terminal parsers don't treat it as prompt text).
-    if [[ -n "$__aterm_pending_banner" ]]; then
-        printf '%s' "$__aterm_pending_banner" | base64 -d
-        unset __aterm_pending_banner
-    fi
-
     # Report current directory
     __aterm_report_cwd
 
@@ -500,18 +490,6 @@ __aterm_git_segment() {
 # (starship, oh-my-bash) that overwrite PS1 during their initialization.
 if [[ -n "$ATERM_PROMPT_STYLE" && "$ATERM_PROMPT_STYLE" != "none" ]]; then
     __aterm_pending_prompt_setup=1
-fi
-
-# Stash startup banner for deferred printing on first PROMPT_COMMAND.
-# Printing now would be erased if the user's PROMPT_COMMAND (starship,
-# oh-my-bash, etc.) clears or redraws the screen on first invocation.
-if [[ -n "$ATERM_BANNER_B64" ]]; then
-    __aterm_pending_banner="$ATERM_BANNER_B64"
-    unset ATERM_BANNER_B64
-    if [[ -n "${BASH_EXECUTION_STRING:-}" ]]; then
-        printf '%s' "$__aterm_pending_banner" | base64 -d
-        unset __aterm_pending_banner
-    fi
 fi
 
 # ─── Key Bindings ───

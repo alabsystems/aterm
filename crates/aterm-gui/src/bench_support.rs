@@ -1318,6 +1318,113 @@ impl BenchApp {
     }
 }
 
+// ----------------------------------------------------------- styled frame --
+
+/// The public face of the AGENT-FACING SCREEN READ (`aterm ctl screen`, and
+/// every `subscribe … cells` push) for `benches/styled_frame.rs`.
+///
+/// Same law as [`BenchApp`] and [`DigestBench`]: a thin forward to functions
+/// that must STAY crate-private, with no logic of its own. It keeps the two
+/// phases SEPARATE because the shipping callers do: `gather` runs with the
+/// terminal mutex HELD — an agent polling the screen stalls the engine for
+/// exactly that long — and `serialize` runs with it released. A bench that
+/// timed them together could not say which one a change moved.
+///
+/// The snapshot is HELD rather than consumed so that its drop (rows × cols
+/// worth of frees) lands outside the timed span, where it belongs: in
+/// production the gather's result is dropped after serialization, off the lock.
+pub struct GatheredFrame {
+    inner: crate::control::StyledFrameSnapshot,
+}
+
+impl GatheredFrame {
+    /// One `gather_styled_frame` — the in-lock phase, verbatim.
+    #[must_use]
+    pub fn gather(t: &aterm_core::terminal::Terminal) -> Self {
+        GatheredFrame {
+            inner: crate::control::gather_styled_frame(t),
+        }
+    }
+
+    /// One `serialize_styled_frame` — the off-lock phase, verbatim.
+    #[must_use]
+    pub fn serialize(&self) -> String {
+        crate::control::serialize_styled_frame(&self.inner)
+    }
+
+    /// Cells in the gathered frame: `rows × cols`, the lossless contract. The
+    /// REACH guard — a frame that trimmed, or a fixture that never painted, is
+    /// caught before it is priced as a fast one.
+    #[must_use]
+    pub fn cells(&self) -> usize {
+        self.inner.cell_count()
+    }
+}
+
+/// What a benched screen is painted with. The glyph read is the same code on
+/// both arms; what differs is BYTES PER CELL — one for ASCII, three for a CJK
+/// lead plus a two-byte combining tail — which is what a per-row grapheme
+/// buffer's single reserve has to cope with.
+#[derive(Clone, Copy)]
+pub enum ScreenFill {
+    /// Dense SGR-coloured ASCII: the ordinary agent-facing screen.
+    Ascii,
+    /// Double-width CJK pairs alternating with combining clusters: the
+    /// multi-byte, cluster-carrying screen.
+    Wide,
+}
+
+/// A `rows`x`cols` terminal with EVERY cell painted through the real parser, so
+/// a frame read sees a full screen rather than the implicit-blank fast path.
+///
+/// Fixture data, not product logic — it lives here rather than in the bench
+/// because the allocation-count gate (`tests/styled_frame_alloc.rs`) has to
+/// price the SAME screen the bench times, and a second copy of the painter is
+/// how two targets come to measure two different things.
+#[must_use]
+pub fn painted_screen(rows: u16, cols: u16, fill: ScreenFill) -> aterm_core::terminal::Terminal {
+    let mut t = aterm_core::terminal::Terminal::new(rows, cols);
+    for r in 0..rows {
+        // Absolute cursor placement per row: writing the last column arms the
+        // pending-wrap flag, and CUP is what the shell's own output would clear
+        // it with. No reliance on autowrap ordering.
+        t.process(format!("\x1b[{};1H", r + 1).as_bytes());
+        let mut line = String::new();
+        let mut width = 0u16;
+        match fill {
+            ScreenFill::Ascii => {
+                while width < cols {
+                    // An SGR run every 8 cells: the resolved-colour path a real
+                    // screen exercises, not one flat default run.
+                    if width.is_multiple_of(8) {
+                        line.push_str(&format!("\x1b[38;5;{}m", 16 + (width % 200)));
+                    }
+                    line.push(char::from(
+                        b'a' + u8::try_from((width + r) % 26).unwrap_or(0),
+                    ));
+                    width += 1;
+                }
+            }
+            ScreenFill::Wide => {
+                // "界" is two columns, "e" + U+0301 is one: a 3-column unit that
+                // puts a wide LEAD, a wide CONTINUATION (empty grapheme) and a
+                // multi-byte cluster in every row.
+                while width + 3 <= cols {
+                    line.push_str("界e\u{0301}");
+                    width += 3;
+                }
+                while width < cols {
+                    line.push('x');
+                    width += 1;
+                }
+            }
+        }
+        t.process(line.as_bytes());
+    }
+    t.process(b"\x1b[0m");
+    t
+}
+
 // ------------------------------------------------------- subscribe digest --
 
 /// The public face of the `events`-digest driver for

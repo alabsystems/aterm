@@ -2549,10 +2549,6 @@ fn spawn_pty_gather(
             // event loop inside `write(2)` — the one hazard the per-byte cadence exists
             // to dodge. `false` merely costs syscalls, so the failure direction is safe.
             sink.note_master_nonblocking(nonblock);
-            // Bench instrument (ATERM_GATHER_SINK=drop), read ONCE at thread start:
-            // count + discard batches to measure the pure kernel→gather drain ceiling.
-            let sink_drop = crate::bench_knobs::gather_sink_drop();
-            let mut sink_dropped_bytes: u64 = 0;
             let mut buf = first_buf;
             loop {
                 // STOP before the next read, never between a read and its hand-off:
@@ -2589,9 +2585,7 @@ fn spawn_pty_gather(
                                 &mut buf,
                                 n,
                                 wake_rd,
-                                // Bench sink detaches the parse stage — bridge
-                                // unconditionally (no idle cutoff to read).
-                                (!sink_drop).then_some(parse_in_flight.as_ref()),
+                                Some(parse_in_flight.as_ref()),
                             )
                         } else {
                             aterm_pty::drain_more(master, &mut buf, n)
@@ -2603,12 +2597,6 @@ fn spawn_pty_gather(
                             u64::try_from(lat_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
                         latest_output_activity_ns
                             .store(output_activity_now.max(1), Ordering::Release);
-                        // Bench sink: discard the batch (no hand-off, no recycle wait);
-                        // Started/Eof/Wake and all read/spin timing stay identical.
-                        if sink_drop {
-                            sink_dropped_bytes += filled as u64;
-                            continue;
-                        }
                         // Counted BEFORE the send: the bridge can never see
                         // "idle" while a batch is queued unparsed, AND the
                         // reader's fetch_sub can never precede this add
@@ -2623,10 +2611,6 @@ fn spawn_pty_gather(
                         };
                     }
                 }
-            }
-            // Bench sink: one exit-line total so the measurement can be read off.
-            if sink_drop {
-                eprintln!("[bench] ATERM_GATHER_SINK=drop discarded {sink_dropped_bytes} bytes");
             }
             // The gather owns the wake pipe's READ end on unix — close it on exit.
             aterm_pty::close_fd(wake_rd);
@@ -3025,18 +3009,23 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 // time off the recorder's own epoch and the channel is FIFO, and no
                 // caller was ever promised that a burst is recorded before the UI sees
                 // it (the hand-off has always been asynchronous).
-                // Bench instrument (ATERM_CAST_TAP=off): price the always-on tap.
-                if !crate::bench_knobs::cast_tap_off() {
-                    let burst: std::sync::Arc<[u8]> = std::sync::Arc::from(buf);
-                    // `try_send`, not `send`: the cast queue is bounded (`CAST_QUEUE_CAP`). If the
-                    // writer thread stalls under an output flood, DROP this burst rather than block
-                    // the reader's hot path or let the queue grow without bound. Recording is
-                    // best-effort; a dropped burst is a gap, never an OOM.
-                    let _ = cast_tx.try_send(burst.clone());
-                    // Live byte fan-out (Item 2): tee the SAME burst to any `bytes`
-                    // subscribers — one refcount bump, never blocks the reader.
-                    byte_fanout.tee(&burst);
-                }
+                // There is deliberately NO env kill switch on this tap. The
+                // `ATERM_CAST_TAP=off` bench knob that used to wrap it lived in a
+                // module compiled unconditionally into every shipped binary, so a
+                // release with it exported recorded NOTHING — `ctl cast` /
+                // `cast frames` answered an empty session and every live `bytes`
+                // subscriber went silent — with nothing in the UI or introspection
+                // saying so, in a terminal whose selling point is that an
+                // unattended session stays observable after the fact.
+                let burst: std::sync::Arc<[u8]> = std::sync::Arc::from(buf);
+                // `try_send`, not `send`: the cast queue is bounded (`CAST_QUEUE_CAP`). If the
+                // writer thread stalls under an output flood, DROP this burst rather than block
+                // the reader's hot path or let the queue grow without bound. Recording is
+                // best-effort; a dropped burst is a gap, never an OOM.
+                let _ = cast_tx.try_send(burst.clone());
+                // Live byte fan-out (Item 2): tee the SAME burst to any `bytes`
+                // subscribers — one refcount bump, never blocks the reader.
+                byte_fanout.tee(&burst);
             };
             #[cfg(windows)]
             loop {
@@ -3103,10 +3092,6 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             // contract); the channel is guaranteed to end with Eof/Wake (or
             // close), so recv() needs no timeout or stop polling.
             #[cfg(unix)]
-            // Bench instrument (ATERM_PARSE_SINK=drop), read ONCE at thread start:
-            // recycle batches without engine ingest (gather+channel+recycle cost only).
-            let parse_drop = crate::bench_knobs::parse_sink_drop();
-            #[cfg(unix)]
             loop {
                 match filled_rx.recv() {
                     Ok(GatherMsg::Started) => {
@@ -3116,11 +3101,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         });
                     }
                     Ok(GatherMsg::Data(batch, len)) => {
-                        // Bench sink: skip ingest (and its downstream taps/wakes);
-                        // the recycle path below stays exactly the same.
-                        if !parse_drop {
-                            ingest(&batch[..len]);
-                        }
+                        ingest(&batch[..len]);
                         // Recycle the buffer; a no-op after the gather exits.
                         let _ = free_tx.try_send(batch);
                         // Ingest done: only now does this batch stop counting as

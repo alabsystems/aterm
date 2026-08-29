@@ -32,7 +32,7 @@
 
 mod fold;
 
-pub use fold::{fold, fold_into, is_no_space_script, is_token_char};
+pub use fold::{fold, fold_into, has_foldable_marks, is_no_space_script, is_token_char};
 
 use aterm_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
@@ -398,6 +398,21 @@ struct LexiconHit {
     form_id: FormId,
     ambiguous: bool,
     species: Option<SpeciesId>,
+    /// THE MARKS-REQUIRED GATE (the `dmg` curse-bonk fix, 2026-08-29): every
+    /// claiming surface lost diacritics in folding AND folded to a bare-ASCII
+    /// key, so plain ASCII text spells something ELSE that merely shares the
+    /// skeleton (Vietnamese `đm` → `dm`, which is also how one types `dmg`,
+    /// `dmesg`, a DM; Spanish `coño` → `cono` inside `conoid`; Slavic `pička`
+    /// → `picka` inside `pickax`). Such a key only matches a token that
+    /// itself carries folded-away marks ([`fold::has_foldable_marks`]) — the
+    /// data's own convention: an entry that WANTS the bare spelling to match
+    /// lists it explicitly (`scheiße` beside `scheisse`), and one that does
+    /// not says so (`đm`: "Tone marks essential").
+    ///
+    /// A key whose fold RETAINS any non-ASCII (e.g. `địt` → `dịt`) is never
+    /// gated: matching text already had to carry those characters, so the
+    /// bare-ASCII collision this bit exists for cannot arise.
+    marks_required: bool,
 }
 
 // ---- TOML shapes ----
@@ -706,10 +721,16 @@ impl Lexicon {
                     insert_class(
                         &mut cjk_forms,
                         key,
-                        class,
-                        lset,
-                        e.ambiguous,
-                        species,
+                        PendingHit {
+                            class,
+                            langs: lset,
+                            ambiguous: e.ambiguous,
+                            species,
+                            // CJK keys are RAW (never folded), so no mark is
+                            // ever lost and the marks-required gate cannot
+                            // apply.
+                            marks_required: false,
+                        },
                         &mut conflicts,
                     );
                 } else {
@@ -744,13 +765,25 @@ impl Lexicon {
                         // exempt it.
                         user_surfaces.insert(key.clone());
                     }
+                    // The marks-required gate (see [`LexiconHit`]): this
+                    // surface folded marks away AND landed on a bare-ASCII
+                    // key, so unmarked ASCII text spells a DIFFERENT word
+                    // that would otherwise complete it (`đm` → `dm` fired
+                    // the curse bonk mid-`dmg`). Explicitly listing the bare
+                    // spelling (its own surface, `marks_required = false`)
+                    // remains the data's way to opt the skeleton in — the
+                    // same-class merge in [`insert_class`] ANDs the bit.
+                    let marks_required = key.is_ascii() && fold::has_foldable_marks(s);
                     insert_class(
                         &mut spaced,
                         key,
-                        class,
-                        lset,
-                        e.ambiguous,
-                        species,
+                        PendingHit {
+                            class,
+                            langs: lset,
+                            ambiguous: e.ambiguous,
+                            species,
+                            marks_required,
+                        },
                         &mut conflicts,
                     );
                 }
@@ -859,6 +892,20 @@ impl Lexicon {
         self.cjk_forms.iter().map(|(k, v)| (k.as_str(), v.class))
     }
 
+    /// Whether the spaced surface behind `folded_key` matches only tokens that
+    /// themselves carry folded-away marks ([`has_foldable_marks`]) — i.e.
+    /// every claiming surface lost diacritics into a bare-ASCII key and none
+    /// listed the bare spelling explicitly (the `đm` → `dm` curse-bonk fix).
+    /// `false` for an unknown key. Validator surface: the round-trip tests
+    /// must probe such a key with a marked witness, and the fold-collision
+    /// gate may trust that its bare skeleton never fires.
+    #[must_use]
+    pub fn surface_requires_marks(&self, folded_key: &str) -> bool {
+        self.spaced
+            .get(folded_key)
+            .is_some_and(|hit| hit.marks_required)
+    }
+
     /// Whether at least one compiled surface in `class` can pass the scanner's
     /// static policy gates and is not claimed by an overriding runtime table.
     /// This is a cold-path capability projection for hosts; it follows the same
@@ -919,13 +966,24 @@ impl Lexicon {
         folded: &mut String,
         candidate_folded: &mut String,
     ) -> Option<LexiconHit> {
+        // The marks-required gate (see [`LexiconHit::marks_required`]): a key
+        // whose every claiming surface lost diacritics into bare ASCII only
+        // matches a token that itself carries folded-away marks. Evaluated
+        // lazily — only a token that actually hits a gated key pays the walk,
+        // and the possessive/clitic fallbacks judge the SAME full token (a
+        // mark anywhere in it is the typist writing marked text).
+        let admits = |c: &LexiconHit| !c.marks_required || fold::has_foldable_marks(token);
         fold::fold_into(token, folded);
-        if let Some(c) = self.spaced.get(folded.as_str()).copied() {
+        if let Some(c) = self.spaced.get(folded.as_str()).copied()
+            && admits(&c)
+        {
             return Some(c);
         }
         if let Some((stripped, variant)) = strip_possessive(token) {
             fold::fold_into(stripped, candidate_folded);
-            if let Some(mut c) = self.spaced.get(candidate_folded.as_str()).copied() {
+            if let Some(mut c) = self.spaced.get(candidate_folded.as_str()).copied()
+                && admits(&c)
+            {
                 c.form_id = c.form_id.with_variant(variant);
                 return Some(c);
             }
@@ -937,7 +995,9 @@ impl Lexicon {
             && rest.chars().count() >= 2
         {
             fold::fold_into(rest, candidate_folded);
-            if let Some(mut c) = self.spaced.get(candidate_folded.as_str()).copied() {
+            if let Some(mut c) = self.spaced.get(candidate_folded.as_str()).copied()
+                && admits(&c)
+            {
                 c.form_id = c.form_id.with_variant(5);
                 return Some(c);
             }
@@ -956,7 +1016,9 @@ impl Lexicon {
         {
             let rest = &token[first.len_utf8()..];
             fold::fold_into(rest, candidate_folded);
-            if let Some(mut c) = self.spaced.get(candidate_folded.as_str()).copied() {
+            if let Some(mut c) = self.spaced.get(candidate_folded.as_str()).copied()
+                && admits(&c)
+            {
                 let variant = arabic_clitics
                     .iter()
                     .position(|c| *c == first)
@@ -1306,7 +1368,14 @@ fn class_rank(class: Class) -> u8 {
 /// A surface's precedence-in-progress record: [`LexiconHit`] minus the
 /// [`FormId`], which is assigned only after every class collision has settled
 /// ([`finalize_hits`]).
-type PendingHit = (Class, LangSet, bool, Option<SpeciesId>);
+#[derive(Clone, Copy, Debug)]
+struct PendingHit {
+    class: Class,
+    langs: LangSet,
+    ambiguous: bool,
+    species: Option<SpeciesId>,
+    marks_required: bool,
+}
 
 /// Insert a surface, resolving collisions: a higher-ranked class REPLACES the
 /// entry and keeps ONLY its own languages (the surface is displayed as the
@@ -1344,27 +1413,23 @@ fn note_cjk_head(heads: &mut FxHashMap<char, usize>, surface: &str) {
 fn insert_class(
     map: &mut FxHashMap<String, PendingHit>,
     key: String,
-    class: Class,
-    langs: LangSet,
-    ambiguous: bool,
-    species: Option<SpeciesId>,
+    new: PendingHit,
     conflicts: &mut Vec<String>,
 ) {
     match map.get_mut(&key) {
-        Some((prev, set, prev_ambiguous, prev_species))
-            if class_rank(class) > class_rank(*prev) =>
-        {
-            *prev = class;
-            *set = langs;
-            *prev_ambiguous = ambiguous;
-            *prev_species = species;
+        Some(prev) if class_rank(new.class) > class_rank(prev.class) => {
+            *prev = new;
         }
-        Some((prev, set, prev_ambiguous, prev_species)) if *prev == class => {
-            *set = set.union(langs);
+        Some(prev) if prev.class == new.class => {
+            prev.langs = prev.langs.union(new.langs);
             // One unambiguous claimant is sufficient to make the winning
             // surface safe for immediate live-cursor decoration.
-            *prev_ambiguous &= ambiguous;
-            match (*prev_species, species) {
+            prev.ambiguous &= new.ambiguous;
+            // Likewise one claimant listing the BARE spelling explicitly
+            // (`scheisse` beside `scheiße`) makes the merged key matchable
+            // by unmarked text — explicit data is consent.
+            prev.marks_required &= new.marks_required;
+            match (prev.species, new.species) {
                 (Some(a), Some(b)) if a != b => {
                     // Two species claim one surface — a data bug (which sprite
                     // would the word show?). First claimant wins (TOML order);
@@ -1374,13 +1439,13 @@ fn insert_class(
                     msg.push_str(" claimed by two animal species: kept the first");
                     conflicts.push(msg);
                 }
-                (None, sp @ Some(_)) => *prev_species = sp,
+                (None, sp @ Some(_)) => prev.species = sp,
                 _ => {}
             }
         }
         Some(_) => {}
         None => {
-            map.insert(key, (class, langs, ambiguous, species));
+            map.insert(key, new);
         }
     }
 }
@@ -1396,7 +1461,7 @@ fn finalize_hits(
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut out = FxHashMap::default();
     out.reserve(entries.len());
-    for (key, (class, langs, ambiguous, species)) in entries {
+    for (key, pending) in entries {
         let form_id = FormId::exact(*next_form_id);
         *next_form_id = next_form_id
             .checked_add(1)
@@ -1404,11 +1469,12 @@ fn finalize_hits(
         out.insert(
             key,
             LexiconHit {
-                class,
-                langs,
+                class: pending.class,
+                langs: pending.langs,
                 form_id,
-                ambiguous,
-                species,
+                ambiguous: pending.ambiguous,
+                species: pending.species,
+                marks_required: pending.marks_required,
             },
         );
     }

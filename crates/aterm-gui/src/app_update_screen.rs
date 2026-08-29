@@ -37,6 +37,33 @@ pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// `true` while the `ATERM_DEBUG_SEAMLESS_REEXEC` QA seam is armed — and it SAYS
+/// SO, once per process, the first time anything asks.
+///
+/// The seam re-execs the SAME binary through the full seamless handoff + adopt
+/// path so the shell-survives-an-update contract is testable without cutting a
+/// release. That is worth keeping. What is not worth keeping is a release binary
+/// that reports "update ready" and takes the handoff route because of an ambient
+/// variable, with nothing on the record saying which of the two it did. It no
+/// longer relaxes the adoption identity gate either — see
+/// `seamless::normalize_commit`, where the `unknown`-commit admission is now
+/// `cfg!(debug_assertions)` alone.
+pub(crate) fn debug_seamless_reexec_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        let on = crate::app_update_screen::debug_seamless_reexec_armed();
+        if on {
+            aterm_log::warn!(
+                "$ATERM_DEBUG_SEAMLESS_REEXEC is set: this process reports a staged \
+                 update as READY and applies it by re-execing THIS SAME BINARY. No \
+                 bundle is verified, staged or swapped — it is the handoff QA seam, \
+                 not an update. Unset it to restore normal update behaviour."
+            );
+        }
+        on
+    })
+}
+
 impl App {
     /// Snapshot the current process-owned updater reducer into a fresh [`UpdateState`].
     /// This is memory-only: ledger and installed-bundle facts enter the reducer solely
@@ -235,7 +262,7 @@ impl App {
     /// repeated filesystem work in one menu click. Mirrors the
     /// `ATERM_DEBUG_SEAMLESS_REEXEC` QA seam so the handoff remains exercisable.
     pub(crate) fn staged_update_ready(&self) -> bool {
-        if std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some() {
+        if crate::app_update_screen::debug_seamless_reexec_armed() {
             return true;
         }
         let snapshot = self.native_updater_service.snapshot();
@@ -257,7 +284,7 @@ impl App {
     /// us) it opens the Software Update route in the native Settings tab: honest
     /// details, never a dead click, a legacy modal, or a blind restart.
     pub(crate) fn apply_update_or_details(&mut self) {
-        let debug_seamless = std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
+        let debug_seamless = crate::app_update_screen::debug_seamless_reexec_armed();
         let staged_ready = self.staged_update_ready();
         let _ = self.apply_update_or_details_with_facts(staged_ready, debug_seamless);
     }

@@ -1291,7 +1291,14 @@ fn release_release_lease_inner(
 /// journal's existence (a journal on disk MEANS the claim is verified);
 /// "build" covers build+bundle+sign+dmg+manifest as one re-enterable unit
 /// (its outputs are all derived from `(version, build_number)` on disk).
-pub const STEPS: [&str; 12] = [
+///
+/// `site` (format 8) runs AFTER `unlock`, deliberately: it touches no release
+/// object — it re-runs `publish/post-promote --latest` so alab.systems' download
+/// button names the DMG this cut just mirrored — so the release must already be
+/// live, mirrored, and lease-free before it starts, and a website failure parks
+/// the journal at `site` (loud, `--resume`-able) while the RELEASE itself is
+/// complete and untouched by any retry.
+pub const STEPS: [&str; 13] = [
     "lock",
     "build",
     "selfcheck",
@@ -1304,7 +1311,18 @@ pub const STEPS: [&str; 12] = [
     "verify",
     "mirror",
     "unlock",
+    "site",
 ];
+
+/// Steps that run after the release lease was CAS-deleted by `unlock`. An
+/// entry (fresh or resumed) whose next step is one of these must not acquire
+/// or demand the lease/fence: the release is already live, verified, mirrored
+/// and unlocked, and re-acquiring would mint a lock nothing will ever delete.
+const POST_UNLOCK_STEPS: [&str; 1] = ["site"];
+
+pub fn is_post_unlock_step(step: &str) -> bool {
+    POST_UNLOCK_STEPS.contains(&step)
+}
 
 const LEGACY_STEPS: [&str; 9] = [
     "build",
@@ -1361,7 +1379,28 @@ const STEPS_V6: [&str; 13] = [
     "unlock",
 ];
 
-pub const JOURNAL_FORMAT: u32 = 7;
+/// Format-7 step order — identical to [`STEPS`] minus the post-unlock website
+/// `site` step, which format 8 appended after `unlock`. Frozen for the same
+/// reason as [`STEPS_V5`]/[`STEPS_V6`]: a COMPLETED v7 journal (every cut
+/// through v0.63.0) must still read back as complete — walking one against the
+/// current list would misfile a finished cut as "resumable at site" and block
+/// the next cut behind a step that was never owed.
+const STEPS_V7: [&str; 12] = [
+    "lock",
+    "build",
+    "selfcheck",
+    "draft",
+    "upload",
+    "preflip",
+    "tag",
+    "flip",
+    "archive",
+    "verify",
+    "mirror",
+    "unlock",
+];
+
+pub const JOURNAL_FORMAT: u32 = 8;
 
 const fn legacy_journal_format() -> u32 {
     1
@@ -1725,6 +1764,7 @@ impl Journal {
             1 => &LEGACY_STEPS,
             ..=5 => &STEPS_V5,
             6 => &STEPS_V6,
+            7 => &STEPS_V7,
             _ => &STEPS,
         };
         steps.iter().copied().find(|step| !self.is_done(step))
@@ -3476,13 +3516,20 @@ pub fn channel_signature_policy(
 
 /// Decode and re-emit the updater Ed25519 key so journal/config comparisons
 /// use one canonical identity rather than textual base64 aliases.
+///
+/// The key arrives as an ARGUMENT — from the committed pin
+/// (`aterm_update_core::pins::update_channel_signing_pubkey`), the release
+/// journal, or the machine roster. These messages used to name
+/// `ATERM_UPDATE_PUBKEY`, which sent an operator hunting for an environment
+/// variable this function has never consulted and that was retired along with
+/// the ambient `release.conf` (docs/RELEASING.md).
 pub fn canonical_update_pubkey(encoded: &str) -> Result<String> {
     let encoded = encoded.trim();
     let bytes = aterm_codec::base64::decode_strict(encoded.as_bytes())
-        .map_err(|_| Error::new("ATERM_UPDATE_PUBKEY is not valid standard base64"))?;
+        .map_err(|_| Error::new("updater signing key is not valid standard base64"))?;
     if bytes.len() != 32 {
         return Err(Error::new(format!(
-            "ATERM_UPDATE_PUBKEY decodes to {} bytes, not an Ed25519 32-byte public key",
+            "updater signing key decodes to {} bytes, not an Ed25519 32-byte public key",
             bytes.len()
         )));
     }
@@ -3534,8 +3581,9 @@ pub fn verify_channel_head_signature_with(
     }
     let pubkey = signature_pubkey.ok_or_else(|| {
         Error::new(
-            "published signature history activates Tier SIG, but no pinned \
-             ATERM_UPDATE_PUBKEY is available; verification cannot fall back to unsigned",
+            "published signature history activates Tier SIG, but no pinned updater \
+             signing key is available (aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS); \
+             verification cannot fall back to unsigned",
         )
     })?;
     let heads: Vec<&AppcastRelease> = releases
@@ -8138,11 +8186,16 @@ fn resume_cut(
 /// pipeline all cut flavors share.
 fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
     // Resume re-proves/reacquires exact ownership even when `lock` was already
-    // journaled. The one exception is an unlock-only resume: absence may mean
+    // journaled. The exceptions: an unlock-only resume (absence may mean the
     // delete landed and the journal mark crashed, so reacquiring would undo
-    // convergence.
+    // convergence) and a post-unlock resume (`site` — the lease was already
+    // CAS-deleted by this cut's own `unlock`; reacquiring would mint a lock
+    // that nothing in the remaining steps ever deletes).
     if ctx.kind == CutKind::Real
-        && ctx.journal.as_ref().and_then(Journal::first_incomplete) != Some("unlock")
+        && !matches!(
+            ctx.journal.as_ref().and_then(Journal::first_incomplete),
+            Some(step) if step == "unlock" || is_post_unlock_step(step)
+        )
     {
         if ctx.lease.is_none() {
             let git = GitCli::new(&ctx.repo);
@@ -8180,7 +8233,10 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
         if ctx.is_done(name) {
             continue;
         }
-        if ctx.kind == CutKind::Real && !matches!(name, "lock" | "unlock") {
+        if ctx.kind == CutKind::Real
+            && !matches!(name, "lock" | "unlock")
+            && !is_post_unlock_step(name)
+        {
             ensure_ctx_release_lease(ctx)?;
         }
         match name {
@@ -8219,6 +8275,13 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             "unlock" => {
                 if ctx.kind == CutKind::Real {
                     step_unlock(ctx)?;
+                }
+            }
+            "site" => {
+                // The rehearsal publishes to a scratch repo the public site
+                // must never link; only a real cut moves alab.systems.
+                if ctx.kind == CutKind::Real {
+                    step_site(ctx)?;
                 }
             }
             _ => unreachable!("unknown pipeline step {name}"),
@@ -8415,6 +8478,139 @@ fn step_unlock(ctx: &mut CutCtx) -> Result<()> {
         },
     );
     Ok(())
+}
+
+/// What the website hook's exit status means for the `site` step. The codes
+/// are `publish/post-promote`'s documented contract (its header comment):
+/// 0 synced-or-deferred, 3 no site checkout, 4 deployed but the live site
+/// lags the CDN — and of those only a code OUTSIDE the contract (1 hard
+/// failure, 2 usage, a signal) fails the step. Pure so the contract is pinned
+/// by tests without running the hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteHookOutcome {
+    /// Exit 0 — synced, already current, or the hook's own narrated deferral
+    /// (e.g. "SITE NOT DEPLOYED — committed and pushed").
+    Synced,
+    /// Exit 3 — no usable site checkout on this machine; nothing was touched
+    /// and no retry HERE can ever succeed. Deferred loudly, step completes.
+    NoSiteCheckout,
+    /// Exit 4 — deployed, but the live origin still served old bytes after
+    /// the settle loop. The deploy succeeded; re-check by hand.
+    LiveLagging,
+    /// Anything else — a real failure; the step fails and the journal parks
+    /// at `site` for `cut --resume`.
+    Failed,
+}
+
+#[must_use]
+pub const fn site_hook_outcome(code: Option<i32>) -> SiteHookOutcome {
+    match code {
+        Some(0) => SiteHookOutcome::Synced,
+        Some(3) => SiteHookOutcome::NoSiteCheckout,
+        Some(4) => SiteHookOutcome::LiveLagging,
+        _ => SiteHookOutcome::Failed,
+    }
+}
+
+/// Journal step "site": alab.systems follows the cut — the download button
+/// names the `aterm-<version>.dmg` the mirror just flipped live, with its true
+/// size, and `/releases` carries the notes. The mechanism is the SAME hook a
+/// `pub promote` runs (`publish/post-promote`, byte transforms in
+/// `publish/site-sync.py`, tested hermetically by `tools/test-site-sync.sh`);
+/// running it again here is what closes the promote-time gap that hook prints
+/// as "v<version> not cut yet".
+///
+/// Runs after `unlock`, on a real cut only (see [`STEPS`]): the release is
+/// already live, verified, mirrored and lease-free, so nothing here can hurt
+/// it. The outcome split is [`site_hook_outcome`]:
+///
+/// - exit 0 — synced, or the hook's own deliberate deferrals (no Firebase
+///   login: "SITE NOT DEPLOYED — committed and pushed; deploy later with
+///   deploy.sh"), which its transcript already narrates;
+/// - exit 3 — this machine has NO site checkout. Structural: no `--resume` on
+///   this machine can ever complete the step, and parking the journal would
+///   block the next cut behind a checkout that does not exist here. Announced
+///   LOUDLY (with the exact command for a machine that has the checkout) and
+///   marked done;
+/// - exit 4 — deployed, but the live site still lags after the settle loop
+///   (CDN). The deploy itself succeeded; announced, marked done, re-check by
+///   hand;
+/// - anything else — a real failure. The step FAILS, naming the release as
+///   safe, and the journal parks at "site": `cargo ship cut --resume` re-enters
+///   exactly here (the hook is idempotent — an already-synced site is "nothing
+///   to commit"), and `publish/post-promote --latest` is the same retry without
+///   the journal.
+fn step_site(ctx: &mut CutCtx) -> Result<()> {
+    let hook = ctx.repo.join("publish/post-promote");
+    if !hook.is_file() {
+        step(
+            "site",
+            "publish/post-promote is not in this tree — no public website follows this channel; skipped",
+        );
+        return Ok(());
+    }
+    step(
+        "site",
+        &format!(
+            "alab.systems follows the cut: publish/post-promote --latest \
+             (download button \u{2192} aterm-{}.dmg on the public channel)",
+            ctx.version
+        ),
+    );
+    let status = Command::new(&hook)
+        .arg("--latest")
+        .env("PUB_VERSION", &ctx.version)
+        .current_dir(&ctx.repo)
+        .status()
+        .map_err(|error| {
+            Error::new(format!(
+                "cannot run {}: {error}; the release v{} is LIVE, verified and mirrored — only \
+                 the website step is owed. Retry with `cargo ship cut --resume`, or run \
+                 `publish/post-promote --latest` by hand",
+                hook.display(),
+                ctx.version
+            ))
+        })?;
+    match site_hook_outcome(status.code()) {
+        SiteHookOutcome::Synced => {
+            step("site", "alab.systems synced (or deferred with instructions above)");
+            Ok(())
+        }
+        SiteHookOutcome::NoSiteCheckout => {
+            // No site checkout on this machine — post-promote touched nothing.
+            step(
+                "site",
+                &format!(
+                    "WARNING: NO SITE CHECKOUT ON THIS MACHINE — alab.systems still links the \
+                     PREVIOUS release's DMG. The cut is complete and unaffected; from a machine \
+                     with the site checkout run: publish/post-promote --latest   (set SITE_DIR \
+                     if it is not at ~/company-life/companies/ferrite/workspace-alab); v{} will \
+                     then be the download",
+                    ctx.version
+                ),
+            );
+            Ok(())
+        }
+        SiteHookOutcome::LiveLagging => {
+            step(
+                "site",
+                "deployed, but the live site still served the old bytes after the settle loop \
+                 (CDN lag or a concurrent deploy) — re-check https://alab.systems in a minute",
+            );
+            Ok(())
+        }
+        SiteHookOutcome::Failed => Err(Error::new(format!(
+            "publish/post-promote --latest failed ({}); the release v{} is LIVE, verified and \
+             mirrored — the cut is safe, only the website step is owed. The journal parks at \
+             \"site\": retry with `cargo ship cut --resume` (re-enters exactly here), or run \
+             `publish/post-promote --latest` by hand and then `cargo ship cut --resume` to \
+             converge the journal (an already-synced site is \"nothing to commit\")",
+            status
+                .code()
+                .map_or_else(|| "killed by signal".to_string(), |c| format!("exit {c}")),
+            ctx.version
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------

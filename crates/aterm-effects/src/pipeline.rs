@@ -242,6 +242,10 @@ impl EffectsPipeline {
             cursor_coordinate_space: None,
             glow: CursorGlow::default(),
             glow_cfg: GlowConfig {
+                // The cold-start style is Lumen, which has no ribbon at all,
+                // so the presentation flag is exactly `false` here rather than
+                // a guess: `apply` overwrites it from the real spelling.
+                ribbon_tall: false,
                 // A COHERENT cold-start pair for `dark_theme: true` — the
                 // documented default palette. Never `0`/`0`: that is `fg == bg`,
                 // which the glyph tint reads as a conceal-shaped theme and
@@ -264,7 +268,6 @@ impl EffectsPipeline {
                 head_dx: 0.5,
                 pack: None,
                 wake_persist_s: RAINBOW_WAKE_PERSIST,
-                ribbon_tall: false,
             },
             glow_color_from_cursor: true,
             glow_accent_from_cursor: true,
@@ -653,6 +656,14 @@ impl EffectsPipeline {
         self.glow_color_from_cursor = color_from_cursor;
         self.glow_accent_from_cursor = accent_from_cursor;
         self.glow_cfg = GlowConfig {
+            // The ribbon's presentation is a SPELLING of the style (like the pet
+            // companions), so it re-derives from the raw string on every
+            // reconfigure, by the same law the native resolver uses
+            // (`app_config`): the four explicit `… tall` spellings opt into the
+            // v0.43 full-height shoulder, and everything else — which is every
+            // ordinary rainbow spelling — gets the default
+            // highlighter-plus-under-baseline mark.
+            ribbon_tall: crate::cursor_glow::GlowStyle::style_names_tall_ribbon(style),
             // CARRIED FORWARD, not reset — the same discipline `pack` and
             // `wake_persist_s` follow below. A reconfigure between two frames
             // must not clobber a ground the fold already resolved, or a live
@@ -693,12 +704,6 @@ impl EffectsPipeline {
             // The host's typing-wake preference survives a reconfigure exactly
             // like its intensity/colour choices do.
             wake_persist_s: self.glow_cfg.wake_persist_s,
-            // The ribbon's presentation is a SPELLING of the style (like the
-            // pet companions), so it re-derives from the raw string on every
-            // reconfigure: the `… tall` spellings opt into the v0.43 full-height
-            // body, everything else gets the default post-v0.43
-            // highlighter-plus-under-baseline mark.
-            ribbon_tall: crate::cursor_glow::GlowStyle::style_names_tall_ribbon(style),
         };
         if !enabled {
             self.glow.reset();

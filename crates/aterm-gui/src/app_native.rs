@@ -5300,12 +5300,43 @@ impl App {
         self.arm_native_auto_apply(build, &digest);
     }
 
+    /// `true` while the `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam is
+    /// suppressing the automatic update lane — and it SAYS SO, once per process,
+    /// the first time either the arm or the poll asks.
+    ///
+    /// The seam seeds a fake `Wake::UpdateStaged` so the relaunch banner can be
+    /// captured with `ctl image` without waiting for a real background stage, and
+    /// a fake nudge must not be able to install anything. That is the right
+    /// intent. The wrong part was the silence: both `arm_native_auto_apply` and
+    /// `poll_native_auto_apply` folded this `var_os` into `enabled` with no
+    /// notice anywhere, so exporting a screenshot variable turned OFF automatic
+    /// update application — a feature this project ships ON — invisibly, in a
+    /// release build. The test at the bottom of this file has to assert the
+    /// variable's ABSENCE or "every poll below answers Clear and this test proves
+    /// nothing", which is the same hazard seen from the inside.
+    pub(crate) fn relaunch_nudge_seam_suppresses_auto_apply() -> bool {
+        static SEAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SEAM.get_or_init(|| {
+            let on = std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_some();
+            if on {
+                aterm_log::warn!(
+                    "$ATERM_DEBUG_RELAUNCH_NUDGE is set: this is the QA/screenshot \
+                     seam for the relaunch banner, and it DISABLES automatic update \
+                     application for the whole process — no staged build will be \
+                     armed or applied, whatever `[update] auto_apply` says. Unset it \
+                     to restore the default."
+                );
+            }
+            on
+        })
+    }
+
     pub(crate) fn arm_native_auto_apply(&mut self, build: u64, digest: &str) -> bool {
         use crate::native_update_auto_intent::{ArmDecision, ArmFacts};
 
         self.lapse_expired_auto_apply_manual_only();
         let enabled = crate::app_config::update_auto_apply(&self.config)
-            && std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_none();
+            && !Self::relaunch_nudge_seam_suppresses_auto_apply();
         let Some(dmg_sha256) = decode_dmg_sha256(digest) else {
             aterm_log::warn!(
                 "refusing to arm automatic update build {build}: malformed DMG identity"
@@ -5413,7 +5444,7 @@ impl App {
             && staged_build.is_some_and(|build| build > current_build);
         let decision = crate::native_update_auto_intent::poll(PollFacts {
             enabled: crate::app_config::update_auto_apply(&self.config)
-                && std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_none(),
+                && !Self::relaunch_nudge_seam_suppresses_auto_apply(),
             deadline_ready,
             current_build,
             target_build: intent.build,
@@ -10671,7 +10702,7 @@ mod tests {
         let wid = WindowId(0);
         assert!(
             crate::app_config::update_auto_apply(&app.config)
-                && std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_none(),
+                && !App::relaunch_nudge_seam_suppresses_auto_apply(),
             "PRECONDITION: the automatic lane must be enabled or every poll below \
              answers Clear and this test proves nothing"
         );

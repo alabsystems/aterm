@@ -151,9 +151,6 @@ if [ -d "$HOME/.aterm/shell.d" ]; then
     done
 fi
 
-# Package suite version
-export ATERM_SUITE_VERSION="${ATERM_SUITE_VERSION:-}"
-
 # State tracking
 typeset -g __aterm_in_command=0
 typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
@@ -440,29 +437,20 @@ __aterm_zle_line_init() {
 zle -N zle-line-init __aterm_zle_line_init
 
 # Install hooks using zsh hook arrays.
-# __aterm_first_precmd is registered first so the one-shot banner prints
-# before __aterm_precmd emits OSC 133;A (prompt start marker). This keeps
-# the banner outside the semantic prompt region.
+# __aterm_first_precmd is registered first so the prompt override lands before
+# __aterm_precmd emits OSC 133;A (prompt start marker).
 autoload -Uz add-zsh-hook
 
 # ─── Deferred First-Precmd Setup ───
 # Runs once on the very first precmd after the shell has fully initialized
-# and processed SIGWINCH from the initial terminal resize. Handles prompt
-# override and startup banner display, then uninstalls itself.
+# and processed SIGWINCH from the initial terminal resize. Handles the prompt
+# override, then uninstalls itself.
 __aterm_first_precmd() {
     local last_status=$?
 
     # Apply prompt override if requested
     if [[ -n "$ATERM_PROMPT_STYLE" && "$ATERM_PROMPT_STYLE" != "none" ]]; then
         __aterm_set_prompt
-    fi
-
-    # Print startup banner passed from the app via base64-encoded env var.
-    # Pipe directly to base64 -d (no command substitution) to preserve
-    # trailing newline bytes in the ANSI escape sequence output.
-    if [[ -n "$ATERM_BANNER_B64" ]]; then
-        printf '%s' "$ATERM_BANNER_B64" | base64 -d
-        unset ATERM_BANNER_B64
     fi
 
     add-zsh-hook -d precmd __aterm_first_precmd

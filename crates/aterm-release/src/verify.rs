@@ -1830,6 +1830,13 @@ pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
                  there is nothing unmirrored to retire — finish it with `cargo ship cut --resume`"
             )));
         }
+        Some(step) if publish::is_post_unlock_step(step) => {
+            return Err(Error::new(format!(
+                "v{version} is live, mirrored and unlocked; only the post-release website step \
+                 \"{step}\" is pending — nothing unmirrored to retire; finish it with \
+                 `cargo ship cut --resume` (or `publish/post-promote --latest`)"
+            )));
+        }
         Some(step) => {
             return Err(Error::new(format!(
                 "v{version} stopped at step {step:?}, before the origin flip; that is \

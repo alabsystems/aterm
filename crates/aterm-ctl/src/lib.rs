@@ -1963,8 +1963,7 @@ fn run_discovery(
     // when NOTHING answered the classified misses ARE the report. A miss beside
     // an instance that answered stays silent — the success path gains no noise.
     let mut probes: Vec<(u32, String, Probe)> = Vec::with_capacity(targets.len());
-    for (pid, sock) in targets {
-        let probe = probe_lines(&sock, "sessions", pid);
+    for (pid, sock, probe) in probe_sessions(targets) {
         if let Probe::Answered(sessions) = &probe {
             let is_self_instance = self_sock
                 .as_deref()
@@ -1977,16 +1976,12 @@ fn run_discovery(
                     writeln!(out, "{line}")?;
                 }
             } else {
-                for line in sessions {
-                    // The calling terminal's own session: its sid (2nd field of the
-                    // `sessions` line) equals $ATERM_PARENT_SESSION_ID.
-                    let sid = line.split_whitespace().nth(1);
-                    let marker = if sid.is_some() && sid == self_sid.as_deref() {
-                        " *"
-                    } else {
-                        ""
-                    };
-                    writeln!(out, "{pid} {line}{marker}")?;
+                // The rows an in-process caller gets from `fleet_sessions`, printed:
+                // ONE mapping decides both what `ls` shows and what the fleet bridge
+                // federates, so the two can never drift apart.
+                for session in instance_sessions(pid, sessions, self_sid.as_deref()) {
+                    let marker = if session.is_self { " *" } else { "" };
+                    writeln!(out, "{} {}{marker}", session.pid, session.row)?;
                 }
             }
         }
@@ -2007,6 +2002,165 @@ fn run_discovery(
         stderr_line(&note)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Dial each target for its `sessions` listing, LAZILY: the probe for an
+/// instance runs only when the iterator reaches it, so a caller that prints as
+/// it goes still emits an answered instance's rows while a later, wedged peer is
+/// burning its [`PROBE_DEADLINE`]. The single place discovery decides WHAT it
+/// asks every instance ([`run_discovery`] and [`fleet_sessions`] both ask this).
+fn probe_sessions(targets: Vec<(u32, String)>) -> impl Iterator<Item = (u32, String, Probe)> {
+    targets.into_iter().map(|(pid, sock)| {
+        let probe = probe_lines(&sock, "sessions", pid);
+        (pid, sock, probe)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// `ls` AS DATA — the in-process listing
+//
+// `ls` is a CLIENT verb: it walks the rendezvous directory, dials every live
+// instance and classifies each answer. An in-process caller that wants the same
+// listing used to have only one way to get it — fork the `aterm-ctl` binary and
+// re-parse its stdout — which throws away the very thing the F8 classification
+// work added: WHY the listing is empty. `Command::output()` also swallows the
+// child's stderr, where that reason was written. So the listing is exposed as
+// DATA here, sharing the walk, the probes, the row mapping and the verdict text
+// with the printing path above: one implementation, two callers.
+// ---------------------------------------------------------------------------
+
+/// One live session in the fleet, exactly as `ls` prints it.
+///
+/// `row` is the server's `sessions` line VERBATIM (`<local> <sid> <parent>
+/// <state> <title…>`), so a consumer reads the same bytes the CLI shows; the
+/// columns callers actually address by have accessors rather than copies, so
+/// there is one parse of the row, not two that can disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetSession {
+    /// The pid of the instance hosting this session — what `--pid` addresses.
+    /// `0` when the socket names no pid (an explicit-socket instance found
+    /// through a graph entry with no `pid` line), the same placeholder the
+    /// printed rows carry.
+    pub pid: u32,
+    /// The server's `sessions` row for this session, verbatim.
+    pub row: String,
+    /// Whether this is the CALLING terminal's own session — the row `ls` marks
+    /// with ` *`.
+    pub is_self: bool,
+}
+
+impl FleetSession {
+    /// The instance-local channel number — the row's first column (`ls`'s
+    /// second). `None` for a row too short to carry one.
+    #[must_use]
+    pub fn local(&self) -> Option<&str> {
+        self.row.split_whitespace().next()
+    }
+
+    /// The stable session id — the row's second column (`ls`'s third), and what
+    /// `@<sid>` addresses. `None` for a row too short to carry one, which is the
+    /// row a listing consumer skips (as the column parse always did).
+    #[must_use]
+    pub fn sid(&self) -> Option<&str> {
+        self.row.split_whitespace().nth(1)
+    }
+}
+
+/// Why a fleet listing produced no sessions — the distinction `ls` writes to
+/// stderr and exits on, handed to an in-process caller instead of a shell.
+///
+/// The point of the type is that [`is_empty_fleet`](Self::is_empty_fleet) is a
+/// question a caller can ASK: "nothing to federate" and "discovery is broken"
+/// are different operational facts, and a bridge that folds them together goes
+/// quietly blind (finding F8, one layer up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetListError {
+    /// The operator-facing reason, byte-identical to what `aterm-ctl ls` writes
+    /// to stderr (without the `aterm-ctl: ` prefix): the classified cause per
+    /// socket, and the hint for the dominant one.
+    pub reason: String,
+    /// The status `ls` would have exited with: [`EXIT_EMPTY_FLEET`] (1) for a
+    /// readable directory holding no instance, [`EXIT_UNREACHABLE`] (2) for
+    /// could-not-look or could-not-reach, [`EXIT_TIMEOUT`] (124) when every
+    /// instance timed out.
+    pub code: u8,
+}
+
+impl FleetListError {
+    /// Whether the fleet is genuinely EMPTY — a readable rendezvous directory
+    /// with no instance in it — as opposed to a directory that could not be
+    /// looked in or instances that could not be reached.
+    #[must_use]
+    pub fn is_empty_fleet(&self) -> bool {
+        self.code == EXIT_EMPTY_FLEET
+    }
+}
+
+impl std::fmt::Display for FleetListError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// The `ls` listing as data: every session on every REACHABLE instance of the
+/// fleet, or the classified reason there is none.
+///
+/// Identical in scope and content to a bare `aterm-ctl ls` — the whole fleet
+/// (discovery verbs are never narrowed by `$ATERM_CONTROL_SOCK`; only the
+/// `--sock`/`--pid` flags scope them, and this entry point takes neither) — with
+/// the ` *` self marker carried as [`FleetSession::is_self`] instead of a
+/// trailing token.
+///
+/// # Errors
+///
+/// [`FleetListError`] whenever no instance answered, carrying the same reason
+/// and status code the CLI reports. An empty `Ok` is impossible to confuse with
+/// it: `Ok(rows)` means at least one instance answered.
+pub fn fleet_sessions() -> Result<Vec<FleetSession>, FleetListError> {
+    let self_sid = env::var(SELF_SID_ENV).ok();
+    let (dir, targets) = inspect_fleet();
+    let mut sessions = Vec::new();
+    let mut probes: Vec<(u32, String, Probe)> = Vec::with_capacity(targets.len());
+    for (pid, sock, probe) in probe_sessions(targets) {
+        if let Probe::Answered(rows) = &probe {
+            sessions.extend(instance_sessions(pid, rows, self_sid.as_deref()));
+        }
+        probes.push((pid, sock, probe));
+    }
+    fleet_listing(sessions, discovery_report(dir, &probes))
+}
+
+/// The sessions one ANSWERED instance contributes to a listing — PURE, so the
+/// row mapping (including the ` *` self rule) is table-testable and is shared by
+/// the `ls` printer and [`fleet_sessions`].
+fn instance_sessions(pid: u32, rows: &[String], self_sid: Option<&str>) -> Vec<FleetSession> {
+    rows.iter()
+        .map(|row| FleetSession {
+            pid,
+            row: row.clone(),
+            // The calling terminal's own session: the row's sid (its 2nd field)
+            // equals $ATERM_PARENT_SESSION_ID.
+            is_self: {
+                let sid = row.split_whitespace().nth(1);
+                sid.is_some() && sid == self_sid
+            },
+        })
+        .collect()
+}
+
+/// Fold a sweep into the listing result — PURE: [`discovery_report`]'s `(report,
+/// code)` verdict is the ONE authority on whether a listing succeeded, so the
+/// data path and the CLI path agree by construction. A zero code is the success
+/// arm (some instance answered); anything else is the failure the caller must be
+/// able to tell apart from an empty result.
+fn fleet_listing(
+    sessions: Vec<FleetSession>,
+    verdict: (String, u8),
+) -> Result<Vec<FleetSession>, FleetListError> {
+    match verdict {
+        (_, 0) => Ok(sessions),
+        (reason, code) => Err(FleetListError { reason, code }),
+    }
 }
 
 /// The `windows` rows for one instance, folded from its `sessions` lines — PURE,
@@ -2110,10 +2264,18 @@ fn roster_tail<'a>(fields: &[&'a str]) -> Vec<&'a str> {
 
 /// Exit code for "could not LOOK, or could not REACH": sockets (or a named
 /// instance) were found and none answered, or the directory is missing,
-/// unreadable or unresolvable. DISTINCT from 1, which `ls`/`instances`/`windows`
-/// now reserve for a readable directory holding no instance socket. Additive over
-/// the 0/1/124 contract: still nonzero for `nonzero == failure` scripts.
+/// unreadable or unresolvable. DISTINCT from [`EXIT_EMPTY_FLEET`], which
+/// `ls`/`instances`/`windows` reserve for a readable directory holding no
+/// instance socket. Additive over the 0/1/124 contract: still nonzero for
+/// `nonzero == failure` scripts.
 const EXIT_UNREACHABLE: u8 = 2;
+
+/// Exit code for a fleet that is genuinely EMPTY: the rendezvous directory was
+/// read and holds no instance socket and no graph entry. The only status that
+/// licenses "no live aterm instances found" — named so the in-process listing
+/// ([`FleetListError::is_empty_fleet`]) can ask the same question the shell asks
+/// of `$?`.
+const EXIT_EMPTY_FLEET: u8 = 1;
 
 /// The `ls`/`instances`/`windows` verdict — PURE, so every line is table-testable: `dir`
 /// is what the directory turned out to be, `probes` every socket dialled with
@@ -2163,7 +2325,7 @@ fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String
             let shown = path.display();
             return (
                 format!("no live aterm instances found (looked in {shown})"),
-                1,
+                EXIT_EMPTY_FLEET,
             );
         }
         DirOutcome::Found { path, n } => {
@@ -6501,6 +6663,116 @@ mod tests {
         // …and the `None` nesting is a no-op, not a panic.
         announce_mux_boundary(None, false);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `sessions` row, as a real server frames one.
+    fn session_rows(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|r| (*r).to_string()).collect()
+    }
+
+    /// The listing rows an in-process caller gets are the rows `ls` PRINTS: the
+    /// server's line verbatim, the hosting pid, the columns `@<sid>` addresses
+    /// by, and the ` *` self marker as a bit instead of a trailing token.
+    #[test]
+    fn fleet_sessions_carry_the_ls_row_verbatim_and_the_self_marker_as_data() {
+        let rows = session_rows(&[
+            "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude",
+            "1 s-b s-a alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
+        ]);
+        let listed = instance_sessions(4242, &rows, Some("s-b"));
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].pid, 4242);
+        assert_eq!(listed[0].row, rows[0], "the server's row, byte for byte");
+        assert_eq!(listed[0].local(), Some("0"));
+        assert_eq!(listed[0].sid(), Some("s-a"));
+        assert!(!listed[0].is_self);
+        // Exactly the row `ls` would mark ` *`: its sid is the calling terminal's.
+        assert!(listed[1].is_self, "the caller's own session is flagged");
+
+        // No `$ATERM_PARENT_SESSION_ID` marks nothing — a row whose sid column is
+        // absent must never match a missing self sid by both being `None`.
+        let outside = instance_sessions(1, &session_rows(&["0"]), None);
+        assert_eq!(outside[0].sid(), None, "a row too short names no session");
+        assert!(!outside[0].is_self);
+    }
+
+    /// THE DISTINCTION THE BRIDGE RUNS ON: an in-process listing must report an
+    /// empty fleet, an unreachable one and a wedged one as three different
+    /// things — the same three `ls` exits on. `aterm-fleet federate` folded all
+    /// of them (plus a missing binary) into `Vec::new()`, so a bridge that had
+    /// gone blind and a fleet with nothing running looked identical.
+    #[test]
+    fn a_fleet_listing_failure_is_never_an_empty_listing() {
+        let sock = fleet_sock(4242);
+        let answered =
+            |rows: &[&str]| vec![(4242, sock.clone(), Probe::Answered(session_rows(rows)))];
+
+        // Reachable: the sessions, however many — Ok is the only "empty fleet".
+        let rows = instance_sessions(4242, &session_rows(&["0 s-a - alive sh meta=0"]), None);
+        let dir = DirOutcome::Found {
+            path: PathBuf::from(FLEET),
+            n: 1,
+        };
+        let ok = fleet_listing(
+            rows,
+            discovery_report(dir, &answered(&["0 s-a - alive sh meta=0"])),
+        )
+        .expect("an instance answered");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].sid(), Some("s-a"));
+
+        // Genuinely empty: the ONE condition that licenses the fleet claim.
+        let empty = fleet_listing(
+            Vec::new(),
+            discovery_report(DirOutcome::Empty(PathBuf::from(FLEET)), &[]),
+        )
+        .expect_err("no instance answered");
+        assert!(empty.is_empty_fleet(), "a readable, empty directory");
+        assert_eq!(empty.code, EXIT_EMPTY_FLEET);
+        assert!(empty.reason.contains(FLEET_CLAIM));
+
+        // Found but unreachable (the seatbelt case): NOT empty, and it says so
+        // with the cause `Command::output()` used to swallow.
+        let denied = vec![(
+            4242,
+            sock.clone(),
+            Probe::Denied(io::Error::from_raw_os_error(1)),
+        )];
+        let blind = fleet_listing(
+            Vec::new(),
+            discovery_report(
+                DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 1,
+                },
+                &denied,
+            ),
+        )
+        .expect_err("nothing answered");
+        assert!(!blind.is_empty_fleet(), "sockets were found, not absent");
+        assert_eq!(blind.code, EXIT_UNREACHABLE);
+        assert!(
+            blind
+                .reason
+                .contains("sandbox is refusing AF_UNIX connect()")
+        );
+        assert!(!blind.reason.contains(FLEET_CLAIM));
+
+        // Wedged: every probe timed out, which is its own status (124).
+        let wedged = fleet_listing(
+            Vec::new(),
+            discovery_report(
+                DirOutcome::Found {
+                    path: PathBuf::from(FLEET),
+                    n: 1,
+                },
+                &[(4242, sock, Probe::Timeout)],
+            ),
+        )
+        .expect_err("nothing answered");
+        assert_eq!(wedged.code, EXIT_TIMEOUT);
+        assert!(!wedged.is_empty_fleet());
     }
 
     /// The `windows` fold over real `sessions` lines: windows in id order, the

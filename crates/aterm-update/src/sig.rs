@@ -5,7 +5,8 @@
 //! the Apple-free "signed channel" tier of the updater's trust model.
 //!
 //! When a public key is compiled into the binary ([`crate::PINNED_UPDATE_PUBKEY`],
-//! baked from `ATERM_UPDATE_PUBKEY` at build time), every release manifest MUST carry a
+//! from the committed `aterm_update_core::pins` constant — no build-environment
+//! variable is consulted), every release manifest MUST carry a
 //! detached Ed25519 signature (`aterm-appcast.toml.sig`) that verifies against it. The
 //! manifest pins the DMG's `sha256`, so a valid signature over the manifest —
 //! transitively, once the sha256 is checked — authenticates the whole artifact WITHOUT

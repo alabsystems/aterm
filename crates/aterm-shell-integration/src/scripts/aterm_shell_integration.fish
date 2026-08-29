@@ -52,9 +52,9 @@ end
 # alike, and aterm's spawn seam plus the user's own environment can and do
 # deliver empty values. So test EMPTINESS (`test -n` / `test -z`), never
 # definedness (`set -q`). `set -q` is correct only for a variable this script
-# defines itself and always defines non-empty (`__aterm_pending_banner`), or
-# where both arms are equivalent and the `set -q` arm additionally scrubs
-# (`ATERM_SHELL_NONCE`, whose note explains why). Pinned by
+# defines itself and always defines non-empty, or where both arms are
+# equivalent and the `set -q` arm additionally scrubs (`ATERM_SHELL_NONCE`,
+# whose note explains why). Pinned by
 # `test_fish_never_tests_definedness_of_an_aterm_variable`.
 #
 # ─── The multiplexer boundary (screen / tmux) ───
@@ -205,17 +205,6 @@ if test -d "$HOME/.aterm/shell.d"
             source "$f"
         end
     end
-end
-
-# Package suite version.
-#
-# `test -z`, NOT `not set -q` — see the loader-guard note above. bash and zsh
-# spell this `export ATERM_SUITE_VERSION="${ATERM_SUITE_VERSION:-}"`, and `:-`
-# substitutes for BOTH unset and empty, so an inherited empty value is always
-# re-exported. `set -q` skipped that branch for an empty-but-defined variable,
-# which left a non-exported (universal or global) empty definition unexported.
-if test -z "$ATERM_SUITE_VERSION"
-    set -gx ATERM_SUITE_VERSION ""
 end
 
 # State tracking
@@ -545,13 +534,6 @@ end
 functions -c fish_prompt __aterm_original_fish_prompt 2>/dev/null
 
 function fish_prompt
-    # Print startup banner on first prompt (one-shot). Deferred from
-    # source time so it survives config.fish clearing the screen.
-    if set -q __aterm_pending_banner
-        printf '%s' "$__aterm_pending_banner" | base64 -d
-        set -e __aterm_pending_banner
-    end
-
     # Mark prompt start
     __aterm_mark_prompt_start
 
@@ -708,17 +690,6 @@ end
 # Update cwd on directory change and at startup
 function __aterm_fish_pwd --on-variable PWD
     __aterm_report_cwd
-end
-
-# Stash startup banner for deferred printing on first fish_prompt.
-# Printing now would be erased if the user's config.fish or a framework
-# clears the screen — vendor_conf.d loads before config.fish.
-# `test -n` alone (the zsh script's `[[ -n "$ATERM_BANNER_B64" ]]`): the
-# `set -q` that used to lead this conjunction was already defused by the
-# `test -n` beside it, but it modelled the wrong idiom for the next reader.
-if test -n "$ATERM_BANNER_B64"
-    set -g __aterm_pending_banner "$ATERM_BANNER_B64"
-    set -e ATERM_BANNER_B64
 end
 
 # ─── Key Bindings ───

@@ -1082,6 +1082,47 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     Some((age_s.max(0.0) * 1e9) as u64)
 }
 
+/// This window's AppKit `-[NSWindow windowNumber]`, or `0` when it has no AppKit
+/// window (headless / another backend).
+///
+/// The one thing the `hwkey` hardware-path injector needs from the main thread.
+/// `-[NSApplication sendEvent:]` routes a key event to the window whose number is
+/// baked into the event, so posting with `0` would dispatch to nothing and the
+/// instrument would silently measure an empty run. Reading it requires touching an
+/// `NSWindow`, which is main-thread-only; everything else the injector does is
+/// deliberately off-main (see [`crate::hwkey`]).
+///
+/// Read-only and allocation-free: it must not perturb the loop whose stalls are
+/// the subject of the measurement.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn appkit_window_number(window: &Window) -> i64 {
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return 0;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return 0;
+    };
+    // SAFETY: `ns_view` points at this window's live NSView (owned by winit for the
+    // window's lifetime); we only borrow it — on the main thread, as AppKit
+    // requires — to read its window's number, a plain scalar getter.
+    let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
+    let Some(ns_window) = view.window() else {
+        return 0;
+    };
+    unsafe { ns_window.windowNumber() as i64 }
+}
+
+/// Non-macOS peer of the macOS reader: there is no AppKit window number, and the
+/// `hwkey` injector refuses on these platforms anyway.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub(crate) fn appkit_window_number(_window: &Window) -> i64 {
+    0
+}
+
 /// Whether a hardware-input event occurred inside `within`.
 ///
 /// Reads the KERNEL's HID idle clock — the `HIDIdleTime` property of the

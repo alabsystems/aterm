@@ -36,14 +36,12 @@ impl Grid {
         total += self.storage.tab_stops.capacity() * std::mem::size_of::<bool>();
         total += self.storage.ring_extras.capacity()
             * std::mem::size_of::<Option<Box<super::scroll_convert::ScrolledRowExtras>>>();
-        for entry in &self.storage.ring_extras {
-            if let Some(extras) = entry {
-                total += std::mem::size_of::<super::scroll_convert::ScrolledRowExtras>();
-                // Shallow is fine for the tens of bytes a hyperlink adds and
-                // wrong by megabytes for a picture, so an image-bearing ring row
-                // charges its share of the payload (see `image_bytes`).
-                total += extras.image_bytes();
-            }
+        for extras in self.storage.ring_extras.iter().flatten() {
+            total += std::mem::size_of::<super::scroll_convert::ScrolledRowExtras>();
+            // Shallow is fine for the tens of bytes a hyperlink adds and
+            // wrong by megabytes for a picture, so an image-bearing ring row
+            // charges its share of the payload (see `image_bytes`).
+            total += extras.image_bytes();
         }
         // Staged-but-undrained scroll-off lines (Wave-3 adversarial review):
         // under flood backpressure the lazy buffer holds raw ~8 B/cell rows the

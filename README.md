@@ -45,10 +45,10 @@ curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/instal
 on first launch with live progress** — each program downloads individually and
 resumably, only the builds for your machine, visible end to end in the app.
 
-The script picks the newest release, checks the download's SHA-256 against the
-release manifest, verifies the app's Developer ID signature and notarization,
-puts `aterm.app` in `/Applications` (or `~/Applications`), and links the `aterm`
-command and its man pages under `~/.local`. `--no-toolchain` keeps the packages
+The script picks the newest app release, checks the download's SHA-256 against
+the release manifest, verifies the app's Developer ID signature and
+notarization, puts `aterm.app` in `/Applications` (or `~/Applications`), and
+links the `aterm` command and its man pages under `~/.local`. `--no-toolchain` keeps the packages
 off (`aterm pkg install --default-set` later), `--no-path` leaves your shell
 profile untouched, `--dry-run` prints the whole plan — elected release, asset,
 every destination, every edit — and writes nothing, and `--uninstall` reverses
@@ -58,7 +58,11 @@ aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel), and for Linux x86_64 as a tarball on the same releases, from the
 public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
-Every macOS release is the same app in two containers:
+The channel carries two kinds of cut: **app releases** ship the containers
+below plus the signed `aterm-appcast.toml` manifest, and **source releases**
+(e.g. v0.62.0, v0.64.0) carry only a signed source manifest — the installer
+and the in-app updater elect the newest app release and skip source cuts.
+Every macOS app release is the same app in two containers:
 
 - **`aterm-X.Y.0.dmg` (~30 MB) — the download.** The signed, notarized app
   alone, as a drag-install image: drag `aterm.app` into Applications.
@@ -75,11 +79,15 @@ release through **v0.63.0** (through v0.61.0 the lean image shipped beside it as
 `aterm-<version>-lite.dmg`), so the first lean `aterm-<version>.dmg` is the next
 cut from `main`.
 
-A release from the one-download lane also carries the permanent
-`releases/latest/download/` names `aterm.dmg` and `aterm-mac.zip`, and every
-container has a `.sha256` sidecar whose digest also appears in that release's
-`aterm-appcast.toml` (v0.63.0, cut by an older cutter, carries `aterm.dmg` but
-no `aterm-mac.zip`). With the sidecar beside the asset, and the app in place:
+A release from the one-download lane also carries the
+`releases/latest/download/` names `aterm.dmg` and `aterm-mac.zip` — but those
+resolve only while an app release holds GitHub's `latest` pointer; when a
+source release holds it (as v0.64.0 does today) they return 404, so reach for
+the versioned assets on the newest app release, or `install.sh`, which elects
+that release itself. Every container has a `.sha256` sidecar whose digest also
+appears in that release's `aterm-appcast.toml` (v0.63.0, cut by an older
+cutter, carries `aterm.dmg` but no `aterm-mac.zip`). With the sidecar beside
+the asset, and the app in place:
 
 ```sh
 shasum -a 256 -c aterm-<version>.dmg.sha256

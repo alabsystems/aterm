@@ -74,7 +74,7 @@ Stamp yourself on arrival so peers can tell the same about you:
 | `ATERM_HEADLESS=1` | server | No window; engine + PTY + socket only. Exactly `--headless` (prefer the flag). `0`/`off`/empty do NOT arm it and say so on stderr. |
 | `ATERM_COLUMNS` / `ATERM_LINES` | server | Initial grid (clamped 20..=500 / 5..=300). |
 | `ATERM_EXEC` | server | Run this in the PTY then exec `$SHELL` — deterministic paint instead of a host-specific prompt. |
-| `ATERM_CTL` | `drive`, `fleet` | Path to the `aterm-ctl` client they shell out to. |
+| `ATERM_CTL` | `drive`, `fleet` | Path to the `aterm-ctl` client they shell out to (`fleet` uses it for the `events` streamers and `exec`; its fleet **discovery** is in-process). |
 | `ATERM_CONTROL_TOKEN` | **only `aterm drive --dial`** | Not read by `aterm ctl` — that reads the sibling token *file*. |
 
 Auth is automatic: a per-launch 32-byte token file sits beside the socket

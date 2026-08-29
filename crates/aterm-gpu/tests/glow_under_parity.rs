@@ -64,6 +64,8 @@ fn emit_under(
         w: (cx1 - cx0) as u16,
         h: ch as u16,
         color,
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     })
 }
 
@@ -231,6 +233,8 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
                 w: (8 * cw) as u16,
                 h: ch as u16,
                 color: 0x0070_3810,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             },
             vec![
                 CharFg {
@@ -449,6 +453,8 @@ fn glow_under_disabled_bytes_identical_on_gpu() {
         w: (10 * cw) as u16,
         h: ch as u16,
         color: 0x0060_3010,
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     });
     cleared.char_fg.push(CharFg {
         row: 0,
@@ -470,4 +476,169 @@ fn glow_under_disabled_bytes_identical_on_gpu() {
         base, stripped,
         "clear_overlays must restore the bare GPU frame (both streams ARE bling)"
     );
+}
+
+/// **THE SOURCE-OVER BED, BYTE FOR BYTE.** The rainbow bed composites
+/// `GlowQuad::alpha > 0` — premultiplied SOURCE-OVER, `src + dst·(1 − a)` — while
+/// every other flat stream on this pipeline keeps `alpha == 0` and stays
+/// `One`/`One`. This is the gate that says the two modes ride ONE pipeline
+/// without either one moving: a MIXED field of both, over real text, in one
+/// frame.
+///
+/// Three claims, and the second is the one a delta-only test would miss.
+///
+/// 1. **PARITY.** The CPU's [`aterm_render::over_premul`] and the GPU's
+///    `One`/`OneMinusSrcAlpha` land the identical byte, on the same
+///    plain-Unorm offscreen and under the same gate the additive streams take.
+/// 2. **THE ADDITIVE HALF DID NOT MOVE.** The same additive-only field renders
+///    byte-identically to what it renders with the source-over quads removed —
+///    so `alpha == 0` really is `One`/`One`, and switching the pipeline's blend
+///    state cost the historical streams nothing.
+/// 3. **THE MODES ARE DISTINGUISHABLE.** A source-over quad and an additive
+///    quad carrying the SAME premultiplied colour over the same ground must
+///    produce DIFFERENT pixels (the source-over one darker, by exactly the
+///    ground it displaced), or the test would pass on a build that ignored
+///    `alpha` entirely.
+#[test]
+fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (10usize, 40usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process("\x1b[?25l".as_bytes());
+    for r in 1..8usize {
+        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
+    }
+    let (cw, ch) = cpu.cell_size();
+    let grid_w = cols * cw;
+
+    // The base premise: without any stream the two backends are byte-exact, so
+    // every delta below is the stream's.
+    let base_input = term.cell_frame(rows, cols);
+    let cpu_base = cpu.render_input(&base_input);
+    let gpu_base = gpu.render_input(&mut win, &base_input, None);
+    assert_eq!(
+        max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
+        0,
+        "procedural-block base must be byte-exact so the stream deltas are effect-only"
+    );
+
+    // **RIGHT OF THE TEXT, DELIBERATELY.** The procedural rows are full-block
+    // glyphs out to column 29, and the bed draws UNDER the glyph pass — a quad
+    // beneath a solid block is completely hidden, and every clause below would
+    // pass vacuously on pixels the mark never reached. Columns 30..40 are bare
+    // ground on every row, which is where a bed is actually visible and where
+    // the mode difference can be read.
+    //
+    // The ADDITIVE half, alone. Rows 2-3, `alpha == 0`.
+    let mut add_only: Vec<GlowQuad> = Vec::new();
+    for (r, x0, x1, color) in [
+        (2usize, (30 * cw) as i64, (38 * cw) as i64, 0x0080_4010u32),
+        (3, (31 * cw) as i64, grid_w as i64 + 60, 0x0060_3018), // clipped RIGHT
+    ] {
+        add_only.extend(emit_under(r, x0, x1, ch, grid_w, color));
+    }
+    let mut add_input = term.cell_frame(rows, cols);
+    add_input.glow_under = add_only.clone();
+    let cpu_add = cpu.render_input(&add_input);
+
+    // …and the SOURCE-OVER half beside it, on rows the additive half does not
+    // touch, at opacities spanning the bed's real range (the shipped ceiling is
+    // `RAINBOW_UNDER_COV_CAP`, 120 of 255) plus the two ends of the byte.
+    let mut mixed = add_only.clone();
+    for (r, x0, x1, color, alpha) in [
+        (4usize, (30 * cw) as i64, (39 * cw) as i64, 0x0044_5522u32, 120u8),
+        (5, (30 * cw) as i64, (37 * cw) as i64, 0x0090_5008, 61),
+        (6, (32 * cw) as i64, (40 * cw) as i64, 0x0012_0d05, 1),
+        (7, (30 * cw) as i64, grid_w as i64 + 60, 0x0030_60c0, 255),
+    ] {
+        mixed.extend(emit_under(r, x0, x1, ch, grid_w, color).map(|q| GlowQuad { alpha, ..q }));
+    }
+    assert!(
+        mixed.iter().filter(|q| q.alpha > 0).count() >= 4,
+        "the mixed field must carry a real source-over half"
+    );
+    let mut input = term.cell_frame(rows, cols);
+    input.glow_under = mixed;
+    let cpu_mix = cpu.render_input(&input);
+    let gpu_mix = gpu.render_input(&mut win, &input, None);
+
+    // 2. THE ADDITIVE HALF DID NOT MOVE. Rows 2-3 carry only `alpha == 0`
+    //    quads, and they must read exactly what they read with the source-over
+    //    quads absent — the pixels, not a tolerance.
+    // `glow_under` is a WINDOW-ABSOLUTE stream and `emit_under` writes
+    // `y = row * ch` into it, so the bands below are window rows and take NO
+    // pad offset — the quads land exactly where the emitter put them.
+    let add_band = 2 * ch..4 * ch;
+    assert_eq!(
+        cpu_mix.pixels[add_band.start * cpu_mix.width..add_band.end * cpu_mix.width],
+        cpu_add.pixels[add_band.start * cpu_add.width..add_band.end * cpu_add.width],
+        "the additive rows must be untouched by the source-over rows beside them"
+    );
+    assert_ne!(
+        cpu_mix.pixels, cpu_base.pixels,
+        "the mixed field must actually paint (non-vacuous)"
+    );
+
+    // 3. THE MODES ARE DISTINGUISHABLE. Same premultiplied colour, same
+    //    geometry, one with `alpha` and one without: the source-over frame must
+    //    differ, and differ DOWNWARD, by the ground it displaced.
+    let same_but_additive: Vec<GlowQuad> = input
+        .glow_under
+        .iter()
+        .map(|q| GlowQuad { alpha: 0, ..*q })
+        .collect();
+    let mut twin = term.cell_frame(rows, cols);
+    twin.glow_under = same_but_additive;
+    let cpu_twin = cpu.render_input(&twin);
+    assert_ne!(
+        cpu_mix.pixels, cpu_twin.pixels,
+        "a build that ignored GlowQuad::alpha would pass every other clause here"
+    );
+    let over_band = 4 * ch..8 * ch;
+    let (mut lower, mut sampled) = (0usize, 0usize);
+    for y in over_band {
+        for x in 0..cpu_mix.width {
+            let (a, b) = (
+                cpu_mix.pixels[y * cpu_mix.width + x],
+                cpu_twin.pixels[y * cpu_twin.width + x],
+            );
+            if a != b {
+                sampled += 1;
+                if luma(a) < luma(b) {
+                    lower += 1;
+                }
+            }
+        }
+    }
+    assert!(sampled > 400, "the comparison must walk a real field: {sampled}");
+    assert_eq!(
+        lower, sampled,
+        "every source-over pixel must sit at or under its additive twin — it \
+         DISPLACES the ground where the twin ADDS to it ({lower} of {sampled})"
+    );
+
+    // 1. PARITY, on the same gate the additive streams take: byte-exact holds on
+    //    a plain-Unorm offscreen; the downlevel sRGB offscreen folds the blend
+    //    into linear, which is the glow idiom's accepted approximation and
+    //    applies to `OneMinusSrcAlpha` for exactly the same reason it applies to
+    //    `One`.
+    let delta = max_channel_delta(&cpu_mix.pixels, &gpu_mix.pixels);
+    eprintln!(
+        "mixed additive + source-over glow_under GPU vs CPU max per-channel delta = {delta} \
+         ({} quads, {} of them source-over)",
+        input.glow_under.len(),
+        input.glow_under.iter().filter(|q| q.alpha > 0).count()
+    );
+    if gpu.additive_is_byte_exact() {
+        assert_eq!(
+            delta, 0,
+            "a source-over glow_under field must be BYTE-EXACT CPU==GPU (got {delta})"
+        );
+    } else {
+        eprintln!("SKIP byte-exact source-over gate: downlevel sRGB offscreen (linear blend)");
+    }
 }

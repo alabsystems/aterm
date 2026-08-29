@@ -131,9 +131,20 @@ enum CursorEffectScrollDecision {
 /// `trail status` line), which needs no rebuild.
 /// A static once-sampled bool — a mid-run env mutation is not a supported use
 /// — so every trace site pays one cached load when the trace is off.
+///
+/// EMPTY DOES NOT ARM IT, the same rule `$ATERM_HEADLESS` states in `--help`
+/// ("0/off/empty do NOT arm it"). This was `var_os(..).is_some()`, which is
+/// TRUE for an empty string — and `tools/paint-conformance/paint_probe.sh`
+/// forwards `ATERM_TRACE_SPAWN="${ATERM_TRACE_SPAWN:-}"` through an `env -i`,
+/// so the variable arrived SET AND EMPTY and every paint-conformance run had
+/// the per-present SPAWNSRC trace armed, writing a line per cursor move into
+/// the probe's gui.log. A pass-through that means "forward it if the operator
+/// set it" must not be what turns the diagnostic on.
 pub(crate) fn trace_spawn_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ATERM_TRACE_SPAWN").is_some())
+    *ON.get_or_init(|| {
+        std::env::var_os("ATERM_TRACE_SPAWN").is_some_and(|v| !v.is_empty() && v != "0")
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1072,6 +1083,8 @@ mod cursor_fx_generation_fence_tests {
                 blinking: false,
                 base: None,
                 head_rgb: None,
+                paint: None,
+                ground: None,
             },
             &mut halo,
         );
@@ -1242,6 +1255,8 @@ mod cursor_fx_generation_fence_tests {
                 blinking: false,
                 base: None,
                 head_rgb: None,
+                paint: None,
+                ground: None,
             },
             &mut halo,
         );
@@ -1308,6 +1323,8 @@ mod cursor_fx_generation_fence_tests {
                 blinking: false,
                 base: None,
                 head_rgb: None,
+                paint: None,
+                ground: None,
             },
             &mut halo,
         );
@@ -1544,7 +1561,7 @@ mod cursor_fx_generation_fence_tests {
             !ws.cursor_fx_active(fixture.await_at, false),
             "negative control: a cold first key owns no resident cadence"
         );
-        let interval = crate::effect_tick_interval(ws.frame_interval);
+        let interval = crate::effect_present_interval(ws.frame_interval);
         let grace = interval * crate::DECO_ANIM_LEVEL_FRAMES;
         let stale_frame_started = fixture
             .await_at
@@ -2395,6 +2412,8 @@ mod canonical_layout_scheduler_tests {
                 // the scheduler's business, not this test's.
                 base: None,
                 head_rgb: None,
+                paint: None,
+                ground: None,
             },
             &mut halo,
         );
@@ -4175,7 +4194,8 @@ mod trail_present_pacing_tests {
 
         // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` panel
         // refreshes, long enough to cover arm -> fire -> next redraw.
-        let grace = crate::effect_tick_interval(ws.frame_interval) * crate::DECO_ANIM_LEVEL_FRAMES;
+        let grace =
+            crate::effect_present_interval(ws.frame_interval) * crate::DECO_ANIM_LEVEL_FRAMES;
         ws.note_deco_animating(t0);
         assert!(ws.deco_anim_frame_active(t0));
         assert!(
@@ -4273,7 +4293,7 @@ mod trail_present_pacing_tests {
         // NOW THE BLOCKER. Five event-loop turns before the slot is due, none of
         // them a redraw of this window and none of them `ResumeTimeReached`, so
         // nothing refreshes the latch and nothing consumes the tick.
-        let interval = crate::effect_tick_interval(ws.frame_interval);
+        let interval = crate::effect_present_interval(ws.frame_interval);
         for step in 1..=5_u32 {
             let woke = t0 + interval / 8 * step;
             assert!(
@@ -4326,7 +4346,7 @@ mod trail_present_pacing_tests {
             .get_mut(&WindowId(0))
             .expect("the headless fixture owns window 0");
         let t0 = Instant::now();
-        let interval = crate::effect_tick_interval(ws.frame_interval);
+        let interval = crate::effect_present_interval(ws.frame_interval);
 
         // Stand in for the reduced-motion cat's one-shot erase, armed by the
         // else-if on an earlier park and still pending when a decoration moves.
@@ -14495,6 +14515,8 @@ mod composed_cursor_effect_projection_tests {
                 w: 10,
                 h: 10,
                 color: 0x0012_3456,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             },
             GlowQuad {
                 row: 0,
@@ -14503,6 +14525,8 @@ mod composed_cursor_effect_projection_tests {
                 w: 2,
                 h: 2,
                 color: 1,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             },
         ];
         let halos = [
@@ -21014,6 +21038,8 @@ impl App {
             spawns: ws.cursor_glow.spawns(),
             ribbon_segments: ws.cursor_glow.ribbon_segments(),
             ribbon_hue_bands: ws.cursor_glow.ribbon_hue_bands(),
+            field: ws.cursor_glow.rainbow_field(),
+            field_span: ws.cursor_glow.ribbon_field_span(),
             sparks: ws.cursor_glow.live_sparks(),
             momentum: ws.cursor_glow.typing_momentum(now),
             momentum_display: ws.cursor_glow.momentum_display(),
@@ -21417,6 +21443,22 @@ impl App {
             // beside the trail it leads. With no live ribbon, the cursor
             // engine falls back to the shared family phase below.
             head_rgb: ws.cursor_glow.rainbow_head_rgb(&glow_cfg),
+            // THE CARET COOLS WITH ITS TRAIL. `rainbow_energy` below is the
+            // typing CADENCE (a 220 ms half-life ignition heat, zero within
+            // ~0.35 s of the last key); the ribbon's width, wave and brightness
+            // all read `momentum_display` (the eased τ = 2 s spine). Feeding
+            // the caret only the first left the block sitting at its idle mix —
+            // the bare theme cursor colour — beside a fully painted ribbon
+            // within a quarter second of the last keystroke, measured on glass
+            // (`#65EB7F` caret against a `#722629` ribbon, spine still 0.96).
+            // The engine folds this with the energy, so the cadence keeps the
+            // attack and the ribbon owns the release.
+            paint: Some(ws.cursor_glow.momentum_display()),
+            // THE PAGE THE CARET'S LIGHT LANDS ON — the same `default_bg` this
+            // pass already handed the ribbon as `glow_cfg.theme_bg`, so the two
+            // halves of one effect solve §2.3's pixel law against ONE ground
+            // rather than two that happen to agree.
+            ground: Some(default_bg & 0x00FF_FFFF),
         };
         // CF-6 (gui half): ONE cadence decay per presented frame — and NONE
         // when nobody is listening. Every `TypingCadence` read re-runs
@@ -21470,11 +21512,17 @@ impl App {
         // feeding it here also removes the private unit-turn wrap that used to
         // snap the cursor body backward roughly once per second.
         let rainbow_family_phase = ws.cursor_glow.rainbow_phase();
+        // THE ONE FIELD (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2.1). The
+        // caret reads the position it is ABOUT TO LAY, so the block and the
+        // light leaving it are the same colour by construction rather than by
+        // two functions happening to agree at one column.
+        let rainbow_family_field = ws.cursor_glow.rainbow_field();
         let rainbow_frame = ws.cursor_rainbow.tick_with_family_phase(
             cur,
             frame_started,
             rainbow_energy,
             rainbow_family_phase,
+            rainbow_family_field,
             blink_phase,
             aterm_render::theme_is_dark(default_bg),
             glow_geom,
@@ -26198,6 +26246,8 @@ impl App {
                                     w: pw as u16,
                                     h: (s1 - s0) as u16,
                                     color,
+                                    // ADDITIVE light (see `GlowQuad::alpha`).
+                                    alpha: 0,
                                 });
                             }
                         }
@@ -28059,6 +28109,14 @@ impl App {
     /// `swap(0)` lets the next burst's leading edge restart the clock;
     /// `$ATERM_TRACE_LATENCY` keeps the stderr log, but the number is always
     /// returned for the `metrics` verb regardless.
+    ///
+    /// IT IS AN OPEN INTERVAL, NOT A FRAME COST. The stamp opens on the output
+    /// burst's leading edge and closes here; whatever happened in between —
+    /// including an idle stretch in which nothing presented, because the output
+    /// moved no pixels — is inside the number. Only `PRESENT_LATENCY_CAP_NS`
+    /// bounds it, so anything under 5 s is published as if it were render
+    /// latency. Callers documenting this figure must say so: see the
+    /// `WHAT THESE SLICES INCLUDE` block on `crate::control::control_query::cmd_metrics`.
     ///
     /// Attribution is PER-WINDOW (the touch-to-glass audit's artifact fix): only
     /// stamps from the presenting window's VISIBLE tab book latency — a TUI
@@ -38175,6 +38233,8 @@ mod split_sparkle_tests {
             w: 30,
             h: 10,
             color: 0x0011_2233,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         translate_nova_into_pane(&mut nova, place(0, 40));
         assert_eq!(

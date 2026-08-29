@@ -312,6 +312,9 @@ impl QuadSink<'_> {
                 w: (x1 - x0) as u16,
                 h: (band_end - yy) as u16,
                 color: premul,
+                // ADDITIVE light — this emitter has no other mode (see
+                // [`GlowQuad::alpha`]).
+                alpha: 0,
             });
             self.budget -= 1;
             yy = band_end;
@@ -1438,6 +1441,7 @@ mod tests {
             w,
             h,
             color,
+            alpha: 0,
         };
         let mut gradient = vec![
             quad(0, 0, 0, 20, 10, 0x00C8_C8C8),
@@ -1529,6 +1533,7 @@ mod tests {
             w,
             h,
             color,
+            alpha: 0,
         };
         let shapes: [&[GlowQuad]; 5] = [
             &[],

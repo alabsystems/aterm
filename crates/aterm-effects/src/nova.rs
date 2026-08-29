@@ -240,6 +240,9 @@ impl QuadSink<'_> {
                 w: (x1 - x0) as u16,
                 h: (band_end - yy) as u16,
                 color: premul,
+                // ADDITIVE light — this emitter has no other mode (see
+                // [`GlowQuad::alpha`]).
+                alpha: 0,
             });
             self.budget -= 1;
             yy = band_end;

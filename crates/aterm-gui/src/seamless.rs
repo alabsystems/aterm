@@ -372,11 +372,24 @@ pub(crate) fn normalize_commit(commit: &str) -> Option<String> {
         return Some(normalized);
     }
     // `unknown` is only ever a debug/dev shape; it must never authorize a
-    // release handoff.
-    (base == "unknown"
-        && !dirty
-        && (cfg!(debug_assertions) || std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some()))
-    .then(|| "unknown".to_string())
+    // release handoff — so the ONLY thing that admits it is `debug_assertions`,
+    // which is a property of the binary, not of the shell that launched it.
+    //
+    // `|| std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some()` used to be
+    // part of this condition. `var_os` is live in a release build, so a shipped
+    // aterm with that variable exported accepted an adoption proof from an
+    // UNSTAMPED build: the identity gate three lines above this comment was
+    // simply off. Worse, that is the environment the handoff is most often
+    // exercised in, so the one configuration that could have surfaced an
+    // `AdoptionMismatch` regression was the configuration where the check did
+    // not run (docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md §13).
+    //
+    // The QA seam keeps everything else it does — `ATERM_DEBUG_SEAMLESS_REEXEC`
+    // still re-execs the same binary through the real handoff — it just no
+    // longer relaxes the identity gate. QA against an unstamped build needs a
+    // stamped throwaway commit, which costs one `git commit` and leaves the
+    // proof honest.
+    (base == "unknown" && !dirty && cfg!(debug_assertions)).then(|| "unknown".to_string())
 }
 
 /// Canonical, attempt-bound commitment to the complete window/tab/pane layout.
@@ -5738,13 +5751,14 @@ mod f4_adoption_proof_asymmetry {
         assert_eq!(base, long, "commit length/case normalization is symmetric");
 
         // (iv) an un-stamped build cannot prove at all in a RELEASE binary:
-        // `unknown` is admitted ONLY under debug_assertions or the debug env.
+        // `unknown` is admitted ONLY under debug_assertions — a property of the
+        // binary. No environment variable can widen this; the
+        // `|| ATERM_DEBUG_SEAMLESS_REEXEC` that used to sit in this predicate
+        // let an exported value switch the identity gate off in a shipped build.
         let unknown = adoption_proof(nonce, 1_784_869_524, "unknown", &ld, &sd, &ids);
-        let admitted =
-            cfg!(debug_assertions) || std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
         assert_eq!(
             unknown.is_some(),
-            admitted,
+            cfg!(debug_assertions),
             "`unknown` commit is release-fatal (no proof is ever emitted)"
         );
     }

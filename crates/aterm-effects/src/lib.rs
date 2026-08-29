@@ -127,6 +127,12 @@ pub mod robi_glyphs_gen {
     include!("robi_glyphs_gen.rs");
 }
 pub mod spec;
+/// **THE ONE SPECTRUM** — `docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2. The
+/// rainbow family's single colour law: a monotone C¹ hue curve through seven
+/// named stops, held at one relative luminance, baked to a 1 KB LUT. Every
+/// layer of the mark resolves its colour through [`spectrum::spectrum`]; every
+/// point-mark snaps to a name through [`spectrum::spectrum_snap`].
+pub mod spectrum;
 pub mod supernova;
 /// Tone-of-typing — the tiny hashed-char-n-gram neural classifier that turns
 /// the line being typed into a coarse mood hint for `trail_sound`'s tone

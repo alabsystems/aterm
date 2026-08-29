@@ -335,8 +335,16 @@ impl CursorPreviewSpec {
     }
 
     /// Match the runtime's broad-style gate plus its raw-token companion
-    /// predicates. A non-pet rainbow spelling owns the flying kitty, including
-    /// the historical `nyan` aliases and the geometry-only underline variant.
+    /// predicates. A non-pet rainbow spelling owns the flying kitty — the
+    /// historical `nyan` / `rainbow` aliases and the explicit `… flying`
+    /// spellings.
+    ///
+    /// The GEOMETRY-ONLY underline variant used to land here too, and this
+    /// comment used to say so. It was not a rule: `style_names_kitty_pet` is a
+    /// whole-string equality and `"rainbow kitty underline"` simply matched no
+    /// entry, so one appended geometry word swapped the animal. It draws the
+    /// resident now, exactly like the `rainbow kitty` it is a geometry of; this
+    /// preview follows because it asks the engine's own predicate.
     pub(crate) fn trail_companion(&self) -> PreviewTrailCompanion {
         if self.resolved_trail_style().style != Some(GlowStyle::RainbowKitty) {
             return PreviewTrailCompanion::None;

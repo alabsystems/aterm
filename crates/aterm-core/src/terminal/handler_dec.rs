@@ -1169,6 +1169,83 @@ impl TerminalHandler<'_> {
         }
     }
 
+    /// Handle DECRARA - Reverse Attributes in Rectangular Area (VT400+).
+    ///
+    /// CSI Pt ; Pl ; Pb ; Pr ; Pm $ t
+    ///
+    /// xterm ctlseqs: "Reverse Attributes in Rectangular Area (DECRARA), VT400
+    /// and up. Pt ; Pl ; Pb ; Pr denotes the rectangle. Pm denotes the
+    /// attributes to reverse, i.e., 0, 1, 4, 5, 7, 8. Reversing SGR 0 reverses
+    /// modes 1, 4, 5, 7. Reversing SGR 8 is an xterm extension. See DECSACE."
+    ///
+    /// The reverse half of the DECCARA pair: same rectangle parsing (DECOM-aware,
+    /// 0 means the default per VT420) and the same DECSACE extent choice, but
+    /// each named attribute is reversed per cell, so the outcome depends on what
+    /// each cell already carried. DA1 advertises code 28 (rectangular editing),
+    /// which is the claim this arm has to make true.
+    pub(super) fn handle_decrara(&mut self, params: &[u16]) {
+        let Some((top, left, bottom, right)) = self.parse_rect_coords(params) else {
+            return;
+        };
+
+        // Pm defaults to 0 — "reverse modes 1, 4, 5, 7" — exactly as DECCARA's
+        // attribute list defaults to SGR 0.
+        let sgr_params = if params.len() > 4 {
+            &params[4..]
+        } else {
+            &[0u16][..]
+        };
+        let (toggle, toggle_underline) = Self::sgr_params_to_reverse_flags(sgr_params);
+        if toggle.is_empty() && !toggle_underline {
+            return;
+        }
+
+        if self.modes.stream_attribute_extent {
+            self.grid
+                .reverse_attrs_stream(top, left, bottom, right, toggle, toggle_underline);
+        } else {
+            self.grid
+                .reverse_attrs_rect(top, left, bottom, right, toggle, toggle_underline);
+        }
+    }
+
+    /// Split a DECRARA `Pm` list into (single-bit flags to XOR, reverse-underline).
+    ///
+    /// Underline comes back separately because it is not one bit: `UNDERLINE`,
+    /// `DOUBLE_UNDERLINE` and `CURLY_UNDERLINE` combine to spell dotted and
+    /// dashed, so only the grid can decide it per cell (`reverse_cell_attrs`).
+    ///
+    /// Codes outside the list DECRARA names (0, 1, 4, 5, 7, 8) are ignored
+    /// rather than mapped onto DECCARA's wider set: an SGR reset code like 22 has
+    /// no defined reverse, and reversing an attribute the application never named
+    /// would corrupt cells it asked to leave alone.
+    fn sgr_params_to_reverse_flags(sgr_params: &[u16]) -> (CellFlags, bool) {
+        let mut toggle = CellFlags::empty();
+        let mut toggle_underline = false;
+
+        for &param in sgr_params {
+            match param {
+                // "Reversing SGR 0 reverses modes 1, 4, 5, 7."
+                0 => {
+                    toggle = toggle
+                        .union(CellFlags::BOLD)
+                        .union(CellFlags::BLINK)
+                        .union(CellFlags::INVERSE);
+                    toggle_underline = true;
+                }
+                1 => toggle = toggle.union(CellFlags::BOLD),
+                4 => toggle_underline = true,
+                5 => toggle = toggle.union(CellFlags::BLINK),
+                7 => toggle = toggle.union(CellFlags::INVERSE),
+                // SGR 8 (invisible) is xterm's extension to the DEC list.
+                8 => toggle = toggle.union(CellFlags::HIDDEN),
+                _ => {}
+            }
+        }
+
+        (toggle, toggle_underline)
+    }
+
     /// Handle DECCRA - Copy Rectangular Area (VT420+).
     ///
     /// CSI Pts ; Pls ; Pbs ; Prs ; Pps ; Ptd ; Pld ; Ppd $ v

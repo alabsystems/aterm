@@ -224,8 +224,21 @@ fn pipeline_step_order_is_the_spec_7_order() {
             // failure is loud and resumable rather than a silently
             // private-only release the fleet can never see.
             "mirror",
-            "unlock"
+            "unlock",
+            // The website follows the cut AFTER unlock: the release is fully
+            // live, mirrored and lease-free before alab.systems is touched, so
+            // a site failure parks the journal here — loud and resumable —
+            // while the release itself is complete and safe.
+            "site"
         ]
+    );
+    assert!(
+        publish::is_post_unlock_step("site"),
+        "site must never demand or reacquire the release lease"
+    );
+    assert!(
+        !publish::is_post_unlock_step("mirror") && !publish::is_post_unlock_step("unlock"),
+        "every release-object step stays lease-guarded"
     );
 }
 
@@ -406,12 +419,100 @@ fn unfinished_v6_journal_still_owes_cask_and_fails_closed() {
     );
 }
 
-/// A current-format journal written by the PREVIOUS cutter still carries the
+/// Format 8 APPENDED the post-unlock `site` step. A finished v7 journal — the
+/// exact file every cut through v0.63.0 left on its cutting machine — never
+/// owed it, so walking one against the current 13-step list must not misfile
+/// the finished cut as "resumable at site" (which would block the next cut
+/// behind a step that was never owed). The insertion twin of the v6 `cask`
+/// removal guarantee above.
+#[test]
+fn completed_v7_journal_stays_complete_after_site_was_appended() {
+    let dir = tmpdir("journal-v7-complete");
+    let path = dir.join("cut-state.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "format = 7\nversion = \"0.61.0\"\nbuild_number = 1787774830\n\
+             commit = \"{}\"\nrelease_id = 55\ndraft_create_issued = true\n\
+             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
+             \"preflip\", \"tag\", \"flip\", \"archive\", \"verify\", \
+             \"mirror\", \"unlock\"]\n",
+            "e".repeat(40)
+        ),
+    )
+    .unwrap();
+
+    let v7 = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(v7.format, 7);
+    assert_eq!(
+        v7.first_incomplete(),
+        None,
+        "a completed v7 journal must stay complete once `site` joined STEPS"
+    );
+    v7.ensure_resumable().unwrap();
+}
+
+/// The website hook's exit contract, pinned: `publish/post-promote` documents
+/// 0 synced-or-deferred, 3 no site checkout, 4 live-site lag — the three
+/// outcomes that complete the step — and ONLY a code outside that contract
+/// (1 hard failure, 2 usage, or a signal) fails it and parks the journal.
+#[test]
+fn the_site_hook_exit_contract_is_pinned() {
+    use publish::{SiteHookOutcome, site_hook_outcome};
+    assert_eq!(site_hook_outcome(Some(0)), SiteHookOutcome::Synced);
+    assert_eq!(site_hook_outcome(Some(3)), SiteHookOutcome::NoSiteCheckout);
+    assert_eq!(site_hook_outcome(Some(4)), SiteHookOutcome::LiveLagging);
+    for failing in [Some(1), Some(2), Some(5), Some(127), None] {
+        assert_eq!(
+            site_hook_outcome(failing),
+            SiteHookOutcome::Failed,
+            "{failing:?} must fail the step (loud, resumable) — never pass silently"
+        );
+    }
+}
+
+/// A current-format cut that failed only its website step parks at `site`:
+/// resumable (the release is live, mirrored and unlocked — only the site is
+/// owed), and recognizably POST-unlock, so a resume must not reacquire the
+/// lease its own `unlock` already CAS-deleted.
+#[test]
+fn a_site_parked_journal_is_resumable_and_post_unlock() {
+    let dir = tmpdir("journal-site-parked");
+    let path = dir.join("cut-state.toml");
+    let mut j = journal();
+    j.release_id = Some(55);
+    j.draft_create_issued = true;
+    j.done = STEPS
+        .iter()
+        .take_while(|step| **step != "site")
+        .map(|step| (*step).to_string())
+        .collect();
+    j.save(&path).unwrap();
+
+    let parked = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(parked.first_incomplete(), Some("site"));
+    parked.ensure_resumable().unwrap();
+    assert!(
+        parked
+            .first_incomplete()
+            .is_some_and(publish::is_post_unlock_step),
+        "the resume entry point must be classified post-unlock (no lease reacquisition)"
+    );
+    assert!(
+        parked.is_done("unlock") && parked.is_done("mirror"),
+        "a site park exists only after the release is fully mirrored and unlocked"
+    );
+}
+
+/// A format-7 journal written by the PREVIOUS cutter still carries the
 /// retired `lite_dmg_sha256` key (the `aterm-<v>-lite.dmg` lane, retired
 /// 2026-08-26). It must keep loading — serde ignores the unknown key — and
 /// its mirrored asset set is judged by today's ONE-DMG exact set: a channel
 /// head that already received the lean twin is refused at the mirror's
-/// exact-set gate for a human to inspect, never silently converged.
+/// exact-set gate for a human to inspect, never silently converged. An
+/// UNFINISHED v7 journal walks the step list it was written against (no
+/// `site` owed) and, being below the current format, fails closed into
+/// stopped-publisher recovery — the same rule every earlier format bump kept.
 #[test]
 fn a_journal_carrying_the_retired_lite_digest_key_still_loads() {
     let dir = tmpdir("journal-retired-lite-key");
@@ -431,8 +532,10 @@ fn a_journal_carrying_the_retired_lite_digest_key_still_loads() {
     .unwrap();
 
     let old = Journal::load(&path).unwrap().unwrap();
-    old.ensure_resumable().unwrap();
     assert_eq!(old.first_incomplete(), Some("archive"));
+    let error = old.ensure_resumable().unwrap_err().to_string();
+    assert!(error.contains("format 7"), "{error}");
+    assert!(error.contains("cannot be resumed safely"), "{error}");
 
     // Today's exact set has exactly one DMG and no retired name…
     let set = mirror::required_asset_names("0.61.0", false, false);

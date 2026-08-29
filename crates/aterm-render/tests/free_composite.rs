@@ -429,6 +429,8 @@ fn free_z_under_text_over_legacy_and_over_text() {
         w: (2 * cw) as u16,
         h: ch as u16,
         color: premul_rgb(0x0040_80FF, 200),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     });
     input_over.nova_add.push(GlowQuad {
         row: 0,
@@ -437,6 +439,8 @@ fn free_z_under_text_over_legacy_and_over_text() {
         w: cw as u16,
         h: ch as u16,
         color: premul_rgb(0x00FF_C040, 200),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     });
     // Non-vacuous premise: WITHOUT the sprite, the stamp and the light paint.
     let mut input_bare = input_over.clone();

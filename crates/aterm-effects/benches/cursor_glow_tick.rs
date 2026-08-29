@@ -119,7 +119,9 @@
 //
 //   rainbow_typing_retina   emit_rainbow 36 %, emit_particles 18 %,
 //                           emit_rainbow_wake 3 %, rainbow_momentum_bands 2.6 %
-//                           (the six-HSV-round-trip site itself), emit_rainbow_jumps
+//                           (the six-HSV-round-trip site itself — DELETED at
+//                           migration step 1, so that share is now zero and the
+//                           profile below is a pre-step-1 reading), emit_rainbow_jumps
 //   rainbow_typing_light    emit_particles 33 %, push_rainbow_streak_over 14 %,
 //                           emit_rainbow 13 %, push_halo_over 8 %,
 //                           emit_fresh_ink 2 %, light_ink_bold 1.8 %
@@ -148,8 +150,9 @@
 // its own numbers should be read: `note_typed` is not a small detail of the
 // rainbow workloads, it is the difference between two different programs. The
 // hint is the only thing that advances the canonical typing-momentum metric, so
-// without it the eased `rainbow.disp` spine never leaves 0, `rainbow_momentum_bands`
-// early-returns its constant array, and the ribbon renders COLD. Measured on the
+// without it the eased `rainbow.disp` spine never leaves 0, every momentum
+// channel (thickness, wave, glint, bloom) sits at its resting value, and the
+// ribbon renders COLD. Measured on the
 // identical script: momentum 1.00 vs 0.00, and 16_477 vs 4_156 emitted items per
 // frame — a 4x difference in emitted volume alone. The shipped
 // `bench_cursor_rainbow_hot_ribbon_worstcase` arms no typed hint, so despite its
@@ -324,6 +327,7 @@ fn beam_for(style: GlowStyle) -> bool {
 /// A shipped-shaped config at full intensity.
 fn cfg_for(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        ribbon_tall: false,
         enabled: true,
         style,
         color: 0x00d0_d0d0,
@@ -343,7 +347,6 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
         head_dx: 0.5,
         pack: None,
         wake_persist_s: RAINBOW_WAKE_PERSIST,
-        ribbon_tall: false,
     }
 }
 
@@ -356,6 +359,7 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
 /// per-run `layered_beam_quads` walk inside the budget.
 fn beam_family_cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        ribbon_tall: false,
         duration: Duration::from_millis(320),
         ..cfg_for(style)
     }
@@ -739,8 +743,8 @@ impl Volume {
 /// output, which is what a volume number cannot do:
 ///
 ///   * `typing_momentum` IS the value the eased `rainbow.disp` spine chases,
-///     and `rainbow_momentum_bands` (the six-HSV-round-trip hot spot) returns
-///     its constant array unchanged whenever that spine is under 0.005. A cold
+///     and the ribbon's whole hot path — the 3-strip subdivision, the bloom,
+///     the wave and the glint — is gated on that spine leaving 0.005. A cold
 ///     spine means the ribbon is the COLD 1-strip path no matter how many
 ///     quads came out. Only a `note_typed`-paired forward move advances it.
 ///   * `blaze` is the raw fire heat the flame field's height and the FirePatch
@@ -1266,9 +1270,9 @@ fn workloads() -> Vec<Workload> {
                 (0, 0),
                 (0, 0),
             ],
-            // THE GATE, not the output: a spine this warm is what takes
-            // `rainbow_momentum_bands` past its `disp < 0.005` early return and
-            // puts the ribbon on the 3-strip hot path.
+            // THE GATE, not the output: a spine this warm is what takes the
+            // ribbon past its `disp < 0.005` resting check and onto the 3-strip
+            // hot path.
             state: [(0.90, 1.0), ANY, (0.0, 0.0)],
             lit_pct: (100, 100),
             witness: Witness::Dimmer {

@@ -23864,6 +23864,49 @@ mod tests {
         }
     }
 
+    /// THE `dmg` REPORT (owner, 2026-08-29): "typing 'dmg' triggered the
+    /// swear noise. it's not a swear." Vietnamese `đm` folded `đ` → `d` into
+    /// the bare key `dm`, and the live caret completed that whole token one
+    /// keystroke into `dmg` — WITH the typed witness supplied, exactly the
+    /// causal pair the bonk trusts. The lexicon's marks-required gate now
+    /// keeps the bare skeleton silent; the tone-marked form the entry
+    /// actually lists ("Tone marks essential") still cues exactly once.
+    #[test]
+    fn typing_dmg_never_bonks_but_the_marked_vietnamese_form_does() {
+        let lex = lex();
+        let c = cfg();
+        let t0 = Instant::now();
+        // Negative arm: d, m, g one committed keystroke at a time. The old
+        // behavior fired `CurseCueKind::Typed` at the 'm' (token "dm"
+        // complete at the caret); no keystroke may cue now.
+        let mut term = Terminal::new(2, 32);
+        let mut wd = WordDecorations::default();
+        let mut out = Vec::new();
+        for (i, byte) in b"dmg".iter().copied().enumerate() {
+            term.process(&[byte]);
+            wd.note_typed_edit(t0, None);
+            wd.rescan(&term, 2, 32, &lex, &c, i as u64 + 1, t0);
+            tick_deco(&mut wd, t0 + Duration::from_millis(i as u64), &c, &mut out);
+            assert_eq!(
+                wd.drain_curse_cues().count(),
+                0,
+                "prefix {:?} of dmg must never bonk",
+                &b"dmg"[..=i]
+            );
+        }
+        // Positive arm: the real Vietnamese abbreviation, typed with its
+        // tone mark, still records exactly one typed cue.
+        let mut term = Terminal::new(2, 32);
+        let mut wd = WordDecorations::default();
+        term.process("đm".as_bytes());
+        wd.note_typed_edit(t0, None);
+        wd.rescan(&term, 2, 32, &lex, &c, 1, t0);
+        tick_deco(&mut wd, t0, &c, &mut out);
+        let cues: Vec<CurseCue> = wd.drain_curse_cues().collect();
+        assert_eq!(cues.len(), 1, "typed đm must record one cue");
+        assert_eq!(cues[0].kind, CurseCueKind::Typed);
+    }
+
     /// DETONATION EDGE: a rolled supernova cues `Detonated` exactly once, AT
     /// the ignition grant (inheriting the flash limiter + `burst_done`), and
     /// an OUTPUT curse detonating cues Detonated WITHOUT a Typed cue — the

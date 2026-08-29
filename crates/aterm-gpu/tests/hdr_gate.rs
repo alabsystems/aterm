@@ -464,6 +464,8 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, *a),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
     }
     input

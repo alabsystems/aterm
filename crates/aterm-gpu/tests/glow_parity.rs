@@ -49,6 +49,8 @@ fn glow_additive_is_byte_exact_over_background() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, *a),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
     }
 
@@ -116,6 +118,8 @@ fn glow_over_text_matches_within_tolerance() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, a),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
     }
     // A crown straddling rows 0,1,2 at column 12 (each as its own single-row quad).
@@ -127,6 +131,8 @@ fn glow_over_text_matches_within_tolerance() {
             w: (cw * 2) as u16,
             h: ch as u16,
             color: premul_rgb(base, 80),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
     }
 
@@ -183,6 +189,8 @@ fn empty_glow_is_byte_identical_to_no_glow() {
         w: cw as u16,
         h: ch as u16,
         color: premul_rgb(0x0050_FA7B, 255),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     };
 
     // CPU: baseline (empty) -> painted -> drained. The painted frame must differ
@@ -280,6 +288,8 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         w: cw as u16,
         h: ch as u16,
         color,
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     };
 
     // Frame 0: the BARE frame (no glow at all), through the cached path on a
@@ -459,6 +469,8 @@ fn bloom_adds_light_over_the_base() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, 220),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
     }
 
@@ -605,6 +617,8 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         w: (2 * cw) as u16,
         h: 9,
         color: premul_rgb(0x00FF_8844, 160),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     });
     // ... and one GRID-space nova quad: pins the `pad`/`grid_top` offset the
     // grid streams add on both backends (`grid_top16 = pad + head`).
@@ -615,6 +629,8 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         w: cw as u16,
         h: 4,
         color: premul_rgb(0x0050_FA7B, 180),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     });
 
     let cpu_f = cpu.render_input(&input);

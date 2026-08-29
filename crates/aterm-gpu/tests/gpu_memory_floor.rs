@@ -173,6 +173,8 @@ fn bloom_target_is_built_on_demand_not_with_the_offscreen() {
         w: (6 * cw) as u16,
         h: ch as u16,
         color: premul_rgb(0x0050_FA7B, 255),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     });
     let lit = gpu.render_input(&mut win, &input, None);
     let lit_pixels = lit.pixels.clone();

@@ -15,6 +15,7 @@ const ITERATIONS: usize = 300;
 
 fn config(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        ribbon_tall: false,
         enabled: true,
         dark_theme: true,
         // The documented default dark palette — a COHERENT pair, never 0/0
@@ -33,7 +34,6 @@ fn config(style: GlowStyle) -> GlowConfig {
         head_dx: 0.5,
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
-        ribbon_tall: false,
     }
 }
 

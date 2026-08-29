@@ -52,22 +52,6 @@ fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
     }
 }
 
-/// Append the combining-aware grapheme text of a SINGLE visible cell.
-///
-/// Public-facing single-cell counterpart of [`push_cell_text`] used by the
-/// introspection `cell` verb: the resolved base char (NUL/`\0` → space) plus
-/// any complex-cluster string and trailing combining marks — exactly the
-/// content the selection/text paths and the renderer's
-/// `cluster_row`/`combining_row` emit, so a cell read never drops accents or
-/// ZWJ/emoji clusters. A wide-continuation (right half of a CJK/emoji glyph)
-/// yields the empty string (its glyph belongs to the lead cell). Out-of-range
-/// coordinates also yield the empty string.
-pub(crate) fn cell_grapheme_string(grid: &Grid, row: u16, col: u16) -> String {
-    let mut out = String::new();
-    push_cell_text(grid, row, col, &mut out);
-    out
-}
-
 /// Extract LIVE-frame (screen-row, display_offset-independent) row text for an
 /// inclusive column range.
 #[must_use]
@@ -224,14 +208,35 @@ impl Terminal {
     /// distinct "out of range"), and `Some("")` for a genuinely blank cell.
     #[must_use]
     pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
-        let r = u16::try_from(row).ok()?;
-        let c = u16::try_from(col).ok()?;
+        let mut out = String::new();
+        self.cell_grapheme_into(row, col, &mut out).then_some(out)
+    }
+
+    /// The buffer-REUSING twin of [`cell_grapheme`](Self::cell_grapheme): the
+    /// same bytes APPENDED to a caller-owned `String`, returning whether the
+    /// coordinates were in range — the `Some`/`None` of the allocating form. An
+    /// out-of-range cell appends nothing and returns `false`; every in-range
+    /// cell returns `true`, including the blank one that appends a single space
+    /// and the wide-continuation that appends nothing.
+    ///
+    /// Both forms route through the SAME `push_cell_text`, so byte-identity is
+    /// by construction rather than by argument. This one exists for the rows ×
+    /// cols sweeps: the agent-facing styled frame (`aterm ctl screen` /
+    /// `subscribe … cells`) built a fresh `String` PER CELL — 1,920 heap
+    /// allocations for a 24x80 screen, 10,000 for 50x200, all under the terminal
+    /// lock and repeated on every poll. Appending into one per-row buffer makes
+    /// that one allocation per row.
+    pub fn cell_grapheme_into(&self, row: usize, col: usize, out: &mut String) -> bool {
+        let (Ok(r), Ok(c)) = (u16::try_from(row), u16::try_from(col)) else {
+            return false;
+        };
         if usize::from(r) >= usize::from(self.grid.rows())
             || usize::from(c) >= usize::from(self.grid.cols())
         {
-            return None;
+            return false;
         }
-        Some(cell_grapheme_string(&self.grid, r, c))
+        push_cell_text(&self.grid, r, c, out);
+        true
     }
 
     /// Get the combining-aware grapheme text of a single DISPLAY cell,

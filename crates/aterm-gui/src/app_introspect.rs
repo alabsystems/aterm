@@ -1238,10 +1238,14 @@ fn run_encode_job(job: EncodeJob) {
                 }
             }
             // SELF-EVALUATION: correlate each PRE-ROUTING input attempt with the
-            // first later whole-frame change. This is useful response-latency
-            // evidence, not proof that the event reached a PTY or caused that
-            // change. For each attempt, the reference is the last earlier frame;
-            // the first later frame that pixel-differs is the observed response.
+            // first later whole-frame change. This is useful response evidence,
+            // not proof that the event reached a PTY or caused that change, and
+            // — the part that misled a week of investigation — it is a SAMPLING
+            // instrument whose readings are floored by the recorder's own
+            // capture cadence. `crate::video_key_analysis` owns the correlation
+            // and publishes that floor beside every number; see its header for
+            // what this block can and cannot say.
+            //
             // WHOLE frame, not a fixed band: the typed line lives wherever the
             // screen has scrolled to (the top-band v1 went blind after one scroll).
             let frame_fp = |f: &aterm_gpu::video_tap::CapturedFrame| -> u64 {
@@ -1249,62 +1253,17 @@ fn run_encode_job(job: EncodeJob) {
                 f.rgba.iter().step_by(64).map(|&b| b as u64).sum()
             };
             let fps: Vec<(u64, u64)> = take.frames.iter().map(|f| (f.t_us, frame_fp(f))).collect();
-            let mut glyph_lines = String::new();
-            let mut lats_ms: Vec<f64> = Vec::new();
-            for (t, sample) in &inputs {
-                let before = fps.iter().rev().find(|(ft, _)| ft < t);
-                let Some((_, ref_fp)) = before else { continue };
-                let hit = fps
-                    .iter()
-                    .filter(|(ft, _)| ft >= t)
-                    .find(|(_, fp)| fp.abs_diff(*ref_fp) > 200);
-                let field = sample.json_field();
-                if !glyph_lines.is_empty() {
-                    glyph_lines.push_str(",\n");
-                }
-                match hit {
-                    Some((ft, _)) => {
-                        let ms = (ft.saturating_sub(*t)) as f64 / 1000.0;
-                        lats_ms.push(ms);
-                        glyph_lines.push_str(&format!(
-                            "      {{{field},\"t_us\":{t},\"response_ms\":{ms:.1}}}"
-                        ));
-                    }
-                    None => glyph_lines.push_str(&format!(
-                        "      {{{field},\"t_us\":{t},\"response_ms\":null}}"
-                    )),
-                }
-            }
-            lats_ms.sort_by(|a, b| a.total_cmp(b));
             let analysis = if inputs.is_empty() {
                 format!(
                     "  \"analysis\": {{\"note\": \"{}\"}},\n",
                     video_empty_ledger_note(keys_enabled, unlogged_inputs, unlogged_other_window)
                 )
-            } else if lats_ms.is_empty() {
-                format!(
-                    "  \"analysis\": {{\n    \"key_response\": [\n{glyph_lines}\n    ],\n    \
-                     \"note\": \"input attempts logged but no later visible change detected; inputs are not delivery receipts\"\n  }},\n"
-                )
             } else {
-                let p50 = lats_ms[lats_ms.len() / 2];
-                let p90 = lats_ms[(lats_ms.len() * 9 / 10).min(lats_ms.len() - 1)];
-                let max = lats_ms[lats_ms.len() - 1];
-                // Verdict thresholds: one 60Hz frame (16.7ms) p50 = instant;
-                // two frames p50 = good; beyond = investigate.
-                let verdict = if p50 <= 16.7 && max <= 50.0 {
-                    "INSTANT: every logged input attempt was followed by a frame change within ~1-2 frames"
-                } else if p50 <= 33.4 {
-                    "GOOD: typical logged input attempt was followed by a frame change within 2 frames; check max outliers"
-                } else {
-                    "SLOW: later frame changes exceed 2 frames — investigate routing, shell echo, and load"
-                };
-                format!(
-                    "  \"analysis\": {{\n    \"key_response\": [\n{glyph_lines}\n    ],\n    \
-                     \"p50_ms\": {p50:.1}, \"p90_ms\": {p90:.1}, \"max_ms\": {max:.1}, \"n\": {},\n    \
-                     \"verdict\": \"{verdict}\"\n  }},\n",
-                    lats_ms.len()
-                )
+                let attempts: Vec<(u64, String)> = inputs
+                    .iter()
+                    .map(|(t, sample)| (*t, sample.json_field()))
+                    .collect();
+                crate::video_key_analysis::analysis_block(&attempts, &fps)
             };
             // Frames first, index.json last inside the still-private recording.
             // Guarded wire preparation later publishes `.published`, the sole
@@ -8808,6 +8767,8 @@ mod terminal_split_capture_tests {
                 w: 1,
                 h: 1,
                 color: 0x0001_0101,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             }];
             window.input_scratch.glow_halo = vec![aterm_render::RainHalo {
                 row: 4,
@@ -9087,6 +9048,8 @@ mod terminal_split_capture_tests {
                 w: u16::MAX,
                 h: u16::MAX,
                 color: 0x0012_3456,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             }];
             window.trail_scratch = vec![
                 aterm_render::TrailCell {
@@ -10955,6 +10918,8 @@ mod encode_worker_tests {
                 w: u16::MAX,
                 h: u16::MAX,
                 color: 0x0042_84C6,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             }];
             window.trail_scratch = vec![
                 aterm_render::TrailCell {

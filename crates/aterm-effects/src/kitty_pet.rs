@@ -360,10 +360,10 @@ const VEL_MAX: f32 = 60.0;
 /// (`v / CHASE_GAIN`) and the pet holds [`STATION_LEAD`] while you type
 /// instead of trailing the caret by the lag.
 const LEAD_TIME: f32 = 0.25;
-/// Ceiling on the velocity lead (cells). Deliberately conservative until the
-/// baker's per-pose body bbox lands (see [`PetBrain::set_body_left_px`]) —
-/// an anchored visible edge is what makes a bigger lead read as "ahead"
-/// rather than "gone".
+/// Ceiling on the velocity lead (cells). Deliberately conservative: the
+/// station anchors the pet's authored TILE, whose transparent margin varies
+/// by pose, so a bigger lead starts reading as "gone" before it reads as
+/// "ahead".
 const LEAD_MAX: f32 = 4.0;
 /// The most a FLIGHT's keep-ahead prediction may add to its aim. The
 /// station's own lead is clamped at [`LEAD_MAX`]; a flight's prediction
@@ -2369,11 +2369,6 @@ pub struct PetBrain {
     pending_wall_transit: bool,
     /// BBOX ANCHOR SEAM (grid pixels): how far the CURRENT pose's visible
     /// left edge sits inside the authored tile. The review wants the visible
-    /// edge at caret+1, which needs the baker's per-pose body bbox — a file
-    /// the art wave owns right now — so the seam ships with a documented
-    /// default of 0 (anchor on the authored box) and the export lands later.
-    /// See [`Self::set_body_left_px`].
-    body_left_px: f32,
     /// Held-delete detector: retreats in the current run, and seconds since
     /// the last one (a retreat within [`STARTLE_RUN_WINDOW`] continues the
     /// run, a later one starts a fresh run of one).
@@ -2737,7 +2732,6 @@ impl Default for PetBrain {
             run_t: 60.0,
             wall_side: false,
             pending_wall_transit: false,
-            body_left_px: 0.0,
             retreat_run: 0,
             // Far outside the window, so the first retreat ever seen starts a
             // fresh run of one rather than continuing a phantom one.
@@ -2906,7 +2900,7 @@ impl PetBrain {
     /// the hysteretic wall side. The static `station` stays as the lead-free
     /// base (first sightings, reduced motion, hosts) — this is the one the
     /// chase follows.
-    fn station_now(&self, caret_col: u16, cols: u16, width: f32, cell_w: u16) -> f32 {
+    fn station_now(&self, caret_col: u16, cols: u16, width: f32) -> f32 {
         let limit = f32::from(cols) - width;
         if limit <= 0.0 {
             return 0.0;
@@ -2915,28 +2909,9 @@ impl PetBrain {
             // Parked wall-side: no lead — there is nowhere ahead to lead to.
             return (f32::from(caret_col) - width - STATION_LEAD).max(0.0);
         }
-        // BBOX ANCHOR SEAM: shift left by the pose's body inset so the
-        // VISIBLE left edge (not the authored tile's) sits at caret+1.
-        // `body_left_px` defaults to 0 until the baker's export lands.
-        let inset = if cell_w == 0 {
-            0.0
-        } else {
-            self.body_left_px / f32::from(cell_w)
-        };
-        (f32::from(caret_col) + STATION_LEAD + self.lead() - inset).clamp(0.0, limit)
+        (f32::from(caret_col) + STATION_LEAD + self.lead()).clamp(0.0, limit)
     }
 
-    /// BBOX ANCHOR SEAM: the current pose's visible-body left inset, in grid
-    /// PIXELS inside the authored tile. The design review's rule is that the
-    /// pet's VISIBLE left edge sits at caret+1; the authored tile carries
-    /// transparent margin, so anchoring the tile there parks the visible cat
-    /// further right, pose by pose.
-    ///
-    /// TODO(pet-art): feed this from `pet_baker`'s per-pose body bbox export
-    /// once the art wave lands it (`pet_baker` is owned by that wave right
-    /// now, so the export cannot be added here). Until then the documented
-    /// default of 0 keeps today's authored-box anchor, and [`LEAD_MAX`] stays
-    /// conservative for the same reason.
     /// Choose which animal the pet is drawn as ([`PetSpecies`]).
     ///
     /// Safe to call every frame — it is a plain field write with no state to
@@ -2954,14 +2929,6 @@ impl PetBrain {
     #[must_use]
     pub fn species(&self) -> PetSpecies {
         self.species
-    }
-
-    pub fn set_body_left_px(&mut self, px: f32) {
-        // NaN.max(0.0) is NaN — a non-finite inset keeps the last good one
-        // (codex review, 2026-08-10).
-        if px.is_finite() {
-            self.body_left_px = px.max(0.0);
-        }
     }
 
     /// THE INK SEAM (gauntlet F1/F5/F8): the host's per-frame ink probe.
@@ -3030,7 +2997,6 @@ impl PetBrain {
     /// and at a later presentation boundary without erasing additional state.
     pub fn retire_coordinate_space(&mut self) {
         let species = self.species;
-        let body_left_px = self.body_left_px;
         let content = self.content;
         let quiet = self.quiet;
         let clock = self.clock;
@@ -3052,7 +3018,6 @@ impl PetBrain {
         // eye (and is what `clippy::field_reassign_with_default` asks for).
         *self = Self {
             species,
-            body_left_px,
             content,
             quiet,
             clock,
@@ -3389,15 +3354,8 @@ impl PetBrain {
     /// caret's. The chase, the evictions and the arrived test all read THIS
     /// one stand, so they can never fight each other over where the pet
     /// belongs.
-    fn station_safe(
-        &self,
-        caret: (u16, u16),
-        cols: u16,
-        rows: u16,
-        width: f32,
-        cell_w: u16,
-    ) -> (f32, f32) {
-        let want = self.station_now(caret.1, cols, width, cell_w);
+    fn station_safe(&self, caret: (u16, u16), cols: u16, rows: u16, width: f32) -> (f32, f32) {
+        let want = self.station_now(caret.1, cols, width);
         self.ink_stand(want, f32::from(caret.0), width, cols, rows)
     }
 
@@ -3846,8 +3804,7 @@ impl PetBrain {
             // Ink-safe either way: a caret that reappears mid-line must not
             // materialise the cat on top of the line.
             if was_invisible {
-                let (c, r) =
-                    self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
+                let (c, r) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
                 self.col = c;
                 self.row = r;
                 // No trip to clear here either: `was_invisible` means the
@@ -4310,8 +4267,7 @@ impl PetBrain {
         // one line off the caret when the caret's own line has no ground near
         // it, and the row hop below is what makes that read as a cat stepping
         // down rather than a cat blinking somewhere else.
-        let (target, target_row) =
-            self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
+        let (target, target_row) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
 
         // ── the ink eviction (gauntlet F1, the systemic root) ──────────────
         // A grounded pose froze its feet while prompts printed and typing ran
@@ -4381,7 +4337,7 @@ impl PetBrain {
                 // line: the very tic the watch exists to remove.
                 self.ink_stand(self.col, self.row, width, sense.cols, sense.rows)
             } else {
-                self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
+                self.station_safe((cr, cc), sense.cols, sense.rows, width)
             };
             let moved_off = (safe - self.col).abs() > f32::EPSILON;
             let safe_row = if watching { self.row } else { safe_row };
@@ -4598,8 +4554,7 @@ impl PetBrain {
                 // second bound were all cut against that row. A ladder row
                 // the flight did not take is picked up by the eviction one
                 // tick after the paws are down.
-                let (aim, aim_row) =
-                    self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
+                let (aim, aim_row) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
                 let to = (aim + predict).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
                 // REBASE, or the re-aim IS a teleport.
                 //
@@ -9044,7 +8999,6 @@ mod tests {
         let mut pet = PetBrain::default();
         let old_now = Instant::now();
         pet.species = PetSpecies::Dog;
-        pet.body_left_px = 3.5;
         pet.content = 0.65;
         pet.quiet = 4.0;
         pet.clock = 19.0;
@@ -9076,7 +9030,6 @@ mod tests {
 
         pet.retire_coordinate_space();
         assert_eq!(pet.species(), PetSpecies::Dog);
-        assert_eq!(pet.body_left_px, 3.5);
         assert_eq!(pet.content, 0.65);
         assert_eq!(pet.quiet, 4.0);
         assert_eq!(pet.clock, 19.0);
@@ -9107,7 +9060,7 @@ mod tests {
             (0.65, Some((2, 3)), PetSpecies::Dog)
         );
         let new_now = old_now + Duration::from_secs(1);
-        let expected_col = pet.station_now(12, 100, art_cols(10, 20), 10);
+        let expected_col = pet.station_now(12, 100, art_cols(10, 20));
         let frame = pet.tick_static_capture(sense(new_now, Some((3, 12))));
         assert_eq!(frame.alpha, 255);
         assert_eq!(frame.row, 3.0);
@@ -16056,7 +16009,7 @@ mod tests {
         let (col, row, _, _) = w.last;
         assert!(w.pet.flight.is_none(), "and it is down by the end");
         assert!((row - 7.0).abs() < 0.01, "on row 7, got {row}");
-        let (station, _) = w.pet.station_safe((7, 2), 80, 24, art_cols(10, 20), 10);
+        let (station, _) = w.pet.station_safe((7, 2), 80, 24, art_cols(10, 20));
         assert!(
             (col - station).abs() < 1.5,
             "beside the prompt (station {station:.2}), got {col:.2}"
@@ -16133,7 +16086,7 @@ mod tests {
         let mut spans = vec![(0u16, 0u16); 24];
         spans[6] = (0, 78);
         pet.sense_ink(0, &spans, Some(6));
-        let (_, row) = pet.station_safe((6, 75), 80, 24, w, 10);
+        let (_, row) = pet.station_safe((6, 75), 80, 24, w);
         assert!(
             (row - 7.0).abs() < 0.01,
             "the walled-shut row hands the stand to the blank row below, got row {row}"
@@ -16141,7 +16094,7 @@ mod tests {
         let mut spans = vec![(0u16, 0u16); 24];
         spans[23] = (0, 78);
         pet.sense_ink(0, &spans, Some(23));
-        let (_, row) = pet.station_safe((23, 75), 80, 24, w, 10);
+        let (_, row) = pet.station_safe((23, 75), 80, 24, w);
         assert!(
             (row - 22.0).abs() < 0.01,
             "and on the last row, to the blank row above, got row {row}"
@@ -18844,8 +18797,6 @@ mod tests {
             assert!(f.col.is_finite(), "the pose stays finite");
         }
         assert_eq!(pet.pointer_heat, 0.0, "a NaN pointer is no pointer");
-        pet.set_body_left_px(f32::NAN);
-        assert!(pet.body_left_px.is_finite());
     }
 
     /// THE TENNIS WATCH (wave 4): a rally that outlives the frolic sits the
@@ -21024,7 +20975,7 @@ mod tests {
             }
             if self.trigger.is_some() && self.settle_at.is_none() {
                 let ok = caret.is_some_and(|c| {
-                    let (tc, tr) = self.pet.station_safe(c, self.cols, PROBE_ROWS, w, 10);
+                    let (tc, tr) = self.pet.station_safe(c, self.cols, PROBE_ROWS, w);
                     f.action.settled()
                         && self.pet.flight.is_none()
                         && (f.col - tc).abs() < 1.0

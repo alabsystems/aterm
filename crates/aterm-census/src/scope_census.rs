@@ -546,26 +546,24 @@ fn line_of(source: &str, at: usize) -> usize {
     source[..at].bytes().filter(|b| *b == b'\n').count() + 1
 }
 
-/// Every non-test, non-example source under `root/crates`, minus this census's
-/// own sources.
+/// Every non-test source under `root/crates`, minus this census's own sources.
 ///
-/// EXAMPLES ARE EXCLUDED FOR THE SAME REASON [`UNSHIPPED_GATES`] MASKS
-/// `#[cfg(test)]`: a `crates/<c>/examples/*.rs` target is built only by an
-/// explicit `cargo run --example` and is never linked into a lib, a bin or the
-/// shipped app, so a probe that builds its own enforcer to poke at it cannot
-/// multiply the enforcer any user runs. Counting them made the census red on
-/// two hand-run probes (`companion_box_probe`, `companion_yield_probe`) that
-/// each `WordDecorations::default()` — a finding that named no reachable
-/// defect, which is the shape that teaches operators to stop reading a gate.
-/// This is a SCOPE correction, not a waiver: OB-13..16/18 still have no waiver
-/// channel, and every shipping construction is counted exactly as before.
+/// EXAMPLES ARE SWEPT, and the exclusion that used to sit here is gone with
+/// the two files that bought it. It was added because `companion_box_probe`
+/// and `companion_yield_probe` — hand-run scratch probes, referenced by
+/// nothing — each built a `WordDecorations` to poke at, and the census went
+/// red on a finding that named no reachable defect. That reasoning was sound
+/// as far as it went (an `examples/` target is never linked into a lib, a bin
+/// or the shipped app), but it answered a slop problem by narrowing a gate:
+/// the two probes stayed, and every future example lost its coverage to buy
+/// their silence. The probes are deleted instead, so the sweep gets its full
+/// reach back. An example that constructs an enforcer will now turn this
+/// census red again — which is the gate working, and the right moment to ask
+/// whether that example should exist.
 fn sweep_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let _ = collect_rs_files(&root.join("crates"), &mut files);
-    files.retain(|p| {
-        let unixish = p.to_string_lossy().replace('\\', "/");
-        !is_test_file(p) && !unixish.contains(SELF_EXCLUDED_DIR) && !unixish.contains("/examples/")
-    });
+    files.retain(|p| !is_test_file(p) && !p.to_string_lossy().contains(SELF_EXCLUDED_DIR));
     files.sort();
     files
 }

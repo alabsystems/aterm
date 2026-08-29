@@ -598,41 +598,33 @@ fn kernel_default_termios() -> Option<libc::termios> {
 ///    master-read chunk stays hard-clamped at exactly 1024 B/read at ospeeds
 ///    9600/38400/230400/1e6 (32 MiB → 32768 reads each), so this is expected
 ///    ~neutral here — kept because it is free, matches other emulators, and the
-///    clamp may differ on other xnu/Linux versions. A/B-revert:
-///    `ATERM_PTY_NULL_TERMIOS=1`.
+///    clamp may differ on other xnu/Linux versions.
 ///
-/// `bench_no_opost` (BENCH-ONLY, env `ATERM_PTY_BENCH_NO_OPOST=1`) additionally
-/// clears `OPOST`: the probe showed kernel output post-processing (ONLCR `\n`
-/// scan) costs ~6% of raw PTY throughput (209.9 vs ~197 MB/s). It CHANGES
-/// cooked-mode display semantics (bare `\n` stairsteps, no `\r` insertion), so
-/// it must never be on for interactive use — default OFF, measurement only.
-fn build_spawn_termios(mut t: libc::termios, bench_no_opost: bool) -> libc::termios {
+/// There is no env revert for either delta. `ATERM_PTY_NULL_TERMIOS=1` used to
+/// force the historical NULL-`termp` path and `ATERM_PTY_BENCH_NO_OPOST=1` used
+/// to additionally clear `OPOST` (worth ~6% of raw PTY throughput, 209.9 vs
+/// ~197 MB/s — and it CHANGES cooked-mode display semantics: bare `\n`
+/// stairsteps with no `\r` insertion, so every full-screen program's output
+/// breaks). Both were read here in the SHIPPED crate with no cfg gate, so an
+/// exported value put a release on a termios no test covers. Measure by
+/// editing this function in a scratch build, where the change is reviewable.
+fn build_spawn_termios(mut t: libc::termios) -> libc::termios {
     t.c_iflag |= libc::IUTF8;
     // SAFETY: `cfsetspeed` only writes the speed fields (and, on Linux, CBAUD
     // bits) of the valid, stack-owned `t`.
     unsafe {
         libc::cfsetspeed(&mut t, libc::B230400);
     }
-    if bench_no_opost {
-        t.c_oflag &= !libc::OPOST;
-    }
     t
 }
 
 /// The termios applied to the spawn's slave — `None` means "apply none", i.e.
 /// the kernel defaults, which is the historical spawn path (`forkpty`'s NULL
-/// `termp`), byte-identical behavior. `ATERM_PTY_NULL_TERMIOS=1` forces that
-/// historical path (the A/B revert switch for the [`build_spawn_termios`]
-/// deltas), and with the explicit slave open it means exactly what it always
-/// meant: open the slave and do NOT `tcsetattr` it. Runs in the PARENT before
-/// the fork (env reads + the one-time probe allocate; the post-fork child stays
-/// async-signal-safe and untouched).
+/// `termp`). That now happens only when the probe itself fails. Runs in the
+/// PARENT before the fork (the one-time probe allocates; the post-fork child
+/// stays async-signal-safe and untouched).
 fn spawn_termios() -> Option<libc::termios> {
-    if std::env::var_os("ATERM_PTY_NULL_TERMIOS").is_some_and(|v| v == "1") {
-        return None;
-    }
-    let bench_no_opost = std::env::var_os("ATERM_PTY_BENCH_NO_OPOST").is_some_and(|v| v == "1");
-    kernel_default_termios().map(|t| build_spawn_termios(t, bench_no_opost))
+    kernel_default_termios().map(build_spawn_termios)
 }
 
 // ===========================================================================
@@ -2971,17 +2963,15 @@ pub fn drain_more(master: i32, buf: &mut [u8], mut filled: usize) -> usize {
     filled
 }
 
-/// Revert knob (`ATERM_PTY_BRIDGE_SPIN=1`): the legacy paced-probe bridge
-/// (256 `spin_loop` pauses between re-reads, deliver once the probe budget is
-/// spent). Kept because the bridge shape is a measured-perf hot spot; measured
-/// on M5 Max, the pause block costs ~2 µs (`spin_loop` lowers to `ISB` on
-/// Apple Silicon), 4× its design assumption — the reason the legacy bridge
-/// lost ~100 MB/s of drain rate.
-fn bridge_legacy_spin() -> bool {
-    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *LEGACY.get_or_init(|| std::env::var_os("ATERM_PTY_BRIDGE_SPIN").is_some_and(|v| v == "1"))
-}
-
+// The `ATERM_PTY_BRIDGE_SPIN=1` revert knob that used to live here restored the
+// legacy paced-probe bridge: 256 `spin_loop` pauses between re-reads, deliver
+// once the probe budget is spent. Measured on M5 Max the pause block costs
+// ~2 µs (`spin_loop` lowers to `ISB` on Apple Silicon), 4x its design
+// assumption — which is why the legacy bridge lost ~100 MB/s of drain rate and
+// why the d2 cadence fix replaced it. Read with no cfg gate in this SHIPPED
+// crate, it was a way to silently put the pre-fix latency back into a released
+// binary: the exact defect ATERM_EFFECT_PACE was deleted for. An A/B belongs in
+// a scratch build with a reviewable diff, not in the environment of a cut.
 /// Default idle-refill patience. Measured sweep (quiet M5 Max, 500 MB flood +
 /// CPR round-trip probe): 0 ⇒ 231 MB/s / +0 µs; 50 ⇒ 266 / +79 µs p50;
 /// 250 ⇒ 265 / +327 µs; 1000 ⇒ 254 / +1.27 ms (the bb0ac4c fps-regression
@@ -3187,14 +3177,11 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     /// Immediate re-read budget per refill gap (ghostty's bridge length; 8-16
     /// catches >90% of gaps).
     const NB_SPIN_MAX: u32 = 16;
-    /// Legacy paced-probe pause length (revert knob only).
-    const NB_SPIN_ITERS: u32 = 256;
     /// One parked poll per dry gap; quiet for the full timeout ⇒ burst over.
     const BRIDGE_POLL_MS: i32 = 1;
     /// Per-batch latency budget (ghostty's); checked per dry gap, so the
     /// effective bound is this plus one [`BRIDGE_POLL_MS`] park.
     const BATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
-    let legacy = bridge_legacy_spin();
     let start = std::time::Instant::now();
     let mut spins = 0u32;
     while filled < buf.len() {
@@ -3217,15 +3204,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                 }
                 if spins < NB_SPIN_MAX {
                     spins += 1;
-                    if legacy {
-                        for _ in 0..NB_SPIN_ITERS {
-                            std::hint::spin_loop();
-                        }
-                    }
                     continue;
-                }
-                if legacy {
-                    break; // legacy bridge delivered once the probe budget ran dry
                 }
                 if parse_in_flight
                     .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0)
@@ -4619,10 +4598,7 @@ mod tests {
     /// winsize and the requested termios deltas, readable from both ends.
     #[test]
     fn pty_pair_is_close_on_exec_from_birth() {
-        let want = build_spawn_termios(
-            kernel_default_termios().expect("kernel termios probe"),
-            false,
-        );
+        let want = build_spawn_termios(kernel_default_termios().expect("kernel termios probe"));
         let ws = libc::winsize {
             ws_row: 41,
             ws_col: 137,
@@ -5960,7 +5936,7 @@ mod tests {
     #[test]
     fn spawn_termios_deltas_are_exactly_iutf8_and_speed() {
         let d = kernel_default_termios().expect("probe");
-        let t = build_spawn_termios(d, false);
+        let t = build_spawn_termios(d);
         // The two documented deltas...
         assert_ne!(
             t.c_iflag & libc::IUTF8,
@@ -5983,24 +5959,23 @@ mod tests {
         assert_eq!(t.c_cflag, d.c_cflag);
     }
 
+    /// The spawn termios KEEPS `OPOST`, and no environment variable can clear
+    /// it. This replaces `bench_no_opost_gate_clears_only_opost`, which proved
+    /// the opposite property of an `ATERM_PTY_BENCH_NO_OPOST=1` gate that was
+    /// live in the shipped crate: with `OPOST` off, `\n` stops being translated
+    /// to `\r\n` and every full-screen program's output staircases. The gate is
+    /// gone; this pins that it stays gone.
     #[test]
-    fn bench_no_opost_gate_clears_only_opost() {
+    fn spawn_termios_never_clears_opost() {
         let d = kernel_default_termios().expect("probe");
-        let bench = build_spawn_termios(d, true);
-        let normal = build_spawn_termios(d, false);
-        assert_eq!(
-            bench.c_oflag & libc::OPOST,
+        let t = build_spawn_termios(d);
+        assert_ne!(
+            t.c_oflag & libc::OPOST,
             0,
-            "bench gate must clear OPOST"
+            "the spawn termios must post-process output (ONLCR); clearing OPOST \
+             staircases every cooked-mode program"
         );
-        assert_eq!(
-            bench.c_oflag | libc::OPOST,
-            normal.c_oflag | libc::OPOST,
-            "bench gate must change no other oflag"
-        );
-        assert_eq!(bench.c_iflag, normal.c_iflag);
-        assert_eq!(bench.c_lflag, normal.c_lflag);
-        assert_eq!(bench.c_cc, normal.c_cc);
+        assert_eq!(t.c_oflag, d.c_oflag, "no oflag delta at all");
     }
 
     #[test]

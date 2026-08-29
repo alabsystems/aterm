@@ -473,6 +473,265 @@ fn decrqss_decsace_roundtrips_current_extent() {
 }
 
 // =========================================================================
+// 5b. DECRARA — Reverse Attributes in Rectangular Area
+//     (CSI Pt;Pl;Pb;Pr;Pm $ t)
+//
+// xterm ctlseqs: "Reverse Attributes in Rectangular Area (DECRARA), VT400 and
+// up. Pt ; Pl ; Pb ; Pr denotes the rectangle. Pm denotes the attributes to
+// reverse, i.e., 0, 1, 4, 5, 7, 8. Reversing SGR 0 reverses modes 1, 4, 5, 7.
+// Reversing SGR 8 is an xterm extension. See DECSACE."
+//
+// DA1 answers `;28` (rectangular editing), so these are capabilities the
+// terminal claims before an application sends anything.
+// =========================================================================
+
+/// Write `text` at row `r` (1-based), column 1, wrapped in `sgr` … SGR 0.
+///
+/// DECALN paints its backdrop with default attributes, so a test that needs
+/// cells which ALREADY carry an attribute has to write them itself.
+fn styled_row(s: &mut Screen, r: u16, sgr: &str, text: &str) {
+    s.feed(format!("\x1b[{r};1H\x1b[{sgr}m{text}\x1b[0m").as_bytes());
+}
+
+#[test]
+fn decrara_turns_a_named_attribute_on_where_absent_and_off_where_present() {
+    // The property that separates DECRARA from DECCARA: one sequence, one
+    // rectangle, opposite outcomes per cell. "Pm denotes the attributes to
+    // reverse" — reverse, not set (that is `$ r`) and not clear (`$ r` with
+    // the reset code).
+    let mut s = Screen::new(4, 6);
+    styled_row(&mut s, 1, "7", "AAA"); // (0,0..2) already INVERSE
+    s.feed(b"\x1b[2;1HBBB"); // (1,0..2) plain
+    s.feed(b"\x1b[1;1;2;3;7$t");
+    for c in 0..3 {
+        assert!(
+            !has_flags(&s, 0, c, CellFlags::INVERSE),
+            "(0,{c}) had SGR 7 and must lose it"
+        );
+        assert!(
+            has_flags(&s, 1, c, CellFlags::INVERSE),
+            "(1,{c}) lacked SGR 7 and must gain it"
+        );
+    }
+    assert_eq!(s.row(0), "AAA", "DECRARA does not change the characters");
+    assert_eq!(s.row(1), "BBB", "DECRARA does not change the characters");
+}
+
+#[test]
+fn decrara_applied_twice_restores_the_original_attributes() {
+    // Reversal is an involution — the invariant that would not hold if the
+    // engine quietly implemented DECRARA as "set" or "clear".
+    let mut s = Screen::new(4, 6);
+    styled_row(&mut s, 1, "1", "AAAAAA"); // BOLD across the row
+    s.feed(b"\x1b[1;2;1;4;1$t");
+    assert!(has_flags(&s, 0, 0, CellFlags::BOLD), "outside the rect");
+    assert!(!has_flags(&s, 0, 1, CellFlags::BOLD), "reversed once: off");
+    s.feed(b"\x1b[1;2;1;4;1$t");
+    for c in 0..6 {
+        assert!(
+            has_flags(&s, 0, c, CellFlags::BOLD),
+            "(0,{c}) restored by the second reversal"
+        );
+    }
+}
+
+#[test]
+fn decrara_leaves_every_cell_outside_the_rectangle_alone() {
+    let mut s = Screen::new(6, 10);
+    decaln(&mut s);
+    s.feed(b"\x1b[2*x\x1b[2;3;4;6;7$t"); // rect extent, rows 2-4 x cols 3-6
+    for r in 1..=3 {
+        for c in 0..2 {
+            assert!(!has_flags(&s, r, c, CellFlags::INVERSE), "({r},{c}) left");
+        }
+        for c in 2..=5 {
+            assert!(has_flags(&s, r, c, CellFlags::INVERSE), "({r},{c}) inside");
+        }
+        for c in 6..10 {
+            assert!(!has_flags(&s, r, c, CellFlags::INVERSE), "({r},{c}) right");
+        }
+    }
+    for c in 0..10 {
+        assert!(!has_flags(&s, 0, c, CellFlags::INVERSE), "row above");
+        assert!(!has_flags(&s, 4, c, CellFlags::INVERSE), "row below");
+    }
+    assert_eq!(s.row(2), "EEEEEEEEEE", "characters survive the reversal");
+}
+
+#[test]
+fn decrara_default_pm_reverses_modes_1_4_5_7() {
+    // xterm ctlseqs: "Reversing SGR 0 reverses modes 1, 4, 5, 7" — and Pm
+    // defaults to 0, exactly as DECCARA's attribute list does. SGR 8 is NOT in
+    // that list: it is xterm's extension and only reverses when named.
+    let mut s = Screen::new(3, 6);
+    styled_row(&mut s, 1, "8", "AAAAAA"); // HIDDEN, nothing else
+    s.feed(b"\x1b[1;1;1;6$t");
+    let want = CellFlags::BOLD
+        .union(CellFlags::UNDERLINE)
+        .union(CellFlags::BLINK)
+        .union(CellFlags::INVERSE);
+    for c in 0..6 {
+        assert!(has_flags(&s, 0, c, want), "(0,{c}) gains 1, 4, 5 and 7");
+        assert!(
+            has_flags(&s, 0, c, CellFlags::HIDDEN),
+            "(0,{c}) keeps SGR 8: reversing 0 does not name it"
+        );
+    }
+}
+
+#[test]
+fn decrara_reversing_mode_8_is_the_documented_xterm_extension() {
+    let mut s = Screen::new(3, 6);
+    styled_row(&mut s, 1, "8", "AAA"); // HIDDEN
+    s.feed(b"\x1b[2;1HBBB"); // plain
+    s.feed(b"\x1b[1;1;2;3;8$t");
+    for c in 0..3 {
+        assert!(!has_flags(&s, 0, c, CellFlags::HIDDEN), "(0,{c}) loses it");
+        assert!(has_flags(&s, 1, c, CellFlags::HIDDEN), "(1,{c}) gains it");
+    }
+}
+
+#[test]
+fn decrara_reversing_mode_4_never_produces_an_underline_style_sgr_4_cannot() {
+    // The underline "attribute" is a family, not a bit: single (SGR 4), double
+    // (4:2), curly (4:3), dotted (4:4) and dashed (4:5). Reversing the single
+    // bit alone would turn a curly underline into a dotted one — a style the
+    // application never asked for and cannot have meant by "reverse mode 4".
+    // The only reading that stays inside what SGR 4 itself can produce is
+    // any-underline -> none, none -> single.
+    let mut s = Screen::new(4, 6);
+    styled_row(&mut s, 1, "4:3", "AAA"); // curly
+    s.feed(b"\x1b[2;1HBBB"); // no underline
+    s.feed(b"\x1b[1;1;2;3;4$t");
+    for c in 0..3 {
+        assert!(
+            !has_flags(&s, 0, c, CellFlags::CURLY_UNDERLINE),
+            "(0,{c}) curly underline removed, not restyled"
+        );
+        assert!(
+            !has_flags(&s, 0, c, CellFlags::UNDERLINE),
+            "(0,{c}) must not become the dotted (UNDERLINE|CURLY) encoding"
+        );
+        assert!(
+            has_flags(&s, 1, c, CellFlags::UNDERLINE),
+            "(1,{c}) bare cell gains a single underline"
+        );
+        assert!(
+            !has_flags(&s, 1, c, CellFlags::CURLY_UNDERLINE),
+            "(1,{c}) gains SGR 4, not a styled underline"
+        );
+    }
+}
+
+#[test]
+fn decrara_ignores_sgr_codes_the_pm_list_does_not_name() {
+    // Pm is "0, 1, 4, 5, 7, 8". A reset code such as SGR 22 has no defined
+    // reverse, so it must leave the cells exactly as they were rather than
+    // borrowing DECCARA's wider set and clearing bold.
+    let mut s = Screen::new(3, 6);
+    styled_row(&mut s, 1, "1", "AAAAAA");
+    s.feed(b"\x1b[1;1;1;6;22$t");
+    for c in 0..6 {
+        assert!(
+            has_flags(&s, 0, c, CellFlags::BOLD),
+            "(0,{c}) unnamed code 22 must not clear bold"
+        );
+    }
+    assert_eq!(s.row(0), "AAAAAA");
+}
+
+#[test]
+fn decrara_rect_extent_decsace2_reverses_the_exact_rectangle() {
+    let mut s = Screen::new(6, 10);
+    decaln(&mut s);
+    // xterm ctlseqs (DECSACE): "Ps = 2 -> rectangle (exact)". DECRARA reads the
+    // same extent selector as DECCARA — "See DECSACE".
+    s.feed(b"\x1b[2*x\x1b[2;3;4;6;1$t");
+    for r in 1..=3 {
+        assert!(!has_flags(&s, r, 1, CellFlags::BOLD), "({r},1) outside");
+        for c in 2..=5 {
+            assert!(has_flags(&s, r, c, CellFlags::BOLD), "({r},{c}) inside");
+        }
+        assert!(!has_flags(&s, r, 6, CellFlags::BOLD), "({r},6) outside");
+    }
+}
+
+#[test]
+fn decrara_stream_extent_decsace1_runs_streamwise() {
+    let mut s = Screen::new(6, 10);
+    decaln(&mut s);
+    // xterm ctlseqs (DECSACE): "Ps = 1 -> from start to end position, wrapped."
+    // First row from Pl to line end, middle rows full width, last row to Pr.
+    s.feed(b"\x1b[1*x\x1b[2;3;4;6;1$t");
+    assert!(!has_flags(&s, 1, 1, CellFlags::BOLD), "(1,1) before Pl");
+    for c in 2..10 {
+        assert!(has_flags(&s, 1, c, CellFlags::BOLD), "(1,{c}) first row");
+    }
+    for c in 0..10 {
+        assert!(has_flags(&s, 2, c, CellFlags::BOLD), "(2,{c}) middle row");
+    }
+    for c in 0..=5 {
+        assert!(has_flags(&s, 3, c, CellFlags::BOLD), "(3,{c}) last row");
+    }
+    for c in 6..10 {
+        assert!(!has_flags(&s, 3, c, CellFlags::BOLD), "(3,{c}) past Pr");
+    }
+}
+
+#[test]
+fn decrara_default_extent_is_stream_like_deccara() {
+    let mut s = Screen::new(6, 10);
+    decaln(&mut s);
+    // No DECSACE sent: the extent is the character stream, the same default
+    // DECCARA takes (`deccara_default_extent_is_stream`), because both read the
+    // one `stream_attribute_extent` mode.
+    s.feed(b"\x1b[2;3;4;6;1$t");
+    assert!(
+        has_flags(&s, 2, 0, CellFlags::BOLD),
+        "middle stream row runs full width by default"
+    );
+    assert!(
+        has_flags(&s, 1, 8, CellFlags::BOLD),
+        "first stream row runs to line end by default"
+    );
+}
+
+#[test]
+fn decrara_does_not_change_dec_sca_protection() {
+    let mut s = Screen::new(4, 10);
+    // VT520 (DECCARA/DECRARA): the protection attribute (DECSCA) is not among
+    // the attributes these change — DECSERA must still spare the cells.
+    s.feed(b"\x1b[1;1H\x1b[1\"qAB\x1b[0\"q");
+    s.feed(b"\x1b[1;1;1;2;0$t");
+    s.feed(b"\x1b[${");
+    assert_eq!(s.row(0), "AB", "DECSCA protection survives DECRARA");
+}
+
+#[test]
+fn decrara_does_not_move_the_cursor() {
+    let mut s = Screen::new(10, 20);
+    decaln(&mut s);
+    s.feed(b"\x1b[5;5H");
+    s.feed(b"\x1b[1;1;2;2;7$t");
+    assert_eq!(s.cursor(), (4, 4), "cursor pinned through DECRARA");
+}
+
+#[test]
+fn decrara_with_an_inverted_rectangle_is_ignored() {
+    let mut s = Screen::new(6, 10);
+    decaln(&mut s);
+    // Same rule as its siblings (`reversed_coords_are_ignored`): Pt <= Pb and
+    // Pl <= Pr, otherwise no-op.
+    s.feed(b"\x1b[2*x\x1b[4;3;2;6;1$t"); // Pb < Pt
+    s.feed(b"\x1b[2*x\x1b[2;6;4;3;1$t"); // Pr < Pl
+    for r in 0..6 {
+        for c in 0..10 {
+            assert!(!has_flags(&s, r, c, CellFlags::BOLD), "({r},{c}) untouched");
+        }
+    }
+}
+
+// =========================================================================
 // 6. DECOM interaction
 // =========================================================================
 
@@ -637,6 +896,8 @@ fn adversarial_rect_sequences_never_panic() {
         s.feed(b"\x1b[65535;65535;65535;65535${");
         s.feed(b"\x1b[65535;65535;65535;65535;65535;65535;65535;65535$v");
         s.feed(b"\x1b[65535;65535;65535;65535;1;4;5;7;0;1;4$r");
+        s.feed(b"\x1b[65535;65535;65535;65535;1;4;5;7;8;0$t");
+        s.feed(b"\x1b[$t"); // DECRARA with no parameters at all
         s.feed(b"\x1b[$v"); // full-screen self-copy (identity)
         s.feed(b"\x1b[$x"); // DECFRA with no Pch at all
         s.feed(b"\x1b[0$x"); // DECFRA with Pch=0

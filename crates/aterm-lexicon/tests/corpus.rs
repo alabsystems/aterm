@@ -267,6 +267,22 @@ fn cjk_incidental_compounds_suppressed() {
 
 // ------------------------------------------------------------------ validator
 
+/// For a marks-required key (every claiming surface folded diacritics into
+/// bare ASCII — `đm` → `dm`), the bare key itself must NOT scan; a token that
+/// carries any folded-away mark still reaches it. Synthesize that witness by
+/// riding a combining acute on the first letter: `fold` strips it back to the
+/// exact key, and `has_foldable_marks` sees it.
+fn marked_witness(folded_key: &str) -> String {
+    let mut chars = folded_key.chars();
+    let mut out = String::with_capacity(folded_key.len() + 2);
+    if let Some(first) = chars.next() {
+        out.push(first);
+        out.push('\u{0301}');
+    }
+    out.extend(chars);
+    out
+}
+
 #[test]
 fn every_surface_round_trips() {
     let lx = lex();
@@ -276,7 +292,23 @@ fn every_surface_round_trips() {
         ..ScanOptions::default()
     };
     // Spaced surfaces: each folded form, scanned alone, classifies as itself.
+    // A marks-required key (the `dmg` fix) inverts: bare stays silent, and
+    // the marked witness is what round-trips.
     for (surface, class) in lx.iter_spaced() {
+        if lx.surface_requires_marks(surface) {
+            assert!(
+                lx.scan(surface, &o).is_empty(),
+                "marks-required surface {surface:?} matched its bare skeleton"
+            );
+            let witness = marked_witness(surface);
+            let got = lx.scan(&witness, &o);
+            assert!(
+                got.iter().any(|m| m.class == class),
+                "marks-required surface {surface:?} ({class:?}) did not \
+                 round-trip via marked witness {witness:?}; got {got:?}"
+            );
+            continue;
+        }
         let got = lx.scan(surface, &o);
         assert!(
             got.iter().any(|m| m.class == class),
@@ -381,6 +413,44 @@ fn user_unscannable_surfaces_surface_as_conflicts() {
     assert_eq!(lx.scan("これは犬です", &single).len(), 1);
     assert!(lx.scan("これは犬です", &ScanOptions::default()).is_empty());
     assert!(lx.scan("go abc猫 now", &ScanOptions::default()).is_empty());
+}
+
+// ------------------------------------------- marks-required gate (dmg fix)
+
+/// THE RULE (2026-08-29): a surface that loses diacritics into a bare-ASCII
+/// key (`đm` → `dm`, `coño` → `cono`) matches only tokens that themselves
+/// carry folded-away marks. The bare skeleton is ordinary text — `dm` is how
+/// one types `dmg`, `cono` sits inside `conoid` — and stays silent.
+#[test]
+fn lossy_folded_surfaces_do_not_match_their_bare_skeleton() {
+    let o = default_opts();
+    for (marked, bare) in [("đm", "dm"), ("coño", "cono"), ("pička", "picka")] {
+        assert_eq!(
+            classes(marked, &o),
+            vec![Class::Profanity],
+            "marked form {marked:?} must keep its match"
+        );
+        assert_eq!(
+            classes(bare, &o),
+            Vec::<Class>::new(),
+            "bare skeleton {bare:?} must not match {marked:?}"
+        );
+    }
+    // The consent counter-example: German lists `scheisse` EXPLICITLY beside
+    // `scheiße`, so the merged key matches bare text (same-class AND-merge).
+    assert_eq!(classes("scheisse", &o), vec![Class::Profanity]);
+}
+
+/// Explicit config is consent (the same law as v3 §6): a USER override that
+/// lists the bare skeleton as its own surface compiles it unflagged, so it
+/// matches — the gate only binds surfaces that never spelled the skeleton.
+#[test]
+fn user_override_opts_a_bare_skeleton_in() {
+    let over = "[[entry]]\nclass=\"profanity\"\nlang=\"vi\"\nmode=\"forms\"\nforms=[\"dm\"]\n";
+    let lx = Lexicon::with_languages_and_override(&["all"], Some(over)).expect("override parses");
+    let m = lx.scan("dm", &default_opts());
+    assert_eq!(m.len(), 1, "explicitly listed bare surface must match");
+    assert_eq!(m[0].class, Class::Profanity);
 }
 
 #[test]
@@ -757,7 +827,15 @@ fn every_surface_has_langs() {
         ..ScanOptions::default()
     };
     for (surface, class) in lx.iter_spaced().chain(lx.iter_cjk()) {
-        let got = lx.scan(surface, &o);
+        // A marks-required key needs its marked witness to scan at all
+        // (see `every_surface_round_trips`); language attribution must be
+        // intact on that same match.
+        let text = if lx.surface_requires_marks(surface) {
+            marked_witness(surface)
+        } else {
+            surface.to_string()
+        };
+        let got = lx.scan(&text, &o);
         assert!(
             got.iter().any(|m| m.class == class && !m.langs.is_empty()),
             "surface {surface:?} ({class:?}) has no langs; got {got:?}"

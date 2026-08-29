@@ -193,12 +193,15 @@ fn hermetic_home() -> &'static std::path::Path {
 ///   - `ATERM_SHELL_INTEGRATION_INSTALLED` trips the "already loaded" guard
 ///     (`[[ -n "$..." ]] && return`), so the script returns before defining any
 ///     function and every sourced-script test sees "command not found";
-///   - `ATERM_BANNER_B64` is base64-decoded to stdout on load, which would
-///     corrupt the exact-stdout assertions in the urlencode/report-cwd tests;
-///   - `ATERM_SUITE_VERSION` / `ATERM_PROMPT_STYLE` / `ATERM_DISABLE_PROMPT_TITLES`
-///     alter prompt/title behavior; the `ATERM_PROMPT_*_COLOR` quintet feeds
-///     `set_color`, and an inherited empty one used to make fish print
+///   - `ATERM_PROMPT_STYLE` / `ATERM_DISABLE_PROMPT_TITLES` alter prompt/title
+///     behavior; the `ATERM_PROMPT_*_COLOR` quintet feeds `set_color`, and an
+///     inherited empty one used to make fish print
 ///     `set_color: Unknown color ""` into the asserted stream.
+///
+/// `ATERM_BANNER_B64` and `ATERM_SUITE_VERSION` used to be stripped here too.
+/// Both are gone from the scripts: the banner was a reader with no writer that
+/// base64-decoded an ambient value to stdout at load, and the suite version was
+/// an `export VAR="${VAR:-}"` self-passthrough nothing ever set or read.
 ///
 /// Strip them all so each test sources the script fresh regardless of the
 /// developer's own active integration. Tests that need a specific var
@@ -209,8 +212,6 @@ fn shell_command(shell: &str) -> Command {
     let mut cmd = Command::new(shell);
     for var in [
         "ATERM_SHELL_INTEGRATION_INSTALLED",
-        "ATERM_SUITE_VERSION",
-        "ATERM_BANNER_B64",
         "ATERM_PROMPT_STYLE",
         "ATERM_DISABLE_PROMPT_TITLES",
         "ATERM_PROMPT_HOST_COLOR",

@@ -45,10 +45,19 @@ notes    = "Bare 'cat' is highly ambiguous (substring of many words: category, c
 class    = "profanity"
 lang     = "es"
 mode     = "forms"
-forms    = ["joder", "jodido", "jodida", "jode", "jodete", "mierda", "coño"]
+forms    = ["joder", "jodido", "jodida", "jodete", "mierda", "coño"]
 cjk      = false
 ambiguous= false
-notes    = "joder = strong general-purpose expletive (jod- root); mierda = shit. jodido/-a also adjectival 'fucked/damned'."
+notes    = "joder = strong general-purpose expletive (jod- root); mierda = shit. jodido/-a also adjectival 'fucked/damned'. coño matches only with its ñ (marks-required gate): bare 'cono' is the English conoid/conodont family."
+
+[[entry]]
+class    = "profanity"
+lang     = "es"
+mode     = "forms"
+forms    = ["jode"]
+cjk      = false
+ambiguous= true
+notes    = "jode (3sg of joder) is a strict prefix of English jodel -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to es users."
 
 [[entry]]
 class    = "feline"
@@ -83,10 +92,19 @@ notes    = "Listed as forms because 'chat' collides with English 'chat' (ambiguo
 class    = "profanity"
 lang     = "it"
 mode     = "forms"
-forms    = ["cazzo", "cazzi", "merda", "vaffanculo", "stronzo", "minchia"]
+forms    = ["cazzo", "cazzi", "merda", "vaffanculo", "stronzo"]
 cjk      = false
 ambiguous= false
-notes    = "cazzo = primary expletive ('dick/fuck'); vaffanculo = 'fuck off'; merda = shit; minchia regional (Sicilian) intensifier."
+notes    = "cazzo = primary expletive ('dick/fuck'); vaffanculo = 'fuck off'; merda = shit."
+
+[[entry]]
+class    = "profanity"
+lang     = "it"
+mode     = "forms"
+forms    = ["minchia"]
+cjk      = false
+ambiguous= true
+notes    = "minchia = regional (Sicilian) intensifier; strict prefix of English minchiate (the tarot deck) -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to it users."
 
 [[entry]]
 class    = "feline"
@@ -103,10 +121,19 @@ notes    = "gatto/gatti/gatta/gatte + diminutives gattino/gattina (kitten). mici
 class    = "profanity"
 lang     = "pt"
 mode     = "forms"
-forms    = ["fodido","fodida","fode","foda","merda","caralho"]
+forms    = ["fodido","fodida","foda","merda","caralho"]
 cjk      = false
 ambiguous= false
 notes    = "foder = 'to fuck' (fod- root); fodido/-a = 'fucked'; merda = shit; caralho = strong intensifier ('dick')."
+
+[[entry]]
+class    = "profanity"
+lang     = "pt"
+mode     = "forms"
+forms    = ["fode"]
+cjk      = false
+ambiguous= true
+notes    = "fode (3sg of foder) is a strict prefix of English foder (fodder variant) -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to pt users."
 
 [[entry]]
 class    = "feline"
@@ -143,10 +170,19 @@ notes    = "Empty suffix yields bare 'gat'. gatet/gateta = kitten. 'mix' (kitty)
 class    = "profanity"
 lang     = "ro"
 mode     = "forms"
-forms    = ["pula", "pizda", "rahat", "muie"]
+forms    = ["pizda", "rahat", "muie"]
 cjk      = false
 ambiguous= false
-notes    = "Fusional -> explicit forms. pula = 'dick'; pizda vulgar; rahat = shit; muie strong insult."
+notes    = "Fusional -> explicit forms. pizda vulgar; rahat = shit; muie strong insult."
+
+[[entry]]
+class    = "profanity"
+lang     = "ro"
+mode     = "forms"
+forms    = ["pula"]
+cjk      = false
+ambiguous= true
+notes    = "pula = 'dick', but also a strict prefix of English pulaski/pullulate-family words and the Botswana currency -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to ro users."
 
 [[entry]]
 class    = "profanity"
@@ -174,10 +210,19 @@ notes    = "pisică/pisica (cat, indef/def), pisici (plural), pisicuță (kitten
 class    = "profanity"
 lang     = "de"
 mode     = "forms"
-forms    = ["scheiße", "scheisse", "scheiß", "scheiss", "scheißen", "scheissen", "ficken", "fick", "verdammt", "verfickt"]
+forms    = ["scheiße", "scheisse", "scheiß", "scheiss", "scheißen", "scheissen", "ficken", "verdammt", "verfickt"]
 cjk      = false
 ambiguous= false
 notes    = "Both ß and ss surfaces enumerated (Swiss/keyboard-less typing uses ss). scheiße/scheisse = shit; scheiß(en) verbal/intensifier prefix; ficken/fick = fuck; verdammt = damn; verfickt = fucking (adj)."
+
+[[entry]]
+class    = "profanity"
+lang     = "de"
+mode     = "forms"
+forms    = ["fick"]
+cjk      = false
+ambiguous= true
+notes    = "fick (bare imperative/noun) is a strict prefix of English fickle -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to de users. ficken/verfickt stay un-gated above."
 
 [[entry]]
 class    = "feline"
@@ -202,10 +247,19 @@ notes    = "kater = tomcat BUT also German for 'hangover', and an EN/NL surname 
 class    = "profanity"
 lang     = "nl"
 mode     = "forms"
-forms    = ["kut", "schijt", "godver", "godverdomme", "neuken", "neukt", "geneukt", "klote"]
+forms    = ["schijt", "godver", "godverdomme", "neuken", "neukt", "geneukt", "klote"]
 cjk      = false
 ambiguous= false
-notes    = "kut = cunt (general expletive); schijt = shit; godver(domme) = goddamn; neuken/neukt/geneukt = fuck (inf/pres/past part); klote = crap/bollocks intensifier."
+notes    = "schijt = shit; godver(domme) = goddamn; neuken/neukt/geneukt = fuck (inf/pres/past part); klote = crap/bollocks intensifier."
+
+[[entry]]
+class    = "profanity"
+lang     = "nl"
+mode     = "forms"
+forms    = ["kut"]
+cjk      = false
+ambiguous= true
+notes    = "kut = cunt (general expletive), but a strict prefix of English kutch/kuttar-family words -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to nl users."
 
 [[entry]]
 class    = "feline"
@@ -265,10 +319,19 @@ notes    = "katt/katter = cat/cats; kattunge/kattunger = kitten(s); katten = the
 class    = "profanity"
 lang     = "da"
 mode     = "forms"
-forms    = ["fanden","lort","kneppe","knepper","pis","helvede"]
+forms    = ["fanden","lort","kneppe","knepper","helvede"]
 cjk      = false
 ambiguous= false
-notes    = "fanden = the devil/damn; lort = shit/turd; kneppe/knepper = fuck (inf/pres); satan = intensifier; pis = piss/crap; helvede = hell."
+notes    = "fanden = the devil/damn; lort = shit/turd; kneppe/knepper = fuck (inf/pres); satan = intensifier; helvede = hell."
+
+[[entry]]
+class    = "profanity"
+lang     = "da"
+mode     = "forms"
+forms    = ["pis"]
+cjk      = false
+ambiguous= true
+notes    = "pis = piss/crap, but a strict prefix of 101 English words (pistol, piston, pistachio, piscine, ...) -> fired the curse bonk mid-typing (2026-08-29 prefix audit, the worst offender); ambiguous defers it at the live caret and gates it to da users."
 
 [[entry]]
 class    = "feline"
@@ -537,8 +600,17 @@ lang     = "tr"
 mode     = "forms"
 cjk      = false
 ambiguous= false
-forms    = ["siktir","sikerim","sikeyim","amına","amına koyayım","bok","orospu"]
-notes    = "sik- = 'fuck' verb: siktir ('fuck off'), sikerim/sikeyim (1sg). amına koyayım is the heavy 'amına' family. bok = shit, orospu = whore, piç = bastard. CASING CAVEAT: Turkish has dotted/dotless i: lowercase of 'I' is 'ı' (dotless) and of 'İ' is 'i'; forms with ı (amına, sıçtır variants) must NOT be matched via a non-Turkish lowercase that maps İ→i / I→i. Use Turkish-locale case folding."
+forms    = ["siktir","sikerim","sikeyim","amına","amına koyayım","orospu"]
+notes    = "sik- = 'fuck' verb: siktir ('fuck off'), sikerim/sikeyim (1sg). amına koyayım is the heavy 'amına' family. bok = shit (ambiguous sibling below: prefix of English bokhara-family words), orospu = whore, piç = bastard. CASING CAVEAT: Turkish has dotted/dotless i: lowercase of 'I' is 'ı' (dotless) and of 'İ' is 'i'; forms with ı (amına, sıçtır variants) must NOT be matched via a non-Turkish lowercase that maps İ→i / I→i. Use Turkish-locale case folding."
+
+[[entry]]
+class    = "profanity"
+lang     = "tr"
+mode     = "forms"
+forms    = ["bok"]
+cjk      = false
+ambiguous= true
+notes    = "bok = shit, but a strict prefix of English bokhara-family words -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to tr users."
 
 [[entry]]
 class    = "feline"
@@ -556,8 +628,17 @@ lang     = "et"
 mode     = "forms"
 cjk      = false
 ambiguous= false
-forms    = ["kurat","kuradi","sitt","raisk","persse"]
-notes    = "kurat = devil, the prime Estonian curse (gen kuradi). sitt = shit (gen sita). perse = arse, persse 'up the arse' (common interjection). raisk = 'damn/carrion'. Estonian lacks a direct high-frequency 'fuck' verb; these are the real strong expletives."
+forms    = ["kurat","kuradi","raisk","persse"]
+notes    = "kurat = devil, the prime Estonian curse (gen kuradi). perse = arse, persse 'up the arse' (common interjection). raisk = 'damn/carrion'. Estonian lacks a direct high-frequency 'fuck' verb; these are the real strong expletives."
+
+[[entry]]
+class    = "profanity"
+lang     = "et"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["sitt"]
+notes    = "sitt = shit (gen sita), but a strict prefix of English sitting/sitter -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to et users, like the sita form before it."
 
 [[entry]]
 class    = "feline"
@@ -652,8 +733,17 @@ lang     = "hi"
 mode     = "forms"
 cjk      = false
 ambiguous= false
-forms    = ["bhenchod","madarchod","gandu","chutiya","bhosdike","lund","भेनचोद","गांडू","चूतिया"]
-notes    = "Romanized forms are how these are overwhelmingly typed; Devanagari variants भेनचोद/गांडू/चूतिया added. bhenchod=sisterfucker, madarchod=motherfucker, gandu=asshole, chutiya=idiot/cunt, bhosdike, lund=dick."
+forms    = ["bhenchod","madarchod","chutiya","bhosdike","भेनचोद","गांडू","चूतिया"]
+notes    = "Romanized forms are how these are overwhelmingly typed; Devanagari variants भेनचोद/गांडू/चूतिया added. bhenchod=sisterfucker, madarchod=motherfucker, chutiya=idiot/cunt, bhosdike. Romanized gandu/lund ride the ambiguous sibling below (English-prefix collisions); their Devanagari twins stay un-gated here."
+
+[[entry]]
+class    = "profanity"
+lang     = "hi"
+mode     = "forms"
+forms    = ["gandu","lund"]
+cjk      = false
+ambiguous= true
+notes    = "gandu = asshole, lund = dick (romanized): strict prefixes of English gandul/gandum and lundyfoot-family words -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers them at the live caret and gates them to hi users. The Devanagari गांडू form stays un-gated."
 
 [[entry]]
 class    = "feline"
@@ -873,10 +963,19 @@ notes    = "ແມວ (maew) = cat. ລູກແມວ = kitten ('child cat'). L
 class    = "profanity"
 lang     = "id"
 mode     = "forms"
-forms    = ["anjing","anjir","ngentot","kontol","memek","bangsat","taik"]
+forms    = ["anjing","anjir","ngentot","kontol","memek","bangsat"]
 cjk      = false
 ambiguous= false
-notes    = "anjing (lit. 'dog') and tai/taik (lit. 'shit') double as ordinary nouns in-language; anjir is the softened euphemism. ngentot/entot is the literal 'fuck' verb. kontol=dick, memek=cunt, bangsat=bastard/vermin."
+notes    = "anjing (lit. 'dog') doubles as an ordinary noun in-language; anjir is the softened euphemism. ngentot/entot is the literal 'fuck' verb. kontol=dick, memek=cunt, bangsat=bastard/vermin. tai rides the earlier ambiguous split; taik joins it below (2026-08-29)."
+
+[[entry]]
+class    = "profanity"
+lang     = "id"
+mode     = "forms"
+forms    = ["taik"]
+cjk      = false
+ambiguous= true
+notes    = "taik (lit. 'shit') is a strict prefix of English taikhana -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to id users, joining the tai form's earlier demotion."
 
 [[entry]]
 class    = "feline"
@@ -975,10 +1074,19 @@ notes    = "Clean concatenation: kat (cat), katte (cats), katjie (kitten, diminu
 class    = "profanity"
 lang     = "jv"
 mode     = "forms"
-forms    = ["jancok", "jancuk", "cok", "diancuk", "asu", "bajingan", "kontol", "matamu"]
+forms    = ["jancok", "jancuk", "diancuk", "bajingan", "kontol", "matamu"]
 cjk      = false
 ambiguous= false
-notes    = "jancok/jancuk (Surabaya iconic ~'fuck'), cok (clipped), diancuk (passive/intensified); asu=dog (strong insult), bajingan=scoundrel, kontol=dick (shared w/ id), matamu (lit. 'your eye', dismissive curse)."
+notes    = "jancok/jancuk (Surabaya iconic ~'fuck'), diancuk (passive/intensified); bajingan=scoundrel, kontol=dick (shared w/ id), matamu (lit. 'your eye', dismissive curse). cok/asu ride the ambiguous sibling below (English-prefix collisions)."
+
+[[entry]]
+class    = "profanity"
+lang     = "jv"
+mode     = "forms"
+forms    = ["cok", "asu"]
+cjk      = false
+ambiguous= true
+notes    = "cok (clipped jancok) is a strict prefix of English coke/coker; asu (dog, strong insult) of asunder -> both fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers them at the live caret and gates them to jv users."
 
 [[entry]]
 class    = "feline"
@@ -1031,10 +1139,19 @@ notes    = "Un-gated split: surfaces with no benign homograph in any other langu
 class    = "profanity"
 lang     = "pl"
 mode     = "forms"
-forms    = ["kurwa", "chuj", "jebany", "jebać", "pierdolić", "skurwysyn"]
+forms    = ["kurwa", "jebany", "jebać", "pierdolić", "skurwysyn"]
 cjk      = false
 ambiguous= false
 notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "pl"
+mode     = "forms"
+forms    = ["chuj"]
+cjk      = false
+ambiguous= true
+notes    = "chuj = dick, but a strict prefix of English chuje -> fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers it at the live caret and gates it to pl users."
 
 [[entry]]
 class    = "profanity"
@@ -1130,10 +1247,19 @@ notes    = "Un-gated split: surfaces with no benign homograph in any other langu
 class    = "profanity"
 lang     = "sw"
 mode     = "forms"
-forms    = ["tomba", "kutomba", "mavi", "shenzi", "kumamako", "mkundu"]
+forms    = ["kutomba", "shenzi", "kumamako", "mkundu"]
 cjk      = false
 ambiguous= false
 notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "sw"
+mode     = "forms"
+forms    = ["tomba", "mavi"]
+cjk      = false
+ambiguous= true
+notes    = "tomba (fuck) is a strict prefix of English tombac/tombal; mavi (shit) of mavis (the song-thrush) -> both fired the curse bonk mid-typing (2026-08-29 prefix audit); ambiguous defers them at the live caret and gates them to sw users. kutomba stays un-gated above."
 
 [[entry]]
 class    = "profanity"

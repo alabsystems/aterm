@@ -23,7 +23,13 @@
 //!   `output→application-present-return` delay (PTY-output leading edge → the
 //!   first attributed successful present return; the number
 //!   `$ATERM_TRACE_LATENCY` logs), most recent and worst-since-reset. It does not
-//!   observe compositor selection, display timing, scanout, or photons.
+//!   observe compositor selection, display timing, scanout, or photons. IT IS AN
+//!   OPEN INTERVAL: the stamp is a first-edge-wins `compare_exchange(0, …)` in
+//!   `spawn::stamp_output_arrival`, cleared only by a content present, so output
+//!   that moves no pixels opens the interval and leaves it open — and every
+//!   millisecond in which nothing presented is inside the reading, bounded only
+//!   by a 5 s discard. A multi-second value means "nothing presented for that
+//!   long", not "a frame took that long".
 //! - `last_/max_frame_render_ns` — causal CPU wall time: compose plus CPU
 //!   raster/copy, or time spent encoding GPU commands and calling `queue.submit`,
 //!   most recent and worst-since-reset. This is not completed GPU execution;
@@ -1628,6 +1634,21 @@ pub fn acquire_wait_distribution() -> &'static Histogram {
     &H_ACQUIRE_WAIT
 }
 
+/// The acquire-wait `(last, max)` pair in nanoseconds — the scalars the
+/// histogram above cannot express.
+///
+/// Published beside the acquire percentiles by the `percentiles` verb, which
+/// does not build a whole [`Snapshot`] (the summary verb reads the same two
+/// values off its snapshot). A percentile is a statement about the BULK; the max
+/// is the only statement about the one frame that stalled.
+#[must_use]
+pub fn acquire_wait_last_max_ns() -> (u64, u64) {
+    (
+        LAST_ACQUIRE_WAIT_NS.load(Ordering::Relaxed),
+        MAX_ACQUIRE_WAIT_NS.load(Ordering::Relaxed),
+    )
+}
+
 /// Record one present's swapchain-acquire wait. Cheap (one histogram bucket
 /// increment); called on every successful present.
 pub fn note_acquire_wait(ns: u64) {
@@ -2647,6 +2668,21 @@ pub struct Snapshot {
     pub last_pre_present_ns: u64,
     pub pre_present_total_ns: u64,
     pub max_pre_present_ns: u64,
+    /// Swapchain-acquire (`nextDrawable`) park — the LAST sample and the WORST
+    /// one in this measurement window. See [`note_acquire_wait`].
+    ///
+    /// A METRIC THAT EXISTS BUT IS NEVER PUBLISHED HIDES A WHOLE CLASS OF STALL
+    /// (2026-08 draw-path audit, tier-1 item 3). Both statics were declared,
+    /// written on every present and cleared by `reset` from the day the slice was
+    /// instrumented — and NO snapshot read them, so the only acquire figures any
+    /// reader could get were `H_ACQUIRE_WAIT`'s percentiles. That is precisely
+    /// the shape this stall does not show up in: one 200 ms park among thousands
+    /// of ~0.02 ms samples cannot move a p99, and a blocked acquire is the
+    /// largest known macOS typing stall (it parks the winit main thread while
+    /// keyDowns queue in the OS event queue, measured at up to ~84 ms). A max
+    /// cannot miss it.
+    pub last_acquire_wait_ns: u64,
+    pub max_acquire_wait_ns: u64,
     pub present_drops: u64,
     /// Output→present samples diverted to the TAINTED ledger because the window
     /// was occluded/parked or a capture was pacing presents. A non-zero value
@@ -2885,6 +2921,8 @@ pub fn snapshot() -> Snapshot {
         last_pre_present_ns: LAST_PRE_PRESENT_NS.load(Ordering::Relaxed),
         pre_present_total_ns: PRE_PRESENT_TOTAL_NS.load(Ordering::Relaxed),
         max_pre_present_ns: MAX_PRE_PRESENT_NS.load(Ordering::Relaxed),
+        last_acquire_wait_ns: LAST_ACQUIRE_WAIT_NS.load(Ordering::Relaxed),
+        max_acquire_wait_ns: MAX_ACQUIRE_WAIT_NS.load(Ordering::Relaxed),
         present_drops: PRESENT_DROPS.load(Ordering::Relaxed),
         tainted_present_samples: TAINTED_PRESENT_SAMPLES.load(Ordering::Relaxed),
         last_tainted_present_latency_ns: LAST_TAINTED_PRESENT_LATENCY_NS.load(Ordering::Relaxed),

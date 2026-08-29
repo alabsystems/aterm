@@ -151,7 +151,11 @@ fn a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back() {
         .iter()
         .map(|&(r, c, ..)| (r, c))
         .collect();
-    assert_eq!(unscrolled.len(), 12, "the footprint is on screen to begin with");
+    assert_eq!(
+        unscrolled.len(),
+        12,
+        "the footprint is on screen to begin with"
+    );
 
     // Scroll back by ONE line: every row on screen shifts down by exactly one,
     // the image included, and nothing may be dropped.

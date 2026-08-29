@@ -74,6 +74,10 @@ pub(crate) use control_query::search_full_history;
 pub(crate) use control_query::{
     search_full_history_direction, search_full_history_point, set_search_max_lines,
 };
+// The gathered-frame TYPE, named by the bench seam alone (`bench_support::
+// GatheredFrame` HOLDS one between the two phases, so it has to spell it).
+#[cfg(feature = "bench-support")]
+pub(crate) use control_query::StyledFrameSnapshot;
 // The combined single-lock wrapper is test-only at the crate level now: prod
 // callers split gather/serialize so JSON rendering runs off the mutex.
 #[cfg(test)]
@@ -6583,6 +6587,7 @@ fn handle(
         }
         "key" if is_cross => cross_input(term, ctx, parse_key(rest), "ERR\n"),
         "key" => control_input::cmd_key(proxy, rest),
+        "hwkey" => control_input::cmd_hwkey(proxy, rest),
         "ctrl" if is_cross && targets_front => front_routed_input(
             proxy,
             session,
@@ -11014,6 +11019,7 @@ mod tests {
             vec![
                 "send",
                 "key",
+                "hwkey",
                 "ctrl",
                 "feed",
                 "feed-bin",
@@ -16276,6 +16282,8 @@ mod tests {
             ribbon_look: "underline",
             ribbon_segments: 4,
             ribbon_hue_bands: 4,
+            field: 1.0,
+            field_span: 0.5,
             sparks: 4,
             momentum: 0.5,
             momentum_display: 0.44,

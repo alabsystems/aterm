@@ -232,7 +232,6 @@ fn discovered_font_bytes_contains(bytes: &[u8]) -> bool {
         .any(|held| held.as_slice() == bytes)
 }
 
-
 /// Parse a fallback `fontdue::Font` from `bytes`, sharing ONE parsed instance across
 /// all Renderers for identical bytes (a broad Unicode fallback is ~370MB parsed, so
 /// without this every pane paid it). Content-keyed by byte equality. Returns the
@@ -583,8 +582,8 @@ impl Default for Theme {
 // `aterm_render::{Frame, RenderInput}` call sites are unchanged; `Rasterizer` is
 // the trait this CPU renderer implements (see `impl Rasterizer for Renderer`).
 pub use aterm_render_api::{
-    CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowQuad, HaloMode,
-    InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip, SpriteQuad,
+    CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowBlend, GlowQuad,
+    HaloMode, InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip, SpriteQuad,
     TrailCell, WordDecoration,
 };
 
@@ -2950,10 +2949,34 @@ enum RasterKind {
 /// Pick the rasterizer: CoreText by default (batteries-included native quality),
 /// unless `ATERM_RASTERIZER=fontdue` forces the portable/deterministic path (tests
 /// use this for byte-stable, machine-independent output).
+///
+/// THE OVERRIDE ANNOUNCES ITSELF, once per process. These reads are in the
+/// SHIPPING render crate, not behind `cfg(test)`, and `=fontdue` is not a small
+/// change: it drops CoreText hinting and system antialiasing, additionally forces
+/// subpixel mode `Off`, and disables the variable-font instancing path. A user
+/// with it exported — or inherited from a test shell — sees glyphs no shipped
+/// build was ever visually judged against, and it is not in the
+/// `app_config` env-override registry that Settings surfaces, so nothing else in
+/// the product would tell them. It cannot simply be deleted: the golden and
+/// parity suites run in-process in this same crate and depend on it for
+/// machine-independent bytes. So it stays, and it is loud.
 #[cfg(target_os = "macos")]
 fn select_rasterizer() -> RasterKind {
     match std::env::var("ATERM_RASTERIZER").ok().as_deref() {
-        Some("fontdue") => RasterKind::Fontdue,
+        Some("fontdue") => {
+            static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ANNOUNCED.get_or_init(|| {
+                eprintln!(
+                    "aterm-render: $ATERM_RASTERIZER=fontdue — glyphs are rasterized \
+                     by the portable fontdue path, NOT CoreText. Hinting and system \
+                     antialiasing are off, subpixel rendering is forced Off, and \
+                     variable-font instancing is disabled. This is the byte-stable \
+                     test path; text will not look like any shipped build. Unset it \
+                     to restore CoreText."
+                );
+            });
+            RasterKind::Fontdue
+        }
         _ => RasterKind::CoreText,
     }
 }
@@ -14687,28 +14710,49 @@ impl Renderer {
             if x0 >= xend {
                 continue;
             }
-            for y in y0..(y0 + q.h as usize).min(h) {
-                let row = &mut pixels[y * w..y * w + w];
-                for px in &mut row[x0..xend] {
-                    *px = add_sat(*px, premul);
+            // THE MODE IS PER QUAD AND THE BRANCH IS PER QUAD (see
+            // [`GlowQuad::alpha`]): hoisted out of the pixel loop, so an
+            // all-additive stream pays one predictable test per rect and the
+            // inner loop is the historical `add_sat` walk verbatim.
+            // `over_premul(dst, c, 0) == add_sat(dst, c)`, so the split is a
+            // pure specialization rather than two laws.
+            if q.alpha == 0 {
+                for y in y0..(y0 + q.h as usize).min(h) {
+                    let row = &mut pixels[y * w..y * w + w];
+                    for px in &mut row[x0..xend] {
+                        *px = add_sat(*px, premul);
+                    }
+                }
+            } else {
+                let a = q.alpha;
+                for y in y0..(y0 + q.h as usize).min(h) {
+                    let row = &mut pixels[y * w..y * w + w];
+                    for px in &mut row[x0..xend] {
+                        *px = over_premul(*px, premul, a);
+                    }
                 }
             }
         }
     }
 
-    /// Draw the EMBERFORGE UNDER-GLYPH additive light (`glow_under`: the flame
-    /// BODY the engulfed glyphs silhouette against) — [`GlowQuad`]-shaped
-    /// premultiplied saturating-add quads, the SAME compositing contract as
-    /// [`Self::draw_glow`] (CPU `add_sat` == GPU One/One on the Unorm view,
-    /// byte-exact) but at a DIFFERENT z-slot: called from the shared phase
+    /// Draw the UNDER-GLYPH light (`glow_under`: EMBERFORGE's flame BODY that
+    /// the engulfed glyphs silhouette against, and the rainbow trail's BED) —
+    /// [`GlowQuad`]-shaped premultiplied quads, the SAME compositing contract as
+    /// [`Self::draw_glow`] (CPU `add_sat`/[`over_premul`] == GPU
+    /// One/One and One/OneMinusSrcAlpha on the Unorm view, byte-exact, chosen
+    /// per quad by [`GlowQuad::alpha`]) but at a DIFFERENT z-slot: called from the shared phase
     /// runner [`Self::composite_free`] AFTER the row backgrounds + every
     /// under-text sprite phase and BEFORE the glyph foreground phase, so the
     /// light lands UNDER the letterforms on BOTH paths (the GPU draws the same
     /// stream in its own Unorm pass between the base-bg and base-fg draws).
     ///
     /// The per-quad rasterization is [`Self::draw_flat_add`], SHARED with
-    /// [`Self::draw_glow`] / [`Self::draw_nova`] so the flat additive streams
-    /// cannot drift. Row gating is the aurora discipline:
+    /// [`Self::draw_glow`] / [`Self::draw_nova`] so the flat streams cannot
+    /// drift. THIS is the stream that carries source-over quads — the rainbow
+    /// bed emits `alpha > 0` — and it needs no separate phase for them: the
+    /// blend is one equation and the additive mode is it at `alpha == 0`, so a
+    /// mixed field composites in one walk, in emit order, on both backends. Row
+    /// gating is the aurora discipline:
     /// [`compute_dirty_rows`] marks every prev∪cur glow_under row dirty
     /// whenever the stream changes, and the phase runner hands this the SAME
     /// dirty set its row iterator was built from. An empty `glow_under` is a
@@ -20287,6 +20331,40 @@ pub fn add_sat(dst: u32, premul: u32) -> u32 {
     (a(16) << 16) | (a(8) << 8) | a(0)
 }
 
+/// SOURCE-OVER a PREMULTIPLIED light colour `premul` onto a destination pixel
+/// `dst` at opacity `a` (0..=255), per channel:
+/// `premul_c + (dst_c·(255 − a) + 127) / 255` — the [`GlowQuad::alpha`] blend,
+/// and the integer twin of the GPU's `One`/`OneMinusSrcAlpha` state on the RAW
+/// linear `Rgba8Unorm` view.
+///
+/// **IT IS THE SAME EQUATION [`add_sat`] IS**, evaluated at a different `a`:
+/// `a == 0` returns `add_sat(dst, premul)` byte for byte, which is why one
+/// stream can carry both modes through one pipeline. `a == 255` returns
+/// `premul` exactly — the light with the ground fully displaced.
+///
+/// **PARITY.** The GPU computes `src + dst·(1 − a)` in float from the Unorm8
+/// operands and rounds ONCE on store; `src` is an integer count of levels, and
+/// `round(P + x) == P + round(x)` for integer `P`, so the rounding may be moved
+/// onto the destination term alone — which is what this does. Exact ties are
+/// impossible (`dst_c·(255 − a) + 127.5` is never an integer), so CPU and GPU
+/// land the IDENTICAL byte, the same argument that makes `One`/`One` equal
+/// [`add_sat`] and `SrcAlpha`/`OneMinusSrcAlpha` equal [`over_rgb`].
+///
+/// **AND IT CANNOT SATURATE** when the operands are well formed: a
+/// premultiplied channel is at most its own opacity (`premul_c <= a`, since
+/// [`premul_rgb`] scales a byte by `a/255`), and the destination term is at
+/// most `255 − a`, so the sum is at most `255`. The `min` is a guard against a
+/// malformed pair, not a clamp the well-formed path ever reaches. Like
+/// `add_sat`, the top (transmittance) byte of the result is 0.
+#[must_use]
+pub fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
+    let inv = 255 - a as u32;
+    let ch = |sh: u32| -> u32 {
+        (((premul >> sh) & 0xff) + (((dst >> sh) & 0xff) * inv + 127) / 255).min(255)
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
 /// SOURCE-OVER a STRAIGHT (unpremultiplied) colour `rgb` onto a destination
 /// pixel `dst` at coverage `a` (0..=255), per channel, round-half:
 /// `(rgb_c·a + dst_c·(255−a) + 127) / 255` — the [`HaloMode::Over`] veil math
@@ -20326,8 +20404,29 @@ pub fn halo_row_ny(dy: i32, ry2: i32) -> i32 {
 /// See [`halo_row_ny`] for the single-source rationale.
 #[inline]
 pub fn halo_weight(dx: i32, ny: i32, rx2: i32) -> i32 {
-    let nsq = (dx * dx * 256) / rx2 + ny;
-    let mut wt = 256 - nsq;
+    halo_weight_at(halo_col_nx(dx, rx2), ny)
+}
+
+/// The per-COLUMN X term of the same falloff: `nx = (dx²·256)/rx²`, the twin of
+/// [`halo_row_ny`] on the other axis.
+///
+/// **Split out because it is the only DIVISION left in the per-pixel loop.** A
+/// consumer that walks a halo scanline holds `rx2` fixed and steps `dx` by one,
+/// so it can resolve this term once per column into a scratch table and then
+/// spend a load per pixel instead of an integer divide. Sampled on the rainbow
+/// budget's own claim walk, this divide was a fifth of it. Callers that do not
+/// walk a scanline keep using [`halo_weight`], which is this composed with
+/// [`halo_weight_at`] and is bit-identical to the old body by construction.
+#[inline]
+pub fn halo_col_nx(dx: i32, rx2: i32) -> i32 {
+    (dx * dx * 256) / rx2
+}
+
+/// [`halo_weight`] with both axis terms already resolved — `((256 − nx − ny)²
+/// >> 8)`, clamped at `0`.
+#[inline]
+pub fn halo_weight_at(nx: i32, ny: i32) -> i32 {
+    let mut wt = 256 - (nx + ny);
     if wt < 0 {
         wt = 0;
     }
@@ -20426,6 +20525,13 @@ impl BeamClip {
 /// grid-space emitter (the identity law). A zero-area / fully-clipped /
 /// zero-colour rect is a no-op. Used by [`comet_beam`]; mirrors the host's
 /// other glow emitters.
+///
+/// `alpha` is [`GlowQuad::alpha`] verbatim — `0` for the additive light every
+/// caller but the ribbon BED emits, the source-over opacity for the bed. It is
+/// stamped on every band the split produces, because the split is a GEOMETRIC
+/// one: the bands are disjoint pixel rows of one rect, so they carry the one
+/// rect's opacity unchanged (a band is not a second layer over the first).
+#[allow(clippy::too_many_arguments)]
 fn push_glow_rect(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -20434,6 +20540,7 @@ fn push_glow_rect(
     w: i32,
     h: i32,
     premul: u32,
+    alpha: u8,
 ) {
     if w <= 0 || h <= 0 || premul == 0 || clip.cell_h <= 0 {
         return;
@@ -20461,6 +20568,7 @@ fn push_glow_rect(
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
             color: premul,
+            alpha,
         });
         yy = band_end;
     }
@@ -20502,10 +20610,12 @@ fn emit_aa_slab(
             return;
         }
         let premul = premul_rgb(color, aa);
+        // The AA slab is the COMET/laser beam's rasterizer, which is additive
+        // light on every one of its callers — `alpha: 0`, the historical mode.
         if horizontal {
-            push_glow_rect(out, clip, a, p, width, len, premul);
+            push_glow_rect(out, clip, a, p, width, len, premul, 0);
         } else {
-            push_glow_rect(out, clip, p, a, len, width, premul);
+            push_glow_rect(out, clip, p, a, len, width, premul, 0);
         }
     };
     if ih - il <= 1 {
@@ -20715,6 +20825,300 @@ pub fn comet_beam(
             p += len;
         }
     }
+}
+
+// ---- THE RIBBON BEAM -------------------------------------------------------
+//
+// `comet_beam` generalized, for migration step 11 of
+// `docs/design/RAINBOW-TRAIL-ONE-STORY.md`. Three things it does that a comet
+// cannot, and each of them is a defect the design names:
+//
+//   * PER-VERTEX ASYMMETRIC HALF-WIDTHS. A comet is a tube: one thickness,
+//     centred. The ribbon reaches a whole glyph band ABOVE its spine and a fifth
+//     of a cell BELOW it, and both ends breathe independently along the mark.
+//   * A TRANSVERSE PROFILE, not a solid core. `emit_aa_slab` paints a flat
+//     interior with two anti-aliased edge pixels — correct for a beam of light,
+//     wrong for a surface that must read as *"opacity 1.0 at the baseline spine,
+//     falling smoothly to 0 at the top of the glyph band"* (§4).
+//   * SUB-CELL COLOUR. The spectrum advances 0.84 of a named stop per typed
+//     cell, so a mark that resolves ONE colour per cell paints cell-wide flat
+//     blocks marching along the line — §2.1's *second* blockiness, in the
+//     horizontal direction. Tiling the major axis finer than a cell and
+//     interpolating between vertices is what turns those blocks into a ramp.
+//
+// HOST-ONLY, like every other beam here: the quads it emits are the quads both
+// the CPU (`add_sat`) and the GPU (`One`/`One`) composite, so parity is
+// structural rather than tested for.
+
+/// The largest share of a reach the ribbon's full-strength CORE may take.
+///
+/// A profile whose plateau runs all the way to its own zero is a bar with a hard
+/// edge. Half is the bound that makes "profile" true rather than aspirational:
+/// whatever the caller asks for, at least half of every reach is falloff.
+pub const RIBBON_CORE_SHARE: f32 = 0.5;
+
+/// Cubic smoothstep `0..1` (Hermite), CLAMPING — the classic AA/feather easing,
+/// and the only shape [`ribbon_profile`] is built from.
+#[inline]
+#[must_use]
+pub fn smoothstep01(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// **THE RIBBON'S TRANSVERSE PROFILE** — its opacity `d` px from the spine, on
+/// one side of it.
+///
+/// **Three knots, and every one of them is a named number rather than a shape:**
+///
+/// - `d = 0` → **1.0.** The spine is the mark's full strength, whatever else is
+///   true.
+/// - `d = core` → **`shoulder`.** The plateau ends where the leading does; past
+///   it the ribbon is behind letterforms and holds the shoulder level (or 1.0 on
+///   a side that has no letterforms on it).
+/// - `d = reach` → **0.0.** Exactly zero, so the mark has no edge to cut.
+///
+/// **It is C¹ at all three**, which is the property the whole thing turns on:
+/// `melt` has zero slope at `core` and at `reach`, `bump` has zero slope at `0`
+/// and at `core`, and at `core` the product's derivative is
+/// `0 · shoulder + 1 · (1 − shoulder) · 0`. A profile with a kink puts a visible
+/// crease in a surface that is supposed to read as one piece of glass.
+///
+/// **`core` can never take more than [`RIBBON_CORE_SHARE`] of `reach`** (clamped
+/// here, not asked of the caller), so no caller, no animation and no cell metric
+/// can collapse the falloff into a bar. `shoulder == 1.0` degenerates exactly —
+/// `bump` drops out and what is left is a flat core melting to zero.
+///
+/// Total: a non-finite or non-positive `reach`, or `d` at or past it, is 0.
+#[inline]
+#[must_use]
+pub fn ribbon_profile(d: f32, core: f32, reach: f32, shoulder: f32) -> f32 {
+    if reach.is_nan() || reach <= 0.0 {
+        return 0.0;
+    }
+    let d = d.abs();
+    if d.is_nan() || d >= reach {
+        return 0.0;
+    }
+    // A non-finite core would poison both terms (`clamp` propagates NaN), and
+    // the honest reading of "no plateau I can trust" is no plateau.
+    let core = if core.is_finite() {
+        core.clamp(0.0, reach * RIBBON_CORE_SHARE)
+    } else {
+        0.0
+    };
+    // Both terms are `smoothstep01`, which CLAMPS, so the plateau (`d <= core`,
+    // where the first argument is >= 1) and the outside (`d >= reach`, where it
+    // is <= 0) need no branch of their own.
+    let melt = smoothstep01((reach - d) / (reach - core));
+    let bump = smoothstep01((core - d) / core.max(f32::MIN_POSITIVE));
+    melt * (shoulder + (1.0 - shoulder) * bump)
+}
+
+/// **THE 4x4 ORDERED (BAYER) DITHER**, normalized to `0..1` and offset by half a
+/// step so its mean is exactly `0.5` — an unbiased rounding, not a brightening.
+///
+/// **WHY A RIBBON NEEDS ONE.** Coverage is computed in `f32` and emitted as a
+/// `u8`, and the truncation between them is the last staircase in this design.
+/// Two places it shows:
+///
+/// - **ALONG THE PROFILE.** The transverse melt is a smooth curve, but every
+///   device row lands on an integer level, so the mark carries CONTOUR BANDS —
+///   iso-coverage stripes at exactly the places the curve crosses a level. A
+///   graded profile does not remove them; it makes them regular.
+/// - **THROUGH THE FADE.** The drain runs the full ceiling to zero over ~1.5 s.
+///   At 120 fps that is ~180 frames across ~108 levels, so the mark holds each
+///   level for about two frames and steps between them. §5: *"a 4x4 Bayer offset
+///   before the `f32 -> u8` truncation turns 57 levels into a perceptually
+///   continuous ramp for one add per quad."*
+///
+/// **IT IS AN ADD, AND IT CANNOT RAISE A CEILING.** The offset is strictly less
+/// than one level, so a request already clamped at its cap truncates to that
+/// same cap: every coverage certificate in the producer keeps meaning exactly
+/// what it was measured to mean.
+pub const BAYER4: [[f32; 4]; 4] = [
+    [0.5 / 16.0, 8.5 / 16.0, 2.5 / 16.0, 10.5 / 16.0],
+    [12.5 / 16.0, 4.5 / 16.0, 14.5 / 16.0, 6.5 / 16.0],
+    [3.5 / 16.0, 11.5 / 16.0, 1.5 / 16.0, 9.5 / 16.0],
+    [15.5 / 16.0, 7.5 / 16.0, 13.5 / 16.0, 5.5 / 16.0],
+];
+
+/// The dither offset for a device pixel — [`BAYER4`] indexed by its own
+/// coordinates, so the pattern is fixed to the SCREEN rather than to the mark.
+/// A pattern that moved with the mark would crawl as the mark moved, which is
+/// the artifact ordered dithering exists to avoid.
+#[inline]
+#[must_use]
+pub fn bayer4_at(x: i32, y: i32) -> f32 {
+    BAYER4[(y.rem_euclid(4)) as usize][(x.rem_euclid(4)) as usize]
+}
+
+/// One vertex of the RIBBON polyline, in WINDOW-ABSOLUTE pixels (the
+/// window-space effects layer: the producer folds in the grid origin, the
+/// renderer adds nothing).
+///
+/// The producer places these at CELL BOUNDARIES rather than cell centres, which
+/// is what keeps [`ribbon_beam`]'s major-axis slabs from straddling two cells:
+/// a segment runs boundary-to-boundary, so every slab it tiles lands inside one
+/// cell however the step divides the cell width.
+#[derive(Clone, Copy, Debug)]
+pub struct RibbonVertex {
+    /// Window-absolute X in pixels (sub-pixel) — the major axis.
+    pub x: f32,
+    /// The mark's full-strength centreline here (sub-pixel).
+    pub spine: f32,
+    /// How far the profile reaches ABOVE the spine before it is exactly zero.
+    pub up: f32,
+    /// …and BELOW it.
+    pub dn: f32,
+    /// The full-strength half-width above the spine…
+    pub core_up: f32,
+    /// …and below it.
+    pub core_dn: f32,
+    /// Resolved colour `0x00RRGGBB` here (interpolated along the segment).
+    pub color: u32,
+    /// Coverage at the spine, `0..=255` — time-fade, intensity, specular and
+    /// drain already folded in.
+    pub cov: f32,
+}
+
+/// Rasterize the RIBBON polyline into per-cell-row [`GlowQuad`]s: one
+/// anti-aliased transverse profile per major-axis slab, colour and geometry
+/// interpolated between vertices.
+///
+/// `shoulder` is the level the profile holds ABOVE the spine once it leaves the
+/// core — the side letterforms are on. Below the spine there is nothing for a
+/// shoulder to be quieter behind, so that side is always drawn at 1.0.
+///
+/// `step` is the major-axis sampling stride in pixels (>= 1). It is the whole
+/// resolution/cost dial: one slab per cell paints the historical flat block, and
+/// four slabs per cell paint a ramp for four times the quads. The producer
+/// grades it against its own budget.
+///
+/// **THE TRANSVERSE EDGES ARE SUB-PIXEL.** Every device row is charged the
+/// profile at the centre of the part of it the band actually covers, TIMES that
+/// overlap — so a band edge landing 0.3 px into a row emits 0.3 of that row's
+/// coverage, and a spine that moves a tenth of a pixel moves the edge by a tenth
+/// of a level rather than snapping to the next row.
+///
+/// Returns `false` when `max_quads` ran out, having emitted everything it could
+/// up to that point: the producer orders its vertices HEAD FIRST, so a saturated
+/// budget sheds the ribbon's tail and never punches a hole in its middle (§5's
+/// cap behaviour).
+///
+/// Fewer than two vertices is a no-op. Segments of zero major extent are
+/// skipped; a reversed segment (`b.x < a.x`) is tiled from its own start, which
+/// is how a right-to-left run stays head-first in the vertex order.
+///
+/// `blend` picks the compositing mode of every quad the mark emits (see
+/// [`GlowQuad::alpha`]). [`GlowBlend::Add`] is the historical additive light and
+/// is byte-identical to the pre-`blend` rasterizer. [`GlowBlend::Over`] stamps
+/// the slab's OWN dithered coverage as the quad's source-over opacity — the
+/// same byte that premultiplied its colour, which is what makes the pair a
+/// well-formed premultiplied source-over sample rather than two independent
+/// dials. **The dither rides both**, deliberately: colour and opacity must
+/// carry the identical truncation or the emitted quad is no longer `colour × a`
+/// at opacity `a`, and the composite would drift off the certified pair.
+#[allow(clippy::too_many_arguments)]
+pub fn ribbon_beam(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    shoulder: f32,
+    step: usize,
+    max_quads: usize,
+    blend: GlowBlend,
+) -> bool {
+    if verts.len() < 2 || clip.cell_h <= 0 {
+        return true;
+    }
+    let step = step.max(1) as i32;
+    for w in verts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let span = b.x - a.x;
+        if !span.is_finite() || span.abs() < 1e-3 {
+            continue;
+        }
+        // Tile the major axis in CONTIGUOUS integer slabs from the segment's own
+        // start. The producer's vertices sit on cell boundaries, so `start` is a
+        // cell edge and no slab can straddle two cells.
+        let (start, end) = (a.x.min(b.x).floor() as i32, a.x.max(b.x).ceil() as i32);
+        let mut p = start;
+        while p < end {
+            let len = step.min(end - p).max(1);
+            // The slab's CENTRE on the segment: sampling at the leading edge
+            // would bias every ramp half a slab toward the tail.
+            let t = ((p as f32 + len as f32 * 0.5 - a.x) / span).clamp(0.0, 1.0);
+            let lerp = |u: f32, v: f32| u + (v - u) * t;
+            let spine = lerp(a.spine, b.spine);
+            let up = lerp(a.up, b.up);
+            let dn = lerp(a.dn, b.dn);
+            let core_up = lerp(a.core_up, b.core_up);
+            let core_dn = lerp(a.core_dn, b.core_dn);
+            let cov = lerp(a.cov, b.cov);
+            let top = spine - up;
+            let bot = spine + dn;
+            if !top.is_nan() && !bot.is_nan() && bot > top && cov >= 1.0 {
+                let color = lerp_rgb_f(a.color, b.color, t);
+                let y0 = top.floor() as i32;
+                let y1 = bot.ceil() as i32;
+                for y in y0..y1 {
+                    // `push_glow_rect` may split at a geometry row edge, so keep
+                    // a conservative two-quad admission check.
+                    if out.len() + 2 > max_quads {
+                        return false;
+                    }
+                    let lo = (y as f32).max(top);
+                    let hi = ((y + 1) as f32).min(bot);
+                    let cover = hi - lo;
+                    if cover <= 0.0 {
+                        continue;
+                    }
+                    let d = (lo + hi) * 0.5 - spine;
+                    let across = if d < 0.0 {
+                        ribbon_profile(d, core_up, up, shoulder)
+                    } else {
+                        ribbon_profile(d, core_dn, dn, 1.0)
+                    };
+                    // THE ORDERED DITHER, at the last truncation in the whole
+                    // design (see [`BAYER4`]). The offset is under one level, so
+                    // a request already clamped at its cap still truncates to
+                    // that cap — the producer's coverage certificates are
+                    // untouched.
+                    //
+                    // INDEXED BY THE SLAB'S ORDINAL, NOT ITS PIXEL X, and that
+                    // is the difference between a 4x4 dither and a 1x4 one. A
+                    // slab is ONE flat quad, so there is no sub-slab x for the
+                    // pattern to vary over; and the stride is normally a
+                    // multiple of four, so `p` alone lands on the SAME matrix
+                    // column at every slab and three quarters of the matrix goes
+                    // unused. The ordinal walks all four. It is still
+                    // screen-anchored rather than mark-anchored — the slab grid
+                    // is pinned to cell boundaries — so the pattern cannot crawl
+                    // as the mark moves, which is the artifact ordered dithering
+                    // exists to avoid.
+                    let c = (cov * across * cover + bayer4_at(p.div_euclid(step), y)) as u8;
+                    if c > 0 {
+                        push_glow_rect(
+                            out,
+                            clip,
+                            p,
+                            y,
+                            len,
+                            1,
+                            premul_rgb(color, c),
+                            match blend {
+                                GlowBlend::Add => 0,
+                                GlowBlend::Over => c,
+                            },
+                        );
+                    }
+                }
+            }
+            p += len;
+        }
+    }
+    true
 }
 
 /// One sample along the cursor "comet" polyline (a swept cell centre):
@@ -22223,6 +22627,65 @@ mod tests {
         assert_eq!(add_sat(0x00AB_CDEF, 0), 0x00AB_CDEF);
     }
 
+
+    /// [`over_premul`] IS [`add_sat`] AT `alpha == 0` — the property the whole
+    /// per-quad [`GlowQuad::alpha`] design rests on, proved EXHAUSTIVELY over
+    /// the byte rather than sampled.
+    ///
+    /// It is what lets one blend state (`One`/`OneMinusSrcAlpha`) and one CPU
+    /// walk carry both the historical additive streams and the rainbow's
+    /// source-over bed with no second pipeline, no second pass, and no draw
+    /// reorder — and therefore what makes the claim "every legacy glow quad is
+    /// byte-identical to the pre-`alpha` path" a theorem instead of a hope. If
+    /// this fails, the aurora, the supernova and the EMBERFORGE flame body all
+    /// moved.
+    ///
+    /// The other three clauses are the operator's own boundary conditions:
+    /// `alpha == 255` displaces the ground entirely, a zero source leaves the
+    /// destination alone at `alpha == 0` and erases it at `alpha == 255`, and
+    /// the result is MONOTONE DECREASING in `alpha` for a fixed premultiplied
+    /// colour — the arithmetic behind "source-over can darken where additive
+    /// cannot".
+    #[test]
+    fn over_premul_is_add_sat_at_zero_alpha() {
+        // EXHAUSTIVE over one channel's full cross product, which is the whole
+        // claim: both functions are per-channel and channel-independent.
+        for d in 0..=255u32 {
+            for c in 0..=255u32 {
+                let (dst, premul) = (d << 16 | d << 8 | d, c << 16 | c << 8 | c);
+                assert_eq!(
+                    over_premul(dst, premul, 0),
+                    add_sat(dst, premul),
+                    "over_premul is not add_sat at alpha 0 for dst {d} src {c}"
+                );
+            }
+        }
+        // Mixed channels too, since the identity must not depend on the greys.
+        assert_eq!(
+            over_premul(0x0012_34AB, 0x0040_2010, 0),
+            add_sat(0x0012_34AB, 0x0040_2010)
+        );
+        // alpha == 255: the ground is gone and the light is all that is left.
+        assert_eq!(over_premul(0x00FF_FFFF, 0x0012_34AB, 255), 0x0012_34AB);
+        assert_eq!(over_premul(0x0000_0000, 0x0012_34AB, 255), 0x0012_34AB);
+        // A zero source is a no-op at alpha 0 and an eraser at alpha 255.
+        assert_eq!(over_premul(0x00AB_CDEF, 0, 0), 0x00AB_CDEF);
+        assert_eq!(over_premul(0x00AB_CDEF, 0, 255), 0);
+        // MONOTONE in alpha at a fixed premultiplied colour: more opacity can
+        // only take more of the ground away.
+        for a in 0..255u8 {
+            let (lo, hi) = (
+                over_premul(0x00C0_C0C0, 0x0020_2020, a),
+                over_premul(0x00C0_C0C0, 0x0020_2020, a + 1),
+            );
+            assert!(
+                hi <= lo,
+                "over_premul must not brighten as alpha rises: {a} gave {lo:#08x}, \
+                 {} gave {hi:#08x}",
+                a + 1
+            );
+        }
+    }
     /// `compute_dirty_rows` must treat the LUMEN aurora as an overlay the per-row
     /// content diff can't see: when a glow quad MOVES from row `r` (prev) to row
     /// `r'` (cur), BOTH rows must be marked dirty (prev∪cur — prev so the vacated
@@ -22248,6 +22711,8 @@ mod tests {
             w: 1,
             h: 1,
             color: 0x0010_2030,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         cur.cursor_glow_add = vec![GlowQuad {
             row: r2,
@@ -22256,6 +22721,8 @@ mod tests {
             w: 1,
             h: 1,
             color: 0x0010_2030,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
 
         let mut dirty = Vec::new();
@@ -29293,6 +29760,352 @@ mod tests {
             before,
             "semantic fork must not resurrect any lazy candidate path"
         );
+    }
+}
+
+#[cfg(test)]
+mod ribbon_beam_tests {
+    use super::{BeamClip, GlowQuad, RIBBON_CORE_SHARE, RibbonVertex, ribbon_beam, ribbon_profile};
+
+    const W: usize = 160;
+    const H: usize = 120;
+    const CH: usize = 20;
+
+    fn clip() -> BeamClip {
+        BeamClip::grid(W, H, CH)
+    }
+
+    fn vert(x: f32, spine: f32, up: f32, dn: f32, color: u32, cov: f32) -> RibbonVertex {
+        RibbonVertex {
+            x,
+            spine,
+            up,
+            dn,
+            core_up: up * 0.2,
+            core_dn: dn * 0.2,
+            color,
+            cov,
+        }
+    }
+
+    /// Composite the emitted quads into a pixel map, so the assertions read the
+    /// SURFACE rather than the primitives that made it.
+    fn paint(quads: &[GlowQuad]) -> std::collections::BTreeMap<(i32, i32), u32> {
+        let mut px = std::collections::BTreeMap::new();
+        for q in quads {
+            for y in q.y..q.y + q.h {
+                for x in q.x..q.x + q.w {
+                    let slot = px.entry((i32::from(y), i32::from(x))).or_insert(0u32);
+                    *slot = super::add_sat(*slot, q.color);
+                }
+            }
+        }
+        px
+    }
+
+    fn peak(c: u32) -> i32 {
+        (((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff)) as i32
+    }
+
+    /// **THE PROFILE'S CONTRACT**, stated on the function rather than inferred
+    /// from a raster: full strength at the spine, exactly zero at the reach,
+    /// monotone in between, and through the shoulder where the core ends. The
+    /// core is CLAMPED here rather than trusted, so no caller can collapse the
+    /// falloff into a bar.
+    #[test]
+    fn the_ribbon_profile_is_a_clamped_monotone_curve() {
+        for &(core, reach, shoulder) in &[
+            (2.0f32, 20.0f32, 1.0f32),
+            (2.0, 20.0, 0.55),
+            (0.0, 6.0, 1.0),
+            // A core asking for far more than its share: the clamp is the only
+            // thing holding the falloff open.
+            (99.0, 6.0, 0.55),
+        ] {
+            let p = |d: f32| ribbon_profile(d, core, reach, shoulder);
+            assert!((p(0.0) - 1.0).abs() < 1e-6, "{core}/{reach}/{shoulder}");
+            assert_eq!(p(reach), 0.0);
+            assert_eq!(p(reach * 3.0), 0.0);
+            assert_eq!(p(-reach * 0.5), p(reach * 0.5), "symmetric in |d|");
+            let mut prev = f32::INFINITY;
+            for i in 0..=400 {
+                let v = p(reach * i as f32 / 400.0);
+                assert!(v <= prev + 1e-6 && (0.0..=1.0).contains(&v));
+                prev = v;
+            }
+            // The clamp: at least `1 - RIBBON_CORE_SHARE` of every reach is
+            // falloff, whatever the caller asked for.
+            let held = reach * RIBBON_CORE_SHARE;
+            assert!(p(held) < 1.0, "the plateau ends by half the reach");
+        }
+        // Totality.
+        for &(d, core, reach, shoulder) in &[
+            (f32::NAN, 4.0f32, 8.0f32, 1.0f32),
+            (1.0, f32::NAN, 8.0, 1.0),
+            (1.0, 4.0, f32::NAN, 1.0),
+            (1.0, 4.0, 0.0, 1.0),
+            (1.0, 4.0, -8.0, 1.0),
+            (f32::INFINITY, 4.0, 8.0, 1.0),
+        ] {
+            let v = ribbon_profile(d, core, reach, shoulder);
+            assert!(v.is_finite() && (0.0..=1.0).contains(&v), "{v}");
+        }
+    }
+
+    /// **ASYMMETRIC HALF-WIDTHS** — the thing a comet cannot do. The mark
+    /// reaches four times as far above its spine as below it, and the raster
+    /// says so.
+    #[test]
+    fn the_ribbon_reaches_further_above_its_spine_than_below() {
+        let (up, dn) = (16.0f32, 4.0f32);
+        let verts = [
+            vert(20.0, 60.0, up, dn, 0x00FF_0000, 200.0),
+            vert(60.0, 60.0, up, dn, 0x00FF_0000, 200.0),
+        ];
+        let mut out = Vec::new();
+        assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+        let px = paint(&out);
+        let col: Vec<(i32, i32)> = px
+            .iter()
+            .filter(|((_, x), _)| *x == 40)
+            .map(|(&(y, _), &c)| (y, peak(c)))
+            .collect();
+        assert!(!col.is_empty(), "the beam paints");
+        let top = col.first().expect("lit").0;
+        let bot = col.last().expect("lit").0;
+        assert!(
+            (60 - top) > (bot - 60) * 2,
+            "the mark reaches further up ({}) than down ({})",
+            60 - top,
+            bot - 60
+        );
+        assert!(top >= (60.0 - up) as i32, "…and never past its own reach");
+        assert!(bot <= (60.0 + dn).ceil() as i32);
+        // ONE CREST, at the spine, monotone either side — the profile, on the
+        // surface.
+        let crest = col.iter().max_by_key(|&&(_, c)| c).expect("lit").0;
+        assert!((crest - 60).abs() <= 1, "the crest is the spine: {crest}");
+        assert!(
+            col.windows(2)
+                .filter(|w| w[1].0 <= crest)
+                .all(|w| w[1].1 >= w[0].1)
+        );
+        assert!(
+            col.windows(2)
+                .filter(|w| w[0].0 >= crest)
+                .all(|w| w[1].1 <= w[0].1)
+        );
+    }
+
+    /// **THE EDGES ARE SUB-PIXEL.** Sliding the spine by a tenth of a pixel must
+    /// move the mark's outer coverage by about a tenth of a level — NOT snap it
+    /// to the next row. This is the staircase the design names: a wave of
+    /// amplitude ±1.9 px resolved to three positions because the edge was
+    /// rounded to whole rows.
+    #[test]
+    fn a_sub_pixel_spine_moves_the_edge_continuously() {
+        let sample = |spine: f32| -> i64 {
+            let verts = [
+                vert(20.0, spine, 12.0, 4.0, 0x00FF_FFFF, 200.0),
+                vert(60.0, spine, 12.0, 4.0, 0x00FF_FFFF, 200.0),
+            ];
+            let mut out = Vec::new();
+            assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+            paint(&out)
+                .iter()
+                .filter(|((_, x), _)| *x == 40)
+                .map(|(_, &c)| i64::from(peak(c)))
+                .sum()
+        };
+        // Ten tenth-pixel steps across one whole pixel: every step must move the
+        // column's total light, and no step may be a jump.
+        let track: Vec<i64> = (0..=10).map(|i| sample(60.0 + i as f32 * 0.1)).collect();
+        let steps: Vec<i64> = track.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        assert!(
+            steps.iter().any(|&s| s > 0),
+            "a sub-pixel spine must move the raster at all: {track:?}"
+        );
+        let biggest = *steps.iter().max().expect("steps");
+        let whole = (sample(60.0) - sample(61.0)).abs().max(1);
+        assert!(
+            biggest <= whole.max(24),
+            "a tenth-pixel spine move stepped {biggest}, which is a staircase, \
+             not a slide: {track:?}"
+        );
+    }
+
+    /// **COLOUR AND GEOMETRY INTERPOLATE ALONG THE POLYLINE**, and the stride is
+    /// the resolution dial: a finer stride paints more distinct colours across
+    /// the same segment for proportionally more quads. One slab per segment is
+    /// the flat block this generalization exists to delete.
+    #[test]
+    fn a_finer_stride_paints_a_ramp_where_one_slab_paints_a_block() {
+        let verts = [
+            vert(0.0, 60.0, 12.0, 4.0, 0x00FF_0000, 200.0),
+            vert(32.0, 60.0, 12.0, 4.0, 0x0000_00FF, 200.0),
+        ];
+        let distinct = |step: usize| -> (usize, usize) {
+            let mut out = Vec::new();
+            assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, step, 100_000, crate::GlowBlend::Add));
+            let row: std::collections::BTreeSet<u32> = out
+                .iter()
+                .filter(|q| i32::from(q.y) == 60)
+                .map(|q| q.color)
+                .collect();
+            (row.len(), out.len())
+        };
+        let (block, block_cost) = distinct(32);
+        let (ramp, ramp_cost) = distinct(4);
+        assert_eq!(block, 1, "one slab per segment is one flat colour");
+        assert!(
+            ramp >= 8,
+            "a finer stride paints a ramp across the same segment: {ramp}"
+        );
+        assert!(
+            ramp_cost > block_cost * 4,
+            "…and it is BOUGHT with quads — the dial the producer grades \
+             against its budget: {ramp_cost} vs {block_cost}"
+        );
+    }
+
+    /// **THE ORDERED DITHER MAKES THE `f32 -> u8` TRUNCATION UNBIASED** — the
+    /// last staircase in this design, and the one §5 prices at "one add per
+    /// quad".
+    ///
+    /// **THE MEASUREMENT.** Sweep a FLAT band's requested coverage across one
+    /// whole level in twentieths and read back the MEAN emitted level over the
+    /// plateau. A truncation answers with one integer for the entire sweep: the
+    /// mark holds a level, then jumps a level, which is what a fade does when it
+    /// staircases and what a smooth profile does when it contours. The dither
+    /// answers with a mean that tracks the request continuously, because at any
+    /// fractional request the two neighbouring levels are mixed in exactly the
+    /// proportion the fraction names.
+    ///
+    /// **NON-VACUOUS BY ITS OWN NEGATIVE CONTROL:** the same sweep through a
+    /// plain `as u8` is checked to collapse to one value.
+    ///
+    /// **AND IT CANNOT RAISE A CEILING.** A request already at its cap emits the
+    /// cap, dither or no dither — the offset is strictly under one level, so
+    /// every coverage certificate the producer holds keeps meaning what it was
+    /// measured to mean.
+    #[test]
+    fn the_ordered_dither_tracks_a_fractional_request() {
+        // A WIDE FLAT BAND: `core == reach` would be refused by the profile's
+        // own clamp, so the plateau is read where the profile is exactly 1 —
+        // within the core — and the reach is generous enough that the melt is
+        // nowhere near it.
+        let mean_level = |cov: f32| -> f64 {
+            let verts = [
+                RibbonVertex {
+                    x: 8.0,
+                    spine: 60.0,
+                    up: 20.0,
+                    dn: 20.0,
+                    core_up: 8.0,
+                    core_dn: 8.0,
+                    color: 0x00FF_FFFF,
+                    cov,
+                },
+                RibbonVertex {
+                    x: 120.0,
+                    ..RibbonVertex {
+                        x: 0.0,
+                        spine: 60.0,
+                        up: 20.0,
+                        dn: 20.0,
+                        core_up: 8.0,
+                        core_dn: 8.0,
+                        color: 0x00FF_FFFF,
+                        cov,
+                    }
+                },
+            ];
+            let mut out = Vec::new();
+            assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+            // The plateau only: rows within the core, where the profile is
+            // exactly 1 and the emitted value is the request plus the dither.
+            let vals: Vec<f64> = paint(&out)
+                .iter()
+                .filter(|((y, _), _)| (*y - 60).abs() < 6)
+                .map(|(_, &c)| f64::from(peak(c)))
+                .collect();
+            assert!(vals.len() > 400, "the plateau must be wide: {}", vals.len());
+            vals.iter().sum::<f64>() / vals.len() as f64
+        };
+        let base = 20.0f32;
+        let sweep: Vec<f64> = (0..=20).map(|i| mean_level(base + i as f32 / 20.0)).collect();
+        // TRACKS THE REQUEST. Every step of a twentieth of a level moves the
+        // emitted mean, and the mean never drifts from the request by more than
+        // the plateau's own edge effects.
+        for (i, &m) in sweep.iter().enumerate() {
+            let want = f64::from(base) + i as f64 / 20.0;
+            assert!(
+                (m - want).abs() <= 0.2,
+                "request {want} emitted a mean of {m}"
+            );
+        }
+        assert!(
+            sweep.windows(2).all(|w| w[1] >= w[0] - 1e-9),
+            "…monotonically: {sweep:?}"
+        );
+        let distinct = sweep
+            .iter()
+            .map(|m| (m * 100.0).round() as i64)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct >= 15,
+            "a dithered sweep resolves the fraction: {distinct} distinct means"
+        );
+        // NEGATIVE CONTROL: the truncation this replaces answers with ONE value
+        // for the whole sweep — hold a level, jump a level.
+        let truncated = (0..=20)
+            .map(|i| (base + i as f32 / 20.0) as u8)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            truncated <= 2 && truncated * 7 < distinct,
+            "the retired truncation must collapse the same sweep to the two \
+             integers it touches: {truncated} values against the dither's {distinct}"
+        );
+        // AND THE CEILING HOLDS. A request pinned at a cap emits the cap.
+        for cap in [57.0f32, 108.0, 255.0] {
+            let m = mean_level(cap);
+            assert!(
+                m <= f64::from(cap),
+                "a capped request must not be dithered past its cap: {m} > {cap}"
+            );
+        }
+    }
+
+    /// **THE BUDGET STOPS IT, AND IT STOPS WHERE IT IS.** A saturated budget
+    /// truncates the polyline from the far end — the producer orders its
+    /// vertices head first, so what is shed is the tail.
+    #[test]
+    fn a_saturated_budget_sheds_the_far_end() {
+        let verts = [
+            vert(0.0, 60.0, 12.0, 4.0, 0x00FF_0000, 200.0),
+            vert(120.0, 60.0, 12.0, 4.0, 0x0000_00FF, 200.0),
+        ];
+        let mut full = Vec::new();
+        assert!(ribbon_beam(&mut full, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+        let mut cut = Vec::new();
+        assert!(
+            !ribbon_beam(&mut cut, clip(), &verts, 1.0, 4, 200, crate::GlowBlend::Add),
+            "a saturated budget reports it"
+        );
+        assert!(cut.len() <= 200 && cut.len() < full.len());
+        assert_eq!(
+            cut.as_slice(),
+            &full[..cut.len()],
+            "what it did emit is a PREFIX of the full mark — the truncation is \
+             from the far end, never a hole in the middle"
+        );
+        // Degenerate inputs are no-ops, not panics.
+        let mut none = Vec::new();
+        assert!(ribbon_beam(&mut none, clip(), &verts[..1], 1.0, 4, 100_000, crate::GlowBlend::Add));
+        assert!(ribbon_beam(&mut none, clip(), &[], 1.0, 4, 100_000, crate::GlowBlend::Add));
+        assert!(none.is_empty());
     }
 }
 

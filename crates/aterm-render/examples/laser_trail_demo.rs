@@ -48,6 +48,7 @@ fn main() {
         head: 0,
     };
     let cfg = GlowConfig {
+        ribbon_tall: false,
         enabled: true,
         style: GlowStyle::Laser,
         color: LASER_DEFAULT_COLOR,
@@ -63,7 +64,6 @@ fn main() {
         head_dx: 0.5,
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
-        ribbon_tall: false,
         dark_theme: true,
         // `theme` is in scope here, so render the TRUTH rather than a
         // stand-in: these demos exist to be looked at.

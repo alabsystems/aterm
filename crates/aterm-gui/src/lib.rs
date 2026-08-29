@@ -90,7 +90,13 @@ mod app_update_screen;
 mod app_window;
 #[cfg(test)]
 mod artifact_transaction_conformance;
-mod bench_knobs;
+// `mod bench_knobs;` was here, with NO cfg — so ATERM_GATHER_SINK,
+// ATERM_PARSE_SINK, ATERM_CAST_TAP and ATERM_FLOOD_QUIET were live in every
+// shipped aterm despite the module's own header calling them "bench instruments
+// only — never product features". Nothing enforced that sentence. Removed:
+// see spawn.rs (gather/parse/cast) and `TrailAudio::new` below for what
+// replaced each, and the commit message for why an env-shaped bench
+// instrument in a shipped binary is the same defect as ATERM_EFFECT_PACE.
 /// BENCH-ONLY observation seam (the `test-open-probe` precedent applied to this
 /// crate): the one public wrapper the external `frame_latency` bench drives the
 /// `#[cfg(any(test, feature = "bench-support"))]` headless fixtures through.
@@ -186,6 +192,7 @@ mod file_picker_win;
 mod handoff_rendezvous;
 #[cfg(windows)]
 mod hdr_win;
+mod hwkey;
 #[cfg(test)]
 mod instance_retention_conformance;
 /// Windows taskbar jump list (right-click menu on the taskbar button): the
@@ -365,6 +372,9 @@ mod type_scale;
 mod update_apply_trouble;
 mod update_screen;
 mod vi_keys;
+/// The `video … keys` self-evaluation, and the disclosures that keep it from
+/// being read as key→photon latency. See the module header.
+mod video_key_analysis;
 /// Dev/CI main-thread STALL watchdog (L0 freeze-hazard guard). Off in release
 /// unless `$ATERM_WATCHDOG` is set; see `watchdog::beat` / `watchdog::start`.
 mod watchdog;
@@ -802,6 +812,66 @@ fn effect_tick_interval(panel: Option<Duration>) -> Duration {
         Some(period) => period.max(MIN_EFFECT_TICK_INTERVAL),
         None => AURORA_TICK_INTERVAL,
     }
+}
+
+/// How many PANEL periods one effect-only present is allowed to occupy — the
+/// drawable-pool headroom divisor. `2` means the effect lane presents at half
+/// the panel rate (60 Hz on a 120 Hz panel) and `1` restores the pre-fix
+/// behaviour of chasing every refresh.
+///
+/// WHY THE EFFECT LANE MAY NOT RUN AT PANEL RATE. macOS has no Mailbox present
+/// mode, so `get_current_texture()` is the throttle: a `CAMetalLayer` hands out
+/// a bounded pool of drawables and `nextDrawable` BLOCKS the calling thread —
+/// here the winit main thread — until the display recycles one. A lane that
+/// presents once per refresh keeps the pool empty in steady state, so the main
+/// thread spends most of every period parked inside the acquire. Measured on
+/// this repo's shipped default (`cursor_trail = true`), the whole cost of the
+/// trail landed there: `acquire_p50` 7.34-8.39 ms of an ~8.1 ms frame, and
+/// key->present-return p50 8.39 ms against 0.39-0.43 ms with the trail off. A
+/// keystroke that arrives during that park does not merely wait for the frame;
+/// it waits in the OS event queue behind it, which is why the hardware-path
+/// injector reads a further ~4 ms on top of what the control socket can see.
+///
+/// Presenting the ANIMATION every OTHER refresh leaves a drawable free at every
+/// acquire, so the wait moves out of `nextDrawable` and into the event loop's
+/// own park — where a keyDown is dispatched the moment it lands instead of
+/// queueing behind a blocked thread. CONTENT presents are untouched: they keep
+/// [`WindowState::content_pace_floor`] (a full period idle, HALF a period while
+/// `input_hot`), so a keystroke's echo still lands on the very next refresh.
+///
+/// The cost is temporal resolution on the effect itself — the trail advances 60
+/// times a second on a 120 Hz panel instead of 120. Every engine decays on wall
+/// time, so the pixels of any given frame are unchanged; only the number of
+/// intermediate frames drops.
+const EFFECT_PRESENT_PANEL_PERIODS: u32 = 2;
+
+/// The cap above, as the law rather than a preference. `ATERM_EFFECT_PACE` used
+/// to be able to restore the uncapped panel-rate lane in the same binary, which
+/// was how the A/B was run; it is DELETED now that the measurement is settled.
+/// Shipping it would have shipped a way to silently put ~9 ms back on every
+/// keystroke, and an env var that re-breaks typing latency is not a safety
+/// valve — it is a trap. The parameterised
+/// [`effect_present_interval_with`] keeps the arithmetic testable at any period
+/// without a process-wide switch.
+const fn effect_present_panel_periods() -> u32 {
+    EFFECT_PRESENT_PANEL_PERIODS
+}
+
+/// The effect lane's PRESENT period for one window: [`effect_tick_interval`]
+/// stretched by [`effect_present_panel_periods`].
+///
+/// This is the cadence the scheduler arms (`plan_terminal_effect_lane`) and the
+/// unit the chrome-decoration latch counts in ([`DECO_ANIM_LEVEL_FRAMES`]), so
+/// the arm and the latch that must outlive it cannot disagree about how long
+/// one lane period is.
+fn effect_present_interval(panel: Option<Duration>) -> Duration {
+    effect_present_interval_with(panel, effect_present_panel_periods())
+}
+
+/// Pure core of [`effect_present_interval`], so both arms of the kill switch are
+/// testable without touching process environment.
+fn effect_present_interval_with(panel: Option<Duration>, periods: u32) -> Duration {
+    effect_tick_interval(panel) * periods.max(1)
 }
 
 /// How many frame intervals ONE animating decoration frame keeps the chrome-
@@ -2812,6 +2882,23 @@ enum Wake {
         session: u64,
         reply: std::sync::mpsc::Sender<bool>,
     },
+    /// Reply-bearing, side-effect-free lookup of the frontmost window's AppKit
+    /// `windowNumber`, for the `hwkey` HARDWARE-PATH key injector.
+    ///
+    /// The injector posts a real `NSEvent` into this process's own event queue
+    /// from the CONTROL thread — deliberately, so the key can arrive (and wait)
+    /// while the main thread is parked inside `nextDrawable`, which is the whole
+    /// slice `ctl key` is structurally blind to. But `-[NSApplication sendEvent:]`
+    /// routes a key event by the window number baked into it, and reading that
+    /// number means touching an `NSWindow`, which is main-thread-only. So the
+    /// number is fetched here, ONCE per verb invocation, and the posting loop
+    /// itself never returns to the main thread.
+    ///
+    /// Answers `0` when there is no frontmost window (headless, every window
+    /// closed) — the injector refuses rather than posting into nothing.
+    HwKeyTarget {
+        reply: std::sync::mpsc::Sender<i64>,
+    },
     /// The Linux/X11 paste worker finished reading a FOREIGN clipboard owner off the
     /// UI thread — `text` is the clipboard body to deliver into `wid` (the paste's
     /// [`InputEvent::Paste`] source `source`). Constructed ONLY by the
@@ -3908,10 +3995,14 @@ mod bottom_padding_geometry_tests {
         let mut input = RenderInput::empty();
         input.cursor_glow_add = vec![GlowQuad {
             y: 20,
+                        // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
             ..GlowQuad::default()
         }];
         input.glow_under = vec![GlowQuad {
             y: 21,
+                        // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
             ..GlowQuad::default()
         }];
         input.glow_halo = vec![RainHalo {
@@ -3927,6 +4018,8 @@ mod bottom_padding_geometry_tests {
         // Renderer-offset/grid-relative streams must not be double-shifted.
         input.nova_add = vec![GlowQuad {
             y: 30,
+                        // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
             ..GlowQuad::default()
         }];
         input.rain_add = vec![RainHalo {
@@ -3960,6 +4053,8 @@ mod bottom_padding_geometry_tests {
         let mut invalid = RenderInput::empty();
         invalid.cursor_glow_add = vec![GlowQuad {
             y: u16::MAX,
+                        // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
             ..GlowQuad::default()
         }];
         let before = invalid.clone();
@@ -8855,7 +8950,7 @@ impl WindowState {
     /// (a dog cameo over a walking Robi) the longer hold wins regardless of the
     /// order the arms run in.
     fn note_deco_animating(&mut self, now: Instant) {
-        let until = now + effect_tick_interval(self.frame_interval) * DECO_ANIM_LEVEL_FRAMES;
+        let until = now + effect_present_interval(self.frame_interval) * DECO_ANIM_LEVEL_FRAMES;
         if self.deco_anim_until.is_none_or(|held| held < until) {
             self.deco_anim_until = Some(until);
         }
@@ -8949,12 +9044,21 @@ impl WindowState {
         let deco_wake = self.deco_anim_frame_active(now);
         // LUMEN cursor aurora: while any light is alive on a focused window,
         // re-present so the comet/bloom/ring/sparks animate, then disarm (→ pure
-        // `Wait`, 0% idle) the moment they decay to nothing. The cadence is the
-        // PANEL's own refresh ([`effect_tick_interval`]): the grid's content
-        // presents at the panel rate, so an effect train pinned to 60 fps hands a
-        // 120 Hz ProMotion panel the same comet twice and lands every second
-        // frame ~8.3 ms stale. Coarse-only effects still take their own deadlines
-        // below, so the extra wakes are confined to light that is actually MOVING.
+        // `Wait`, 0% idle) the moment they decay to nothing. Coarse-only effects
+        // still take their own deadlines below, so the extra wakes are confined
+        // to light that is actually MOVING.
+        //
+        // The cadence is [`effect_present_interval`] — the panel's own refresh
+        // DIVIDED by the drawable-pool headroom divisor, so the effect lane
+        // presents strictly slower than the display refreshes. It used to be the
+        // panel period flat, on the ground that a 60 fps train hands a 120 Hz
+        // ProMotion panel the same comet twice. That is true and it is not worth
+        // what it cost: a lane presenting once per refresh keeps the Metal
+        // drawable pool empty (no Mailbox on macOS), so the winit main thread
+        // spent `acquire_p50` 7.34-8.39 ms of every ~8.1 ms period blocked inside
+        // `nextDrawable`, with the user's next keyDown queued in the OS behind it
+        // — the trail's entire measured +8 ms on key->present-return. Half the
+        // effect frames buys back the whole park; see the constant's doc.
         if has_glass
             && (deco_wake
                 || self.terminal_effect_frame_active_with_recording(
@@ -8963,7 +9067,7 @@ impl WindowState {
                     recording_watcher,
                 ))
         {
-            let aurora_interval = effect_tick_interval(self.frame_interval);
+            let aurora_interval = effect_present_interval(self.frame_interval);
             // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember tail.
             // If the ONLY live cursor effect is the glow's slowly-cooling ember
             // (no moving light, no rainbow/cat/trail/deco, no fade), poll at the
@@ -12004,9 +12108,8 @@ impl App {
             }
         } else {
             // Recreate only where the original startup policy permits it. Headless
-            // capture and flood benchmarks remain worker/device-free after unmute.
-            self.trail_audio
-                .replace(!self.headless && !crate::bench_knobs::flood_quiet());
+            // capture remains worker/device-free after unmute.
+            self.trail_audio.replace(!self.headless);
         }
 
         // Bloom/shimmer are whole-frame decorative post passes. The windowed cold
@@ -18536,7 +18639,7 @@ impl ApplicationHandler<Wake> for App {
             // The controller received only `OK apply requested`; this reducer owns
             // the first truthful acceptance/rejection decision.
             Wake::ApplyStagedUpdate => {
-                if std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some() {
+                if crate::app_update_screen::debug_seamless_reexec_armed() {
                     let outcome = self.apply_debug_seamless_update();
                     // QA seam: visible, but never written to the health ledger.
                     self.react_to_update_apply_outcome("debug control request", outcome, false);
@@ -18876,6 +18979,19 @@ impl ApplicationHandler<Wake> for App {
             Wake::CursorMoveLicenseClear { session, reply } => {
                 let canceled = self.clear_move_license_for_session(session);
                 let _ = reply.send(canceled);
+            }
+            // Read-only: resolve the frontmost window's AppKit `windowNumber` for
+            // the `hwkey` injector. Touches no state, writes no bytes, and requests
+            // no redraw — a measurement instrument must not perturb the thing it
+            // measures, and this arm runs on the very loop whose stalls are the
+            // subject.
+            Wake::HwKeyTarget { reply } => {
+                let n = self
+                    .frontmost_window
+                    .and_then(|wid| self.windows.get(&wid))
+                    .and_then(|ws| ws.os_window.as_deref())
+                    .map_or(0, crate::platform::appkit_window_number);
+                let _ = reply.send(n);
             }
             // Phase 0.5 (A.2.3): apply a controller-built batch on the main thread
             // (the sole owner of term geometry + gesture state + the encoders), IN
@@ -21802,7 +21918,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // the forgery risk (one tab's output can't forge another tab's marks — the nonce is
     // minted fresh per session in `spawn_session`), and `$ATERM_NO_SHELL_INTEGRATION`
     // opts out (presence-based, like the other kill switches; the legacy
-    // `$ATERM_SHELL_INTEGRATION` opt-in is now a no-op). The shell sources the user's own
+    // `--shell-integration` opt-in is now a no-op flag with no variable behind
+    // it). The shell sources the user's own
     // rc and adds the marks; its loader vars are appended per session. No shell
     // integration when `-e` runs a command directly: there is no interactive shell to
     // inject OSC 133/633 marks into.
@@ -22774,11 +22891,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         close_confirm_suppressed: false,
         frame_interval: MIN_FRAME_INTERVAL,
         bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
-        // Bench instrument (ATERM_FLOOD_QUIET=1): inert audio — no worker thread,
-        // no CoreAudio — so flood measurements see zero audio threads.
-        trail_audio: trail_audio::TrailAudio::new(
-            !headless && !bench_knobs::flood_quiet() && !config.serious_mode_or_default(),
-        ),
+        // A flood measurement that wants zero audio threads sets `serious_mode`
+        // in its scratch aterm.toml — the config key already spelled here, and
+        // the reason the `ATERM_FLOOD_QUIET=1` env knob that used to sit in this
+        // OR was redundant as well as invisible.
+        trail_audio: trail_audio::TrailAudio::new(!headless && !config.serious_mode_or_default()),
         typing_sound_auditioned: config.trail_sound_voice(),
         lock_modifiers: if headless {
             keymap::no_lock_modifiers
@@ -36666,6 +36783,8 @@ mod tab_strip_math_tests {
             w: 1,
             h: 1,
             color: 0,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
         // A second glow quad INSIDE the grid (y=40 ≥ 16): pixel y still untouched,
         // but its row TAG shifts with the splice like the grid content it lights.
@@ -36676,6 +36795,8 @@ mod tab_strip_math_tests {
             w: 1,
             h: 1,
             color: 0,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
         frame.cursor_trail.push(aterm_render::TrailCell {
             row: 1,
@@ -36813,6 +36934,8 @@ mod tab_strip_math_tests {
                 w: 1,
                 h: 1,
                 color: 0,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             });
         }
         prepend_strip_rows(&mut frame, &strip, 16, 0, &mut Vec::new());
@@ -37191,6 +37314,59 @@ mod effect_cadence_tests {
         assert_eq!(
             effect_tick_interval(Some(Duration::ZERO)),
             MIN_EFFECT_TICK_INTERVAL
+        );
+    }
+
+    /// DRAWABLE-POOL HEADROOM. The lane the scheduler actually arms is the panel
+    /// period STRETCHED, so the effect-only present rate is strictly below the
+    /// refresh rate and `nextDrawable` always finds a free drawable. Panel-rate
+    /// presents are the pre-fix behaviour and are pinned here as the negative
+    /// control, because that is exactly what parked the winit main thread for
+    /// 7.34-8.39 ms of every ~8.1 ms frame.
+    #[test]
+    fn the_effect_lane_presents_strictly_slower_than_the_panel_refreshes() {
+        let promotion = Duration::from_nanos(1_000_000_000_000 / 120_000); // 120 Hz
+        let capped = super::effect_present_interval_with(Some(promotion), 2);
+        assert_eq!(capped, promotion * 2, "120 Hz panel ⇒ 60 Hz effect lane");
+        assert!(
+            capped > effect_tick_interval(Some(promotion)),
+            "a lane that presents once per refresh keeps the Metal pool empty"
+        );
+        // The kill switch's arm: byte-for-byte the old cadence, same binary.
+        assert_eq!(
+            super::effect_present_interval_with(Some(promotion), 1),
+            effect_tick_interval(Some(promotion)),
+            "ATERM_EFFECT_PACE=panel restores the uncapped lane"
+        );
+        // A nonsense divisor cannot produce a zero-length period (a hot loop).
+        assert_eq!(
+            super::effect_present_interval_with(Some(promotion), 0),
+            effect_tick_interval(Some(promotion)),
+            "0 clamps to 1, never to an unpaced lane"
+        );
+        // Unknown refresh: the 60 fps fallback is stretched by the same law, and
+        // the floor still applies underneath it.
+        assert_eq!(
+            super::effect_present_interval_with(None, 2),
+            AURORA_TICK_INTERVAL * 2
+        );
+        assert_eq!(
+            super::effect_present_interval_with(Some(Duration::ZERO), 2),
+            MIN_EFFECT_TICK_INTERVAL * 2
+        );
+    }
+
+    /// The chrome-decoration latch counts LANE periods, not panel periods. If it
+    /// kept counting panel refreshes it would expire mid-deferral once the lane
+    /// stretched — the permanent-freeze bug `deco_anim_until` exists to prevent.
+    #[test]
+    fn the_decoration_latch_outlives_one_stretched_lane_period() {
+        let promotion = Duration::from_nanos(1_000_000_000_000 / 120_000);
+        let lane = super::effect_present_interval_with(Some(promotion), 2);
+        let latch = lane * super::DECO_ANIM_LEVEL_FRAMES;
+        assert!(
+            latch >= lane * 3,
+            "the latch must cover arm → fire → next redraw at the LANE's period"
         );
     }
 }

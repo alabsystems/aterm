@@ -126,7 +126,7 @@ pub(crate) fn parse_report(json: &str) -> Option<PerfReport> {
 /// the live gate uses [`PASS_RATIO`] (the source of truth), not this echoed copy.
 pub(crate) fn baseline_json(r: &PerfReport, ratio: f64) -> String {
     format!(
-        "{{\n  \"_comment\": \"aterm wall-clock throughput baseline (PERF-WALLCLOCK-BASELINE). Median-of-N MB/s of Terminal::process over a deterministic ~32 MiB mixed VT workload. Re-record with `ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf` (or `gate perf --record`). The gate fails only if measured median < median_mbps * pass_ratio; pass_ratio is generous to tolerate multi-machine/throttle variance.\",\n  \"median_mbps\": {:.3},\n  \"min_mbps\": {:.3},\n  \"max_mbps\": {:.3},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {:.3}\n}}\n",
+        "{{\n  \"_comment\": \"aterm wall-clock throughput baseline (PERF-WALLCLOCK-BASELINE). Median-of-N MB/s of Terminal::process over a deterministic ~32 MiB mixed VT workload. Re-record with `cargo run -p xtask -- gate perf --record`. The gate fails only if measured median < median_mbps * pass_ratio; pass_ratio is generous to tolerate multi-machine/throttle variance.\",\n  \"median_mbps\": {:.3},\n  \"min_mbps\": {:.3},\n  \"max_mbps\": {:.3},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {:.3}\n}}\n",
         r.median_mbps, r.min_mbps, r.max_mbps, r.workload_bytes, r.n, r.warmup, ratio,
     )
 }
@@ -219,8 +219,8 @@ pub(crate) fn pathological_baseline_json(medians: &[(&str, f64)], ratio: f64) ->
     let mut s = String::from(
         "{\n  \"_comment\": \"aterm PATHOLOGICAL-BENCH baseline: per-corpus median MB/s of \
          Terminal::process under hostile input (yes-flood / escape-storm / style-churn / \
-         long-escapes / wide-unicode). Re-record with ATERM_PERF_RECORD=1 cargo run -p xtask -- \
-         gate perf. Each corpus fails independently iff measured < recorded * pass_ratio.\",\n",
+         long-escapes / wide-unicode). Re-record with cargo run -p xtask -- \
+         gate perf --record. Each corpus fails independently iff measured < recorded * pass_ratio.\",\n",
     );
     for (name, med) in medians {
         s.push_str(&format!("  \"{name}_median_mbps\": {med:.3},\n"));
@@ -317,8 +317,7 @@ pub(crate) fn gate_pathological(trend: &mut Vec<TrendSample>) -> bool {
 fn compare_pathological_against_baseline(path: &Path, medians: &[(&'static str, f64)]) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!(
-            "  pathological: no baseline at {} — REPORT-ONLY, PASS (record with \
-             ATERM_PERF_RECORD=1).",
+            "  pathological: no baseline at {} — REPORT-ONLY, PASS (record with --record).",
             path.display()
         );
         for (name, med) in medians {
@@ -397,7 +396,7 @@ pub(crate) fn scroll_baseline_json(medians: &[(&str, f64)], ratio: f64) -> Strin
         "{\n  \"_comment\": \"aterm ARENA-SCROLL baseline: scrollback-scrub read-path rates \
          (rows materialized/sec for wheel-scrub + page-sweep, jumps/sec for jump-to-top) over a \
          100k+-line tiered-scrollback fill. All BIGGER-IS-BETTER. Re-record with \
-         ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf. Each phase fails independently iff \
+         cargo run -p xtask -- gate perf --record. Each phase fails independently iff \
          measured < recorded * pass_ratio.\",\n",
     );
     for (name, key) in SCROLL_PHASES {
@@ -498,8 +497,7 @@ pub(crate) fn gate_scroll_scrub(trend: &mut Vec<TrendSample>) -> bool {
 fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)]) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!(
-            "  scroll-scrub: no baseline at {} — REPORT-ONLY, PASS (record with \
-             ATERM_PERF_RECORD=1).",
+            "  scroll-scrub: no baseline at {} — REPORT-ONLY, PASS (record with --record).",
             path.display()
         );
         for (name, med) in medians {
@@ -535,16 +533,21 @@ fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)])
     ok
 }
 
-/// Should the gate (re)write the baseline this run? Either `ATERM_PERF_RECORD` is
-/// set to a truthy value, or `--record` appears anywhere on the argv.
+/// Should the gate (re)write the baseline this run? ONLY when `--record`
+/// appears on the argv.
+///
+/// There is deliberately no environment spelling. Recording is a WRITE SIDE
+/// EFFECT ON A GATE: it replaces the performance floors with whatever this run
+/// happened to measure, so a `ATERM_PERF_RECORD=1` left in a shell profile made
+/// every later `gate perf` pass by re-recording the floor it was supposed to
+/// enforce — silently, and for as long as the export lived. That is the same
+/// shape as `ATERM_SKIP_CHANNEL_VERSION_GATE`, which this repo deleted for
+/// exactly this reason (aterm-release `gates.rs`, docs/RELEASING.md): a gate's
+/// relaxation must be derived from an explicit per-invocation flag, never from
+/// ambient state. `--record` has to be typed, and it shows up in the shell
+/// history of the run that moved the numbers.
 pub(crate) fn record_requested() -> bool {
-    let env_truthy = std::env::var("ATERM_PERF_RECORD")
-        .map(|v| {
-            let v = v.trim();
-            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
-        })
-        .unwrap_or(false);
-    env_truthy || std::env::args().any(|a| a == "--record")
+    std::env::args().any(|a| a == "--record")
 }
 
 /// The wall-clock throughput sub-gate. Returns `true` (PASS) on success, including
@@ -600,7 +603,7 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!(
             "  throughput: no baseline at {} — REPORT-ONLY: {:.1} MB/s (median of {}). \
-             PASS (a fresh checkout is never blocked; record with ATERM_PERF_RECORD=1).",
+             PASS (a fresh checkout is never blocked; record with --record).",
             path.display(),
             report.median_mbps,
             report.n,
@@ -689,7 +692,7 @@ pub(crate) const SEARCH_LANE: FloorLane = FloorLane {
               retained-index lines-per-MiB on the trigram-diverse (rotating), repetitive-log \
               (replog), and hyperlink-heavy (linkheavy, Wave-4A P7) corpora, plus the \
               incremental index_scrollback_line primitive. All BIGGER-IS-BETTER. Re-record \
-              with ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf.",
+              with cargo run -p xtask -- gate perf --record.",
 };
 
 pub(crate) const RESTORE_LANE: FloorLane = FloorLane {
@@ -699,7 +702,7 @@ pub(crate) const RESTORE_LANE: FloorLane = FloorLane {
     baseline_file: "perf-baseline-restore.json",
     comment: "aterm RESTORE-BENCH baseline (E0): serialize->fresh-engine replay rate over a \
               10k-line SGR-mixed snapshot (the product's cold-restore path). BIGGER-IS-BETTER. \
-              Re-record with ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf.",
+              Re-record with cargo run -p xtask -- gate perf --record.",
 };
 
 pub(crate) const RESIZE_LANE: FloorLane = FloorLane {
@@ -711,7 +714,7 @@ pub(crate) const RESIZE_LANE: FloorLane = FloorLane {
               the 50k cap and offload+pump+reattach cycles/s over a 110k-line tiered fill. \
               BIGGER-IS-BETTER; the 42s-freeze-class ABSOLUTE fences live in the gate code \
               (RESIZE_RING_WORST_CAP_MS / RESIZE_TIERED_SYNC_WORST_CAP_MS), not this file. \
-              Re-record with ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf.",
+              Re-record with cargo run -p xtask -- gate perf --record.",
 };
 
 pub(crate) const WASM_LANE: FloorLane = FloorLane {
@@ -733,8 +736,8 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
     comment: "aterm WASM-BENCH baseline (E0): the SHIPPED wasm modules (CPU aterm-wasm + GPU \
               aterm-gpu-web) driven under node by tools/wasm-bench — ingest, scroll/typing \
               present, search build/query, restore, GPU wasm-side frame build. All \
-              BIGGER-IS-BETTER. Re-record with ATERM_PERF_RECORD=1 cargo run -p xtask -- gate \
-              perf (needs node + a wasm32-capable stable toolchain).",
+              BIGGER-IS-BETTER. Re-record with cargo run -p xtask -- gate perf \
+              --record (needs node + a wasm32-capable stable toolchain).",
 };
 
 /// The 42s-freeze-class ABSOLUTE fences (audit §5.3). Unlike the ratio floors
@@ -867,7 +870,7 @@ fn compare_keyed_against_baseline(
 ) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!(
-            "  {}: no baseline at {} — REPORT-ONLY, PASS (record with ATERM_PERF_RECORD=1).",
+            "  {}: no baseline at {} — REPORT-ONLY, PASS (record with --record).",
             lane.lane,
             path.display()
         );

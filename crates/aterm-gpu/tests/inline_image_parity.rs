@@ -373,6 +373,8 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
                 w: cw as u16,
                 h: ch as u16,
                 color: glow,
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             });
             input.images[0].push((
                 0,

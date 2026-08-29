@@ -77,7 +77,14 @@ impl Grid {
 
     /// WideCharConsistent + WideCharNotAtEnd: wide chars have continuations
     /// and don't appear at the last column.
-    #[cfg(any(test, feature = "testing"))]
+    // Compiled exactly when its ONE caller can reach it: `assert_invariants` is
+    // `#[cfg(any(test, feature = "testing"))]` with a `#[cfg(debug_assertions)]`
+    // body — so a release test build has the caller with an empty body, and an
+    // `any(...)` here leaves this method alive-but-dead under `--release
+    // --all-targets` lints. Deliberately NOT wired into the structural set: see
+    // `assert_structural_invariants`'s doc — WideCharConsistent is genuinely
+    // violable (the wide-write-over-continuation gap, owner-territory).
+    #[cfg(all(debug_assertions, any(test, feature = "testing")))]
     fn assert_wide_char_consistent(&self) {
         for row_idx in 0..self.storage.visible_rows {
             if let Some(row) = self.row(row_idx) {

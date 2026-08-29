@@ -30,6 +30,9 @@
 //! The bridge holds NO engine state and evaluates NO predicates — it is pure glue
 //! over `aterm-ctl`, so it inherits the control plane's auth, relay, and semantics
 //! verbatim (a cross-instance `@<sid>` is relayed by aterm-ctl exactly as always).
+//! DISCOVERY is glue over the aterm-ctl CRATE (`fleet_sessions`, the listing `ls`
+//! itself prints); the long-lived `subscribe` streamers and the `exec` dispatch
+//! are still glue over the aterm-ctl BINARY, resolved by [`ctl_bin`].
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
@@ -80,8 +83,9 @@ fn usage(code: u8) -> ExitCode {
          \x20 aterm-fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human\n\
          \x20 aterm-fleet clear-fault confirm=human\n\
          \x20 aterm-fleet propose    read one guarded-turn JSON proposal from stdin\n\n\
-         Operator commands use the in-process control client. Legacy events/exec find\n\
-         aterm-ctl via $ATERM_CTL, then a sibling of this binary, then PATH.\n\n\
+         Operator commands and fleet DISCOVERY use the in-process control client.\n\
+         The events streamers and exec find the aterm-ctl BINARY via $ATERM_CTL,\n\
+         then a sibling of this binary, then PATH.\n\n\
          The embedded operator is EXPERIMENTAL (status reports it) and OFF by default.\n\
          Launch an aterm instance with ATERM_OPERATOR=1 to opt in; it then starts with an\n\
          empty allowlist, so `manage <sid>` is still required before anything is observed.\n\
@@ -129,8 +133,12 @@ fn operator_ctl_args(
     Ok(ctl_args)
 }
 
-/// Resolve the `aterm-ctl` client: `$ATERM_CTL`, else a sibling of this binary
-/// (the co-distributed toolchain layout), else the bare name on `PATH`.
+/// Resolve the `aterm-ctl` BINARY for the child-process paths that still need
+/// one — the per-instance `subscribe` streamers and `exec` dispatch: `$ATERM_CTL`,
+/// else a sibling of this binary (the co-distributed toolchain layout), else the
+/// bare name on `PATH`. Discovery no longer goes through it (see
+/// [`list_sessions`]), so a missing binary is now a streaming/dispatch failure
+/// only, never a silently empty fleet.
 fn ctl_bin() -> String {
     if let Ok(p) = std::env::var("ATERM_CTL") {
         return p;
@@ -146,28 +154,127 @@ fn ctl_bin() -> String {
     "aterm-ctl".to_string()
 }
 
-/// A live session, from `aterm-ctl ls`: `<pid> <local> <sid> <parent> <state> <title>`.
+/// A live session from the fleet listing — the `<pid> <local> <sid> …` row of
+/// `ls`, reduced to the two columns the bridge addresses by.
 struct Session {
     pid: String,
     sid: String,
 }
 
-/// Snapshot the fleet via `aterm-ctl ls`. Empty on any failure (nothing to federate).
-fn list_sessions(ctl: &str) -> Vec<Session> {
-    let out = match Command::new(ctl).arg("ls").output() {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return Vec::new(),
-    };
-    String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let pid = it.next()?.to_string();
-            let _local = it.next()?;
-            let sid = it.next()?.to_string();
-            Some(Session { pid, sid })
+/// Snapshot the fleet IN-PROCESS, through the `aterm-ctl` CRATE's own listing.
+///
+/// WHAT THIS REPLACES. The scanner used to fork the `aterm-ctl` BINARY once per
+/// [`RESCAN_SECS`] — forever — and read `ls` out of its stdout, with every
+/// failure arm collapsed to `Vec::new()`: a missing binary, a nonzero exit and
+/// unparseable output were all indistinguishable from "the fleet is empty".
+/// `Command::output()` then swallowed the child's stderr, which is where
+/// `aterm-ctl` had written the actual cause (a control-socket directory it could
+/// not read, a sandbox refusing AF_UNIX `connect()`, an instance whose token was
+/// rewritten) — so a bridge that had gone permanently blind and a fleet with
+/// nothing running produced the SAME silence on `aterm-fleet events`.
+///
+/// `fleet_sessions` returns that classification as data, so the two are now
+/// distinct: `Err` is reported through `diag` (rate-limited — see
+/// [`ListDiagnostics`]), and only `Ok` can mean an empty fleet.
+fn list_sessions(diag: &mut ListDiagnostics) -> Vec<Session> {
+    let outcome = aterm_ctl::fleet_sessions();
+    if let Some(line) = diag.observe(&outcome) {
+        eprintln!("{line}");
+    }
+    outcome.map(|rows| sessions_from(&rows)).unwrap_or_default()
+}
+
+/// The listing rows the bridge can federate: those carrying both columns it
+/// addresses by (the instance pid for `--pid`, the sid for the fallback target
+/// list). A row too short to name a session is skipped, exactly as the column
+/// parse of `ls`'s stdout skipped it.
+fn sessions_from(rows: &[aterm_ctl::FleetSession]) -> Vec<Session> {
+    rows.iter()
+        .filter_map(|row| {
+            Some(Session {
+                pid: row.pid.to_string(),
+                sid: row.sid()?.to_string(),
+            })
         })
         .collect()
+}
+
+/// How often a STILL-BROKEN listing repeats its diagnostic: once per this many
+/// consecutive failures carrying the same reason. At [`RESCAN_SECS`] that is one
+/// line every five minutes — enough that an operator who attached to
+/// `aterm-fleet events` after the breakage still learns of it, and far short of
+/// the 1 Hz repetition that would drown the stream stderr shares with the
+/// federation notes.
+const LIST_REPEAT_EVERY: u64 = 300;
+
+/// The rate limiter and the phrasing for fleet-listing outcomes.
+///
+/// The federate loop lists once a second forever, so the diagnostic cannot be
+/// unconditional — but silence is the defect being fixed, so it cannot be
+/// dropped either. The rule: every DISTINCT reason speaks immediately (the first
+/// failure, and every change of cause), an unchanged one speaks again every
+/// [`LIST_REPEAT_EVERY`] scans, and a recovery speaks once and rearms.
+#[derive(Default)]
+struct ListDiagnostics {
+    /// The reason last reported and how many consecutive failures have carried
+    /// it; `None` while the listing is healthy.
+    failing: Option<(String, u64)>,
+}
+
+impl ListDiagnostics {
+    /// The line to log for this scan's `outcome`, or `None` when the scan says
+    /// nothing an operator has not already been told.
+    ///
+    /// "Nothing to federate" and "discovery is broken" are phrased apart on
+    /// purpose: an empty fleet is the bridge working, and an unreachable one is
+    /// the bridge blind — the whole point of reporting at all.
+    fn observe(
+        &mut self,
+        outcome: &Result<Vec<aterm_ctl::FleetSession>, aterm_ctl::FleetListError>,
+    ) -> Option<String> {
+        let error = match outcome {
+            Ok(rows) => {
+                // Recovery is worth exactly one line, and only after a failure:
+                // a healthy loop stays silent.
+                let (_, scans) = self.failing.take()?;
+                let found = rows.len();
+                return Some(format!(
+                    "aterm-fleet: fleet listing recovered — {found} session(s) after {scans} failed scan(s)"
+                ));
+            }
+            Err(error) => error,
+        };
+        let scans = match &mut self.failing {
+            Some((reason, scans)) if *reason == error.reason => {
+                *scans += 1;
+                *scans
+            }
+            slot => {
+                *slot = Some((error.reason.clone(), 1));
+                1
+            }
+        };
+        if scans > 1 && scans % LIST_REPEAT_EVERY != 0 {
+            return None;
+        }
+        let repeat = if scans > 1 {
+            format!(" (still, {scans} scans)")
+        } else {
+            String::new()
+        };
+        Some(if error.is_empty_fleet() {
+            format!(
+                "aterm-fleet: nothing to federate{repeat} — {}",
+                error.reason
+            )
+        } else {
+            format!(
+                "aterm-fleet: CANNOT LIST THE FLEET{repeat} — the fleet is unknown, not empty \
+                 (aterm-ctl ls would exit {}): {}",
+                error.code, error.reason
+            )
+        })
+    }
 }
 
 /// The fleet-rescan cadence: how often FEDERATE re-lists the fleet to pick up
@@ -223,13 +330,16 @@ fn federate() {
     let streaming: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let scanner = thread::spawn(move || {
+        // Carried ACROSS rescans: it is what keeps a broken listing from either
+        // spamming the stream once a second or going silent after one line.
+        let mut listing = ListDiagnostics::default();
         while !scan_stop.load(std::sync::atomic::Ordering::Relaxed) {
             // Group the live sids by owning instance pid. The sids are needed ONLY
             // as the fallback selector list for a peer too old to know `@*`; on a
             // current peer the list is never used.
             let mut fleet: std::collections::BTreeMap<String, Vec<String>> =
                 std::collections::BTreeMap::new();
-            for s in list_sessions(&scan_ctl) {
+            for s in list_sessions(&mut listing) {
                 fleet.entry(s.pid).or_default().push(s.sid);
             }
             for (pid, sids) in fleet {
@@ -552,6 +662,154 @@ mod tests {
         let (sid, argv) = dispatch_argv("text");
         assert_eq!(sid, "-");
         assert_eq!(argv, vec!["text".to_string()]);
+    }
+
+    /// A listing row as `aterm-ctl` hands one over.
+    fn row(pid: u32, row: &str) -> aterm_ctl::FleetSession {
+        aterm_ctl::FleetSession {
+            pid,
+            row: row.to_string(),
+            is_self: false,
+        }
+    }
+
+    /// A classified listing failure, as `fleet_sessions` reports one.
+    fn list_error(code: u8, reason: &str) -> aterm_ctl::FleetListError {
+        aterm_ctl::FleetListError {
+            reason: reason.to_string(),
+            code,
+        }
+    }
+
+    /// EQUIVALENCE: a live fleet federates exactly as before. The columns the
+    /// scanner keys on — the hosting pid and the sid — are the ones the `ls` row
+    /// always carried, and a row too short to name a session is still skipped
+    /// rather than federated as a phantom.
+    #[test]
+    fn a_live_listing_maps_to_the_same_pid_and_sid_columns_as_the_ls_parse() {
+        let listed = sessions_from(&[
+            row(
+                67939,
+                "0 s-ab12 - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude",
+            ),
+            row(
+                67939,
+                "1 s-cd34 s-ab12 alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
+            ),
+            row(70001, "0 s-ef56 - alive sh meta=0"),
+            // An explicit-socket instance whose graph entry named no pid: the `0`
+            // placeholder rides through exactly as it did through the printed row.
+            row(0, "0 s-0000 - alive sh meta=0"),
+            // Too short to name a session — never federated.
+            row(67939, "9"),
+        ]);
+        let pairs: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|s| (s.pid.as_str(), s.sid.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("67939", "s-ab12"),
+                ("67939", "s-cd34"),
+                ("70001", "s-ef56"),
+                ("0", "s-0000"),
+            ]
+        );
+    }
+
+    /// THE SILENT-EMPTY DEFECT: a listing that FAILED must reach the operator as
+    /// a diagnostic. It cannot reach them as sessions — the snapshot is empty
+    /// either way — so the logged line is the only thing standing between
+    /// "nothing to federate" and a bridge that has gone permanently blind.
+    #[test]
+    fn a_failed_listing_is_reported_and_never_read_as_an_empty_fleet() {
+        let mut diag = ListDiagnostics::default();
+        let broken = Err(list_error(
+            2,
+            "found 1 control socket in /run/aterm but could not reach any:\n  \
+             aterm-67939.sock  connect: Operation not permitted — a sandbox is refusing \
+             AF_UNIX connect()",
+        ));
+        let line = diag
+            .observe(&broken)
+            .expect("a failure must never pass silently");
+        assert!(line.contains("CANNOT LIST THE FLEET"), "{line}");
+        assert!(line.contains("not empty"), "{line}");
+        // The cause `Command::output()` used to swallow with the child's stderr.
+        assert!(
+            line.contains("a sandbox is refusing AF_UNIX connect()"),
+            "{line}"
+        );
+        assert!(line.contains("exit 2"), "{line}");
+
+        // An EMPTY fleet is a different sentence: the bridge is working, there is
+        // simply nothing to federate. An operator must be able to tell them apart
+        // from the stream alone.
+        let mut diag = ListDiagnostics::default();
+        let empty = Err(list_error(
+            1,
+            "no live aterm instances found (looked in /run/aterm)",
+        ));
+        let line = diag.observe(&empty).expect("said once");
+        assert!(line.contains("nothing to federate"), "{line}");
+        assert!(!line.contains("CANNOT LIST"), "{line}");
+    }
+
+    /// The 1 Hz rescan must not become a 1 Hz log. A distinct reason speaks at
+    /// once; the same one repeats only every [`LIST_REPEAT_EVERY`] scans, so an
+    /// operator who attached late still learns discovery is broken.
+    #[test]
+    fn a_repeated_failure_speaks_once_per_distinct_reason_then_periodically() {
+        let mut diag = ListDiagnostics::default();
+        let denied = Err(list_error(2, "connect: Operation not permitted"));
+        assert!(diag.observe(&denied).is_some(), "the first failure speaks");
+        for scan in 2..LIST_REPEAT_EVERY {
+            assert!(
+                diag.observe(&denied).is_none(),
+                "scan {scan} of an unchanged failure must stay quiet"
+            );
+        }
+        let repeat = diag
+            .observe(&denied)
+            .expect("the periodic reminder is what a late operator sees");
+        assert!(repeat.contains("still, 300 scans"), "{repeat}");
+
+        // A CHANGED cause is news, whatever the count: the fleet moved from
+        // "denied" to "the directory vanished" and the operator must hear it.
+        let missing = Err(list_error(
+            2,
+            "control-socket directory /run/aterm does not exist",
+        ));
+        let changed = diag.observe(&missing).expect("a new cause speaks at once");
+        assert!(changed.contains("does not exist"), "{changed}");
+        assert!(!changed.contains("still,"), "a new cause is not a repeat");
+    }
+
+    /// Recovery closes the story exactly once, and a healthy loop says nothing
+    /// at all — the property that lets an operator treat any listing line on the
+    /// stream as significant.
+    #[test]
+    fn a_recovered_listing_says_so_once_and_a_healthy_loop_stays_silent() {
+        let mut diag = ListDiagnostics::default();
+        let broken = Err(list_error(2, "connect: Operation not permitted"));
+        assert!(diag.observe(&broken).is_some());
+        assert!(diag.observe(&broken).is_none());
+
+        let live = Ok(vec![row(67939, "0 s-ab12 - alive sh meta=0")]);
+        let back = diag.observe(&live).expect("recovery is reported once");
+        assert!(back.contains("recovered"), "{back}");
+        assert!(
+            back.contains("1 session(s) after 2 failed scan(s)"),
+            "{back}"
+        );
+        assert!(
+            diag.observe(&live).is_none(),
+            "a healthy listing is silent, scan after scan"
+        );
+
+        // …and the next failure is news again, not a suppressed repeat.
+        assert!(diag.observe(&broken).is_some());
     }
 
     #[test]

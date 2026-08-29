@@ -388,6 +388,45 @@ pub(crate) fn cmd_key(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through
+/// the OS EVENT QUEUE instead of the control seam.
+///
+/// The deliberately different spelling from [`cmd_key`] is the point: the two
+/// verbs are not interchangeable and must never be confused in a measurement.
+/// `key` posts a decoded `InputEvent` to the main thread over a `CFRunLoopSource`
+/// and the arrival is stamped inside the handler, so the key is BORN already
+/// dequeued — no socket-injected key has ever measured OS-level key queueing.
+/// `hwkey` builds a real `NSEvent` and posts it into this application's own event
+/// queue, from THIS (control) thread, so it is dequeued, routed and translated by
+/// the same code a physical keypress runs, including the
+/// `note_key_arrival_queued` backdate that prices a parked event loop.
+///
+/// Reply honesty: `OK posted=<n>` means `n` press events were handed to the OS
+/// event queue, NOT that any of them reached the PTY. That is a weaker claim than
+/// `key`'s `OK` (which means the seam applied the event), and it is the strongest
+/// claim this path can truthfully make — the whole point is that delivery is the
+/// OS's business from the post onward. Read the result through `metrics`
+/// (`n_key_write` only ever moves on the hardware path) or `text`.
+pub(crate) fn cmd_hwkey(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let spec = match crate::hwkey::parse_hwkey(rest) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    // ONE main-thread round trip for the window number, then nothing else touches
+    // the main thread: the posting loop must be able to run — and the posted keys
+    // must be able to wait — while that thread is parked inside `nextDrawable`.
+    let window_number = match crate::control::control_media::call_main(proxy, |reply| {
+        Wake::HwKeyTarget { reply }
+    }) {
+        Ok(n) => n,
+        Err(e) => return format!("ERR hwkey: {e}\n"),
+    };
+    match crate::hwkey::post(&spec, window_number) {
+        Ok(n) => format!("OK posted={n}\n"),
+        Err(e) => e,
+    }
+}
+
 /// Map a reply-bearing input outcome to a verb reply line. `Ok` (applied) and
 /// `RangeRejected` (out-of-range geometry — not relevant to key/mouse/paste, but
 /// handled for completeness) become OK / ERR; an `Err` (event loop closed / no

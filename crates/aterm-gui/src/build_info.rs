@@ -72,9 +72,10 @@ pub const COMPILER_COMMIT: &str = env!("ATERM_COMPILER_COMMIT");
 pub const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
 
 /// Compiler flavor: `"r"` = upstream Rust, `"t"` = Trust (trustc). Detection order
-/// (see `build.rs` / `compiler_probe.rs`): explicit `ATERM_COMPILER_FLAVOR` override,
-/// the `-vV` self-identification, `/trust/` in the RUSTC path,
-/// `RUSTUP_TOOLCHAIN=trust`, else `"r"`.
+/// (see `build.rs` / `compiler_probe.rs`): the `-vV` self-identification,
+/// `/trust/` in the RUSTC path, `RUSTUP_TOOLCHAIN=trust`, else `"r"`. Evidence
+/// only — no build-environment override can flip it (the `build.rs` name below
+/// is a `cargo:rustc-env` conduit the build script writes, not one it reads).
 pub const COMPILER_FLAVOR: &str = env!("ATERM_COMPILER_FLAVOR");
 
 /// Cargo profile the binary was compiled under (`"debug"`/`"release"`).
@@ -85,8 +86,9 @@ pub const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
 
 /// Exact lowercase SHA-256 fingerprint of the raw compiled Ed25519 updater key,
 /// or the all-zero no-pin sentinel in an ordinary development build.  `build.rs`
-/// derives it from the same `ATERM_UPDATE_PUBKEY` input consumed by
-/// `aterm-update`; the release cutter independently cross-checks this record
+/// derives it from the same COMMITTED constant consumed by `aterm-update`
+/// (`aterm_update_core::pins::update_channel_signing_pubkey`), never from a build
+/// environment variable; the release cutter independently cross-checks this record
 /// against both runtime diagnostics and the permanent channel authority.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const EMBEDDED_UPDATE_PIN_SHA256: &str = env!("ATERM_UPDATE_PIN_SHA256");

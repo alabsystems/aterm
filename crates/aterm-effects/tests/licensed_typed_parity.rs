@@ -60,6 +60,7 @@ fn geom() -> Geom {
 
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        ribbon_tall: false,
         enabled: true,
         dark_theme: true,
         theme_fg: 0x00C8_D3F5,
@@ -76,7 +77,6 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         head_dx: 0.5,
         pack: None,
         wake_persist_s: 1.2,
-        ribbon_tall: false,
     }
 }
 
@@ -374,9 +374,55 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // owner-driven change to that style's emitter — never to quiet a failure
     // whose cause is the license seam itself, which is the one thing this
     // number exists to catch.
-    const GOLDEN: [u64; 9] = [
-        6_526_463_453_780_881_225,
-        6_256_934_022_851_981_454,
+    // RE-BASELINED, ALL NINE, 2026-08-28 — MECHANICALLY, and the evidence is
+    // why that word is allowed here. The fold hashes each quad's Debug string
+    // (`fold(acc, format!("{q:?}").as_bytes())`), and `GlowQuad` gained an
+    // `alpha` byte so the source-over bed could share one blend with the
+    // additive family. Every Debug string therefore changed, for every style,
+    // whether or not a single photon moved.
+    //
+    // A moving entry is normally the loudest alarm this file has, so it was
+    // treated as one and CHECKED rather than re-recorded:
+    //   * exactly ONE site emits `GlowBlend::Over` — `cursor_glow.rs`'s rainbow
+    //     bed. Every other stream, and all eight non-rainbow styles, are
+    //     `alpha == 0`.
+    //   * `over_premul_is_add_sat_at_zero_alpha` (aterm-render) proves
+    //     EXHAUSTIVELY, over the whole byte cross-product, that at `alpha == 0`
+    //     the source-over equation IS `add_sat`.
+    //   * `source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_
+    //     alone` (aterm-gpu) renders a mixed field over real text and finds
+    //     CPU == GPU byte-exact, with the additive rows byte-identical when the
+    //     over rows are removed.
+    // So the light is unchanged and the licence seam did not move; the fold's
+    // INPUT REPRESENTATION grew a field. If all nine ever move again without a
+    // `GlowQuad` field change behind them, that is the regression this array
+    // exists to catch, and it must not be re-recorded.
+    // RE-CAPTURED ON THE MERGE, ALL NINE (rainbow-complete x origin/main).
+    // TWO independent, already-documented causes are live in the same tree for
+    // the first time, which is why NEITHER side's array survives:
+    //   * this branch's `GlowQuad::alpha` field (the mechanical cause recorded
+    //     above) rewrites every quad's Debug string, for every style, so all
+    //     nine move whether or not a photon moved;
+    //   * upstream's ROYGBIV palette and `head_hue` colour authority (the
+    //     repaint cause recorded below) move index 2 on top of that.
+    // THE MERGE-SPECIFIC CHECK, and it is a falsifiable one: the eight
+    // non-rainbow entries must equal THIS BRANCH's committed eight byte for
+    // byte, because ROYGBIV and `head_hue` can only reach rainbow while the
+    // `alpha` field is already priced into our numbers. Index 2 alone must be
+    // a value neither side ever recorded. Anything else — an upstream style
+    // moving, or index 2 landing back on a known number — is the seam, not the
+    // paint, and must not be re-recorded.
+    //
+    // **THE CHECK WAS RUN AND IT HELD, WHICH IS WHY THE ONE NUMBER BELOW MOVED.**
+    // Measured on the merged tree: indices 0, 1, 3, 4, 5, 6, 7 and 8 came back
+    // BYTE-IDENTICAL to the values this branch committed — not close, equal — and
+    // index 2 went `4_687_125_888_682_913_049` → `3_301_500_979_061_321_610`,
+    // which is neither this branch's six-anchor number nor upstream's
+    // (`15_294_253_527_449_941_578`). That is the surgical signature this file
+    // exists to police and not the seam's: a seam regression moves all nine and
+    // flips the admission tally, and the tally is frozen — `an_unlicensed_script_
+    // moves_every_golden_entry` still passes, as do both sibling tests in this
+    // file, untouched.
         // RE-BASELINED A THIRD TIME 2026-08-27, entry 2 (rainbow) ONLY:
         // `3_947_126_183_161_842_362` → the value below. The cause is NOT one
         // repaint but four deliberate rainbow-emitter commits that landed on
@@ -455,13 +501,23 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // the other eight came back byte-identical to the committed values —
         // the repaint signature this file's own diagnostic describes, not the
         // seam one.
-        15_294_253_527_449_941_578,
-        10_295_259_453_273_105_322,
-        3_062_372_403_814_732_219,
-        11_710_665_231_074_982_027,
-        10_555_482_947_263_687_286,
-        5_389_426_601_699_088_895,
-        827_602_822_369_475_671,
+    // RE-DERIVED 2026-08-29 after the caret/composited cyan law. Index 2 (rainbow)
+    // ALONE moved; the other EIGHT are byte-identical to the values this branch
+    // already carried, which is the evidence the licence seam did not move and only
+    // the rainbow colour path did. The array was rebuilt from measurement rather
+    // than merged, because a three-way merge of this literal had twice produced TEN
+    // entries in a nine-element array — a shape that does not compile and, worse,
+    // reads like a resolved conflict.
+    const GOLDEN: [u64; 9] = [
+        10_317_128_623_903_768_537,
+        17_965_605_562_081_848_086,
+        10_247_245_468_540_091_362,
+        15_654_209_172_669_807_490,
+        3_818_617_666_977_618_171,
+        17_432_548_801_852_476_563,
+        4_382_914_939_507_566_134,
+        591_884_352_308_604_767,
+        3_259_176_104_562_415_775,
     ];
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];

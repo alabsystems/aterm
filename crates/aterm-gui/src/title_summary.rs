@@ -558,7 +558,7 @@ fn shed_place<'a>(title: &str, description: &'a str) -> &'a str {
     if place.is_empty() || state.is_empty() {
         return description;
     }
-    // `~/aterm`, `/home/x/aterm` and a bare `aterm` all count as naming it.
+    // `~/aterm`, `/home/<user>/aterm` and a bare `aterm` all count as naming it.
     let names_place = title
         .rsplit(['/', ' ', ':'])
         .any(|token| !token.is_empty() && token == place);
@@ -4271,11 +4271,26 @@ mod tests {
     /// (the same shape `maximum_type_landscape_update_sections_are_complete` uses),
     /// not a POSIX tool, which is what made the previous proof unrunnable on
     /// Windows.
+    /// THREE PROCESSES, NOT TWO, and the middle one is what makes it sound.
+    /// The old shape `set_var`'d the leaked names into THIS process so the
+    /// spawned daemon could prove they were cleared — but `set_var` mutates the
+    /// process-global environment while cargo's harness runs sibling tests on
+    /// other threads, which is exactly the race `deprecated_safe_2024` exists
+    /// to flag, and its "single-threaded test setup" SAFETY comment claimed a
+    /// guarantee the harness does not give. So the leak is now INJECTED, not
+    /// planted: the outer test re-execs itself as a STAGER with the four names
+    /// staged through `Command::env` — making them genuinely inherited across a
+    /// real exec boundary — and the stager, which owns them in its own
+    /// environment from birth, spawns the managed daemon exactly as before. No
+    /// process ever mutates its own environment, and the property proved gets
+    /// STRONGER: "cleared what it inherited" now spans a true exec.
     #[test]
     fn the_real_command_surface_clears_the_environment_it_inherits() {
+        const STAGER: &str = "ATERM_OLLAMA_ENV_STAGER";
         const CHILD: &str = "ATERM_OLLAMA_ENV_CHILD";
         const SENTINEL: &str = "ATERM_OLLAMA_ENV_SENTINEL";
-        const EXACT: &str = "title_summary::tests::the_real_command_surface_clears_the_environment_it_inherits";
+        const EXACT: &str =
+            "title_summary::tests::the_real_command_surface_clears_the_environment_it_inherits";
 
         if std::env::var_os(CHILD).is_some() {
             // We are the child, spawned through the real surface. The sentinel
@@ -4291,6 +4306,10 @@ mod tests {
                     "the managed daemon inherited {leaked}"
                 );
             }
+            // The marker the stager asserts on. Without it, a child spawn
+            // whose `--exact` filter matched nothing would run zero tests,
+            // exit 0, and turn this whole proof vacuous.
+            eprintln!("ATERM-ENV-TEST: child ran its assertions");
             // …and the minimal set really did arrive.
             assert_eq!(
                 std::env::var_os("OLLAMA_NOHISTORY").as_deref(),
@@ -4300,40 +4319,76 @@ mod tests {
             return;
         }
 
-        let home = std::env::temp_dir();
-        // SAFETY: single-threaded test setup, before any child is spawned; the
-        // variables are read back only in the child process.
-        unsafe {
-            std::env::set_var(SENTINEL, "leaked");
-            std::env::set_var("OLLAMA_API_KEY", "leaked");
-            std::env::set_var("HTTPS_PROXY", "leaked");
-            std::env::set_var("SSH_AUTH_SOCK", "leaked");
+        let exe = std::env::current_exe().expect("test binary path");
+
+        if std::env::var_os(STAGER).is_some() {
+            // We are the STAGER: the four leaked names are in OUR inherited
+            // environment — put there by the outer process through the exec
+            // boundary, never by mutation. Spawn the managed daemon through the
+            // real surface; it must not see them.
+            let home = std::env::temp_dir();
+            let mut command = managed_ollama_command(
+                &exe,
+                "127.0.0.1:11434",
+                std::path::Path::new("/managed/models"),
+                &home,
+            );
+            // `managed_ollama_command` stages `serve`; the harness needs its own
+            // argv and its own stdio to report a failure.
+            command
+                .arg("--exact")
+                .arg(EXACT)
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let output = command.output().expect("re-exec this test binary");
+            let child_err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child rejected the cleared environment:\nstdout: {}\nstderr: {child_err}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            // Exit 0 alone is not proof: a filter that matched nothing also
+            // exits 0. Demand the child's own marker.
+            assert!(
+                child_err.contains("ATERM-ENV-TEST: child ran its assertions"),
+                "the child exited 0 without running its assertions — the \
+                 `--exact` filter matched nothing and the proof was vacuous:\n{child_err}"
+            );
+            eprintln!("ATERM-ENV-TEST: stager spawned and verified the child");
+            return;
         }
 
-        let exe = std::env::current_exe().expect("test binary path");
-        let mut command = managed_ollama_command(
-            &exe,
-            "127.0.0.1:11434",
-            std::path::Path::new("/managed/models"),
-            &home,
-        );
-        // `managed_ollama_command` stages `serve`; the harness needs its own argv
-        // and its own stdio to report a failure.
-        command
+        // Outermost: inject the leak into the stager the sound way — staged on
+        // ITS Command, inherited by IT, owned by no thread of ours.
+        let mut stage = std::process::Command::new(&exe);
+        stage
             .arg("--exact")
             .arg(EXACT)
             .arg("--nocapture")
-            .env(CHILD, "1")
+            .env(STAGER, "1")
+            .env(SENTINEL, "leaked")
+            .env("OLLAMA_API_KEY", "leaked")
+            .env("HTTPS_PROXY", "leaked")
+            .env("SSH_AUTH_SOCK", "leaked")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-
-        let output = command.output().expect("re-exec this test binary");
+        let staged = stage.output().expect("re-exec this test binary as stager");
+        let stager_err = String::from_utf8_lossy(&staged.stderr);
         assert!(
-            output.status.success(),
-            "child rejected the cleared environment:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            staged.status.success(),
+            "stager failed:\nstdout: {}\nstderr: {stager_err}",
+            String::from_utf8_lossy(&staged.stdout),
+        );
+        // Same anti-vacuity demand, one level up.
+        assert!(
+            stager_err.contains("ATERM-ENV-TEST: stager spawned and verified the child"),
+            "the stager exited 0 without spawning the child — the `--exact` \
+             filter matched nothing and the proof was vacuous:\n{stager_err}"
         );
     }
 

@@ -126,7 +126,12 @@ pub const ENV_NET_KEY: &str = "ATERM_NET_KEY";
 /// child is re-injected a fresh set; see the consts above and `build_child_env`).
 pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_CONTAINMENT_MODE",
-    "ATERM_CONTAINMENT_ALLOWLIST",
+    // (There is no `ATERM_CONTAINMENT_ALLOWLIST`. It was deny-listed here and
+    // advertised in aterm-gui(1) as a containment knob, but no parser, field, or
+    // env read for it has ever existed in `aterm-containment` — the allowlist is
+    // loaded from TOML via `AllowlistConfig`, never from the environment.
+    // Denying a name nothing reads defends nothing and documented a knob users
+    // could not use.)
     // Control-socket selectors: never inherit, so a nested aterm rebinds its OWN
     // per-instance socket and never unlinks/steals the parent's explicit path.
     "ATERM_CONTROL_SOCK",
@@ -202,7 +207,6 @@ mod tests {
     #[test]
     fn test_is_ai_env_var_strips_containment_vars_but_preserves_shell_integration_vars() {
         assert!(is_ai_env_var("ATERM_CONTAINMENT_MODE"));
-        assert!(is_ai_env_var("ATERM_CONTAINMENT_ALLOWLIST"));
         assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
         assert!(!is_ai_env_var("ATERM_ORIGINAL_ZDOTDIR"));
         assert!(!is_ai_env_var("ATERM_UNSET_ZDOTDIR"));

@@ -144,7 +144,7 @@ const HELP_HEAD: &str = concat!(
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
     "        --shell-integration        OSC 133/633 command marks (blocks/cwd/title) — ON by\n",
-    "                                       default; this flag is a no-op. [env: ATERM_SHELL_INTEGRATION]\n",
+    "                                       default; this flag is a no-op.\n",
     "        --no-shell-integration     Disable shell-integration marks (default is on).\n",
     "                                       [env: ATERM_NO_SHELL_INTEGRATION]\n",
     "        --no-procedural-glyphs     Disable procedural box/Powerline glyphs.\n",
@@ -257,7 +257,6 @@ const HELP_TAIL: &str = concat!(
     "                               equivalent of --headless. 0/off/empty do NOT arm it\n",
     "                               (and say so on stderr rather than starting a window\n",
     "                               under a script that is waiting for a socket).\n",
-    "    ATERM_SHELL_INTEGRATION=1  OSC 133/633 command marks (ON by default; this is a no-op).\n",
     "    ATERM_NO_SHELL_INTEGRATION=1  Disable shell-integration marks (default is on).\n",
     "    ATERM_NO_PROCEDURAL_GLYPHS=1  Disable procedural box/Powerline glyphs.\n",
     "    ATERM_TRACE_LATENCY=1      Print PTY→present latency samples.\n",
@@ -996,7 +995,12 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                     std::process::exit(2);
                 }
             }
-            "--shell-integration" => flag_env("ATERM_SHELL_INTEGRATION", "1"),
+            // Accepted for compatibility and does nothing: shell integration is
+            // on by default and `--no-shell-integration` is the opt-out. This
+            // used to `flag_env("ATERM_SHELL_INTEGRATION", "1")`, which exported
+            // a variable no code has ever read — a write-only name in the env
+            // surface. The flag stays; the phantom variable is gone.
+            "--shell-integration" => {}
             "--no-shell-integration" => flag_env("ATERM_NO_SHELL_INTEGRATION", "1"),
             "--no-procedural-glyphs" => flag_env("ATERM_NO_PROCEDURAL_GLYPHS", "1"),
             "--trace-latency" => flag_env("ATERM_TRACE_LATENCY", "1"),

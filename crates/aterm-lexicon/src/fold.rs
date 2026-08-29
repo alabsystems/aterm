@@ -116,6 +116,32 @@ fn base_letter(c: char) -> Option<char> {
     Some(b)
 }
 
+/// True when `s` carries diacritic information that [`fold`] DROPS: a
+/// strippable combining mark, or a precomposed accented letter that folds to
+/// its bare base (`đ` → `d`, `ç` → `c`, `ä` → `a`, Turkish `ı` → `i`).
+///
+/// The `ß`→`ss` and final-sigma folds are NOT mark loss — they are canonical
+/// respellings whose result spells the same word — so they do not count.
+///
+/// This is the witness the scanner's marks-required gate keys on: a lexicon
+/// surface that loses marks in folding (Vietnamese `đm` → `dm`, whose entry
+/// says the tone marks are essential) compiles to a bare-ASCII key that plain
+/// ASCII typing would otherwise complete (`dm` mid-`dmg` fired the curse
+/// bonk, 2026-08-29). Such a surface only matches a token that itself folds
+/// marks away — `đm`, `ĐM`, or a decomposed `d` + combining stroke — never
+/// the bare skeleton.
+#[must_use]
+pub fn has_foldable_marks(s: &str) -> bool {
+    s.chars().any(|c| {
+        if c.is_ascii() {
+            return false;
+        }
+        is_strippable_mark(c)
+            || c.to_lowercase()
+                .any(|lc| is_strippable_mark(lc) || base_letter(lc).is_some())
+    })
+}
+
 /// A combining mark we DROP during folding (a non-spacing diacritic in a script
 /// whose base letters are written separately). Restricted to the ranges where
 /// stripping is safe: Latin, Greek, Cyrillic, Arabic harakat, Hebrew niqqud.

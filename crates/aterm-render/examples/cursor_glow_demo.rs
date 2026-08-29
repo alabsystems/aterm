@@ -92,6 +92,8 @@ fn main() {
                     w: (x1 - x0) as u16,
                     h: (band_end - yy) as u16,
                     color: premul,
+                    // ADDITIVE light (see `GlowQuad::alpha`).
+                    alpha: 0,
                 });
                 yy = band_end;
             }
@@ -224,6 +226,8 @@ fn main() {
                 w: cw as u16,
                 h: ch as u16,
                 color: premul_rgb(lumen(pos), cov),
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             });
         }
         input.cursor_glow_add = q;

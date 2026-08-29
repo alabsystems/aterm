@@ -60,6 +60,8 @@ fn fire_comet(row: usize, cols: std::ops::Range<usize>, cw: usize, ch: usize) ->
         w: cw as u16,
         h: ch as u16,
         color: premul_rgb(0x00FF_6A00, 230),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
     })
     .collect()
 }
@@ -445,6 +447,8 @@ fn shimmer_region_derivation_sanity() {
             w: cw as u16,
             h: ch as u16,
             color: 0,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         })
         .collect();
     assert!(
@@ -535,6 +539,8 @@ fn shimmer_visual_dump() {
                 w: cw as u16,
                 h: ch as u16,
                 color: premul_rgb(0x00FF_6A00, 245u8.saturating_sub(d * 22)),
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                alpha: 0,
             }
         })
         .collect();

@@ -18206,10 +18206,19 @@ mod tests {
         let motion = crate::native_app::ViewMotionCx::default();
         let theme = aterm_render::Theme::default();
         for (raw, expected) in [
+            // The underline spelling is a GEOMETRY of the kitty family and
+            // draws the family's companion. It used to answer FlyingKitty here
+            // — not by any rule, but because `style_names_kitty_pet` is a
+            // whole-string equality that it happened not to match, so appending
+            // one geometry word to `rainbow kitty` swapped the animal.
             (
                 "rainbow kitty underline",
-                PreviewTrailCompanion::FlyingKitty,
+                PreviewTrailCompanion::Pet(PetSpecies::Cat),
             ),
+            // `… tall` is the sibling spelling that still falls through to the
+            // head (`cursor_glow`'s
+            // `every_kitty_spelling_draws_the_resident_and_flying_stays_reachable`
+            // pins it out of both companion lists on purpose).
             ("rainbow kitty tall", PreviewTrailCompanion::FlyingKitty),
             (
                 "rainbow kitty pet",

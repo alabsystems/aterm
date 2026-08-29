@@ -841,6 +841,8 @@ mod tests {
                     w: 40,
                     h: 14,
                     color: 0x0020_1008,
+                    // ADDITIVE light (see `GlowQuad::alpha`).
+                    alpha: 0,
                 },
                 GlowQuad {
                     row: 0,
@@ -849,6 +851,8 @@ mod tests {
                     w: 18,
                     h: 20,
                     color: 0x0008_1020,
+                    // ADDITIVE light (see `GlowQuad::alpha`).
+                    alpha: 0,
                 },
             ];
             // Fire field patches in the head band, Add then Over ink.
@@ -895,6 +899,8 @@ mod tests {
                     w: 8,
                     h: 12,
                     color: 0x0018_3040,
+                    // ADDITIVE light (see `GlowQuad::alpha`).
+                    alpha: 0,
                 },
                 GlowQuad {
                     row: 5,
@@ -903,6 +909,8 @@ mod tests {
                     w: 30,
                     h: 8,
                     color: 0x0030_1010,
+                    // ADDITIVE light (see `GlowQuad::alpha`).
+                    alpha: 0,
                 },
             ];
             // Radial halos: an Add ember on the left strip + an Over veil on
@@ -981,6 +989,8 @@ mod tests {
             w: 24,
             h: 10,
             color: 0x0020_3040,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         let mut spill = SpillBand::new();
         spill.update(&r, &input);
@@ -1053,6 +1063,8 @@ mod tests {
             w: 8,
             h: 8,
             color: 0x0010_2030,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 0, "grid-interior emissions must not tick");
@@ -1071,6 +1083,8 @@ mod tests {
             w: 20,
             h: 12,
             color: 0x0020_1008,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1);
@@ -1124,6 +1138,8 @@ mod tests {
             w: 16,
             h: 10,
             color: 0x0020_2020,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         let mut spill = SpillBand::new();
         spill.update(&r, &input);
@@ -1172,6 +1188,8 @@ mod tests {
             w: 10,
             h: 10,
             color: 0x0020_2020,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         let mut spill = SpillBand::new();
         spill.update(&r, &input);

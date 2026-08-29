@@ -44,33 +44,28 @@ pub fn parse_rustc_vv(vv: &str) -> RustcVv {
 
 /// Classify the compiler flavor: `"r"` (upstream Rust) or `"t"` (the Trust fork).
 ///
+/// EVIDENCE ONLY. There is deliberately no override — this is a provenance
+/// claim the project ships in the About panel and `aterm ctl version`, and a
+/// claim that can be flipped from the build shell with no diff to review is not
+/// evidence. (An `ATERM_COMPILER_FLAVOR=r|t` env override used to rank ahead of
+/// every signal below, so `ATERM_COMPILER_FLAVOR=t cargo build` shipped a binary
+/// that reported trustc provenance it did not have. The three signals that
+/// remain already covered every real lane.)
+///
 /// Priority order (first match wins):
-///   1. an explicit `ATERM_COMPILER_FLAVOR=r|t` override (other values are ignored,
-///      falling through — a typo must not silently mislabel provenance);
-///   2. the compiler's own `-vV` self-identification: `binary: trustc` or a
+///   1. the compiler's own `-vV` self-identification: `binary: trustc` or a
 ///      `(trustc)` / `(trustc <version>)` version-line parenthetical (the 2026-07
 ///      toolchains stamp both; direct evidence from the probed binary, so it
-///      survives lanes where no env hint exists — e.g. `ATERM_CARGO=targo`
-///      resolves a bare `rustc` via PATH and sets neither RUSTC nor
-///      RUSTUP_TOOLCHAIN);
-///   3. the `RUSTC` path contains `/trust/` (the fork lives at `$HOME/trust/build/...`,
+///      survives lanes where no env hint exists — e.g. a bare `rustc` resolved
+///      via PATH, which sets neither RUSTC nor RUSTUP_TOOLCHAIN);
+///   2. the `RUSTC` path contains `/trust/` (the fork lives at `$HOME/trust/build/...`,
 ///      linked as `~/.rustup/toolchains/trust/` — covers pre-marker toolchains);
-///   4. `RUSTUP_TOOLCHAIN == "trust"` (a `rustup toolchain link trust ...` lane).
-///   5. default `"r"`.
+///   3. `RUSTUP_TOOLCHAIN == "trust"` (a `rustup toolchain link trust ...` lane).
+///   4. default `"r"`.
 ///
 /// Deliberately NOT inferred from a `-dev` release string: ANY locally built rustc
 /// (upstream included) reports `-dev`, so `-dev` alone is zero evidence of Trust.
-pub fn detect_flavor(
-    explicit: Option<&str>,
-    vv: &str,
-    rustc_path: &str,
-    rustup_toolchain: Option<&str>,
-) -> &'static str {
-    match explicit {
-        Some("r") => return "r",
-        Some("t") => return "t",
-        _ => {}
-    }
+pub fn detect_flavor(vv: &str, rustc_path: &str, rustup_toolchain: Option<&str>) -> &'static str {
     let vv_says_trust = vv.lines().any(|l| {
         l.strip_prefix("binary:")
             .is_some_and(|b| b.trim() == "trustc")
@@ -151,11 +146,11 @@ mod tests {
     fn flavor_defaults_to_r() {
         // The default on this box: stock cargo, no override, no trust toolchain.
         assert_eq!(
-            detect_flavor(None, UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
+            detect_flavor(UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
             "r"
         );
         assert_eq!(
-            detect_flavor(None, UPSTREAM_VV, "rustc", Some("stable")),
+            detect_flavor(UPSTREAM_VV, "rustc", Some("stable")),
             "r"
         );
     }
@@ -164,58 +159,59 @@ mod tests {
     fn flavor_trust_from_rustc_path_or_toolchain() {
         assert_eq!(
             detect_flavor(
-                None,
                 TRUST_VV,
                 "/Users//example/trust/build/host/stage2/bin/rustc",
                 None
             ),
             "t"
         );
-        assert_eq!(detect_flavor(None, TRUST_VV, "rustc", Some("trust")), "t");
+        assert_eq!(detect_flavor(TRUST_VV, "rustc", Some("trust")), "t");
     }
 
     /// The 2026-07 trustc self-identifies in `-vV`, so it classifies 't' with NO
-    /// env evidence at all — the `ATERM_CARGO=targo` ship lane (bare `rustc` via
+    /// env evidence at all — the targo ship lane (bare `rustc` via
     /// PATH, no RUSTC, no RUSTUP_TOOLCHAIN), which previously mislabeled as +r.
     #[test]
     fn flavor_trust_from_vv_self_identification() {
-        assert_eq!(detect_flavor(None, TRUST_VV_MARKED, "rustc", None), "t");
+        assert_eq!(detect_flavor(TRUST_VV_MARKED, "rustc", None), "t");
         // Either marker alone suffices: version-line parenthetical…
         let line_only = "rustc 1.96.0-dev (7e631b2a4 2026-07-04) (trustc)\nbinary: rustc";
-        assert_eq!(detect_flavor(None, line_only, "rustc", None), "t");
+        assert_eq!(detect_flavor(line_only, "rustc", None), "t");
         // …or the `binary: trustc` field.
         let field_only = "rustc 1.96.0-dev (7e631b2a4 2026-07-04)\nbinary: trustc";
-        assert_eq!(detect_flavor(None, field_only, "rustc", None), "t");
+        assert_eq!(detect_flavor(field_only, "rustc", None), "t");
         // …or the versioned parenthetical the post-purge toolchains print
         // (`(trustc <trust-version>)` — Trust's own version, not the rust-compat
         // number).
         let versioned = "rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 0.1.0)\nbinary: rustc";
-        assert_eq!(detect_flavor(None, versioned, "rustc", None), "t");
+        assert_eq!(detect_flavor(versioned, "rustc", None), "t");
         // "(trustc)" anywhere PAST the first line is not the marker (defensive:
         // only the version line's parenthetical is the compiler's self-name).
         let stray = "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)\nbinary: rustc\nnote: (trustc)";
-        assert_eq!(detect_flavor(None, stray, "rustc", None), "r");
+        assert_eq!(detect_flavor(stray, "rustc", None), "r");
     }
 
+    /// Provenance is EVIDENCE ONLY — there is no override, in either direction.
+    ///
+    /// This replaces `flavor_explicit_override_wins_and_junk_falls_through`,
+    /// which pinned an `ATERM_COMPILER_FLAVOR=r|t` build-environment override
+    /// that ranked AHEAD of the compiler's own `-vV` self-identification. That
+    /// made `ATERM_COMPILER_FLAVOR=t cargo build` produce a binary whose About
+    /// panel and `aterm ctl version` claimed trustc provenance it did not have
+    /// — a claim the project ships as evidence, falsifiable from a shell with
+    /// no diff to review. The remaining three signals cover every real lane,
+    /// including the bare-PATH `rustc` one the override was justified by.
     #[test]
-    fn flavor_explicit_override_wins_and_junk_falls_through() {
-        // Explicit override beats vV/path/toolchain evidence, in BOTH directions.
+    fn flavor_is_evidence_only_and_cannot_be_overridden() {
+        // Trust evidence classifies 't' whatever the environment says.
         assert_eq!(
-            detect_flavor(
-                Some("r"),
-                TRUST_VV_MARKED,
-                "/x/trust/bin/rustc",
-                Some("trust")
-            ),
-            "r"
-        );
-        assert_eq!(
-            detect_flavor(Some("t"), UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
+            detect_flavor(TRUST_VV_MARKED, "/x/trust/bin/rustc", Some("trust")),
             "t"
         );
-        // A junk override is ignored, not trusted.
+        // An upstream compiler at an upstream path stays 'r'. Nothing an
+        // operator can export moves it.
         assert_eq!(
-            detect_flavor(Some("banana"), UPSTREAM_VV, "rustc", None),
+            detect_flavor(UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
             "r"
         );
     }
@@ -228,7 +224,7 @@ mod tests {
         let p = parse_rustc_vv(TRUST_VV);
         assert!(p.version_line.contains("-dev"));
         assert_eq!(
-            detect_flavor(None, TRUST_VV, "/usr/local/bin/rustc", None),
+            detect_flavor(TRUST_VV, "/usr/local/bin/rustc", None),
             "r"
         );
     }

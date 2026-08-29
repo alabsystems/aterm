@@ -976,11 +976,13 @@ fn fs_hdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
 
 // SDR twin of the boost (the swapchain-side crown on a NON-f16 present): scale
 // the aurora colour by the BUDGET (hu.headroom carries it, <= 0.35 by the proven
-// `sdr_glow_budget` bound; hu.boost is 1.0) and One/One-add RAW — the SDR
-// swapchain is a non-sRGB Unorm view, so blending adds code values, the exact
-// GPU twin of the CPU `add_sat` convention (no s2l decode). Scaling (not
-// clamping) preserves the glow's gradient shape: peak = budget at full colour,
-// no plateau. COLOR write-mask: the blit's alpha stays 1.0.
+// `sdr_glow_budget` bound; hu.boost is 1.0) and emit it RAW — the SDR swapchain
+// is a non-sRGB Unorm view, so blending works in code values (no s2l decode).
+// The pipeline composites this through the BOUNDED screen operator
+// (`BoostComposite::Screen`), NOT One/One: the crown is the last light drawn on
+// the frame and an add here lands outside every budget upstream of it. Scaling
+// (not clamping) preserves the glow's gradient shape: peak = budget at full
+// colour, no plateau. COLOR write-mask: the blit's alpha stays 1.0.
 @fragment
 fn fs_sdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
     let c = clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -1054,15 +1056,18 @@ fn fs_tray(in: TrayOut) -> @location(0) vec4<f32> {
 "#;
 
 /// GPU-only cursor-comet BLOOM (the "more amazing on GPU" layer). The crisp comet
-/// is rendered into a HALF-RES texture, gaussian-blurred, and additively composited
-/// back over the offscreen — a soft radiant halo around the streak that host quads
-/// can't cheaply do. This is a PRESENT-QUALITY embellishment LAYERED on top of the
+/// is rendered into a HALF-RES texture, gaussian-blurred, and composited back over
+/// the offscreen through the BOUNDED [`BoostComposite::Screen`] operator — a soft
+/// radiant halo around the streak that host quads can't cheaply do, which spends
+/// the destination's remaining headroom instead of overflowing it. This is a
+/// PRESENT-QUALITY embellishment LAYERED on top of the
 /// (byte-parity-proven) base render: it only runs when `enable_bloom` is set, so the
 /// CPU/GPU differential tests (which disable it) stay byte-exact.
 ///
 /// `vs_fs` is the standard fullscreen triangle. `fs_bloom` does a separable-free
 /// 5×5 gaussian over the half-res glow texture (cheap; the half-res + linear filter
-/// already widen it) scaled by `strength`, returned for a One/One additive blend.
+/// already widen it) scaled by `strength`, returned for the bounded SCREEN blend
+/// ([`BoostComposite::Screen`]) the composite pipeline is built with.
 const BLOOM_SHADER: &str = r#"
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -3681,6 +3686,65 @@ fn build_atlas_resources(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
     (atlas_bgl, sampler)
 }
 
+/// **THE BOUNDED COMPOSITE RULE** — how a PRESENT-TIME light layer (the bloom
+/// halo, the SDR crown) joins the frame it is drawn over.
+///
+/// **WHY THIS EXISTS.** The CPU effects crate spends one shared budget
+/// (`spend_rainbow_budget` + its pixel-exact `RainbowLedger`) so the effect's own
+/// layers together stay inside the byte they composite into. That budget is
+/// computed BEFORE the frame is drawn and it can only bound the streams it knows
+/// about. The two present-time layers here are drawn AFTERWARDS, over the
+/// finished frame — glyphs, aurora, caret and all — and used to do it with
+/// `One`/`One`. A ledger cannot bound light that is added after it: a pixel
+/// brought to the ledger's ceiling took `0.85 x blurred-aurora` from the bloom
+/// and another `sdr_glow_budget x aurora` from the crown on top, and clipped.
+/// Clipping is not merely "too bright": it flattens the falloff that was the
+/// mark's shape and desaturates the colour toward white, which is what the
+/// standing "blocky / washed out" complaints are about.
+///
+/// **SCREEN, NOT ADD.** `Screen` is `s + d.(1 - s)` — algebraically
+/// `1 - (1 - s)(1 - d)`. Three properties earn it the slot:
+///
+/// * **It cannot saturate.** The result reaches `1.0` only where the source or
+///   the destination already was `1.0`, so a layer composited this way can never
+///   be the thing that pushed a channel to `255`.
+/// * **It is bounded by the destination's OWN headroom, per pixel.** Over a
+///   letterform at level `L` it may add at most `255 - L`, which is exactly the
+///   bound `rainbow_ink_lift_max` states — but enforced on the real pixel rather
+///   than through a cell-granular probe, so it holds for every glyph, sprite and
+///   coloured background in the frame without any of them being modelled.
+/// * **It stays order-independent**, the property the additive streams are
+///   documented to rely on: `1 - (1-a)(1-b)(1-c)` is symmetric in its layers, so
+///   bloom-then-crown and crown-then-bloom composite identically.
+///
+/// Over a DARK ground — where the trail actually lives — `s + d(1-s)` differs
+/// from `s + d` by `s.d`, which at the shipped ground (`d ~ 0.08`) is under 8%
+/// of the added light: the halo keeps its brightness and loses only the part
+/// that was overflowing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BoostComposite {
+    /// `One`/`One` — the historical raw add. Kept for the EDR (`Rgba16Float`)
+    /// crown, whose target deliberately carries values above `1.0` and whose
+    /// bound is the panel headroom clamp in the shader, not the byte.
+    Additive,
+    /// `One`/`OneMinusSrc` — screen. The bounded operator described above.
+    Screen,
+}
+
+impl BoostComposite {
+    /// The blend component this operator asks the fixed-function unit for.
+    fn blend_component(self) -> wgpu::BlendComponent {
+        wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: match self {
+                Self::Additive => wgpu::BlendFactor::One,
+                Self::Screen => wgpu::BlendFactor::OneMinusSrc,
+            },
+            operation: wgpu::BlendOperation::Add,
+        }
+    }
+}
+
 /// Half-resolution divisor for the bloom texture: the glow halo is soft, so a
 /// quarter of the pixels is plenty and keeps the blur cheap + naturally wider.
 const BLOOM_DOWNSCALE: u32 = 2;
@@ -3691,9 +3755,10 @@ const BLOOM_RADIUS: f32 = 2.2;
 
 /// Build the GPU-only BLOOM resources: shader module, the bind-group layout
 /// (half-res glow texture + linear sampler + `BloomUniform`), a LINEAR clamp
-/// sampler (smooth half-res upsample), the additive composite pipeline (One/One
-/// over the `Rgba8Unorm` offscreen, RGB-only write-mask so it never perturbs the
-/// alpha the blit relies on), and the uniform buffer. See [`BLOOM_SHADER`].
+/// sampler (smooth half-res upsample), the BOUNDED composite pipeline
+/// ([`BoostComposite::Screen`] over the `Rgba8Unorm` offscreen, RGB-only
+/// write-mask so it never perturbs the alpha the blit relies on), and the
+/// uniform buffer. See [`BLOOM_SHADER`].
 fn build_bloom_resources(
     device: &wgpu::Device,
     target: wgpu::TextureFormat,
@@ -3752,11 +3817,14 @@ fn build_bloom_resources(
         bind_group_layouts: &[Some(&bgl)],
         immediate_size: 0,
     });
-    let add = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::One,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Add,
-    };
+    // THE HALO IS INSIDE THE BUDGET (see [`BoostComposite`]). The composite used
+    // to `One`/`One`-add `BLOOM_STRENGTH x blurred-aurora` over the FINISHED frame
+    // — after the glyphs, after the aurora the CPU ledger had already spent its
+    // ceiling on, after the caret — which is light no CPU budget can bound
+    // because it lands later than the budget exists. `Screen` spends the
+    // headroom the destination has left instead, so the halo can brighten
+    // anything and saturate nothing.
+    let add = BoostComposite::Screen.blend_component();
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu bloom composite pipeline"),
         layout: Some(&layout),
@@ -4403,6 +4471,31 @@ fn build_effect_pipeline(
         dst_factor: wgpu::BlendFactor::One,
         operation: wgpu::BlendOperation::Add,
     };
+    // …and the ONE-SIDED GENERALIZATION of it the flat [`GlowQuad`] streams take
+    // instead: `out = src + dst·(1 − src_a)`, premultiplied SOURCE-OVER.
+    //
+    // **IT IS `add` AT `src_a == 0`, EXACTLY.** `OneMinusSrcAlpha` is `1` there,
+    // so the equation collapses to `src + dst` for every instance that carries a
+    // zero alpha byte — which is every historical glow instance (see
+    // [`GlowQuad::alpha`]: `0` IS the additive mode). So the three flat additive
+    // streams and the bloom extract keep their byte-exact `One`/`One` behaviour
+    // through this state, and NOTHING had to be reordered, split into a second
+    // pipeline, or given its own pass to let ONE of them composite as paint.
+    //
+    // Why the generalization is wanted at all: an additive bed is charged the
+    // ground's own luminance against its legibility ceiling. See
+    // [`GlowQuad::alpha`] for the argument and `certify_rainbow_band_cov_caps`
+    // for what it buys on the shipped dark ground.
+    //
+    // The COLOR write-mask below is what makes the alpha component moot — the
+    // offscreen's own alpha (the transmittance the blit relies on) is never
+    // written by this pipeline in either mode, so `src_a` is read as a blend
+    // operand and never stored.
+    let glow_over = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    };
     match which {
         // Identical to `bg_pipeline` except the blend state: ALPHA_BLENDING for the
         // translucent-cursor fill (see the `CursorBlend` field doc). The fill blends
@@ -4441,10 +4534,12 @@ fn build_effect_pipeline(
                 cache: None,
             })
         }
-        // LUMEN aurora pipeline: PREMULTIPLIED ADDITIVE light. Reuses the bg layout +
-        // `vs_bg`/`fs_bg` + `BG_ATTRS` verbatim (fs_bg already returns the full vec4);
-        // the ONLY difference is the blend = One/One (out = src + dst) and a COLOR
-        // write-mask (RGB only — never perturbs the offscreen alpha the blit relies on).
+        // LUMEN aurora pipeline: PREMULTIPLIED light, additive or source-over per
+        // INSTANCE (the instance alpha byte is [`GlowQuad::alpha`]; `0` is the
+        // additive mode and `glow_over` collapses to One/One there). Reuses the bg
+        // layout + `vs_bg` + `BG_ATTRS` verbatim; the differences from `bg_pipeline`
+        // are the blend state, the RAW `fs_glow` fragment, and a COLOR write-mask
+        // (RGB only — never perturbs the offscreen alpha the blit relies on).
         EffectPipeline::GlowAdd => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("aterm-gpu glow additive pipeline"),
             layout: Some(bg_layout),
@@ -4471,8 +4566,8 @@ fn build_effect_pipeline(
                 targets: &[Some(wgpu::ColorTargetState {
                     format: additive_target,
                     blend: Some(wgpu::BlendState {
-                        color: add,
-                        alpha: add,
+                        color: glow_over,
+                        alpha: glow_over,
                     }),
                     write_mask: wgpu::ColorWrites::COLOR,
                 })],
@@ -7626,14 +7721,42 @@ impl GpuRenderer {
         // WindowServer still composites at the display refresh, so a windowed surface
         // does not tear.
         //
-        // `ATERM_GPU_PRESENT_MODE=fifo` restores the old behavior in one flag.
+        // `ATERM_GPU_PRESENT_MODE=fifo|immediate` overrides the choice below.
+        //
+        // THIS OVERRIDE ANNOUNCES ITSELF, unconditionally, on every surface
+        // configuration. It is only reachable on a backend with NO Mailbox (the
+        // early return above wins everywhere else), which on the platform aterm
+        // ships on means `=fifo` re-arms precisely the unbounded `nextDrawable()`
+        // park the Immediate default exists to avoid — measured at up to ~84 ms of
+        // keyDowns queued behind it. A shipped binary that types 84 ms slower than
+        // the one that was tested must not do so silently; the audit that produced
+        // this line found it changed the present mode with nothing on stderr and
+        // no entry in the Settings env-override report.
         let forced = std::env::var("ATERM_GPU_PRESENT_MODE").ok();
         match forced.as_deref().map(str::trim) {
-            Some("fifo") => return wgpu::PresentMode::Fifo,
+            Some("fifo") => {
+                eprintln!(
+                    "aterm-gpu: $ATERM_GPU_PRESENT_MODE=fifo — forcing Fifo present. \
+                     This RE-ARMS the unbounded nextDrawable() park the default \
+                     avoids; input latency regressions of ~84ms have been measured \
+                     in this mode. Unset it to restore the shipped default."
+                );
+                return wgpu::PresentMode::Fifo;
+            }
             Some("immediate") if caps.present_modes.contains(&wgpu::PresentMode::Immediate) => {
+                eprintln!(
+                    "aterm-gpu: $ATERM_GPU_PRESENT_MODE=immediate — forcing Immediate \
+                     present (the shipped default on macOS; an override elsewhere)."
+                );
                 return wgpu::PresentMode::Immediate;
             }
-            _ => {}
+            Some(other) => {
+                eprintln!(
+                    "aterm-gpu: unknown ATERM_GPU_PRESENT_MODE {other:?} \
+                     (want fifo|immediate); using the default"
+                );
+            }
+            None => {}
         }
         if cfg!(target_os = "macos") && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
@@ -7659,10 +7782,30 @@ impl GpuRenderer {
         // immediately) and adds ZERO latency while un-exhausted; FIFO still
         // paces the glass. Non-Metal backends with real Mailbox keep 1 via env.
         let default = if cfg!(target_os = "macos") { 2 } else { 1 };
-        std::env::var("ATERM_GPU_FRAME_LATENCY")
+        let Some(raw) = std::env::var("ATERM_GPU_FRAME_LATENCY")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(default, |v| v.clamp(1, 3))
+        else {
+            return default;
+        };
+        let forced = raw.clamp(1, 3);
+        // LOUD, because this is not inert. On macOS the latency IS
+        // `maximumDrawableCount - 1`: forcing 1 leaves two drawables, which a
+        // typing-hot TUI repaint storm exhausts, parking the event loop on
+        // `nextDrawable()` with keyDowns queued behind it (measured up to ~84ms).
+        // Only the value that equals the default changes nothing — and a knob
+        // whose non-default values move keystroke latency must say so rather than
+        // let a stale export make a shipped binary slower than the tested one.
+        if forced != default {
+            eprintln!(
+                "aterm-gpu: $ATERM_GPU_FRAME_LATENCY={forced} overrides the \
+                 measured default of {default}. Lower values shrink the drawable \
+                 pool and can park the event loop on nextDrawable() under a repaint \
+                 storm (~84ms of queued keystrokes measured at 1 on Metal). Unset it \
+                 to restore the shipped default."
+            );
+        }
+        forced
     }
 
     fn pick_surface_format(
@@ -9064,6 +9207,10 @@ impl GpuRenderer {
             "aterm-gpu hdr-glow pipeline",
             "fs_hdr_glow",
             wgpu::TextureFormat::Rgba16Float,
+            // EDR stays ADDITIVE: the f16 target's whole point is emission ABOVE
+            // 1.0, so there is no `1 - dst` headroom to divide up. The pass is
+            // already bounded by the panel headroom clamp inside `fs_hdr_glow`.
+            BoostComposite::Additive,
         );
         self.hdr_glow_pipeline = Some(pipeline);
     }
@@ -9079,8 +9226,19 @@ impl GpuRenderer {
             return;
         }
         self.ensure_glow_boost_shared();
-        let pipeline =
-            self.build_glow_boost_pipeline("aterm-gpu sdr-glow pipeline", "fs_sdr_glow", format);
+        let pipeline = self.build_glow_boost_pipeline(
+            "aterm-gpu sdr-glow pipeline",
+            "fs_sdr_glow",
+            format,
+            // THE CROWN IS INSIDE THE BUDGET. It is the LAST thing drawn on an
+            // SDR present — after the glyphs, after the aurora, after the caret,
+            // after the bloom — and it used to One/One-add onto all of them, so a
+            // pixel the CPU ledger had brought to its ceiling took another
+            // `sdr_glow_budget` levels on top and clipped. `Screen` spends only
+            // the headroom the destination actually has left, so the crown can
+            // brighten but can never saturate. See [`BoostComposite`].
+            BoostComposite::Screen,
+        );
         self.sdr_glow_pipeline = Some((format, pipeline));
     }
 
@@ -9126,14 +9284,16 @@ impl GpuRenderer {
     }
 
     /// One glow-boost pipeline over the `BgInstance` stream: `vs_hdr_glow` +
-    /// the given fragment entry, One/One additive, COLOR write-mask (the blit's
-    /// alpha is never perturbed), targeting `format`. Caller picks the fragment
-    /// (EDR headroom clamp vs SDR budget scale) and the target format.
+    /// the given fragment entry, COLOR write-mask (the blit's alpha is never
+    /// perturbed), targeting `format`. Caller picks the fragment (EDR headroom
+    /// clamp vs SDR budget scale), the target format, and the composite
+    /// operator ([`BoostComposite`]).
     fn build_glow_boost_pipeline(
         &self,
         label: &str,
         fs_entry: &str,
         format: wgpu::TextureFormat,
+        composite: BoostComposite,
     ) -> wgpu::RenderPipeline {
         let device = &self.ctx.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -9149,11 +9309,7 @@ impl GpuRenderer {
             )],
             immediate_size: 0,
         });
-        let add = wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::One,
-            operation: wgpu::BlendOperation::Add,
-        };
+        let add = composite.blend_component();
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&layout),
@@ -9417,7 +9573,7 @@ impl GpuRenderer {
             by1 = by1.max(ry.saturating_add(eh));
             v.push(BgInstance {
                 rect: [rx, ry, q.w, q.h],
-                color: rgb4_u32(q.color),
+                color: glow4(q),
             });
         }
         let n = v.len();
@@ -13788,7 +13944,7 @@ impl GpuRenderer {
                 }
                 self.inst.glow_under.push(BgInstance {
                     rect: [q.x, q.y, q.w, q.h],
-                    color: rgb4_u32(q.color),
+                    color: glow4(q),
                 });
             }
         }
@@ -13826,9 +13982,10 @@ impl GpuRenderer {
         }
 
         // LUMEN aurora: PREMULTIPLIED ADDITIVE light quads (comet/bloom/ring/sparks).
-        // The host already premultiplied `q.color`, so we emit it straight (rgb4_u32's
-        // a=255 is irrelevant under One/One + COLOR write-mask) and the glow_add
-        // pipeline adds it onto the dest — byte-identical to the CPU `add_sat`. Quads
+        // The host already premultiplied `q.color`, so we emit it straight through
+        // `glow4` — which carries the quad's own `alpha` byte, `0` for every quad
+        // this stream emits, so the glow pipeline's `src + dst·(1 − src_a)` blend
+        // is One/One here and the result is byte-identical to the CPU `add_sat`. Quads
         // are WINDOW-ABSOLUTE pixels (converted at the producer) tagged with a
         // single-row damage hint; row-gated by `row_active` so they stay inside
         // the scissor's dirty band.
@@ -13839,7 +13996,7 @@ impl GpuRenderer {
                 }
                 self.inst.glow_add.push(BgInstance {
                     rect: [q.x, q.y, q.w, q.h],
-                    color: rgb4_u32(q.color),
+                    color: glow4(q),
                 });
             }
         }
@@ -13902,7 +14059,7 @@ impl GpuRenderer {
                         q.w,
                         q.h,
                     ],
-                    color: rgb4_u32(q.color),
+                    color: glow4(q),
                 });
             }
         }
@@ -15402,6 +15559,26 @@ fn rgb4_u32(c: u32) -> [u8; 4] {
     rgb4([(c >> 16) as u8, (c >> 8) as u8, c as u8])
 }
 
+/// A flat [`GlowQuad`] as a `BgInstance` colour: the host's PREMULTIPLIED bytes
+/// with the quad's own [`GlowQuad::alpha`] in the alpha slot.
+///
+/// **THE ALPHA BYTE IS THE MODE**, and it is the reason this is not
+/// [`rgb4_u32`]. The glow pipeline's blend is `src + dst·(1 − src_a)`, which is
+/// `One`/`One` at `src_a == 0` and premultiplied source-over above it. Every
+/// historical glow stream emits `alpha == 0` and so reaches the identical byte
+/// it always did; the rainbow BED emits its coverage there and composites as
+/// paint. Handing this pipeline `rgb4_u32`'s `a == 255` would ask for
+/// `src + dst·0` — a REPLACE — so the two must not be confused, and there is
+/// one function so they cannot be.
+fn glow4(q: &aterm_render::GlowQuad) -> [u8; 4] {
+    [
+        (q.color >> 16) as u8,
+        (q.color >> 8) as u8,
+        q.color as u8,
+        q.alpha,
+    ]
+}
+
 /// Stamp a [`HaloMode::Over`](aterm_render::HaloMode::Over) veil instance with
 /// its per-pixel alpha CEILING: the straight `color`'s HIGH BYTE
 /// ([`aterm_render::halo_over_cap`]) is carried in the instance ALPHA byte the
@@ -15736,6 +15913,8 @@ mod tests {
             w: 4,
             h: 4,
             color: 0x0020_2020,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         });
         let want = frame_effect_pipelines(&inst, &input, true);
         let mut expected = [false; EFFECT_PIPELINE_COUNT];
@@ -17526,7 +17705,9 @@ ab\r\n",
             y: (pad + row * ch + 2) as u16,
             w: cw as u16,
             h: (ch - 4) as u16,
-            color: 0x0030_50A0, // premultiplied light
+            color: 0x0030_50A0, // premultiplied light,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         };
 
         let run = |gpu: &mut GpuRenderer, label: &str| {
@@ -17621,6 +17802,8 @@ ab\r\n",
             w: cw as u16,
             h: (ch - 4) as u16,
             color: 0x0030_50A0,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         };
         let mut glow_a = frame(b"AAAA\r\nbbbb");
         glow_a.cursor_glow_add = vec![quad(4, 0)];
@@ -17697,6 +17880,8 @@ ab\r\n",
             w: cw as u16,
             h: (ch - 2) as u16,
             color: 0x0030_50A0,
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
         }];
         let seq = [frame(b"AAAA"), with_edge_glow, frame(b"AAAA\r\nbbbb")];
         let mut win = WindowGpu::new();

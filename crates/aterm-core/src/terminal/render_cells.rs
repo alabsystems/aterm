@@ -704,6 +704,8 @@ impl Terminal {
         // behaviour-identical.
         let has_kitty = !self.transient.kitty_images.is_empty();
         for col in 0..grid.cols() {
+            #[cfg(test)]
+            image_probe_meter::charge();
             let Some(extra) = grid.cell_extra(screen_row, col) else {
                 continue;
             };
@@ -717,6 +719,25 @@ impl Terminal {
                 out.push((col as usize, iref));
             }
         }
+    }
+
+    /// Every visible row's inline-image placements, in ONE pass over the extras
+    /// map: the frame-level twin of [`images_row`](Self::images_row), allocating
+    /// a fresh `Vec` per row exactly as [`cell_frame`](Self::cell_frame) wraps
+    /// [`cell_frame_into`](Self::cell_frame_into).
+    ///
+    /// Same rows, same ascending-column order within a row, same `ImageRef`s as
+    /// calling `images_row` for every row in `0..rows` (pinned by
+    /// `images_frame_into_matches_per_row`) — for the cost of the extras that
+    /// exist rather than `rows x cols` hash probes. This is the reader for an
+    /// off-frame whole-screen gather (the control socket's styled frame); the
+    /// windowed frontend takes the scratch-reusing fill through
+    /// [`cell_frame_into`](Self::cell_frame_into) instead of allocating here.
+    #[must_use]
+    pub fn images_frame(&self, rows: usize) -> Vec<Vec<(usize, aterm_grid::ImageRef)>> {
+        let mut images = Vec::new();
+        self.images_frame_into(&mut images, rows);
+        images
     }
 
     /// Batch equivalent of calling [`images_row_into`](Self::images_row_into)
@@ -756,7 +777,7 @@ impl Terminal {
         // not the history row's, and the placeholder protocol has its own
         // history story. Direct placements — OSC 1337 and sixel — are what this
         // path restores.
-        for r in 0..rows.min(offset) {
+        for (r, images_row) in images.iter_mut().enumerate().take(rows.min(offset)) {
             let Ok(visible_row) = u16::try_from(r) else {
                 break;
             };
@@ -767,7 +788,7 @@ impl Terminal {
                     if col < cols
                         && let Some(image) = extra.image()
                     {
-                        images[r].push((usize::from(col), image.clone()));
+                        images_row.push((usize::from(col), image.clone()));
                     }
                 }
             }
@@ -796,6 +817,8 @@ impl Terminal {
         // this borrow is live, so the emitted rows are byte-identical.
         let has_kitty = !self.transient.kitty_images.is_empty();
         for (coord, extra) in grid.extras().iter() {
+            #[cfg(test)]
+            image_probe_meter::charge();
             // The map is keyed by SCREEN row; at a scrolled viewport a live row
             // sits `display_offset` slots lower on screen (identity at 0).
             let Some(r) = usize::from(coord.row).checked_add(offset) else {
@@ -1472,6 +1495,36 @@ fn is_emoji_sequence_marker(c: char) -> bool {
     matches!(c as u32, 0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF)
 }
 
+/// Deterministic cost meter for the two inline-image readers, in the tree's
+/// established shape (`aterm_grid::test_counters`): a complexity claim about a
+/// screen read is asserted as an OPERATION COUNT, not as wall-clock, which no
+/// test can hold steady.
+///
+/// One charge per extras lookup the reader performs — a `cell_extra` probe in
+/// the per-row sweep, a visited map entry in the batch pass — so the two are
+/// directly comparable and `images_frame_costs_the_extras_not_rows_times_cols`
+/// can pin the difference between them.
+#[cfg(test)]
+mod image_probe_meter {
+    thread_local! {
+        static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// One extras lookup.
+    pub(super) fn charge() {
+        PROBES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Read and reset, so each measured stretch starts from zero.
+    pub(super) fn take() -> usize {
+        PROBES.with(|c| {
+            let v = c.get();
+            c.set(0);
+            v
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1875,6 +1928,66 @@ mod tests {
         assert_eq!(
             total, 6,
             "the scrolled-back 3x2 footprint must be fully present in BOTH readers"
+        );
+    }
+
+    /// THE COST CLAIM, as an operation count (wall-clock cannot be asserted; the
+    /// probe count can). The per-row reader's ONLY early-out is the extras map
+    /// being empty, so a screen carrying one hyperlink and no picture at all — an
+    /// `ls --hyperlink` listing, a link in a TUI status line — pays a `cell_extra`
+    /// probe for every cell on it, on every whole-screen gather. The batch reader
+    /// pays one lookup per extra that actually exists.
+    ///
+    /// Both states are asserted, because the interesting half is the second one:
+    /// the emptiness gate really does rescue a plain-text screen (0 probes either
+    /// way), and it really does NOT rescue the hyperlink screen.
+    #[test]
+    fn images_frame_costs_the_extras_not_rows_times_cols() {
+        const ROWS: u16 = 40;
+        const COLS: u16 = 120;
+        let mut term = Terminal::new(ROWS, COLS);
+        let rows = usize::from(ROWS);
+
+        // Plain text: nothing in the extras map, so both readers take the gate.
+        term.process(b"plain text, no extras at all\r\n");
+        assert!(
+            term.grid().extras().is_empty(),
+            "no extras on a plain screen"
+        );
+        let _ = image_probe_meter::take();
+        for r in 0..rows {
+            let _ = term.images_row(r);
+        }
+        assert_eq!(
+            image_probe_meter::take(),
+            0,
+            "the empty-map gate must keep the per-row sweep off a plain screen"
+        );
+        let _ = term.images_frame(rows);
+        assert_eq!(
+            image_probe_meter::take(),
+            0,
+            "same gate in the batch reader"
+        );
+
+        // ONE hyperlink, zero images — the case the gate does not rescue.
+        term.process(b"\x1b]8;;https://example.com\x1b\\L\x1b]8;;\x1b\\");
+        let extras = term.grid().extras().len();
+        assert_eq!(extras, 1, "one linked cell is one extras entry");
+        let _ = image_probe_meter::take();
+        for r in 0..rows {
+            let _ = term.images_row(r);
+        }
+        assert_eq!(
+            image_probe_meter::take(),
+            rows * usize::from(COLS),
+            "the per-row sweep charges the WHOLE screen for one hyperlink"
+        );
+        let _ = term.images_frame(rows);
+        assert_eq!(
+            image_probe_meter::take(),
+            extras,
+            "the batch reader charges the extras that exist, not rows x cols"
         );
     }
 

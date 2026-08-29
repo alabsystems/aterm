@@ -92,7 +92,8 @@
 //!   corruption/tamper is caught, but **no Apple anchor / Team ID / notarization is
 //!   required**. This is the internal-distribution baseline.
 //! * **Tier SIG (a signing key — Apple-free cryptographic authenticity).** If a public
-//!   key is compiled in ([`PINNED_UPDATE_PUBKEY`] from `ATERM_UPDATE_PUBKEY`), every
+//!   key is compiled in ([`PINNED_UPDATE_PUBKEY`], from the committed
+//!   `aterm_update_core::pins` constant — no env var), every
 //!   release manifest MUST carry a valid Ed25519 signature verifiable against it (the
 //!   offline private key lives in CI secrets / offline). Since the manifest pins the
 //!   sha256 of every downloadable container (DMG and zip), this authenticates the
@@ -187,8 +188,10 @@ pub use progress::{Progress, ProgressNotify, set_progress_observer};
 /// the accumulation this closes.
 pub use relaunch::reexec_forwarded_args;
 
-/// The Apple Developer **Team ID** for the OPTIONAL Tier APPLE anchor, baked in at
-/// compile time from `ATERM_EXPECTED_TEAM_ID`. Empty (the default) does **not** disable
+/// The Apple Developer **Team ID** for the OPTIONAL Tier APPLE anchor, read from the
+/// committed constant `aterm_update_core::pins::APPLE_TEAM_ID` — NOT from any build
+/// environment variable (the old `ATERM_EXPECTED_TEAM_ID` input was retired when the
+/// anchors became constants; see that module's header). Empty (the default) does **not** disable
 /// the updater — it just skips the codesign/notarization anchor, leaving the
 /// repo-trust / signed-manifest tiers (see the crate-level trust model). Set it (the
 /// owner's Developer-ID build) to additionally require the swapped bundle be
@@ -210,7 +213,7 @@ static REQUIRED_TEAM_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new(
 /// all), and this lets such a deployment opt into Developer-ID enforcement.
 ///
 /// The gap it left was that the STRICTER posture was only reachable by rebuilding
-/// with `ATERM_EXPECTED_TEAM_ID` baked in. Once there is a Developer ID to require,
+/// from a source edit to `pins::APPLE_TEAM_ID`. Once there is a Developer ID to require,
 /// requiring it should be a setting, not a compile.
 ///
 /// This is deliberately ONE-WAY: it can install a team requirement where there was
@@ -251,7 +254,10 @@ pub fn effective_team_id() -> &'static str {
 }
 
 /// The base64 Ed25519 **public key** for the OPTIONAL Tier SIG anchor (the Apple-free
-/// signed channel), baked in from `ATERM_UPDATE_PUBKEY` at build time. Empty (the
+/// signed channel), read from the committed constant
+/// `aterm_update_core::pins::update_channel_signing_pubkey()` — NOT from a build
+/// environment variable (`ATERM_UPDATE_PUBKEY` was retired with the ambient
+/// `release.conf`; see that module's header for why). Empty (the
 /// default) disables signature checking; when set, every release manifest MUST carry a
 /// valid `aterm-appcast.toml.sig` verifying against it (mint the keypair with
 /// `atpkg-keys setup`/`join` — the machine key; the secret never leaves its machine). See [`sig`].

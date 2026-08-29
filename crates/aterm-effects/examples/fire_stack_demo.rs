@@ -111,6 +111,7 @@ fn main() {
     let (w, h) = (COLS * CW, ROWS * CH);
     // Mirror the host's resolved fire config (defaults + the live-review 2s trail).
     let cfg = GlowConfig {
+        ribbon_tall: false,
         enabled: true,
         style: GlowStyle::Fire,
         color: 0x0050_FA7B,
@@ -124,7 +125,6 @@ fn main() {
         head_dx: 0.5,
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
-        ribbon_tall: false,
         dark_theme: true,
         // The documented default dark palette — a COHERENT pair, never 0/0
         // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
