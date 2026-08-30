@@ -83,6 +83,20 @@ const BASE_LIGHT_THEME: u32 = 0x0016_161C; // near-black block on a light backgr
 const GROUND_DARK_THEME: u32 = 0x0011_1318;
 const GROUND_LIGHT_THEME: u32 = 0x00FD_F6E3;
 
+/// **THE PAGES THE RIM'S LIGHT-LAW ANSWERS FOR**, beyond the one the config
+/// names: the two dark grounds every glass gate in this family solves against
+/// (`ColorScheme::default`'s `#111318` and Tokyo Night's `#1A1B26`).
+///
+/// One ground used to be enough, and the ROYGBIV roof is what ended that: the
+/// crossing's samples are bright (`V ≥ 217` where the retired lerp sagged to
+/// `130`), so a ring quad that composites clean over the page it was solved
+/// for can now clear the 32-level chroma floor over a slightly different dark
+/// page and read inside the window there — measured at `5,580` of `3.67 M`
+/// composites (worst `#112C36`, hue `196.5°`, `S 0.69`) when the law was asked
+/// about one ground and the gate about two. The law therefore answers for the
+/// family's whole dark-page set, plus whatever ground the host actually names.
+const RIM_LAW_GROUNDS: [u32; 2] = [GROUND_DARK_THEME, 0x001A_1B26];
+
 /// Hue rotation in turns/second: a slow baseline while charged, plus up to a
 /// full brisk spin at peak energy (≈one rotation/sec typing flat-out).
 const IDLE_SPIN: f32 = 0.05;
@@ -958,10 +972,27 @@ impl CursorRainbow {
             x1 = x1.max(u32::from(q.x) + u32::from(q.w));
             y1 = y1.max(u32::from(q.y) + u32::from(q.h));
         }
+        // The host's page plus [`RIM_LAW_GROUNDS`] — deduplicated so the
+        // common case (dark theme on the shipped default) pays for two
+        // rasterizations, not three.
+        let mut grounds = [ground, RIM_LAW_GROUNDS[0], RIM_LAW_GROUNDS[1]];
+        let n_grounds = {
+            let mut n = 1;
+            for i in 1..3 {
+                if !grounds[..n].contains(&grounds[i]) {
+                    grounds[n] = grounds[i];
+                    n += 1;
+                }
+            }
+            n
+        };
+        let grounds = &grounds[..n_grounds];
         let (w, h) = ((x1.saturating_sub(x0)) as usize, (y1.saturating_sub(y0)) as usize);
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
             for q in quads.iter_mut() {
-                q.color = clear_light_of_cyan(q.color, q.alpha, ground);
+                for &g in grounds {
+                    q.color = clear_light_of_cyan(q.color, q.alpha, g);
+                }
             }
             return;
         }
@@ -974,24 +1005,31 @@ impl CursorRainbow {
         // onto it through the family's own blend.
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         let mut over_anywhere = |quads: &[GlowQuad], emitted: &[u32], keep: f32| -> bool {
-            scratch.clear();
-            scratch.resize(w * h, ground);
-            for (q, &c) in quads.iter().zip(emitted) {
-                let c = if keep >= 1.0 {
-                    c
-                } else {
-                    crate::spectrum::pale_light_at_constant_light(c, keep)
-                };
-                for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
-                    for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
-                        let i = (yy - y0) as usize * w + (xx - x0) as usize;
-                        scratch[i] = crate::spectrum::compose_on_glass(scratch[i], c, q.alpha);
+            for &page in grounds {
+                scratch.clear();
+                scratch.resize(w * h, page);
+                for (q, &c) in quads.iter().zip(emitted) {
+                    let c = if keep >= 1.0 {
+                        c
+                    } else {
+                        crate::spectrum::pale_light_at_constant_light(c, keep)
+                    };
+                    for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
+                        for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
+                            let i = (yy - y0) as usize * w + (xx - x0) as usize;
+                            scratch[i] =
+                                crate::spectrum::compose_on_glass(scratch[i], c, q.alpha);
+                        }
                     }
                 }
+                if scratch
+                    .iter()
+                    .any(|&p| crate::spectrum::light_is_over_the_glass_ceiling(p))
+                {
+                    return true;
+                }
             }
-            scratch
-                .iter()
-                .any(|&p| crate::spectrum::light_is_over_the_glass_ceiling(p))
+            false
         };
         if over_anywhere(quads, &self.rim_emitted, 1.0) {
             let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -3577,4 +3615,72 @@ mod tests {
     // the seventh anchor was adopted to remove. The successors named above
     // therefore inherit the BOUND, not the prohibition; see their own headers for
     // the share each one now permits.
+
+    /// THE TWO-GROUND RIM LAW IS PINNED, because it had no coverage: collapse
+    /// [`RIM_LAW_GROUNDS`] to one ground and every test stayed green while the
+    /// measured defect (5,580 cyan composites, worst #112C36 at hue 196.5,
+    /// S 0.69, when the law answered for one page and the gate asked about two)
+    /// silently returned. This asks the law's own question at the second
+    /// ground: a premultiplied ring colour that composites CLEAN over
+    /// [`GROUND_DARK_THEME`] but lands inside HSV [165,200] at S>0.3 over the
+    /// second dark page must come back altered by the law. Mutating the law to
+    /// consult only the first ground turns this red.
+    #[test]
+    fn the_rim_law_answers_for_every_dark_page_not_just_the_shipped_one() {
+        use crate::spectrum::{clear_light_of_cyan, spectrum_hsv};
+        let second = RIM_LAW_GROUNDS[1];
+        assert_ne!(RIM_LAW_GROUNDS[0], second, "two grounds or the law is one-page");
+        // Sweep premultiplied candidates; keep those clean over ground 0 but
+        // cyan over ground 1 BEFORE the law. The law must move every one of
+        // them off the window over ground 1.
+        let over = |c: u32, a: u8, g: u32| -> (f64, f64, f64) {
+            let comp = |cc: u32, sh: u32, gg: u32| -> f32 {
+                let s = ((cc >> sh) & 0xff) as f32;
+                let d = ((gg >> sh) & 0xff) as f32;
+                s + d * (255.0 - a as f32) / 255.0
+            };
+            let (r, g_, b) = (comp(c, 16, g), comp(c, 8, g), comp(c, 0, g));
+            let px = ((r.min(255.0) as u32) << 16)
+                | ((g_.min(255.0) as u32) << 8)
+                | (b.min(255.0) as u32);
+            spectrum_hsv(px)
+        };
+        // The owner's window, at the law's own absolute chroma floor: a
+        // composited pixel under 32 levels of max-min cannot read as colour
+        // (the same floor `the_band_is_never_cyan_on_glass` applies), and
+        // asking the law to rule sub-floor near-black pixels would make this
+        // pin stricter than the law it pins.
+        let in_window = |(h, s, v): (f64, f64, f64)| {
+            (165.0..=200.0).contains(&h)
+                && s > 0.3
+                && v * 255.0 > 24.0
+                && s * v * 255.0 >= 32.0
+        };
+        let mut exercised = 0usize;
+        for r in (0..64u32).step_by(4) {
+            for g in (0..192u32).step_by(4) {
+                for b in (0..192u32).step_by(4) {
+                    let c = (r << 16) | (g << 8) | b;
+                    for a in [40u8, 96, 160] {
+                        if in_window(over(c, a, RIM_LAW_GROUNDS[0])) {
+                            continue; // ground 0 already polices this one
+                        }
+                        if !in_window(over(c, a, second)) {
+                            continue;
+                        }
+                        exercised += 1;
+                        let ruled = clear_light_of_cyan(c, a, second);
+                        assert!(
+                            !in_window(over(ruled, a, second)),
+                            "the rim law left #{c:06X} a={a} cyan over the second                              dark page #{second:06X}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            exercised > 50,
+            "the sweep must actually exercise the second ground: {exercised}"
+        );
+    }
 }

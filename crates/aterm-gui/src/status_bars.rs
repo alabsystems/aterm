@@ -157,11 +157,60 @@ impl Bar {
     }
 }
 
+/// How many finished activities the ledger keeps.
+///
+/// Presentation is ephemeral — a bar folds and the sentence is gone — but the
+/// RECORD is not: `aterm ctl appstatus` answers "what has this app been doing"
+/// after the fact, which is the question an operator (or a driving agent) asks
+/// once the screen has moved on. A fixed ring, because the alternative is a list
+/// that grows for the life of a process that may run for weeks.
+const LEDGER_ROWS: usize = 32;
+
+/// One finished activity, kept after its bar folded.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LedgerRow {
+    pub lane: Lane,
+    /// The bar's last words — what the user would have read.
+    pub title: String,
+    pub detail: String,
+    /// How it ended, from the tone the last bar carried.
+    pub outcome: Outcome,
+    /// When the bar retired, as this process's monotonic clock.
+    pub finished: Instant,
+}
+
+/// How a finished activity ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Ok,
+    Warn,
+}
+
+impl Outcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+        }
+    }
+}
+
+impl Lane {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Toolchain => "toolchain",
+            Self::Update => "update",
+        }
+    }
+}
+
 /// The two-lane state.
 #[derive(Default, Debug)]
 pub(crate) struct StatusBars {
     toolchain: Option<Bar>,
     update: Option<Bar>,
+    /// Finished activities, oldest first, capped at [`LEDGER_ROWS`].
+    ledger: std::collections::VecDeque<LedgerRow>,
 }
 
 impl StatusBars {
@@ -188,15 +237,83 @@ impl StatusBars {
     /// re-grid trigger.
     pub(crate) fn settle(&mut self, now: Instant) -> bool {
         let before = self.rows();
-        for slot in [&mut self.toolchain, &mut self.update] {
+        let mut retired: Vec<LedgerRow> = Vec::new();
+        for (lane, slot) in [
+            (Lane::Toolchain, &mut self.toolchain),
+            (Lane::Update, &mut self.update),
+        ] {
             if slot
                 .as_ref()
                 .is_some_and(|b| b.retires_at().is_some_and(|at| now >= at))
             {
-                *slot = None;
+                // THE ROW OUTLIVES THE BAR. What the user could have read goes
+                // into the ledger as it leaves the glass, so `appstatus` can
+                // answer for it afterwards.
+                if let Some(bar) = slot.take() {
+                    retired.push(LedgerRow {
+                        lane,
+                        title: bar.text.title,
+                        detail: bar.text.detail,
+                        outcome: match bar.text.tone {
+                            Tone::Warn => Outcome::Warn,
+                            Tone::Info | Tone::Success => Outcome::Ok,
+                        },
+                        finished: now,
+                    });
+                }
             }
         }
+        for row in retired {
+            if self.ledger.len() == LEDGER_ROWS {
+                self.ledger.pop_front();
+            }
+            self.ledger.push_back(row);
+        }
         self.rows() != before
+    }
+
+    /// The finished activities, oldest first — the `appstatus` ledger.
+    pub(crate) fn ledger(&self) -> impl Iterator<Item = &LedgerRow> {
+        self.ledger.iter()
+    }
+
+    /// The `appstatus` reply body: one `activity` row per LIVE bar, then one per
+    /// finished activity the ring still holds, oldest first — the order a reader
+    /// reconstructs the sequence in.
+    ///
+    /// Rendered here, next to the state, rather than in the control verb: the
+    /// verb thread cannot see App state at all, and the wire grammar is a
+    /// SEPARATE safety question from the glass. `layout` sanitizes for cells;
+    /// this percent-encodes for a line-oriented protocol, so a program name with
+    /// a space — or a newline out of some installer's stderr — cannot forge a
+    /// row or truncate the reply.
+    pub(crate) fn activity_rows(&self, now: Instant) -> Vec<String> {
+        let enc = crate::control::pct_encode;
+        let mut rows = Vec::with_capacity(self.rows() as usize + self.ledger.len());
+        for (lane, bar) in self.bars() {
+            let progress = bar.fill.map_or_else(
+                || "-".to_string(),
+                |f| format!("{}/100", (f.clamp(0.0, 1.0) * 100.0).round() as u32),
+            );
+            rows.push(format!(
+                "activity kind={} phase=live progress={progress} title={} detail={} stats={} outcome=-",
+                lane.as_str(),
+                enc(&bar.text.title),
+                enc(&bar.text.detail),
+                enc(&bar.text.stats),
+            ));
+        }
+        for row in self.ledger() {
+            rows.push(format!(
+                "activity kind={} phase=done progress=- title={} detail={} stats= outcome={} since_ms={}",
+                row.lane.as_str(),
+                enc(&row.title),
+                enc(&row.detail),
+                row.outcome.as_str(),
+                now.saturating_duration_since(row.finished).as_millis(),
+            ));
+        }
+        rows
     }
 
     /// The next instant a bar leaves on its own: a held outcome's fold, or a
@@ -1256,6 +1373,152 @@ mod tests {
         assert!(bars.settle(now + HOLD_WARN));
         assert_eq!(bars.rows(), 0);
         assert_eq!(bars.fingerprint(), 0);
+    }
+
+    /// THE ROW OUTLIVES THE BAR. A folded bar's sentence is gone from the glass,
+    /// and that is exactly when someone asks what the machine was doing — so the
+    /// retirement writes it down, keeping the tone as the outcome.
+    #[test]
+    fn a_folded_bar_leaves_its_sentence_in_the_ledger() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_failed("⚠ ALab toolchain install failed", now);
+        bars.update_progress(
+            &aterm_update::Progress::Staged {
+                version: "0.48.0".into(),
+                build: 99,
+            },
+            now,
+        );
+        assert_eq!(bars.ledger().count(), 0, "nothing has folded yet");
+
+        assert!(bars.settle(now + HOLD_OK), "the update bar folded first");
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 1, "only the folded lane is recorded");
+        assert_eq!(rows[0].lane, Lane::Update);
+        assert_eq!(rows[0].outcome, Outcome::Ok);
+        assert_eq!(rows[0].finished, now + HOLD_OK);
+        assert!(
+            !rows[0].title.is_empty(),
+            "the words the user could have read survive the fold"
+        );
+
+        assert!(bars.settle(now + HOLD_WARN), "then the warn bar");
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].lane, rows[1].lane),
+            (Lane::Update, Lane::Toolchain),
+            "oldest first — the order they left the glass"
+        );
+        assert_eq!(
+            rows[1].outcome,
+            Outcome::Warn,
+            "a warn tone retires as a warn outcome, not an ok one"
+        );
+        assert_eq!(bars.rows(), 0, "the ledger holds no rows on the glass");
+        assert_eq!(
+            bars.fingerprint(),
+            0,
+            "FL-1: a full ledger is still an idle zero — the record is not a repaint"
+        );
+    }
+
+    /// The wire is a SEPARATE grammar from the glass. `layout` makes a hostile
+    /// string safe to PAINT; this makes it safe to PARSE — a space, a newline or
+    /// a `=` out of some installer's stderr must not forge a field, split a row,
+    /// or truncate the reply a driving agent is reading.
+    #[test]
+    fn activity_rows_cannot_be_forged_by_the_words_in_them() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_failed(
+            "boom\nactivity kind=update phase=done outcome=ok stats= detail= title=forged",
+            now,
+        );
+        let rows = bars.activity_rows(now);
+        assert_eq!(rows.len(), 1, "one bar is one row, whatever it says");
+        let row = &rows[0];
+        assert!(
+            !row.contains('\n') && !row.contains('\r'),
+            "no row can break the line framing: {row}"
+        );
+        assert_eq!(
+            row.matches("activity kind=").count(),
+            1,
+            "the payload cannot mint a second activity: {row}"
+        );
+        assert!(
+            row.starts_with("activity kind=toolchain phase=live "),
+            "the lane and phase are the renderer's to say, not the text's: {row}"
+        );
+        assert!(row.ends_with(" outcome=-"), "a live row has no outcome yet");
+    }
+
+    /// The shape `appstatus` promises: live rows first, then the ledger
+    /// oldest-first, each finished row carrying how it ended and how long ago.
+    #[test]
+    fn activity_rows_put_the_live_bars_above_the_finished_ones() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_failed("install failed", now);
+        assert!(bars.settle(now + HOLD_WARN), "it folds into the ledger");
+        bars.update_progress(
+            &aterm_update::Progress::Downloading {
+                version: "0.62.0".into(),
+                bytes_done: 45,
+                bytes_total: 90,
+            },
+            now + HOLD_WARN,
+        );
+
+        let rows = bars.activity_rows(now + HOLD_WARN + Duration::from_millis(1500));
+        assert_eq!(rows.len(), 2, "one live, one finished");
+        assert!(
+            rows[0].starts_with("activity kind=update phase=live progress=50/100 "),
+            "the live download leads, with its meter: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("activity kind=toolchain phase=done progress=- "),
+            "the finished install follows: {}",
+            rows[1]
+        );
+        assert!(
+            rows[1].contains(" outcome=warn ") && rows[1].ends_with(" since_ms=1500"),
+            "how it ended and how long ago: {}",
+            rows[1]
+        );
+    }
+
+    /// A process can run for weeks. The ledger is a RING, so the record is
+    /// bounded: the newest [`LEDGER_ROWS`] survive and the oldest fall off.
+    #[test]
+    fn the_ledger_is_a_ring_that_keeps_the_newest() {
+        let mut bars = StatusBars::default();
+        let mut now = t0();
+        for i in 0..(LEDGER_ROWS + 5) {
+            bars.update_progress(
+                &aterm_update::Progress::Staged {
+                    version: format!("0.{i}.0"),
+                    build: i as u64,
+                },
+                now,
+            );
+            now += HOLD_OK;
+            assert!(bars.settle(now), "each staged bar folds in turn");
+        }
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), LEDGER_ROWS, "the ring is capped");
+        assert!(
+            rows[0].title.contains("0.5.") || rows[0].detail.contains("0.5."),
+            "the OLDEST kept row is the 6th activity, not the 1st: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows.windows(2).all(|w| w[0].finished <= w[1].finished),
+            "still oldest-first after eviction"
+        );
     }
 
     #[test]

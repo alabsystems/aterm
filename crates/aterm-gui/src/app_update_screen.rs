@@ -51,7 +51,12 @@ pub(crate) fn hold_update_ledger_for_test() -> std::sync::MutexGuard<'static, ()
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
-        let on = crate::app_update_screen::debug_seamless_reexec_armed();
+        // THE ENVIRONMENT ANSWERS THIS, and nothing else can. Calling this
+        // function here — as the "make the knobs loud" refactor did — is a
+        // self-recursive `OnceLock`: the initializer waits on the `Once` it is
+        // itself running, so the FIRST caller parks forever. It is reached from
+        // `apply_staged_update_now`, i.e. the main thread, on every apply.
+        let on = std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
         if on {
             aterm_log::warn!(
                 "$ATERM_DEBUG_SEAMLESS_REEXEC is set: this process reports a staged \
@@ -864,11 +869,36 @@ fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyLedgerVerdict, apply_ledger_verdict};
+    use super::{ApplyLedgerVerdict, apply_ledger_verdict, debug_seamless_reexec_armed};
     use crate::App;
     use crate::WindowId;
     use crate::native_app::{AppViewState, UpdateOutcome};
     use crate::native_updater_service::CheckStart;
+
+    /// REGRESSION — the QA seam's own flag used to hang the process that asked
+    /// for it. Its `OnceLock` initializer called the function it was
+    /// initializing, so the first caller waited on the `Once` it was itself
+    /// inside, forever. `apply_staged_update_now` reaches it on the MAIN
+    /// THREAD, which made every update apply a permanent freeze — the exact
+    /// failure the whole handoff design exists to avoid.
+    ///
+    /// This test deadlocks rather than fails if the shape comes back. That is
+    /// the honest signal: the defect IS a hang, and a suite that stops is
+    /// louder than an assertion that never runs.
+    #[test]
+    fn the_reexec_seam_reads_the_environment_and_never_itself() {
+        let armed = debug_seamless_reexec_armed();
+        assert_eq!(
+            armed,
+            std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some(),
+            "the seam is armed exactly when its variable is present"
+        );
+        assert_eq!(
+            armed,
+            debug_seamless_reexec_armed(),
+            "and the cached answer is stable across callers"
+        );
+    }
 
     /// ONE-CLICK fallback (MenuAction::ApplyUpdate with nothing staged): the unit-test
     /// environment has no strictly-newer build in the update ledger, so the one-click

@@ -3009,6 +3009,27 @@ pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
 }
 
 /// `title` -> `OK <window title>\n` (the OSC 0/2 window title; empty if unset).
+/// `appstatus` -> the STATUS-SURFACE ledger (design §3): one `activity` line per
+/// LIVE status-bar row, then one per finished activity the ring still holds,
+/// oldest first.
+///
+/// Presentation is ephemeral and the record is not: a bar folds and its sentence
+/// leaves the glass, but "what has this app been doing on its own initiative"
+/// is exactly the question an operator — or a driving agent that was not looking
+/// at the window — asks afterwards. Read-only, and every free-text field is
+/// percent-encoded through the same `pct_encode` the `status`/`meta` verbs use,
+/// so a program name or an error sentence can never break the line grammar.
+///
+/// The rows are rendered on the MAIN THREAD (`Wake::ReadAppStatus`) because the
+/// state is App state; this function only frames the reply.
+pub(crate) fn cmd_appstatus(proxy: &EventLoopProxy<Wake>) -> String {
+    match control_media::call_main(proxy, |reply| Wake::ReadAppStatus { reply }) {
+        Ok(rows) if rows.is_empty() => "OK 0\n".to_string(),
+        Ok(rows) => format!("OK {}\n{}\n", rows.len(), rows.join("\n")),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
 pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     format!("OK {}\n", t.title())

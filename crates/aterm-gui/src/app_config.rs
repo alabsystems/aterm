@@ -6827,10 +6827,14 @@ pub(crate) fn resolve_cursor_glow(
         // and the resolver has already clamped it into 0..=1.5 s.
         wake_persist_s: inputs.wake_persist_s,
         // The ribbon presentation rides the RESOLVED spelling, like the beam
-        // above and the pet companions do. Every ordinary rainbow spelling uses
-        // the highlighter-plus-under-baseline mark; only an explicit `... tall`
-        // spelling selects the v0.43 full-height body.
-        ribbon_tall: GlowStyle::style_names_tall_ribbon(style_token),
+        // above and the pet companions do. THE TALL BODY IS THE DEFAULT
+        // (owner, 2026-08-29: "WHERE IS MY TALL RIBBON"): every ordinary
+        // rainbow spelling draws the v0.43 full-height body — letters inside
+        // the light — and only an explicit `... underline` spelling selects
+        // the highlighter-plus-under-baseline mark. This reverses 317f765a,
+        // which had flipped the default on a claimed ruling the owner did not
+        // give; the explicit spellings for BOTH looks survive.
+        ribbon_tall: !GlowStyle::style_names_underline_ribbon(style_token),
     }
 }
 

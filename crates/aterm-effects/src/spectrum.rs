@@ -169,6 +169,120 @@ pub const SPECTRUM_ANCHORS: [u32; SPECTRUM_STOPS] = [
 /// control points.
 pub const SPECTRUM_STOPS: usize = 7;
 
+/// **THE CROSSING ROOF** — eight full-chroma through-samples the green→blue
+/// interval is drawn through, pinned at consecutive table slots
+/// [`SPECTRUM_ROOF_AT`]`..+8` of that interval. NOT named stops: nothing snaps
+/// here ([`spectrum_snap`] still resolves to the seven ROYGBIV anchors), and
+/// [`SPECTRUM_STOPS`] does not count them.
+///
+/// # The defect they exist to remove (2026-08-29)
+///
+/// The straight per-channel green→blue lerp sags in VALUE — its midpoint is
+/// `#007D82`, `V 0.51` — and passes the cyan window at full chroma, so
+/// [`clear_light_of_cyan`] stripped its composites to `S ≤ 0.22` grey. On glass
+/// that printed a ~15-device-pixel patch of `V ≈ 66` grey between green and
+/// blue: a hole where a seventh of the rainbow should be, measured at median
+/// `S 0.38`, hue `171°` over a 244-frame capture.
+///
+/// # What the roof is, and why this exact shape
+///
+/// `#80FFD4 → #80D2FF`: hue `160° → 201°` in seven steps of `4.4–7.2°`, value
+/// riding a roof `255 → 217 → 255`, saturation held at a FLOOR of `≈ 0.50` —
+/// chroma spread `109–127`, far over the family's 24-level grey bar and over
+/// the on-glass gate's own `100`. Three properties are bought at once, and
+/// each is at its bar:
+///
+/// * **the window is crossed in FIVE table entries** (hue `165–200` spans slots
+///   41–45 of the interval) instead of ten — the fastest transit the 16-level
+///   channel bar and the aliasing budget below allow;
+/// * **the crossing is BRIGHT.** `V ≥ 217` where the lerp sagged to `130`, so
+///   the pixels the light-law pales are pale AND bright — a seam, not a hole;
+/// * **the flanks arrive DESATURATED, and that is the cyan true-peak bound.**
+///   Nothing on glass is one colour: the beam interpolates between neighbours,
+///   edges antialias, and the one-pixel blend where the green flank meets the
+///   seam wears a hue INSIDE the window with the SATURATION of the flanks that
+///   made it. A first cut of this roof kept `S = 1` right up to the transit
+///   and a 246-frame capture answered with in-window blend pixels at
+///   `S 0.84` — worse than the `0.60` the retired grey crossing peaked at,
+///   because its junction colours were already washed. The taper (`S 1 → 0.80`
+///   by slot 31, `→ 0.50` at the roof, mirrored on the exit) puts the bound
+///   back where the old arc had it without giving back the chroma: every
+///   source within reach of the window carries `S ≤ 0.53`, so no blend of
+///   them can read more saturated than that plus the ground's own lean.
+///
+/// The roof's hue SPAN is `41.2°`, and that number is an aliasing budget, not
+/// taste: `rainbow_palette_has_no_cyan_anchor_and_no_grey_hole` bounds the hue
+/// a half-cell sample step may carry (`18° + 640/cw`, tightest at `cw = 18`:
+/// `53.6°` per `14.2` table entries). The whole transit plus its slow flanks
+/// must fit under that window — a `50°` roof measured `54.1°` and failed by
+/// half a degree, so the span is set where the worst window reads `~52.5°`.
+///
+/// **WHY NOT 100 % OF COLUMNS.** The paint scanner counts a pixel at
+/// `max ≥ 110 && max−min ≥ 60`. A composited pixel inside the window is held to
+/// `S ≤ 0.22` by [`SPECTRUM_GLASS_SAT_CEIL`], so its spread is at most
+/// `0.22 × 255 = 56 < 60`: under the verbatim cyan ruling and the 5.25:1
+/// legibility bar, an in-window column CANNOT count, whatever the arc does.
+/// What the roof buys is the minimum of them — about five table entries' worth
+/// of glass — with counting columns immediately on both flanks, verified on
+/// capture rather than claimed.
+pub const SPECTRUM_CROSSING_ROOF: [u32; SPECTRUM_ROOF_LEN] = [
+    0x0080_FFD4, // 160°, the roof's on-ramp, S 0.50 from here to the off-ramp
+    0x007A_F5D5,
+    0x0074_E9D5, // enters HSV [165, 200] past here
+    0x006C_D9D2, // 176.1°, V 217 — the roof's floor…
+    0x006C_D2D9, // …and its byte-mirror at 183.9°
+    0x0074_D5E9,
+    0x007A_D3F5, // leaves the window past here
+    0x0080_D2FF, // 201.3°, the off-ramp
+];
+
+/// How many samples [`SPECTRUM_CROSSING_ROOF`] carries.
+pub const SPECTRUM_ROOF_LEN: usize = 8;
+
+/// The green→blue interval's index — the one interval the roof redraws.
+const SPECTRUM_ROOF_SEG: usize = 3;
+
+/// The interval slot the roof's first sample is pinned at. `39..=46` of the
+/// 85-slot interval: the window transit sits just past the interval's middle,
+/// which is where the plain mix crossed it too, so the re-draw moves WHERE
+/// nothing was and re-paces only what it must.
+const SPECTRUM_ROOF_AT: usize = 39;
+
+/// **THE FOUR PACING KNOTS**, `(interval slot, colour)` — two on each side of
+/// the roof, all at full value.
+///
+/// They exist for two measured reasons.
+///
+/// **The ALIASING bound.**
+/// `rainbow_palette_has_no_cyan_anchor_and_no_grey_hole` samples the sweep at
+/// half-cell spacing — `14.2` table entries at `cw = 18` — and allows at most
+/// `18° + 640/cw` of hue between two samples. The half-cell window is TWICE the
+/// roof's own width, so whatever hue the flanks carry rides in the same window
+/// as the roof's `41.2°`: without these knots the PCHIP through anchor-and-roof
+/// alone let the approach drift fast enough that the worst window measured
+/// `54.1°` against `cw = 18`'s `53.6°`. The inner pair pins the flanks to
+/// `~1.5°`/slot for the eight slots beside the roof (worst window: `52.5°`);
+/// the outer pair keeps the remaining approach and exit from paying the
+/// difference.
+///
+/// **The SATURATION taper.** The outer pair carries `S = 0.85` and the inner
+/// pair `S = 0.68`, the ramp down to the roof's `0.50` floor — see the roof's
+/// own account of the on-glass blend pixels this bounds. It reaches this far
+/// out (`140°`, a whole side of green away from the window) because the bound
+/// is on BLENDS: a pixel where the flank's light meets the seam's wears an
+/// intermediate hue at up to the flank's own saturation, so every source
+/// within blend-reach of the window has to have already given some up. The
+/// per-entry `S` rate stays inside the 16-level channel bar, which prices an
+/// `S` ramp in the R channel at `≈ 0.065` per entry.
+///
+/// None is a stop, and none is inside the window.
+const SPECTRUM_ROOF_PACE: [(usize, u32); 4] = [
+    (22, 0x0026_FF6F), // hue 140°, S 0.85 — the approach
+    (31, 0x0052_FFA3), // hue 148°, S 0.68 — the taper's on-ramp
+    (54, 0x0052_B4FF), // hue 206°, S 0.68 — the taper's off-ramp
+    (60, 0x0026_8BFF), // hue 212°, S 0.85 — the exit
+];
+
 /// The LUT's length. **511 entries, 2 KB** — doubled from the 256 the six-anchor
 /// arc shipped with, and the reason is [`SPECTRUM_SAT_ENV`]: the chroma law adds
 /// a second thing that moves along the arc, and where it ramps (`hue 198..206`,
@@ -517,7 +631,6 @@ pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
 /// two neighbouring table entries whose targets are a hair apart can come back
 /// from opposite ends of the same plateau. The solve runs in `f64` and the
 /// result is rounded exactly once, at the end.
-#[cfg(test)]
 fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
     let h = hue_deg.rem_euclid(360.0) / 60.0;
     let c = v * s;
@@ -576,6 +689,13 @@ pub fn generate_spectrum_lut() -> [u32; SPECTRUM_LUT_LEN] {
                 lut[idx] = SPECTRUM_ANCHORS[if slot == 0 { seg } else { seg + 1 }];
                 continue;
             }
+            // THE GREEN→BLUE INTERVAL IS DRAWN THROUGH THE ROOF, in HSV rather
+            // than per channel — see `spectrum_roof_entry` and
+            // [`SPECTRUM_CROSSING_ROOF`]'s own account of why.
+            if seg == SPECTRUM_ROOF_SEG {
+                lut[idx] = spectrum_roof_entry(slot);
+                continue;
+            }
             // THE EASED PER-CHANNEL MIX BETWEEN TWO AUTHORED STOPS, and nothing
             // else. `smoothstep01` is C¹ with ZERO SLOPE at each anchor, which is
             // what makes the arc C¹ across every control point and at both
@@ -589,6 +709,105 @@ pub fn generate_spectrum_lut() -> [u32; SPECTRUM_LUT_LEN] {
         }
     }
     lut
+}
+
+/// One interior entry of the green→blue interval: a monotone cubic (Fritsch–
+/// Carlson PCHIP) in HSV hue and value through the anchors and the eight
+/// [`SPECTRUM_CROSSING_ROOF`] samples, at saturation exactly `1`.
+///
+/// # Why PCHIP and not another stack of smoothsteps
+///
+/// A smoothstep piece has ZERO slope at both of its knots, so a chain of them
+/// through eight consecutive samples would print seven dwell shelves — seven
+/// places the hue stops — inside the one stretch of the arc built to keep
+/// moving. Fritsch–Carlson tangents are the standard monotone choice: interior
+/// knots take a slope-limited harmonic mean (never zero inside a monotone run,
+/// so no shelves), the two ENDPOINT tangents are pinned at zero, and
+/// monotonicity of the data is monotonicity of the curve. The zero endpoint
+/// tangents are what keep the arc C¹ where this interval hands off to the
+/// per-channel intervals beside it, whose eased mixes also arrive flat.
+///
+/// # Why the knots' hues, saturations and values are READ, not transcribed
+///
+/// The roof is stated as COLOURS ([`SPECTRUM_CROSSING_ROOF`]) and all three of
+/// its HSV knot coordinates are read back out of those colours here, the same
+/// discipline the anchors follow: the curve cannot disagree with the constants
+/// it is built from. What is asserted instead of the retired shared-zero
+/// clause is the family's own grey bar, one level up: every knot must keep a
+/// channel spread of at least `100` — the exact floor
+/// `the_band_is_never_cyan_on_glass` holds the whole arc to — so an edited
+/// sample that reopened a grey hole fails the regeneration here, with the
+/// knot named, rather than at the gate.
+fn spectrum_roof_entry(slot: usize) -> u32 {
+    const KNOTS: usize = SPECTRUM_ROOF_LEN + 6;
+    let mut xs = [0.0f64; KNOTS];
+    let mut hue = [0.0f64; KNOTS];
+    let mut sat = [0.0f64; KNOTS];
+    let mut val = [0.0f64; KNOTS];
+    let mut put = |k: usize, x: usize, c: u32| {
+        let chan = |sh: u32| (c >> sh) & 0xff;
+        let spread = chan(16).max(chan(8)).max(chan(0)) - chan(16).min(chan(8)).min(chan(0));
+        assert!(
+            spread >= 100,
+            "crossing knot #{c:06X} dipped to chroma {spread} — a grey hole"
+        );
+        let (h, s, v) = spectrum_hsv(c);
+        xs[k] = x as f64;
+        (hue[k], sat[k], val[k]) = (h, s, v);
+    };
+    put(0, 0, SPECTRUM_ANCHORS[SPECTRUM_ROOF_SEG]);
+    put(1, SPECTRUM_ROOF_PACE[0].0, SPECTRUM_ROOF_PACE[0].1);
+    put(2, SPECTRUM_ROOF_PACE[1].0, SPECTRUM_ROOF_PACE[1].1);
+    for (i, &c) in SPECTRUM_CROSSING_ROOF.iter().enumerate() {
+        put(i + 3, SPECTRUM_ROOF_AT + i, c);
+    }
+    put(KNOTS - 3, SPECTRUM_ROOF_PACE[2].0, SPECTRUM_ROOF_PACE[2].1);
+    put(KNOTS - 2, SPECTRUM_ROOF_PACE[3].0, SPECTRUM_ROOF_PACE[3].1);
+    put(KNOTS - 1, SPECTRUM_STRIDE, SPECTRUM_ANCHORS[SPECTRUM_ROOF_SEG + 1]);
+    let x = slot as f64;
+    let h = pchip_eval(&xs, &hue, x);
+    let s = pchip_eval(&xs, &sat, x);
+    let v = pchip_eval(&xs, &val, x);
+    let rgb = hsv_srgb(h, s, v);
+    let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (byte(rgb[0]) << 16) | (byte(rgb[1]) << 8) | byte(rgb[2])
+}
+
+/// Monotone cubic Hermite (Fritsch–Carlson) through `(xs, ys)`, endpoint
+/// tangents pinned at ZERO — see [`spectrum_roof_entry`] for why both choices
+/// are load-bearing. Knot abscissae must be strictly increasing.
+fn pchip_eval<const N: usize>(xs: &[f64; N], ys: &[f64; N], x: f64) -> f64 {
+    // Secant slopes, then limited interior tangents.
+    let mut d = [0.0f64; N];
+    for k in 0..N - 1 {
+        d[k] = (ys[k + 1] - ys[k]) / (xs[k + 1] - xs[k]);
+    }
+    let mut m = [0.0f64; N];
+    for k in 1..N - 1 {
+        if d[k - 1] * d[k] > 0.0 {
+            let h0 = xs[k] - xs[k - 1];
+            let h1 = xs[k + 1] - xs[k];
+            let w1 = 2.0 * h1 + h0;
+            let w2 = h1 + 2.0 * h0;
+            m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k]);
+        }
+    }
+    if x <= xs[0] {
+        return ys[0];
+    }
+    if x >= xs[N - 1] {
+        return ys[N - 1];
+    }
+    let mut i = 0usize;
+    while i < N - 2 && x > xs[i + 1] {
+        i += 1;
+    }
+    let h = xs[i + 1] - xs[i];
+    let u = (x - xs[i]) / h;
+    (2.0 * u.powi(3) - 3.0 * u.powi(2) + 1.0) * ys[i]
+        + (u.powi(3) - 2.0 * u.powi(2) + u) * h * m[i]
+        + (-2.0 * u.powi(3) + 3.0 * u.powi(2)) * ys[i + 1]
+        + (u.powi(3) - u.powi(2)) * h * m[i + 1]
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +1101,47 @@ pub fn compose_on_glass(ground: u32, premul: u32, alpha: u8) -> u32 {
 /// touched at all.
 #[inline]
 fn over_the_glass_ceiling(px: u32) -> bool {
+    // **THE INTEGER TURNSTILE** — a reject-only pre-gate on the bytes, with the
+    // f64 HSV law below it untouched and still the only thing that can answer
+    // `true`. This predicate is asked of every composite of every rainbow quad
+    // and of 255 weights of every halo, every frame; profiled on the hot-ribbon
+    // release gate it was the single largest line in the frame, and for almost
+    // every pixel the answer is "no" for a reason three integer compares can
+    // establish. Each gate rejects only what the exact law below provably
+    // rejects, with degrees of margin over the window's own shoulders, so the
+    // answers are bit-identical to the un-gated form:
+    //   - `val * 255.0` IS the max byte for byte channels, so the first test is
+    //     the `SPECTRUM_GLASS_LIT_MIN` test itself, not an approximation;
+    //   - `sat <= 0.2` sits under `SPECTRUM_GLASS_SAT_CEIL = 0.22`, the LOWEST
+    //     ceiling the shoulder blend can produce;
+    //   - the hue gates bound hue outside `(150, 210)`, seven degrees clear of
+    //     the softened window `(157, 204)`: an r-max pixel reads in
+    //     `[0, 60] ∪ [300, 360)`; a g-max pixel reads over `150` only when
+    //     `2(b - r) > d`; a b-max pixel reads under `210` only when
+    //     `2(g - r) > d` — the sector formulas solved at the margin.
+    {
+        let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+        let mx = r.max(g).max(b);
+        if mx <= SPECTRUM_GLASS_LIT_MIN as u32 {
+            return false;
+        }
+        let d = mx - r.min(g).min(b);
+        if d * 5 <= mx {
+            return false;
+        }
+        // Mirrors `spectrum_hsv`'s own tie-breaking: `hi == r` first, then
+        // `hi == g`, then blue.
+        if r >= mx {
+            return false;
+        }
+        if g >= mx {
+            if 2 * b.saturating_sub(r) <= d {
+                return false;
+            }
+        } else if 2 * g.saturating_sub(r) <= d {
+            return false;
+        }
+    }
     let (hue, sat, val) = spectrum_hsv(px);
     if val * 255.0 <= f64::from(SPECTRUM_GLASS_LIT_MIN) {
         return false;
@@ -1126,6 +1386,22 @@ const SPECTRUM_GLASS_STACK: u32 = 6;
 /// Exact for `n` identical layers in BOTH modes, because it composites them
 /// rather than modelling them: additive light sums along the ray, and repeated
 /// source-over converges on the colour with residual ground `(1 - a)^n`.
+///
+/// # What is NOT asked, measured both ways (2026-08-29)
+///
+/// The rasterizer also draws FRACTIONS of a quad's coverage — edge
+/// antialiasing, and the compositor's own mixing — and desaturating toward the
+/// blue-black ground can walk a legal green edge pixel into the window. A
+/// fractional clause (eight sub-coverages of one layer) was tried here and
+/// REFUTED ON GLASS both ways at once: it widened the crossing's non-counting
+/// gap from a median of 8 device pixels to 22 (the bisection spends the quad's
+/// CORE chroma to fix its edge, which is the grey hole one layer down), and
+/// the capture still carried in-window pixels in 24 frames (peak `S 0.67`,
+/// at bytes no single-quad model produces — the leak it chased lives in the
+/// compositor's mixing of DIFFERENT marks' light, which no per-quad predicate
+/// can see). The residual edge leak is bounded at the SOURCE instead: the arc
+/// spends as few bright entries as the aliasing budget allows inside the
+/// drift-prone hue strip below the window (see `SPECTRUM_ROOF_PACE`).
 #[inline]
 fn the_stack_is_over_the_ceiling(premul: u32, alpha: u8, ground: u32) -> bool {
     let mut px = ground;
@@ -1337,21 +1613,21 @@ pub const SPECTRUM_LUT: [u32; SPECTRUM_LUT_LEN] = [
     0x0027_FF00, 0x0024_FF00, 0x0021_FF00, 0x001D_FF00, 0x001B_FF00, 0x0018_FF00,
     0x0015_FF00, 0x0012_FF00, 0x0010_FF00, 0x000E_FF00, 0x000C_FF00, 0x000A_FF00,
     0x0008_FF00, 0x0006_FF00, 0x0005_FF00, 0x0004_FF00, 0x0003_FF00, 0x0002_FF00,
-    0x0001_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00,
-    0x0000_FE01, 0x0000_FD02, 0x0000_FC03, 0x0000_FB04, 0x0000_FA05, 0x0000_F906,
-    0x0000_F708, 0x0000_F50A, 0x0000_F30C, 0x0000_F10E, 0x0000_EF10, 0x0000_ED12,
-    0x0000_EA15, 0x0000_E718, 0x0000_E41B, 0x0000_E21D, 0x0000_DE21, 0x0000_DB24,
-    0x0000_D827, 0x0000_D52A, 0x0000_D12E, 0x0000_CD32, 0x0000_CA35, 0x0000_C639,
-    0x0000_C23D, 0x0000_BE41, 0x0000_BA45, 0x0000_B649, 0x0000_B24D, 0x0000_AE51,
-    0x0000_AA55, 0x0000_A55A, 0x0000_A15E, 0x0000_9D62, 0x0000_9867, 0x0000_946B,
-    0x0000_8F70, 0x0000_8B74, 0x0000_8679, 0x0000_827D, 0x0000_7D82, 0x0000_7986,
-    0x0000_748B, 0x0000_708F, 0x0000_6B94, 0x0000_6798, 0x0000_629D, 0x0000_5EA1,
-    0x0000_5AA5, 0x0000_55AA, 0x0000_51AE, 0x0000_4DB2, 0x0000_49B6, 0x0000_45BA,
-    0x0000_41BE, 0x0000_3DC2, 0x0000_39C6, 0x0000_35CA, 0x0000_32CD, 0x0000_2ED1,
-    0x0000_2AD5, 0x0000_27D8, 0x0000_24DB, 0x0000_21DE, 0x0000_1DE2, 0x0000_1BE4,
-    0x0000_18E7, 0x0000_15EA, 0x0000_12ED, 0x0000_10EF, 0x0000_0EF1, 0x0000_0CF3,
-    0x0000_0AF5, 0x0000_08F7, 0x0000_06F9, 0x0000_05FA, 0x0000_04FB, 0x0000_03FC,
-    0x0000_02FD, 0x0000_01FE, 0x0000_00FF, 0x0000_00FF, 0x0000_00FF, 0x0000_00FF,
+    0x0001_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF02,
+    0x0001_FF04, 0x0002_FF07, 0x0003_FF0A, 0x0004_FF0F, 0x0005_FF13, 0x0006_FF19,
+    0x0008_FF1E, 0x000A_FF24, 0x000B_FF2A, 0x000D_FF31, 0x0010_FF37, 0x0012_FF3E,
+    0x0014_FF45, 0x0016_FF4B, 0x0019_FF52, 0x001B_FF58, 0x001E_FF5E, 0x0021_FF64,
+    0x0023_FF6A, 0x0026_FF6F, 0x0029_FF74, 0x002D_FF7A, 0x0032_FF7F, 0x0036_FF85,
+    0x003C_FF8B, 0x0041_FF91, 0x0047_FF97, 0x004D_FF9D, 0x0052_FFA3, 0x0058_FFA9,
+    0x005F_FFB0, 0x0067_FFB6, 0x006E_FFBC, 0x0075_FFC3, 0x007B_FFC9, 0x007F_FFCF,
+    0x0080_FFD4, 0x007A_F5D5, 0x0074_E9D5, 0x006C_D9D2, 0x006C_D2D9, 0x0074_D5E9,
+    0x007A_D3F5, 0x0080_D2FF, 0x007F_CFFF, 0x007B_CCFF, 0x0076_C9FF, 0x006F_C5FF,
+    0x0068_C1FF, 0x0060_BDFF, 0x0059_B9FF, 0x0052_B4FF, 0x004B_AEFF, 0x0042_A8FF,
+    0x0039_A0FF, 0x0031_98FF, 0x002A_91FF, 0x0026_8BFF, 0x0023_85FF, 0x0020_80FF,
+    0x001E_79FF, 0x001B_73FF, 0x0019_6CFF, 0x0016_65FF, 0x0014_5EFF, 0x0012_56FF,
+    0x0010_4FFF, 0x000E_48FF, 0x000C_40FF, 0x000B_39FF, 0x0009_32FF, 0x0008_2BFF,
+    0x0006_25FF, 0x0005_1EFF, 0x0004_19FF, 0x0003_13FF, 0x0002_0FFF, 0x0002_0AFF,
+    0x0001_07FF, 0x0001_04FF, 0x0000_02FF, 0x0000_00FF, 0x0000_00FF, 0x0000_00FF,
     0x0000_00FF, 0x0000_00FF, 0x0000_00FE, 0x0001_00FE, 0x0001_00FD, 0x0001_00FD,
     0x0002_00FC, 0x0002_00FB, 0x0003_00FA, 0x0003_00F9, 0x0004_00F8, 0x0005_00F7,
     0x0005_00F6, 0x0006_00F5, 0x0007_00F3, 0x0008_00F2, 0x0009_00F1, 0x000A_00EF,
@@ -1711,18 +1987,23 @@ mod tests {
     /// pushed down to red's light, mean `V = 0.60`, which on the default dark
     /// palette reads as a wash rather than as paint.
     ///
-    /// **SATURATION IS NOW EXACTLY 1 EVERYWHERE, AND THAT IS A PROPERTY OF THE
-    /// PALETTE RATHER THAN A BOUND ANYONE CHOSE.** Every ROYGBIV interval joins
+    /// **SATURATION IS EXACTLY 1 EVERYWHERE OUTSIDE THE CROSSING TAPER, AND
+    /// THAT IS A PROPERTY OF THE PALETTE.** Every ROYGBIV interval joins
     /// two anchors that share a channel pinned at zero — red→orange→yellow all
     /// hold `B = 0`, yellow→green holds `B = 0`, green→blue holds `R = 0`,
     /// blue→indigo→violet hold `G = 0` — so a per-channel mix inside any interval
     /// keeps that channel at zero, and HSV saturation `(max − min) / max` is
-    /// identically `1`. Measured over the whole table: `min S = 1.000`,
-    /// `mean S = 1.000`. This replaces the old `min_sat >= 0.6` / transit-share
-    /// pair, which existed to price [`SPECTRUM_SAT_ENV`]'s chroma spend across the
-    /// green→blue crossing. That envelope is retired with the six-anchor arc it
-    /// served: it was the "neutralized handoff" in another form, and spending
-    /// chroma to dodge cyan is exactly the grey hole the owner rejected.
+    /// identically `1`.
+    ///
+    /// **THE ONE EXCEPTION IS AUTHORED, BOUNDED, AND BRIGHT.** The green→blue
+    /// crossing's roof ([`SPECTRUM_CROSSING_ROOF`]) tapers `S` to a floor of
+    /// `0.50` across the pacing knots' span and back — the on-glass cyan
+    /// true-peak bound, priced there in the roof's own doc. It is NOT the grey
+    /// hole coming back, and the clauses below say precisely why not: the
+    /// taper's entries hold `V ≥ 0.85` (the hole was `V 0.51` grey) and chroma
+    /// `≥ 109` (the hole's midpoint was chroma 12; the on-glass gate's bar is
+    /// 100), and every entry OUTSIDE the pacing knots' span still reads
+    /// `S = 1` exactly, so the taper cannot creep.
     ///
     /// **VALUE IS THE ANCHORS' OWN, AND ITS FLOOR IS AN AUTHORED COLOUR.**
     /// `min V = 0.510` is indigo `#4B0082` itself — a named ROYGBIV stop, not a
@@ -1745,17 +2026,36 @@ mod tests {
         let mean_sat = sum_sat / SPECTRUM_LUT_LEN as f64;
         let mean_val = sum_val / SPECTRUM_LUT_LEN as f64;
 
-        // FULL CHROMA, EVERYWHERE. Not "high" — exactly 1, by the shared-zero
-        // argument above. A future anchor edit that broke the shared zero (a
-        // stop with no channel at 0, or two adjacent stops zeroing different
-        // channels) would desaturate the interval between them and fail here,
-        // which is precisely the edit that reopens a grey hole.
-        assert!(
-            min_sat >= 0.999,
-            "an entry desaturates to S {min_sat:.4} — the palette lost its \
-             shared zero channel and the arc is washing out inside an interval"
-        );
-        assert!(mean_sat >= 0.999, "mean saturation is only {mean_sat:.4}");
+        // FULL CHROMA EVERYWHERE OUTSIDE THE AUTHORED TAPER — exactly 1, by
+        // the shared-zero argument above, so an anchor edit that broke the
+        // shared zero still fails here. The taper is the green→blue interval's
+        // own interior (its pacing knots ease S from the anchors' 1 down to the
+        // roof's 0.50 floor and back), so the exception zone is that interval
+        // and the guard is that it may not creep past it — the other five
+        // intervals hold S = 1 exactly, entry for entry.
+        let taper = (SPECTRUM_ROOF_SEG * SPECTRUM_STRIDE + 1)
+            ..=((SPECTRUM_ROOF_SEG + 1) * SPECTRUM_STRIDE - 1);
+        for (i, &rgb) in SPECTRUM_LUT.iter().enumerate() {
+            let (_, s, _) = spectrum_hsv(rgb);
+            if taper.contains(&i) {
+                assert!(
+                    s >= 0.49,
+                    "taper entry {i} desaturates to S {s:.4} — under the roof's \
+                     own floor, the grey hole reopening"
+                );
+            } else {
+                assert!(
+                    s >= 0.999,
+                    "entry {i} desaturates to S {s:.4} outside the authored \
+                     taper — the palette lost its shared zero channel"
+                );
+            }
+        }
+        assert!(min_sat >= 0.49, "the arc's floor fell to S {min_sat:.4}");
+        // The taper occupies most of one interval of six at a mean S of ~0.80,
+        // which prices the whole-table mean at 0.9683; a mean under 0.96 is a
+        // second desaturated stretch, not this one.
+        assert!(mean_sat >= 0.96, "mean saturation is only {mean_sat:.4}");
 
         // VALUE'S FLOOR IS AN AUTHORED ANCHOR, not a chosen number: the darkest
         // point of the arc must be one of the seven stops, so a table that had
@@ -1779,7 +2079,7 @@ mod tests {
 
         // AND THE ARC IS CHROMATIC EVERYWHERE — the grey-hole guard, in the
         // table's own bytes. The retired neutralized handoff put its midpoint at
-        // chroma 12; the shipped arc's minimum is 130.
+        // chroma 12; the shipped arc's minimum is 109, at the roof's floor.
         let chroma = |c: u32| {
             let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
             r.max(g).max(b) - r.min(g).min(b)

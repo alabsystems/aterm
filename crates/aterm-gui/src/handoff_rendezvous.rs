@@ -1995,6 +1995,73 @@ mod tests {
         }
     }
 
+    /// THE HOIST'S SAFETY CLAIM, in one test. `proof_identities_in_device_terms`
+    /// is the only step moved above `park_all_readers` that touches the kernel at
+    /// all, so the move is sound exactly if it (a) gives the same answer whether
+    /// or not a reader has been stopped, and (b) consumes nothing — a parked
+    /// window exists to keep bytes unread, and a preparation step that swallowed
+    /// one would corrupt the very checkpoint the park protects.
+    ///
+    /// Both are asserted against a master with unread bytes waiting on it, which
+    /// is the state the parked window is defined by.
+    #[test]
+    fn proof_identities_are_park_independent_and_consume_nothing() {
+        let (master, slave) = open_pty();
+        let identities = vec![(7u64, master, 4242i32)];
+
+        let before = proof_identities_in_device_terms(&identities)
+            .expect("a live pty answers fstat");
+
+        // Put unread output on the master — the exact condition a park preserves.
+        // No newline: the line discipline maps NL to CR NL on the way out, and
+        // this test is about what the PREPARATION did, not about termios.
+        let payload = b"parked bytes";
+        // SAFETY: `slave` is a live descriptor and the buffer outlives the call.
+        let wrote = unsafe {
+            libc::write(slave, payload.as_ptr().cast::<libc::c_void>(), payload.len())
+        };
+        assert!(wrote > 0, "seed the master with unread output");
+
+        let after = proof_identities_in_device_terms(&identities)
+            .expect("pending output does not change the device term");
+        assert_eq!(
+            before, after,
+            "the device term is a property of the DEVICE, not of what is queued on it \
+             — so taking it before the park is the same answer as taking it after"
+        );
+        assert_ne!(
+            before[0].1, master,
+            "the proof term really is the device number, not the fd number"
+        );
+
+        // (b): the bytes are still there. `poll` says readable, and the read that
+        // follows returns what was written — nothing was consumed on the way past.
+        let mut fds = [libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one initialized pollfd, zero timeout.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+        assert_eq!(ready, 1, "the seeded output is still queued");
+        let mut buf = [0u8; 32];
+        // SAFETY: `master` is live and the buffer is exactly `buf.len()` bytes.
+        let read = unsafe {
+            libc::read(master, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+        };
+        assert_eq!(
+            &buf[..usize::try_from(read).expect("a non-negative read")],
+            payload,
+            "every byte survived the preparation step"
+        );
+
+        // SAFETY: both descriptors were opened by this test and are unused now.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
     fn open_pty() -> (i32, i32) {
         let (mut master, mut slave) = (0i32, 0i32);
         // SAFETY: valid out-params; openpty fills them on success.

@@ -2772,6 +2772,12 @@ fn dispatch_app_verb(
             ));
         }
         "chrome" => control_media::cmd_chrome(proxy),
+        // `appstatus` -> what aterm has been doing ON ITS OWN INITIATIVE (a
+        // toolchain installing, an update downloading): the live status-bar rows
+        // plus the finished jobs the ring still remembers. Instance state, not
+        // session state, so it answers the same with no terminal at all — which
+        // is exactly when an operator asks it.
+        "appstatus" => control_query::cmd_appstatus(proxy),
         "panes" => control_media::cmd_panes(proxy, None),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
@@ -6821,6 +6827,11 @@ fn handle(
         // `custody` -> WHO last took the reading position or the highlight, by name.
         // Read-side: it reports the engine's own custody record and no screen content.
         "custody" => control_query::cmd_custody(term),
+        // `appstatus` -> what aterm has been doing ON ITS OWN INITIATIVE (a
+        // toolchain installing, an update downloading): the live status-bar rows
+        // plus the finished ones the ring still holds. Session-independent App
+        // state, so it takes no `term` and is correct from any session.
+        "appstatus" => control_query::cmd_appstatus(proxy),
         "title" => control_query::cmd_title(term),
         "cwd" => control_query::cmd_cwd(term),
         "blocks" => control_selection::cmd_blocks(&host, session, rest),
@@ -10980,6 +10991,10 @@ mod tests {
                 "window",
                 "video",
                 "chrome",
+                // Instance state, and READ-op like every other observer: it
+                // reports what aterm has been doing on its own initiative and
+                // starts nothing.
+                "appstatus",
                 "panes",
                 "controls",
                 "inspect",

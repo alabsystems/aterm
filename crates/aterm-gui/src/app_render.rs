@@ -25929,6 +25929,18 @@ impl App {
             // glass.
             let robi_on = !deco_suspend
                 && self.config.robi_or_default()
+                // DECORATION YIELDS TO INFORMATION — the status bars' own rule,
+                // applied from the other side. Robi hangs from the tab strip's
+                // chips (they ARE his handholds, which is why re-anchoring him
+                // below a bar is the wrong fix: it would take away the thing he
+                // swings from), so with a bar up his body drapes over the one
+                // row that is explaining why the machine is busy. He is a
+                // robot doing a bit; the bar is the answer to "what is it
+                // doing". While a bar is up he simply does not perform, and the
+                // `!robi_on` arm below takes him off the glass by the ordinary
+                // bypass-to-final-state path — no new teardown, and he is
+                // re-born when the bar folds.
+                && self.status_bar_rows == 0
                 // A click-dismissal in flight retires him THIS frame, not at
                 // the durable completion: the latch is what makes the press's
                 // promise structural — no re-stash, no second write, no

@@ -1056,6 +1056,11 @@ struct PressClass<'ev> {
     /// kills (Ctrl-K, Alt-D, forward Delete) must NOT arm nav or the leaked
     /// hint eats the next typed glyph's wake.
     kill_moves: bool,
+    /// WORD-scale kills (Ctrl-W, Alt-D, Alt/Ctrl-Backspace, forward Delete):
+    /// the poof they license speaks the word poof — the erase poof's slightly
+    /// larger, softer cousin — where the LINE kills (Ctrl-K/U) keep the
+    /// clause-scale swoosh. Meaningless unless `kill_key` is set.
+    kill_word: bool,
     /// Any Enter press, chorded or not (`is_plain_enter` is the bare form).
     enter_like: bool,
     /// Any Tab press (joins the typed-hint disarm set).
@@ -1225,20 +1230,27 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         }
         _ => false,
     };
-    let (kill_key, kill_moves): (bool, bool) = match ev {
+    // (kill_key, kill_moves, kill_word): which erase chord, whether its echo
+    // relocates the caret, and whether it erases a WORD rather than a line —
+    // the word-scale chords voice the softer word poof (see `PressClass`).
+    let (kill_key, kill_moves, kill_word): (bool, bool, bool) = match ev {
         InputEvent::Key { key, mods, .. } => {
             let ctrl = mods.contains(TMods::CTRL);
             let alt = mods.contains(TMods::ALT);
             match key {
-                TKey::Character(c) if ctrl && *c == 'k' => (true, false),
-                TKey::Character(c) if ctrl && matches!(c, 'u' | 'w') => (true, true),
-                TKey::Character(c) if alt && *c == 'd' => (true, false),
-                TKey::Named(TNamed::Backspace) if ctrl || alt => (true, true),
-                TKey::Named(TNamed::Delete) => (true, false),
-                _ => (false, false),
+                TKey::Character(c) if ctrl && *c == 'k' => (true, false, false),
+                TKey::Character(c) if ctrl && *c == 'u' => (true, true, false),
+                TKey::Character(c) if ctrl && *c == 'w' => (true, true, true),
+                TKey::Character(c) if alt && *c == 'd' => (true, false, true),
+                TKey::Named(TNamed::Backspace) if ctrl || alt => (true, true, true),
+                // Forward Delete erases ONE character — even the word poof is
+                // generous for it, but the clause swoosh it used to throw was
+                // the exact over-statement the word tier exists to end.
+                TKey::Named(TNamed::Delete) => (true, false, true),
+                _ => (false, false, false),
             }
         }
-        _ => (false, false),
+        _ => (false, false, false),
     };
     let enter_like = matches!(
         ev,
@@ -1337,6 +1349,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         navigation_key,
         kill_key,
         kill_moves,
+        kill_word,
         enter_like,
         tab_key,
         typed,
@@ -2502,6 +2515,7 @@ impl App {
                     navigation_key,
                     kill_key,
                     kill_moves,
+                    kill_word,
                     enter_like,
                     tab_key,
                     typed,
@@ -3025,7 +3039,9 @@ impl App {
                         // need `note_kill`'s fresh nav classifier; stationary
                         // kills keep only their row-shrink poof witness and
                         // license no movement class.
-                        if kill_key {
+                        if kill_key && kill_word {
+                            ws.cursor_glow.note_word_kill(input_now, kill_moves);
+                        } else if kill_key {
                             ws.cursor_glow.note_kill(input_now, kill_moves);
                         }
                         // Feed the kitty-cursor metric — DELETES ONLY, at the key.

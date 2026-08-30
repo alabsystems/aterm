@@ -2537,6 +2537,13 @@ enum Wake {
         term: Arc<Mutex<Terminal>>,
         reply: std::sync::mpsc::Sender<Result<control::DimsSnapshot, &'static str>>,
     },
+    /// `appstatus` — the STATUS-SURFACE ledger (design §3): the live status-bar
+    /// activities plus the finished ones the ring still holds. Read-only; the
+    /// reply is rendered by `control_query::cmd_appstatus`, and no authority
+    /// crosses this wake.
+    ReadAppStatus {
+        reply: std::sync::mpsc::Sender<Vec<String>>,
+    },
     /// Retired overlay test seam. Shipping changes supply exact bytes through
     /// `ConfigReloadObserved`; no durable completion can request a pathname
     /// reopen on the event loop.
@@ -18222,6 +18229,12 @@ impl ApplicationHandler<Wake> for App {
             // Assemble one coherent session/window/frame/surface geometry record
             // from the main-thread-owned per-window state. A dropped control
             // client only drops the reply; this read never mutates App state.
+            Wake::ReadAppStatus { reply } => {
+                // Rendered by `StatusBars` itself (it owns both the live bars and
+                // the ledger); the main thread's job here is only to be the place
+                // where App state is legal to read.
+                let _ = reply.send(self.status_bars.activity_rows(Instant::now()));
+            }
             Wake::ReadDims {
                 session,
                 term,
@@ -21118,6 +21131,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // builds, when nothing is staged, or when the updater is disabled/unpinned —
     // see crate aterm-update. Running here keeps the env-var loop-guard single-
     // threaded and avoids swapping a bundle with the engine already live.
+    // The successor half of the park->dial split (the worker logs the other half).
+    // This is the ONE piece of pre-dial work a design could plausibly remove, so
+    // its cost has to be a number before anyone restructures the parked window
+    // around a guess: the parent's readers are still parked for every millisecond
+    // spent in here.
+    let boot_apply_at = std::time::Instant::now();
     let boot_apply = if incoming_exec_fds.blocks_boot_apply() {
         aterm_update::ApplyOutcome::NotApplicable
     } else {
@@ -21139,6 +21158,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             seamless::target_identity_names_this_build(),
         )
     };
+    // Logged for EVERY outcome, the quiet ones included: a `NoUpdate` that took a
+    // second is exactly the finding that would justify moving this work, and the
+    // arm below is silent about it by design.
+    if incoming_exec_fds.parent_pid().is_some() {
+        aterm_log::info!(
+            "update apply (boot): {boot_apply:?} in {} ms — this ran with the outgoing \
+             process's readers still parked",
+            boot_apply_at.elapsed().as_millis(),
+        );
+    }
     match boot_apply {
         aterm_update::ApplyOutcome::NotApplicable | aterm_update::ApplyOutcome::NoUpdate => {}
         // BOTH sinks, deliberately. `eprintln!` alone put every boot-lane refusal on a

@@ -663,7 +663,11 @@ impl EffectsPipeline {
             // v0.43 full-height shoulder, and everything else — which is every
             // ordinary rainbow spelling — gets the default
             // highlighter-plus-under-baseline mark.
-            ribbon_tall: crate::cursor_glow::GlowStyle::style_names_tall_ribbon(style),
+            // The tall body is the DEFAULT again (owner, 2026-08-29: "WHERE
+            // IS MY TALL RIBBON") — only an explicit `… underline` spelling
+            // selects the highlighter. Matches `app_config`'s resolver; this
+            // embedder twin was the one site the ruling's sweep missed.
+            ribbon_tall: !crate::cursor_glow::GlowStyle::style_names_underline_ribbon(style),
             // CARRIED FORWARD, not reset — the same discipline `pack` and
             // `wake_persist_s` follow below. A reconfigure between two frames
             // must not clobber a ground the fold already resolved, or a live

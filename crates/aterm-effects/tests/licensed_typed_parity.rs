@@ -513,10 +513,40 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // evidence the licence seam did not. Rebuilt from capture, never hand-merged —
     // a three-way merge of this literal has produced ten entries in a nine-array
     // twice before.
+    // RE-DERIVED 2026-08-29 (the sound-redesign merge), and the cause PRE-DATES
+    // the merge: measured at the merge BASE — plain main `89d9f7b4`, the merge
+    // that brought the cloud poof back to the shipped style — index 2 was
+    // ALREADY `12_902_664_559_077_609_800` against the committed
+    // `10_229_932_340_051_593_466`, i.e. main landed that merge without
+    // re-capturing the rainbow entry and has been red here since. The
+    // sound-redesign merge is measurement-NEUTRAL: the merged tree measures the
+    // SAME nine values as its base, bit for bit — index 2 alone differs from
+    // the committed array and the other EIGHT are byte-identical, the repaint
+    // signature (rainbow is the style the cloud work repainted), not the seam
+    // one. Captured from measurement, not hand-merged.
+    // RE-DERIVED 2026-08-29 (the light-strike lane), and the cause PRE-DATES
+    // the lane: measured at its base — the merge `7381ba1f` — index 2 was
+    // ALREADY `10_097_007_343_695_914_747` against the committed
+    // `12_902_664_559_077_609_800`, i.e. main once again landed a rainbow
+    // merge without re-capturing this entry (the exact shape the previous
+    // paragraph records). The lane itself is measurement-NEUTRAL here, and
+    // that was verified rather than argued: this dark-theme script measures
+    // the SAME nine values at the lane's base and at its head, bit for bit —
+    // the lane's spawn-gate edit only removes a `dark_theme` conjunct that is
+    // TRUE on this script, and its light draw arm is gated `!dark_theme`, so
+    // no dark byte can move. Index 2 alone differs from the committed array
+    // and the other EIGHT are byte-identical — the repaint signature, not the
+    // seam one. Captured from measurement, not hand-merged.
+    // RE-DERIVED 2026-08-30 (the PILE LAW, `settle_flying_pile`): the rainbow
+    // frame now settles cross-owner flying crossings and the near-caret
+    // allowance, so the rainbow entry's bytes legitimately move — index 2
+    // alone, `10_097_… → 10_857_…`, with the other EIGHT byte-identical
+    // (the repaint signature again). Captured from measurement on the merged
+    // tree, not hand-merged.
     const GOLDEN: [u64; 9] = [
         10_317_128_623_903_768_537,
         17_965_605_562_081_848_086,
-        10_229_932_340_051_593_466,
+        10_857_777_412_812_312_039,
         15_654_209_172_669_807_490,
         3_818_617_666_977_618_171,
         17_432_548_801_852_476_563,

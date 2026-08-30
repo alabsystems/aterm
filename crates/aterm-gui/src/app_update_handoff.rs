@@ -44,6 +44,12 @@ mod island;
 #[cfg(unix)]
 struct HandoffWorkerJob {
     attempt_id: u64,
+    /// When `park_all_readers` returned in the parent — the zero point of the
+    /// freeze the user actually feels. Carried so the worker can SPLIT the one
+    /// number the main thread later logs as park->proof into its two halves at
+    /// the moment the split becomes observable (the successor's dial). Data
+    /// only: nothing branches on it.
+    park_at: std::time::Instant,
     current_build: u64,
     target_build: u64,
     target_commit: String,
@@ -2497,6 +2503,7 @@ fn run_out_of_band_handoff(
         return None;
     }
     let deadline = handoff_ready_deadline();
+    let launch_at = std::time::Instant::now();
     let launched = match crate::app_launch_successor::launch_app_bundle(
         &bundle,
         &arguments,
@@ -2598,6 +2605,21 @@ fn run_out_of_band_handoff(
             return None;
         }
     };
+    // THE SPLIT, at the one instant it exists. `park->proof` (logged by the main
+    // thread at Commit) is one number covering the launch, the successor's boot
+    // apply, its second execve, its cold GUI boot, its first present and the
+    // proof — and the two competing designs for shrinking the freeze attack
+    // OPPOSITE halves of it. The dial is the boundary between them: everything
+    // before it is the successor's pre-window work (which a pre-apply or a late
+    // park could remove), everything after it is GUI boot and first present
+    // (which neither can touch). Measured here, on the worker, so the parked
+    // main thread pays nothing for the reading.
+    let dial_at = std::time::Instant::now();
+    aterm_log::info!(
+        "update apply: successor dialled — park->dial {} ms, launch->dial {} ms",
+        dial_at.saturating_duration_since(job.park_at).as_millis(),
+        dial_at.saturating_duration_since(launch_at).as_millis(),
+    );
     // The identity the whole launched lane rests on, taken at the one instant it
     // is available: a pid the KERNEL attested for a process we did not fork,
     // plus the kernel's birth stamp for it. Together they survive pid reuse,
@@ -3437,6 +3459,110 @@ impl App {
             )));
         }
 
+        // HOISTED OUT OF THE PARKED WINDOW. Nothing below this comment consumes
+        // a byte from a master, and nothing above the park has stopped one yet:
+        // the attempt's identity, its successor `Command`, and the LANE DECISION
+        // with its proof identities are all pure functions of facts settled
+        // BEFORE the park — the pool snapshot, the dup'd masters, the apply
+        // ticket. Computing them inside the 20 ms budget bought nothing and
+        // spent the one resource the capture ladder is actually short of, so
+        // the degrade ladder below now has that budget back on every lane.
+        // What remains under the park is exactly what DEPENDS on the parked
+        // state: the two digests over the captured screens and layout.
+        //
+        // These early returns therefore do NOT roll back the overlap — no
+        // reader is parked, so there is nothing to re-attach. (It would be a
+        // no-op today, `attach_deferred_readers` over an empty selection, but
+        // writing it would be a lie about what happened here.) A return also
+        // drops `job_tx`, which is how the worker spawned just above learns to
+        // exit: the same shape the activity re-check below already relies on.
+
+        let attempt_id = self.next_update_handoff_id;
+        let Some(next_attempt_id) = attempt_id.checked_add(1) else {
+            return Err(crate::UpdateHandoffStartError::failed(
+                "handoff identity space is exhausted",
+            ));
+        };
+        self.next_update_handoff_id = next_attempt_id;
+        let mut command = std::process::Command::new(exe);
+        command
+            // Leading `--window` pins stripped, as on the cold/Windows lanes.
+            .args(aterm_update::reexec_forwarded_args(
+                std::env::args_os().skip(1),
+            ))
+            .env("ATERM_UPDATED_FROM", build.to_string());
+        // An ACTIVATION binds no expected artifact: the successor has nothing to swap
+        // (its `apply_staged_if_ready` finds no newer stage and returns NoUpdate) and
+        // it simply IS the authorized build — the identity check below still names it.
+        let installed_activation = apply_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.is_installed_activation());
+        bind_expected_update_artifact(
+            &mut command,
+            apply_attempt.as_ref().filter(|_| !installed_activation),
+        );
+        let target_build = apply_attempt
+            .as_ref()
+            .map_or(build, |attempt| attempt.target_build());
+        let target_commit = apply_attempt.as_ref().map_or_else(
+            || crate::build_info::GIT_COMMIT.to_string(),
+            |attempt| attempt.target_commit().to_string(),
+        );
+        // THE LANE IS DECIDED HERE AND NOWHERE ELSE, and it has to be settled
+        // before the pending attempt is recorded: it selects which term the
+        // adoption proof hashes, and the main thread re-derives that proof from
+        // the pending attempt at Commit time. A lane chosen later would leave
+        // the two halves of one proof speaking different terms — the exact
+        // failure that shows up as an unexplained `AdoptionMismatch`.
+        //
+        // Both arms produce `(lane, proof identities)` together for the same
+        // reason: they are one decision, not two that have to agree.
+        #[cfg(target_os = "macos")]
+        let (lane, proof_identities) = {
+            let facts = HandoffLaneFacts {
+                bundled: bundle.is_some(),
+                // A build for this platform has one compiled in. The fact is
+                // still a field rather than an assumption so the refusal it
+                // guards is reachable from a test.
+                launcher_available: true,
+                socket_path_fits: rendezvous_path_fits,
+                target_not_older: target_build >= build,
+                sessions: adoption.len(),
+                environment_is_a_merge: launch_environment(&command).is_some(),
+            };
+            match out_of_band_lane_refusal(facts) {
+                None => {
+                    match crate::handoff_rendezvous::proof_identities_in_device_terms(&adoption) {
+                        Some(terms) => (HandoffLane::OutOfBand, terms),
+                        // A master that will not answer `fstat` cannot be given a
+                        // device term, and a proof missing one term is a proof over
+                        // a different session set. Forking is exact here rather than
+                        // degraded: the fd-number term needs nothing from the kernel.
+                        None => {
+                            aterm_log::warn!(
+                                "update apply: forking instead of launching — a handed-off PTY would \
+                             not answer fstat, so the out-of-band proof term cannot be computed"
+                            );
+                            (HandoffLane::Fork, adoption.clone())
+                        }
+                    }
+                }
+                Some(reason) => {
+                    aterm_log::info!("update apply: forking instead of launching — {reason}");
+                    (HandoffLane::Fork, adoption.clone())
+                }
+            }
+        };
+        // Every other unix has exactly one transport, so the proof term is the
+        // descriptor number and there is no choice to record.
+        #[cfg(not(target_os = "macos"))]
+        let proof_identities = adoption.clone();
+        if self.update_handoff_activity_epoch == u64::MAX {
+            return Err(crate::UpdateHandoffStartError::failed(
+                "handoff activity identity space is exhausted",
+            ));
+        }
+
         // Close the synchronous-preparation TOCTOU immediately before the first
         // reader stop. Activity defers automatic apply while every reader is
         // still live; manual explicit apply bypasses only this quiet policy.
@@ -3814,87 +3940,6 @@ impl App {
         // capture") instead of producing a degraded layout here.
         let layout = self.capture_restore_manifest();
 
-        let attempt_id = self.next_update_handoff_id;
-        let Some(next_attempt_id) = attempt_id.checked_add(1) else {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff identity space is exhausted",
-            ));
-        };
-        self.next_update_handoff_id = next_attempt_id;
-        let mut command = std::process::Command::new(exe);
-        command
-            // Leading `--window` pins stripped, as on the cold/Windows lanes.
-            .args(aterm_update::reexec_forwarded_args(
-                std::env::args_os().skip(1),
-            ))
-            .env("ATERM_UPDATED_FROM", build.to_string());
-        // An ACTIVATION binds no expected artifact: the successor has nothing to swap
-        // (its `apply_staged_if_ready` finds no newer stage and returns NoUpdate) and
-        // it simply IS the authorized build — the identity check below still names it.
-        let installed_activation = apply_attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.is_installed_activation());
-        bind_expected_update_artifact(
-            &mut command,
-            apply_attempt.as_ref().filter(|_| !installed_activation),
-        );
-        let target_build = apply_attempt
-            .as_ref()
-            .map_or(build, |attempt| attempt.target_build());
-        let target_commit = apply_attempt.as_ref().map_or_else(
-            || crate::build_info::GIT_COMMIT.to_string(),
-            |attempt| attempt.target_commit().to_string(),
-        );
-        // THE LANE IS DECIDED HERE AND NOWHERE ELSE, and it has to be settled
-        // before the pending attempt is recorded: it selects which term the
-        // adoption proof hashes, and the main thread re-derives that proof from
-        // the pending attempt at Commit time. A lane chosen later would leave
-        // the two halves of one proof speaking different terms — the exact
-        // failure that shows up as an unexplained `AdoptionMismatch`.
-        //
-        // Both arms produce `(lane, proof identities)` together for the same
-        // reason: they are one decision, not two that have to agree.
-        #[cfg(target_os = "macos")]
-        let (lane, proof_identities) = {
-            let facts = HandoffLaneFacts {
-                bundled: bundle.is_some(),
-                // A build for this platform has one compiled in. The fact is
-                // still a field rather than an assumption so the refusal it
-                // guards is reachable from a test.
-                launcher_available: true,
-                socket_path_fits: rendezvous_path_fits,
-                target_not_older: target_build >= build,
-                sessions: adoption.len(),
-                environment_is_a_merge: launch_environment(&command).is_some(),
-            };
-            match out_of_band_lane_refusal(facts) {
-                None => {
-                    match crate::handoff_rendezvous::proof_identities_in_device_terms(&adoption) {
-                        Some(terms) => (HandoffLane::OutOfBand, terms),
-                        // A master that will not answer `fstat` cannot be given a
-                        // device term, and a proof missing one term is a proof over
-                        // a different session set. Forking is exact here rather than
-                        // degraded: the fd-number term needs nothing from the kernel.
-                        None => {
-                            aterm_log::warn!(
-                                "update apply: forking instead of launching — a handed-off PTY would \
-                             not answer fstat, so the out-of-band proof term cannot be computed"
-                            );
-                            (HandoffLane::Fork, adoption.clone())
-                        }
-                    }
-                }
-                Some(reason) => {
-                    aterm_log::info!("update apply: forking instead of launching — {reason}");
-                    (HandoffLane::Fork, adoption.clone())
-                }
-            }
-        };
-        // Every other unix has exactly one transport, so the proof term is the
-        // descriptor number and there is no choice to record.
-        #[cfg(not(target_os = "macos"))]
-        let proof_identities = adoption.clone();
         let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::failed(
@@ -3918,12 +3963,6 @@ impl App {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::failed(
                 "handoff proof capture exceeded the 20 ms deadline",
-            ));
-        }
-        if self.update_handoff_activity_epoch == u64::MAX {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff activity identity space is exhausted",
             ));
         }
         let activity_epoch = self.update_handoff_activity_epoch;
@@ -3962,6 +4001,7 @@ impl App {
         };
         let job = HandoffWorkerJob {
             attempt_id,
+            park_at,
             current_build: build,
             target_build,
             target_commit,

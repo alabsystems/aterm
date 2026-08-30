@@ -20980,6 +20980,36 @@ pub struct RibbonVertex {
     /// Coverage at the spine, `0..=255` — time-fade, intensity, specular and
     /// drain already folded in.
     pub cov: f32,
+    /// Extra coverage at the spine ABOVE `cov`, `0..=255` — the strip's own
+    /// strength in the leading between two rows, where there is no ink to keep
+    /// legible. It rides [`ribbon_lift_profile`]: a C¹ bump that is exactly zero
+    /// one device row inside the plateau above the spine and well inside the
+    /// downward reach below it, so nothing behind letterforms moves and the
+    /// base profile at `cov` stays byte-identical. `0.0` for a mark with no
+    /// lift.
+    pub lift: f32,
+}
+
+/// The share of the downward reach the spine's lift melts over — inside the
+/// next row's ink-free top margin (§4: the glyph band starts `0.22` of a cell
+/// below the cell top; the reach is `0.25..0.29`), with zero slope at its end.
+pub const RIBBON_LIFT_DN_SHARE: f32 = 0.6;
+
+/// **THE LIFT'S TRANSVERSE PROFILE** — `1.0` at the spine, exactly `0.0` at
+/// one device row inside the plateau above it (`core_up - 1`) and at
+/// [`RIBBON_LIFT_DN_SHARE`] of the reach below it, C¹ at all three. Total: a
+/// span that is not positive, or a non-finite `d`, is `0.0`.
+#[inline]
+#[must_use]
+pub fn ribbon_lift_profile(d: f32, core_up: f32, dn: f32) -> f32 {
+    if d.is_nan() {
+        return 0.0;
+    }
+    let span = if d < 0.0 { core_up - 1.0 } else { dn * RIBBON_LIFT_DN_SHARE };
+    if !span.is_finite() || span <= 0.0 {
+        return 0.0;
+    }
+    1.0 - smoothstep01(d.abs() / span)
 }
 
 /// Rasterize the RIBBON polyline into per-cell-row [`GlowQuad`]s: one
@@ -21056,6 +21086,7 @@ pub fn ribbon_beam(
             let core_up = lerp(a.core_up, b.core_up);
             let core_dn = lerp(a.core_dn, b.core_dn);
             let cov = lerp(a.cov, b.cov);
+            let lift = lerp(a.lift, b.lift).max(0.0);
             let top = spine - up;
             let bot = spine + dn;
             if !top.is_nan() && !bot.is_nan() && bot > top && cov >= 1.0 {
@@ -21080,6 +21111,11 @@ pub fn ribbon_beam(
                     } else {
                         ribbon_profile(d, core_dn, dn, 1.0)
                     };
+                    // THE SPINE'S OWN LIFT, a second C¹ term over the base
+                    // profile: it is zero wherever the base profile is behind
+                    // letterforms, so the certified pair `(colour, cov)` is what
+                    // lands there and only the leading is brighter.
+                    let level = cov * across + lift * ribbon_lift_profile(d, core_up, dn);
                     // THE ORDERED DITHER, at the last truncation in the whole
                     // design (see [`BAYER4`]). The offset is under one level, so
                     // a request already clamped at its cap still truncates to
@@ -21097,7 +21133,7 @@ pub fn ribbon_beam(
                     // is pinned to cell boundaries — so the pattern cannot crawl
                     // as the mark moves, which is the artifact ordered dithering
                     // exists to avoid.
-                    let c = (cov * across * cover + bayer4_at(p.div_euclid(step), y)) as u8;
+                    let c = (level * cover + bayer4_at(p.div_euclid(step), y)) as u8;
                     if c > 0 {
                         push_glow_rect(
                             out,
@@ -29785,6 +29821,7 @@ mod ribbon_beam_tests {
             core_dn: dn * 0.2,
             color,
             cov,
+            lift: 0.0,
         }
     }
 
@@ -30005,6 +30042,7 @@ mod ribbon_beam_tests {
                     core_dn: 8.0,
                     color: 0x00FF_FFFF,
                     cov,
+                    lift: 0.0,
                 },
                 RibbonVertex {
                     x: 120.0,
@@ -30017,6 +30055,7 @@ mod ribbon_beam_tests {
                         core_dn: 8.0,
                         color: 0x00FF_FFFF,
                         cov,
+                        lift: 0.0,
                     }
                 },
             ];

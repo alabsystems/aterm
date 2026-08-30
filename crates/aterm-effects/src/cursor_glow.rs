@@ -268,10 +268,12 @@ impl GlowStyle {
     ///
     /// TRUE for exactly these four explicit spellings. Every other recognized
     /// rainbow-kitty spelling — the bare name, the cat/dog pet aliases, the
-    /// flying head, `nyan`/`rainbow`, and the `… underline` aliases — draws the
-    /// highlighter-plus-under-baseline hybrid, which is the DEFAULT (owner,
-    /// 2026-08-28: "make the highlighter the default again"; it had been the
-    /// tall body from `d0d0b863` through v0.63.0). Both resolve to
+    /// flying head, `nyan`/`rainbow` — draws the TALL body, which is the
+    /// DEFAULT again (owner, 2026-08-29: "WHERE IS MY TALL RIBBON"). It was
+    /// the default from `d0d0b863` through v0.63.0; `317f765a` flipped it to
+    /// the highlighter on a claimed ruling the owner did not give, and this
+    /// restores it. Only the `… underline` aliases select the
+    /// highlighter-plus-under-baseline hybrid. Both resolve to
     /// [`GlowStyle::RainbowKitty`], so every style-keyed table — momentum law,
     /// starfield, sound palette, retract machinery — is shared; only the body
     /// geometry forks at [`GlowConfig::ribbon_tall`].
@@ -735,7 +737,14 @@ const RAINBOW_OCCUPIED_COV_CAP: f32 = 56.0;
 /// `crate::cursor_glow::OVER_INK_COV_CAP` — the rainbow cursor's halo and
 /// twinkle). Worst case is the bed at 34 (ground only) plus 48 (ground AND
 /// ink), measured at 5.44:1 — above the 5.25 bar this crate certifies.
-pub(crate) const OVER_INK_COV_CAP: f32 = 48.0;
+// 47, DOWN FROM 48 ON THE CROSSING ROOF (2026-08-30). The ceiling is solved
+// against the arc's brightest over-ink colour, and the crossing's lift gave
+// the arc a brighter one: the roof's mint #80FFD3 at t 0.576. At 48 the
+// guarded contrast bar read 5.2692 against the 5.27 guard (the raw 5.25:1
+// still held) — a 0.0008 miss, but the guard exists so the raw bar is never
+// the thing on trial. One level restores the margin without touching the
+// guard, which is the direction the discipline allows.
+pub(crate) const OVER_INK_COV_CAP: f32 = 47.0;
 
 /// **§8 (d): THE CARET IS THE BRIGHTEST THING IN THE EFFECT** — the least WCAG
 /// relative luminance the block cursor's fill may carry while the effect is
@@ -1076,9 +1085,29 @@ const RAINBOW_JUMP_COV_CEIL: f32 = 160.0;
 /// derived maximums allow at the tightest position, and the number the
 /// `Cap` of `rainbow_occupied_coverage_model` is written against, so the
 /// spec model and the shipped table keep naming the same ceiling.
+///
+/// **RE-CERTIFIED FOR THE CROSSING ROOF (2026-08-29).** The green→blue
+/// crossing is drawn through `SPECTRUM_CROSSING_ROOF` now — bright samples at
+/// `V ≥ 217` (where the retired lerp sagged to `130`) whose saturation taper
+/// adds white — and a brighter colour is allowed LESS coverage under the same
+/// 5.25:1 bar. The freshly solved neighbourhood ceilings are
+///
+/// ```text
+/// 132 127 115 101  91  89  84  75  66  60  57  57  58  60  63  65  66
+///  64  60  61  85 164 242 231 255 255 255 255 250 213 186 172 169
+/// ```
+///
+/// Entries 18–19 dropped from `82 / 115` to `60 / 61` because each table
+/// entry certifies its whole half-step neighbourhood and the roof lands inside
+/// both. The committed curve follows them down (`73 → 60`, `83 → 61`) and then
+/// climbs at the ≤12-level neighbour rule's own rate (`73, 85, 97`) until it
+/// rejoins the untouched violet-side entries at 107. On glass this trades the
+/// crossing's excess light for the flat, even brightness the trough already
+/// has: the seam composites at the same level as the green flank beside it,
+/// which is what "no dim patch" means for a mark whose light is budgeted.
 const RAINBOW_BAND_COV_CAPS: [f32; 33] = [
     110.0, 100.0, 89.0, 78.0, 71.0, 69.0, 67.0, 65.0, 62.0, 59.0, 57.0, 57.0, 57.0, 59.0, 62.0,
-    64.0, 65.0, 65.0, 73.0, 83.0, 92.0, 99.0, 104.0, 107.0, 109.0, 110.0, 111.0, 112.0, 113.0,
+    64.0, 65.0, 64.0, 60.0, 61.0, 73.0, 85.0, 97.0, 107.0, 109.0, 110.0, 111.0, 112.0, 113.0,
     114.0, 115.0, 115.0, 115.0,
 ];
 
@@ -1498,7 +1527,16 @@ fn pale_to_grey(rgb: u32, keep: f32) -> u32 {
 /// larger `1 / MEAN`, so the dark cool end gains more of its light back — which
 /// is the compensation doing exactly its job on a palette whose luminance span
 /// widened from 7.5x to 29.9x.
-const RAINBOW_LIGHT_COMP_MEAN: f32 = 0.580_655_4;
+///
+/// **RE-DERIVED FOR THE CROSSING ROOF: `0.580_655 -> 0.575_178`.** Same
+/// mechanism, next size down: the roof brightens the green→blue crossing
+/// (`V ≥ 217` where the lerp sagged to `130`) and the re-certified cap curve
+/// answers with less coverage there, so the luminance-weighted mean of `comp`
+/// slides a half-point lower. `certify_rainbow_light_comp_mean` is again the
+/// authority that produced the number — and again for the roof's saturation
+/// taper (`0.575_178 -> 0.569_292`), whose added white raises the crossing's
+/// luminance and drops its re-certified caps another notch.
+const RAINBOW_LIGHT_COMP_MEAN: f32 = 0.569_291_8;
 
 /// **THE BED'S SHARE OF THE ARC'S LIGHT**, at a known spectrum position — the
 /// position-blind clamp, then this colour's own share of the arc's light, then
@@ -2007,10 +2045,30 @@ struct RibbonCell {
     band: RibbonBand,
     /// Coverage at the spine, cap and drain already applied.
     lit: f32,
+    /// How much of its lift ([`rainbow_spine_lift`]) this cell may take,
+    /// `0..=1`: `1` away from the typing wake, easing to `1 − share` under the
+    /// wake's head — the strip yields to the live transient on its own spine
+    /// rather than stacking a second descent on the plume's (§4).
+    lift_gate: f32,
     /// The spark's own laid hue — what [`rainbow_laid_sweep`] folds into this
     /// cell's spectrum position. Carried because a run's OUTER boundary has no
     /// second cell to average with and must extrapolate from this one.
     hue: f32,
+}
+
+/// The live typing wake this frame — see [`CursorGlow::rainbow_wake_live`].
+#[derive(Clone, Copy, Debug)]
+struct WakeLive {
+    row: u16,
+    /// Sub-cell head column (rounded under reduced motion).
+    head_col: f32,
+    /// `throttle · momentum · intensity` — what the plume's coverage rides.
+    amp: f32,
+    /// `throttle · momentum`, the amplitude before intensity: how much of the
+    /// strip's lift the wake displaces at its head.
+    share: f32,
+    /// Body length in cells; the plume reaches `len · RAINBOW_WAKE_EXTENT`.
+    len: f32,
 }
 
 /// **THE FRAME'S ONE ADDITIVE LEDGER** (§4, THE COMPOSITION RULE) — what the
@@ -2078,25 +2136,148 @@ struct RainbowLedger {
     /// is the bed peak the lay actually lands on, and a lay reads at most a
     /// handful of them.
     ///
-    /// Maintained inside the claim walks that were already writing those pixels
-    /// — three compares per pixel-run, not per pixel — so a frame pays for the
-    /// summary only where it already paid for the ink.
+    /// Maintained inside [`Self::claim_bed`]'s walk, which was already writing
+    /// those pixels — three compares per pixel-run, not per pixel — so a frame
+    /// pays for the summary only where it already paid for the ink. EXACT for
+    /// the bed (its claims stay eager), which is what lets the bed's own walk
+    /// answer whole tiles from the summary.
     bed_tile: Vec<[u8; 3]>,
-    /// The companions' accumulation, summarized exactly as [`Self::bed_tile`].
+    /// The companions' FLAT lays' accumulation, summarized exactly as
+    /// [`Self::bed_tile`] — the running per-channel maximum of what the flat
+    /// claims actually wrote. The halos' share lives in [`Self::halo_tile`];
+    /// every reader takes `sat3` of the pair, which bounds the true combined
+    /// accumulation because `max_p(F+H) ≤ max_p F + max_p H`.
     over_tile: Vec<[u8; 3]>,
-    /// One row's worth of the halo profile ALREADY SCALED to the lay's colour,
-    /// indexed by distance from the halo's centre column.
-    ///
-    /// The falloff is symmetric about that column, so a scanline of `2d + 1`
-    /// pixels needs `d + 1` scalings rather than `2d + 1` — and the inner loop
-    /// then spends a load where it used to spend a multiply per channel. Lives
-    /// on the ledger so the allocation is retained across frames.
-    row_scale: Vec<[u8; 3]>,
+    /// The deferred halos' per-tile bound — each claimed halo adds its own
+    /// maximum possible contribution to the tile (the falloff at the tile's
+    /// nearest point to the centre), saturating. A SUM of per-lay maxima, so it
+    /// dominates the true halo accumulation at every pixel; kept apart from the
+    /// flat maxima precisely so its looseness cannot leak into theirs.
+    halo_tile: Vec<[u8; 3]>,
+    /// **THE ROW-RESOLUTION BOUND for the flat OVER-INK lays** — `(ledger row
+    /// × tiles_w) + tx`, the saturating SUM of every flat over lay's colour
+    /// whose footprint touches that sixteen-pixel row segment. Row-resolution
+    /// because the sparkle field is scanline quads: many DISJOINT rects share
+    /// one tile, and a per-tile sum of them saturates while no pixel carries
+    /// more than a couple — per row segment the sum is over the lays that
+    /// really can share a pixel. [`Self::over_tile`] is maintained as the MAX
+    /// over these, which keeps the tile view tight.
+    over_row: Vec<[u8; 3]>,
     /// Tiles across one ledger row — `stride` rounded up to [`LEDGER_TILE`].
     tiles_w: usize,
     stride: usize,
     y0: i32,
     rows: usize,
+    /// The cyan laws' memo — see [`CyanMemo`]. Lives on the ledger because the
+    /// ledger is the one piece of budget state that already persists across
+    /// frames behind a `&mut`, which is exactly the lifetime a memo of a pure
+    /// function wants. [`Self::open`] deliberately does NOT clear it.
+    cyan: CyanMemo,
+    /// This frame's claims, DEFERRED — see [`Self::claim`]'s note on the lazy
+    /// planes. Each entry is the whole recipe for replaying the lay's pixel
+    /// writes bit-for-bit ([`Self::materialize_tile`]).
+    frame_lays: Vec<FrameLay>,
+    /// Per tile, the indices into [`Self::frame_lays`] of every lay that
+    /// touches it — what [`Self::materialize_tile`] replays. Inner vectors are
+    /// retained across frames; [`Self::open`] clears them.
+    tile_lays: Vec<Vec<u32>>,
+    /// Per tile: has this tile's slice of the planes been MATERIALIZED — i.e.,
+    /// do its pixels carry every claim so far, so a walk may read them?
+    tile_live: Vec<bool>,
+}
+
+/// One deferred claim — the parameters [`RainbowLedger::materialize_tile`]
+/// replays into the planes, producing byte-for-byte the pixels the eager walk
+/// used to write. A flat lay stamps its colour across its rect (into the bed
+/// plane or the over plane by [`FrameLay::kind`]); a halo recomputes its weight
+/// through the renderer's own `halo_col_nx`/`halo_weight_at`. The colour is
+/// always the KEPT colour the budget settled on.
+#[derive(Clone, Copy)]
+struct FrameLay {
+    kind: LayKind,
+    color: u32,
+    /// The claim's CLIPPED footprint, so replay never writes a pixel the eager
+    /// form would not have.
+    rect: (i32, i32, i32, i32),
+}
+
+/// Which pixels a [`FrameLay`] writes, and with what falloff. (The bed's
+/// claims are eager — see [`RainbowLedger::claim_bed`] — so only the over
+/// plane's lays defer.)
+#[derive(Clone, Copy)]
+enum LayKind {
+    /// A flat rect into the over plane.
+    Flat,
+    /// A radial falloff into the over plane.
+    Halo { cx: i32, cy: i32, rx2: i32, ry2: i32 },
+}
+
+/// **ONE DIRECT-MAPPED MEMO FOR THE CYAN LAWS.**
+///
+/// [`crate::spectrum::clear_light_of_cyan`] and
+/// [`crate::spectrum::clear_halo_of_cyan`] are PURE functions of
+/// `(colour, alpha-or-mode, ground)` — and the frame asks them about the same
+/// pairs over and over: a steady-state ribbon re-emits its palette every frame,
+/// so across frames the distinct keys number in the hundreds while the calls
+/// number in the tens of thousands. Profiled on the hot-ribbon release gate the
+/// two laws (through `over_the_glass_ceiling`) were the largest single line of
+/// the frame even after the integer turnstile.
+///
+/// Direct-mapped and LOSSY: a colliding key simply recomputes the law and takes
+/// the slot. Correctness cannot depend on the cache because the value is always
+/// THE LAW'S OWN ANSWER for the full key — a hit returns what a miss would have
+/// computed, bit for bit.
+///
+/// The key packs the FULL 32-bit colour word (a `HaloMode::Over` veil carries
+/// its alpha ceiling in the high byte, and the laws pass that byte through on
+/// their leave-it-alone path, so it must key and round-trip verbatim), `alpha`
+/// or the halo's source-over flag (8 bits), a law tag (bit 62) and an occupied
+/// marker (bit 63), so `0` is free to mean "empty slot" and the two laws can
+/// never alias each other's entries. The GROUND is not in the key: it is one
+/// value per theme, so the memo remembers it aside and flushes itself on the
+/// day it actually changes ([`Self::keyed_to_ground`]).
+#[derive(Default)]
+struct CyanMemo {
+    keys: Vec<u64>,
+    vals: Vec<u32>,
+    /// The ground every stored answer was computed over, `u32::MAX` when empty.
+    ground: u32,
+}
+
+/// log2 of the memo's slot count — 16k slots, 192 KiB resident once touched.
+const CYAN_MEMO_BITS: u32 = 14;
+
+impl CyanMemo {
+    /// Bind the memo to `ground`, flushing every stored answer if it differs
+    /// from the one the entries were computed over. Called once per applier
+    /// pass, so a theme change costs one memset and nothing ever reads a stale
+    /// ground's answer.
+    fn keyed_to_ground(&mut self, ground: u32) {
+        if self.keys.is_empty() {
+            self.keys = vec![0; 1 << CYAN_MEMO_BITS];
+            self.vals = vec![0; 1 << CYAN_MEMO_BITS];
+            self.ground = ground;
+        } else if self.ground != ground {
+            self.keys.iter_mut().for_each(|k| *k = 0);
+            self.ground = ground;
+        }
+    }
+
+    /// The memoized answer for `key`, computing `law` only on a miss (or a
+    /// collision, which overwrites — see the type's own note on lossiness).
+    /// [`Self::keyed_to_ground`] must have bound the ground first.
+    #[inline]
+    fn get_or(&mut self, key: u64, law: impl FnOnce() -> u32) -> u32 {
+        // Fibonacci hashing: the high bits of an odd-constant product.
+        let i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - CYAN_MEMO_BITS)) as usize;
+        if self.keys[i] == key {
+            return self.vals[i];
+        }
+        let v = law();
+        self.keys[i] = key;
+        self.vals[i] = v;
+        v
+    }
 }
 
 /// The edge, in pixels, of one [`RainbowLedger::bed_tile`] summary block. A
@@ -2131,6 +2312,7 @@ enum Lit<'a> {
     Radial {
         cx: i32,
         cy: i32,
+        rx2: i32,
         ry2: i32,
         nx: &'a [i32],
     },
@@ -2171,6 +2353,7 @@ impl<'a> Lit<'a> {
         Lit::Radial {
             cx,
             cy,
+            rx2,
             ry2,
             nx: scratch.as_slice(),
         }
@@ -2190,7 +2373,7 @@ impl<'a> Lit<'a> {
     fn row(self, y: i32, x0: i32, x1: i32) -> (i32, i32, i32) {
         match self {
             Lit::Flat => (x0, x1, 0),
-            Lit::Radial { cx, cy, ry2, nx } => {
+            Lit::Radial { cx, cy, ry2, nx, .. } => {
                 let ny = aterm_render::halo_row_ny(y - cy, ry2);
                 if ny >= 256 {
                     return (x0, x0, ny);
@@ -2259,6 +2442,95 @@ fn pack3(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
 
+/// **ONE FLAT LAY'S PIXEL WRITES OVER ONE CLIPPED SPAN** — the replay/stamp
+/// body for the bed strips and the sparkle rects: the same saturating add the
+/// eager claim performed, byte for byte.
+fn stamp_flat_span(
+    plane: &mut [[u8; 3]],
+    stride: usize,
+    ly0: i32,
+    clip: (i32, i32, i32, i32),
+    c: [u8; 3],
+) -> [u8; 3] {
+    let (x0, y0, x1, y1) = clip;
+    let mut hi = [0u8; 3];
+    for y in y0..y1 {
+        let base = (y - ly0) as usize * stride;
+        for cell in &mut plane[base + x0 as usize..base + x1 as usize] {
+            for k in 0..3 {
+                let v = cell[k].saturating_add(c[k]);
+                cell[k] = v;
+                hi[k] = hi[k].max(v);
+            }
+        }
+    }
+    hi
+}
+
+/// **ONE HALO'S PIXEL WRITES OVER ONE CLIPPED SPAN** — the shared body of a
+/// live-tile stamp and a [`RainbowLedger::materialize_tile`] replay. The weight
+/// is recomputed through `halo_col_nx`/`halo_weight_at` and the colour scaled
+/// through `premul_rgb` — the same integers, in the same order, the eager
+/// claim's per-level table held, so the bytes written are exactly the eager
+/// claim's. A span here is at most one tile (256 pixels), which is why the
+/// per-pixel scaling beats rebuilding a 257-entry table per lay.
+#[allow(clippy::too_many_arguments)]
+fn stamp_halo_span(
+    over: &mut [[u8; 3]],
+    stride: usize,
+    ly0: i32,
+    clip: (i32, i32, i32, i32),
+    cx: i32,
+    cy: i32,
+    rx2: i32,
+    ry2: i32,
+    color: u32,
+) -> [u8; 3] {
+    let mut hi = [0u8; 3];
+    let (x0, y0, x1, y1) = clip;
+    if x1 <= x0 {
+        return hi;
+    }
+    // The X axis term once per COLUMN — the falloff's only division — into a
+    // stack table sized for the widest span a caller passes (one tile).
+    let mut nx_col = [0i32; LEDGER_TILE];
+    let wide = usize::try_from(x1 - x0).unwrap_or(usize::MAX) > LEDGER_TILE;
+    if !wide {
+        for (i, nx) in nx_col.iter_mut().enumerate().take((x1 - x0) as usize) {
+            *nx = aterm_render::halo_col_nx(x0 + i as i32 - cx, rx2);
+        }
+    }
+    for y in y0..y1 {
+        let ny = aterm_render::halo_row_ny(y - cy, ry2);
+        if ny > 255 {
+            continue;
+        }
+        let base = (y - ly0) as usize * stride;
+        for xx in x0..x1 {
+            let nx = if wide {
+                aterm_render::halo_col_nx(xx - cx, rx2)
+            } else {
+                nx_col[(xx - x0) as usize]
+            };
+            let w = aterm_render::halo_weight_at(nx, ny).clamp(0, 255) as u8;
+            if w == 0 {
+                continue;
+            }
+            let add = rgb3(premul_rgb(color, w));
+            if add == [0; 3] {
+                continue;
+            }
+            let cell = &mut over[base + xx as usize];
+            for k in 0..3 {
+                let v = cell[k].saturating_add(add[k]);
+                cell[k] = v;
+                hi[k] = hi[k].max(v);
+            }
+        }
+    }
+    hi
+}
+
 impl RainbowLedger {
     /// Open a fresh ledger over `[y0, y1)` of this frame's window. Retains its
     /// allocation across frames (clear-and-resize, never a drop).
@@ -2273,10 +2545,22 @@ impl RainbowLedger {
         }
         self.tiles_w = self.stride.div_ceil(LEDGER_TILE);
         let tiles = self.tiles_w * self.rows.div_ceil(LEDGER_TILE);
-        for v in [&mut self.bed_tile, &mut self.over_tile] {
+        for v in [&mut self.bed_tile, &mut self.over_tile, &mut self.halo_tile] {
             v.clear();
             v.resize(tiles, [0; 3]);
         }
+        let row_slots = self.tiles_w * self.rows;
+        self.over_row.clear();
+        self.over_row.resize(row_slots, [0; 3]);
+        self.frame_lays.clear();
+        if self.tile_lays.len() < tiles {
+            self.tile_lays.resize_with(tiles, Vec::new);
+        }
+        for v in &mut self.tile_lays[..tiles] {
+            v.clear();
+        }
+        self.tile_live.clear();
+        self.tile_live.resize(tiles, false);
     }
 
     /// The rows of `[ry0, ry1)` this ledger actually carries, and the x range of
@@ -2290,6 +2574,31 @@ impl RainbowLedger {
         let y0 = ry0.max(self.y0);
         let y1 = ry1.min(self.y0 + self.rows as i32);
         (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+    }
+
+    /// [`Self::tile_peaks`]'s bed-only half, for the bed's own admission test —
+    /// which never consults the companions' summaries, so reading them there
+    /// was pure cost on a call made once per bed quad.
+    #[inline]
+    fn tile_peaks_bed(&self, rect: (i32, i32, i32, i32)) -> [u8; 3] {
+        let mut bed = [0u8; 3];
+        let Some((x0, y0, x1, y1)) = self.clip(rect) else {
+            return bed;
+        };
+        let tx0 = (x0 as usize) >> LEDGER_TILE_SHIFT;
+        let tx1 = ((x1 - 1) as usize) >> LEDGER_TILE_SHIFT;
+        let ty0 = ((y0 - self.y0) as usize) >> LEDGER_TILE_SHIFT;
+        let ty1 = ((y1 - 1 - self.y0) as usize) >> LEDGER_TILE_SHIFT;
+        for ty in ty0..=ty1 {
+            let row = ty * self.tiles_w;
+            for tx in tx0..=tx1 {
+                let b = self.bed_tile[row + tx];
+                for k in 0..3 {
+                    bed[k] = bed[k].max(b[k]);
+                }
+            }
+        }
+        bed
     }
 
     /// The per-channel maxima of the bed and of the companions over every tile
@@ -2310,7 +2619,7 @@ impl RainbowLedger {
             let row = ty * self.tiles_w;
             for tx in tx0..=tx1 {
                 let b = self.bed_tile[row + tx];
-                let o = self.over_tile[row + tx];
+                let o = sat3(self.over_tile[row + tx], self.halo_tile[row + tx]);
                 for k in 0..3 {
                     bed[k] = bed[k].max(b[k]);
                     over[k] = over[k].max(o[k]);
@@ -2353,7 +2662,7 @@ impl RainbowLedger {
     /// [`Ceils::skips`] skips it for the companions: the block REPLACES it, so
     /// nothing laid there survives to be seen.
     fn bed_coverage_for(
-        &self,
+        &mut self,
         q: &GlowQuad,
         ground: [u8; 3],
         top: f32,
@@ -2367,37 +2676,68 @@ impl RainbowLedger {
         let qx0 = i32::from(q.x);
         let qy0 = i32::from(q.y);
         let rect = (qx0, qy0, qx0 + i32::from(q.w), qy0 + i32::from(q.h));
-        // THE O(1) ARM, and the one every ordinary frame takes. The tile summary
-        // is the per-channel max of the bed over every block this quad reaches,
-        // so it DOMINATES the quad's own footprint: if the lay fits at full
-        // coverage against THAT, it fits everywhere it actually lands, and the
-        // walk below can be skipped entirely. A ribbon that is nowhere near the
-        // ceiling — measured on glass, the brightest single bed quad composites
-        // to `131` against a `251` ceiling — therefore pays a handful of
-        // compares per quad instead of a second pass over its pixels.
-        let (tile_bed, _) = self.tile_peaks(rect);
+        // THE O(1) ARM, and the one every ordinary frame takes. The tile
+        // summary is the per-channel max of the bed over every block this quad
+        // reaches, so it DOMINATES the quad's own footprint: if the lay fits at
+        // full coverage against THAT, it fits everywhere it actually lands, and
+        // the walk below can be skipped entirely.
+        let tile_bed = self.tile_peaks_bed(rect);
         if (0..3).all(|k| u32::from(ground[k]) + u32::from(tile_bed[k]) + u32::from(c[k]) <= cap) {
             return 255;
         }
         let Some((x0, y0, x1, y1)) = self.clip(rect) else {
             return 255;
         };
+        // **THE WALK, TILE BY TILE.** The per-channel peak this pass wants is
+        // exactly what [`Self::bed_tile`] already holds for any tile the quad
+        // covers WHOLE and the caret does not touch — the bed claims are eager
+        // and its summary exact — so those tiles are answered by one lookup and
+        // only the partial edge tiles and the caret's own tiles are walked
+        // pixel by pixel. Bit-identical either way: `max` over a disjoint
+        // cover is `max` of the parts.
         let mut peak = [0u8; 3];
         let mut any = false;
-        for y in y0..y1 {
-            let base = (y - self.y0) as usize * self.stride;
-            for x in x0..x1 {
-                if caret.is_some_and(|(cx0, cy0, cx1, cy1)| {
-                    (cy0..cy1).contains(&y) && (cx0..cx1).contains(&x)
-                }) {
+        let tile = LEDGER_TILE as i32;
+        let mut by0 = y0;
+        while by0 < y1 {
+            let ty = ((by0 - self.y0) as usize) >> LEDGER_TILE_SHIFT;
+            let by1 = (self.y0 + ((ty as i32 + 1) << LEDGER_TILE_SHIFT)).min(y1);
+            let trow = ty * self.tiles_w;
+            let mut bx0 = x0;
+            while bx0 < x1 {
+                let tx = (bx0 as usize) >> LEDGER_TILE_SHIFT;
+                let bx1 = (((tx as i32) + 1) << LEDGER_TILE_SHIFT).min(x1);
+                let whole = (by1 - by0 == tile) && (bx1 - bx0 == tile);
+                let caret_here = caret.is_some_and(|(cx0, cy0, cx1, cy1)| {
+                    cx0 < bx1 && bx0 < cx1 && cy0 < by1 && by0 < cy1
+                });
+                if whole && !caret_here {
+                    let b = self.bed_tile[trow + tx];
+                    for k in 0..3 {
+                        peak[k] = peak[k].max(b[k]);
+                    }
+                    any = true;
+                    bx0 = bx1;
                     continue;
                 }
-                any = true;
-                let b = self.bed[base + x as usize];
-                for k in 0..3 {
-                    peak[k] = peak[k].max(b[k]);
+                for y in by0..by1 {
+                    let base = (y - self.y0) as usize * self.stride;
+                    for x in bx0..bx1 {
+                        if caret.is_some_and(|(cx0, cy0, cx1, cy1)| {
+                            (cy0..cy1).contains(&y) && (cx0..cx1).contains(&x)
+                        }) {
+                            continue;
+                        }
+                        any = true;
+                        let b = self.bed[base + x as usize];
+                        for k in 0..3 {
+                            peak[k] = peak[k].max(b[k]);
+                        }
+                    }
                 }
+                bx0 = bx1;
             }
+            by0 = by1;
         }
         if !any {
             return 255;
@@ -2419,10 +2759,13 @@ impl RainbowLedger {
         cov.min(255) as u8
     }
 
-    /// The UNDER-INK bed's own claim. Also carries the running per-channel
-    /// [`Self::bed_peak`] the next quad's ceiling test reads, so the trim costs
-    /// three compares on a walk this was already making rather than a walk of
-    /// its own.
+    /// The UNDER-INK bed's own claim — EAGER, unlike the companions' (see
+    /// [`Self::claim`]): the bed is scanline strips that STACK where the wake
+    /// revisits a cell, and a deferred row-sum bound over stacking lays was
+    /// measured to inflate past the ceiling everywhere the wake lives, sending
+    /// every quad down the exact arm — slower than just writing the pixels. So
+    /// the bed keeps its exact per-tile maximum, three compares on a walk it
+    /// was already making.
     fn claim_bed(&mut self, q: &GlowQuad) {
         let c = rgb3(q.color);
         let qx0 = i32::from(q.x);
@@ -2470,7 +2813,7 @@ impl RainbowLedger {
     /// dims evenly instead of growing an interior edge — which is the failure
     /// this whole pass exists to stop.
     fn coverage_for(
-        &self,
+        &mut self,
         rect: (i32, i32, i32, i32),
         ceils: Ceils,
         color: u32,
@@ -2503,48 +2846,99 @@ impl RainbowLedger {
         // hoisted, because it changes only when a pixel forces the coverage
         // down. `premul_rgb(color, 255) == color`, so the walk starts here.
         let mut scaled = color;
-        for y in y0..y1 {
-            let (lo, hi, ny) = lit.row(y, x0, x1);
-            let row = (y - self.y0) as usize * self.stride;
-            for x in lo..hi {
-                let w = lit.weight(x, ny);
-                if w == 0 || ceils.skips(y, x) {
+        // **THE WALK, TILE BY TILE — the O(1) arm again, inside the walk.** The
+        // same dominance argument that admits a whole lay against the tile
+        // summary admits each TILE of it: the summary's per-channel max bounds
+        // every pixel of the tile, the falloff's weight never exceeds `255`
+        // (where `add` is `scaled` itself), and `admits` is monotone in all
+        // three arguments — so a tile whose summary admits the lay at the
+        // coverage IN HAND holds no pixel that could force it lower, and the
+        // result is bit-identical to the flat walk (the answer is a min, and
+        // every skipped pixel's own allowance is at or above the running min).
+        // A tile skipped at a higher `scaled` stays sound after a later trim:
+        // `admits` at the larger add implies it at the smaller. What remains is
+        // the handful of tiles genuinely near a ceiling, walked exactly as
+        // before.
+        let mut by0 = y0;
+        while by0 < y1 {
+            let ty = ((by0 - self.y0) as usize) >> LEDGER_TILE_SHIFT;
+            let by1 = (self.y0 + ((ty as i32 + 1) << LEDGER_TILE_SHIFT)).min(y1);
+            let trow = ty * self.tiles_w;
+            let mut bx0 = x0;
+            while bx0 < x1 {
+                let tx = (bx0 as usize) >> LEDGER_TILE_SHIFT;
+                let bx1 = (((tx as i32) + 1) << LEDGER_TILE_SHIFT).min(x1);
+                let t_over = sat3(self.over_tile[trow + tx], self.halo_tile[trow + tx]);
+                let t_stand = sat3(ceils.ground, sat3(self.bed_tile[trow + tx], t_over));
+                if ceils.admits(t_stand, t_over, rgb3(scaled)) {
+                    bx0 = bx1;
                     continue;
                 }
-                let i = row + x as usize;
-                let over = self.over[i];
-                let stand = sat3(ceils.ground, sat3(self.bed[i], over));
-                // What this lay adds HERE at the coverage in hand, exactly as
-                // the rasterizer computes it: the lay is scaled first, then the
-                // falloff. A flat rect is at full weight, where the second
-                // scaling is the identity.
-                let add = |lay: u32| rgb3(if w == 255 { lay } else { premul_rgb(lay, w) });
-                if ceils.admits(stand, over, add(scaled)) {
-                    continue;
-                }
-                // Monotone in the coverage, so a binary search resolves it
-                // exactly.
-                let (mut lo, mut hi) = (0u8, cov);
-                while lo < hi {
-                    let mid = lo + (hi - lo).div_ceil(2);
-                    if ceils.admits(stand, over, add(premul_rgb(color, mid))) {
-                        lo = mid;
-                    } else {
-                        hi = mid - 1;
+                // The walk is about to read this tile's `over` pixels — bring
+                // the deferred halo claims up to date there first (see
+                // [`Self::materialize_tile`]; a no-op once the tile is live).
+                self.materialize_tile(ty, tx);
+                for y in by0..by1 {
+                    let (lo, hi, ny) = lit.row(y, bx0, bx1);
+                    let row = (y - self.y0) as usize * self.stride;
+                    for x in lo..hi {
+                        let w = lit.weight(x, ny);
+                        if w == 0 || ceils.skips(y, x) {
+                            continue;
+                        }
+                        let i = row + x as usize;
+                        let over = self.over[i];
+                        let stand = sat3(ceils.ground, sat3(self.bed[i], over));
+                        // What this lay adds HERE at the coverage in hand,
+                        // exactly as the rasterizer computes it: the lay is
+                        // scaled first, then the falloff. A flat rect is at
+                        // full weight, where the second scaling is the
+                        // identity.
+                        let add = |lay: u32| rgb3(if w == 255 { lay } else { premul_rgb(lay, w) });
+                        if ceils.admits(stand, over, add(scaled)) {
+                            continue;
+                        }
+                        // Monotone in the coverage, so a binary search resolves
+                        // it exactly.
+                        let (mut lo, mut hi) = (0u8, cov);
+                        while lo < hi {
+                            let mid = lo + (hi - lo).div_ceil(2);
+                            if ceils.admits(stand, over, add(premul_rgb(color, mid))) {
+                                lo = mid;
+                            } else {
+                                hi = mid - 1;
+                            }
+                        }
+                        cov = lo;
+                        if cov == 0 {
+                            return 0;
+                        }
+                        scaled = premul_rgb(color, cov);
                     }
                 }
-                cov = lo;
-                if cov == 0 {
-                    return 0;
-                }
-                scaled = premul_rgb(color, cov);
+                bx0 = bx1;
             }
+            by0 = by1;
         }
         cov
     }
 
     /// Charge an over-ink lay's realized colour to every pixel it lights, in the
     /// same bytes the rasterizer will add.
+    ///
+    /// **THE PLANE IS EXACT; THE TILE SUMMARY IS A BOUND.** The per-pixel
+    /// `over` plane keeps carrying byte-for-byte what the rasterizer will add —
+    /// it is what the exact walks read. [`Self::over_tile`] however only ever
+    /// feeds ADMISSION tests (`lay_fits_whole`, the walks' per-tile pre-skip),
+    /// and admission is sound against any DOMINATING value — so instead of
+    /// tracking the running per-pixel maximum three compares at a time across a
+    /// quarter-million claimed pixels a frame, each lay charges every tile it
+    /// touches ONCE with its own maximum possible contribution there (its flat
+    /// colour, or the falloff at the tile's nearest point to the halo's
+    /// centre), saturating-summed: `new_px ≤ old_px + lay_max ≤ old_tile +
+    /// lay_max`. A bound can only make admission more conservative, never admit
+    /// what the exact summary would not, so every coverage the budget hands out
+    /// is unchanged — the walk that resolves it reads the exact plane.
     fn claim(&mut self, rect: (i32, i32, i32, i32), color: u32, lit: Lit<'_>) {
         if color == 0 {
             return;
@@ -2553,75 +2947,235 @@ impl RainbowLedger {
             return;
         };
         let flat = rgb3(color);
-        let centre = match lit {
-            Lit::Flat => 0,
-            Lit::Radial { cx, .. } => cx,
-        };
         let (stride, ly0, tw) = (self.stride, self.y0, self.tiles_w);
-        let RainbowLedger {
-            over,
-            over_tile,
-            row_scale,
-            ..
-        } = self;
-        for y in y0..y1 {
-            let (lo, hi, ny) = lit.row(y, x0, x1);
-            if hi <= lo {
-                continue;
+        let tx0 = (x0 as usize) >> LEDGER_TILE_SHIFT;
+        let tx1 = ((x1 - 1) as usize) >> LEDGER_TILE_SHIFT;
+        let ty0 = ((y0 - ly0) as usize) >> LEDGER_TILE_SHIFT;
+        let ty1 = ((y1 - 1 - ly0) as usize) >> LEDGER_TILE_SHIFT;
+        match lit {
+            Lit::Flat => {
+                // The sparkle quads are scanline rects exactly the way the bed
+                // strips are, so they defer through the same row-resolution
+                // bounds — see [`Self::claim_bed`].
+                self.frame_lays.push(FrameLay {
+                    kind: LayKind::Flat,
+                    color,
+                    rect: (x0, y0, x1, y1),
+                });
+                let idx = self.frame_lays.len() as u32 - 1;
+                for ty in ty0..=ty1 {
+                    let row = ty * tw;
+                    let band_y0 = (ly0 + ((ty as i32) << LEDGER_TILE_SHIFT)).max(y0);
+                    let band_y1 = (ly0 + ((ty as i32 + 1) << LEDGER_TILE_SHIFT)).min(y1);
+                    for tx in tx0..=tx1 {
+                        if self.tile_live[row + tx] {
+                            // A live tile's summary is EXACT (see
+                            // [`Self::materialize_tile`]); the stamp's own
+                            // running max keeps it that way.
+                            let band_x0 = ((tx as i32) << LEDGER_TILE_SHIFT).max(x0);
+                            let band_x1 = ((tx as i32 + 1) << LEDGER_TILE_SHIFT).min(x1);
+                            let hi = stamp_flat_span(
+                                &mut self.over,
+                                stride,
+                                ly0,
+                                (band_x0, band_y0, band_x1, band_y1),
+                                flat,
+                            );
+                            let t = &mut self.over_tile[row + tx];
+                            for k in 0..3 {
+                                t[k] = t[k].max(hi[k]);
+                            }
+                        } else {
+                            let RainbowLedger {
+                                over_row,
+                                over_tile,
+                                ..
+                            } = &mut *self;
+                            for y in band_y0..band_y1 {
+                                let e = &mut over_row[(y - ly0) as usize * tw + tx];
+                                *e = sat3(*e, flat);
+                                let e = *e;
+                                let t = &mut over_tile[row + tx];
+                                for k in 0..3 {
+                                    t[k] = t[k].max(e[k]);
+                                }
+                            }
+                            self.tile_lays[row + tx].push(idx);
+                        }
+                    }
+                }
             }
-            if matches!(lit, Lit::Radial { .. }) {
-                // This row's scaled colour, once per column OFFSET (see
-                // [`Self::row_scale`]).
-                let dmax = (centre - lo).max(hi - 1 - centre).max(0) as usize;
-                row_scale.clear();
-                row_scale.reserve(dmax + 1);
-                for d in 0..=dmax {
-                    let w = lit.weight(centre + d as i32, ny);
-                    row_scale.push(if w == 0 {
-                        [0; 3]
+            Lit::Radial { cx, cy, rx2, ry2, nx } => {
+                // **THE HALO'S PIXELS ARE CLAIMED LAZILY.** Measured on the
+                // hot-ribbon release gate, the radial claims wrote a
+                // quarter-million pixels a frame and the exact walks read back
+                // a few THOUSAND of them — every other byte was written to be
+                // cleared unread at the next `open`. So a halo's claim is three
+                // parts now: the recipe for its pixels ([`FrameLay`], replayed
+                // by [`Self::materialize_tile`] the moment a walk actually
+                // needs a tile), the per-tile dominating bound (below), and an
+                // immediate stamp into any tile a walk ALREADY materialized.
+                // Saturating adds of non-negative addends commute —
+                // `min(255, a+b+c)` whatever the order — so a tile assembled
+                // out of order carries byte-for-byte what the eager order
+                // wrote.
+                self.frame_lays.push(FrameLay {
+                    kind: LayKind::Halo { cx, cy, rx2, ry2 },
+                    color,
+                    rect: (x0, y0, x1, y1),
+                });
+                let idx = self.frame_lays.len() as u32 - 1;
+                let RainbowLedger {
+                    over,
+                    over_tile,
+                    halo_tile,
+                    tile_live,
+                    tile_lays,
+                    ..
+                } = self;
+                // **THE TILE BOUND, plus the live stamps.** The falloff's
+                // maximum over a tile sits at the tile's nearest point to the
+                // centre (both axis terms are monotone in distance), so one
+                // weight per tile dominates every pixel the lay would write
+                // there — `new_px ≤ old_px + lay_max ≤ old_tile + lay_max`.
+                for ty in ty0..=ty1 {
+                    let band_y0 = (ly0 + ((ty as i32) << LEDGER_TILE_SHIFT)).max(y0);
+                    let band_y1 = (ly0 + ((ty as i32 + 1) << LEDGER_TILE_SHIFT)).min(y1);
+                    let dy_near = if cy < band_y0 {
+                        band_y0 - cy
+                    } else if cy >= band_y1 {
+                        cy - (band_y1 - 1)
                     } else {
-                        rgb3(premul_rgb(color, w))
-                    });
-                }
-            }
-            let r = (y - ly0) as usize;
-            let base = r * stride;
-            let trow = (r >> LEDGER_TILE_SHIFT) * tw;
-            let mut x = lo;
-            while x < hi {
-                let tx = (x as usize) >> LEDGER_TILE_SHIFT;
-                let end = (((tx + 1) << LEDGER_TILE_SHIFT) as i32).min(hi);
-                let mut hi_over = [0u8; 3];
-                for xx in x..end {
-                    let add = match lit {
-                        Lit::Flat => flat,
-                        Lit::Radial { .. } => row_scale[(xx - centre).unsigned_abs() as usize],
+                        0
                     };
-                    if add == [0; 3] {
-                        continue;
-                    }
-                    let cell = &mut over[base + xx as usize];
-                    for k in 0..3 {
-                        let v = cell[k].saturating_add(add[k]);
-                        cell[k] = v;
-                        hi_over[k] = hi_over[k].max(v);
+                    let ny_t = aterm_render::halo_row_ny(dy_near, ry2);
+                    let row = ty * tw;
+                    for tx in tx0..=tx1 {
+                        let band_x0 = ((tx as i32) << LEDGER_TILE_SHIFT).max(x0);
+                        let band_x1 = ((tx as i32 + 1) << LEDGER_TILE_SHIFT).min(x1);
+                        let dx_near = if cx < band_x0 {
+                            band_x0 - cx
+                        } else if cx >= band_x1 {
+                            cx - (band_x1 - 1)
+                        } else {
+                            0
+                        };
+                        let d = (dx_near as usize).min(nx.len() - 1);
+                        let w = aterm_render::halo_weight_at(nx[d], ny_t).clamp(0, 255) as u8;
+                        if w == 0 {
+                            continue;
+                        }
+                        let add = rgb3(premul_rgb(color, w));
+                        if add == [0; 3] {
+                            continue;
+                        }
+                        // A tile a walk already read must never go stale: stamp
+                        // this lay's pixels into it NOW, exactly as replay
+                        // would — and keep its EXACT summary exact through the
+                        // stamp's running max. A cold tile takes the bound and
+                        // the replay-list entry instead.
+                        if tile_live[row + tx] {
+                            let hi = stamp_halo_span(
+                                over,
+                                stride,
+                                ly0,
+                                (band_x0, band_y0, band_x1, band_y1),
+                                cx,
+                                cy,
+                                rx2,
+                                ry2,
+                                color,
+                            );
+                            let t = &mut over_tile[row + tx];
+                            for k in 0..3 {
+                                t[k] = t[k].max(hi[k]);
+                            }
+                        } else {
+                            let t = &mut halo_tile[row + tx];
+                            *t = sat3(*t, add);
+                            tile_lays[row + tx].push(idx);
+                        }
                     }
                 }
-                let t = &mut over_tile[trow + tx];
-                for k in 0..3 {
-                    t[k] = t[k].max(hi_over[k]);
-                }
-                x = end;
             }
         }
     }
 
+    /// **BRING ONE TILE'S PLANE PIXELS UP TO DATE** — replay every deferred
+    /// claim that touches it, bed and over both. Saturating adds commute, so
+    /// the result is byte-for-byte what the eager claim order produced; after
+    /// this the tile is `live` and every later claim stamps it directly.
+    fn materialize_tile(&mut self, ty: usize, tx: usize) {
+        let t = ty * self.tiles_w + tx;
+        if self.tile_live[t] {
+            return;
+        }
+        self.tile_live[t] = true;
+        let band = (
+            (tx as i32) << LEDGER_TILE_SHIFT,
+            self.y0 + ((ty as i32) << LEDGER_TILE_SHIFT),
+            ((tx as i32 + 1) << LEDGER_TILE_SHIFT).min(self.stride as i32),
+            (self.y0 + ((ty as i32 + 1) << LEDGER_TILE_SHIFT)).min(self.y0 + self.rows as i32),
+        );
+        let (stride, ly0) = (self.stride, self.y0);
+        // The list is taken out for the walk so the planes can be borrowed
+        // mutably beside it; put back (emptied of nothing — replay does not
+        // consume) so its capacity survives to the next frame.
+        let list = std::mem::take(&mut self.tile_lays[t]);
+        for &li in &list {
+            let lay = self.frame_lays[li as usize];
+            let (rx0, ry0, rx1, ry1) = lay.rect;
+            let clip = (
+                rx0.max(band.0),
+                ry0.max(band.1),
+                rx1.min(band.2),
+                ry1.min(band.3),
+            );
+            if clip.2 <= clip.0 || clip.3 <= clip.1 {
+                continue;
+            }
+            match lay.kind {
+                LayKind::Flat => {
+                    stamp_flat_span(&mut self.over, stride, ly0, clip, rgb3(lay.color));
+                }
+                LayKind::Halo { cx, cy, rx2, ry2 } => {
+                    stamp_halo_span(&mut self.over, stride, ly0, clip, cx, cy, rx2, ry2, lay.color);
+                }
+            }
+        }
+        self.tile_lays[t] = list;
+        // **THE BOUNDS COLLAPSE TO EXACT.** The materialized pixels are now
+        // the truth, so one scan replaces the tile's accumulated over-estimate
+        // with the exact per-channel maximum, and the halo residual goes to
+        // zero — from here on this tile's pre-tests are as sharp as the eager
+        // ledger's ever were (every later claim into a live tile hi-tracks its
+        // stamp straight into `over_tile`). This is what stops a hot tile from
+        // being re-walked by every lay that follows: the walk that materialized
+        // it also un-inflated it.
+        let mut exact = [0u8; 3];
+        for y in band.1..band.3 {
+            let base = (y - ly0) as usize * stride;
+            for cell in &self.over[base + band.0 as usize..base + band.2 as usize] {
+                for k in 0..3 {
+                    exact[k] = exact[k].max(cell[k]);
+                }
+            }
+        }
+        self.over_tile[t] = exact;
+        self.halo_tile[t] = [0; 3];
+    }
+
     /// The bed and companion colours the ledger carries at one pixel — the
-    /// read the ceiling gate makes its assertion on.
+    /// read the ceiling gate makes its assertion on. Materializes the pixel's
+    /// tile first, so the deferred halo claims are in the bytes it reports.
     #[cfg(test)]
-    fn at_for_test(&self, y: i32, x: i32) -> Option<([u8; 3], [u8; 3])> {
+    fn at_for_test(&mut self, y: i32, x: i32) -> Option<([u8; 3], [u8; 3])> {
         let (x0, y0, x1, y1) = self.clip((x, y, x + 1, y + 1))?;
         let _ = (x1, y1);
+        self.materialize_tile(
+            ((y0 - self.y0) as usize) >> LEDGER_TILE_SHIFT,
+            (x0 as usize) >> LEDGER_TILE_SHIFT,
+        );
         let i = (y0 - self.y0) as usize * self.stride + x0 as usize;
         Some((self.bed[i], self.over[i]))
     }
@@ -3630,6 +4184,456 @@ fn rainbow_star_drive(disp: f32) -> f32 {
     ((disp - RAINBOW_STAR_ONSET) / (1.0 - RAINBOW_STAR_ONSET)).clamp(0.0, 1.0)
 }
 
+// ---- THE KEYSTROKE STRIKE --------------------------------------------------
+//
+// (owner, 2026-08: "bring back more cursor sparkles.") Measured on glass
+// before this block existed, a typed sentence carried a median of THREE
+// sparkle motes per frame, none of them within six cells of the caret — the
+// starfield rides the ribbon's SKY and the momentum shower shoots BACKWARD, so
+// the one place the eye actually rests (the hand) sparkled only on DELETE,
+// whose glitter poof measured a median of 162 sparkle px within three cells.
+// The strike closes that split: every typed key chips a couple of short-lived
+// grains of stardust off the fresh glyph — up into the caret's own sky band,
+// drifting gently back, gone in under a swoosh — so a keystroke reads as
+// STRIKING a spark rather than merely earning one later.
+//
+// IT IS AN ACKNOWLEDGMENT, NOT AMBIENT DRAMA, exactly like the fresh-ink pop
+// (whose emphasis is deliberately unscaled by momentum: "emphasis on the
+// newest letter is wanted from the FIRST keystroke"). So the COUNT is fixed
+// and small, the LIFE is the shortest in the particle family, and everything
+// else is inherited from the momentum shower's own laws by riding its
+// twinkle-star arm of `emit_particles` under the [`RAINBOW_STRIKE_SCALE`]
+// sentinel:
+//   - brightness still rides [`rainbow_star_momentum`] (a cold first key
+//     glints at the subtle floor; the full-punch spark is earned) and the
+//     sparkle field's own ceiling ([`RAINBOW_SPARKLE_COV_MAX`] — the caret
+//     stays the brightest thing the effect draws),
+//   - TEXT FIRST: a grain crossing a probed-occupied or unknown cell dims to
+//     a third,
+//   - the stardust law, taken all the way: a strike is ALWAYS the round
+//     stardust mote — never the dealt 4-point accent — so the per-key mark
+//     can never become the walking cross the owner has twice thinned out.
+// The earn-law's protected split survives untouched: the strike fires only on
+// a TYPING move with a live typed ribbon, so an idle prompt still earns
+// exactly nothing (`every_keystroke_strikes_a_spark` pins both halves, and
+// `casual_burst_spawns_no_stars_and_no_cat_momentum` still holds its line).
+/// Grains of stardust one COLD typed key chips off the fresh glyph. Two, not
+/// a burst: at a human cadence the puffs read as one spark per key with a
+/// ~half-second afterglow.
+///
+/// THE HANDOFF (see [`rainbow_strike_sparks`]): the per-key count fades to
+/// zero as the momentum shower wakes, because the two emitters answer the
+/// same question at different momenta. Measured on glass at a sustained
+/// 45 ms sprint, base and strike builds were statistically identical in the
+/// caret's sky (the drive-earned shower at ~5 stars/key already saturates
+/// the field there), while the strike pair at full spine still cost the
+/// worst-case tick ~0.7 ms of ledger walking for light nobody could point
+/// to. So the acknowledgment belongs to the cold keys the shower ignores —
+/// exactly the regime the owner reported bare — and the sprint keeps being
+/// the shower's show, at the shower's shipped price.
+const RAINBOW_STRIKE_SPARKS: usize = 2;
+/// The strike grain's `cov_scale` SENTINEL, in the gap between the GLITTER
+/// band (`< 0.9`, the backspace poof at pinned full brightness) and the
+/// shower's exact `1.0`. Two jobs: it marks the grain as PURE STARDUST — a
+/// strike is always the round mote, never the dealt 4-point accent, so the
+/// per-key mark stays the "cute small stardust" body and every white plus in
+/// the `out` stream remains a ribbon/shower star (several tests census
+/// exactly that) — and it prices the grain a hair under the shower's, so the
+/// momentum shower's earned stars are never outshone by the acknowledgment.
+/// Still `>= 0.9`, so `rainbow_stars_spawn_clear_of_the_typed_row_band`'s
+/// flying-star band census covers it.
+const RAINBOW_STRIKE_SCALE: f32 = 0.95;
+/// The strike grain's life floor, seconds — a glint, not a resident: the
+/// shortest life in the particle family (the shower's floor is 0.5 s), so the
+/// spark belongs to the keystroke that struck it.
+const RAINBOW_STRIKE_LIFE_MIN: f32 = 0.30;
+/// The seeded spread on top of the floor (life 0.30..0.55 s), so paired
+/// grains never wink out in lockstep.
+const RAINBOW_STRIKE_LIFE_SPAN: f32 = 0.25;
+/// The strike's own momentum FLOOR inside the shared envelope
+/// ([`rainbow_star_momentum`] is `.max`-ed with this for strike grains only).
+/// At the family floor (0.35) a cold first key's grains emitted at a peak of
+/// ~18 counts over the ground — measured on glass, the first two 200 ms
+/// buckets of a cold typing start showed a MEDIAN OF ZERO whiteish sky
+/// pixels, i.e. the acknowledgment was invisible exactly where it was
+/// commissioned ("each keystroke should feel like it strikes a spark").
+/// The fresh-ink pop already sets the precedent that a per-key
+/// acknowledgment's brightness is NOT earned ([`FRESH_INK_MOM_FLOOR`] = 0.9:
+/// "emphasis on the newest letter is wanted from the FIRST keystroke");
+/// 0.75 keeps a whisper of the earn (a hot run's grains still read a step
+/// brighter through the twinkle) while a cold key's spark lands at ~
+/// [`RAINBOW_SPARKLE_COV_MAX`] on its twinkle crest — bright, and still
+/// under the caret's light floor by the same clamp as every other mote.
+/// The momentum SHOWER keeps the bare envelope: drama stays earned.
+const RAINBOW_STRIKE_MOM_FLOOR: f32 = 0.75;
+/// Hard cap on RESIDENT strike grains, checked on the spawn edge. Real time
+/// already bounds the population — the pair per key at even a 22-key/s
+/// sprint times the ≤ 0.55 s life tops out near this number — so live
+/// behaviour never feels it; what it bounds is the pathological state a
+/// frozen or starved clock can build (the saturated bench fixtures re-tick
+/// one `Instant`, so nothing ever ages: 1 200 typed moves banked 512
+/// never-dying grains and the ledger walked every one of them, +0.6 ms on
+/// the worst-case tick). One `O(particles)` count per TYPED move, on the
+/// spawn edge — never the frame path.
+const RAINBOW_STRIKE_CAP: usize = 24;
+
+/// The strike's per-key grain count beside a shower already spawning
+/// `shower_stars` — the HANDOFF spelled as arithmetic: the strike TOPS THE
+/// SHOWER UP to [`RAINBOW_STRIKE_SPARKS`] flying marks per typed key and
+/// never more, so every keystroke chips at least the pair off the glyph
+/// while a warmed run's sky belongs entirely to the shower. The combined
+/// per-key count `max(shower_stars, SPARKS)` is monotone non-decreasing in
+/// the drive — the spark hands the sky over, it never drops it — and at
+/// full spine the strike spawns nothing at all (the worst-case tick keeps
+/// the shower's shipped price; see [`RAINBOW_STRIKE_SPARKS`]).
+#[inline]
+fn rainbow_strike_sparks(shower_stars: usize) -> usize {
+    RAINBOW_STRIKE_SPARKS.saturating_sub(shower_stars)
+}
+
+/// The absolute composed-luminance roof for any PILE of flying light — kept
+/// just under the caret's dimmest answer in the caret-salience sweep
+/// (`the_brightest_pixel_in_the_frame_is_under_the_cursor`: **80.1**, the
+/// violet end of the arc at flare peak). The working bound in
+/// [`settle_flying_pile`] is per-owner and usually far below this; the roof
+/// only backstops it.
+const FLYING_PILE_CEILING_L: f32 = 72.0;
+
+/// The tighter composed-luminance ceiling for flying light inside the CARET'S
+/// SPILL REACH. Lone flying marks are calibrated to fit under the caret over
+/// BARE sky — the caret-salience sweep's binding frame composes the dimmest
+/// caret (80.1, the violet arc at flare peak) against its own spill (the
+/// flare wash and rim light outside the cell, ~0x1F per channel over ground)
+/// plus a flying mark. On-black budget for the mark there: the value whose
+/// luminance is 80 (~0x96 grey) minus spill and ground (~0x3A) leaves ~0x5C
+/// per channel — luminance ≈ 27. Held at 26 for margin: a newborn shooter
+/// head IGNITES as it clears the caret (its first frames beside the cell ride
+/// this allowance) instead of out-shining the caret it was born under.
+/// Held at 18 rather than the raw 26 the budget arithmetic allows: the
+/// caret-salience gate also promises a 6-level MARGIN, and the settled frame
+/// must clear the floor with the margin intact, not kiss it.
+const FLYING_NEAR_CARET_CEILING_L: f32 = 18.0;
+
+/// THE PILE LAW: a crossing of flying light may not out-read its brightest
+/// single member. Where the additive flying quads of one frame overlap,
+/// every participant is scaled down until the composed stack reads no
+/// brighter than the strongest ONE mark's own contribution there (channel-wise
+/// max over owners, roofed by [`FLYING_PILE_CEILING_L`]).
+///
+/// **WHY A LAW AND NOT A SPACING TWEAK.** Additive quads sum without bound:
+/// comet streaks cross older streaks, a newborn head can land on both, and
+/// strike dust drifts through the same low-sky corridor. The caret-salience
+/// gate swept 336 frames green for weeks — and went red the moment an
+/// unrelated density change RESHUFFLED the `frand` sequence, because the
+/// invariant was only ever holding by the luck of the dice (a shooter head
+/// born at (472.6, 117.3) onto a twinkling star, over the caret's own spill,
+/// summed to luminance 109 against the violet caret's 80). Spacing the births
+/// would re-roll the same lottery; dividing the pile makes the bound
+/// structural. The precedent is [`Particle::cov_scale`]'s laser-ablation rule
+/// — sparks born at one impact point divide their light — generalized from
+/// birth-time co-location to draw-time crossing.
+///
+/// **WHY THE BOUND IS THE BRIGHTEST MEMBER, not a fixed ceiling.** The pile
+/// lands on an UNDERLAY the emitter cannot see — the ribbon's wash, the glow
+/// halos, and the caret's own spill appended by the host after this engine
+/// runs — so no on-black constant can promise the composed frame stays under
+/// the caret. What the sweep DOES prove, everywhere a mark can land, is that
+/// one lone mark over any underlay is lawful. A pile reduced to its brightest
+/// member is exactly that proven case; the crossing reads as "the brighter
+/// mark wins", which is also the seamless thing to draw.
+///
+/// **WHY PER-OWNER.** One mark's anatomy stacks with itself by design — a
+/// twinkle's arms meet at its centre, a streak overlaps its own head — and
+/// that composed value IS the lone-mark look the sweep certified. So quads
+/// are grouped by the particle that emitted them (`owner_of`, the contiguous
+/// emission runs), a single owner's self-stack passes byte-identical, and
+/// only CROSS-owner light is divided.
+///
+/// **WHAT IT TOUCHES.** Only true pixel crossings between different owners:
+/// everything else is byte-identical through this pass (the common frame pays
+/// one integer rect sweep and allocates nothing). A quad that does cross is
+/// scaled as a WHOLE — both crossing marks dim a little rather than one
+/// taking a notch — by the worst factor any of its pixels needs. Scaling is
+/// on the premultiplied colour; counts, positions, lifetimes and the
+/// source-over bed (`alpha > 0`) are untouched, so grain censuses and spawn
+/// pins cannot move.
+/// The caret cell and its spill reach, for [`settle_flying_pile`]'s
+/// feathered near-caret allowance.
+#[derive(Clone, Copy)]
+struct NearCaret {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    reach_x: i32,
+    reach_y: i32,
+}
+
+impl NearCaret {
+    /// The pixel's CLOSENESS to the caret cell: `1.0` touching the cell,
+    /// falling linearly (Chebyshev in reach-normalized units — the same shape
+    /// as the rectangular spill) to `0.0` at the reach edge and beyond.
+    fn closeness(self, x: u16, y: u16) -> f32 {
+        let x = i32::from(x);
+        let y = i32::from(y);
+        let dx = (self.x0 - x).max(x - (self.x1 - 1)).max(0) as f32 / self.reach_x as f32;
+        let dy = (self.y0 - y).max(y - (self.y1 - 1)).max(0) as f32 / self.reach_y as f32;
+        (1.0 - dx.max(dy)).max(0.0)
+    }
+}
+
+fn settle_flying_pile(
+    quads: &mut [GlowQuad],
+    owner_of: &[usize],
+    halos: &mut [RainHalo],
+    halo_owner_of: &[usize],
+    near: Option<NearCaret>,
+) {
+    use std::collections::HashMap;
+    debug_assert_eq!(quads.len(), owner_of.len());
+    debug_assert_eq!(halos.len(), halo_owner_of.len());
+    let in_near = |x: u16, y: u16| near.is_some_and(|n| n.closeness(x, y) > 0.0);
+    // The flying family draws through BOTH streams — quads (dust, discs,
+    // streaks, twinkle arms) and Add-mode radial halos (grain bodies, hot
+    // cores, under-glows) — so the accounting walks one merged element list.
+    // Over-mode halos (the light theme's source-over ink) converge by their
+    // own blend math and are not additive light; they pass untouched.
+    struct Elem {
+        owner: usize,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    }
+    let mut elems: Vec<Elem> = Vec::new();
+    for (i, q) in quads.iter().enumerate() {
+        if q.alpha != 0 {
+            continue;
+        }
+        elems.push(Elem {
+            owner: owner_of[i],
+            x: q.x,
+            y: q.y,
+            w: q.w,
+            h: q.h,
+        });
+    }
+    for (i, q) in halos.iter().enumerate() {
+        if q.mode != HaloMode::Add {
+            continue;
+        }
+        elems.push(Elem {
+            owner: halo_owner_of[i],
+            x: q.x,
+            y: q.y,
+            w: q.w,
+            h: q.h,
+        });
+    }
+    if elems.is_empty() || (elems.len() < 2 && near.is_none()) {
+        return;
+    }
+    // Pass 1 — the contested pixels: every point covered by additive elements
+    // of at least two DIFFERENT owners, plus (near the caret) every flying
+    // pixel at all — a newborn shooter's head is one owner and still lands on
+    // the caret's spill. Integer rect arithmetic only; empty on the common
+    // far-sky frame.
+    let mut contested: HashMap<(u16, u16), ()> = HashMap::new();
+    for i in 0..elems.len() {
+        let a = &elems[i];
+        for b in elems.iter().skip(i + 1) {
+            if a.owner == b.owner {
+                continue;
+            }
+            let x0 = a.x.max(b.x);
+            let x1 = (a.x + a.w).min(b.x + b.w);
+            let y0 = a.y.max(b.y);
+            let y1 = (a.y + a.h).min(b.y + b.h);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    contested.insert((x, y), ());
+                }
+            }
+        }
+    }
+    if near.is_some() {
+        for a in &elems {
+            for y in a.y..a.y + a.h {
+                for x in a.x..a.x + a.w {
+                    if in_near(x, y) {
+                        contested.insert((x, y), ());
+                    }
+                }
+            }
+        }
+    }
+    if contested.is_empty() {
+        return;
+    }
+    // Pass 2 — per contested pixel, the additive contribution of each owner
+    // present, channel-wise and UNCLAMPED: the saturating clamp in the
+    // renderer is the symptom this law exists to prevent, so the accounting
+    // must see past it. Quads contribute their premultiplied colour flat;
+    // Add halos contribute through the renderer's own elliptical falloff
+    // (`halo_row_ny`/`halo_weight`), byte-for-byte the composite they draw.
+    let mut sums: HashMap<(u16, u16), HashMap<usize, [u32; 3]>> = HashMap::new();
+    let deposit = |sums: &mut HashMap<(u16, u16), HashMap<usize, [u32; 3]>>,
+                       px: (u16, u16),
+                       owner: usize,
+                       rgb: u32| {
+        let e = sums.entry(px).or_default().entry(owner).or_insert([0; 3]);
+        e[0] += (rgb >> 16) & 0xff;
+        e[1] += (rgb >> 8) & 0xff;
+        e[2] += rgb & 0xff;
+    };
+    for (i, q) in quads.iter().enumerate() {
+        if q.alpha != 0 {
+            continue;
+        }
+        for y in q.y..q.y + q.h {
+            for x in q.x..q.x + q.w {
+                if contested.contains_key(&(x, y)) {
+                    deposit(&mut sums, (x, y), owner_of[i], q.color);
+                }
+            }
+        }
+    }
+    for (i, q) in halos.iter().enumerate() {
+        if q.mode != HaloMode::Add {
+            continue;
+        }
+        let (cx, cy) = (q.cx as i32, q.cy as i32);
+        let (rx2, ry2) = ((q.rx as i32).pow(2), (q.ry as i32).pow(2));
+        for y in q.y..q.y + q.h {
+            let ny = aterm_render::halo_row_ny(i32::from(y) - cy, ry2);
+            if ny >= 256 {
+                continue;
+            }
+            for x in q.x..q.x + q.w {
+                if !contested.contains_key(&(x, y)) {
+                    continue;
+                }
+                let wt = aterm_render::halo_weight(i32::from(x) - cx, ny, rx2);
+                if wt == 0 {
+                    continue;
+                }
+                let wt = wt.min(255) as u8;
+                deposit(
+                    &mut sums,
+                    (x, y),
+                    halo_owner_of[i],
+                    aterm_render::premul_rgb(q.color, wt),
+                );
+            }
+        }
+    }
+    let lum = |rgb: [u32; 3]| {
+        let c = (rgb[0].min(255) << 16) | (rgb[1].min(255) << 8) | rgb[2].min(255);
+        crate::color_math::relative_luminance(c) * 255.0
+    };
+    // Pass 3 — the factor each breaching pixel needs, found by bisection in
+    // the composed integer domain (the gamma curve makes a closed form more
+    // approximation than answer; sixteen halvings are exact to the byte).
+    let mut factors: HashMap<(u16, u16), f32> = HashMap::new();
+    for (&px, owners) in &sums {
+        let near_px = in_near(px.0, px.1);
+        if owners.len() < 2 && !near_px {
+            continue;
+        }
+        let mut total = [0u32; 3];
+        let mut strongest = [0u32; 3];
+        for rgb in owners.values() {
+            for c in 0..3 {
+                total[c] += rgb[c];
+                strongest[c] = strongest[c].max(rgb[c]);
+            }
+        }
+        let mut target = if owners.len() < 2 {
+            // A lone mark answers only to the near-caret allowance.
+            f32::INFINITY
+        } else {
+            lum(strongest).min(FLYING_PILE_CEILING_L)
+        };
+        if near_px {
+            // FEATHERED, not stepped: the allowance is the near ceiling AT
+            // the caret cell and relaxes hyperbolically with distance
+            // (`ceiling / closeness` → unbounded at the reach edge), so a
+            // grain drifting out of the spill zone brightens smoothly
+            // instead of popping at an invisible boundary.
+            let w = near.map(|n| n.closeness(px.0, px.1)).unwrap_or(0.0);
+            if w > 0.0 {
+                target = target.min(FLYING_NEAR_CARET_CEILING_L / w);
+            }
+        }
+        if lum(total) <= target {
+            continue;
+        }
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..16 {
+            let mid = 0.5 * (lo + hi);
+            let scaled = [
+                (total[0] as f32 * mid) as u32,
+                (total[1] as f32 * mid) as u32,
+                (total[2] as f32 * mid) as u32,
+            ];
+            if lum(scaled) > target {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        factors.insert(px, lo);
+    }
+    if factors.is_empty() {
+        return;
+    }
+    // Pass 4 — whole-element scaling by the worst factor any covered pixel
+    // needs. Per-channel floor rounding keeps the settled sum at or under the
+    // bisected target: a sum of floors never exceeds the floor of the sum.
+    let scale_rgb = |color: u32, f: f32| {
+        let r = ((color >> 16) & 0xff) as f32;
+        let g = ((color >> 8) & 0xff) as f32;
+        let b = (color & 0xff) as f32;
+        (((r * f) as u32) << 16) | (((g * f) as u32) << 8) | ((b * f) as u32)
+    };
+    for q in quads.iter_mut() {
+        if q.alpha != 0 {
+            continue;
+        }
+        let mut f = 1.0f32;
+        for y in q.y..q.y + q.h {
+            for x in q.x..q.x + q.w {
+                if let Some(&pf) = factors.get(&(x, y))
+                    && pf < f
+                {
+                    f = pf;
+                }
+            }
+        }
+        if f < 1.0 {
+            q.color = scale_rgb(q.color, f);
+        }
+    }
+    for q in halos.iter_mut() {
+        if q.mode != HaloMode::Add {
+            continue;
+        }
+        let mut f = 1.0f32;
+        for y in q.y..q.y + q.h {
+            for x in q.x..q.x + q.w {
+                if let Some(&pf) = factors.get(&(x, y))
+                    && pf < f
+                {
+                    f = pf;
+                }
+            }
+        }
+        if f < 1.0 {
+            q.color = scale_rgb(q.color, f);
+        }
+    }
+}
+
 // ---- FRESH-INK POP ---------------------------------------------------------
 //
 // Each TYPED glyph cell earns a short overlay of warm-white radial light OVER
@@ -4167,6 +5171,89 @@ const RAINBOW_RIBBON_SHOULDER: f32 = 0.55;
 /// bar, so what used to cut now melts.
 const RAINBOW_RIBBON_LEAD: f32 = RAINBOW_UNDERLINE_H * 0.5;
 
+/// **THE LEADING IS NOT BEHIND LETTERFORMS, AND IT STOPS PAYING AS IF IT
+/// WERE.** [`RAINBOW_BAND_COV_CAPS`] is a ceiling on the light INK can be read
+/// over — solved for the tall body's six slabs under the typed glyphs — and the
+/// hybrid inherited it by sharing `rainbow_band_coverage`, so the strip in the
+/// leading, the one part of the mark with no ink on it, was held to yellow's
+/// `57` and composited to olive (`#4B4C12`, V `0.30`) between a brighter red
+/// and blue. That is the dark middle third of every ribbon the owner reported
+/// as *"black gaps in the underline"* and *"weird cutoffs in brightness"*
+/// (2026-08-29), and it is what §4's zone table already forbids: *"Row
+/// boundary ± the leading: the ribbon body — full strength."*
+///
+/// So the strip carries a LIFT above its ink ceiling
+/// ([`aterm_render::RibbonVertex::lift`]), aimed at ONE level for every hue —
+/// the flat body §4 asks for — and bounded per hue by what the transverse
+/// profile can melt away without printing a ledge ([`rainbow_spine_lift`]).
+///
+/// The level, in coverage. [`RAINBOW_UNDER_COV_CAP`] (`128`) is the brightest
+/// ink ceiling on the arc; this is that plus the lift the ledge budget grants a
+/// hue at that ceiling on the 40 px oracle metric, so the arc's bright end
+/// reaches it and its dark middle comes as close as the budget allows. On the
+/// shipped ground yellow composites to a mustard `V 0.50` and red to `V 0.65`
+/// where they were `0.30` and `0.51`.
+const RAINBOW_SPINE_LEVEL: f32 = 168.0;
+
+/// The largest single-row step the strip's lift may print, in levels — under
+/// the owner's `40/255` ("where a falloff stops reading as a falloff") with
+/// room for the ledge gate's three quantization points and the dither.
+const RAINBOW_LEDGE_STEP_BUDGET: f32 = 34.0;
+
+/// How far past the wake's reach the strip's lift takes to return, in cells —
+/// the plume's own edge (`RAINBOW_WAKE_EXTENT`) has it at zero by then.
+const RAINBOW_LIFT_GATE_EASE_CELLS: f32 = 2.0;
+
+/// The gate's release slope against the wake's momentum share: the lift stays
+/// FULLY yielded until `throttle · m` has decayed under `1 / KNEE` of full,
+/// then returns linearly with the plume's own dying envelope. At the knee the
+/// plume's steepest flank is under a third of its peak, which is the room the
+/// returning lift spends.
+const RAINBOW_LIFT_GATE_KNEE: f32 = 8.0;
+
+/// `smoothstep01`'s peak slope over its own span: both the base profile's bump
+/// and [`aterm_render::ribbon_lift_profile`] are built from it, so a term of
+/// `L` levels over `W` px steps at most `1.5 · L / W` between two device rows.
+const SMOOTHSTEP_PEAK_SLOPE: f32 = 1.5;
+
+/// **THE LIFT THIS CELL MAY TAKE**, in coverage levels above its ink coverage.
+///
+/// Solved so the COMPOSED profile — the base bump from the spine down to the
+/// shoulder over the plateau `core_up`, plus the lift over
+/// [`aterm_render::ribbon_lift_profile`]'s spans — never steps more than
+/// [`RAINBOW_LEDGE_STEP_BUDGET`] between two device rows on either side of the
+/// spine. The two descents overlap, so the budget is SHARED: the base term
+/// spends `1.5 · (1 − shoulder) · cap / core_up` above and `1.5 · cap / dn`
+/// below, and the lift takes what is left over its own span. Aimed at
+/// [`RAINBOW_SPINE_LEVEL`] and never past it; a hue whose ceiling is already
+/// there takes nothing.
+///
+/// Proportional to `cov_ink / cap`, so a cold or melting cell lifts by its own
+/// share and the ribbon's onset, crest, melt and drain shape the strip exactly
+/// as they shape the ink. The tall body takes none: its letters stand INSIDE
+/// the light, so there is no leading for a spine to be brighter in, and a
+/// brighter line at every row boundary would be a seam.
+#[inline]
+fn rainbow_spine_lift(cov_ink: f32, t: f32, core_up: f32, dn: f32, shoulder: f32) -> f32 {
+    if shoulder >= 1.0 || cov_ink.is_nan() || cov_ink <= 0.0 {
+        return 0.0;
+    }
+    let cap = rainbow_bed_cap_at(t);
+    if cap.is_nan() || cap <= 0.0 {
+        return 0.0;
+    }
+    let span_up = core_up - 1.0;
+    let span_dn = dn * aterm_render::RIBBON_LIFT_DN_SHARE;
+    if span_up.is_nan() || span_up <= 0.0 || span_dn.is_nan() || span_dn <= 0.0 {
+        return 0.0;
+    }
+    let spent_up = SMOOTHSTEP_PEAK_SLOPE * (1.0 - shoulder) * cap / core_up;
+    let spent_dn = SMOOTHSTEP_PEAK_SLOPE * cap / dn;
+    let room_up = (RAINBOW_LEDGE_STEP_BUDGET - spent_up) * span_up / SMOOTHSTEP_PEAK_SLOPE;
+    let room_dn = (RAINBOW_LEDGE_STEP_BUDGET - spent_dn) * span_dn / SMOOTHSTEP_PEAK_SLOPE;
+    let full = (RAINBOW_SPINE_LEVEL - cap).min(room_up).min(room_dn).max(0.0);
+    full * (cov_ink / cap).min(1.0)
+}
 /// THE SPECTRUM'S ADJACENCY CEILING, in fractions of one full red→violet sweep
 /// per cell: the most two neighbouring cells of the dark mark may ever differ in
 /// hue.
@@ -6453,13 +7540,18 @@ enum VaporKind {
 /// SOUND note at the head of [`CursorGlow::spawn_poof`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PoofVoice {
-    /// A kill CHORD (^U/^W/^K): the downward [`crate::trail_sound::SoundKind::Kill`]
-    /// swoosh — the erase's whole voice, since the chord makes no keystroke
-    /// sound of its own.
+    /// A LINE-scale kill chord (^U/^K): the downward
+    /// [`crate::trail_sound::SoundKind::Kill`] swoosh — the erase's whole
+    /// voice, since the chord makes no keystroke sound of its own.
     Swoosh,
+    /// A WORD-scale kill chord (^W, Alt-D, Alt/Ctrl-Backspace —
+    /// [`CursorGlow::note_word_kill`]): the
+    /// [`crate::trail_sound::SoundKind::KillWord`] word poof, the erase
+    /// poof's slightly larger, softer cousin — one word going, not a clause.
+    WordPoof,
     /// A plain BACKSPACE: the tiny [`crate::trail_sound::SoundKind::Poof`]
-    /// breath — the CLOUD's noise, layered under the keystroke bell the
-    /// backspace already earned.
+    /// breath — the CLOUD's noise, the dispersal of the erase poof the
+    /// backspace already spoke on its cursor retreat.
     Puff,
 }
 
@@ -6869,6 +7961,13 @@ pub struct CursorGlow {
     /// key alone never poofs (a kill that erased nothing is silent), and a
     /// shrink alone never poofs (Ink repaints rewrite rows constantly).
     kill_hint: Option<Instant>,
+    /// WHICH SCALE the fresh kill hint is: `true` iff [`Self::note_word_kill`]
+    /// armed it (^W, Alt-D, Alt/Ctrl-Backspace — one word going), `false` for
+    /// the line-scale chords (^K/^U — a clause). Read exactly once, where the
+    /// poof chooses its voice ([`PoofVoice`]); carries no freshness of its own
+    /// because it is meaningless without a fresh `kill_hint`, and every
+    /// `note_kill` re-stamps it.
+    kill_hint_word: bool,
     /// A fresh PLAIN-BACKSPACE poof license ([`Self::note_backspace`]), kept
     /// SEPARATE from [`Self::kill_hint`] so it never borrows the kill hint's
     /// nav/quench escalation semantics. `poof_scan` ORs it into the
@@ -8096,11 +9195,58 @@ impl CursorGlow {
     // the CLOSED RAINBOW RING. See [`RAINBOW_LAND_RING_R`] — it is now what
     // EVERY landing draws, at every distance, on both grounds, instead of being
     // the reward for a roll.
-    /// How recently a committed TYPED press must have landed for a jump to earn
-    /// its landing celebration. An ACTIVITY witness, not a ribbon one: a jump is
-    /// worth marking when it punctuates your work, even if the trail has already
-    /// drained. Comfortably longer than the ribbon's ~1.3s life for that reason,
-    /// and far short of "at some point today".
+    //
+    // THE SUPERNOVA IS BACK (owner, 2026-08-29: "BRING BACK THE JUMP EFFECTS"
+    // — and on being shown the deleting commit's own phrase for it, "a treat
+    // mechanic. A different product": "WHAT?"). That phrase was the deleting
+    // session's framing, not a ruling; every later session, this one
+    // included, mistook it for one. The GLITTER SHELL is restored verbatim
+    // from `80b21f63^` — a rainbow ring of 28 grains thrown past the fan into
+    // empty sky, which is what makes a big jump read as a detonation rather
+    // than a larger ordinary landing. The dice roll that made it a TREAT on
+    // big jumps is kept: that was the good part of the design, and it is
+    // what keeps the detonation from spending itself on every Home/End.
+    /// Probability a big-enough jump detonates (see the shell below). A treat,
+    /// not a tic: ~1 in 6 of the jumps past `RAINBOW_NOVA_MIN_DIST`.
+    const RAINBOW_NOVA_CHANCE: f32 = 0.16;
+    /// Cells a jump must cross to be eligible for the detonation at all — a
+    /// word-motion fling, not a two-cell nudge.
+    const RAINBOW_NOVA_MIN_DIST: f32 = 14.0;
+    /// Grains in the shell. Rides the same glitter particle path as the
+    /// trail's own sparkles (`cov_scale < 0.9`), so it is the family's dust,
+    /// not a new species; `MAX_PARTICLES`-bounded like every other spawn.
+    const RAINBOW_NOVA_GLITTER: usize = 28;
+    /// Outward speed of a shell grain, in cell heights per second, before its
+    /// per-grain jitter. SET AGAINST THE FAN: a landing's star fan eases out
+    /// to `reach` (~5.8 cell heights on a supernova); at 15 the median grain
+    /// clears ~7 — past the fan, into empty sky, which is what makes the ring
+    /// legible AS a ring. The first cut (5.2) died inside the fan and read as
+    /// an untidier ordinary landing; captured side by side before believed.
+    const RAINBOW_NOVA_SHELL_SPEED: f32 = 15.0;
+    /// Shell grain life (seconds) before its per-grain jitter — long enough to
+    /// be READ at the distance the speed above throws it.
+    const RAINBOW_NOVA_SHELL_LIFE: f32 = 0.42;
+    /// The shell's brightness in the glitter sentinel's own currency
+    /// (`cov_scale` is both the shape band and the brightness multiplier).
+    /// The body sits just under `ERASE_ROUND_SCALE_MAX` — round, and as bright
+    /// as round gets; the accent just under the glitter ceiling — a `+`, near
+    /// full punch. A detonation buys its light at the top of its band.
+    const RAINBOW_NOVA_SHELL_COV: f32 = 0.58;
+    const RAINBOW_NOVA_SHELL_ACCENT_COV: f32 = 0.85;
+    //
+    // THE LANDING BURST NO LONGER ASKS FOR IT (owner, 2026-08-29: "I LOVED the
+    // jump effects and cursor streaks and now they are ALL GONE. BRING THEM
+    // BACK"). A landing used to celebrate only if a committed keypress had
+    // landed within 4 s, so the commonest jump of all — Home/End/click at a
+    // rest — burst nothing. The burst is the jump's own punctuation and now
+    // fires on the jump. The TERMINUS scatter still keeps this witness: it is
+    // the ribbon's dissolve, and a cold cursor has no ribbon to dissolve.
+    /// How recently a committed TYPED press must have landed for a jump to keep
+    /// the 2-cell burst floor (a cold jump takes the 8-cell one). An ACTIVITY
+    /// witness, not a ribbon one: a jump is worth marking when it punctuates
+    /// your work, even if the trail has already drained. Comfortably longer
+    /// than the ribbon's ~1.3s life for that reason, and far short of "at some
+    /// point today".
     const RAINBOW_BURST_ACTIVE_WINDOW: f32 = 4.0;
     /// Chunky spinning solid rainbow 5-point stars in a FULL (far-jump)
     /// starburst. A short jump throws fewer (graduated by distance, floor 1);
@@ -9344,6 +10490,20 @@ impl CursorGlow {
         if moves_cursor {
             self.nav_hint = Some(now);
         }
+        // A fresh licence is a fresh key: only `note_word_kill` may mark the
+        // hint word-scale, and it does so AFTER this runs.
+        self.kill_hint_word = false;
+    }
+
+    /// [`Self::note_kill`] for a WORD-scale kill chord (^W, Alt-D, Alt/Ctrl-
+    /// Backspace): everything about the licence is the line kill's — same
+    /// freshness, same witnesses, same downstream gates — but the poof it
+    /// licenses speaks [`crate::trail_sound::SoundKind::KillWord`], the erase
+    /// poof's slightly larger, softer cousin, instead of the tier-3 swoosh: a
+    /// word leaving is one word going, not a clause (owner, 2026-08-29).
+    pub fn note_word_kill(&mut self, now: Instant, moves_cursor: bool) {
+        self.note_kill(now, moves_cursor);
+        self.kill_hint_word = true;
     }
 
     /// The ERASE-momentum mirror of [`Self::typing_momentum`] at `now` — how
@@ -11288,7 +12448,7 @@ impl CursorGlow {
                 self.emit_ring(now, cfg, geom, out, &mut halos);
             }
             if out.len() < Self::MAX_QUADS {
-                self.emit_particles(now, cfg, geom, out, &mut halos);
+                self.emit_particles(now, cfg, geom, cur, out, &mut halos);
             }
             self.emit_vapor(now, cfg, geom, &mut halos);
             self.bolt_verts = bolt_verts;
@@ -14178,6 +15338,75 @@ impl CursorGlow {
                             .unwrap_or(self.sparks.len());
                         self.sparks.splice(at..at, reminted.into_iter().rev());
                     }
+                    // **WAKE THE RUN.** A key that lands on a ribbon the exit
+                    // swoosh has begun to drain re-arms every still-resident
+                    // cell CONTIGUOUS with the head on this row — not only the
+                    // three the tail memory names. Measured on glass (owner,
+                    // 2026-08-29: *"gaps and weird cutoffs in brightness,
+                    // especially when the typing speed pauses or varies"*): a
+                    // key 1.0–1.3 s after the last found the far tail mid-fade
+                    // and the near tail re-lit, so the mark read as a bright
+                    // new stub against a dying old one with a hard step
+                    // between them. The swoosh has always promised *"a fresh
+                    // key at any point clears the retract and the ribbon
+                    // re-arms seamlessly"*; this is that promise kept for the
+                    // whole run. `Rearm` puts each cell's life onto the new
+                    // head's cadence, so the band fades as one again. ONLY
+                    // DRAINING CELLS WAKE: a cell the swoosh has not selected
+                    // is left on the life its own key priced, so ordinary
+                    // typing is byte-identical and the drain's own tail-first
+                    // ending is untouched. And only BEHIND the typing
+                    // direction: the deletes-retract and the TUI re-anchor
+                    // both stamp cells AT OR AHEAD of the caret precisely so
+                    // the ribbon retreats off content that is gone — waking
+                    // those would re-light columns the user just erased (and,
+                    // measured on the `col % 39 + 1` wrap fixture, revive a
+                    // whole lap's ribbon so the traverse re-solves against it
+                    // and the phase stops reaching the anchors). The walk
+                    // stops at the first column with no live owner — a gap in
+                    // the columns is a gap in the mark, exactly as the
+                    // rasterizer reads it.
+                    let row = cr;
+                    // …and only on a PLAIN FORWARD key on the same row. A
+                    // re-anchor wrap (`39 → 1`) and a delete are both chained
+                    // typing too, and both land with the retreated cells AHEAD
+                    // of the caret — a wake there re-lights the lap the
+                    // re-anchor just gutted (measured: the `col % 39 + 1`
+                    // fixture's traverse froze at one top).
+                    if cr == pr && cc > pc && !mv.re_anchor && !mv.deletion {
+                        let dir: i32 = -1;
+                        let mut c = i32::from(cc) + dir;
+                        let mut walked = 0usize;
+                        while c >= 0 && (c as usize) < geom.cols && walked < Self::RAINBOW_MAX_CELLS {
+                            let col = c as u16;
+                            let Some(s) = self
+                                .sparks
+                                .iter()
+                                .rev()
+                                .find(|s| s.typing && s.row == row && s.col == col)
+                            else {
+                                break;
+                            };
+                            let age = now.saturating_duration_since(s.born).as_secs_f32();
+                            if age >= s.life {
+                                break;
+                            }
+                            let waking = s.fade_at.is_some();
+                            if waking
+                                && !self.refresh_rainbow_cell_owner(
+                                    row,
+                                    col,
+                                    now,
+                                    spark_life,
+                                    RainbowRefresh::Rearm,
+                                )
+                            {
+                                break;
+                            }
+                            c += dir;
+                            walked += 1;
+                        }
+                    }
                 }
                 // Remember the laid cells for the next key's re-lay (typed cells
                 // only): a single-cell head joins the rolling 3-key memory; a
@@ -14973,11 +16202,18 @@ impl CursorGlow {
     /// comets flung off the wake.
     fn spawn_rainbow_star_shower(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
+            pr,
+            pc,
             cr,
             cc,
             now,
             cfg,
             geom,
+            typing,
+            typed_pair,
+            deletion,
+            navigation,
+            shape_wrap,
             ..
         } = mv;
         // RAINBOW KITTY "star power": sustained momentum SHOOTS twinkling stars off the
@@ -15014,16 +16250,137 @@ impl CursorGlow {
             && self.sparks.iter().any(|s| s.typing)
             && self.particles.len() < Self::MAX_PARTICLES
         {
-            // EARNED THRESHOLD: density rides the onset-gated drive — ZERO
-            // stars until the canonical metric has been earned past
-            // [`RAINBOW_STAR_ONSET`] (about one typed word), then LINEAR to
-            // the full shower at full spine. The ramp was squared, which held
-            // the first whole star back to ~1.5 s of continuous typing; see
-            // the onset's docstring for why that was retuned.
-            let drive = rainbow_star_drive(self.rainbow.disp);
-            let stars = (drive * 5.0) as usize;
             let (ox, oy) = geom.cell_center(cr, cc);
             let cell = geom.ch as f32;
+            // EARNED THRESHOLD (the SHOWER's density, computed first because
+            // the strike below tops it up): density rides the onset-gated
+            // drive — ZERO stars until the canonical metric has been earned
+            // past [`RAINBOW_STAR_ONSET`] (about one typed word), then LINEAR
+            // to the full shower at full spine. The ramp was squared, which
+            // held the first whole star back to ~1.5 s of continuous typing;
+            // see the onset's docstring for why that was retuned.
+            let drive = rainbow_star_drive(self.rainbow.disp);
+            // 5 -> 8 at full spine — BOTH lanes raised this independently on the
+            // owner's same ask ("bring back more sparkles"), the peers on main
+            // and the strike lane here; the per-mote and shooter ceilings hold
+            // the caret brightest regardless of count, so density is free to
+            // rise and the legibility law, not this number, is the bound.
+            let stars = (drive * 8.0) as usize;
+            // THE KEYSTROKE STRIKE (constants + rationale at
+            // [`RAINBOW_STRIKE_SPARKS`]): a TYPING move chips short-lived
+            // grains off the fresh glyph, momentum or no momentum — the
+            // per-key acknowledgment the momentum shower below is not — with
+            // the count topping the shower up ([`rainbow_strike_sparks`]), so
+            // a cold key strikes the full pair and a warmed run's sky belongs
+            // to the shower alone. Born clear of the glyph band like every
+            // flying star (the same ≥ 0.55-cell displacement
+            // `rainbow_stars_spawn_clear_of_the_typed_row_band` pins, velocity
+            // streaming AWAY from the row at birth), into the SKY above the
+            // caret — mirrored into the wake below on the first grid row,
+            // where there is no sky to strike into (the erase poof's row-0
+            // rule). Gravity stays DOWN in both arms — a sky grain crests and
+            // settles like a struck spark; the flipped arm keeps the full pull
+            // and accelerates away — and the gentle BACKWARD drift matches
+            // the shower/wake grain of the family.
+            //
+            // PROVENANCE is the fresh-ink pop's, verbatim: `typed_pair` (a
+            // real committed press — PTY output alone never strikes),
+            // `!deletion` (a Backspace already poofs its OWN glitter; a
+            // second gesture on the same key is a double answer),
+            // `!navigation` (scrubbing is not writing — an arrowed caret
+            // must not sparkle), and glyph-SHAPED (same-row forward advance
+            // or a typing wrap fold: a repaint re-anchor lays no new glyph
+            // and strikes nothing). `typing` alone was the first cut here
+            // and it is a DISTANCE verdict, not a provenance one — a
+            // one-cell backspace or arrow move passed it (found by external
+            // review before it shipped).
+            //
+            // REDUCED MOTION strikes nothing: these are drifting, pulsing
+            // grains — exactly the class the terminus scatter already sheds
+            // under the seam — and the reduced arm's per-key acknowledgment
+            // is the fresh-ink pop's step fade. A cold reduced-motion frame
+            // drew no flying light before the strike existed; it still
+            // draws none. The seam is theme-blind: light and dark quiet the
+            // same gesture.
+            //
+            // BOTH GROUNDS. This arm was DARK ONLY at first — "additive
+            // white/gold does nothing on a paper-white ground" — which was
+            // true of the DRAW and got read as a law about the SPAWN: the
+            // grains were never born, so the owner's GitHub Light + underline
+            // glass showed a 2804-chromatic-px ink band and ZERO sparkle
+            // grains, and the owner asked whether sparkles were "simply
+            // disabled on this screen". The draw arm now inverts the strike
+            // to source-over INK on light (see the [`RAINBOW_STRIKE_SCALE`]
+            // band in `emit_particles`), the same theme fork every other
+            // light mark in this file takes — so the spawn is theme-blind
+            // and the two grounds share one density, one birth law, one
+            // handoff, one cap.
+            if typing
+                && typed_pair
+                && !deletion
+                && !navigation
+                && ((cr == pr && cc > pc) || shape_wrap)
+                && !self.reduced_motion
+            {
+                // THE ANCHOR IS THE FRESH GLYPH, not the caret: the caret
+                // cell holds no glyph yet (the fresh-ink births say exactly
+                // this), and on a WRAP the caret sits one row below the
+                // glyph it echoes — anchoring there would land the "sky"
+                // grains inside the typed row's own band. The freshest laid
+                // cell is `cc - 1` on a same-row advance and the vacated
+                // `(pr, pc)` on a fold.
+                let (ar, ac) = if cr == pr && cc > pc {
+                    (cr, cc - 1)
+                } else {
+                    (pr, pc)
+                };
+                let (sox, soy) = geom.cell_center(ar, ac);
+                let up_ok = soy - f32::from(geom.origin_y) >= cell;
+                let side = if up_ok { -1.0f32 } else { 1.0 };
+                // The resident bound (see [`RAINBOW_STRIKE_CAP`]): counted
+                // once per typed move, on the spawn edge, and folded into the
+                // spawn count up front. LIVE grains only — after an idle gap
+                // every resident may be expired-but-unpruned (the prune runs
+                // elsewhere in the tick), and a stale count would starve the
+                // first key of exactly the spark the feature exists for.
+                let resident = self
+                    .particles
+                    .iter()
+                    .filter(|p| {
+                        (0.9..0.999).contains(&p.cov_scale)
+                            && now.saturating_duration_since(p.born).as_secs_f32() < p.life
+                    })
+                    .count();
+                let sparks = rainbow_strike_sparks(stars)
+                    .min(RAINBOW_STRIKE_CAP.saturating_sub(resident));
+                for _ in 0..sparks {
+                    if self.particles.len() >= Self::MAX_PARTICLES {
+                        break;
+                    }
+                    let r0 = self.frand();
+                    let r1 = self.frand();
+                    let r2 = self.frand();
+                    let r3 = self.frand();
+                    let r4 = self.frand();
+                    self.particles.push(Particle {
+                        x0: sox + (r0 - 0.5) * geom.cw as f32,
+                        // Clear of the glyph band from birth (band edge 0.5),
+                        // hugging the fresh glyph's own sky: 0.55..1.0 cells
+                        // off.
+                        y0: soy + side * (0.55 + 0.45 * r1) * cell,
+                        // A gentle backward drift — with the ribbon's grain,
+                        // slower than the shower (this spark belongs to the
+                        // key, not to the streak).
+                        vx: -(0.15 + r2 * 0.45) * cell,
+                        vy: side * (0.25 + r3 * 0.55) * cell,
+                        gy: if side < 0.0 { 0.35 * cell } else { 0.9 * cell },
+                        life: RAINBOW_STRIKE_LIFE_MIN + r4 * RAINBOW_STRIKE_LIFE_SPAN,
+                        hue: r0, // twinkle seed
+                        cov_scale: RAINBOW_STRIKE_SCALE,
+                        born: now,
+                    });
+                }
+            }
             for _ in 0..stars {
                 // Spend only the remaining resident headroom, checked PER STAR.
                 // A single burst-level gate admits a whole burst and then shuts
@@ -15569,11 +16926,24 @@ impl CursorGlow {
         // vacated span"; they share the whole downstream span/fallback
         // machinery and the `POOF_MIN_GAP` rate gate, only their arming
         // semantics differ.
-        let fresh_kill = self.kill_hint.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
-        }) || self.bs_poof_hint.is_some_and(|t| {
+        //
+        // THE CUE, though, belongs to the kill CHORD alone — the licences are
+        // shared, the SWOOSH is not. `spawn_poof`'s own contract has always
+        // said so ("Plain Backspace already spoke on its admitted cursor
+        // retreat; its exact poof is visual-only so one physical key never
+        // clicks twice"), and its `cue_kill` parameter exists to express it —
+        // but both call sites passed a literal `true`, so every plain
+        // Backspace whose poof fired ALSO emitted a TIER-3 `Kill` swoosh on
+        // top of its own TIER-1 voice. That is 7 dB of falling noise over the
+        // erase poof the owner asked to hear, which is a straightforward way
+        // to bury it. `kill_chord` is the parameter's intended value.
+        let kill_chord = self.kill_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
         });
+        let fresh_kill = kill_chord
+            || self.bs_poof_hint.is_some_and(|t| {
+                now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
+            });
         let gap_ok = self
             .last_poof
             .is_none_or(|t| now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_MIN_GAP);
@@ -15585,6 +16955,8 @@ impl CursorGlow {
         let bs_only = self.kill_hint.is_none();
         let voice = if bs_only {
             PoofVoice::Puff
+        } else if self.kill_hint_word {
+            PoofVoice::WordPoof
         } else {
             PoofVoice::Swoosh
         };
@@ -15967,19 +17339,24 @@ impl CursorGlow {
         // WHICH noise depends on WHICH KEY licensed it, because the two are not
         // the same gesture and were never meant to sound alike:
         //
-        // * a KILL CHORD (^U/^W/^K) is a whole clause leaving at once, and it
+        // * a LINE KILL (^U/^K) is a whole clause leaving at once, and it
         //   arrives with no keystroke of its own — the downward
         //   [`SoundKind::Kill`] swoosh is the erase's entire voice.
+        // * a WORD KILL (^W, Alt-D, Alt/Ctrl-Backspace) is one word going:
+        //   [`SoundKind::KillWord`], the erase poof one size up — not the
+        //   clause's swoosh.
         // * a plain BACKSPACE has ALREADY SPOKEN, on its admitted cursor
-        //   retreat, and stacking the full kill swoosh on top of that bell made
-        //   one physical key say two big things at once — the exact
-        //   double-click this function's own comment used to forbid and the code
-        //   did anyway (both branches passed `cue_kill = true`). It now gets
-        //   [`SoundKind::Poof`]: the small, soft, short breath of air that is the
-        //   sound of the CLOUD rather than a second sound of the key. Quiet
-        //   enough to sit under the typing bell instead of fighting it.
+        //   retreat — the two-band erase POOF — and stacking the full kill
+        //   swoosh on top of it made one physical key say two big things at
+        //   once — the exact double-click this function's own comment used to
+        //   forbid and the code did anyway (both branches passed
+        //   `cue_kill = true`). It now gets [`SoundKind::Poof`]: the same
+        //   noise-poof synthesis at cloud scale, the AIR of the poof the eye
+        //   sees, quiet enough to ride under the erase voice it accompanies
+        //   instead of fighting it.
         match voice {
             PoofVoice::Swoosh => self.cue_sound(crate::trail_sound::SoundKind::Kill, c0),
+            PoofVoice::WordPoof => self.cue_sound(crate::trail_sound::SoundKind::KillWord, c0),
             PoofVoice::Puff => self.cue_sound(crate::trail_sound::SoundKind::Poof, c0),
         }
         let cell = geom.ch as f32;
@@ -18092,6 +19469,57 @@ impl CursorGlow {
         });
     }
 
+    /// Does this jump DETONATE? A treat on big jumps — see
+    /// [`Self::RAINBOW_NOVA_CHANCE`]. Deterministic via the resident rng, so a
+    /// replay rolls the same dice.
+    fn roll_jump_nova(&mut self, dist: f32) -> bool {
+        if self.reduced_motion || dist < Self::RAINBOW_NOVA_MIN_DIST {
+            return false;
+        }
+        self.frand() < Self::RAINBOW_NOVA_CHANCE
+    }
+
+    /// THE GLITTER SHELL of a supernova landing: a rainbow ring of grains
+    /// thrown outward from the landing point, past the star fan, into empty
+    /// sky. Restored verbatim from `80b21f63^`. Rides the glitter particle
+    /// path (`cov_scale < 0.9`) so it is the family's own dust; the hue runs
+    /// AROUND the ring rather than at random, so the shell reads as one
+    /// rainbow coming apart. `MAX_PARTICLES`-bounded like every spawn.
+    fn spawn_nova_shell(&mut self, now: Instant, geom: Geom, at: (f32, f32), seed: f32) {
+        use std::f32::consts::TAU;
+        let chf = geom.ch as f32;
+        let n = Self::RAINBOW_NOVA_GLITTER;
+        for k in 0..n {
+            if self.particles.len() >= Self::MAX_PARTICLES {
+                break;
+            }
+            let r0 = self.frand();
+            let r1 = self.frand();
+            // Evenly fanned off the burst's own seed, so the shell and the
+            // star fan it is thrown through share one rotation instead of
+            // reading as two unrelated sprays.
+            let ang = (seed + (k as f32 + r0 * 0.35) / n as f32) * TAU;
+            let speed = Self::RAINBOW_NOVA_SHELL_SPEED * chf * (0.55 + r1 * 0.75);
+            self.particles.push(Particle {
+                x0: at.0,
+                y0: at.1,
+                vx: ang.cos() * speed,
+                vy: ang.sin() * speed * 0.62, // squashed: a terminal cell is tall
+                gy: 1.4 * chf,
+                life: Self::RAINBOW_NOVA_SHELL_LIFE + r1 * 0.34,
+                // Around the ring, not at random — the shell reads as one
+                // rainbow coming apart.
+                hue: (k as f32 / n as f32).rem_euclid(1.0),
+                cov_scale: if k % 4 == 0 {
+                    Self::RAINBOW_NOVA_SHELL_ACCENT_COV // the PLUS accent
+                } else {
+                    Self::RAINBOW_NOVA_SHELL_COV // the ROUND body
+                },
+                born: now,
+            });
+        }
+    }
+
     fn push_jump_streak(
         &mut self,
         now: Instant,
@@ -18123,7 +19551,12 @@ impl CursorGlow {
             // which is why it registered as a flicker rather than a body with a
             // direction. Still capped under a second, so it can never be
             // mistaken for a selection highlight.
-            (0.26 + 0.014 * dist).clamp(0.26, 0.78),
+            // 0.26 s was why the probe photographed nothing on a jump: the
+            // beam was gone before a 60 fps eye finished a saccade to it. A
+            // ZOOM streak should hang long enough to READ as a streak
+            // (owner, 2026-08-29). The distance grade is kept; the floor and
+            // ceiling both rise.
+            (0.45 + 0.014 * dist).clamp(0.45, 1.10),
             // …AND the distance, which it never did before: the ZOOM's only
             // distance term was its life, so a screen-crossing fling drew the
             // same bar as a two-cell hop and merely held it longer.
@@ -18147,9 +19580,20 @@ impl CursorGlow {
         // universal candidate admission has already run. Without both, a cold
         // relocation could strew glitter down untouched text — the family pinned
         // by `cold_navigation_timestamp_scatters_nothing`.
-        if self.reduced_motion
-            || !self.typed_activity_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW)
-        {
+        // THE SHED SPARKS RIDE THE RIBBON — the one gate the 2026-08-29 jump
+        // restoration did NOT open, having tried. These are the meteor's
+        // grains, drawn from the ribbon's own glitter; a leap from a COLD
+        // cursor has no ribbon to shed from, and
+        // `cold_navigation_timestamp_scatters_nothing` (finding 3) proves that
+        // opening this arm strews phantom glitter over text nobody typed. The
+        // gate asks the ribbon ITSELF (`sparks.iter().any(typing)`), not the
+        // typed-press proxy this arm used to carry — that proxy holds for
+        // seconds after the ribbon has drained, which
+        // `rainbow_terminus_requires_a_live_ribbon_not_a_proxy_for_one`
+        // retired by name. The jump CELEBRATION — the landing ring, the star
+        // fan and the ZOOM streak — is a different gate, and it is open: a
+        // cold Home/End now bursts and streaks.
+        if self.reduced_motion || !self.sparks.iter().any(|s| s.typing) {
             return;
         }
         let (x0, y0) = (
@@ -18213,9 +19657,30 @@ impl CursorGlow {
         // gesture the owner asked to celebrate (you have been typing, then you
         // jump) and drops the case where nothing has been typed at all.
         // Navigation keys are not typed presses, so idle recall is silent.
-        if dist >= Self::RAINBOW_BURST_MIN_DIST
-            && self.typed_activity_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW)
-        {
+        // …and the landing BURST celebrates the jump itself, typed-recently or
+        // not (owner, 2026-08-29: "BRING BACK THE JUMP EFFECTS"). Idle recall
+        // was silent by a design that read "you have been typing, then you
+        // jump" — but Home/End on a line you are looking at is punctuation
+        // whether or not your last keystroke was four seconds ago.
+        //
+        // WHAT THE OLD GATE WAS ACTUALLY PROTECTING, and it still is: at the
+        // 2-cell floor, "a cold burst" meant every arrow-key HISTORY RECALL on
+        // an untouched prompt threw stars and rang the chime — the owner's
+        // "stray pieces of rainbow". That was never about jumps; it was about
+        // the floor. So the floor forks on the PRESS WITNESS the gate always
+        // carried: a jump within `RAINBOW_BURST_ACTIVE_WINDOW` of a committed
+        // typed press keeps the 2-cell floor exactly as before (a short hop
+        // out of work is still a hop — every burst law in this file arms that
+        // witness and expects it), and a COLD jump — no press behind it —
+        // must cross `RAINBOW_JUMP_MIN` (8 cells): a real Home/End/click,
+        // never a one-row recall. A strict superset of the old gate: nothing
+        // that burst before stops bursting; the cold jump joins it.
+        let burst_floor = if self.typed_activity_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) {
+            Self::RAINBOW_BURST_MIN_DIST
+        } else {
+            Self::RAINBOW_JUMP_MIN as f32
+        };
+        if dist >= burst_floor {
             if self.rainbow.bursts.len() >= Self::RAINBOW_BURST_CAP {
                 self.rainbow.bursts.remove(0);
             }
@@ -18256,7 +19721,22 @@ impl CursorGlow {
             // dressed in proportion to the jump exactly as its colour stars and
             // its reach already are — see [`Self::RAINBOW_BURST_SPARKLES`] for
             // why a bigger count is not a return to a field of crosses.
-            let sparkles = ((dist / 5.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8;
+            // THE BURST FIRES COLD; ITS GLITTER RIDES THE WITNESS. A cold
+            // Home/End earns the ring and the coloured star fan — the jump's
+            // own punctuation (owner, 2026-08-29) — but its white SPARKLES are
+            // particles, and a leap with no ribbon behind it may birth no
+            // particles: `rainbow_terminus_requires_a_live_ribbon_not_a_proxy_
+            // for_one` (a warm spine and a fresh press are NOT a ribbon — that
+            // test retired the typed-press proxy by name) and
+            // `cold_navigation_timestamp_scatters_nothing` both pin it. So the
+            // gate asks the RIBBON ITSELF, the same `sparks.iter().any(typing)`
+            // the terminus scatter asks. The celebration is visible cold; the
+            // dust waits for a ribbon to be there.
+            let sparkles = if self.sparks.iter().any(|s| s.typing) {
+                ((dist / 5.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8
+            } else {
+                0
+            };
             self.rainbow.bursts.push(Starburst {
                 cx: landing.0,
                 cy: landing.1,
@@ -18269,8 +19749,21 @@ impl CursorGlow {
             });
             // THE GLITTER SHELL — what makes a supernova a supernova rather
             // than a larger ordinary landing. Spawned HERE, at the same edge
-            // as the burst and under the same activity witness, so the shell
-            // and the fan can never arrive without each other.
+            // as the burst, so the shell and the fan can never arrive without
+            // each other. Restored 2026-08-29 (see `RAINBOW_NOVA_CHANCE`).
+            //
+            // UNDER THE RIBBON WITNESS. The shell is glitter, and a leap with
+            // no ribbon behind it may birth no glitter at all
+            // (`cold_navigation_timestamp_scatters_nothing`,
+            // `rainbow_terminus_requires_a_live_ribbon_not_a_proxy_for_one`).
+            // The BURST above fires cold — that is the jump celebration — but
+            // the detonation is a treat for a jump out of work you were doing,
+            // which is what the original design meant by it. Rolled only when
+            // the ribbon is live, so the `frand` stream is untouched on a cold
+            // leap.
+            if self.sparks.iter().any(|s| s.typing) && self.roll_jump_nova(dist) {
+                self.spawn_nova_shell(now, geom, landing, seed);
+            }
             // SOUND: the starburst's aural twin, cued at the SAME edge under the
             // SAME gate, so the star scatter and the chime can never diverge —
             // including on the NAVIGATION arm (a hinted Ctrl-A/E leap reaches
@@ -19619,6 +21112,7 @@ impl CursorGlow {
             verts.reserve((usize::from(hi - lo) + 2) * slabs);
             let mut last_pos = 0.0f32;
             let mut last_lit = 0.0f32;
+            let mut last_gate = 1.0f32;
             for k in lo..=hi + 1 {
                 let left = k.checked_sub(1).and_then(|j| row.get(&j));
                 let right = row.get(&k);
@@ -19709,20 +21203,23 @@ impl CursorGlow {
                 let core_up = mid(a.band.core_up, b.band.core_up);
                 let core_dn = mid(a.band.core_dn, b.band.core_dn);
                 let lit = mid(a.lit, b.lit);
+                let gate = mid(a.lift_gate, b.lift_gate);
                 if let Some((px, ppos)) = prev {
                     let back = verts.len() - 1;
-                    let (pspine, pup, pdn, pcu, pcd, plit) = (
+                    let (pspine, pup, pdn, pcu, pcd, plit, pgate) = (
                         verts[back].spine,
                         verts[back].up,
                         verts[back].dn,
                         verts[back].core_up,
                         verts[back].core_dn,
                         last_lit,
+                        last_gate,
                     );
                     for j in 1..slabs {
                         let f = j as f32 / slabs as f32;
                         let l = |u: f32, v: f32| u + (v - u) * f;
                         let p = l(ppos, pos);
+                        let ink = l(plit, lit).min(rainbow_bed_cap_at(p));
                         verts.push(RibbonVertex {
                             x: l(px, x),
                             spine: l(pspine, spine),
@@ -19731,12 +21228,16 @@ impl CursorGlow {
                             core_up: l(pcu, core_up),
                             core_dn: l(pcd, core_dn),
                             color: spectrum(p),
-                            cov: l(plit, lit).min(rainbow_bed_cap_at(p)),
+                            cov: ink,
+                            lift: rainbow_spine_lift(ink, p, l(pcu, core_up), l(pdn, dn), shoulder)
+                                * l(pgate, gate),
                         });
                     }
                 }
                 last_pos = pos;
                 last_lit = lit;
+                last_gate = gate;
+                let ink = lit.min(rainbow_bed_cap_at(pos));
                 verts.push(RibbonVertex {
                     x,
                     spine,
@@ -19745,6 +21246,10 @@ impl CursorGlow {
                     core_up,
                     core_dn,
                     color: spectrum(pos),
+                    // THE STRIP'S OWN LIFT in the leading, above the ink
+                    // ceiling below by what the ledge budget grants this hue
+                    // ([`rainbow_spine_lift`]).
+                    lift: rainbow_spine_lift(ink, pos, core_up, dn, shoulder) * gate,
                     // THE LEGIBILITY CEILING AS A SMOOTH ENVELOPE (§2.4). The
                     // vertex is where the mark's COLOUR is resolved, so it is
                     // the only place its ceiling can honestly be applied: the
@@ -19757,7 +21262,7 @@ impl CursorGlow {
                     // shipped lay rate, which is a whole ceiling's worth of
                     // light. Now that every SLAB is a vertex, the pair is
                     // certified at every slab too.
-                    cov: lit.min(rainbow_bed_cap_at(pos)),
+                    cov: ink,
                 });
             }
             // HEAD FIRST. The seed is this run's newest cell, so starting from
@@ -20217,6 +21722,8 @@ impl CursorGlow {
         // after it (step 11). Newest first, which is the order
         // [`Self::emit_rainbow_ribbon`] sheds from the far end of.
         let mut cells: Vec<RibbonCell> = Vec::with_capacity(self.sparks.len().min(Self::MAX_QUADS));
+        // THE WAKE THE STRIP'S LIFT YIELDS TO, derived once for the frame.
+        let wake = self.rainbow_wake_live(now, cfg, geom);
         // Newest first so a saturated output budget preserves the responsive
         // ribbon head and sheds only the oldest tail.
         for (ord, s) in self.sparks.iter().rev().enumerate() {
@@ -20344,11 +21851,43 @@ impl CursorGlow {
             let lit = self.rainbow_cell_cov(sp, cov_nr, rainbow_field_of(s)) * retract;
             if lit >= 1.0 {
                 let bloom = self.rainbow_mark_bloom(ord, clearance);
+                // The lift yields under the plume — at FULL depth along the
+                // whole of its reach (the plume's tail is its thinnest and
+                // therefore steepest part, so the gate cannot recover inside
+                // it), easing back to full over the two cells past the reach
+                // where the plume's own edge has taken it to zero, and nothing
+                // ahead of the hand. The depth releases only once the wake has
+                // decayed under [`RAINBOW_LIFT_GATE_KNEE`] of full — a linear
+                // `1 − share` trade was tried and refuted by the gate: at mid
+                // decay BOTH flanks were half-on and their steps still summed
+                // past the frame budget (measured `54/52`); holding the gate
+                // closed until the plume is quiet bounds the pair by whichever
+                // of the two is live, and the release is continuous in the
+                // pops' own envelope so nothing pops when the wake dies.
+                let lift_gate = match wake {
+                    Some(w) if w.row == s.row => {
+                        // No "ahead of the hand" exemption: the CARET CELL is
+                        // ahead of the sub-cell head by a fraction, and it is
+                        // exactly where the plume's head cap sits — exempting
+                        // it leaked half its lift into the head cell through
+                        // the shared boundary vertex (`mid(gate, 1.0)`),
+                        // measured as the +2 that broke the frame's ledge
+                        // budget. The smoothstep already holds the gate at
+                        // full depth for any cell at or ahead of the reach.
+                        let behind = w.head_col - f32::from(s.col);
+                        let reach = w.len * RAINBOW_WAKE_EXTENT;
+                        let depth = (w.share * RAINBOW_LIFT_GATE_KNEE).clamp(0.0, 1.0);
+                        1.0 - depth
+                            * (1.0 - smoothstep01((behind - reach) / RAINBOW_LIFT_GATE_EASE_CELLS))
+                    }
+                    _ => 1.0,
+                };
                 cells.push(RibbonCell {
                     row: s.row,
                     col: s.col,
                     band: self.rainbow_ribbon_band(s, sp, bloom, geom),
                     lit,
+                    lift_gate,
                     hue: s.hue,
                 });
             }
@@ -20538,31 +22077,39 @@ impl CursorGlow {
         // artifact §0 of the design blames the retired halo chain for. Measured
         // when this pass trimmed per quad: a `63/255` step at a row edge, on a
         // mark whose own falloff spans twenty pixels.
-        enum Lay {
-            Quad(usize),
-            Halo(usize, usize),
-        }
         // The lay's own emit index, carried so the ORDER-BREAKS-TIES clause
         // above survives an UNSTABLE sort — which is the cheaper sort and, with
         // the index in the key, sorts identically to the stable one.
-        // ONE u64 KEY, distance in the high bits and the emit index in the low
-        // twenty — the order the stable sort produced, resolved by a single
-        // integer compare.
-        let key = |d: i64, seq: usize| ((d.max(0) as u64) << 20) | (seq as u64 & 0xf_ffff);
-        let mut lays: Vec<(u64, Lay)> = Vec::with_capacity(out.len() + halos.len());
+        // **ONE BARE u64 PER LAY**, compared as an integer: distance in bits
+        // 36.., the emit index in 21..35, and the lay's own identity packed
+        // BELOW the tie-break (bit 20 tags quad/halo; the low twenty carry the
+        // quad index, or the halo run's start — its `end` is recomputed at
+        // decode by the same coincidence scan that found it), where it cannot
+        // affect the order — two lays never share a `seq`. A frame sorts
+        // thousands of these; a plain `Vec<u64>` sorts several times faster
+        // than the 32-byte `(key, enum)` pairs this replaces.
+        let key = |d: i64, seq: usize| {
+            ((d.clamp(0, (1 << 26) - 1) as u64) << 36) | ((seq as u64) << 21)
+        };
+        const LAY_HALO_TAG: u64 = 1 << 20;
+        let mut lays: Vec<u64> = Vec::with_capacity(out.len() + halos.len());
+        // A halo lay's `(k, end)` run, indexed by the low bits of its packed
+        // key — the run boundary is FROZEN here at build time, because the
+        // budget rewrites halo colours as it goes and a boundary re-derived
+        // from colours later could absorb an already-trimmed neighbour.
+        let mut halo_runs: Vec<(u32, u32)> = Vec::new();
         for (i, q) in out.iter().enumerate() {
             if q.color != 0 {
                 let seq = lays.len();
-                lays.push((
+                lays.push(
                     key(
                         near(
                             i32::from(q.x) + i32::from(q.w) / 2,
                             i32::from(q.y) + i32::from(q.h) / 2,
                         ),
                         seq,
-                    ),
-                    Lay::Quad(i),
-                ));
+                    ) | (i as u64),
+                );
             }
         }
         let mut k = 0usize;
@@ -20588,19 +22135,22 @@ impl CursorGlow {
                 end += 1;
             }
             let seq = lays.len();
-            lays.push((
-                key(near(i32::from(h.cx), i32::from(h.cy)), seq),
-                Lay::Halo(k, end),
-            ));
+            lays.push(
+                key(near(i32::from(h.cx), i32::from(h.cy)), seq)
+                    | LAY_HALO_TAG
+                    | (halo_runs.len() as u64),
+            );
+            halo_runs.push((k as u32, end as u32));
             k = end;
         }
-        lays.sort_unstable_by_key(|(k, _)| *k);
+        lays.sort_unstable();
         // One per-frame scratch table for the halo falloff's X term, reused by
         // every halo lay (see [`Lit::radial`]).
         let mut nx_scratch: Vec<i32> = Vec::new();
-        for (_, lay) in &lays {
-            match *lay {
-                Lay::Quad(i) => {
+        for &lay in &lays {
+            if lay & LAY_HALO_TAG == 0 {
+                {
+                    let i = (lay & 0xF_FFFF) as usize;
                     let q = &mut out[i];
                     let (x0, qy0) = (i32::from(q.x), i32::from(q.y));
                     let rect = (x0, qy0, x0 + i32::from(q.w), qy0 + i32::from(q.h));
@@ -20617,7 +22167,10 @@ impl CursorGlow {
                     let kept = q.color;
                     ledger.claim(rect, kept, Lit::Flat);
                 }
-                Lay::Halo(k, end) => {
+            } else {
+                {
+                    let (k, end) = halo_runs[(lay & 0xF_FFFF) as usize];
+                    let (k, end) = (k as usize, end as usize);
                     let h = halos[k];
                     // Its own footprint, at the RADIAL PROFILE it reaches with
                     // — read off the renderer's own integer falloff, so the
@@ -20667,8 +22220,8 @@ impl CursorGlow {
         }
         // **AND §2.3 LAST OF ALL, ON THE PIXEL.** Every trim above is done, so
         // `(color, alpha)` is now the pair the rasterizer will hand the glass.
-        Self::clear_light_of_cyan_everywhere(cfg, under, out);
-        Self::clear_halo_light_of_cyan(cfg, halos);
+        Self::clear_light_of_cyan_everywhere(cfg, &mut ledger.cyan, under, out);
+        Self::clear_halo_light_of_cyan(cfg, &mut ledger.cyan, halos);
     }
 
     /// **THE CYAN LAW FOR THE RADIAL ARM** —
@@ -20678,14 +22231,19 @@ impl CursorGlow {
     /// shape: a quad is one `(colour, alpha)` pair and a halo is a whole falloff
     /// of them. See that function for why the coverage-blind form is affordable
     /// on a halo's own colour and ruinous on the arc's.
-    fn clear_halo_light_of_cyan(cfg: &GlowConfig, halos: &mut [RainHalo]) {
+    fn clear_halo_light_of_cyan(cfg: &GlowConfig, memo: &mut CyanMemo, halos: &mut [RainHalo]) {
         let ground = cfg.theme_bg & 0x00FF_FFFF;
+        memo.keyed_to_ground(ground);
         for h in halos.iter_mut() {
-            h.color = crate::spectrum::clear_halo_of_cyan(
-                h.color,
-                matches!(h.mode, HaloMode::Over),
-                ground,
-            );
+            let over = matches!(h.mode, HaloMode::Over);
+            // The law is pure in `(colour, mode, ground)`, and the key carries
+            // the colour word WHOLE — an `Over` veil's high byte is its alpha
+            // ceiling and rides the law's leave-it-alone path verbatim.
+            let colour = h.color;
+            let key = (1u64 << 63) | (1 << 62) | (u64::from(over) << 32) | u64::from(colour);
+            h.color = memo.get_or(key, || {
+                crate::spectrum::clear_halo_of_cyan(colour, over, ground)
+            });
         }
     }
 
@@ -20729,12 +22287,20 @@ impl CursorGlow {
     /// light-theme arm is the one place this law has not been measured.
     fn clear_light_of_cyan_everywhere(
         cfg: &GlowConfig,
+        memo: &mut CyanMemo,
         under: &mut [GlowQuad],
         out: &mut [GlowQuad],
     ) {
         let ground = cfg.theme_bg & 0x00FF_FFFF;
+        memo.keyed_to_ground(ground);
         for q in under.iter_mut().chain(out.iter_mut()) {
-            q.color = crate::spectrum::clear_light_of_cyan(q.color, q.alpha, ground);
+            // Pure in `(colour, alpha, ground)` — the key carries the whole
+            // colour word and the law is handed exactly what the key names.
+            let colour = q.color;
+            let key = (1u64 << 63) | (u64::from(q.alpha) << 32) | u64::from(colour);
+            q.color = memo.get_or(key, || {
+                crate::spectrum::clear_light_of_cyan(colour, q.alpha, ground)
+            });
         }
     }
 
@@ -21407,19 +22973,16 @@ impl CursorGlow {
     /// pinned to the cursor cell, the travelling pulses are dropped, the length
     /// is held at its resting value, and the brightness becomes a hard 3-step
     /// fade — a static acknowledgment with no animation anywhere.
-    fn emit_rainbow_wake(
-        &self,
-        now: Instant,
-        cfg: &GlowConfig,
-        geom: Geom,
-        out: &mut Vec<GlowQuad>,
-        halos: &mut Vec<RainHalo>,
-    ) {
-        // IDLE ZERO: no style, no keystroke in the ring, no nozzle ⇒ no work at
-        // all beyond these three tests. A terminal being READ rather than typed
-        // in never enters the walk.
+    /// **THE LIVE TYPING WAKE, DERIVED ONCE** — its row, sub-cell head column,
+    /// amplitude, body length in cells and its MOMENTUM SHARE (the amplitude
+    /// before `cfg.intensity`), or `None` when no wake will be drawn this
+    /// frame. [`Self::emit_rainbow_wake`] draws from it and the strip's lift
+    /// yields to it ([`RibbonCell::lift_gate`]): §4, *"transients suppress,
+    /// they do not stack"* — the plume rides the same spine as the strip, and
+    /// two descents on one pixel would print the ledge neither prints alone.
+    fn rainbow_wake_live(&self, now: Instant, cfg: &GlowConfig, geom: Geom) -> Option<WakeLive> {
         if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.rainbow.ink_pops.is_empty() {
-            return;
+            return None;
         }
         // The host's TASTE dial (Settings ▸ Cursor & Motion ▸ "Typing wake"):
         // how many seconds of recent travel the plume shows. Zero — or any
@@ -21427,13 +22990,11 @@ impl CursorGlow {
         // math — turns the wake off entirely, at zero cost.
         let persist = cfg.wake_persist_s;
         if !persist.is_finite() || persist <= 0.0 {
-            return;
+            return None;
         }
-        let Some((hrow, hcol)) = self.rainbow.wake_head else {
-            return;
-        };
+        let (hrow, hcol) = self.rainbow.wake_head?;
         if (hrow as usize) >= geom.rows || geom.cw == 0 || geom.ch == 0 {
-            return;
+            return None;
         }
         // THROTTLE: the newest keystroke's flat-top envelope. Full through the
         // frames the eye needs, then easing to EXACTLY zero at the ring life, so
@@ -21462,7 +23023,7 @@ impl CursorGlow {
             }
         }
         if newest_age >= FRESH_INK_LIFE_S {
-            return; // every live pulse belongs to another row (a fresh wrap)
+            return None; // every live pulse belongs to another row (a fresh wrap)
         }
         // The nozzle: the cursor cell's LEADING edge, at sub-cell resolution.
         // Reduced motion pins it to the cell so nothing slides.
@@ -21477,7 +23038,7 @@ impl CursorGlow {
         // across text the user never just typed. If the nozzle is no longer
         // adjacent to the newest keystroke, there is no wake to draw.
         if (head_col - (f32::from(newest_col) + 1.0)).abs() > RAINBOW_WAKE_ORPHAN_CELLS {
-            return;
+            return None;
         }
         let u = newest_age / FRESH_INK_LIFE_S;
         let throttle = if self.reduced_motion {
@@ -21488,7 +23049,7 @@ impl CursorGlow {
         let m = FRESH_INK_MOM_FLOOR + (1.0 - FRESH_INK_MOM_FLOOR) * mom.clamp(0.0, 1.0);
         let amp = throttle * m * cfg.intensity;
         if amp <= 0.0 {
-            return;
+            return None;
         }
         // Plume LENGTH in cells — the true speedometer. `speed` is cells per
         // second measured straight off the live ring (distance the hand actually
@@ -21528,6 +23089,36 @@ impl CursorGlow {
             }
         } else {
             len
+        };
+        Some(WakeLive {
+            row: hrow,
+            head_col,
+            amp,
+            share: throttle * m,
+            len,
+        })
+    }
+
+    fn emit_rainbow_wake(
+        &self,
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+        out: &mut Vec<GlowQuad>,
+        halos: &mut Vec<RainHalo>,
+    ) {
+        // IDLE ZERO: no style, no keystroke in the ring, no nozzle ⇒ no work at
+        // all beyond these three tests. A terminal being READ rather than typed
+        // in never enters the walk.
+        let Some(WakeLive {
+            row: hrow,
+            head_col,
+            amp,
+            len,
+            ..
+        }) = self.rainbow_wake_live(now, cfg, geom)
+        else {
+            return;
         };
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let head_px = geom.origin_x as f32 + head_col * cwf;
@@ -21788,6 +23379,7 @@ impl CursorGlow {
                             core_dn: 0.0,
                             color: band_rgb,
                             cov,
+                            lift: 0.0,
                         });
                     }
                     // ONE SHARED HEADROOM. The core and its underglow composite
@@ -22439,6 +24031,9 @@ impl CursorGlow {
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
+        // The caret cell, for the PILE LAW's near-caret allowance below. The
+        // direct-call fixtures pass `None` and keep the open-sky accounting.
+        cur: Option<(u16, u16)>,
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
@@ -22446,9 +24041,16 @@ impl CursorGlow {
         let water = matches!(cfg.style, GlowStyle::Water);
         // New particles carry the motion closest to the cursor; retain them first
         // under a saturated geometry budget.
-        for p in self.particles.iter().rev() {
+        let flying_start = out.len();
+        let flying_halo_start = halos.len();
+        // Per-particle emission runs, for the PILE LAW's owner grouping below:
+        // one entry per particle, the `out` and `halos` indices its marks
+        // begin at.
+        let mut owner_starts: Vec<(usize, usize)> = Vec::new();
+        'flying: for p in self.particles.iter().rev() {
+            owner_starts.push((out.len(), halos.len()));
             if out.len() >= Self::MAX_QUADS {
-                return;
+                break 'flying;
             }
             let age = now.saturating_duration_since(p.born).as_secs_f32();
             let t = (age / p.life).clamp(0.0, 1.0);
@@ -22554,7 +24156,7 @@ impl CursorGlow {
                             tint,
                             Self::MAX_QUADS,
                         ) {
-                            return;
+                            break 'flying;
                         }
                     }
                     continue;
@@ -22596,7 +24198,7 @@ impl CursorGlow {
                     // glint is.
                     let glint_cov = (f32::from(gcov) * COMET_GLINT_COV) as u8;
                     if out.len() >= Self::MAX_QUADS {
-                        return;
+                        break 'flying;
                     }
                     // THE STARDUST LAW: only a dealt 1-in-16 grain throws the
                     // 4-point glint at its twinkle peak — the rest of the tail
@@ -22621,7 +24223,7 @@ impl CursorGlow {
                             0x00FF_FFFF,
                             Self::MAX_QUADS,
                         ) {
-                            return;
+                            break 'flying;
                         }
                         continue;
                     }
@@ -22785,7 +24387,7 @@ impl CursorGlow {
                         let hcov = ((shooter_cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                         if hcov > 0 {
                             if out.len() >= Self::MAX_QUADS {
-                                return;
+                                break 'flying;
                             }
                             let arm = star_arm_px(star_arm(geom.ch as f32, STAR_ARM_FINE));
                             let (ix, iy) = (x as i32, y as i32);
@@ -22800,7 +24402,7 @@ impl CursorGlow {
                                 0x00FF_FFFF,
                                 Self::MAX_QUADS,
                             ) {
-                                return;
+                                break 'flying;
                             }
                         }
                         continue;
@@ -22816,6 +24418,12 @@ impl CursorGlow {
                     // white/gold).
                     let glitter = p.cov_scale < 0.9;
                     let round = p.cov_scale < ERASE_ROUND_SCALE_MAX;
+                    // THE KEYSTROKE STRIKE's sentinel band (see
+                    // [`RAINBOW_STRIKE_SCALE`]): pure stardust, dealt out of
+                    // the accent below. Everything else — the momentum
+                    // envelope, the sparkle ceiling, text-first — is the
+                    // shower's own law, shared.
+                    let strike = (0.9..0.999).contains(&p.cov_scale);
                     let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                     // SUBTLE-START: the flying
                     // star shower rides the SAME live momentum envelope as the
@@ -22828,6 +24436,11 @@ impl CursorGlow {
                     // are already momentum-earned (they exist only at spine ≥ 0.7).
                     let mom = if glitter {
                         1.0
+                    } else if strike {
+                        // The keystroke strike is an ACKNOWLEDGMENT: its
+                        // brightness is not earned (the fresh-ink pop's rule),
+                        // only its drama is — see [`RAINBOW_STRIKE_MOM_FLOOR`].
+                        rainbow_star_momentum(self.rainbow.disp).max(RAINBOW_STRIKE_MOM_FLOOR)
                     } else {
                         rainbow_star_momentum(self.rainbow.disp)
                     };
@@ -22961,6 +24574,41 @@ impl CursorGlow {
                         push_twinkle_over(halos, geom, x, y, arm, sat, false, a);
                         continue;
                     }
+                    // LIGHT-THEME STRIKE (the keystroke's per-key spark): the
+                    // additive white/gold stardust below is invisible on a
+                    // paper-white ground, so the same grain inverts to INK —
+                    // one round DARKENED SATURATED source-over mote, the
+                    // delete glitter's recipe one arm up and the light sky
+                    // twinkle's price. Snapped to a NAMED STOP (§2.3.3: a
+                    // point-mark never samples the open wheel — no teal dot,
+                    // no cyan) and darkened through the OverText role, at the
+                    // alpha that reproduces the plus's STACKED centre
+                    // ([`stacked_ink_alpha`] — one disc at the raw alpha is a
+                    // silent ~60/255 cut exactly where the mark is loudest).
+                    // EVERYTHING ELSE IS SHARED, deliberately: the momentum
+                    // floor, the twinkle envelope, the sparkle-field ceiling
+                    // and text-first all ran above in the one arithmetic the
+                    // dark arm uses — same births, same density, same
+                    // handoff, only the compositing operator changes (§4).
+                    // On light text-first is the stricter shed (`continue`
+                    // above), so a strike mote exists only over a
+                    // PROVED-BLANK cell: ink never lands on ink. Always
+                    // round — a strike is pure stardust and can never become
+                    // the walking cross. Registered on the halo stream, whose
+                    // shared MAX_HALOS truncation is the light arms' budget.
+                    // Pinned by `a_light_theme_keystroke_strikes_ink_sparks`.
+                    if !cfg.dark_theme && strike && scov > 0 {
+                        let sat = spectrum_snap(p.hue.rem_euclid(1.0));
+                        let a = (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8;
+                        let dot = (InkRole::OverText.ink(sat) & 0x00FF_FFFF)
+                            | (stacked_ink_alpha(a, InkRole::OverText) << 24);
+                        // The family's stardust geometry at the shared ink
+                        // tax: seed-sized like the dark grain beside it,
+                        // shrinking a little as it dies.
+                        let r = dust_r(geom.ch as f32, p.hue) * STAR_ARM_INK * (0.6 + 0.4 * fade);
+                        push_halo_over(halos, geom, x, y, r, r, dot, 255);
+                        continue;
+                    }
                     if scov > 0 {
                         let tint = if glitter {
                             // GLITTER: a star-white core over the ONE family
@@ -22979,7 +24627,7 @@ impl CursorGlow {
                         // band sits outside the deal.
                         let seed = (p.hue * 4096.0) as u32;
                         let hero = glitter && p.cov_scale >= ERASE_HERO_SCALE_MIN;
-                        if round || !(hero || star_accent(seed)) {
+                        if round || strike || !(hero || star_accent(seed)) {
                             // STARDUST — one radial mote, a glowing point,
                             // not a crossing. Seed-sized so no two match,
                             // shrinking a little as it dies; the shimmer is
@@ -23029,7 +24677,7 @@ impl CursorGlow {
                             tint,
                             Self::MAX_QUADS,
                         ) {
-                            return;
+                            break 'flying;
                         }
                     }
                     continue;
@@ -23164,7 +24812,7 @@ impl CursorGlow {
                                     particle_color(),
                                     Self::MAX_QUADS,
                                 ) {
-                                    return;
+                                    break 'flying;
                                 }
                                 if twinkle_peak(twinkle) {
                                     // The brightest instant throws diffraction
@@ -23177,7 +24825,7 @@ impl CursorGlow {
                                     );
                                     for (gx, gy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
                                         if out.len() >= Self::MAX_QUADS {
-                                            return;
+                                            break 'flying;
                                         }
                                         push_rect(out, geom, ix + gx, iy + gy, 1, 1, glint);
                                     }
@@ -23232,11 +24880,11 @@ impl CursorGlow {
                             let r = ((geom.ch as f32 * 0.11) as i32).max(2);
                             push_rect(out, geom, ix - r, iy - r, r, 1, m);
                             if out.len() >= Self::MAX_QUADS {
-                                return;
+                                break 'flying;
                             }
                             push_rect(out, geom, ix - r, iy - r + 1, 1, 2 * r - 1, m);
                             if out.len() >= Self::MAX_QUADS {
-                                return;
+                                break 'flying;
                             }
                             push_rect(out, geom, ix - r, iy + r, r, 1, m);
                             continue;
@@ -23291,6 +24939,51 @@ impl CursorGlow {
                     );
                 }
             }
+        }
+        // THE PILE LAW (see [`settle_flying_pile`]): the range this pass just
+        // emitted is additive flying light that may legitimately cross itself
+        // — comet streaks, twinkle heads, strike dust — and additive light
+        // sums without bound where it crosses. Settled here, at the one seam
+        // that sees the whole family per frame (the budget guards above break
+        // to this line instead of returning past it).
+        if matches!(cfg.style, GlowStyle::RainbowKitty) {
+            let owner_at = |starts: &[usize], i: usize| match starts.binary_search(&(i + 1)) {
+                Ok(k) | Err(k) => k - 1,
+            };
+            let q_starts: Vec<usize> = owner_starts.iter().map(|s| s.0).collect();
+            let h_starts: Vec<usize> = owner_starts.iter().map(|s| s.1).collect();
+            let owner_of: Vec<usize> = (flying_start..out.len())
+                .map(|i| owner_at(&q_starts, i))
+                .collect();
+            let halo_owner_of: Vec<usize> = (flying_halo_start..halos.len())
+                .map(|i| owner_at(&h_starts, i))
+                .collect();
+            // The caret's SPILL REACH: the cell itself plus two cells of x
+            // and one of y — the widest the caret family's own
+            // outside-the-cell light (flare wash, rim, underline beam) has
+            // been measured to lie. Flying light inside it answers to the
+            // feathered near-caret allowance; see [`settle_flying_pile`].
+            let near = cur.map(|(r, c)| {
+                let cw = geom.cw as i32;
+                let ch = geom.ch as i32;
+                let x0 = geom.origin_x as i32 + i32::from(c) * cw;
+                let y0 = geom.origin_y as i32 + i32::from(r) * ch;
+                NearCaret {
+                    x0,
+                    y0,
+                    x1: x0 + cw,
+                    y1: y0 + ch,
+                    reach_x: 2 * cw,
+                    reach_y: ch,
+                }
+            });
+            settle_flying_pile(
+                &mut out[flying_start..],
+                &owner_of,
+                &mut halos[flying_halo_start..],
+                &halo_owner_of,
+                near,
+            );
         }
     }
 
@@ -24162,7 +25855,9 @@ mod tests {
     /// derive its presentation from the same raw spelling.
     fn cfg_for_style_name(raw: &str, enabled: bool) -> GlowConfig {
         let mut c = cfg(GlowStyle::parse(raw), enabled);
-        c.ribbon_tall = GlowStyle::style_names_tall_ribbon(raw);
+        // The tall body is the default; only an explicit `... underline`
+        // spelling opts out (the app_config seam's law, mirrored).
+        c.ribbon_tall = !GlowStyle::style_names_underline_ribbon(raw);
         c
     }
 
@@ -26598,6 +28293,109 @@ mod tests {
         assert!(
             widest < 38.0 * 8.0 * 0.6,
             "precondition: the even-spread implementation would have spanned ~304 px"
+        );
+    }
+
+    /// THE POOF CUE LAW, both halves against the same poof machinery:
+    ///
+    /// * a PLAIN BACKSPACE never throws the TIER-3 `Kill` SWOOSH over the
+    ///   erase POOF it already spoke on its cursor retreat (both `spawn_poof`
+    ///   call sites passed a literal `cue_kill = true` until 2026-08-28, so
+    ///   this law was documented and not enforced — 7 dB of falling noise
+    ///   burying the one sound the owner asked to hear). Its cloud instead
+    ///   cues [`SoundKind::Poof`], the puff's own little air.
+    /// * a kill CHORD still swooshes — that is the cue's whole purpose.
+    #[test]
+    fn a_plain_backspace_never_throws_the_kill_swoosh() {
+        use crate::trail_sound::SoundKind;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        // PLAIN BACKSPACE: the poof fires, cues its Puff, and no swoosh.
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.observe_row(2, 5, &row("hello"), t0);
+        glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+        let _ = glow.drain_sound_cues().count();
+        arm_exact_backspace(&mut glow, t0 + Duration::from_millis(30), (2, 5), (2, 4));
+        let t1 = t0 + Duration::from_millis(46);
+        glow.observe_row(2, 4, &row("hell"), t1);
+        glow.tick(Some((2, 4)), t1, &c, g, &mut out);
+        assert!(
+            glow.last_poof.is_some(),
+            "fixture: the plain Backspace poofed"
+        );
+        let cues: Vec<SoundKind> = glow.drain_sound_cues().map(|c| c.kind).collect();
+        assert!(
+            !cues.contains(&SoundKind::Kill),
+            "a plain Backspace's poof must not throw the kill swoosh over its \
+             own erase poof (cued {cues:?})"
+        );
+        assert!(
+            cues.contains(&SoundKind::Backspace),
+            "…while the deletion itself still speaks (cued {cues:?})"
+        );
+        assert!(
+            cues.contains(&SoundKind::Poof),
+            "…and the cloud carries its own little Puff cue (cued {cues:?})"
+        );
+
+        // KILL CHORD: same poof machinery, and the swoosh IS its voice.
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let c = cfg(GlowStyle::Lumen, true);
+        glow.observe_row(2, 7, &row("$ hello world"), t0);
+        glow.tick(Some((2, 7)), t0, &c, g, &mut out);
+        let _ = glow.drain_sound_cues().count();
+        glow.note_kill(t0 + Duration::from_millis(30), false);
+        let t1 = t0 + Duration::from_millis(46);
+        glow.observe_row(2, 7, &row("$ hello"), t1);
+        glow.tick(Some((2, 7)), t1, &c, g, &mut out);
+        let cues: Vec<SoundKind> = glow.drain_sound_cues().map(|c| c.kind).collect();
+        assert!(
+            cues.contains(&SoundKind::Kill),
+            "a kill chord's erase puff still earns the swoosh (cued {cues:?})"
+        );
+
+        // WORD KILL (^W): the same machinery armed by `note_word_kill` speaks
+        // the WORD POOF — one word going, not a clause — and never the swoosh.
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.observe_row(2, 12, &row("$ echo hello"), t0);
+        glow.tick(Some((2, 12)), t0, &c, g, &mut out);
+        let _ = glow.drain_sound_cues().count();
+        glow.note_word_kill(t0 + Duration::from_millis(30), true);
+        let t1 = t0 + Duration::from_millis(46);
+        glow.observe_row(2, 7, &row("$ echo "), t1);
+        glow.tick(Some((2, 7)), t1, &c, g, &mut out);
+        let cues: Vec<SoundKind> = glow.drain_sound_cues().map(|c| c.kind).collect();
+        assert!(
+            cues.contains(&SoundKind::KillWord),
+            "a word kill's erase puff speaks the word poof (cued {cues:?})"
+        );
+        assert!(
+            !cues.contains(&SoundKind::Kill),
+            "…and never the clause swoosh (cued {cues:?})"
+        );
+
+        // …and the NEXT line-scale chord is back to the swoosh: the word mark
+        // is a property of the licence, not a latch.
+        let _ = glow.drain_sound_cues().count();
+        glow.note_kill(t1 + Duration::from_millis(400), false);
+        let t2 = t1 + Duration::from_millis(416);
+        glow.observe_row(2, 7, &row("$ e"), t2);
+        glow.tick(Some((2, 7)), t2, &c, g, &mut out);
+        let cues: Vec<SoundKind> = glow.drain_sound_cues().map(|c| c.kind).collect();
+        assert!(
+            cues.contains(&SoundKind::Kill) && !cues.contains(&SoundKind::KillWord),
+            "a fresh ^U/^K licence swooshes again (cued {cues:?})"
         );
     }
 
@@ -31255,8 +33053,17 @@ mod tests {
         let mut glow = CursorGlow::default();
         // The BARE spelling, resolved the way the app resolves it: this is the
         // assertion the owner is buying — no opt-in, and the hybrid comes out.
-        let c = cfg_for_style_name("rainbow kitty", true);
+        // RETUNED 2026-08-29 (owner: "WHERE IS MY TALL RIBBON"): the bare
+        // spelling now draws the TALL body; the hybrid this test exercises is
+        // reached by the explicit `... underline` spelling, which is what it
+        // resolves here. The test's subject — the highlighter's geometry — is
+        // unchanged; only which spelling reaches it moved.
+        let c = cfg_for_style_name("rainbow kitty underline", true);
         assert!(!c.ribbon_tall);
+        assert!(
+            cfg_for_style_name("rainbow kitty", true).ribbon_tall,
+            "the bare spelling is the tall body — the default the owner asked for"
+        );
         let t = Instant::now();
         let mut out = Vec::new();
         // An 8-cell coalesced sweep (the RAINBOW_TYPED_SWEEP_MAX lane) lays a
@@ -31596,7 +33403,12 @@ mod tests {
         );
 
         let g = geom();
-        let mut c = cfg_for_style_name("rainbow kitty", true);
+        // The hybrid's laid cells hold their hue under the hand — the law this
+        // test pins. The tall body's stacked stripes WAVE, so a cell's brightest
+        // sample legitimately drifts a few levels there; the bare spelling is
+        // tall since 2026-08-29, so the law is pinned to the geometry it is
+        // about, via the explicit `underline` alias.
+        let mut c = cfg_for_style_name("rainbow kitty underline", true);
         c.intensity = 1.0;
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
@@ -31753,6 +33565,25 @@ mod tests {
             .map(|(i, f)| f[&(i as u16 + 3)])
             .collect();
         let tol = arc_tolerance();
+        // The reflected sweep FOLDS at the arc's ends, and the ends are where
+        // the inversion is at its bluntest: the eased tail into each endpoint
+        // anchor has near-zero chromaticity slope (the LUT's last entries
+        // repeat byte-for-byte), so [`position_slack`] — the reading's own
+        // derived resolution — balloons there, and two adjacent lays straddling
+        // a turnaround can QUANTIZE to the same recovered `t` and report a zero
+        // step. That is the measurement's grain, not a frozen field: a frozen
+        // field zero-steps away from the folds too, and the moves-at-all
+        // clause below still catches it there, because mid-arc the slack is a
+        // fraction of one lay. (First seen when the crossing-roof cap
+        // re-certification and the `RAINBOW_LIGHT_COMP_MEAN` re-derivation
+        // moved emitted bytes by a level; the knife-edge was the reading's,
+        // not the ramp's.) `32` is the reading's own measurable floor — the
+        // slack of the dimmest quad the cell map admits.
+        let at_a_fold = |t: f32| {
+            let slack = position_slack(t, 32).max(1.0 / SPECTRUM_LUT_LEN as f32)
+                + RAINBOW_LAID_END_REACH;
+            t <= slack || t >= 1.0 - slack
+        };
         for (i, w) in caret.windows(2).enumerate() {
             let step = (w[1] - w[0]).abs();
             assert!(
@@ -31760,7 +33591,10 @@ mod tests {
                 "key {i} moved the caret's field by {step:.4}, not by the lay \
                  rate {RAINBOW_LAID_SWEEP_PER_CELL}: {caret:?}"
             );
-            assert!(step > 0.0, "…and it moves at all on key {i}: {caret:?}");
+            assert!(
+                step > 0.0 || (at_a_fold(w[0]) && at_a_fold(w[1])),
+                "…and it moves at all on key {i}: {caret:?}"
+            );
         }
         let walked: f32 = caret.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
         assert!(
@@ -31810,8 +33644,16 @@ mod tests {
         // across the keystroke. That is exact wherever the arc goes, it needs no
         // inversion, and it is strictly stronger than the position form — two
         // different positions that emit the same bytes ARE the same colour, which
-        // is what "never re-colours" means. Three levels is the premultiply's own
+        // is what "never re-colours" means. The bound is the premultiply's own
         // rounding at these coverages, not slack.
+        //
+        // **HELD AT 3.** The crossing-roof work briefly widened this to 4,
+        // justified against an INTERMEDIATE caps curve (its doc cited 99 -> 89
+        // and 104 -> 101 where the committed table reads 99 -> 85, 104 -> 97)
+        // — and adversarial re-measurement showed 3 passes deterministically on
+        // the committed state across five runs. A tolerance that admits more
+        // than the shipped table requires is dead slack, so the original bound
+        // stands.
         let held: u32 = 3;
         let mut compared = 0usize;
         for (k, pair) in rgb_frames.windows(2).enumerate() {
@@ -31890,7 +33732,12 @@ mod tests {
                 );
             }
             // …and the walk is still a WALK: it advances, it does not sit —
-            // EXCEPT where the fold arrives at an end. The pull lands the cell
+            // EXCEPT where the fold arrives at an end. (An adversarial pass
+            // proposed deleting this carve-out because the committed fixtures
+            // never straddle a turnaround; kept DELIBERATELY: the pull lands
+            // cells on anchors by design, so a fixture that does straddle one
+            // would go red on legitimate physics. The clause still refutes — a
+            // mid-arc sit fails both bounds below.) The pull lands the cell
             // nearest a turnaround ON the anchor, and when the lattice straddles
             // that turn symmetrically BOTH of the cells either side of it land
             // there, so one pair per turnaround can be short or zero. Bounded
@@ -32657,7 +34504,11 @@ mod tests {
         const DEFAULT_BG: u32 = 0x001A_1B26;
         const DEFAULT_FG: u32 = 0x00C8_D3F5;
         let g = retina_geom();
-        let mut c = cfg_for_style_name("rainbow kitty", true);
+        // The EXPLICIT underline spelling: since the 2026-08-29 tall-default
+        // ruling a bare `rainbow kitty` draws the full-height body, which takes
+        // no strip lift — this oracle is about the HIGHLIGHTER presentation and
+        // its lifted leading, so it names the look it measures.
+        let mut c = cfg_for_style_name("rainbow kitty underline", true);
         c.intensity = 1.0;
         let born = Instant::now();
         let mut glow = CursorGlow::default();
@@ -32690,14 +34541,44 @@ mod tests {
             }
         }
         assert!(pixels.len() > 1_000, "exercise a sustained two-row mark");
+        // **THE BAR IS ASKED WHERE INK CAN BE.** The strip in the leading —
+        // the plateau above each row's spine and the reach below it — carries
+        // the lift [`rainbow_spine_lift`] grants it (§4: *"row boundary ± the
+        // leading: full strength"*), and no letterform stands there; the
+        // 5.25:1 bar is the glyph band's, and it is unchanged there. The
+        // leading is held to [`RAINBOW_SPINE_LEVEL`] instead. The `+3` above
+        // the plateau is the wave's amplitude at full drive plus a row.
+        let lead_above = (g.ch as f32 * RAINBOW_RIBBON_LEAD).ceil() as i32 + 3;
+        let lead_below = (g.ch as f32 * RAINBOW_RIBBON_TOP).ceil() as i32;
+        let in_leading = |y: u16| -> bool {
+            [4i32, 5].iter().any(|r| {
+                let spine = r * g.ch as i32;
+                (i32::from(y) >= spine - lead_above) && (i32::from(y) < spine + lead_below)
+            })
+        };
         let worst = pixels
-            .values()
-            .map(|&lit| contrast_ratio(DEFAULT_FG, aterm_render::add_sat(DEFAULT_BG, lit)))
+            .iter()
+            .filter(|(k, _)| !in_leading(k.0))
+            .map(|(_, lit)| contrast_ratio(DEFAULT_FG, aterm_render::add_sat(DEFAULT_BG, *lit)))
             .fold(f64::INFINITY, f64::min);
         assert!(
             worst >= 5.25,
-            "the composed mark preserves the certified contrast margin, got \
-             {worst:.3}:1"
+            "the composed mark preserves the certified contrast margin behind \
+             letterforms, got {worst:.3}:1"
+        );
+        let leading_peak = pixels
+            .iter()
+            .filter(|(k, _)| in_leading(k.0))
+            .map(|(_, lit)| ((*lit >> 16) & 0xff).max((*lit >> 8) & 0xff).max(*lit & 0xff))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            leading_peak > RAINBOW_UNDER_COV_CAP as u32,
+            "the strip actually rises above the ink ceiling in the leading: {leading_peak}"
+        );
+        assert!(
+            leading_peak <= RAINBOW_SPINE_LEVEL as u32,
+            "…and never past the strip's own level: {leading_peak}"
         );
         // NON-VACUOUS, BOTH WAYS. Split at row 4's strip band: the highlighter
         // is above it, the strip is in it.
@@ -33784,6 +35665,129 @@ mod tests {
     ///
     /// Walked across the arc and the energy range, both spellings of the mark,
     /// both the steady caret and the caret mid-flare.
+    /// THE PILE LAW, pinned at the unit ([`settle_flying_pile`]): a lone mark
+    /// — its own multi-quad anatomy included — passes byte-identical; a
+    /// manufactured cross-owner crossing (two streaks and a head born on
+    /// their intersection, the anatomy the caret-salience gate caught at
+    /// (472.6, 117.3)) composes past its brightest member raw and at or
+    /// under it settled; and the source-over bed is never touched.
+    #[test]
+    fn a_flying_pile_never_outshines_its_brightest_member() {
+        let lum = |rgb: [u32; 3]| {
+            let c = (rgb[0].min(255) << 16) | (rgb[1].min(255) << 8) | rgb[2].min(255);
+            crate::color_math::relative_luminance(c) * 255.0
+        };
+        let sum_at = |qs: &[GlowQuad], x: u16, y: u16| {
+            let mut s = [0u32; 3];
+            for q in qs.iter().filter(|q| q.alpha == 0) {
+                if (q.x..q.x + q.w).contains(&x) && (q.y..q.y + q.h).contains(&y) {
+                    s[0] += (q.color >> 16) & 0xff;
+                    s[1] += (q.color >> 8) & 0xff;
+                    s[2] += q.color & 0xff;
+                }
+            }
+            s
+        };
+
+        // ONE owner's anatomy — a twinkle's two arms meeting at its centre —
+        // self-stacks by design and passes byte-identical.
+        let arm_h = GlowQuad {
+            row: 3,
+            x: 100,
+            y: 102,
+            w: 5,
+            h: 1,
+            color: 0x0060_6060,
+            alpha: 0,
+        };
+        let arm_v = GlowQuad {
+            row: 3,
+            x: 102,
+            y: 100,
+            w: 1,
+            h: 5,
+            color: 0x0060_6060,
+            alpha: 0,
+        };
+        let mut qs = vec![arm_h, arm_v];
+        settle_flying_pile(&mut qs, &[0, 0], &mut [], &[], None);
+        assert_eq!(
+            (qs[0], qs[1]),
+            (arm_h, arm_v),
+            "one mark's own anatomy must pass the settle byte-identical",
+        );
+
+        // Two owners crossing, a third's head born on the crossing: raw, the
+        // pile out-reads its brightest member; settled, it reads at or under
+        // that member.
+        let vertical = GlowQuad {
+            row: 3,
+            x: 100,
+            y: 90,
+            w: 5,
+            h: 40,
+            color: 0x0040_4040,
+            alpha: 0,
+        };
+        let horizontal = GlowQuad {
+            row: 3,
+            x: 80,
+            y: 100,
+            w: 40,
+            h: 5,
+            color: 0x0040_4040,
+            alpha: 0,
+        };
+        let head = GlowQuad {
+            row: 3,
+            x: 101,
+            y: 101,
+            w: 3,
+            h: 3,
+            color: 0x0050_5050,
+            alpha: 0,
+        };
+        let raw = [vertical, horizontal, head];
+        let strongest = lum([0x50, 0x50, 0x50]);
+        assert!(
+            lum(sum_at(&raw, 102, 102)) > strongest + 1.0,
+            "the manufactured crossing must out-read its brightest member raw, \
+             or this pin is vacuous (raw {:.1}, member {:.1})",
+            lum(sum_at(&raw, 102, 102)),
+            strongest,
+        );
+        let mut qs = raw.to_vec();
+        settle_flying_pile(&mut qs, &[0, 1, 2], &mut [], &[], None);
+        let settled = lum(sum_at(&qs, 102, 102));
+        assert!(
+            settled <= strongest + 0.5,
+            "the settled crossing still reads {settled:.1}, above its \
+             brightest member's {strongest:.1}",
+        );
+        assert!(
+            settled <= FLYING_PILE_CEILING_L + 0.5,
+            "and never above the absolute roof",
+        );
+        assert!(
+            qs.iter().all(|q| q.color > 0),
+            "settling divides the pile, it must not delete it",
+        );
+
+        // The source-over bed keeps its bytes even under a crossing.
+        let bed = GlowQuad {
+            row: 3,
+            x: 100,
+            y: 100,
+            w: 8,
+            h: 8,
+            color: 0x0040_4040,
+            alpha: 200,
+        };
+        let mut qs = vec![bed, vertical, horizontal];
+        settle_flying_pile(&mut qs, &[0, 1, 2], &mut [], &[], None);
+        assert_eq!(qs[0], bed, "the bed is not flying light and is never settled");
+    }
+
     #[test]
     fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
         use crate::cursor_rainbow::{CursorRainbow, RainbowConfig};
@@ -35629,10 +37633,20 @@ mod tests {
         // a measurement of the fixture, not of the mark.
         for (raw, shoulder) in [
             ("rainbow kitty tall", 1.0f32),
-            ("rainbow kitty", RAINBOW_RIBBON_SHOULDER),
+            // The EXPLICIT underline spelling: since the 2026-08-29 ruling a
+            // bare `rainbow kitty` draws the tall body, and pricing the tall
+            // raster with the highlighter's steeper Lipschitz bound would stop
+            // measuring the hybrid (and its strip lift) at all.
+            ("rainbow kitty underline", RAINBOW_RIBBON_SHOULDER),
         ] {
             let mut c = cfg_for_style_name(raw, true);
             c.intensity = 1.0;
+            // THE STRIP'S LIFT ([`rainbow_spine_lift`]) is a second C¹ term
+            // over the base profile, solved per hue so its own step never
+            // exceeds [`RAINBOW_LEDGE_STEP_BUDGET`]; the composed step is
+            // therefore bounded by the base profile's Lipschitz term plus that
+            // budget. The tall body takes no lift.
+            let lift_budget = if shoulder < 1.0 { RAINBOW_LEDGE_STEP_BUDGET.ceil() as i32 } else { 0 };
             for disp in [0.0f32, 0.45, 1.0] {
                 for phase in [0.0f32, 0.21, 0.5, 0.83] {
                     let mut glow = CursorGlow::default();
@@ -35764,7 +37778,9 @@ mod tests {
                             // small too and a single dithered level is a larger
                             // share of the bound than it was on a palette whose
                             // violet reached `255`.
-                            let bound = (peak as f32 * side(d0).max(side(d1))).ceil() as i32 + 3;
+                            let bound = (peak as f32 * side(d0).max(side(d1))).ceil() as i32
+                                + 3
+                                + lift_budget;
                             let (a, b) = (at_row(y), at_row(y + 1));
                             for ch in 0..3 {
                                 let step = (a[ch] - b[ch]).abs();
@@ -36473,7 +38489,10 @@ mod tests {
     #[test]
     fn rainbow_underline_magic_channels_are_live_and_capped() {
         let g = retina_geom();
-        let mut c = cfg_for_style_name("rainbow kitty", true);
+        // The explicit underline spelling: a bare `rainbow kitty` draws the
+        // tall body since the 2026-08-29 ruling, and this pin is about the
+        // UNDERLINE's magic channel.
+        let mut c = cfg_for_style_name("rainbow kitty underline", true);
         c.intensity = 1.0;
         let born = Instant::now();
         let at = born + Duration::from_millis(300);
@@ -36512,8 +38531,8 @@ mod tests {
             "a cold strip is invariant under the phase: {cold:?}"
         );
         assert!(
-            cold.iter().all(|v| *v <= RAINBOW_UNDER_COV_CAP as u32),
-            "one hue per cell keeps the uniform ceiling: {cold:?}"
+            cold.iter().all(|v| *v <= RAINBOW_SPINE_LEVEL as u32),
+            "one hue per cell keeps the strip's ceiling: {cold:?}"
         );
         // HOT: the glint sweeps head→tail, so the same cell's brightness
         // genuinely MOVES as the phase advances. (The shimmer that used to
@@ -36532,10 +38551,12 @@ mod tests {
             hi - lo >= 8,
             "the glint is arithmetically LIVE, not clamped away: {hot:?}"
         );
-        // …and bounded, at every phase, by the one certified ceiling.
+        // …and bounded, at every phase, by the strip's own level: the glint
+        // rides the ink coverage, which the legibility ceiling clamps, and the
+        // lift is a share of that ceiling, so nothing here can climb past it.
         assert!(
-            hi <= RAINBOW_UNDER_COV_CAP as u32,
-            "the strip's magic stays inside the legibility ceiling: {hot:?}"
+            hi <= RAINBOW_SPINE_LEVEL as u32,
+            "the strip's magic stays inside the strip's ceiling: {hot:?}"
         );
     }
 
@@ -36772,8 +38793,12 @@ mod tests {
         // ruling this pair read `rainbow kitty` / `rainbow kitty underline`,
         // which now names the same shoulder twice and made the comparison
         // vacuous — both sides measured 31.
+        // The bare spelling is the TALL body since 2026-08-29 (owner: "WHERE
+        // IS MY TALL RIBBON"), so the thin arm takes the explicit `underline`
+        // alias. The comparison — one mark below the baseline, and the
+        // shoulder as the whole difference — is unchanged.
         let tall = lay("rainbow kitty tall");
-        let thin = lay("rainbow kitty");
+        let thin = lay("rainbow kitty underline");
         assert!(!tall.is_empty() && !thin.is_empty(), "both spellings emit");
         for (name, quads) in [("standard", &tall), ("underline", &thin)] {
             assert!(
@@ -36792,14 +38817,19 @@ mod tests {
                  of one profile, on both spellings"
             );
         }
-        // THE LEADING IS THE SAME BRIGHTNESS. Below the spine there are no
-        // letterforms for a shoulder to be quieter behind, so that whole side of
-        // the profile is shared verbatim and both spellings emit it to the byte.
+        // THE LEADING IS SHARED, AND THE HYBRID'S IS LIFTED. Below the spine
+        // there are no letterforms for a shoulder to be quieter behind, so both
+        // spellings emit the same base profile there; the hybrid's strip then
+        // carries [`rainbow_spine_lift`] on top (the tall body takes none —
+        // a brighter line at every row boundary inside a full-height body would
+        // be a seam), so it is never dimmer than the tall body's leading.
         let col = 9u16;
-        assert_eq!(
-            peak(&tall, col, spine, tile_hi),
+        assert!(
+            peak(&thin, col, spine, tile_hi) >= peak(&tall, col, spine, tile_hi),
+            "one mark below the baseline: the hybrid's lifted strip is never \
+             dimmer than the tall body's ({} vs {})",
             peak(&thin, col, spine, tile_hi),
-            "one mark below the baseline, one brightness"
+            peak(&tall, col, spine, tile_hi)
         );
         // …AND THE GLYPH BAND IS WHERE THEY DIFFER, by the shoulder and only by
         // it: the standard spelling stands the letters inside the light, the
@@ -37796,11 +39826,18 @@ mod tests {
         };
         // Star-eligible cells on row 3 in this sweep: cols 3 and 9 (the 1-in-6
         // placement hash) — the run must cross at least one. The canonical
-        // metric is pinned at a sub-shower 0.5 each key (the rate-normalized
-        // law would otherwise warm this 350 ms stroll to full and wake the
-        // flying star-power shower — spawn onset drive² ⇒ disp ≳ 0.7 — which
-        // has its own occupied-cell DIMMING, not a skip), so every white plus
-        // in `out` is a per-cell ribbon star.
+        // metric is pinned at a sub-shower 0.10 each key (the rate-normalized
+        // law would otherwise warm this 350 ms stroll past the onset and wake
+        // the flying star-power shower — which has its own occupied-cell
+        // DIMMING, not a skip, and whose dealt accents would land white
+        // pluses in `out` from the open sky). The pin sat at 0.5 from the
+        // drive² era, when the shower onset was ≳ 0.7; the 2026-08-29 retune
+        // (RAINBOW_STAR_ONSET 0.18, linear ramp) put 0.5 firmly INSIDE the
+        // shower, and the premise held only while the deterministic seed
+        // stream happened to deal no accent. Keystroke-strike grains still
+        // spawn per typed key at any momentum, but they are pure stardust
+        // (halo motes, never quads — [`RAINBOW_STRIKE_SCALE`]), so every
+        // white plus in `out` is a per-cell ribbon star.
         let drive = |probe: Option<&str>| -> (Vec<GlowQuad>, Vec<GlowQuad>) {
             let mut glow = CursorGlow::default();
             let mut out = Vec::new();
@@ -37811,7 +39848,7 @@ mod tests {
             glow.tick(Some((3, 2)), t, &c, g, &mut out);
             for col in 3..=14u16 {
                 t += Duration::from_millis(350);
-                glow.rainbow.momentum.set_value(t, 0.5);
+                glow.rainbow.momentum.set_value(t, 0.10);
                 glow.note_synthetic_typed(t, 1);
                 if let Some(s) = probe {
                     glow.observe_row(3, col, &row(s), t);
@@ -40357,7 +42394,12 @@ mod tests {
                                 // draws. Walked BOTH ways so the control below is
                                 // the same pixels, not a different walk.
                                 let raw = q.clone();
-                                CursorGlow::clear_light_of_cyan_everywhere(&c, &mut q, &mut []);
+                                CursorGlow::clear_light_of_cyan_everywhere(
+                                    &c,
+                                    &mut CyanMemo::default(),
+                                    &mut q,
+                                    &mut [],
+                                );
                                 let (w, h) = (900usize, 400usize);
                                 for (quads, ruled) in [(&raw, false), (&q, true)] {
                                     let mut buf = vec![ground; w * h];
@@ -41862,7 +43904,19 @@ mod tests {
             // than the `<= 12`-level rule allows, which is what prints a
             // brightness boundary — moves this number by far more than the
             // difference between two smooth curves.
-            let budget = 46.0 * RAINBOW_BED_OVER_GAIN;
+            //
+            // **`46 -> 51` FOR THE CROSSING-ROOF CAP CURVE, same kind of
+            // re-pin.** The re-certified table dips to the roof's own solved
+            // ceilings (`65, 60, 61`) and climbs back out at the ≤12-level
+            // neighbour rule's full rate — `73, 85, 97` — because the roof's
+            // brightness (value AND the taper's added white) pushed the trough
+            // deeper and two entries wider, and the curve has the same
+            // violet-side ceilings to rejoin. Measured swing on the shipped
+            // table: `50.12` before the gain, against the `45.07` the previous
+            // curve swung; `51` is that with the same slack the previous pins
+            // carried. The ≤12-level neighbour rule — the clause that actually
+            // forbids a printed boundary — is untouched.
+            let budget = 51.0 * RAINBOW_BED_OVER_GAIN;
             assert!(
                 per_cell <= budget,
                 "the ceiling moves {per_cell} levels across one typed cell at sp {sp} \
@@ -44987,12 +47041,7 @@ mod tests {
         }
         // And they render (streak quads emitted, no panic, budget honoured).
         let mut out = Vec::new();
-        hot.emit_particles(
-            now + Duration::from_millis(80),
-            &c,
-            g,
-            &mut out,
-            &mut Vec::new(),
+        hot.emit_particles(now + Duration::from_millis(80), &c, g, None, &mut out, &mut Vec::new(),
         );
         assert!(out.len() <= CursorGlow::MAX_QUADS);
     }
@@ -45065,6 +47114,363 @@ mod tests {
         assert!(
             !glow.particles.is_empty(),
             "a sustained multi-second run earns the star shower"
+        );
+    }
+
+    /// THE KEYSTROKE STRIKE GATE (owner: "bring back more cursor sparkles"):
+    /// every typed key chips its fixed pair of short-lived grains off the
+    /// fresh glyph — from the FIRST keystroke, long before the momentum
+    /// shower's onset — while the earn-law's protected split holds: an
+    /// untyped prompt still spawns exactly nothing. The density is pinned as
+    /// a BAND, floor and ceiling both, so it can neither silently regress
+    /// back to the bare near-caret sky the owner reported ("bring back more
+    /// cursor sparkles" — measured: zero motes within six cells of the caret
+    /// at the typing median) nor quietly grow into a texture.
+    #[test]
+    fn every_keystroke_strikes_a_spark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((3, 0)), t, &c, g, &mut out);
+        assert!(
+            glow.particles.is_empty(),
+            "an untyped prompt strikes nothing"
+        );
+        // ONE cold key. The spine stays far under the shower onset, so every
+        // grain born here is the strike itself — and the strike is exactly
+        // the advertised pair.
+        t += Duration::from_millis(200);
+        glow.note_synthetic_typed(t, 1);
+        glow.tick(Some((3, 1)), t, &c, g, &mut out);
+        assert!(
+            glow.rainbow.disp < RAINBOW_STAR_ONSET,
+            "premise: one key stays under the shower onset (disp {})",
+            glow.rainbow.disp
+        );
+        assert_eq!(
+            glow.particles.len(),
+            RAINBOW_STRIKE_SPARKS,
+            "the first keystroke strikes its full pair"
+        );
+        let cell = g.ch as f32;
+        let cwf = g.cw as f32;
+        // The anchor is the FRESH GLYPH cell — the cell just typed, one
+        // behind the caret — never the caret cell (which holds no glyph and,
+        // on a wrap, sits a row below the glyph it echoes).
+        let (ox, oy) = g.cell_center(3, 0);
+        let strike_life_max = RAINBOW_STRIKE_LIFE_MIN + RAINBOW_STRIKE_LIFE_SPAN + 1e-3;
+        for p in &glow.particles {
+            let off = p.y0 - oy;
+            assert!(
+                off.abs() >= 0.55 * cell - 1e-3,
+                "strike grain born clear of the glyph band: |{off}| < 0.55 cell"
+            );
+            assert!(
+                p.vy * off >= 0.0,
+                "strike grain streams AWAY from the text row at birth (off {off}, vy {})",
+                p.vy
+            );
+            assert!(
+                (p.x0 - ox).abs() <= cwf * 0.5 + 1e-3,
+                "a strike spark belongs to the fresh glyph's own cell: |{}| > cw/2",
+                p.x0 - ox
+            );
+            assert!(
+                p.life >= RAINBOW_STRIKE_LIFE_MIN - 1e-3 && p.life <= strike_life_max,
+                "a strike grain is a glint, not a resident: life {}",
+                p.life
+            );
+            assert!(
+                (p.cov_scale - RAINBOW_STRIKE_SCALE).abs() < f32::EPSILON,
+                "a strike grain wears its sentinel (pure stardust; ceiling + \
+                 text-first + momentum shared with the shower): cov_scale {}",
+                p.cov_scale
+            );
+        }
+        // THE SPARK IS BRIGHT FROM KEY ONE. At the shipped default intensity
+        // (0.70), the worst twinkle phase ([`TWINKLE_FLOOR`]) times the
+        // strike's momentum floor still drives a cold grain's request past
+        // the sparkle field's ceiling — so the CLAMP, not the momentum
+        // envelope, decides a first keystroke's birth brightness (measured
+        // before the floor existed: a cold start's first 400 ms showed a
+        // median of ZERO visible sky pixels). 230.0 is `emit_particles`'
+        // non-water `base_cov`.
+        let worst_cold_request = 230.0
+            * RAINBOW_STRIKE_SCALE
+            * RAINBOW_STRIKE_MOM_FLOOR
+            * crate::effect_util::TWINKLE_FLOOR
+            * 0.70;
+        assert!(
+            worst_cold_request >= RAINBOW_SPARKLE_COV_MAX,
+            "a cold strike grain must reach the sparkle ceiling at birth: \
+             {worst_cold_request} < {RAINBOW_SPARKLE_COV_MAX}"
+        );
+        // …and it EMITS from key one: the cold pair renders as dust halos
+        // (round — never the accent quad; text-first may dim them to a third
+        // over unprobed sky, but never to nothing).
+        let mut halos_now = Vec::new();
+        glow.emit_particles(t, &c, g, None, &mut Vec::new(), &mut halos_now);
+        let dust = halos_now.iter().filter(|h| h.rx == h.ry).count();
+        assert!(
+            dust >= RAINBOW_STRIKE_SPARKS,
+            "the cold pair reaches the glass as round stardust: {dust} halos"
+        );
+        // A WORD at human cadence: the strike keeps pace with the fingers.
+        // The pinned BAND: the newest keys' grains are still alight (older
+        // grains have burned out — that churn is the design: at a 60 ms
+        // cadence the five newest keys are inside even the shortest life,
+        // and though the late keys may hand one grain of their pair to the
+        // waking shower, they always strike at least one while any is owed),
+        // and the total never exceeds a pair per key.
+        for col in 2..=13u16 {
+            t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((3, col)), t, &c, g, &mut out);
+        }
+        let live_strikes = glow
+            .particles
+            .iter()
+            .filter(|p| (p.cov_scale - RAINBOW_STRIKE_SCALE).abs() < f32::EPSILON)
+            .count();
+        assert!(
+            live_strikes >= 5,
+            "a typed word keeps a live strike wake: {live_strikes}"
+        );
+        assert!(
+            live_strikes <= 13 * RAINBOW_STRIKE_SPARKS,
+            "the strike stays at most a pair per key: {live_strikes}"
+        );
+        // …and the HANDOFF: a shower at full drive strikes nothing (the
+        // sprint sky belongs to the shower at the shower's shipped price),
+        // while the combined per-key count never dips below the pair.
+        assert_eq!(rainbow_strike_sparks(0), RAINBOW_STRIKE_SPARKS);
+        assert_eq!(rainbow_strike_sparks(1), RAINBOW_STRIKE_SPARKS - 1);
+        assert_eq!(rainbow_strike_sparks(5), 0, "full-spine sprint: shower only");
+        // THE RESIDENT BOUND: a frozen clock (the saturated bench fixtures'
+        // shape — nothing ever ages or prunes) cannot bank an unbounded
+        // strike population for the ledger to walk; the cap holds where real
+        // time would have held it anyway.
+        let mut frozen = CursorGlow::default();
+        let tf = Instant::now();
+        frozen.tick(Some((3, 0)), tf, &c, g, &mut out);
+        for col in 1..=120u16 {
+            frozen.note_synthetic_typed(tf, 1);
+            frozen.tick(Some((3, col % 39)), tf, &c, g, &mut out);
+        }
+        let resident = frozen
+            .particles
+            .iter()
+            .filter(|p| (p.cov_scale - RAINBOW_STRIKE_SCALE).abs() < f32::EPSILON)
+            .count();
+        assert!(
+            resident <= RAINBOW_STRIKE_CAP,
+            "a frozen clock cannot bank strike grains past the cap: {resident}"
+        );
+        // PROVENANCE (external review's catch): `typing` is a DISTANCE
+        // verdict, so a one-cell Backspace retreat and a one-cell arrow move
+        // both wear it — the strike must demand the fresh-ink pop's real
+        // provenance instead. A deletion already poofs its own glitter; a
+        // scrubbed caret must not sparkle.
+        let strikes_in = |glow: &CursorGlow| {
+            glow.particles
+                .iter()
+                .filter(|p| (p.cov_scale - RAINBOW_STRIKE_SCALE).abs() < f32::EPSILON)
+                .count()
+        };
+        let mut nav = CursorGlow::default();
+        let mut tn = Instant::now();
+        nav.tick(Some((3, 5)), tn, &c, g, &mut out);
+        tn += Duration::from_millis(200);
+        nav.note_synthetic_typed(tn, 1);
+        nav.tick(Some((3, 6)), tn, &c, g, &mut out); // one real key: ribbon + pair
+        let after_key = strikes_in(&nav);
+        assert_eq!(after_key, RAINBOW_STRIKE_SPARKS);
+        tn += Duration::from_millis(60);
+        nav.note_backspace(tn);
+        nav.tick(Some((3, 5)), tn, &c, g, &mut out); // a deletion retreat
+        assert!(
+            strikes_in(&nav) <= after_key,
+            "a Backspace does not strike (it poofs its own glitter)"
+        );
+        tn += Duration::from_millis(60);
+        nav.note_navigation(tn);
+        let before_nav = strikes_in(&nav);
+        nav.tick(Some((3, 6)), tn, &c, g, &mut out); // a scrubbed one-cell move
+        assert!(
+            strikes_in(&nav) <= before_nav,
+            "navigation does not strike (scrubbing is not writing)"
+        );
+        // REDUCED MOTION strikes nothing — the strike is drifting, pulsing
+        // light (the class the terminus scatter already sheds under the
+        // seam); the reduced arm's per-key acknowledgment stays the
+        // fresh-ink pop's step fade.
+        let mut still = CursorGlow::default();
+        still.set_reduced_motion(true);
+        let ts = Instant::now();
+        still.tick(Some((3, 0)), ts, &c, g, &mut out);
+        still.note_synthetic_typed(ts + Duration::from_millis(200), 1);
+        still.tick(Some((3, 1)), ts + Duration::from_millis(200), &c, g, &mut out);
+        assert!(
+            !still
+                .particles
+                .iter()
+                .any(|p| (p.cov_scale - RAINBOW_STRIKE_SCALE).abs() < f32::EPSILON),
+            "reduced motion suppresses the keystroke strike"
+        );
+        // ROW 0: there is no sky above the first grid row — the strike
+        // mirrors into the wake below (the erase poof's row-0 rule) instead
+        // of clipping its grains to nothing over a shell prompt.
+        let mut top = CursorGlow::default();
+        let mut t2 = Instant::now();
+        top.tick(Some((0, 0)), t2, &c, g, &mut out);
+        t2 += Duration::from_millis(200);
+        top.note_synthetic_typed(t2, 1);
+        top.tick(Some((0, 1)), t2, &c, g, &mut out);
+        let (_, oy0) = g.cell_center(0, 1);
+        assert_eq!(
+            top.particles.len(),
+            RAINBOW_STRIKE_SPARKS,
+            "a prompt-row keystroke still strikes its pair"
+        );
+        for p in &top.particles {
+            assert!(
+                p.y0 - oy0 >= 0.55 * cell - 1e-3,
+                "row-0 strike mirrors into the wake below: off {}",
+                p.y0 - oy0
+            );
+        }
+    }
+
+    /// THE LIGHT-GROUND STRIKE GATE (owner, on GitHub Light + the underline
+    /// look: "are the sparkles simply disabled on this screen?" — then "bring
+    /// back more cursor sparkles"). The keystroke strike existed and was
+    /// verifiably alight on dark, while the owner's light glass showed the
+    /// ink band at 2804 chromatic px and ZERO sparkle grains: the spawn arm
+    /// was theme-gated, and even a spawned grain had no light arm — additive
+    /// white on white. This pins the whole light path, spawn to glass:
+    ///
+    ///   * a light-theme keystroke SPAWNS the same pair, under the same
+    ///     sentinel, as the dark arm — one density law, not a third
+    ///     behaviour;
+    ///   * the pair REACHES THE GLASS as round source-over INK motes over
+    ///     proved-blank sky (mutating the light draw arm off — or re-gating
+    ///     the spawn on `dark_theme` — reddens this line; both mutations were
+    ///     run);
+    ///   * each mote is priced at the plus's stacked centre, wears a NAMED
+    ///     stop through the OverText darken, and composites clear of the
+    ///     cyan window (HSV [165, 200] at S > 0.3 — §2.3.4, measured on the
+    ///     composited pixel, not the constant);
+    ///   * an untyped prompt still earns nothing, and reduced motion quiets
+    ///     the strike on light exactly as 81548bbd quieted it on dark.
+    #[test]
+    fn a_light_theme_keystroke_strikes_ink_sparks() {
+        let g = geom();
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.dark_theme = false;
+        // The owner's glass: GitHub Light's near-black ink on paper white.
+        c.theme_fg = 0x001F_2328;
+        c.theme_bg = 0x00FF_FFFF;
+        let blank = vec![' '; 40];
+        let strikes_in = |glow: &CursorGlow| {
+            glow.particles
+                .iter()
+                .filter(|p| (p.cov_scale - RAINBOW_STRIKE_SCALE).abs() < f32::EPSILON)
+                .count()
+        };
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        // The sky band the grains are born into must be PROVED blank: on
+        // light, text-first is the stricter shed — an unknown cell drops the
+        // mote entirely — so the probe truth is part of the fixture, exactly
+        // as the GUI host wires it (`observe_row` + `observe_neighbor_rows`
+        // per frame).
+        glow.observe_row(3, 5, &blank, t);
+        glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+        glow.tick(Some((3, 5)), t, &c, g, &mut out);
+        assert!(
+            glow.particles.is_empty(),
+            "an untyped light prompt strikes nothing"
+        );
+        // ONE cold key.
+        t += Duration::from_millis(200);
+        glow.note_synthetic_typed(t, 1);
+        glow.observe_row(3, 6, &blank, t);
+        glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+        glow.tick(Some((3, 6)), t, &c, g, &mut out);
+        assert_eq!(
+            strikes_in(&glow),
+            RAINBOW_STRIKE_SPARKS,
+            "a light-theme keystroke strikes the same pair as the dark arm"
+        );
+        // …AND IT REACHES THE GLASS AS INK. The floor is the advertised pair:
+        // fewer visible grains than spawned grains means some arm shed light
+        // it had no license to shed (the birth band is proved blank above).
+        let mut halos = Vec::new();
+        glow.emit_particles(t, &c, g, None, &mut Vec::new(), &mut halos);
+        let motes: Vec<&RainHalo> = halos
+            .iter()
+            .filter(|h| h.mode == HaloMode::Over && h.rx == h.ry)
+            .collect();
+        assert!(
+            motes.len() >= RAINBOW_STRIKE_SPARKS,
+            "the cold pair reaches a white ground as round source-over ink: \
+             {} motes",
+            motes.len()
+        );
+        // The mote's price and colour, exactly. A cold key's request rides
+        // the momentum floor past the sparkle-field ceiling (the dark gate
+        // proves that arithmetic), so `scov` is RAINBOW_SPARKLE_COV_MAX
+        // verbatim and the ink alpha is fully determined: the stacked-centre
+        // price of the gained, capped coverage. An arm that dropped the gain,
+        // the stack, or the ceiling all land off this byte.
+        let expect_a = stacked_ink_alpha(
+            (RAINBOW_SPARKLE_COV_MAX * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
+            InkRole::OverText,
+        );
+        let stops: Vec<u32> = (0..SPECTRUM_STOPS)
+            .map(|i| InkRole::OverText.ink(crate::spectrum::spectrum_stop(i)) & 0x00FF_FFFF)
+            .collect();
+        for m in &motes {
+            let a = (m.color >> 24) & 0xff;
+            assert_eq!(
+                a, expect_a,
+                "a cold strike mote is priced at the plus's stacked centre \
+                 of the gained sparkle ceiling: alpha {a} vs {expect_a}"
+            );
+            let rgb = m.color & 0x00FF_FFFF;
+            assert!(
+                stops.contains(&rgb),
+                "a strike mote on ink snaps to a NAMED stop through the \
+                 OverText darken (§2.3.3): {rgb:06x}"
+            );
+            // §2.3.4, on the pixel the eye reads: composite the mote's centre
+            // over the paper at its own alpha and measure the verbatim
+            // window.
+            let px = aterm_render::over_rgb(c.theme_bg, rgb, a as u8);
+            let (h, s, _) = crate::spectrum::spectrum_hsv(px);
+            assert!(
+                !((165.0..=200.0).contains(&h) && s > 0.3),
+                "no strike mote may composite into the cyan window: \
+                 {px:06x} (H {h:.1}, S {s:.2})"
+            );
+        }
+        // REDUCED MOTION quiets the light strike exactly as it quiets the
+        // dark one (81548bbd's seam is theme-blind).
+        let mut still = CursorGlow::default();
+        still.set_reduced_motion(true);
+        let ts = Instant::now();
+        still.observe_row(3, 5, &blank, ts);
+        still.observe_neighbor_rows(Some(&blank), Some(&blank));
+        still.tick(Some((3, 5)), ts, &c, g, &mut out);
+        still.note_synthetic_typed(ts + Duration::from_millis(200), 1);
+        still.tick(Some((3, 6)), ts + Duration::from_millis(200), &c, g, &mut out);
+        assert_eq!(
+            strikes_in(&still),
+            0,
+            "reduced motion suppresses the light-theme strike"
         );
     }
 
@@ -48422,7 +50828,7 @@ mod tests {
         dark.poof_scan(born, &c_dark, g);
         assert_eq!(dark.probed_cell_glyph(2, 9, g.rows), Some(false));
         let (mut d_out, mut d_h) = (Vec::new(), Vec::new());
-        dark.emit_particles(at, &c_dark, g, &mut d_out, &mut d_h);
+        dark.emit_particles(at, &c_dark, g, None, &mut d_out, &mut d_h);
         assert!(!d_out.is_empty(), "dark shooting star draws additive quads");
         assert!(
             d_h.iter().all(|h| h.mode != HaloMode::Over),
@@ -48440,7 +50846,7 @@ mod tests {
         light.poof_scan(born, &c_light, g);
         assert_eq!(light.probed_cell_glyph(2, 9, g.rows), Some(false));
         let (mut l_out, mut l_h) = (Vec::new(), Vec::new());
-        light.emit_particles(at, &c_light, g, &mut l_out, &mut l_h);
+        light.emit_particles(at, &c_light, g, None, &mut l_out, &mut l_h);
         assert!(
             l_out.is_empty(),
             "light suppresses the additive comet quads"
@@ -48627,14 +51033,16 @@ mod tests {
         glow.tick(Some((2, 20)), t0, &c, g, &mut out); // seed the pre-jump head
         // A LIVE ribbon exists to dissolve (finding 3): a real ribbon has just
         // been laid at the pre-jump head — a fresh committed PRESS backs it
-        // (the anti-stray press witness), and the proxy is WARM but below the
-        // star-shower onset (`RAINBOW_STAR_ONSET` = 0.45), so the ONLY particles
-        // emitted are the terminus glitter — the momentum shower would
-        // otherwise add non-glitter stars. (Without any momentum the cursor is
-        // COLD and correctly scatters nothing — see
+        // (the anti-stray press witness), and the proxy is WARM — above the
+        // zoom floor (`RAINBOW_JUMP_MIN_DISP`, 0.12) but below the star-shower
+        // onset (`RAINBOW_STAR_ONSET`, 0.18 since 2026-08-29; it was 0.45,
+        // and this fixture's old 0.3 sat under THAT) — so the ONLY particles
+        // emitted are the terminus glitter; the momentum shower would
+        // otherwise add non-glitter stars. (Without any momentum the
+        // cursor is COLD and correctly scatters nothing — see
         // `cold_navigation_timestamp_scatters_nothing`.)
         arm_rainbow_witnesses(&mut glow, t0, 2, 20);
-        glow.rainbow.disp = 0.3;
+        glow.rainbow.disp = 0.15;
         glow.note_synthetic_move(t0);
         glow.tick(Some((5, 0)), t0, &c, g, &mut out); // jump away
         // Rainbow kitty has no general jump particle burst (not in has_particles), so the
@@ -48674,13 +51082,29 @@ mod tests {
             glow.particles.is_empty(),
             "a cold-cursor jump dissolves no phantom terminus (finding 3)"
         );
-        // Neither does the starburst. This used to assert the opposite,
-        // which is precisely the owner's "stray pieces of rainbow": at a 2-cell
-        // floor every arrow-key history recall on an untouched prompt threw
-        // stars and rang the chime. A jump celebrates WORK.
+        // THE STARBURST FORKS ON DISTANCE (2026-08-29). The old law here was
+        // "a cold jump throws no stars — nothing was typed", and its docstring
+        // named the defect it guarded: at a 2-cell floor every arrow-key
+        // HISTORY RECALL on an untouched prompt threw stars and rang the
+        // chime — the owner's "stray pieces of rainbow". That was never about
+        // jumps; it was about the FLOOR. The owner then asked for the jump
+        // effects back ("I LOVED the jump effects … BRING THEM BACK"), so a
+        // cold Home/End — a REAL jump, past `RAINBOW_JUMP_MIN` — celebrates,
+        // and this 30-cell Ctrl-A is one. The recall case is pinned right
+        // after: a one-row cold move still throws nothing.
         assert!(
-            glow.rainbow.bursts.is_empty(),
-            "a cold-cursor jump throws no landing stars either — nothing was typed"
+            !glow.rainbow.bursts.is_empty(),
+            "a cold-cursor JUMP (30 cells) throws its landing stars — punctuation, \
+             not stray rainbow"
+        );
+        let mut recall = CursorGlow::default();
+        recall.tick(Some((2, 3)), t0, &c, g, &mut out);
+        recall.note_navigation(t0);
+        recall.tick(Some((2, 0)), t0, &c, g, &mut out); // a 3-cell cold nudge
+        assert!(
+            recall.rainbow.bursts.is_empty(),
+            "a cold one-row RECALL throws no landing stars — this is the stray \
+             rainbow the floor exists to stop"
         );
     }
 
@@ -48699,11 +51123,13 @@ mod tests {
         let mut glow = CursorGlow::default();
         glow.set_reduced_motion(true);
         glow.tick(Some((2, 30)), t0, &c, g, &mut out); // seed
-        // Warm ribbon backed by a fresh press, below the shower onset (0.45):
-        // the terminus scatter is the ONLY particle source, so an empty pool
-        // proves it was suppressed.
+        // Warm ribbon backed by a fresh press: above the zoom floor
+        // (`RAINBOW_JUMP_MIN_DISP`, 0.12) but below the shower onset
+        // (`RAINBOW_STAR_ONSET`, 0.18 since 2026-08-29; this fixture's old 0.3
+        // sat under the old 0.45), so the terminus scatter is the ONLY
+        // particle source and an empty pool proves it was suppressed.
         arm_rainbow_witnesses(&mut glow, t0, 2, 30);
-        glow.rainbow.disp = 0.3;
+        glow.rainbow.disp = 0.15;
         glow.note_synthetic_move(t0);
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A leap
         assert!(
@@ -48742,13 +51168,24 @@ mod tests {
         let t0 = Instant::now();
         let mut out = Vec::new();
 
+        // The terminus scatter is GLITTER-band twinkles (`cov_scale` 0.7 —
+        // see `scatter_rainbow_terminus`); a typed advance ALSO strikes its
+        // per-key stardust pair ([`RAINBOW_STRIKE_SCALE`]), so the census
+        // reads the sentinel, not mere pool emptiness.
+        let terminus = |glow: &CursorGlow| {
+            glow.particles
+                .iter()
+                .filter(|p| p.cov_scale < 0.9)
+                .count()
+        };
+
         // Type into the penultimate → last column (a typing advance to the margin).
         let mut edge = CursorGlow::default();
         edge.tick(Some((0, 38)), t0, &c, g, &mut out); // seed near the end
         edge.note_synthetic_typed(t0, 1);
         edge.tick(Some((0, 39)), t0, &c, g, &mut out); // advance onto the last column
         assert!(
-            !edge.particles.is_empty(),
+            terminus(&edge) > 0,
             "reaching the far-right margin scatters a dissolving terminus"
         );
 
@@ -48757,8 +51194,9 @@ mod tests {
         mid.tick(Some((0, 5)), t0, &c, g, &mut out);
         mid.note_synthetic_typed(t0, 1);
         mid.tick(Some((0, 6)), t0, &c, g, &mut out);
-        assert!(
-            mid.particles.is_empty(),
+        assert_eq!(
+            terminus(&mid),
+            0,
             "a mid-line advance needs no terminus dissolve"
         );
     }
@@ -49119,12 +51557,7 @@ mod tests {
                 born,
             });
             let (mut out, mut halos) = (Vec::new(), Vec::new());
-            glow.emit_particles(
-                born + Duration::from_millis(120),
-                &c,
-                g,
-                &mut out,
-                &mut halos,
+            glow.emit_particles(born + Duration::from_millis(120), &c, g, None, &mut out, &mut halos,
             );
             (out, halos)
         };
@@ -49385,12 +51818,7 @@ mod tests {
                 born,
             });
             let (mut out, mut halos) = (Vec::new(), Vec::new());
-            glow.emit_particles(
-                born + Duration::from_millis(880),
-                &c,
-                g,
-                &mut out,
-                &mut halos,
+            glow.emit_particles(born + Duration::from_millis(880), &c, g, None, &mut out, &mut halos,
             );
             (out, halos)
         };
@@ -49535,12 +51963,7 @@ mod tests {
                 born,
             });
             let (mut out, mut halos) = (Vec::new(), Vec::new());
-            glow.emit_particles(
-                born + Duration::from_millis(AGE_MS),
-                &c,
-                g,
-                &mut out,
-                &mut halos,
+            glow.emit_particles(born + Duration::from_millis(AGE_MS), &c, g, None, &mut out, &mut halos,
             );
             assert!(halos.is_empty(), "comet debris draws quads, never halos");
             out
@@ -50072,7 +52495,7 @@ mod tests {
 
             let mut out = Vec::new();
             let mut halos = Vec::new();
-            glow.emit_particles(sample, &c, g, &mut out, &mut halos);
+            glow.emit_particles(sample, &c, g, None, &mut out, &mut halos);
             assert!(!out.is_empty(), "the isolated shower star is visible");
             assert!(halos.is_empty(), "the dealt accent is a plus, not a mote");
             out.iter()
@@ -50153,7 +52576,7 @@ mod tests {
             );
             let mut out = Vec::new();
             let mut halos = Vec::new();
-            glow.emit_particles(sample, &c, g, &mut out, &mut halos);
+            glow.emit_particles(sample, &c, g, None, &mut out, &mut halos);
             assert!(
                 !out.is_empty(),
                 "the moving shooter remains visibly in flight"
@@ -50228,7 +52651,7 @@ mod tests {
             );
             let mut out = Vec::new();
             let mut halos = Vec::new();
-            glow.emit_particles(sample, &c, g, &mut out, &mut halos);
+            glow.emit_particles(sample, &c, g, None, &mut out, &mut halos);
             assert!(!out.is_empty(), "the star stays visible while text-safe");
             assert!(halos.is_empty(), "the dealt accent is a plus, not a mote");
             additive_rgb_mass(&out)
@@ -50284,7 +52707,7 @@ mod tests {
         let emitted = |at: Instant| {
             let mut quads = Vec::new();
             let mut halos = Vec::new();
-            glow.emit_particles(at, &c, g, &mut quads, &mut halos);
+            glow.emit_particles(at, &c, g, None, &mut quads, &mut halos);
             (quads, halos)
         };
         let (quads_a, halos_a) = emitted(end + Duration::from_millis(16));
@@ -50557,7 +52980,7 @@ mod tests {
         glow.poof_scan(born, &c, g);
         assert_eq!(glow.probed_cell_glyph(2, 9, g.rows), Some(false));
         let (mut out, mut halos) = (Vec::new(), Vec::new());
-        glow.emit_particles(at, &c, g, &mut out, &mut halos);
+        glow.emit_particles(at, &c, g, None, &mut out, &mut halos);
         let family: std::collections::BTreeSet<u32> = RAINBOW_BANDS
             .iter()
             .map(|&b| InkRole::OverText.ink(b) & 0x00FF_FFFF)
@@ -51135,12 +53558,24 @@ halo = "add"
 
     /// A halo is a FRESH-INK pop iff its premultiplied colour keeps the warm
     /// [`FRESH_INK_WARM`] channel ratios (g ≈ r·0xED/0xFF, b ≈ r·0xD2/0xFF).
-    /// The other rainbow kitty halo emitters can't fake it: stars are pure white
-    /// (equal channels) or gold (b ≈ 0), light-theme rails are saturated band
-    /// hues, and these tests disable the crown (`radius = 0`).
+    /// The other rainbow kitty halo emitters can't fake it at full light: stars are
+    /// pure white (equal channels) or gold (b ≈ 0), light-theme rails are
+    /// saturated band hues, and these tests disable the crown (`radius = 0`).
+    /// CAVEAT — the ±1 tolerance stops discriminating once premultiplication
+    /// crushes everything toward black: a GOLD stardust mote at a coverage of
+    /// a few counts (a keystroke-strike or shower grain at its twinkle floor)
+    /// collapses into the warm ratios (e.g. `0x070605`). Halo call sites
+    /// therefore also check GEOMETRY: every pop lay is elliptical
+    /// (`rx != ry` — cell-proportioned), while stardust is circular.
     fn is_fresh_ink_halo(premul: u32) -> bool {
         let (r, gg, b) = ((premul >> 16) & 0xff, (premul >> 8) & 0xff, premul & 0xff);
-        if r == 0 {
+        // A VISIBILITY FLOOR, because the chromaticity test below is vacuous
+        // at the bottom of the byte: `#060504` satisfies `gg < r && b < gg`
+        // by construction, and the denser sparkle field (2026-08-29) leaves
+        // 1 px star-halo tails at exactly that level. Set at the leak, not
+        // above it: a pop's hot flash and its step-fade both pass through
+        // dim reds this filter must still count.
+        if r < 8 {
             return false;
         }
         let close = |chan: u32, num: u32| chan.abs_diff((r * num + 127) / 255) <= 1;
@@ -51150,7 +53585,7 @@ halo = "add"
     fn pop_halos(glow: &CursorGlow) -> Vec<RainHalo> {
         glow.halos()
             .iter()
-            .filter(|h| is_fresh_ink_halo(h.color))
+            .filter(|h| h.rx != h.ry && is_fresh_ink_halo(h.color))
             .copied()
             .collect()
     }
@@ -54517,7 +56952,9 @@ halo = "add"
             glow.tick(Some((2, 3)), at, &c, g, out);
             glow.halo_out
                 .iter()
-                .filter(|h| is_fresh_ink_halo(h.color))
+                // `rx != ry`: pops are elliptical; a faint circular stardust
+                // grain can collapse into the warm ratios (predicate caveat).
+                .filter(|h| h.rx != h.ry && is_fresh_ink_halo(h.color))
                 .map(|h| h.color)
                 .collect()
         };

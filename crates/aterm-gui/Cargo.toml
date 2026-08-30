@@ -195,7 +195,21 @@ aterm-update-core = { workspace = true }
 atpkg = { workspace = true }
 libc = { workspace = true }
 winit = { workspace = true }
-softbuffer = "0.4"
+# DEFAULT FEATURES OFF, and the omission that matters is `kms`. softbuffer's
+# default set is [kms, x11, x11-dlopen, wayland, wayland-dlopen]; `kms` pulls
+# drm + drm-ffi + drm-sys + drm-fourcc + linux-raw-sys 0.9.4 — 5 packages,
+# 376,763 lines and 6,046 unsafe tokens, ALL of it on the linux cell only, to
+# drive a DRM/KMS framebuffer aterm never presents to (it presents to a winit
+# window). `kms = ["bytemuck", "drm", "rustix"]` and both bytemuck and rustix
+# are ALSO held by the x11 and wayland arms, so nothing else falls out with it.
+# The feature list is `vendor/winit/Cargo.toml:332-340` verbatim — winit already
+# made exactly this trim for exactly this reason.
+softbuffer = { version = "0.4", default-features = false, features = [
+    "x11",
+    "x11-dlopen",
+    "wayland",
+    "wayland-dlopen",
+] }
 # Cross-platform accessibility tree (behind the default-on `a11y-accesskit` feature).
 # accesskit_winit =0.33.1 targets winit ^0.30.5, satisfied by the vendored winit 0.30.13
 # through the workspace `[patch.crates-io]` redirect (so a SINGLE winit instance links).
@@ -249,7 +263,13 @@ aterm-http = { workspace = true }
 aterm-png = { workspace = true }
 # Glyph rasterization for the widget-tray text labels (free-positioned, multi-size).
 # The SAME crate + version aterm-render uses, so it adds no new dep to the tree.
-fontdue = "0.9"
+# DEFAULT FEATURES OFF to drop the OPTIONAL `hashbrown` arm: fontdue's default
+# is ["simd", "hashbrown"], and its only use of it is `HashMap`/`HashSet` with
+# new/with_capacity/get/insert — src/lib.rs:25-28 falls back to std::collections
+# with no `std`-feature guard, so this compiles unchanged and rasterizes
+# identically. Costs hashbrown 0.15.5 + foldhash + allocator-api2: 3 packages,
+# 32,597 lines, mac-arm and wasm. `simd` is kept — it is the rasterizer.
+fontdue = { version = "0.9", default-features = false, features = ["simd"] }
 
 [build-dependencies]
 # The build script derives the exact 64-byte lowercase updater-key fingerprint

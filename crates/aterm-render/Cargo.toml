@@ -47,7 +47,13 @@ aterm-types = { workspace = true }
 # (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the standard,
 # safe choice (matches the engine's grid/core caches, which already use it).
 aterm-hash = { workspace = true }
-fontdue = "0.9"
+# DEFAULT FEATURES OFF to drop the OPTIONAL `hashbrown` arm: fontdue's default
+# is ["simd", "hashbrown"], and its only use of it is `HashMap`/`HashSet` with
+# new/with_capacity/get/insert — src/lib.rs:25-28 falls back to std::collections
+# with no `std`-feature guard, so this compiles unchanged and rasterizes
+# identically. Costs hashbrown 0.15.5 + foldhash + allocator-api2: 3 packages,
+# 32,597 lines, mac-arm and wasm. `simd` is kept — it is the rasterizer.
+fontdue = { version = "0.9", default-features = false, features = ["simd"] }
 # First-party PNG (crates/aterm-png), which retired `png` and the flate2/
 # miniz_oxide/fdeflate/simd-adler32/crc32fast/adler2 compression stack behind
 # it — 7 packages / 33,439 lines. Decode is the inline-image and colour-emoji

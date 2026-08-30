@@ -26,11 +26,13 @@
 //! figures each `palette_trim` comment quotes.
 //!
 //! It also benches the GESTURE FAMILY (`trail_sound`'s `gesture_shape` law):
-//! each of Typed / Backspace / Glide± / Sweep± is rendered in ISOLATION from
-//! the same melody state and reported by first-note pitch, travel in
-//! semitones, note count, timbre (centroid, energy over 2 kHz) and CREST — so
-//! "a deletion is a keystroke inverted" and "a word motion is a character
-//! motion at scale" are measurements rather than intentions. (The note COUNT
+//! each of Typed / Space / Backspace / Glide± / Sweep± is rendered in
+//! ISOLATION from the same melody state and reported by first-note pitch,
+//! travel in semitones, note count, timbre (centroid, energy over 2 kHz) and
+//! CREST — so "a word motion is a character motion at scale" is a measurement
+//! rather than an intention, and so is "the erase sits ABOVE the keystroke"
+//! (read the Backspace row's CENTROID: the poof is unpitched, so its pitch
+//! columns are a noise-band centre, not a note). (The note COUNT
 //! on a word run reads ±1: its notes overlap heavily, and the beat between a
 //! pulse and its own sub-octave can clear the refractory. TRAVEL is the exact
 //! scale measurement; the note count is a sanity check.)
@@ -67,6 +69,16 @@ type Cue = (f32, SoundGesture, f32, f32);
 /// The TYPING script every scenario shares, offset by `t0`: three paragraphs
 /// of 5-8 cps with pauses, an Enter, and a backspace correction — the same
 /// shape `bed_audition` uses, so the two harnesses read against each other.
+///
+/// EVERY SIXTH CHARACTER IS A SPACE (2026-08-28). Until then this script cued
+/// Typed / Jump / Backspace and nothing else, so the SPACE — a per-character
+/// TIER-1 gesture with a voice of its own, and the one the owner named when
+/// they asked for "a more musical space bar" — was invisible to every
+/// measurement this bench prints. English words run ~5 characters, so a space
+/// every sixth is the real word cadence rather than a decoration. (The
+/// dedicated bench for that request is `keyboard_song_ab`, which types actual
+/// prose; this one keeps its own shape so its scenarios stay comparable
+/// against `bed_audition`.)
 fn typing_script(t0: f32) -> Vec<Cue> {
     let mut cues: Vec<Cue> = Vec::new();
     let typing = |from: f32, to: f32, cps: f32, heat: f32, cues: &mut Vec<Cue>| {
@@ -74,7 +86,12 @@ fn typing_script(t0: f32) -> Vec<Cue> {
         for i in 0..n {
             let t = from + i as f32 / cps;
             let pan = -0.8 + 1.6 * ((t - from) / (to - from).max(1e-3));
-            cues.push((t0 + t, SoundGesture::Trail(SoundKind::Typed), pan, heat));
+            let kind = if i % 6 == 5 {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            cues.push((t0 + t, SoundGesture::Trail(kind), pan, heat));
         }
     };
     typing(0.0, 4.0, 6.0, 0.35, &mut cues);
@@ -1103,8 +1120,16 @@ fn main() {
     );
     let typed_probe = probe(SoundGesture::Trail(SoundKind::Typed), voice);
     let reference = family_row("Typed", &typed_probe, 0.0).first_hz;
-    let family: [(&str, SoundGesture); 6] = [
+    // The SPACE joins the family table (2026-08-28): it is a per-character
+    // TIER-1 gesture with a voice of its own, and comparing it against the
+    // keystroke is the only way to see whether the downbeat sits under the
+    // letters. The Backspace row now reads as the erase POOF — unpitched, so
+    // its "first_hz"/"travel"/"offset" columns are a noise-band centre rather
+    // than a note; CENTROID and HI>2K are the columns that mean something for
+    // it, and they are what "poofy higher" is measured in.
+    let family: [(&str, SoundGesture); 7] = [
         ("Typed", SoundGesture::Trail(SoundKind::Typed)),
+        ("Space", SoundGesture::Trail(SoundKind::Space)),
         ("Backspace", SoundGesture::Trail(SoundKind::Backspace)),
         ("Glide +", SoundGesture::Trail(SoundKind::Glide { dir: 1 })),
         ("Glide -", SoundGesture::Trail(SoundKind::Glide { dir: -1 })),
