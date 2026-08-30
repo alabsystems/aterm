@@ -373,6 +373,35 @@ fn take_inline_mods(body: &str) -> (aterm_types::keyboard::Modifiers, &str) {
     (m, rest)
 }
 
+/// Whether a well-formed `key` verb body is a PLAIN TYPED GLYPH press —
+/// a Character/Space press with no Ctrl/Alt/Super — i.e. the same class the
+/// input seams' mash exception leaves alone. Used by the control dispatcher to
+/// skip the pre-parse licence fence for exactly this class: the injected key
+/// stamps its own typed licence a moment later, and pre-clearing on every key
+/// wiped the banked stamps of keys whose echoes were still in flight — the
+/// flood-typing black gap, alive on the control path after the physical press
+/// paths were fixed. Anything malformed, modified, named (Enter/Tab/nav), or a
+/// release answers `false` and keeps the fence.
+pub(crate) fn key_is_plain_typed_glyph(rest: &str) -> bool {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    match parse_key(rest) {
+        Some(InputEvent::Key {
+            key,
+            mods,
+            event_type: KeyEventType::Press,
+            ..
+        }) => {
+            !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                && match key {
+                    Key::Character(c) => aterm_grapheme::char_width(c) > 0,
+                    Key::Named(NamedKey::Space) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 /// `key <name> [mods=<list>]` -> build an [`InputEvent::Key`] and post it to the
 /// seam (the SOLE encoder caller, under the CURRENT keyboard mode). See
 /// [`parse_key`] for the grammar.

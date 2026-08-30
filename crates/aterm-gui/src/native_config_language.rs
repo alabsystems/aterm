@@ -1185,6 +1185,352 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     })
 }
 
+/// How far a spelling may sit from a registered one and still be called a typo.
+///
+/// One edit for a short name, two for a long one. Anything looser starts
+/// renaming one real setting into a different real setting, and a confident
+/// wrong suggestion is worse than silence: it sends someone to change a key
+/// they never touched. The ladder is length-scaled because two edits inside
+/// `gpu` is most of the word, while two inside `scrollback_lines` is a slip.
+const fn near_miss_budget(length: usize) -> usize {
+    if length <= 8 { 1 } else { 2 }
+}
+
+/// Bounded, ASCII-case-folded optimal string alignment distance — Levenshtein
+/// plus ADJACENT TRANSPOSITION, which is the shape most config typos actually
+/// take (`cursor_trail_stlye`, `keybindigns`). Plain Levenshtein scores a
+/// transposition as two edits and would need a budget loose enough to also
+/// admit genuinely different keys.
+///
+/// `None` as soon as a whole row exceeds `budget`: a row minimum can never fall
+/// again, so most of the ~250-path registry is rejected after one row instead
+/// of a full matrix. `rows` is caller-owned so one sweep over the registry
+/// allocates three buffers rather than three per candidate.
+///
+/// The three rows are the standard OSA window (`i-2`, `i-1`, `i`); the `i-2` row
+/// is only ever read under `i > 1`, when a real row occupies it.
+fn osa_distance_within(
+    a: &[char],
+    b: &[char],
+    budget: usize,
+    rows: &mut [Vec<usize>; 3],
+) -> Option<usize> {
+    if a.is_empty() {
+        return (b.len() <= budget).then_some(b.len());
+    }
+    let width = b.len() + 1;
+    for row in rows.iter_mut() {
+        row.clear();
+        row.resize(width, 0);
+    }
+    let (mut two_back, mut one_back, mut current) = (0usize, 1usize, 2usize);
+    for (column, cell) in rows[one_back].iter_mut().enumerate() {
+        *cell = column;
+    }
+    for i in 1..=a.len() {
+        rows[current][0] = i;
+        let mut row_best = i;
+        for j in 1..width {
+            let substitution = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (rows[one_back][j] + 1)
+                .min(rows[current][j - 1] + 1)
+                .min(rows[one_back][j - 1] + substitution);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(rows[two_back][j - 2] + 1);
+            }
+            rows[current][j] = best;
+            row_best = row_best.min(best);
+        }
+        if row_best > budget {
+            return None;
+        }
+        let spent = two_back;
+        two_back = one_back;
+        one_back = current;
+        current = spent;
+    }
+    let distance = rows[one_back][b.len()];
+    (distance <= budget).then_some(distance)
+}
+
+/// The candidate closest to `query` within [`near_miss_budget`], or `None` when
+/// nothing is close enough to name. Ties break on the shorter then
+/// lexicographically smaller candidate so one misspelling always names one
+/// spelling, whatever order the caller iterates in.
+///
+/// A byte-identical candidate is not a miss; a candidate that differs ONLY in
+/// case is (TOML keys and these value domains are case-sensitive where the
+/// runtime does not fold them, so `Columns` is exactly the mistake worth
+/// naming).
+fn nearest_candidate<'a>(
+    query: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let folded = query
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let budget = near_miss_budget(folded.len());
+    let mut rows = [Vec::new(), Vec::new(), Vec::new()];
+    let mut scratch = Vec::new();
+    let mut best: Option<(usize, &'a str)> = None;
+    for candidate in candidates {
+        if candidate == query {
+            continue;
+        }
+        scratch.clear();
+        scratch.extend(
+            candidate
+                .chars()
+                .map(|character| character.to_ascii_lowercase()),
+        );
+        if folded.len().abs_diff(scratch.len()) > budget {
+            continue;
+        }
+        let Some(distance) = osa_distance_within(&folded, &scratch, budget, &mut rows) else {
+            continue;
+        };
+        let better = best.is_none_or(|(best_distance, best_candidate)| {
+            (distance, candidate.len(), candidate)
+                < (best_distance, best_candidate.len(), best_candidate)
+        });
+        if better {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
+}
+
+/// Every dotted path this build accepts as a key: the [`config_schema`] registry
+/// itself plus the table headers its dotted keys imply (`net`, `matrix_rain`,
+/// `sparkle_words.feline`, …).
+///
+/// Derived from the registry rather than listed, so a suggestion can never name
+/// a key this build would go on to ignore. Compatibility-only and retired
+/// spellings are excluded for the same reason completion refuses to offer them
+/// (`retired_bottom_hud_keys_are_never_suggested`): "did you mean `show_hud`?"
+/// would answer a typo with a key that does nothing.
+fn suggestable_config_paths() -> &'static [&'static str] {
+    static PATHS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let mut paths = Vec::new();
+        for entry in config_schema() {
+            if is_compatibility_only_key(entry.key) {
+                continue;
+            }
+            paths.push(entry.key);
+            let mut ancestor = entry.key;
+            while let Some(cut) = ancestor.rfind('.') {
+                ancestor = &ancestor[..cut];
+                if !is_compatibility_only_key(ancestor) {
+                    paths.push(ancestor);
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    })
+}
+
+/// Whether `path` names a key or table this build knows about.
+fn config_path_is_known(path: &str) -> bool {
+    suggestable_config_paths().binary_search(&path).is_ok()
+}
+
+/// The registered key a misspelling most likely meant, or `None` when nothing is
+/// close enough to name.
+///
+/// Answered against [`suggestable_config_paths`] — the same registry that decides
+/// what completion offers and what [`validate_registered_values`] type-checks —
+/// so the spelling suggested is by construction a spelling the loader accepts.
+///
+/// Compared at EQUAL DOT-DEPTH first, then up the ancestors. A misspelled table
+/// header never reaches the walker as itself: `[keybindigns]` arrives as its leaf
+/// `keybindigns.ctrl+t`, whose own depth holds nothing like it, and only the walk
+/// up to `keybindigns` can name `keybindings`. The walk stops at the first
+/// ancestor that IS known, because there the leaf was the mistake and no ancestor
+/// is worth suggesting.
+pub(crate) fn nearest_config_key(path: &str) -> Option<&'static str> {
+    let mut candidate = path;
+    loop {
+        if config_path_is_known(candidate) {
+            return None;
+        }
+        // A QUOTED segment is a literal name the author chose — a chord, a link
+        // name, a word — and `join_config_key_path` keeps its quotes. No
+        // registered key carries them, so anything that scores close at this
+        // level is scoring against the quoting rather than a spelling. Climb
+        // past it: `[keybindigns]` still has to be able to name `keybindings`
+        // through its own quoted `"ctrl+t"` leaf.
+        if !candidate.contains('"') {
+            let depth = candidate.matches('.').count();
+            let nearest = nearest_candidate(
+                candidate,
+                suggestable_config_paths()
+                    .iter()
+                    .copied()
+                    .filter(|known| known.matches('.').count() == depth),
+            );
+            if nearest.is_some() {
+                return nearest;
+            }
+        }
+        candidate = &candidate[..candidate.rfind('.')?];
+    }
+}
+
+/// The accepted value a misspelling most likely meant, out of `options` (the
+/// live domain the caller already prints as "must be one of"). Aliases are
+/// deliberately NOT candidates: an alias resolves, so suggesting one would offer
+/// a second spelling of an answer the canonical list already gives.
+pub(crate) fn nearest_enum_value<'a>(value: &str, options: &[&'a str]) -> Option<&'a str> {
+    nearest_candidate(value.trim(), options.iter().copied())
+}
+
+/// One sentence naming the near miss, or nothing — appended to a message that
+/// has already said what is wrong.
+fn did_you_mean(suggestion: Option<&str>) -> String {
+    suggestion.map_or_else(String::new, |suggestion| {
+        format!(" — did you mean {suggestion:?}?")
+    })
+}
+
+/// Every key in `source` this build will silently ignore: a misspelling, a key
+/// from a future aterm, or a retired spelling that no longer does anything.
+///
+/// THE SEAM. `Config`'s serde derive accepts unknown keys BY DESIGN — forward
+/// compatibility, plus `[packages]` keys that only the co-located `atpkg` reads —
+/// so nothing downstream of the parse can tell a typo from a setting. Every
+/// surface that answers "why did my edit do nothing" therefore asks this one
+/// walk, the same one Manual's editor runs, and they cannot come to different
+/// conclusions about what this build accepts.
+///
+/// A TOML syntax error yields nothing: the caller's own parse reports it with a
+/// line and column, and restating it here would double the message.
+pub(crate) fn ignored_key_warnings(source: &str) -> Vec<String> {
+    if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
+        return Vec::new();
+    }
+    let Ok(document) = source.parse::<aterm_toml::edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let mut analysis = ConfigAnalysis::default();
+    warn_compatibility_only_values(source, &document, &mut analysis);
+    warn_unknown_values(source, &document, &mut analysis);
+    let mut lines = analysis
+        .diagnostics
+        .iter()
+        .map(|diagnostic| format!("line {}: {}", diagnostic.line, diagnostic.message))
+        .collect::<Vec<_>>();
+    if analysis.omitted_diagnostics > 0 {
+        lines.push(format!(
+            "{} further ignored key(s) not listed by the bounded validator",
+            analysis.omitted_diagnostics
+        ));
+    }
+    lines
+}
+
+/// A spelling the registry domain rejects that the RUNTIME nonetheless resolves.
+///
+/// `cursor_style = "underline"` is retired and renders as a bar, so it needs the
+/// sentence that says so and must never be told it is outside the domain: the
+/// cursor does not fall back to the default, and a reader sent to "fix" a working
+/// config learns the wrong thing. Named once because both the editor's value
+/// validation and the fail-soft value walk have to make the same exception.
+fn is_retired_but_resolving(key: &str, value: &str) -> bool {
+    key == crate::prefs::EDIT_CURSOR_STYLE && value.trim().eq_ignore_ascii_case("underline")
+}
+
+/// One `(key, value, sentence)` per registered key in `source` whose authored
+/// VALUE this build does not accept.
+///
+/// THE VALUE HALF OF THE SAME SEAM as [`ignored_key_warnings`]. A key can be
+/// spelled perfectly and still do nothing, because every `app_config` value
+/// resolver fails SOFT: an unrecognized `window_theme`/`motion`/`right_click`
+/// prints to a stderr no windowed launch has and silently keeps the default. The
+/// parsed `Config` holds the rejected string, so no consumer downstream of the
+/// parse can tell a typo'd value from a chosen one.
+///
+/// The vocabulary and the acceptance test are the registry's — [`config_schema`]
+/// plus [`registered_enum_value_is_valid`] and its alias tables, the same pair
+/// the Manual editor validates against and the Settings picker offers — so the
+/// spelling suggested is by construction one the loader accepts, and a
+/// command-line answer cannot disagree with an in-window one.
+///
+/// A TOML syntax error yields nothing, for the reason [`ignored_key_warnings`]
+/// gives.
+fn unaccepted_enum_values(source: &str) -> Vec<(&'static str, String, String)> {
+    if source.len() > MAX_CONFIG_ANALYSIS_BYTES {
+        return Vec::new();
+    }
+    let Ok(document) = source.parse::<aterm_toml::edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for setting in config_schema() {
+        let ConfigSchemaKind::Scalar(EditKind::Enum { options }) = setting.kind else {
+            continue;
+        };
+        // An inert key's story is "this build does nothing with it at all",
+        // which the compatibility walker already tells. Grading its value would
+        // give one authored key two contradictory recoveries.
+        if is_compatibility_only_key(setting.key) {
+            continue;
+        }
+        let Some(value) =
+            dotted_item(&document, setting.key).and_then(aterm_toml::edit::Item::as_str)
+        else {
+            continue;
+        };
+        if registered_enum_value_is_valid(setting.key, value, options)
+            || is_retired_but_resolving(setting.key, value)
+        {
+            continue;
+        }
+        found.push((
+            setting.key,
+            value.to_string(),
+            // NEAR MISS BEFORE VOCABULARY. The in-window banner paints one line
+            // per notice and truncates at the terminal width, so whatever trails
+            // a fourteen-option list is the part nobody reads. The recovery is
+            // the half worth guaranteeing; the domain is the reference behind it.
+            format!(
+                "{}: {value:?} is not accepted{} (expected one of: {}; the default is used at load)",
+                setting.key,
+                did_you_mean(nearest_enum_value(value, options)),
+                options.join(", "),
+            ),
+        ));
+    }
+    found
+}
+
+/// [`unaccepted_enum_values`] minus the keys a line in `already_told` has
+/// already explained.
+///
+/// A loader-specific complaint QUOTES the value it is refusing (`got "blok"`,
+/// `unknown style "phasr"`) because it also knows something the vocabulary alone
+/// does not — which fallback runs, that the whole cursor effect goes dark. That
+/// quoting is the test, and it is a property of the messages rather than a list
+/// of keys, so a resolver that gains or loses its bespoke sentence needs no edit
+/// here. A line about the same key that does NOT name the value — a platform
+/// note, an environment-override note — has not told this story, and hiding the
+/// domain error behind it would be exactly the false-green this walk ends.
+pub(crate) fn unaccepted_value_warnings(source: &str, already_told: &[String]) -> Vec<String> {
+    unaccepted_enum_values(source)
+        .into_iter()
+        .filter(|(key, value, _)| {
+            let quoted = format!("{value:?}");
+            !already_told
+                .iter()
+                .any(|told| told.contains(key) && told.contains(&quoted))
+        })
+        .map(|(_, _, message)| message)
+        .collect()
+}
+
 pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
     let mut analysis = ConfigAnalysis {
         syntax: lex_toml(source),
@@ -1325,9 +1671,7 @@ fn validate_registered_values(
                 let Some(value) = item.as_str() else {
                     continue;
                 };
-                if setting.key == crate::prefs::EDIT_CURSOR_STYLE
-                    && value.trim().eq_ignore_ascii_case("underline")
-                {
+                if is_retired_but_resolving(setting.key, value) {
                     push_diagnostic(
                         analysis,
                         source,
@@ -1344,7 +1688,12 @@ fn validate_registered_values(
                         source,
                         range,
                         ConfigDiagnosticSeverity::Error,
-                        format!("{} must be one of: {}", setting.key, options.join(", ")),
+                        format!(
+                            "{} must be one of: {}{}",
+                            setting.key,
+                            options.join(", "),
+                            did_you_mean(nearest_enum_value(value, options))
+                        ),
                     );
                 }
             }
@@ -2015,6 +2364,14 @@ fn warn_unknown_item(
         return;
     }
     if schema.is_none() {
+        // Forward compatibility is the honest reading of a key from a NEWER
+        // aterm, and it is the wrong first sentence for a typo: the key is
+        // preserved either way, but only one of the two readings has a
+        // recovery. So the two readings get two shapes, and the near miss goes
+        // FIRST when there is one — the in-window banner paints one line per
+        // notice and truncates at the terminal width, and on an 80-column window
+        // a spelling that trails the forward-compatibility clause is the exact
+        // half that falls off the end.
         push_diagnostic(
             analysis,
             source,
@@ -2022,9 +2379,15 @@ fn warn_unknown_item(
                 .or_else(|| item.span())
                 .unwrap_or(0..source.len().min(1)),
             ConfigDiagnosticSeverity::Warning,
-            format!(
-                "{path} is unknown to this aterm build; it will be preserved for forward compatibility"
-            ),
+            match nearest_config_key(path) {
+                Some(near) => format!(
+                    "{path} — did you mean {near:?}? (unknown to this aterm build; \
+                     preserved for forward compatibility)"
+                ),
+                None => format!(
+                    "{path} is unknown to this aterm build; it will be preserved for forward compatibility"
+                ),
+            },
         );
     }
 }
@@ -5003,15 +5366,19 @@ home = "~/aterm"
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
+        // Asserted as "this dotted path is named, and named as unknown" rather
+        // than as one word order: a nested key close to a registered one leads
+        // with its near miss so the spelling survives the banner's truncation,
+        // and the property under test is the WALK reaching the leaf either way.
+        let named_as_unknown = |path: &str| {
+            messages.iter().any(|message| {
+                message.starts_with(path) && message.contains("unknown to this aterm build")
+            })
+        };
+        assert!(named_as_unknown("sparkle_words.enabld"), "{messages:?}");
         assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("sparkle_words.enabld is unknown"))
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("sparkle_words.feline.gzae is unknown"))
+            named_as_unknown("sparkle_words.feline.gzae"),
+            "{messages:?}"
         );
 
         let allowed = [
@@ -6988,5 +7355,308 @@ sty"#;
                 );
             }
         });
+    }
+
+    fn only_message(source: &str) -> String {
+        let analysis = analyze(source);
+        assert_eq!(
+            analysis.diagnostics.len(),
+            1,
+            "expected exactly one diagnostic for {source:?}: {:?}",
+            analysis.diagnostics
+        );
+        analysis.diagnostics[0].message.clone()
+    }
+
+    /// The whole bar for a mistyped key: the reader is told the spelling that
+    /// works. A transposition is the common shape and the one plain Levenshtein
+    /// scores as two edits, so it is the case worth pinning.
+    #[test]
+    fn a_mistyped_key_is_told_the_spelling_that_works() {
+        for (typo, intended) in [
+            ("cursor_trail_stlye", "cursor_trail_style"),
+            ("colums", "columns"),
+            ("font_pxx", "font_px"),
+            ("scrollback_lnies", "scrollback_lines"),
+        ] {
+            let message = only_message(&format!("{typo} = 1\n"));
+            assert!(
+                message.contains(typo) && message.contains(&format!("did you mean {intended:?}")),
+                "{typo} must name {intended}: {message}"
+            );
+        }
+    }
+
+    /// TOML keys are case-sensitive and this loader does not fold them, so a
+    /// capitalized key is a silent no-op like any other misspelling — and the
+    /// zero-distance case must still be reported as a miss rather than mistaken
+    /// for the key itself.
+    #[test]
+    fn a_capitalized_key_is_a_miss_and_names_its_lowercase_spelling() {
+        let message = only_message("Columns = 100\n");
+        assert!(
+            message.contains("did you mean \"columns\""),
+            "capitalized key must name its accepted spelling: {message}"
+        );
+    }
+
+    /// The forward-compatibility promise is the honest reading of a key from a
+    /// NEWER aterm, and it must not be dressed up as a typo. Nothing in the
+    /// registry is near this name, so no rename may be guessed.
+    #[test]
+    fn a_key_from_a_future_build_is_preserved_without_a_guessed_rename() {
+        let message = only_message("quantum_flux_capacitor_mode = true\n");
+        assert!(
+            message.contains("preserved for forward compatibility"),
+            "{message}"
+        );
+        assert!(!message.contains("did you mean"), "{message}");
+    }
+
+    /// A misspelled TABLE header never reaches the walker as itself — it arrives
+    /// as its leaves — so the suggestion has to climb to the ancestor that is
+    /// wrong. Without the climb the leaf's own depth holds nothing like it and
+    /// the reader is told only that a key they never wrote is unknown.
+    #[test]
+    fn a_mistyped_table_header_names_the_table_rather_than_its_leaf() {
+        let message = only_message("[keybindigns]\n\"ctrl+t\" = \"new_tab\"\n");
+        assert!(
+            message.contains("did you mean \"keybindings\""),
+            "a mistyped table must name the table: {message}"
+        );
+    }
+
+    /// A near miss is answered from the registry, so it can only ever name a key
+    /// this build accepts — and never renames one working key into another.
+    #[test]
+    fn a_suggestion_is_always_a_key_the_loader_accepts_and_never_a_working_one() {
+        for entry in config_schema() {
+            assert_eq!(
+                nearest_config_key(entry.key),
+                None,
+                "{} is registered and must never be corrected",
+                entry.key
+            );
+        }
+        for typo in ["cursor_trail_stlye", "colums", "keybindigns", "wndow_theme"] {
+            let suggestion = nearest_config_key(typo).unwrap_or_else(|| panic!("{typo}"));
+            assert!(
+                config_path_is_known(suggestion),
+                "{typo} suggested {suggestion}, which this build does not accept"
+            );
+        }
+    }
+
+    /// A retired spelling still has a Manual story of its own ("was removed"),
+    /// and offering it as the answer to someone else's typo would hand them a
+    /// key that does nothing — the exact defect the diagnostic exists to end.
+    #[test]
+    fn a_retired_spelling_is_never_offered_as_the_answer_to_a_typo() {
+        for retired in RETIRED_CONFIG_KEYS {
+            assert!(
+                !suggestable_config_paths().contains(&retired.key),
+                "{} is retired and must not be suggestable",
+                retired.key
+            );
+        }
+        for compatibility_only in COMPATIBILITY_ONLY_KEYS {
+            assert!(
+                !suggestable_config_paths().contains(compatibility_only),
+                "{compatibility_only} is compatibility-only and must not be suggestable"
+            );
+        }
+    }
+
+    /// Listing the vocabulary answers "what may I write"; naming the near miss
+    /// answers "what did I mean". A long domain needs both.
+    #[test]
+    fn a_mistyped_enum_value_names_the_nearest_accepted_spelling() {
+        let message = only_message("cursor_style = \"blok\"\n");
+        assert!(
+            message.contains("must be one of") && message.contains("did you mean \"block\""),
+            "{message}"
+        );
+    }
+
+    /// An unknown key leaves NO trace in the parsed `Config`, so this walk is the
+    /// only thing standing between a typo and a silent no-op. The line number
+    /// rides along because the caller's surfaces have no other cursor into the file.
+    #[test]
+    fn ignored_key_warnings_locate_every_key_the_loader_will_drop() {
+        let warnings = ignored_key_warnings("theme = \"Nord\"\ncolums = 100\nshow_hud = true\n");
+        assert!(
+            warnings.iter().any(
+                |line| line.starts_with("line 2:") && line.contains("did you mean \"columns\"")
+            ),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|line| line.starts_with("line 3:")),
+            "a retired key is ignored too and must be listed: {warnings:?}"
+        );
+        assert!(
+            ignored_key_warnings("theme = \"Nord\"\n").is_empty(),
+            "a config of accepted keys must produce no ignored-key line"
+        );
+    }
+
+    /// A syntax error is reported by the caller's own parse, with its own line and
+    /// column. Restating it here would print every broken file's one mistake twice.
+    #[test]
+    fn ignored_key_warnings_stay_silent_on_a_file_that_does_not_parse() {
+        assert!(ignored_key_warnings("theme = \"Nord\n").is_empty());
+    }
+
+    /// The budget is length-scaled in both directions. Two edits inside `gpu` is
+    /// most of the word — a guess that far out would be inventing an intent —
+    /// while two inside `scrollback_lines` is an ordinary slip and still worth
+    /// naming.
+    #[test]
+    fn the_near_miss_budget_scales_with_how_much_of_the_name_is_left() {
+        assert_eq!(
+            nearest_config_key("gpx"),
+            Some("gpu"),
+            "one edit, short key"
+        );
+        assert_eq!(nearest_config_key("xzq"), None, "two edits, short key");
+        assert_eq!(
+            nearest_config_key("scrolback_lnes"),
+            Some("scrollback_lines"),
+            "two edits, long key"
+        );
+        assert_eq!(nearest_config_key("theme_of_everything"), None);
+        assert_eq!(nearest_enum_value("blok", &["block", "bar"]), Some("block"));
+        assert_eq!(
+            nearest_enum_value("wildly-different", &["block", "bar"]),
+            None
+        );
+        assert_eq!(
+            nearest_enum_value("block", &["block", "bar"]),
+            None,
+            "an accepted spelling is not a miss"
+        );
+    }
+
+    /// A key spelled RIGHT whose value this build does not accept is the same
+    /// silent no-op as a misspelled key: the resolver keeps the default and says
+    /// so only on a stderr a windowed launch does not have. Most enum keys never
+    /// got a hand-written check, so the registry has to answer for all of them.
+    #[test]
+    fn a_key_spelled_right_with_a_value_that_is_not_is_reported_with_its_vocabulary() {
+        for (source, key, intended) in [
+            ("window_theme = \"drak\"\n", "window_theme", "dark"),
+            ("motion = \"redcued\"\n", "motion", "reduced"),
+            ("right_click = \"of\"\n", "right_click", "off"),
+        ] {
+            let warnings = unaccepted_value_warnings(source, &[]);
+            let joined = warnings.join("\n");
+            assert!(
+                joined.contains(key) && joined.contains(&format!("did you mean {intended:?}")),
+                "{key} must name {intended}: {joined}"
+            );
+        }
+    }
+
+    /// The two halves of the seam answer from ONE registry, so a key cannot get
+    /// one without the other: whatever `config_schema` registers with an enum
+    /// domain is both a spelling [`ignored_key_warnings`] will miss when it is
+    /// mistyped and a domain [`unaccepted_value_warnings`] will grade when the
+    /// value is. A key added to the registry tomorrow is covered by this sweep
+    /// on the day it lands, which is the only way the coverage stays honest: a
+    /// per-key list can only ever cover the keys someone remembered to add to it.
+    #[test]
+    fn every_registered_enum_key_is_graded_on_its_spelling_and_on_its_value() {
+        let mut graded = 0;
+        for setting in config_schema() {
+            let ConfigSchemaKind::Scalar(EditKind::Enum { .. }) = setting.kind else {
+                continue;
+            };
+            if is_compatibility_only_key(setting.key) {
+                continue;
+            }
+            // A `[[sparkle_words.custom]]` field is authored inside a RECORD, not
+            // as a setting of its own, and the record walker reports it against
+            // the record it sits in ("… in [[sparkle_words.custom]] record 1").
+            // Grading it as a top-level dotted key would test a shape nobody
+            // writes.
+            if setting.key.starts_with("sparkle_words.custom.") {
+                continue;
+            }
+            graded += 1;
+            let mistyped = format!("{}zq = \"x\"\n", setting.key);
+            assert!(
+                ignored_key_warnings(&mistyped)
+                    .iter()
+                    .any(|line| line.contains(setting.key)),
+                "a mistyped {} must be reported: {:?}",
+                setting.key,
+                ignored_key_warnings(&mistyped)
+            );
+            let refused = format!("{} = \"zq not a value\"\n", setting.key);
+            assert!(
+                unaccepted_value_warnings(&refused, &[])
+                    .iter()
+                    .any(|line| line.starts_with(setting.key)),
+                "a value {} does not accept must be reported: {:?}",
+                setting.key,
+                unaccepted_value_warnings(&refused, &[])
+            );
+        }
+        assert!(graded > 20, "the registry sweep found only {graded} keys");
+    }
+
+    /// The domain and the acceptance test are the registry's, so every spelling
+    /// the loader admits — canonical, aliased, or retired-but-still-resolving —
+    /// stays silent. A walk that warned about a value the runtime happily
+    /// resolves would be worse than no walk at all: it sends someone to change a
+    /// config that works.
+    #[test]
+    fn every_spelling_the_loader_admits_raises_no_value_warning() {
+        for accepted in [
+            "window_theme = \"dark\"",
+            "window_theme = \"Auto\"",
+            "cursor_style = \"beam\"",
+            "cursor_style = \"underline\"",
+            "cursor_trail_style = \"nyan rainbow\"",
+            "motion = \"full\"",
+            "right_click = \"copy_paste\"",
+            "columns = 100",
+        ] {
+            let warnings = unaccepted_value_warnings(&format!("{accepted}\n"), &[]);
+            assert!(warnings.is_empty(), "{accepted:?} warned: {warnings:?}");
+        }
+        assert!(
+            unaccepted_value_warnings("theme = \"Nord\n", &[]).is_empty(),
+            "a file that does not parse is the caller's own error to report"
+        );
+    }
+
+    /// A resolver that already named the value it refused knows more than the
+    /// vocabulary does — which fallback runs, that the whole cursor effect goes
+    /// dark — so it keeps the sentence and the generic line stands down. The test
+    /// is the QUOTED VALUE, not the key: a platform note about the same key has
+    /// not said the value is wrong, and hiding the domain error behind it would
+    /// be the false-green this walk exists to end.
+    #[test]
+    fn a_line_that_already_named_the_value_suppresses_the_generic_one_but_a_platform_note_does_not()
+    {
+        let source = "window_theme = \"drak\"\n";
+        assert!(
+            unaccepted_value_warnings(
+                source,
+                &["window_theme: expected auto|light|dark, got \"drak\"; using auto".to_string()],
+            )
+            .is_empty(),
+            "a line naming the refused value has told this story"
+        );
+        assert_eq!(
+            unaccepted_value_warnings(
+                source,
+                &["window_theme has no effect on this platform".to_string()],
+            )
+            .len(),
+            1,
+            "a platform note never said the value was wrong"
+        );
     }
 }

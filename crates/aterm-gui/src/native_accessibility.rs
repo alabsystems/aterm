@@ -710,9 +710,12 @@ fn materialize_visible_text(
             });
         }
         let mut status_node = Node::new(Role::Status);
-        status_node.set_label("Editor status");
-        status_node.set_value(status.to_string());
-        status_node.set_live(Live::Polite);
+        // The CONTEXT is the description; the announced string is the status itself
+        // ([`announce_live`] — the name is what AT-SPI and UIA speak, so a constant
+        // "Editor status" name would be the only thing a Linux/Windows reader ever heard,
+        // once, and never the diagnostic that changed).
+        status_node.set_description("Editor status");
+        announce_live(&mut status_node, Live::Polite, status);
         status_node.set_bounds(Rect {
             x0: f64::from(rect.x),
             y0: f64::from(rect.bottom() - geometry.footer_h),
@@ -850,6 +853,7 @@ pub(crate) fn compose_native_accessibility(
     projections: Vec<(AccessibilityOwner, NativeAccessibilityProjection)>,
     focused_native: Option<ViewId>,
     window_bounds: Rect,
+    window_title: &str,
 ) -> Result<NativeAccessibilityProjection, AccessibilityProjectionError> {
     if projections.is_empty() {
         return Err(AccessibilityProjectionError::EmptyTree);
@@ -905,7 +909,15 @@ pub(crate) fn compose_native_accessibility(
     }
 
     let mut window = Node::new(Role::Window);
-    window.set_label("aterm");
+    // The window's own title, exactly as `accesskit_tree::grid_tree` names the terminal
+    // window: the root's name is what every assistive client calls the WINDOW, so a user
+    // moving between windows must not hear "aterm" for all of them — and it must not
+    // change meaning merely because the front tab is a native app rather than a shell.
+    window.set_label(if window_title.is_empty() {
+        "aterm"
+    } else {
+        window_title
+    });
     window.set_bounds(window_bounds);
     window.set_children(child_roots);
     nodes.push((root, window));
@@ -1189,12 +1201,45 @@ fn lower_node(
         node.set_read_only();
     }
     if semantic.role == SemanticRole::Status {
-        node.set_live(Live::Polite);
+        // A `Status` semantic carries its sentence in the LABEL (`UiContent::Text` and
+        // `UiContent::Group` both project their text there) and usually has no value at
+        // all, which is silent on macOS. `announce_live` mirrors whichever one is present
+        // onto the other so every platform speaks the same words.
+        let announced = node
+            .value()
+            .map(str::to_string)
+            .unwrap_or_else(|| semantic.label.clone());
+        announce_live(&mut node, Live::Polite, &announced);
     }
     if enabled {
         lower_actions(&mut node, semantic, focusable);
     }
     Ok(node)
+}
+
+/// Mark `node` a LIVE REGION whose spoken text is `announced`, on every platform.
+///
+/// THE NAME AND THE VALUE ARE BOTH LOAD-BEARING, and each platform reads a different
+/// one — a node that carries only one of them is announced on some platforms and silent
+/// on the rest:
+///
+/// * AT-SPI (`accesskit_atspi_common`) emits `ObjectEvent::Announcement` carrying the
+///   node's NAME, and only when the name CHANGES (or the node is newly added). A live
+///   region whose name is a constant caption therefore speaks that caption once and
+///   never says anything again, however often its value moves.
+/// * UIA (`accesskit_windows`) raises `UIA_LiveRegionChangedEventId` under the same
+///   name-changed condition, and the screen reader then reads the element's name.
+/// * NSAccessibility (`accesskit_macos`) does the opposite: it announces the node's
+///   VALUE, and raises nothing at all when the node has no value.
+///
+/// So the announced string goes in BOTH, and any fixed caption belongs in the
+/// `description` — which is a property change on every platform and never an
+/// announcement. Keeping this in one function is what stops a new live surface from
+/// re-deriving half the rule.
+fn announce_live(node: &mut Node, politeness: Live, announced: &str) {
+    node.set_label(announced.to_string());
+    node.set_value(announced.to_string());
+    node.set_live(politeness);
 }
 
 fn lower_role(role: SemanticRole) -> Role {
@@ -1570,7 +1615,10 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].live(), Some(Live::Polite));
         assert_eq!(statuses[0].label(), Some(COMPLETE));
-        assert_eq!(statuses[0].value(), None);
+        // The COMPLETE sentence, never the responsive visual truncation — and in the
+        // value as well as the name, because NSAccessibility announces a live region by
+        // its value and says nothing at all for a node that has none.
+        assert_eq!(statuses[0].value(), Some(COMPLETE));
         assert!(statuses[0].children().is_empty());
         assert!(
             projection
@@ -1578,6 +1626,52 @@ mod tests {
                 .nodes
                 .iter()
                 .all(|(_, node)| node.label() != Some(visual.as_str()))
+        );
+    }
+
+    /// A live region has to carry the SAME sentence in its name and its value, because
+    /// the three platforms read different halves: AT-SPI and UIA announce the name (and
+    /// only when it changes), NSAccessibility announces the value (and nothing when
+    /// there is none). Publishing one half is how a status surface ends up audible on
+    /// exactly one operating system.
+    #[test]
+    fn every_live_region_announces_the_same_sentence_by_name_and_by_value() {
+        const SENTENCE: &str = "Reading page 3 of 12";
+        let compiled = UiTree::new(
+            UiNode::new(
+                "app",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column())
+            .children(vec![
+                UiNode::new(
+                    "reader/status",
+                    UiContent::Text(TextSpec {
+                        text: SENTENCE.to_string(),
+                        role: SemanticRole::Status,
+                        style: StyleRef::Plain,
+                    }),
+                )
+                .layout(Layout::default().height(Length::Fixed(24.0))),
+            ]),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 240.0, 24.0))
+        .unwrap();
+
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+        let live: Vec<_> = projection
+            .update()
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .filter(|node| node.live().is_some_and(|live| live != Live::Off))
+            .collect();
+        assert_eq!(live.len(), 1, "the status node is the frame's live region");
+        assert_eq!(live[0].label(), Some(SENTENCE), "AT-SPI/UIA announce this");
+        assert_eq!(
+            live[0].value(),
+            Some(SENTENCE),
+            "NSAccessibility announces this"
         );
     }
 
@@ -1814,6 +1908,7 @@ mod tests {
                 x1: 900.0,
                 y1: 700.0,
             },
+            "Settings \u{2014} aterm",
         )
         .unwrap();
         let window_root = projection.update().tree.as_ref().unwrap().root;
@@ -1824,6 +1919,10 @@ mod tests {
             .find(|(id, _)| *id == window_root)
             .unwrap();
         assert_eq!(window.1.role(), Role::Window);
+        // The accessible window is named what the titlebar names it, on the native
+        // branch exactly as on the terminal one — a user with several windows open has
+        // nothing else to tell them apart by ear.
+        assert_eq!(window.1.label(), Some("Settings \u{2014} aterm"));
         assert_eq!(window.1.children(), [first_root, second_root]);
         assert_eq!(
             projection.update().nodes.len(),
@@ -1987,6 +2086,15 @@ mod tests {
             status.value(),
             Some("Config error · Ln 7, Col 3 · complete diagnostic message")
         );
+        // AT-SPI and UIA announce a live region by its NAME and only when the name
+        // moves, so the diagnostic has to be the name too; "Editor status" is the fixed
+        // caption and belongs in the description, where it is a property change and
+        // never an announcement.
+        assert_eq!(
+            status.label(),
+            Some("Config error · Ln 7, Col 3 · complete diagnostic message")
+        );
+        assert_eq!(status.description(), Some("Editor status"));
 
         let published = PublishedNativeAccessibility::with_virtual_text(
             ViewId::from_stored(7),

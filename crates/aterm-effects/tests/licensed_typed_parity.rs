@@ -508,10 +508,15 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // than merged, because a three-way merge of this literal had twice produced TEN
     // entries in a nine-element array — a shape that does not compile and, worse,
     // reads like a resolved conflict.
+    // RE-DERIVED ON THE MERGE 2026-08-29 (caret-rim pixel law x traverse-per-mark
+    // with decay): index 2 alone moved; the other EIGHT are byte-identical, the
+    // evidence the licence seam did not. Rebuilt from capture, never hand-merged —
+    // a three-way merge of this literal has produced ten entries in a nine-array
+    // twice before.
     const GOLDEN: [u64; 9] = [
         10_317_128_623_903_768_537,
         17_965_605_562_081_848_086,
-        10_247_245_468_540_091_362,
+        10_229_932_340_051_593_466,
         15_654_209_172_669_807_490,
         3_818_617_666_977_618_171,
         17_432_548_801_852_476_563,

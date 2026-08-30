@@ -248,8 +248,42 @@ fn paint_scanner_semantic_classifiers_keep_their_negative_controls() {
 #[cfg(target_os = "macos")]
 enum Expect {
     /// Effect ink present: ≥150 dynamic saturated px across the take, ≥4 of
-    /// 12 hue buckets, a visible clump in some single frame, and no interior
-    /// multi-frame rainbow blackout or status/raster contradiction.
+    /// 12 hue buckets, a visible clump in some single frame, no interior
+    /// multi-frame rainbow blackout, and — on a paired take — NOT ONE frame
+    /// where the engine claims a ribbon IT IS STILL DRIVING over an unbanded
+    /// raster, on a claim that itself covered at least two frames.
+    ///
+    /// Two things make that a bind rather than a coin flip, and both were
+    /// measured on row 6b (2026-08-29):
+    ///
+    /// * WHAT COUNTS AS A BAND. The hue-separation witness must be two samples
+    ///   of ONE 4-connected painted object (`object_row_hue_separation` in
+    ///   scan.py). Read across the whole raster row it paired the caret's own
+    ///   one-hue block with a walking pet's coat and answered about the pet's
+    ///   pose. It is a strictly stricter oracle — in-object separation is a max
+    ///   over a subset of the whole-row pairs — so no blackout it used to catch
+    ///   can escape through it. It still asks only "does SOME one object carry
+    ///   ≥15° within a row", the pet included; see the note on `probe`.
+    /// * WHEN THE CLAIM IS HELD. `ribbon_hue_bands` counts DISTINCT HUE BANDS
+    ///   among the live typing sparks, quantized to twentieths of a turn — not
+    ///   the number of sparks, which is the separate `ribbon_segments`. A spark
+    ///   keeps the hue it was laid in for life, so the count falls only as
+    ///   sparks EXPIRE and keeps claiming right through the authored ~2 s
+    ///   exhale, after the ribbon's colour has legitimately left the raster
+    ///   (see `driven_last_frame`). The claim is therefore held only while the
+    ///   engine's own ledger still reports the ribbon being driven.
+    ///
+    /// The contradiction count is NOT sliced to the raster-derived
+    /// `sustained_rainbow_bounds` any more: a ribbon that dies mid-take ended
+    /// those bounds at its own last lit frame and walked out of its own audit
+    /// window. Injected on a healthy take (blackout from frame 12 to the end,
+    /// engine still claiming and still driving), that shape scored 0
+    /// contradictions and PASSED under the slice — `ribbon_dark=0
+    /// ribbon_bound=18 rainbow_frames=11 rainbow_gap=0 total_ink=3257`; unsliced
+    /// it charges 13 and fails.
+    ///
+    /// The two-frame floor is an obligation on the EVIDENCE and rides on this
+    /// arm alone, deliberately outside the predicate [`Expect::Quiet`] negates.
     Ink,
     /// The dark control: ZERO dynamic saturated px in EVERY frame. Only valid
     /// for a style with NO RESIDENT COMPANION — see [`Expect::TrailDark`].
@@ -276,6 +310,12 @@ enum Expect {
     /// See the probe's `--expect quiet` note for the
     /// measurements; on the unpinned path the deciding term is hue spread
     /// (1 bucket vs the trail's 9), not pixel count.
+    ///
+    /// What is negated is the PAINT predicate only. [`Expect::Ink`]'s
+    /// `ribbon_bound >= 2` floor is not part of it, and must not be: this row's
+    /// own take books no driven mature ribbon (`ribbon_bound=0`, measured on 3
+    /// of 3 live runs), so folding the floor in would let the control go green
+    /// for want of a ledger entry on a take that painted.
     Quiet,
 }
 
@@ -288,8 +328,10 @@ fn probe(shape: &str, keys: &str, expect: Expect) {
     //
     // `classic` spells `rainbow kitty`, which was a companion-free ribbon until
     // 2026-08-26 and has been a RESIDENT ANIMAL since. `scan.py`'s rainbow predicate
-    // (>=15 deg of hue separation among changed saturated pixels in one raster row)
-    // cannot tell live fur from ribbon, and the resident fades in AFTER the frame-0
+    // (>=15 deg of hue separation among changed saturated pixels sharing one raster
+    // row OF ONE 4-CONNECTED PAINTED OBJECT) cannot tell live fur from ribbon — a
+    // coat is one object and carries its own hue spread, so scoping the oracle to an
+    // object narrows nothing here — and the resident fades in AFTER the frame-0
     // baseline, so its body is "changed" in every later frame. Roughly seven of
     // `COAT_RAMP`'s sixteen coats clear the saturation floor and `mint_launch_seed`
     // draws a fresh one per launch — so these rows became a COIN FLIP on the cat,
@@ -677,6 +719,39 @@ fn focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin() {
 /// Row 6b: the same law beside an ESC7/ESC8 token streamer — unowned batches
 /// landing away from the caret several times a second, which is precisely the
 /// concurrent-decoration traffic that makes the batch counter a bad proxy.
+///
+/// THIS ROW IS WHERE THE RIBBON BIND WAS REPAIRED (2026-08-29). It went red
+/// intermittently, always in the tail: typing stops, the authored exhale runs,
+/// and `ribbon_hue_bands` — a count of DISTINCT HUE BANDS among the live
+/// sparks, not of the sparks themselves (that is `ribbon_segments`) — falls
+/// only 11 → 8 over the nine frames after the last admitted move, never near
+/// the claim's 4, while the ribbon's own ink leaves the raster entirely: the
+/// merged ribbon+caret object shrinks 157 → 139 → 123 → 119 → 109 → 98 px over
+/// frames 21-26, i.e. down to exactly the caret's own 7x14 block. From there
+/// the only other saturated ink is 1-4 detached single pixels of the resident
+/// pet's coat ~150° away, and the whole-row oracle paired those two objects:
+/// frames 26-30 of the preserved failing take read 151.7, 0.7, 0.1, 149.2,
+/// 151.4 deg while the raster's aggregates barely moved — `dynamic_saturated`
+/// 102/99/99/100/101, companion 315/306/306/319/315, hue buckets [4, 11] on all
+/// five. Three pixels of ink and thirteen of companion, against a 151° swing in
+/// the verdict: it was the pet's walk cycle deciding the row.
+///
+/// BOTH HALVES WERE NEEDED, and the second one is why. The contaminated flag
+/// feeds `rainbow_gap` as well as `ribbon_dark`, and on this `--capture image`
+/// path `continuity_holds` falls back to `rainbow_gap <= 1` (no keystroke
+/// ledger, so `driven_dark_us` is -1). Bounding the CLAIM to the driven window
+/// alone left the preserved failing take red: `ribbon_dark=0 ribbon_bound=17`
+/// but `rainbow_gap=2`. Scoping the ORACLE to one painted object
+/// (`object_row_hue_separation`) takes nine preserved takes from
+/// `rainbow_gap` 0,1,0,0,0,1,0,0,2 and `ribbon_dark` 0,1,0,0,0,1,0,0,2 to zero
+/// on both, everywhere.
+///
+/// MEASURED with the verdict predicate lifted verbatim from each version and
+/// run over the same nine preserved takes: HEAD scores 3 FAIL of 9, the
+/// repaired gate 0 of 9. Live, 18 consecutive runs of this row: 18 PASS,
+/// `ribbon_dark=0` and `rainbow_gap=0` on every one, `ribbon_bound` 17-19.
+/// Blanking two interior DRIVEN frames of a healthy take still scores
+/// `ribbon_dark=2` and red; blanking one still scores 1.
 #[cfg(target_os = "macos")]
 #[test]
 fn focused_streamer_typing_paints_trail_ink_without_a_recording_pin() {

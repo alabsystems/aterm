@@ -2757,12 +2757,30 @@ impl App {
                     // lock.
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.input_hot = true;
-                        // Every newer press closes the older license term.
-                        // Class-specific code below re-stamps the license its
-                        // own class earns; raw/unsupported input deliberately
-                        // leaves both dark.
-                        ws.cursor_glow.clear_typed(input_now);
-                        ws.cursor_trail.clear_typed();
+                        // Every newer press of a DIFFERENT class closes the
+                        // older license term (class-specific code below
+                        // re-stamps the license its own class earns;
+                        // raw/unsupported input deliberately leaves both
+                        // dark). A press that is itself a typed glyph keeps
+                        // the banked typed stamps instead: each is a real key
+                        // whose echo is still in flight, and wiping them here
+                        // was the flood-typing black gap — when keys outran
+                        // frames, every keypress destroyed its predecessor's
+                        // license and the orphaned echo sweeps were declined
+                        // into permanently unlit ribbon cells (measured 5-13
+                        // per 100-key flood before the fix). The engines bank
+                        // stamps bounded at TYPED_STAMP_DEPTH and spend one
+                        // per observed echo sweep, so K keys license exactly
+                        // K sweeps — program output still finds no license.
+                        let typed_press_supersede = typed_forward == Some(true)
+                            && (!enter_like || (enter_like && !typed_enter && is_alt));
+                        if typed_press_supersede {
+                            ws.cursor_glow.supersede_typed_press(input_now);
+                            ws.cursor_trail.supersede_typed_press();
+                        } else {
+                                            ws.cursor_glow.clear_typed(input_now);
+                            ws.cursor_trail.clear_typed();
+                        }
                         // ECHO-CORRELATION DEADLINE. Clearing the bypass on the FIRST
                         // content present after the key would not correlate it with THIS
                         // keystroke: in a session that is already streaming (a build log,
@@ -5377,11 +5395,36 @@ impl App {
             self.release_physical_press(wid, ev.physical_key);
             return;
         }
-        // Every newer physical press is a supersession boundary, including a
-        // local overlay/keybinding/native-view action that returns before the
-        // PTY seam. Repeats are new attempts too; releases deliberately are not
-        // (they may precede a delayed echo from their delivered press).
-        self.clear_move_license(wid);
+        // Every newer physical press of a DIFFERENT class is a supersession
+        // boundary, including a local overlay/keybinding/native-view action
+        // that returns before the PTY seam. Repeats are new attempts too;
+        // releases deliberately are not (they may precede a delayed echo from
+        // their delivered press). A PLAIN TYPED GLYPH (no Ctrl/Alt/Super;
+        // Character or Space) is the exception — the same mash exception the
+        // `Wake::Input` seam already carries: its banked typed stamps are real
+        // keys whose echoes are still in flight, and wiping them here on every
+        // press was half of the flood-typing black gap (the surplus echo
+        // sweeps were declined at no-fresh-hint and printed as permanently
+        // unlit ribbon cells). The non-typed license classes are still closed;
+        // App::input's own typed-press supersede runs downstream.
+        let plain_typed_glyph = self
+            .windows
+            .get(&wid)
+            .map(|ws| ws.mods)
+            .is_some_and(|m| !m.control_key() && !m.alt_key() && !m.super_key())
+            && matches!(
+                base_logical_key(&ev),
+                Key::Character(_) | Key::Named(NamedKey::Space)
+            );
+        if plain_typed_glyph {
+            let at = std::time::Instant::now();
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.cursor_glow.supersede_typed_press(at);
+                ws.cursor_trail.supersede_typed_press();
+            }
+        } else {
+            self.clear_move_license(wid);
+        }
         // A repeat belongs to the physical PRESS epoch, not to the content,
         // focus, modifiers, or keybinding state visible when winit delivers it.
         // Route it before even resetting this arrival window's blink: routing any

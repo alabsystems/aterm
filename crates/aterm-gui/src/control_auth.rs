@@ -28,7 +28,12 @@
 //! Instances do not collide: each binds its own `aterm-<pid>.sock` with a
 //! matching `aterm-<pid>.token`, and a `aterm.sock` symlink is atomically
 //! repointed at the newest instance so a single-instance `aterm-ctl` needs no
-//! flags. Naming/staleness decisions are engine-side
+//! flags. An instance on an explicit `$ATERM_CONTROL_SOCK` path is isolated
+//! the same way — its token is named after ITS socket
+//! ([`control_socket::token_name_for_sock`], [`token_path_for_socket`]) — so
+//! two private instances in one directory keep their own credentials instead
+//! of the second one overwriting the first's and locking out its clients.
+//! Naming/staleness decisions are engine-side
 //! ([`aterm_types::control_socket`]); this module does the filesystem work.
 //!
 //! "No nagging, keep power": there is NO prompt and NO new required flag. The
@@ -75,10 +80,6 @@ pub(crate) use imp::peer_uid;
 // draw a token directly.
 #[cfg(test)]
 use imp::random_token_hex;
-
-/// Token filename beside a socket that is not per-instance (an explicit
-/// `$ATERM_CONTROL_SOCK` path).
-pub const TOKEN_FILE: &str = control_socket::SIBLING_TOKEN_FILE;
 
 /// Filename of the `latest` symlink in the per-user directory, pointing at
 /// the newest instance's `aterm-<pid>.sock`.
@@ -1721,7 +1722,7 @@ pub fn resolve_socket_plan() -> SocketResolution {
                     limit: MAX_SUN_PATH,
                 };
             }
-            let token_path = dir_of_socket(&p).join(TOKEN_FILE);
+            let token_path = token_path_for_socket(&p);
             SocketResolution::Enabled(SocketPlan {
                 sock_path: p,
                 token_path,
@@ -1790,18 +1791,38 @@ pub fn dir_of_socket(path: &str) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-/// Read the capability token from `<dir>/aterm.token`, trimming whitespace.
-/// The symmetric counterpart of [`provision_token`]: the `aterm-ctl` client
-/// reads the token equivalently (resolving the per-instance token through the
-/// `latest` symlink), and the server uses it in tests and as a self-check.
-/// Returns `None` if unreadable (wrong user, missing).
+/// The capability-token file beside the socket at `path`: the SHARED name rule
+/// ([`control_socket::token_name_for_sock`]) resolved in that socket's own
+/// directory. The server writes exactly this file and the client derives the
+/// same one from the same rule, so the two ends cannot drift.
+///
+/// Load-bearing: the explicit-`$ATERM_CONTROL_SOCK` arm used to write the one
+/// fixed `aterm.token` per DIRECTORY, so the second private instance an agent
+/// booted in a scratch directory overwrote the first one's credential — and
+/// every client of the first was refused `ERR auth` while its socket was still
+/// listening, with nothing in either log to say why.
+#[must_use]
+pub fn token_path_for_socket(path: &str) -> PathBuf {
+    let name = Path::new(path)
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    dir_of_socket(path).join(control_socket::token_name_for_sock(&name))
+}
+
+/// Read back the capability token of the socket at `sock_path`, trimming
+/// whitespace. The symmetric counterpart of [`provision_token`]: it resolves
+/// the file through [`token_path_for_socket`], the same rule the writer used,
+/// so a drift between write and read shows up here rather than as an
+/// unexplained `ERR auth`. The `aterm-ctl` client reads it equivalently
+/// (resolving the per-instance token through the `latest` symlink first).
+/// Returns `None` if unreadable (wrong user, missing) — fail closed.
 #[must_use]
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "symmetric API; client reads token equivalently")
 )]
-pub fn read_token(dir: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(dir.join(TOKEN_FILE)).ok()?;
+pub fn read_token(sock_path: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(token_path_for_socket(sock_path)).ok()?;
     let t = raw.trim().to_string();
     if t.is_empty() { None } else { Some(t) }
 }
@@ -2401,15 +2422,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aterm-auth-test-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();
-        let written = provision_token(&dir.join(TOKEN_FILE)).expect("token written");
-        let read = read_token(&dir).expect("token readable");
+        // Write and read through the SHARED name rule, exactly as the server
+        // and the client do — an explicit socket's token is named after that
+        // socket, so this roundtrip also pins the pairing itself.
+        let sock = dir.join("a.sock").to_string_lossy().into_owned();
+        let token_path = token_path_for_socket(&sock);
+        assert_eq!(token_path, dir.join("a.sock.token"));
+        let written = provision_token(&token_path).expect("token written");
+        let read = read_token(&sock).expect("token readable");
         assert_eq!(written, read);
+        // A SECOND socket in the same directory has its own token file, and
+        // provisioning it leaves the first one's alone (F9: it used to
+        // overwrite it, and the first instance's clients then got `ERR auth`).
+        let other = dir.join("b.sock").to_string_lossy().into_owned();
+        let other_written = provision_token(&token_path_for_socket(&other)).expect("token written");
+        assert_ne!(other_written, written);
+        assert_eq!(read_token(&sock).as_deref(), Some(written.as_str()));
+        assert_eq!(read_token(&other).as_deref(), Some(other_written.as_str()));
         // Token file is 0600.
-        let mode = std::fs::metadata(dir.join(TOKEN_FILE))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         // Dir is 0700.
         let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
@@ -2427,7 +2458,8 @@ mod tests {
     fn provision_token_roundtrips_and_create_new_refuses_preexisting() {
         let dir = std::env::temp_dir().join(format!("aterm-auth-test-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();
-        let tokpath = dir.join(TOKEN_FILE);
+        let sock = dir.join("a.sock").to_string_lossy().into_owned();
+        let tokpath = token_path_for_socket(&sock);
         // A planted pre-existing file: the exclusive-create primitive refuses it.
         std::fs::write(&tokpath, b"planted").unwrap();
         let err = std::fs::OpenOptions::new()
@@ -2438,7 +2470,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         // provision_token unlinks first, then exclusively creates: rotation works.
         let written = provision_token(&tokpath).expect("token written");
-        let read = read_token(&dir).expect("token readable");
+        let read = read_token(&sock).expect("token readable");
         assert_eq!(written, read);
         assert_eq!(written.len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2895,7 +2927,8 @@ mod tests {
         touch(&control_socket::instance_token_name(dead));
         touch(&control_socket::instance_sock_name(us));
         touch(&control_socket::instance_token_name(us));
-        touch(TOKEN_FILE);
+        touch(control_socket::SIBLING_TOKEN_FILE);
+        touch(&control_socket::token_name_for_sock("private.sock"));
 
         sweep_stale_instances(&dir);
 
@@ -2904,7 +2937,13 @@ mod tests {
         // Our own (live) files and the fixed names survive.
         assert!(dir.join(control_socket::instance_sock_name(us)).exists());
         assert!(dir.join(control_socket::instance_token_name(us)).exists());
-        assert!(dir.join(TOKEN_FILE).exists());
+        assert!(dir.join(control_socket::SIBLING_TOKEN_FILE).exists());
+        // An explicit socket's token encodes no pid, so the sweep leaves it to
+        // its owner's graceful exit exactly as it leaves the fixed names.
+        assert!(
+            dir.join(control_socket::token_name_for_sock("private.sock"))
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

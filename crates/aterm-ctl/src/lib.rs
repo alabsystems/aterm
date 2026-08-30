@@ -44,9 +44,10 @@
 //! The server is access-controlled by default: it accepts only same-uid peers
 //! and requires a per-launch capability token. This client reads that token
 //! from the socket's sibling token file — the matching `aterm-<pid>.token`
-//! for a per-instance socket (resolved through the `latest` symlink), else
-//! `aterm.token` — and sends `AUTH <hex>\n` as the FIRST line of every
-//! connection, before the verb. Normal same-user usage is therefore unchanged
+//! for a per-instance socket (resolved through the `latest` symlink), else the
+//! socket's OWN `<name>.token` (so two private instances in one directory keep
+//! their own credentials) — and sends `AUTH <hex>\n` as the FIRST line of
+//! every connection, before the verb. Normal same-user usage is therefore unchanged
 //! — there is no flag and no prompt. If the token file is unreadable
 //! (different user, or aterm not running) the connection is refused by the
 //! server with `ERR auth`.
@@ -2553,10 +2554,11 @@ fn dominant_hint(probes: &[(u32, String, Probe)], in_dir: Option<&Path>) -> Opti
 
 /// Read the per-launch capability token sitting beside the socket at `path`.
 /// A per-instance socket (reached directly or through the `latest` symlink)
-/// pairs with its `aterm-<pid>.token`; anything else falls back to the
-/// sibling `aterm.token`. Returns `None` if unreadable (e.g. a different
-/// user, or aterm not running); the connection is then attempted without an
-/// `AUTH` line and the server refuses it with `ERR auth`.
+/// pairs with its `aterm-<pid>.token`; an explicit socket pairs with its OWN
+/// `<name>.token`, so two private instances in one directory keep their own
+/// credentials. Returns `None` if unreadable (e.g. a different user, or aterm
+/// not running); the connection is then attempted without an `AUTH` line and
+/// the server refuses it with `ERR auth`.
 fn read_token_for(path: &str) -> Option<String> {
     read_token_at(path).ok()
 }
@@ -2565,6 +2567,16 @@ fn read_token_for(path: &str) -> Option<String> {
 /// it could not be read (absent, another user's 0600, empty). Discovery
 /// reports that per socket instead of letting the server's bare `ERR auth`
 /// stand in for "the token file is unreadable".
+///
+/// The candidates are the shared rule's, in ITS order
+/// ([`control_socket::token_names_for_sock`]): the per-socket file this build's
+/// server writes, then — for an explicit socket only — the legacy shared
+/// `aterm.token` an OLDER server wrote for that same socket. Only an ABSENT
+/// (or unreadable) file moves on; a per-socket token that exists but is empty
+/// fails right there, because it belongs to the instance being dialed and
+/// reaching past it for a directory-shared file would be reaching for someone
+/// else's credential. A miss always names the PER-SOCKET path, the file this
+/// build expects to find.
 fn read_token_at(path: &str) -> Result<String, (PathBuf, io::Error)> {
     let p = Path::new(path);
     let (Some(dir), Some(file_name)) = (p.parent(), p.file_name()) else {
@@ -2576,22 +2588,37 @@ fn read_token_at(path: &str) -> Result<String, (PathBuf, io::Error)> {
     // `latest::target_name` is `read_link` + final component on Unix, and the
     // pointer file's validated contents on Windows — the same relative name.
     let sock_name = aterm_uds::latest::target_name(p).unwrap_or_else(|| file_name.to_os_string());
-    let token_path = dir.join(control_socket::token_name_for_sock(
-        &sock_name.to_string_lossy(),
-    ));
-    let raw = match std::fs::read_to_string(&token_path) {
-        Ok(raw) => raw,
-        Err(e) => return Err((token_path, e)),
-    };
-    let t = raw.trim().to_string();
-    if t.is_empty() {
-        Err((
-            token_path,
-            io::Error::new(io::ErrorKind::InvalidData, "token file is empty"),
-        ))
-    } else {
-        Ok(t)
+    let names = control_socket::token_names_for_sock(&sock_name.to_string_lossy());
+    let mut miss: Option<(PathBuf, io::Error)> = None;
+    for name in names {
+        let token_path = dir.join(name);
+        let raw = match std::fs::read_to_string(&token_path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Keep the FIRST (per-socket) miss: it is the file this build
+                // wants, and the one whose absence a report should name.
+                miss.get_or_insert((token_path, e));
+                continue;
+            }
+        };
+        let t = raw.trim().to_string();
+        return if t.is_empty() {
+            Err(miss.unwrap_or_else(|| {
+                (
+                    token_path,
+                    io::Error::new(io::ErrorKind::InvalidData, "token file is empty"),
+                )
+            }))
+        } else {
+            Ok(t)
+        };
     }
+    Err(miss.unwrap_or_else(|| {
+        (
+            PathBuf::from(path),
+            io::Error::new(io::ErrorKind::NotFound, "socket path names no token"),
+        )
+    }))
 }
 
 /// The distinct exit code for a TIMEOUT, additive over the 0=OK / 1=failure
@@ -3777,7 +3804,8 @@ fn receive_guarded_artifact_reply(
 /// sub-forms frame correctly even though the line SENT is `dial <name> …`.
 ///
 /// The server requires `AUTH <hex>\n` as the first line of every connection.
-/// We read the token from the socket's sibling `aterm.token` and send it
+/// We read the token from the file beside the socket (its own `<name>.token`,
+/// or `aterm-<pid>.token` for a per-instance socket) and send it
 /// transparently; only then do we send the actual request line. There is no
 /// server response to the `AUTH` line itself (it is consumed silently on
 /// success), so the first line we read back is the response to `request`.
@@ -5056,7 +5084,8 @@ mod tests {
     /// stay dependency-free (`aterm-agent`'s `--dial` path reads the token
     /// through it, and `aterm-agent` does not depend on `aterm-types`). This
     /// crate is the only one that depends on BOTH, so the agreement is pinned
-    /// here. A drift means a `--dial` drive authenticates against a file the
+    /// here — for the name the server WRITES and for the ordered list a client
+    /// READS. A drift means a `--dial` drive authenticates against a file the
     /// server never wrote — the exact bug the mirror replaced.
     #[test]
     fn uds_token_name_mirror_matches_aterm_types() {
@@ -5065,7 +5094,8 @@ mod tests {
             "aterm-1.sock",
             "aterm-42.sock",
             "aterm-4294967295.sock",
-            // the `latest` alias and every non-instance shape -> sibling token
+            // the `latest` alias and every explicit shape -> a token named
+            // after that socket alone
             "aterm.sock",
             "c.sock",
             "control.sock",
@@ -5073,7 +5103,7 @@ mod tests {
             "aterm-abc.sock",
             "aterm-1x.sock",
             // pid ROUND-TRIPS through u32: leading zeros normalize, and a pid
-            // past u32::MAX falls through to the sibling name. Slicing-only
+            // past u32::MAX falls through to the explicit form. Slicing-only
             // mirrors drift on both.
             "aterm-01.sock",
             "aterm-007.sock",
@@ -5082,6 +5112,18 @@ mod tests {
             "aterm-1.socket",
             "aterm-1",
             "",
+            // Names that would APPEND onto a reserved token name, and the one
+            // shape whose `.sock`/`.token` handling used to differ BETWEEN the
+            // two mirrors (`aterm_types` accepted the `.token` spelling as an
+            // instance name and named the socket file itself; the mirror did
+            // not). Both now key on `.sock` alone.
+            "aterm",
+            "aterm-4242",
+            "aterm-42.token",
+            "aterm.token",
+            "ctl",
+            "a.b.c.sock",
+            "\u{65e5}\u{672c}.sock",
         ];
         for name in cases {
             assert_eq!(
@@ -5089,7 +5131,78 @@ mod tests {
                 control_socket::token_name_for_sock(name),
                 "token-name mirror drifted for {name:?}"
             );
+            assert_eq!(
+                aterm_uds::latest::token_names_for_sock(name),
+                control_socket::token_names_for_sock(name),
+                "token-name READ ORDER mirror drifted for {name:?}"
+            );
+            // Neither mirror may hand two different sockets one token file:
+            // every explicit name stays out of the reserved `aterm.token` /
+            // `aterm-<pid>.token` space.
+            let token = control_socket::token_name_for_sock(name);
+            if control_socket::instance_pid(name).is_none() || !name.ends_with(".sock") {
+                assert_ne!(
+                    token,
+                    control_socket::SIBLING_TOKEN_FILE,
+                    "{name:?} must not derive the legacy shared token"
+                );
+                assert_eq!(
+                    control_socket::instance_pid(&token),
+                    None,
+                    "{name:?} must not derive a per-instance token name"
+                );
+            }
         }
+    }
+
+    /// The client's reader follows the shared rule, per socket: two explicit
+    /// sockets in ONE directory read two different tokens (F9 — they used to
+    /// read one file, so the second instance to start locked out the first
+    /// one's clients while it was still listening).
+    #[test]
+    fn two_explicit_sockets_in_one_directory_read_their_own_tokens() {
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-tok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let a = dir.join("a.sock").to_string_lossy().into_owned();
+        let b = dir.join("b.sock").to_string_lossy().into_owned();
+        std::fs::write(dir.join("a.sock.token"), "aaaa\n").expect("token a");
+        std::fs::write(dir.join("b.sock.token"), "bbbb\n").expect("token b");
+        assert_eq!(read_token_for(&a).as_deref(), Some("aaaa"));
+        assert_eq!(read_token_for(&b).as_deref(), Some("bbbb"));
+
+        // A stale shared `aterm.token` from an older build cannot displace
+        // either: the per-socket file exists, so the fallback is never reached.
+        std::fs::write(dir.join("aterm.token"), "cccc\n").expect("legacy token");
+        assert_eq!(read_token_for(&a).as_deref(), Some("aaaa"));
+        assert_eq!(read_token_for(&b).as_deref(), Some("bbbb"));
+
+        // COMPATIBILITY: an instance from a build that wrote only the shared
+        // name is still reachable — the fallback fires exactly when the
+        // per-socket file is absent, and it resolves to the same path the
+        // dependency-free mirror picks.
+        let c = dir.join("c.sock").to_string_lossy().into_owned();
+        assert_eq!(read_token_for(&c).as_deref(), Some("cccc"));
+        assert_eq!(
+            aterm_uds::latest::token_path_for_sock(&c).expect("resolves"),
+            dir.join("aterm.token")
+        );
+
+        // A per-instance socket never falls back onto the shared file.
+        let inst = dir.join("aterm-4242.sock").to_string_lossy().into_owned();
+        let (miss, err) = read_token_at(&inst).expect_err("no per-instance token");
+        assert_eq!(miss, dir.join("aterm-4242.token"));
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(read_token_for(&inst).is_none());
+
+        // An EMPTY per-socket token fails right there: it belongs to the
+        // instance being dialed, and the shared file may be anyone's.
+        std::fs::write(dir.join("a.sock.token"), "   \n").expect("empty token");
+        let (path, err) = read_token_at(&a).expect_err("an empty token is a miss");
+        assert_eq!(path, dir.join("a.sock.token"));
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REGRESSION: `ls`/`instances` are client-answered, and they used to
@@ -5862,13 +5975,15 @@ mod tests {
         // the request went out with no AUTH line.
         let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
         match probe_lines(&sock, "sessions", 0) {
-            Probe::NoToken(path, _) => assert_eq!(path, dir.join("aterm.token")),
+            // The miss names the PER-SOCKET file this build writes, not the
+            // legacy shared one.
+            Probe::NoToken(path, _) => assert_eq!(path, dir.join("mock.sock.token")),
             other => panic!("no token on disk + ERR auth is NoToken, got {other:?}"),
         }
         assert_eq!(srv.join().expect("mock"), "sessions\n");
 
         // AuthRejected: the token IS on disk, was sent, and still ERR auth.
-        std::fs::write(dir.join("aterm.token"), "deadbeef\n").expect("token");
+        std::fs::write(dir.join("mock.sock.token"), "deadbeef\n").expect("token");
         let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
         assert!(matches!(
             probe_lines(&sock, "sessions", 0),
@@ -5944,13 +6059,15 @@ mod tests {
     }
 
     /// The mirror must resolve in the socket's OWN directory — the concrete
-    /// regression: an explicit `$ATERM_CONTROL_SOCK` path like `/tmp/c.sock`
-    /// pairs with `/tmp/aterm.token`, NEVER the hand-rolled `/tmp/c.token`.
+    /// regressions: an explicit `$ATERM_CONTROL_SOCK` path like `/tmp/c.sock`
+    /// pairs with `/tmp/c.sock.token`, NEVER the hand-rolled `/tmp/c.token`
+    /// (which no server writes) and no longer the directory-wide
+    /// `/tmp/aterm.token` (which the next explicit socket would overwrite).
     #[test]
     fn uds_token_path_resolves_in_the_socket_dir() {
         let p = aterm_uds::latest::token_path_for_sock("/tmp/run/c.sock")
             .expect("a socket path with a parent resolves");
-        assert_eq!(p, Path::new("/tmp/run/aterm.token"));
+        assert_eq!(p, Path::new("/tmp/run/c.sock.token"));
 
         let inst = aterm_uds::latest::token_path_for_sock("/tmp/run/aterm-77.sock")
             .expect("instance socket resolves");

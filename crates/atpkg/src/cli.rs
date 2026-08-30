@@ -2585,27 +2585,16 @@ fn note_extra_optin(
     }
 }
 
-/// Reconcile SYSTEM SATISFACTION over `wanted` against this process's `PATH`. Returns the
+/// Reconcile SYSTEM SATISFACTION over `wanted` against the given `PATH`. Returns the
 /// members satisfied this pass (each also recorded + announced by [`satisfy_by_system`],
 /// and dropped from `installed` when a managed copy was retired). The caller removes the
 /// returned names from its wanted set.
-fn reconcile_system_satisfied(
-    layout: &crate::store::Layout,
-    index: &crate::manifest::Index,
-    wanted: &std::collections::BTreeSet<String>,
-    installed: &mut std::collections::BTreeMap<String, u64>,
-) -> Vec<String> {
-    reconcile_system_satisfied_with(
-        layout,
-        index,
-        wanted,
-        installed,
-        std::env::var_os("PATH").as_deref(),
-    )
-}
-
-/// [`reconcile_system_satisfied`] over an injected `PATH` value, so the rule is testable
-/// without mutating the process environment.
+///
+/// The `PATH` is INJECTED, never read here — the env-reading wrapper this used to
+/// carry is gone. A pass now reads `PATH` exactly once, at its own entry
+/// ([`install_default_set`]), and threads the one value to both consumers, so the
+/// answer to "what was on `PATH` during this pass" cannot differ between the
+/// system-satisfaction question and the shadow question.
 fn reconcile_system_satisfied_with(
     layout: &crate::store::Layout,
     index: &crate::manifest::Index,
@@ -4212,6 +4201,41 @@ fn install_default_set(
     lane: ProvisionLane,
     now: i64,
 ) -> DefaultSetOutcome {
+    install_default_set_with_path(
+        layout,
+        fetcher,
+        anchor,
+        cfg,
+        lane,
+        now,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`install_default_set`] over an INJECTED `PATH`, so a pass is testable without
+/// reading the developer's environment — the same split, for the same reason, as
+/// [`reconcile_system_satisfied`] / [`reconcile_system_satisfied_with`].
+///
+/// It is not a nicety. A pass answers two questions against `PATH` — "is a
+/// foreign copy of this tool ahead of ours" (`reconcile_shadowed`) and "is this
+/// program already satisfied by a system install"
+/// (`reconcile_system_satisfied_with`) — and both used to read the process
+/// environment from inside the pass. So a test's temp prefix was judged against
+/// the REAL machine: on any developer box with aterm's own toolchain installed
+/// (`~/Library/Application Support/aterm/pkg/bin` — i.e. the machine this is
+/// developed on), `ay` resolves outside the fixture prefix and the recorded row
+/// reads `managed <b> — SHADOWED by …` where the fixture expects `pinned by
+/// index …`. Two tests failed exactly there, on exactly the machines most likely
+/// to run them, and read as flakes rather than as the environment leak they were.
+fn install_default_set_with_path(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    anchor: &crate::Anchor,
+    cfg: &crate::config::PackagesConfig,
+    lane: ProvisionLane,
+    now: i64,
+    path_var: Option<&std::ffi::OsStr>,
+) -> DefaultSetOutcome {
     // Live-progress pass ownership (R5): when the GUI opted in via `--progress-file`
     // and no pass is live yet, this pass IS the "net" pass — begun here so its start
     // truncates the file, ended here so the terminal snapshot (pid cleared,
@@ -4223,7 +4247,7 @@ fn install_default_set(
     // channel exactly as it gates the stdout announcement (`net_announcement`).
     let owned_pass = lane == ProvisionLane::Network
         && progress_path().is_some_and(|p| crate::progress::begin_pass(p, lane.pass_name()));
-    let out = install_default_set_inner(layout, fetcher, anchor, cfg, lane, now);
+    let out = install_default_set_inner(layout, fetcher, anchor, cfg, lane, now, path_var);
     if owned_pass {
         crate::progress::end_pass();
     }
@@ -4239,6 +4263,7 @@ fn install_default_set_inner(
     cfg: &crate::config::PackagesConfig,
     lane: ProvisionLane,
     now: i64,
+    path_var: Option<&std::ffi::OsStr>,
 ) -> DefaultSetOutcome {
     let floor = build_floor(layout);
     let index = match crate::resolve_verified_index(fetcher, layout, anchor, floor, now) {
@@ -4296,7 +4321,7 @@ fn install_default_set_inner(
     // status row — and a managed copy it may have had is retired so the system binary
     // is the only one. If the system install later disappears the name simply stays
     // wanted-and-missing here and installs through its artifact like any other member.
-    for p in reconcile_system_satisfied(layout, &index, &wanted, &mut installed) {
+    for p in reconcile_system_satisfied_with(layout, &index, &wanted, &mut installed, path_var) {
         wanted.remove(&p);
     }
     // SERVE THIS TRIPLE OR SAY NOTHING. `wanted` so far is what the signed
@@ -4669,11 +4694,7 @@ fn install_default_set_inner(
     // exposed name a foreign copy precedes on PATH is recorded as SHADOWED — said, never
     // fixed — with `type alab-<tool> for the managed one` on the log line when the alias
     // just reconciled is what answers.
-    reconcile_shadowed(
-        layout,
-        index.index_build,
-        std::env::var_os("PATH").as_deref(),
-    );
+    reconcile_shadowed(layout, index.index_build, path_var);
     // Parity with the per-member install path: a wanted member the channel does not
     // PIN fails loudly as NotPinned — silence would hide a half-published index.
     for program in &wanted {
@@ -6935,6 +6956,49 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// EVERY FIXTURE PASS RUNS AGAINST AN EMPTY `PATH`.
+    ///
+    /// Deliberately shadowing [`super::install_default_set`] for the whole test
+    /// module, rather than editing sixteen call sites that a seventeenth could
+    /// then forget: a pass consults `PATH` twice — for a foreign copy ahead of
+    /// ours (`reconcile_shadowed`) and for a system install that already
+    /// satisfies a program (`reconcile_system_satisfied_with`) — and a fixture that
+    /// reads the DEVELOPER's `PATH` is judging a temp prefix against the real
+    /// machine.
+    ///
+    /// That is not hypothetical and it is not a flake. On any box with aterm's
+    /// own toolchain installed — `~/Library/Application Support/aterm/pkg/bin`,
+    /// i.e. the machine this crate is developed and dogfooded on — `ay` resolves
+    /// outside the fixture prefix, so the recorded row reads `managed 18 —
+    /// SHADOWED by …` where the fixture expects `pinned by index 41`, and
+    /// `a_program_whose_requirement_is_unmet_…` and
+    /// `an_index_listed_extra_gets_a_consent_stub_…` failed for exactly the
+    /// people most likely to run them. The shipping behaviour was right the
+    /// whole time; only the test's environment was ambient.
+    ///
+    /// An EMPTY value, not the real one filtered: it is the only setting that
+    /// cannot acquire a foreign binary later. A pass that wants to exercise
+    /// shadowing calls `super::install_default_set_with_path` and says which
+    /// `PATH` it means.
+    fn install_default_set(
+        layout: &crate::store::Layout,
+        fetcher: &dyn crate::flow::Fetcher,
+        anchor: &crate::Anchor,
+        cfg: &crate::config::PackagesConfig,
+        lane: super::ProvisionLane,
+        now: i64,
+    ) -> super::DefaultSetOutcome {
+        super::install_default_set_with_path(
+            layout,
+            fetcher,
+            anchor,
+            cfg,
+            lane,
+            now,
+            Some(std::ffi::OsStr::new("")),
+        )
+    }
+
 
     /// A FLAG IS NOT A PROGRAM. Measured on a live box: a mistyped
     /// `atpkg install --progress-file` recorded the flag as a wanted program,

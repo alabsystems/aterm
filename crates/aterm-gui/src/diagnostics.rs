@@ -1763,10 +1763,18 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
     }
     let config =
         aterm_toml::from_str::<crate::app_config::Config>(text).map_err(|e| e.to_string())?;
-    let mut warnings = config_semantic_warnings(&config)
-        .into_iter()
-        .map(|warning| warning.message)
-        .collect::<Vec<_>>();
+    // FIRST, because every other check below reads the PARSED `Config`, and a
+    // misspelled key never reaches it: serde admits unknown keys by design, so
+    // `cursor_trail_stlye = "…"` deserializes cleanly into a config where the
+    // field is simply unset. Without this walk the one mistake most likely to
+    // send someone here — "I changed a setting and nothing happened" — is the
+    // one mistake `--validate-config` reports as valid.
+    let mut warnings = crate::native_config_language::ignored_key_warnings(text);
+    warnings.extend(
+        config_semantic_warnings(&config)
+            .into_iter()
+            .map(|warning| warning.message),
+    );
     // W5h: keys the loaders warn-skip (falling back to a default) also flagged
     // here, so `--validate-config` can't false-green a config whose font/theme/
     // cursor/colours silently do nothing at load.
@@ -1812,6 +1820,16 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
             .into_iter()
             .map(|warning| warning.message),
     );
+    // LAST, and answered from the registry rather than by hand, because the
+    // checks above cover only the keys someone remembered to write a resolver
+    // warning for. Every other enum-valued key fails soft the same way — the
+    // value is kept in `Config`, the resolver quietly uses the default — so only
+    // this walk keeps `window_theme = "drak"` from being called valid. A key
+    // this build does not know and a value it does not accept are the same
+    // silence to the reader, and both must reach this answer. It runs after the
+    // bespoke lines so it can stand down for any key one of them already named.
+    let unaccepted = crate::native_config_language::unaccepted_value_warnings(text, &warnings);
+    warnings.extend(unaccepted);
     Ok(warnings)
 }
 
@@ -3169,6 +3187,69 @@ ink = "rainbow"
                 "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
             ]
         );
+    }
+
+    /// The mistake that most often sends someone to `--validate-config` is the
+    /// one it is least able to see from the parsed `Config`: serde admits an
+    /// unknown key silently, so a misspelling leaves the field simply unset and
+    /// every downstream check reads a config that looks clean. Reporting that
+    /// file as valid is the worst possible answer — the reader came asking why
+    /// their edit did nothing and left believing the file was fine.
+    #[test]
+    fn validate_refuses_to_green_light_a_config_whose_key_is_misspelled() {
+        let joined = validate_config_text("cursor_trail_stlye = \"rainbow kitty\"\n")
+            .expect("structurally valid TOML")
+            .join("\n");
+        assert!(
+            joined.contains("cursor_trail_stlye")
+                && joined.contains("did you mean \"cursor_trail_style\""),
+            "a misspelled key must be reported with its spelling: {joined}"
+        );
+        assert!(
+            validate_config_text("cursor_trail_style = \"rainbow kitty\"\n")
+                .expect("valid")
+                .is_empty(),
+            "the correct spelling must still validate green"
+        );
+    }
+
+    /// A hand-written check covers only the keys someone remembered to give a
+    /// resolver warning. Every other enum key fails soft identically —
+    /// `window_theme_or_default` and friends keep the default and print to a
+    /// stderr a dock launch has not got — so only the registry walk keeps such a
+    /// file from being reported valid. A value this build does not accept is a
+    /// green light exactly as wrong as a misspelled key's, and both are answered
+    /// here. One reported key per authored mistake, never two.
+    #[test]
+    fn validate_refuses_to_green_light_a_value_outside_the_vocabulary_it_accepts() {
+        for (source, key, intended) in [
+            ("window_theme = \"drak\"\n", "window_theme", "dark"),
+            ("motion = \"redcued\"\n", "motion", "reduced"),
+            ("right_click = \"of\"\n", "right_click", "off"),
+        ] {
+            let warnings = validate_config_text(source).expect("structurally valid TOML");
+            let joined = warnings.join("\n");
+            assert!(
+                joined.contains(key) && joined.contains(&format!("did you mean {intended:?}")),
+                "{key} must name {intended}: {joined}"
+            );
+        }
+        for accepted in ["window_theme = \"dark\"\n", "right_click = \"off\"\n"] {
+            let warnings = validate_config_text(accepted).expect("valid");
+            assert!(warnings.is_empty(), "{accepted:?} warned: {warnings:?}");
+        }
+        // The keys that DO have a resolver sentence keep exactly one — theirs.
+        for (source, key) in [
+            ("cursor_style = \"blok\"\n", "cursor_style"),
+            ("cursor_trail_style = \"phasr\"\n", "cursor_trail_style"),
+        ] {
+            let warnings = validate_config_text(source).expect("structurally valid TOML");
+            assert_eq!(
+                warnings.iter().filter(|line| line.starts_with(key)).count(),
+                1,
+                "{key} must be explained once, not twice: {warnings:?}"
+            );
+        }
     }
 
     /// An unknown `cursor_trail_style` silently draws the DEFAULT style at

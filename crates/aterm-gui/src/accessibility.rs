@@ -31,6 +31,17 @@ pub const LABEL: &str = "aterm terminal";
 ///
 /// Shared by the accessibility snapshot and the SIGUSR1 `.txt` snapshot so the two
 /// representations are always identical.
+///
+/// ONE CHARACTER PER CELL, WIDE GLYPHS INCLUDED. A double-width glyph occupies two
+/// cells and the engine fills its continuation with a space
+/// (`aterm_core::terminal::render_cells`), so a CJK or emoji line reaches an assistive
+/// client as `漢 字` and navigates as separate words. That pad is deliberate and
+/// load-bearing rather than an oversight: it is what makes the character index EQUAL the
+/// grid column, which every consumer of this text depends on — the caret offset, the
+/// published selection span, and the per-character positions that drive braille cursor
+/// routing all address the row by column. Dropping it would buy correct word navigation
+/// at the price of a caret that lands in the wrong place on every line with a wide glyph
+/// to its left.
 pub fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: usize) {
     for cell in cells.iter().take(cols) {
         text.push(if cell.ch == '\0' || cell.ch.is_control() {
@@ -78,15 +89,44 @@ impl AccessibleSnapshot {
         cols: usize,
         cursor: Option<(usize, usize)>,
     ) -> Self {
-        let rows = rows_cells.len();
-        let mut text = String::with_capacity(rows * (cols + 1));
-        for cells in rows_cells {
-            push_visible_row(&mut text, cells, cols);
+        Self::from_cells_in(rows_cells, 0..rows_cells.len(), 0..cols, cursor)
+    }
+
+    /// Build a snapshot of ONE RECTANGLE of the rendered rows — the projection a
+    /// split pane needs.
+    ///
+    /// A composed split frame carries every visible pane side by side on the same
+    /// rows, separated by a divider column. Read whole, a row of that frame is two
+    /// unrelated programs' output spliced together and a screen reader reads
+    /// nonsense; read through one pane's rectangle it is that pane's line. The
+    /// rectangle is taken from the SAME composed cells the frame was drawn from, so
+    /// a pane's announced text is the pane's painted text by construction.
+    ///
+    /// `cursor` is already PANE-LOCAL (the caller owns the pane's origin), and is
+    /// `None` for a pane whose cursor is not on screen.
+    ///
+    /// Rows and columns outside the supplied cells are simply absent rather than
+    /// clamped-with-padding: a short row yields a short line, exactly as the
+    /// whole-frame projection does.
+    #[must_use]
+    pub fn from_cells_in(
+        rows_cells: &[Vec<RenderCell>],
+        rows: std::ops::Range<usize>,
+        cols: std::ops::Range<usize>,
+        cursor: Option<(usize, usize)>,
+    ) -> Self {
+        let width = cols.len();
+        let mut text = String::with_capacity(rows.len() * (width + 1));
+        for r in rows.clone() {
+            let row: &[RenderCell] = rows_cells.get(r).map_or(&[], Vec::as_slice);
+            let start = cols.start.min(row.len());
+            let end = cols.end.max(cols.start).min(row.len());
+            push_visible_row(&mut text, &row[start..end], width);
         }
         Self {
             text,
-            rows,
-            cols,
+            rows: rows.len(),
+            cols: width,
             cursor,
         }
     }
@@ -262,6 +302,45 @@ mod tests {
         assert_eq!(s.rows, 3);
         // Cursor after "hello" → offset 5.
         assert_eq!(s.cursor_offset(), Some(5));
+    }
+
+    /// A composed split frame tiles both panes onto the SAME rows with a divider between
+    /// them, so the whole-frame projection reads two unrelated programs' output spliced
+    /// together on every line. Reading one pane's rectangle out of those same cells is
+    /// what gives that pane its own text — and it is the same cells, so the announced text
+    /// is the painted text.
+    #[test]
+    fn a_pane_rectangle_reads_only_its_own_columns() {
+        let mut term = Terminal::new(2, 21);
+        term.process(b"left\x1b[11G\xe2\x96\x90right");
+        let cells: Vec<Vec<RenderCell>> = (0..2).map(|r| term.render_row(r)).collect();
+
+        let whole = AccessibleSnapshot::from_cells(&cells, 21, None);
+        let composed = whole.value().lines().next().unwrap();
+        assert!(
+            composed.contains("left") && composed.contains("right"),
+            "the composed row carries both panes: {composed:?}"
+        );
+
+        let left = AccessibleSnapshot::from_cells_in(&cells, 0..2, 0..10, None);
+        let right = AccessibleSnapshot::from_cells_in(&cells, 0..2, 11..21, Some((0, 5)));
+        assert_eq!(left.value(), "left\n\n", "no divider, no neighbour");
+        assert_eq!(right.value(), "right\n\n");
+        assert_eq!((left.rows, left.cols), (2, 10));
+        assert_eq!(right.cursor_offset(), Some(5), "the pane-local caret");
+    }
+
+    /// The whole-frame projection is the rectangle that covers everything, so the two
+    /// cannot drift: `from_cells` is `from_cells_in` over the full grid.
+    #[test]
+    fn the_whole_frame_is_the_full_rectangle() {
+        let mut term = Terminal::new(3, 10);
+        term.process(b"hello\r\nworld");
+        let cells: Vec<Vec<RenderCell>> = (0..3).map(|r| term.render_row(r)).collect();
+        assert_eq!(
+            AccessibleSnapshot::from_cells(&cells, 10, Some((1, 2))),
+            AccessibleSnapshot::from_cells_in(&cells, 0..3, 0..10, Some((1, 2)))
+        );
     }
 
     #[test]

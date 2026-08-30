@@ -2098,6 +2098,7 @@ fn resolve_block_fill(
     fills: BlockFillSplice,
     cursor_color: u32,
     trail_color: u32,
+    cursor_base_pinned: bool,
 ) -> Option<crate::cursor_glow::BlockFill> {
     use crate::cursor_glow::{BlockFill, BlockFillOwner};
     let owned = |owner: BlockFillOwner, fill: Option<u32>| {
@@ -2105,11 +2106,21 @@ fn resolve_block_fill(
             owner,
             fill,
             base: match owner.base_from() {
-                crate::cursor_glow::BlockFillBase::CursorColor => Some(cursor_color),
+                // THE SENSOR REPORTS WHAT WAS HANDED, not what the owner would
+                // take if handed something. A `CursorColor` owner whose user
+                // pinned no colour was handed `None` and built from white
+                // (the tick's `cursor_base_pinned.then(..)`), so its base
+                // here is `None` too — or the row prints the theme's green
+                // beside a white pixel, and the sensor is lying about the
+                // exact thing it measures.
+                crate::cursor_glow::BlockFillBase::CursorColor => {
+                    cursor_base_pinned.then_some(cursor_color)
+                }
                 crate::cursor_glow::BlockFillBase::TrailColor => Some(trail_color),
                 // Handed nothing, and the row says so: the identity ramp is
                 // the whole story for these two.
-                crate::cursor_glow::BlockFillBase::StyleIdentity => None,
+                crate::cursor_glow::BlockFillBase::StyleIdentity
+                | crate::cursor_glow::BlockFillBase::White => None,
             },
         })
     };
@@ -13259,6 +13270,9 @@ mod terminal_cursor_color_tests {
                 wid,
                 CursorFxInputs {
                     live_cursor_rgb: rgb,
+                    // This fixture MODELS a pinned colour (OSC 12 / a configured
+                    // `cursor_color`): the value it feeds was asked for.
+                    cursor_color_pinned: true,
                     ..CursorFxInputs::sample_for_test(now)
                 },
             )
@@ -13331,6 +13345,9 @@ mod terminal_cursor_color_tests {
                 wid,
                 CursorFxInputs {
                     live_cursor_rgb: rgb,
+                    // This fixture MODELS a pinned colour (OSC 12 / a configured
+                    // `cursor_color`): the value it feeds was asked for.
+                    cursor_color_pinned: true,
                     ..CursorFxInputs::sample_for_test(now)
                 },
             )
@@ -13399,6 +13416,10 @@ mod terminal_cursor_color_tests {
                     wid,
                     CursorFxInputs {
                         live_cursor_rgb: rgb,
+                        // Pinned iff the test body wrote a `cursor_color`
+                        // into the config — the row's provenance must track
+                        // that switch, which is the whole point of the test.
+                        cursor_color_pinned: app.config.cursor_color.is_some(),
                         ..CursorFxInputs::sample_for_test(now)
                     },
                 )
@@ -13416,14 +13437,42 @@ mod terminal_cursor_color_tests {
             app.trail_status().expect("a front window exists")
         };
 
-        // The SHIPPED DEFAULT: the rainbow block owns the caret and blooms from
-        // the cursor colour it was handed.
+        // THE SHIPPED DEFAULT, UNPINNED: the rainbow block owns the caret and,
+        // with no `cursor_color` in the config, builds from WHITE — the caret
+        // is a white light the rainbow passes through (owner, 2026-08-29).
+        // The row says so honestly: `base=none from=white`. It used to print
+        // the theme's green here beside a white pixel, because the sensor
+        // reported the owner's DECLARED provenance rather than what it was
+        // handed — the sensor lying about the one thing it measures.
+        let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
+        assert!(
+            line.contains(" block_fill=rainbow")
+                && line.contains(" block_fill_base=none")
+                && line.contains(" block_fill_base_from=white"),
+            "an unpinned caret builds from white and the row must say so: {line}"
+        );
+        let painted = line
+            .split(" block_fill_rgb=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .expect("the row carries the painted colour");
+        assert!(
+            (painted >> 16) & 0xff > 200 && (painted >> 8) & 0xff > 200 && painted & 0xff > 200,
+            "the unpinned caret at rest is white, not the theme's cursor colour: \
+             got {painted:#08x}"
+        );
+
+        // …AND A PINNED COLOUR STILL REACHES THE CARET. This is the `d602f8cd`
+        // law — "the rainbow block ate OSC 12" — and it is what `cursor_color`
+        // provenance means: the user WROTE one, so the block blooms from it.
+        app.config.cursor_color = Some("#ff0000".into());
         let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
         assert!(
             line.contains(" block_fill=rainbow")
                 && line.contains(" block_fill_base=ff0000")
                 && line.contains(" block_fill_base_from=cursor_color"),
-            "the default style owns the caret and the row must say so: {line}"
+            "a pinned cursor colour reaches the caret and the row must say so: {line}"
         );
         // …and the colour it PAINTED, which is the caret on the glass. Since
         // the fix it tracks the base; the row prints both precisely so a build
@@ -19200,6 +19249,14 @@ pub(crate) struct CursorFxInputs {
     /// Effective live cursor colour: OSC 12 when set, otherwise the live OSC 10
     /// foreground. Rewires the glow/trail colours exactly like the cursor body.
     pub live_cursor_rgb: [u8; 3],
+    /// Whether `live_cursor_rgb` was PINNED — asked for by someone — rather
+    /// than being the theme's own seed. True when the user wrote a
+    /// `cursor_color` into the config, or a program sent a live OSC 12
+    /// (`Terminal::cursor_color_recoloured`). The rainbow and phaser blocks
+    /// wear a pinned colour and build from white otherwise; the value alone
+    /// cannot say which, because the theme seeds the terminal's slot and a
+    /// seeded green and a requested green arrive as the same three bytes.
+    pub cursor_color_pinned: bool,
     /// Live default background (DECSCNM-folded) — the rainbow's dark-theme input.
     pub default_bg: u32,
     /// Row probe `(row, caret, trust)` for this frame — the chars ride in
@@ -19256,6 +19313,10 @@ impl CursorFxInputs {
             cursor_style: CursorStyle::SteadyBlock,
             blink_phase: true,
             live_cursor_rgb: [255, 255, 255],
+            // A bare test sample pins nothing: the caret builds from white.
+            // A fixture modelling OSC 12 or a configured `cursor_color`
+            // sets this `true` itself — that is what "pinned" means.
+            cursor_color_pinned: false,
             default_bg: Theme::default().bg,
             row_probe: None,
             row_probe_neighbors: None,
@@ -19592,6 +19653,9 @@ struct FocusedComposedCursorFxSample {
     cursor_style: CursorStyle,
     display_offset: usize,
     live_cursor_rgb: [u8; 3],
+    /// A live OSC 12 over the theme's seed (`Terminal::cursor_color_recoloured`)
+    /// — the terminal's half of "was this colour pinned?".
+    cursor_recoloured: bool,
     default_bg: u32,
     /// Its twin — the effect layer's tint anchor. Sampled from the SAME blank
     /// cell as `default_bg` so a DECSCNM-swapped frame stays coherent, and
@@ -19654,6 +19718,10 @@ fn focused_composed_cursor_fx_sample(
         cursor_style: terminal.cursor_style(),
         display_offset,
         live_cursor_rgb: terminal_cursor_rgb(terminal),
+        // The terminal's half of "pinned": a live OSC 12 over the theme's
+        // seed. The config's half is folded in where `self.config` is in
+        // scope, at the CursorFxInputs build.
+        cursor_recoloured: terminal.cursor_color_recoloured(),
         default_bg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).bg),
         default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).fg),
         alt: terminal.is_alternate_screen(),
@@ -21104,6 +21172,7 @@ impl App {
             cursor_style,
             blink_phase,
             live_cursor_rgb,
+            cursor_color_pinned,
             default_bg,
             default_fg,
             row_probe,
@@ -21401,6 +21470,13 @@ impl App {
         // frame off `self.config`, so a config hot-reload or a Settings toggle
         // lights the body on the very next frame — which is exactly what a
         // "resolve it once at startup" gate would have broken.
+        // Was this cursor colour PINNED — asked for by the user (config) or a
+        // program (a live OSC 12)? The value alone cannot say: the theme
+        // seeds the terminal's slot, so a seeded green and a requested green
+        // arrive as the same bytes. The host decides at the input build,
+        // where both halves are in scope, and the caret reads the verdict.
+        // See the rainbow block's `base` below for what it decides.
+        let cursor_base_pinned = cursor_color_pinned;
         let rainbow_block = cursor_body_allowed
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0
@@ -21435,7 +21511,22 @@ impl App {
             // colour was reset to #0000FF. Every non-block shape was always
             // fine — they take no override — which is why the break read as
             // "the cursor colour never arrives" rather than "one effect eats it".
-            base: Some(aterm_render::rgb_to_u32(live_cursor_rgb)),
+            //
+            // THE CARET IS A WHITE LIGHT THE RAINBOW PASSES THROUGH (owner,
+            // 2026-08-29: *"the cursor is subtly changing to rainbow colors,
+            // but the base color should be white"*). The fix above was right
+            // and overshot: it took the cursor's colour whenever the terminal
+            // HELD one, but the theme seeds `tc.cursor_color` from its own
+            // scheme (`app_config.rs`, `if let Some(cur) = s.cursor`), so
+            // `term.cursor_color()` is `Some` on every default window and the
+            // shipped caret came up the theme's green (#50FA7B) with nothing
+            // having asked for it. The terminal cannot tell OSC 12 from the
+            // theme's seed; the config can. A colour the USER wrote is pinned
+            // and wins; an unset one falls to `None`, which the block resolves
+            // to `BASE_DARK_THEME` white — the only base from which every hue
+            // is an equal step, and the only one that cannot itself rotate a
+            // hue toward the banned cyan on the way to the ribbon's own.
+            base: cursor_base_pinned.then(|| aterm_render::rgb_to_u32(live_cursor_rgb)),
             // The ribbon emitter is the colour authority at the nozzle. Its
             // newest typing cell resolves through the exact presentation law
             // (continuous body centre or explicit underline's laid-hue bloom),
@@ -21612,8 +21703,9 @@ impl App {
             // ate OSC 12 / the configured `cursor_color` exactly as the shipped
             // default did — same `cursor_fill_override` seam, same reason
             // (`draw_cursor` and its GPU twin apply the override INSTEAD of
-            // `frame_cursor(input)`).
-            base: Some(aterm_render::rgb_to_u32(live_cursor_rgb)),
+            // `frame_cursor(input)`). Same pinned-or-white law as the rainbow
+            // block above, for the same reason.
+            base: cursor_base_pinned.then(|| aterm_render::rgb_to_u32(live_cursor_rgb)),
         };
         let phaser_frame = ws.cursor_phaser.tick(
             cur,
@@ -21763,6 +21855,7 @@ impl App {
                 },
                 terminal_cursor_color,
                 glow_cfg.color,
+                cursor_base_pinned,
             ),
             terminal_cursor_color,
             shed_env,
@@ -22098,6 +22191,7 @@ impl App {
             cursor_style,
             display_offset,
             live_cursor_rgb,
+            cursor_recoloured,
             default_bg,
             default_fg,
             alt,
@@ -22209,6 +22303,7 @@ impl App {
                 cursor_style,
                 blink_phase,
                 live_cursor_rgb,
+                cursor_color_pinned: self.config.cursor_color.is_some() || cursor_recoloured,
                 default_bg,
                 default_fg,
                 row_probe,
@@ -24572,6 +24667,9 @@ impl App {
             // of the presented `cursor_color` below — read ONCE so both stay
             // consistent.
             let live_cursor_rgb = terminal_cursor_rgb(&term);
+            // …and whether a program pinned it (a live OSC 12 over the
+            // theme's seed), read under the same lock as the colour itself.
+            let cursor_recoloured = term.cursor_color_recoloured();
             let epoch = term.damage_epoch();
             // PHOSPHOR: the weather machine's agent-output clock — advances on
             // CONTENT mutation only (never a pure viewport scroll), read here
@@ -24944,6 +25042,10 @@ impl App {
                     cursor_style,
                     blink_phase,
                     live_cursor_rgb,
+                    // Pinned by the user (config) or by a program (a live
+                    // OSC 12 over the theme's seed); the theme's own seed
+                    // pins nothing and the caret builds from white.
+                    cursor_color_pinned: self.config.cursor_color.is_some() || cursor_recoloured,
                     default_bg: default_bg_u32,
                     default_fg: default_fg_u32,
                     row_probe,
@@ -29550,6 +29652,7 @@ impl App {
         // OSC 10): recolours the wake/comet exactly like the single-pane
         // `tick_cursor_fx` (layout parity).
         let mut focus_cursor_rgb: Option<[u8; 3]> = None;
+        let mut focus_recoloured = false;
         // The focused pane's effective implicit background (OSC 10/11 +
         // DECSCNM), used by focused-pane-local effects even when other panes
         // make the window-wide base clear ambiguous.
@@ -29734,6 +29837,7 @@ impl App {
                 focus_off = (r.row_off, r.col_off);
                 focus_dims = (r.rows, r.cols);
                 focus_cursor_rgb = Some(terminal_cursor_rgb(&term));
+                focus_recoloured = term.cursor_color_recoloured();
                 focus_blank = terminal_blank_cell(&term);
                 focus_default_bg = aterm_render::rgb_to_u32(focus_blank.bg);
                 focus_title_sample = term.title_arc();
@@ -30153,6 +30257,7 @@ impl App {
                 cursor_style: focus_style,
                 blink_phase,
                 live_cursor_rgb,
+                cursor_color_pinned: self.config.cursor_color.is_some() || focus_recoloured,
                 default_bg: focus_default_bg,
                 default_fg: aterm_render::rgb_to_u32(focus_blank.fg),
                 row_probe: focus_probe,

@@ -106,10 +106,24 @@ fn sanitized(line: &str) -> String {
         .collect()
 }
 
+/// The two keys that answer the question, right-aligned on the title row and
+/// spoken as the a11y question's description. `pub(crate)` and named once: the
+/// banner a sighted user reads and the alert a screen reader hears must offer
+/// the SAME two answers, and a second literal is how they stop doing that.
+pub(crate) const ANSWER_KEYS: &str = "Enter pastes \u{00b7} Esc cancels";
+
+/// The QUESTION the banner asks about `text`, as one sentence.
+///
+/// The title row's words and the accessible alert's name come from here, so the
+/// pixels and the announcement cannot claim a different number of lines.
+pub(crate) fn question(text: &str) -> String {
+    format!("!  Paste {} lines?", text.lines().count())
+}
+
 /// PURE grid-cell row builder: exactly `panel_rows` rows, each exactly `cols`
 /// wide, so the splice overwrites frame rows in place (the `config_notice`
-/// contract). Row 0 carries the question ("!  Paste N lines?") with the two
-/// answer keys right-aligned; the following rows preview the paste body,
+/// contract). Row 0 carries the question ([`question`]) with the two answer keys
+/// ([`ANSWER_KEYS`]) right-aligned; the following rows preview the paste body,
 /// sanitized and ellipsized, with a "+N more lines" tally when it overflows.
 pub(crate) fn banner_rows(
     text: &str,
@@ -125,14 +139,21 @@ pub(crate) fn banner_rows(
         return rows;
     }
     let lines: Vec<&str> = text.lines().collect();
-    let title = format!("!  Paste {} lines?", lines.len());
+    let title = question(text);
     write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
-    // The two keys that answer the question. `value` (not the dim `label`): this
-    // is not an aside — it is the only way to answer, so it reads at full tone.
-    const KEYS: &str = "Enter pastes \u{00b7} Esc cancels";
-    let keys_col = cols.saturating_sub(KEYS.chars().count() + MARGIN);
+    // `value` (not the dim `label`): the answer keys are not an aside — they are
+    // the only way to answer, so they read at full tone.
+    let keys_col = cols.saturating_sub(ANSWER_KEYS.chars().count() + MARGIN);
     if keys_col > MARGIN + title.chars().count() + 2 {
-        write_str(&mut rows[0], cols, keys_col, KEYS, c.value, c.bar_bg, true);
+        write_str(
+            &mut rows[0],
+            cols,
+            keys_col,
+            ANSWER_KEYS,
+            c.value,
+            c.bar_bg,
+            true,
+        );
     }
 
     // Preview capacity: every row after the title, reserving the last for the

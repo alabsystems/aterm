@@ -285,6 +285,22 @@ impl Terminal {
         self.color.cursor_color
     }
 
+    /// Whether a program has RECOLOURED the cursor over the host's baseline —
+    /// a live OSC 12 that OSC 112 / RIS has not yet reset.
+    ///
+    /// [`Self::set_default_cursor_color`] seeds BOTH the live value and the
+    /// reset baseline from the theme, so [`Self::cursor_color`] being `Some`
+    /// says nothing about whether anyone asked for that colour: on every
+    /// default window it is the theme's own seed. The two slots diverge only
+    /// when OSC 12 writes the live one, and re-converge when OSC 112 restores
+    /// the baseline. That divergence is the one honest answer to "did a
+    /// program pin this colour?", and it is what a cursor effect needs to
+    /// decide whether the caret wears the terminal's colour or its own.
+    #[must_use]
+    pub fn cursor_color_recoloured(&self) -> bool {
+        self.color.cursor_color != self.color.configured_cursor
+    }
+
     /// Get the selection background color, if explicitly set.
     ///
     /// Returns `None` if the selection uses the renderer default color.

@@ -10830,6 +10830,7 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     preflight_mirror_target(&slug)?;
 
     let observed = unique_release_object_by_tag(&slug, &ctx.tag)?;
+    let mut adopted_published = false;
     let release_id = match mirror::mirror_plan(
         ctx.mirror_create_issued,
         observed.as_ref().map(|release| release.draft),
@@ -10877,12 +10878,67 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
             release.id
         }
         mirror::MirrorPlan::ConvergePublished => {
-            // Our own flip landed and the journal mark did not — the only
-            // benign reading. Prove the live channel head really is THIS build
-            // before treating it as ours; anything else is a foreign release
-            // sitting on our tag, and adopting it would publish someone else's
-            // bytes as this cut.
+            // TWO benign readings since the source/binary tag unification.
+            // Either our own flip landed and the journal mark did not — or the
+            // SOURCE publish owns the tag: `pub publish` runs first by enforced
+            // order and creates the public vX.Y.0 release carrying only its
+            // attestation pair (and the roster pair it re-uploads). The
+            // discriminator is exact: a source release carries ZERO elected
+            // binary assets; our own flip carries the full set. Anything in
+            // between — a partial binary set — is foreign, and adopting it
+            // would publish someone else's bytes as this cut.
             let release = observed.expect("visible published decision");
+            let names: Vec<String> = release_asset_inventory_for_release_id(&slug, release.id)?
+                .into_iter()
+                .map(|asset| asset.name)
+                .collect();
+            let elected = mirror::required_asset_names(
+                &ctx.version,
+                ctx.signature_required,
+                ctx.attaches_roster(),
+            );
+            // The roster pair is BOTH elected and legitimately pub-uploaded
+            // (the source publish re-attaches it), so it cannot discriminate;
+            // only a binary/appcast asset proves a flip happened here.
+            let carries_any_elected = names.iter().any(|n| {
+                elected.contains(n)
+                    && n != aterm_update_core::roster::ROSTER_ASSET
+                    && n != aterm_update_core::roster::ROSTER_SIG_ASSET
+            });
+            let only_source_shapes = names.iter().all(|n| {
+                mirror::SOURCE_ATTESTATION_ASSETS.contains(&n.as_str())
+                    || n == aterm_update_core::roster::ROSTER_ASSET
+                    || n == aterm_update_core::roster::ROSTER_SIG_ASSET
+            });
+            if ctx.mirror_create_issued {
+                // OUR durable adoption from a previous pass — a crash between
+                // intent and completion resumes here with a partial asset set,
+                // which must read as ours-in-progress, never as foreign.
+                step(
+                    "mirror",
+                    &format!("{} on {slug} — resuming this cut's own shared-tag convergence", ctx.tag),
+                );
+                adopted_published = true;
+                release.id
+            } else if !carries_any_elected && only_source_shapes {
+                // Adopting the source release binds its ID, and the journal's
+                // invariant is that an ID implies OUR durable create intent —
+                // that pairing is the one-shot protocol. So the adoption is made
+                // durable FIRST (the permit is deliberately unused: nothing will
+                // POST, the visible release IS the object the intent covers),
+                // and only then is the ID bound. A crash after this resumes into
+                // the arm above.
+                let _adoption = ctx.persist_mirror_create_intent()?;
+                step(
+                    "mirror",
+                    &format!(
+                        "{} on {slug} is the SOURCE release (attestation pair, no                          binaries) — converging this cut's assets onto the shared tag",
+                        ctx.tag
+                    ),
+                );
+                adopted_published = true;
+                release.id
+            } else {
             prove_mirror_channel_head(ctx, &slug, release.id)?;
             // AND THE ANONYMOUS PROOF, for the same reason the flip path runs it —
             // every check above rode the release-org credential. Omitting it here made
@@ -10903,13 +10959,24 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
                 ),
             );
             return Ok(());
+            }
         }
     };
     ctx.bind_mirror_release_id(release_id)?;
     let reread = release_object_by_id(&slug, release_id)?;
-    validate_mirror_release_capability(reread.as_ref(), release_id, &ctx.tag, true)?;
+    validate_mirror_release_capability(reread.as_ref(), release_id, &ctx.tag, !adopted_published)?;
 
-    for file in ctx.mirror_asset_paths() {
+    let mut upload_paths = ctx.mirror_asset_paths();
+    if adopted_published {
+        // The release is ALREADY VISIBLE, so upload order is client-visible:
+        // the appcast pair is what makes a head electable, and it must land
+        // after every byte it names, or a client arriving mid-mirror elects a
+        // head whose assets 404. On the draft path order is irrelevant.
+        upload_paths.sort_by_key(|p| {
+            p.file_name().is_some_and(|n| n.to_string_lossy().contains("appcast"))
+        });
+    }
+    for file in upload_paths {
         if !file.is_file() {
             return Err(Error::new(format!(
                 "mirror asset missing: {} — this cut's dist/ artifacts are gone, so the \
@@ -10918,7 +10985,7 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
                 file.display()
             )));
         }
-        upload_mirror_asset(ctx, &slug, release_id, &file)?;
+        upload_mirror_asset(ctx, &slug, release_id, &file, !adopted_published)?;
     }
 
     // Prove, from a FRESH remote listing, that the draft carries exactly the
@@ -10926,7 +10993,7 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     // objects is byte-identical to the artifact `verify` just proved live on
     // the private repo. Both proofs happen while the release is still a draft:
     // a channel head is never allowed to become visible unproven.
-    prove_mirror_draft_assets(ctx, &slug, release_id)?;
+    prove_mirror_draft_assets(ctx, &slug, release_id, !adopted_published)?;
 
     // THE LAST LOOK BEFORE THE FLEET CAN SEE IT. Every earlier ratchet (lock,
     // selfcheck, preflip, flip) ran against the ORIGIN, and a resume can reach this
@@ -10951,16 +11018,23 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     }
     roster_floor_covered(carried, fleet_roster.as_ref().map(|(seq, _)| *seq))?;
 
-    let endpoint = format!("repos/{slug}/releases/{release_id}");
-    gh_retry_guarded(
-        &["api", "--method", "PATCH", &endpoint, "-F", "draft=false"],
-        || {
-            let current = release_object_by_id(&slug, release_id)?;
-            validate_mirror_release_capability(current.as_ref(), release_id, &ctx.tag, true)?;
-            ensure_ctx_release_lease(ctx)?;
-            Ok(())
-        },
-    )?;
+    if adopted_published {
+        step(
+            "mirror",
+            "adopted published source release — already visible; no flip to perform",
+        );
+    } else {
+        let endpoint = format!("repos/{slug}/releases/{release_id}");
+        gh_retry_guarded(
+            &["api", "--method", "PATCH", &endpoint, "-F", "draft=false"],
+            || {
+                let current = release_object_by_id(&slug, release_id)?;
+                validate_mirror_release_capability(current.as_ref(), release_id, &ctx.tag, true)?;
+                ensure_ctx_release_lease(ctx)?;
+                Ok(())
+            },
+        )?;
+    }
     let after = release_object_by_id(&slug, release_id)?;
     validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
     prove_mirror_channel_head(ctx, &slug, release_id)?;
@@ -11224,7 +11298,13 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
 /// authority already exists on the private repo, so a mismatch means something
 /// unexpected is holding our tag on the public channel and the safe move is to
 /// stop and let a human look.
-fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Path) -> Result<()> {
+fn upload_mirror_asset(
+    ctx: &mut CutCtx,
+    slug: &str,
+    release_id: u64,
+    file: &Path,
+    expect_draft: bool,
+) -> Result<()> {
     let name = file
         .file_name()
         .and_then(|name| name.to_str())
@@ -11247,16 +11327,51 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
             )));
         }
         DurablePostDecision::ConvergeVisible => {
-            verify_release_asset_id_matches_local(slug, release_id, name, file).map_err(
-                |error| {
-                    Error::new(format!(
+            match verify_release_asset_id_matches_local(slug, release_id, name, file) {
+                Ok(_verified) => return Ok(()),
+                // THE ONE PERMITTED REPLACEMENT. On an adopted shared tag the
+                // source publish attached its own roster pair, and that copy
+                // can be STALE relative to the roster this cut verified on the
+                // origin release — the document the fleet's ratchet is judged
+                // against. Replacement is gated three ways: the adopted path
+                // only (a draft convergence never meets a foreign asset), the
+                // roster pair only (nothing else overlaps), and a mismatch
+                // only. The stale object is deleted by its immutable ID and
+                // the verified bytes go up through the same one-shot POST and
+                // re-download proof as any other asset.
+                Err(error)
+                    if !expect_draft
+                        && (name == aterm_update_core::roster::ROSTER_ASSET
+                            || name == aterm_update_core::roster::ROSTER_SIG_ASSET) =>
+                {
+                    let (stale_id, _stale_size) =
+                        observed.as_ref().expect("ConvergeVisible implies observed");
+                    step(
+                        "mirror",
+                        &format!(
+                            "replacing stale source-published {name} (asset ID {}) with \
+                             this cut's origin-verified bytes: {error}",
+                            stale_id
+                        ),
+                    );
+                    let endpoint = format!("repos/{slug}/releases/assets/{stale_id}");
+                    let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
+                    if !out.success() {
+                        return Err(Error::new(format!(
+                            "failed to delete stale {name} (asset ID {stale_id}) on {slug}: {}",
+                            out.stderr_utf8().trim()
+                        )));
+                    }
+                    // fall through to the one-shot POST below
+                }
+                Err(error) => {
+                    return Err(Error::new(format!(
                         "mirror asset {name} on {slug} already exists with different bytes than \
                          the verified release artifact; refusing to overwrite a public-channel \
                          object. Inspect release ID {release_id} on {slug} by hand: {error}"
-                    ))
-                },
-            )?;
-            return Ok(());
+                    )));
+                }
+            }
         }
         DurablePostDecision::PersistIntentThenPost => {}
     }
@@ -11264,7 +11379,7 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
     let post = OneShotPost::prepare_binary("mirror asset", &endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(release.as_ref(), release_id, &ctx.tag, true)?;
+    validate_mirror_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
     ensure_ctx_release_lease(ctx)?;
     let permit = ctx.persist_mirror_upload_intent(name)?;
     let out = post.issue(permit)?;
@@ -11295,9 +11410,14 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
 /// Prove the still-invisible mirrored draft carries EXACTLY the asset set the
 /// deployed updater elects, and that each of those objects is byte-identical to
 /// the local artifact `verify` proved live on the private repo.
-fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
+fn prove_mirror_draft_assets(
+    ctx: &CutCtx,
+    slug: &str,
+    release_id: u64,
+    expect_draft: bool,
+) -> Result<()> {
     let before = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(before.as_ref(), release_id, &ctx.tag, true)?;
+    validate_mirror_release_capability(before.as_ref(), release_id, &ctx.tag, expect_draft)?;
     let inventory_before = release_asset_inventory_for_release_id(slug, release_id)?;
     let names: Vec<String> = inventory_before
         .iter()
@@ -11323,7 +11443,7 @@ fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         ));
     }
     let after = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, true)?;
+    validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, expect_draft)?;
     Ok(())
 }
 

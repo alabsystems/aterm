@@ -1666,14 +1666,38 @@ impl App {
         } else {
             Vec::new()
         };
-        // The status bars' spoken lines — the rows are real chrome above the
-        // grid, so a tree without them describes a taller terminal than the one
-        // on glass and drops the only announcement of background work.
-        let grid_status_bars = if grid_snap.is_some() {
-            self.status_bars.spoken_lines()
+        // The rest of what the frame carries beyond its rows: the split panes it was
+        // composed from, the painted selection, and the find panel's own field. All read
+        // from the SAME presented `input_scratch` the rows came from, so a screen reader
+        // is described the frame that is on the glass, not a fresher one.
+        let grid_panes = if grid_snap.is_some() {
+            self.grid_a11y_panes(wid)
         } else {
             Vec::new()
         };
+        let grid_selection = grid_snap
+            .as_ref()
+            .filter(|_| grid_panes.is_empty())
+            .and_then(|snap| self.grid_a11y_selection(wid, snap, 0, 0..snap.cols));
+        let grid_find = grid_snap
+            .is_some()
+            .then(|| self.grid_a11y_find(wid))
+            .flatten();
+        // The chrome messages this window is showing. Built for the GRID tree only: an
+        // overlay and a native tab app own the whole tree while they are up, and the
+        // bands/cards are not on their glass either.
+        let grid_messages = if grid_snap.is_some() {
+            self.grid_a11y_messages(wid)
+        } else {
+            Vec::new()
+        };
+        // The window's chrome title, so the accessible WINDOW is named the same thing the
+        // titlebar names it. Cloned out before the mutable borrow below.
+        let window_title = self
+            .windows
+            .get(&wid)
+            .map(|ws| ws.current_title.clone())
+            .unwrap_or_default();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1689,8 +1713,14 @@ impl App {
                         crate::accesskit_tree::grid_tree(
                             snap,
                             grid_geometry,
-                            &grid_tabs,
-                            &grid_status_bars,
+                            &crate::accesskit_tree::GridFrame {
+                                tabs: &grid_tabs,
+                                panes: &grid_panes,
+                                selection: grid_selection,
+                                find: grid_find.as_ref(),
+                                messages: &grid_messages,
+                                window_title: &window_title,
+                            },
                         ),
                         None,
                     ),
@@ -1796,6 +1826,412 @@ impl App {
             .collect()
     }
 
+    /// Window `wid`'s visible SPLIT PANES as one publishable terminal document each, or
+    /// empty when the frame is a single document.
+    ///
+    /// A composed split tiles every pane onto the same frame rows with a divider column
+    /// between them, so the whole-frame projection reads as two unrelated programs' output
+    /// spliced together on every line — with nothing to say which half is which, or which
+    /// one the keyboard is in. Slicing each pane's rectangle out of the SAME composed
+    /// cells the frame was drawn from restores one document per pane without inventing a
+    /// second source of truth.
+    ///
+    /// Empty for a single pane and for a ZOOMED tab — the same `len() > 1 && !is_zoomed()`
+    /// predicate `splice_find_bar` uses, because a zoomed pane genuinely renders through
+    /// the single-pane path and IS one document.
+    ///
+    /// A pane's id slot is its position in the layout. Closing a pane therefore renumbers
+    /// the survivors' rows, which is correct: a closed pane is a structural change, not a
+    /// line of output, and the consumer should rebuild rather than diff.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_panes(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridPane> {
+        let Some(tree) = self.active_tree(wid) else {
+            return Vec::new();
+        };
+        if tree.len() < 2 || tree.is_zoomed() {
+            return Vec::new();
+        }
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let focus = tree.focus();
+        let rects = tree.compute_layout(ws.rows, ws.cols);
+        let strip = usize::from(self.chrome_rows());
+        let total = rects.len();
+        rects
+            .iter()
+            .enumerate()
+            .map(|(slot, r)| {
+                let row_off = usize::from(r.row_off);
+                let col_off = usize::from(r.col_off);
+                let rows = usize::from(r.rows);
+                let cols = usize::from(r.cols);
+                // The composed frame carries ONE cursor — the focused pane's — so a
+                // sibling honestly publishes none rather than borrowing it.
+                let cursor = (ws.input_scratch.cursor_visible && r.session == focus)
+                    .then(|| {
+                        let crow = ws.input_scratch.cursor_row.saturating_sub(strip);
+                        let ccol = ws.input_scratch.cursor_col;
+                        (crow >= row_off
+                            && crow < row_off + rows
+                            && ccol >= col_off
+                            && ccol < col_off + cols)
+                            .then_some((crow - row_off, ccol - col_off))
+                    })
+                    .flatten();
+                let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
+                    &ws.input_scratch.cells,
+                    strip + row_off..strip + row_off + rows,
+                    col_off..col_off + cols,
+                    cursor,
+                );
+                let selection =
+                    self.grid_a11y_selection(wid, &snap, row_off, col_off..col_off + cols);
+                crate::accesskit_tree::GridPane {
+                    slot,
+                    label: format!(
+                        "{} — pane {} of {total}",
+                        crate::accessibility::LABEL,
+                        slot + 1
+                    ),
+                    snap,
+                    row_off,
+                    col_off,
+                    focused: r.session == focus,
+                    selection,
+                }
+            })
+            .collect()
+    }
+
+    /// The PAINTED selection covering one published document — the whole visible grid
+    /// (`row_off = 0`, the full column range) or one pane's rectangle.
+    ///
+    /// Read from `RenderInput::selection_row_key`, the renderer's OWN per-row, per-entry
+    /// selection list, so the reader and the glass are told from the SAME SOURCE. Not
+    /// exact equality at every edge: the band is painted per CELL through
+    /// `TextSelection::contains_cell`, which snaps a double-width glyph whole, while this
+    /// list is the damage key and is content-independent — an edge landing on a wide
+    /// LEAD paints one column past what the span states. The divergence is one cell at a
+    /// wide glyph's boundary and never a whole run, which is what makes the spans usable
+    /// here at all. The per-ENTRY form is what makes a split honest —
+    /// the hull `selection_row_span` returns would merge two panes' spans into one that
+    /// covers the divider between them.
+    ///
+    /// `None` for no selection AND for one that collapses to a point after clipping, so a
+    /// click that selected nothing leaves the terminal's own caret published rather than
+    /// dragging it to the press.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_selection(
+        &self,
+        wid: crate::WindowId,
+        snap: &crate::accessibility::AccessibleSnapshot,
+        row_off: usize,
+        cols: std::ops::Range<usize>,
+    ) -> Option<crate::accesskit_tree::GridSpan> {
+        let ws = self.windows.get(&wid)?;
+        let strip = usize::from(self.chrome_rows());
+        let mut keys: Vec<aterm_core::render::SelectionRowKey> = Vec::new();
+        let mut anchor: Option<(usize, usize)> = None;
+        let mut focus: Option<(usize, usize)> = None;
+        for (row, line) in snap.value().split_inclusive('\n').enumerate() {
+            ws.input_scratch
+                .selection_row_key(strip + row_off + row, &mut keys);
+            // Clip each entry to this document's columns and take the hull of what
+            // survives: within one pane's box the entries cannot overlap, and for the
+            // single-document case there is only ever one.
+            let Some((lo, hi)) = keys
+                .iter()
+                .filter_map(|k| {
+                    let lo = usize::from(k.lo).max(cols.start);
+                    let hi = usize::from(k.hi).min(cols.end.saturating_sub(1));
+                    (lo <= hi).then_some((lo, hi))
+                })
+                .reduce(|(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)))
+            else {
+                continue;
+            };
+            // The published text has this row's trailing blanks trimmed, so a span
+            // running into them ends at the row's last real character.
+            let trimmed = line.strip_suffix('\n').unwrap_or(line).chars().count();
+            let start = lo.saturating_sub(cols.start).min(trimmed);
+            let end = (hi.saturating_sub(cols.start) + 1).min(trimmed);
+            anchor.get_or_insert((row, start));
+            focus = Some((row, end));
+        }
+        let (anchor, focus) = (anchor?, focus?);
+        (anchor != focus).then_some(crate::accesskit_tree::GridSpan { anchor, focus })
+    }
+
+    /// The find panel's query FIELD for window `wid`, or `None` when find mode is not up.
+    ///
+    /// The panel paints as terminal cells, so its text already reaches the grid document —
+    /// as anonymous output, with the caret still on the shell prompt. This is the node that
+    /// makes it a field a screen reader can be IN: the live query, the caret inside it, and
+    /// the panel's own answer (`match 2 of 7`, `no matches`, `bad regex`) plus the active
+    /// modes as the description. The strings mirror `FindBarView`'s, so what is announced
+    /// and what is painted say the same thing.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_find(&self, wid: crate::WindowId) -> Option<crate::accesskit_tree::GridFind> {
+        let search = self.windows.get(&wid)?.search.as_ref()?;
+        // `SearchState::cursor` is a BYTE offset on a char boundary; the a11y caret is a
+        // character index into the same string.
+        let caret = search
+            .query
+            .get(..search.cursor)
+            .map_or_else(|| search.query.chars().count(), |head| head.chars().count());
+        // FOLLOW THE PAINTER, including where it says nothing. `status_seg` returns
+        // None for an empty query — a field nobody has typed into has found neither
+        // everything nor nothing — so announcing "no matches" there would have a reader
+        // hear a verdict the glass never gives. And the partial-history marker rides the
+        // COUNT form too, not just the empty one: a count drawn from an index that did
+        // not reach the whole history is a floor, and a reader is owed that qualifier for
+        // the same reason the painter keeps its `+` at every width.
+        let mut status: Vec<String> = Vec::new();
+        if search.regex_error {
+            status.push("bad regex".to_string());
+        } else if search.query.is_empty() {
+        } else if search.matches.is_empty() {
+            status.push(if search.truncated {
+                "no matches (partial history)".to_string()
+            } else {
+                "no matches".to_string()
+            });
+        } else {
+            status.push(format!(
+                "match {} of {}{}",
+                search.current + 1,
+                search.matches.len(),
+                if search.truncated {
+                    " (partial history)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if search.case_sensitive {
+            status.push("case sensitive".to_string());
+        }
+        if search.is_regex {
+            status.push("regular expression".to_string());
+        }
+        Some(crate::accesskit_tree::GridFind {
+            query: search.query.clone(),
+            caret,
+            status: status.join("; "),
+        })
+    }
+
+    /// The CHROME MESSAGES window `wid` is showing right now — the surfaces that speak to
+    /// the user unprompted and then leave.
+    ///
+    /// These are the one class of surface a screen reader cannot find by exploring: by
+    /// the time the user goes looking, a notice has faded and a status band has folded.
+    /// Three of the four paint as terminal cells, so their words did reach the grid
+    /// document as anonymous output; the transient card does not paint cells at all, so
+    /// until it was published here its sentence existed only as pixels.
+    ///
+    /// EVERY ENTRY IS GATED ON THE SAME PREDICATE THE PIXELS ARE. The notice asks
+    /// [`crate::WindowState::notice_is_on_glass`] — `App::notice` is global and its card
+    /// can be absent in this window — and the status bands ask the committed
+    /// `status_bar_rows`, so a message is announced when and only when it is on the glass
+    /// of THIS window.
+    ///
+    /// AND EVERY ENTRY IS CUT WHERE THE PIXELS ARE CUT. What a live region says is spoken
+    /// in full the instant it changes, so a sentence longer than the row it describes
+    /// tells a listener about a screen no one is looking at — the config band's raw lines
+    /// are whole diagnostics, and it takes its words from
+    /// [`crate::config_notice::band_text`] at the frame's own width.
+    ///
+    /// The split between the announced sentence and the description is deliberate and is
+    /// what keeps a live region from becoming a flood: a band's `title`/`detail` change
+    /// only when the work moves to a new phase, while its `stats` tick with every
+    /// megabyte. Announcing the figures would say the bar aloud a hundred times on the
+    /// way to 100%.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_messages(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridMessage> {
+        use crate::accesskit_tree::{ChromeMessage, GridMessage};
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let mut out: Vec<GridMessage> = Vec::new();
+
+        // The status bands, top to bottom, but only the ones whose rows the geometry has
+        // actually committed — `splice_status_bars` trims its painted cache to that count
+        // too, so the tree can never describe a band the frame does not carry.
+        for (row, (lane, bar)) in self
+            .status_bars
+            .bars()
+            .take(usize::from(self.status_bar_rows))
+            .enumerate()
+        {
+            let mut text = bar.text.title.clone();
+            if !bar.text.detail.is_empty() {
+                text.push_str(" \u{00b7} ");
+                text.push_str(&bar.text.detail);
+            }
+            out.push(GridMessage {
+                message: match lane {
+                    crate::status_bars::Lane::Toolchain => ChromeMessage::ToolchainStatus,
+                    crate::status_bars::Lane::Update => ChromeMessage::UpdateStatus,
+                },
+                text,
+                detail: (!bar.text.stats.is_empty()).then(|| bar.text.stats.clone()),
+                progress: bar.fill,
+                // A press on a band opens its deliberate surface (Settings ▸ Packages /
+                // Software Update), and so does a screen reader's activate.
+                activates: true,
+                // The row this band reserved, which is where the tree says it is —
+                // `bars()` yields them in the painted order the splice consumes.
+                bar_row: Some(row),
+            });
+        }
+
+        // The multi-line-paste confirmation: a question, and on this platform the only
+        // one the pastejacking guard asks. Announced ASSERTIVELY (see
+        // `ChromeMessage::politeness`) because nothing reaches the PTY until it is
+        // answered, and the answer keys are the description because they never change.
+        if let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) {
+            out.push(GridMessage {
+                message: ChromeMessage::PasteConfirm,
+                text: crate::paste_banner::question(pending.text()),
+                detail: Some(crate::paste_banner::ANSWER_KEYS.to_string()),
+                progress: None,
+                // Enter and Escape answer it. A screen reader's Click carries neither
+                // meaning, and guessing one on a security prompt is the wrong default.
+                activates: false,
+                // The band overwrites the frame's top rows rather than reserving a row of
+                // its own, so it has no rectangle of its own to publish.
+                bar_row: None,
+            });
+        }
+
+        // The config-load/reload warnings. GLOBAL (config is window-uniform), like the
+        // band the painter splices into every window.
+        //
+        // BOUNDED THE WAY THE BAND IS BOUNDED, from the same builder and the same
+        // `cols`/`panel_rows` `splice_config_notice` passes it. The raw `lines` behind
+        // this banner are whole diagnostics — a rejected `aterm.toml` reaches here as a
+        // TOML parse error with embedded newlines and a caret diagram — and announcing
+        // that paragraph while painting one ellipsized row tells a screen reader about a
+        // screen no sighted user is looking at.
+        if let Some(notice) = self.config_notice.as_ref() {
+            let panel_rows = notice.wanted_rows().min(ws.input_scratch.cells.len());
+            let band =
+                crate::config_notice::band_text(&notice.lines, usize::from(ws.cols), panel_rows);
+            let mut rows = band.warnings.iter().chain(band.more.iter());
+            // The title plus the FIRST warning as painted: one sentence, the length of
+            // one row. Everything else the band shows is there to be read on demand.
+            if panel_rows > 0 {
+                let spoken = match rows.next() {
+                    Some(first) => format!("{} \u{00b7} {first}", band.title),
+                    None => band.title.clone(),
+                };
+                let rest: Vec<&str> = rows.map(String::as_str).collect();
+                out.push(GridMessage {
+                    message: ChromeMessage::ConfigWarning,
+                    text: spoken,
+                    detail: (!rest.is_empty()).then(|| rest.join("; ")),
+                    progress: None,
+                    activates: false,
+                    bar_row: None,
+                });
+            }
+        }
+
+        // The transient card. `notice_is_on_glass` is the predicate every side effect on
+        // this card already has to ask; announcing a card the compositor never showed in
+        // THIS window would be the same lie in a different sense.
+        if let Some(notice) = self.notice.as_ref().filter(|_| ws.notice_is_on_glass()) {
+            out.push(GridMessage {
+                message: ChromeMessage::Notice,
+                text: notice.text(),
+                detail: None,
+                progress: None,
+                // Only the update pill does anything when clicked, and only while it is
+                // still legible — the exact pair of gates `App::notice_click` applies, so
+                // the tree never offers an action the pixels do not have.
+                activates: notice.is_update_ready()
+                    && notice.alpha(std::time::Instant::now()) >= crate::notice::CLICK_MIN_ALPHA,
+                // A floating card that slides through its whole life is not a place on
+                // the glass; a rectangle here would name where it was one frame ago.
+                bar_row: None,
+            });
+        }
+        out
+    }
+
+    /// A screen reader activated one of window `wid`'s chrome messages.
+    ///
+    /// RE-CHECKED, NOT TRUSTED. The request names a node from a tree published some
+    /// frames ago; the card may have faded and the band may have folded since. Every arm
+    /// therefore asks the SAME live question the pointer path asks before it does
+    /// anything, so an activate can never reach a surface a click could not — which on
+    /// the update pill is the difference between "apply the staged build" and "re-exec
+    /// the app from a patch of blank terminal".
+    #[cfg(a11y_tree)]
+    fn activate_a11y_message(
+        &mut self,
+        wid: crate::WindowId,
+        message: crate::accesskit_tree::ChromeMessage,
+    ) {
+        use crate::accesskit_tree::ChromeMessage;
+        match message {
+            ChromeMessage::Notice => {
+                // `App::notice_click`'s gates, minus its hit test: the card must be on
+                // THIS window's glass and still legible.
+                let Some(notice) = self.notice.as_ref() else {
+                    return;
+                };
+                if !self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(crate::WindowState::notice_is_on_glass)
+                    || notice.alpha(std::time::Instant::now()) < crate::notice::CLICK_MIN_ALPHA
+                {
+                    return;
+                }
+                let actionable = notice.is_update_ready();
+                self.notice = None;
+                if actionable {
+                    self.apply_update_or_details();
+                }
+                self.request_redraw_all_windows();
+            }
+            // The band's own click route (`App::on_mouse_button`): open the lane's
+            // deliberate surface. Gated on the band still occupying a committed row, so
+            // an activate on a folded bar opens nothing.
+            ChromeMessage::ToolchainStatus | ChromeMessage::UpdateStatus => {
+                let lane = match message {
+                    ChromeMessage::ToolchainStatus => crate::status_bars::Lane::Toolchain,
+                    _ => crate::status_bars::Lane::Update,
+                };
+                let live = self
+                    .status_bars
+                    .bars()
+                    .take(usize::from(self.status_bar_rows))
+                    .any(|(up, _)| up == lane);
+                if !live {
+                    return;
+                }
+                let route = match lane {
+                    crate::status_bars::Lane::Toolchain => {
+                        crate::native_settings::SettingsRoute::Packages
+                    }
+                    crate::status_bars::Lane::Update => {
+                        crate::native_settings::SettingsRoute::SoftwareUpdate
+                    }
+                };
+                let _ = self.open_settings_tab(route);
+            }
+            // Neither carries a Click in the published tree. The paste question is
+            // answered by Enter/Escape and a generic activate names neither answer, which
+            // on a security prompt must not be guessed; the config band informs and then
+            // leaves on its own.
+            ChromeMessage::PasteConfirm | ChromeMessage::ConfigWarning => {}
+        }
+    }
+
     /// P2: handle an event from a window's AccessKit adapter (delivered as
     /// `Wake::Accessibility`): the OS a11y client requesting the initial tree, an action
     /// request from a screen reader, or deactivation.
@@ -1871,6 +2307,16 @@ impl App {
                 // Republish synchronously: a screen reader must hear the new selection
                 // even if the visual frame is coalesced away.
                 self.push_a11y_tree(wid);
+                return;
+            }
+            // A chrome MESSAGE the reader activated. Its id range is its own (well below
+            // the tab range `tab_index_for` refuses), so this cannot steal a native app's
+            // request either.
+            if req.action == accesskit::Action::Click
+                && let Some(message) =
+                    crate::accesskit_tree::ChromeMessage::from_node(req.target_node)
+            {
+                self.activate_a11y_message(wid, message);
                 return;
             }
             self.on_native_accessibility_action(wid, req);
@@ -3171,5 +3617,166 @@ mod tests {
             0
         );
         assert!(glow.is_empty() && trail.is_empty());
+    }
+}
+
+/// THE PRODUCTION WIRING for the chrome-message live regions: the `App` methods that read
+/// the live window and decide what a screen reader is told. The pure `accesskit_tree`
+/// layer is covered in its own module against hand-built inputs; everything interesting
+/// about these surfaces — which band is on the glass, how wide the frame cut it, whether a
+/// card is still clickable — lives here, on a real `App`.
+#[cfg(all(test, a11y_tree))]
+mod a11y_message_wiring_tests {
+    use std::time::Instant;
+
+    use crate::accesskit_tree::{ChromeMessage, GridMessage};
+    use crate::{App, WindowId};
+
+    /// The text a window's frame actually carries on row `row`, margins trimmed — what a
+    /// sighted user reads off the glass.
+    fn painted_row(app: &App, wid: WindowId, row: usize) -> String {
+        app.windows[&wid].input_scratch.cells[row]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    fn message(app: &App, wid: WindowId, kind: ChromeMessage) -> GridMessage {
+        app.grid_a11y_messages(wid)
+            .into_iter()
+            .find(|m| m.message == kind)
+            .unwrap_or_else(|| panic!("{kind:?} is not published"))
+    }
+
+    /// A LIVE REGION IS A SENTENCE, AND THE SENTENCE IS THE ONE ON SCREEN. The lines
+    /// behind the config band are raw diagnostics: a rejected `aterm.toml` reaches here as
+    /// a TOML parse error carrying embedded newlines and an ASCII caret diagram. The band
+    /// paints ONE ellipsized row of it, so that is what is announced — reading the whole
+    /// paragraph aloud describes a screen nobody is looking at and takes the listener
+    /// through a caret diagram spoken as punctuation.
+    #[test]
+    fn the_config_bands_announcement_is_cut_exactly_where_the_band_is_cut() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let raw = "aterm.toml is not a valid aterm config: TOML parse error at line 6, \
+                   column 31\n  |\n6 | this_key_does_not_exist = 42\n  |            ^^\n\
+                   invalid type: integer `42`, expected a string\n";
+        app.config_notice =
+            crate::config_notice::ConfigNotice::new(vec![raw.to_string()], Instant::now());
+        app.splice_config_notice(wid);
+
+        let spoken = message(&app, wid, ChromeMessage::ConfigWarning).text;
+        assert!(
+            !spoken.contains('\n'),
+            "a live region carrying five newlines is spoken as one run-on paragraph: \
+             {spoken:?}"
+        );
+        // The title row and the first warning row, exactly as the frame carries them.
+        let separator = spoken.find(" \u{00b7} ").expect("title \u{00b7} warning");
+        let painted_title = painted_row(&app, wid, 0);
+        let painted_first = painted_row(&app, wid, 1);
+        let bullet = painted_first
+            .trim_start()
+            .strip_prefix('\u{2022}')
+            .expect("the warning row is bulleted")
+            .trim_start();
+        assert!(
+            painted_title.starts_with(&spoken[..separator]),
+            "the announced title is the painted title: {painted_title:?} vs {spoken:?}"
+        );
+        assert!(
+            spoken.ends_with(bullet),
+            "the announced warning is the painted warning, ellipsis and all:\n  \
+             painted:   {bullet:?}\n  announced: {spoken:?}"
+        );
+        assert!(
+            bullet.ends_with('\u{2026}') && bullet.chars().count() < raw.chars().count(),
+            "sanity: the frame really did cut this diagnostic — {bullet:?}"
+        );
+    }
+
+    /// A STATUS BAND IS ANNOUNCED WHERE IT IS PAINTED, AND ONLY WHILE IT IS. The tree
+    /// reads the same committed `status_bar_rows` the splice trims its painted rows to, so
+    /// a band whose row the frame has not committed is not described at all; and the
+    /// volatile figures stay out of the spoken half, because the announcement fires on
+    /// that half CHANGING and a byte counter there would say the bar aloud all the way to
+    /// 100%.
+    #[test]
+    fn a_status_band_is_announced_at_the_row_it_reserves_and_only_while_it_holds_it() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let now = Instant::now();
+        let downloading = |done: u64| aterm_update::Progress::Downloading {
+            version: "0.64.0".to_string(),
+            bytes_done: done * 1024 * 1024,
+            bytes_total: 480 * 1024 * 1024,
+        };
+        app.status_bars.update_progress(&downloading(120), now);
+        app.sync_status_bar_rows();
+        assert_eq!(app.status_bar_rows, 1, "the update lane reserved its row");
+
+        let band = message(&app, wid, ChromeMessage::UpdateStatus);
+        assert_eq!(band.bar_row, Some(0), "the only band is the top band");
+        assert_eq!(band.progress, Some(0.25));
+        assert!(band.activates, "a press opens Software Update");
+        assert!(
+            band.text.contains("downloading"),
+            "the phase is spoken: {:?}",
+            band.text
+        );
+        let figures = band.detail.clone().expect("the byte counter is described");
+        assert!(
+            !band.text.contains(&figures),
+            "the volatile figures must not ride the announced sentence: {:?}",
+            band.text
+        );
+
+        // Further bytes move the description and leave the announced sentence alone.
+        app.status_bars.update_progress(&downloading(400), now);
+        let later = message(&app, wid, ChromeMessage::UpdateStatus);
+        assert_eq!(later.text, band.text, "no announcement for a byte count");
+        assert_ne!(later.detail, band.detail);
+
+        // A band the frame has not committed a row for is not described at all — the same
+        // trim `splice_status_bars` applies to its painted rows.
+        app.status_bar_rows = 0;
+        assert!(
+            app.grid_a11y_messages(wid).is_empty(),
+            "a band with no committed row is not on the glass"
+        );
+    }
+
+    /// A SCREEN READER MAY NOT REACH WHAT A CLICK COULD NOT. An action request names a
+    /// node from a tree published some frames ago, and the notice card fades and slides
+    /// the whole time it is up; `activate_a11y_message` therefore re-asks the very
+    /// question `App::notice_click` asks before it touches the update lane.
+    #[test]
+    fn activating_a_card_that_is_not_on_this_windows_glass_does_nothing() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        app.notice = Some(crate::notice::TransientNotice::update_ready(
+            "0.64.0".to_string(),
+            42,
+            Instant::now(),
+        ));
+        // The card is global; this window has not composited one, which is the state a
+        // second window is in while the first one shows the pill.
+        assert!(!app.windows[&wid].notice_is_on_glass());
+        assert!(
+            app.grid_a11y_messages(wid)
+                .iter()
+                .all(|m| m.message != ChromeMessage::Notice),
+            "a card this window never showed is not announced here"
+        );
+        app.activate_a11y_message(wid, ChromeMessage::Notice);
+        assert!(
+            app.notice.is_some(),
+            "an activate on a card that is not on this glass consumes nothing"
+        );
     }
 }

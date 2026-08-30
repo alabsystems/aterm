@@ -22672,8 +22672,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let path_feed_fps = prepared_path_feeds.fingerprints;
     // One revisioned config authority owns every filesystem-backed visual
     // asset. The live host, capture, windows, and semantic Settings views clone
-    // this exact outer catalog Arc.
-    let config_assets = native_config_service.snapshot().assets;
+    // this exact outer catalog Arc. Re-snapshotting here picks up the path feeds
+    // just completed above; it is the SAME revision as `startup_config_snapshot`
+    // — completing a generation does not admit new text — so this name stays
+    // distinct from it rather than shadowing, and anything that must agree with
+    // the applied `config` reads the earlier snapshot, not this one.
+    let startup_assets_snapshot = native_config_service.snapshot();
+    let config_assets = std::sync::Arc::clone(&startup_assets_snapshot.assets);
 
     // Resolve keybindings + key_sequences, COLLECTING any dropped-rule warnings so a
     // Finder-launched .app can surface them in-window (stderr is invisible there).
@@ -22682,6 +22687,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let (key_sequences, ks_warns) =
         keybinding::KeySequences::from_config_warn(config.key_sequences.as_ref());
     cfg_warns.extend(ks_warns);
+    // Keys `aterm.toml` sets that this build does nothing with. Unlike every
+    // other line on this banner, these cannot be derived from the parsed
+    // `Config` — an unknown key leaves no trace in it — so they are read from
+    // the admitted TEXT instead. That text comes from `startup_config_snapshot`,
+    // the same binding `config` was cloned from, which is the seam that keeps a
+    // notice from ever describing a revision this launch did not apply.
+    cfg_warns.extend(app_config::ignored_key_notices(
+        &startup_config_snapshot.text,
+    ));
     // W5h: a misspelled `font_family` previously reduced to the built-in
     // candidates with ZERO output — warn once (like themes) and ride the same
     // in-window config-notice banner. `font_family` here is already the
@@ -22708,6 +22722,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // W9: malformed variable-font requests were skipped by the same startup
     // generation and ride the shared warning banner.
     cfg_warns.extend(vf_warns);
+    // LAST among the config lines, once every resolver above has had its say: a
+    // key spelled right whose VALUE this build does not accept keeps the default
+    // just as silently as a misspelled key ignores the edit, and says so only on
+    // the stderr a dock/Finder/Start-menu launch does not have. The filter reads
+    // the lines already collected, so a resolver that named the value it refused
+    // keeps its fuller sentence and this adds nothing for that key.
+    let unaccepted_values =
+        app_config::unaccepted_value_notices(&startup_config_snapshot.text, &cfg_warns);
+    cfg_warns.extend(unaccepted_values);
     // L6: evidence that the PREVIOUS run crashed (a non-empty fatal-signal
     // marker or a panic report in the log dir — see `logging::take_crash_evidence`)
     // rides the same one-shot banner. Until this line, `crash_signal` carefully

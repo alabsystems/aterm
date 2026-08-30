@@ -115,6 +115,33 @@ pub enum SoundKind {
     Navigation,
     /// A kill (^K/^U/^W) that moved the cursor — a soft downward swoosh.
     Kill,
+    /// THE CLOUD'S LITTLE NOISE — the sound of the erase POOF a plain Backspace
+    /// puffs (`cursor_glow`'s `PoofVoice::Puff`, cued on the very edge that
+    /// spawns the smoke, so what you hear and what you see are one event and
+    /// share one rate limit).
+    ///
+    /// Deliberately the SMALLEST thing in the vocabulary: a ~90 ms breath of
+    /// heavily low-passed noise, no partials, no pitch — a puff, not a thud, and
+    /// far under the keystroke floor ([`POOF_KIND_GAIN`]) because a Backspace
+    /// has ALREADY spoken its bell and this rides UNDER it. The kill chord's
+    /// [`SoundKind::Kill`] swoosh is the same idea at clause scale; this is the
+    /// one-character version, and the reason a Backspace no longer fires the
+    /// full swoosh on top of its own keystroke.
+    ///
+    /// Three admission properties, all of them consequences of "it accompanies a
+    /// visible puff rather than composing the tune":
+    /// - it BYPASSES the min-gap governor, exactly as [`SoundKind::Land`] does
+    ///   and for the same reason — the cloud is on glass whether or not the gap
+    ///   would have thinned the note, and the backspace bell that precedes it in
+    ///   the very same drain would otherwise eat it every single time;
+    /// - it does NOT claim the beat (the [`SoundKind::Shift`] rule): an
+    ///   accompaniment that owned the gap would thin the NEXT keystroke;
+    /// - it does NOT step the phrase melody — a puff of air is not a note.
+    ///
+    /// Rate-limiting is upstream and visual: `cursor_glow`'s `POOF_MIN_GAP`
+    /// governs the light, and the cue rides the light, so a held Backspace can
+    /// never machine-gun this however it bypasses the audio gap.
+    Poof,
     /// A multi-cell jump (Enter to a prompt, tab-complete, screen redraws) —
     /// the style's flourish: an arpeggio, a splash, a whoosh, a power chord.
     /// Rapid line feeds are rapid Jumps, and because Jumps bypass the
@@ -920,6 +947,25 @@ const SWEEP_KIND_GAIN: f32 = 0.692;
 /// swoosh's own voice gain rather than here, because the deficit is a VOICE
 /// deficit — see `design_trail`'s Kill arm.
 const KILL_KIND_GAIN: f32 = 1.25;
+/// UNDER THE FLOOR, with the SHIFT lift — and for the same reason. The cloud's
+/// puff ([`SoundKind::Poof`]) accompanies a keystroke that has already spoken,
+/// so it is an ACCOMPANIMENT, not authorship: it must be plainly audible as a
+/// texture and never as a second key. Sits at the bottom of the ladder, below
+/// [`SHIFT_KIND_GAIN`], because unlike the lift it layers ON TOP of the very
+/// bell it follows rather than replacing anything.
+///
+/// Like [`KILL_KIND_GAIN`], most of the level lives in the voice: this is pure
+/// band-passed noise with no partials, ~17 dB under a tonal voice at equal
+/// gain, and `design_poof` carries that compensation. This number is the
+/// PRIORITY statement, and it is the smallest one in the vocabulary.
+///
+/// FITTED BY MEASUREMENT, not by taste alone (`examples/erase_ab`): at 0.42 the
+/// puff metered -34.0 dBFS against the Backspace bell's -22.9 — 11 dB down and
+/// 16 ms behind it, which is inside the bell's forward-masking shadow, i.e. the
+/// same "cued but never heard" outcome the swoosh it replaced already had. 0.68
+/// lands it ~7 dB under the bell: plainly present, plainly subordinate — the
+/// same relationship the movement family holds to the typing floor.
+const POOF_KIND_GAIN: f32 = 0.68;
 /// TIER 3. With the palette trim in place this lands Jump at -17.6 dBFS, and
 /// it is the trail ceiling [`BONK_KIND_GAIN`] must stay strictly above
 /// (const-asserted).
@@ -2023,10 +2069,15 @@ impl TrailSynth {
                     // Cursor scrubbing feeds the bed at a whisper — presence,
                     // not a swell. The shift lift joins it: a modifier is
                     // presence too, never a swell of its own.
+                    // THE CLOUD'S PUFF feeds it NOTHING: it is the accompaniment
+                    // of a Backspace that already kicked the bed on this very
+                    // gesture, and counting it again would let a delete swell the
+                    // weather twice as hard as a keystroke.
                     SoundKind::Navigation
                     | SoundKind::Glide { .. }
                     | SoundKind::Sweep { .. }
                     | SoundKind::Shift => 0.12,
+                    SoundKind::Poof => 0.0,
                 };
                 self.bed.energy = (self.bed.energy + kick).min(1.0);
                 self.bed.gain += (ev.gain - self.bed.gain) * 0.3;
@@ -2052,6 +2103,13 @@ impl TrailSynth {
               // glass whether or not the gap would have thinned the note,
               // so thinning it would silence a VISIBLE celebration.
                 | SoundGesture::Trail(SoundKind::Land)
+              // THE CLOUD'S PUFF, on the LANDING's exact reasoning: it is the
+              // voice of a puff that is ON GLASS, and the keystroke bell it
+              // accompanies is drained from the SAME frame's cue list one slot
+              // ahead of it — so under the gap it would be thinned into silence
+              // every single time, not occasionally. Its rate limit is the
+              // VISUAL one (`cursor_glow`'s POOF_MIN_GAP): no cloud, no puff.
+                | SoundGesture::Trail(SoundKind::Poof)
                 | SoundGesture::Words(WordGesture::Bonk)
                 // A riff bar is ONE event per ~1.6 s carrying the whole
                 // phrase — thinning it would silence entire bars, so it
@@ -2066,7 +2124,15 @@ impl TrailSynth {
         // one MIN_GAP at speed, and a grace note that owned the gap would
         // thin the very keystroke it announces. Every other admission resets
         // the clock exactly as before.
-        if ev.kind != SoundGesture::Trail(SoundKind::Shift) {
+        // THE CLOUD'S PUFF joins the SHIFT here for the mirror-image reason:
+        // where a grace note must not thin the keystroke it announces, an
+        // accompaniment must not thin the keystroke it FOLLOWS — the next key of
+        // a held Backspace run lands well inside one MIN_GAP of the puff, and a
+        // puff that claimed the beat would eat the bell.
+        if !matches!(
+            ev.kind,
+            SoundGesture::Trail(SoundKind::Shift) | SoundGesture::Trail(SoundKind::Poof)
+        ) {
             self.since_voice = 0.0;
         }
         match ev.kind {
@@ -2086,6 +2152,10 @@ impl TrailSynth {
                         | SoundKind::Land
                         | SoundKind::Space
                         | SoundKind::Shift
+                        // A puff of air is not a note of the sentence — and the
+                        // Backspace it accompanies already stepped the melody
+                        // for this gesture.
+                        | SoundKind::Poof
                 ) {
                     self.advance_melody(kind, pause);
                 }
@@ -2339,6 +2409,8 @@ impl TrailSynth {
             SoundKind::Glide { .. } => GLIDE_KIND_GAIN,
             // UNDER the floor — intent, not authorship.
             SoundKind::Shift => SHIFT_KIND_GAIN,
+            // …and under THAT — accompaniment, not authorship.
+            SoundKind::Poof => POOF_KIND_GAIN,
             // TIER 2 — per GESTURE.
             SoundKind::Navigation => NAVIGATION_KIND_GAIN,
             SoundKind::Sweep { .. } => SWEEP_KIND_GAIN,
@@ -2420,6 +2492,14 @@ impl TrailSynth {
             // VOICE. Not in `KILL_KIND_GAIN`, which is a PRIORITY statement
             // and must stay under `BONK_KIND_GAIN`.
             self.spawn(v, g * 2.6, ev.pan);
+            return;
+        }
+
+        // THE CLOUD'S PUFF — the kill swoosh's little brother, designed here
+        // beside it and style-agnostic for the same reason: a puff of air
+        // sounds like a puff of air in every palette.
+        if kind == SoundKind::Poof {
+            self.design_poof(&ev, g);
             return;
         }
 
@@ -2726,6 +2806,47 @@ impl TrailSynth {
             0.0,
             [0.0; 3],
         );
+    }
+
+    /// THE CLOUD'S LITTLE NOISE ([`SoundKind::Poof`]) — the erase puff a plain
+    /// Backspace makes, designed at kind level beside the kill swoosh it is the
+    /// small brother of.
+    ///
+    /// The owner's brief for it, verbatim: *"a puff, not a thud, and it must not
+    /// fight the typing bell."* So:
+    /// - PURE NOISE, no partials — a puff of air has no pitch, and a pitchless
+    ///   voice cannot land on a wrong note of the tune it plays under;
+    /// - SHORT (90 ms against the swoosh's 280) with a SOFT attack: a click at
+    ///   the front would read as a second keystroke, which is precisely the
+    ///   thing this replaced;
+    /// - DARK. `lp_cut` well below the keystroke's click band so the puff sits
+    ///   UNDER the bell in the spectrum as well as in level — the two do not
+    ///   compete for the same air;
+    /// - IN THE SWOOSH'S BAND, taken from [`kill_swoosh_band`] so every style
+    ///   and voice tints its puff exactly as it tints its kill, and the pair are
+    ///   audibly one family at two scales. It starts partway down that band and
+    ///   falls a little: one character leaving, where the swoosh is a clause.
+    ///
+    /// The `* 2.6` is [`SoundKind::Kill`]'s noise-voice compensation verbatim
+    /// and for the same reason (band-passed noise peaks ~17 dB under a tonal
+    /// voice at equal gain); the TIER lives in [`POOF_KIND_GAIN`], which is the
+    /// quietest in the vocabulary.
+    fn design_poof(&mut self, ev: &SoundEvent, g: f32) {
+        let (hi, lo) = kill_swoosh_band(ev.voice, ev.style);
+        let v = Voice {
+            dur: 0.09,
+            attack: 0.006,
+            decay: 0.045,
+            n_lvl: 0.5,
+            n_f0: hi * 0.42,
+            n_f1: lo * 1.15,
+            n_glide: 0.05,
+            // WIDE. A narrow band would whistle a pitch; the puff is air.
+            n_q: 0.8,
+            lp_cut: 1800.0,
+            ..Voice::default()
+        };
+        self.spawn(v, g * 2.6, ev.pan);
     }
 
     /// The curse-word BONK — designed once at kind level exactly like Kill,
@@ -5276,10 +5397,11 @@ impl Palette for MechPalette {
                     s.spawn(tick, g * 0.22, -ev.pan * 0.4);
                 }
             }
-            // Kill / Glide / Sweep / Space / Shift are designed kind-level
+            // Kill / Poof / Glide / Sweep / Space / Shift are designed kind-level
             // before palette dispatch and never arrive here (trait doc);
             // Bonk and the riff route through their own designers.
             SoundKind::Kill
+            | SoundKind::Poof
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
             | SoundKind::Land
@@ -5533,6 +5655,7 @@ impl Palette for TypewriterPalette {
             // kind-level before palette dispatch and never arrive here
             // (trait doc).
             SoundKind::Kill
+            | SoundKind::Poof
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
             | SoundKind::Land
@@ -5685,6 +5808,7 @@ impl Palette for MarimbaPalette {
             // kind-level before palette dispatch and never arrive here
             // (trait doc).
             SoundKind::Kill
+            | SoundKind::Poof
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
             | SoundKind::Land
@@ -5828,6 +5952,7 @@ impl Palette for FeltPalette {
             // kind-level before palette dispatch and never arrive here
             // (trait doc).
             SoundKind::Kill
+            | SoundKind::Poof
             | SoundKind::Glide { .. }
             | SoundKind::Sweep { .. }
             | SoundKind::Land
@@ -9246,6 +9371,100 @@ mod tests {
             .sum()
     }
 
+    /// THE CLOUD'S LITTLE NOISE ([`SoundKind::Poof`]) — every admission property
+    /// it needs in order to be HEARD at all, and every one it needs in order not
+    /// to be a nuisance.
+    ///
+    /// THE ONE THAT MAKES OR BREAKS IT is the min-gap bypass. The puff is cued
+    /// on the erase poof, and the Backspace bell that licensed that poof is
+    /// drained from the SAME frame's cue list one slot ahead of it — well inside
+    /// `MIN_GAP` (45 ms). A gap-thinned puff would therefore be thinned EVERY
+    /// TIME, not occasionally: it would be dead code that unit tests pass and
+    /// nobody ever hears. That is exactly the class of "green but inaudible" the
+    /// visual half of this feature was also lost to, so it is pinned here, in the
+    /// synth, at the seam that decides.
+    #[test]
+    fn the_clouds_puff_survives_the_bell_it_follows() {
+        // 1. IT SPEAKS inside the min-gap, right behind the keystroke.
+        let mut s = TrailSynth::new(48_000.0, 1);
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Backspace)); // since_voice ← 0
+        let after_bell = s.live_voices();
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Poof));
+        assert!(
+            s.live_voices() > after_bell,
+            "the puff must speak behind the bell it accompanies — under the gap \
+             it would be silenced on every single delete"
+        );
+
+        // 2. IT DOES NOT CLAIM THE BEAT: the next keystroke still speaks. (A
+        //    held Backspace lands its next key well inside one MIN_GAP of the
+        //    puff, so a puff that reset the clock would eat the bell.)
+        let mut s = TrailSynth::new(48_000.0, 1);
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Poof));
+        let after_puff = s.live_voices();
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Backspace));
+        assert!(
+            s.live_voices() > after_puff,
+            "the puff is an accompaniment: it must not thin the key that follows"
+        );
+
+        // 3. IT IS NOT A NOTE OF THE TUNE.
+        let mut s = TrailSynth::new(48_000.0, 0x9A11);
+        let walk = s.walk;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Poof));
+        assert_eq!(s.walk, walk, "a puff of air does not compose the melody");
+
+        // 4. IT IS PITCHLESS — pure noise, no partials. A puff that carried a
+        //    tone could land on a wrong note of the tune it plays under.
+        let live: Vec<Voice> = s.voices.iter().filter(|v| v.on).copied().collect();
+        assert_eq!(live.len(), 1, "the puff is ONE voice");
+        assert!(
+            live[0].p.iter().all(|p| p.lvl == 0.0),
+            "the puff has no tonal partials"
+        );
+        assert!(live[0].n_lvl > 0.0, "…it is band-passed noise");
+    }
+
+    /// …AND IT IS THE SMALLEST THING IN THE VOCABULARY. The owner's brief for
+    /// it: *"a puff, not a thud, and it must not fight the typing bell."*
+    ///
+    /// Two relative pins, per palette voice, because the law is the ORDER and
+    /// not a dBFS figure:
+    /// - UNDER THE BELL it layers on top of — anything else and the delete
+    ///   sounds like two keys;
+    /// - FAR under the [`SoundKind::Kill`] swoosh, which is the same gesture at
+    ///   CLAUSE scale. This is the pin that refutes the shipped defect it
+    ///   replaced, where a plain Backspace fired that full swoosh outright.
+    #[test]
+    fn the_puff_is_the_quietest_delete_in_the_ladder() {
+        fn peak(voice: SoundVoice, kind: SoundKind) -> f32 {
+            let mut s = TrailSynth::new(48_000.0, 0x5EED_1234);
+            let mut e = voiced(voice, GlowStyle::RainbowKitty, kind);
+            e.hue = 0.0;
+            e.bed = false;
+            s.push(e);
+            let mut buf = vec![0.0f32; (48_000.0f32 * 2.4) as usize * CHANNELS];
+            s.render(&mut buf);
+            buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        }
+        for &voice in SoundVoice::ALL {
+            let puff = peak(voice, SoundKind::Poof);
+            let back = peak(voice, SoundKind::Backspace);
+            let kill = peak(voice, SoundKind::Kill);
+            assert!(puff > 0.0, "{voice:?}: the puff must be audible at all");
+            assert!(
+                puff < back,
+                "{voice:?}: the puff rides UNDER the bell it follows \
+                 (puff {puff} vs backspace {back})"
+            );
+            assert!(
+                puff < kill * 0.6,
+                "{voice:?}: a one-character puff is not a line kill \
+                 (puff {puff} vs kill swoosh {kill})"
+            );
+        }
+    }
+
     /// A GLIDE plays exactly ONE in-key tone, a scale-step in the travel
     /// direction of the melody's current degree, and sits ON the typing floor
     /// beside the keystroke it accompanies. It does NOT step the phrase (the
@@ -9465,6 +9684,9 @@ mod tests {
                     | SoundKind::Glide { .. }
                     | SoundKind::Sweep { .. }
                     | SoundKind::Shift => 0.12,
+                    // The cloud's puff is likewise never pushed by the pins;
+                    // mirrored at production's value so the two cannot drift.
+                    SoundKind::Poof => 0.0,
                 };
                 self.bed.energy = (self.bed.energy + kick).min(1.0);
                 self.bed.gain += (gain - self.bed.gain) * 0.3;
@@ -9592,6 +9814,8 @@ mod tests {
                     // lift); present so the match stays total.
                     SoundKind::Space => SPACE_KIND_GAIN,
                     SoundKind::Shift => SHIFT_KIND_GAIN,
+                    // The cloud's puff, likewise never reached.
+                    SoundKind::Poof => POOF_KIND_GAIN,
                     // TIER 2 — per GESTURE. Never reached (the pins emit no
                     // cursor gestures); present so the match stays total.
                     SoundKind::Navigation => NAVIGATION_KIND_GAIN,

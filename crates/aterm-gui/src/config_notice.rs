@@ -160,6 +160,71 @@ fn ellipsized(s: &str, max: usize) -> String {
     out
 }
 
+/// The banner's TITLE row for `count` warnings, and the name a screen reader hears for
+/// the same band. One function so the painted words and the announced words cannot drift.
+///
+/// "config: 3 notice(s) (auto-dismiss)" said the same thing three ways and made the user
+/// parse a plural stub. The mark carries the severity, the count carries the scale, and
+/// the fact that it leaves on its own is a quiet aside on the right of the painted row.
+/// The mark stays inside `write_str`'s stated contract — ASCII and a few narrow BMP
+/// glyphs, one char per CELL. A warning triangle would be ambiguous-width and could bleed
+/// into the next cell on the terminals that treat it as emoji, which is a poor trade for
+/// a mark whose severity the warn colour already carries.
+fn title_for(count: usize) -> String {
+    format!(
+        "!  Config \u{00B7} {count} {}",
+        if count == 1 { "notice" } else { "notices" }
+    )
+}
+
+/// The WORDS the band puts on screen, in reading order — the one source both the pixels
+/// and the announcement are built from.
+///
+/// A live region is spoken in full the instant its sentence changes, so what it says has
+/// to be what the eye can see. The `lines` behind this band are RAW diagnostics of
+/// unbounded length: a rejected `aterm.toml` arrives as a TOML parse error carrying five
+/// embedded newlines and an ASCII caret diagram, and a band that paints one ellipsized row
+/// of it while announcing the whole paragraph is describing a screen nobody is looking at.
+/// Both readers pass the same `cols`/`panel_rows` the splice uses
+/// (`App::splice_config_notice`), so the cut a reader hears and the cut a reader sees are
+/// one cut by construction.
+pub(crate) struct BandText {
+    /// The title row. Counts EVERY notice, including the ones the panel has no room for.
+    pub(crate) title: String,
+    /// One entry per warning the panel has room for, each already cut to the width the
+    /// band writes it at.
+    pub(crate) warnings: Vec<String>,
+    /// The `+N more` tally, present only when the list overflowed AND a row was left to
+    /// say so — a capped list that looks complete is worse than no banner.
+    pub(crate) more: Option<String>,
+}
+
+/// [`BandText`] for a banner of `lines` painted `panel_rows` tall in a `cols`-wide window.
+pub(crate) fn band_text(lines: &[String], cols: usize, panel_rows: usize) -> BandText {
+    // Capacity for warning rows, reserving one for the "+N more" tally when the list
+    // overflows and there is room to say so.
+    let capacity = panel_rows.saturating_sub(1);
+    let overflow = lines.len() > capacity;
+    let shown = if overflow && capacity >= 2 {
+        capacity - 1
+    } else {
+        capacity
+    };
+    let text_w = cols.saturating_sub(BULLET_INDENT + MARGIN);
+    BandText {
+        title: title_for(lines.len()),
+        warnings: lines
+            .iter()
+            .take(shown)
+            .map(|line| ellipsized(line, text_w))
+            .collect(),
+        more: (overflow && shown < capacity).then(|| {
+            let more = format!("+{} more \u{2014} see the log", lines.len() - shown);
+            ellipsized(&more, text_w)
+        }),
+    }
+}
+
 /// PURE grid-cell row builder: exactly `panel_rows` rows, each
 /// exactly `cols` wide so the splice overwrites frame rows in place. Row 0 is a bold
 /// title on a seam (the panel's top edge) with a right-aligned "it goes away by itself"
@@ -182,40 +247,23 @@ pub(crate) fn notice_rows(
     if panel_rows == 0 {
         return rows;
     }
-    // "config: 3 notice(s) (auto-dismiss)" said the same thing three ways and made the
-    // user parse a plural stub. The mark carries the severity, the count carries the
-    // scale, and the fact that it leaves on its own is a quiet aside on the right.
-    // The mark stays inside `write_str`'s stated contract — ASCII and a few narrow BMP
-    // glyphs, one char per CELL. A warning triangle would be ambiguous-width and could
-    // bleed into the next cell on the terminals that treat it as emoji, which is a poor
-    // trade for a mark whose severity the warn colour already carries.
-    let title = format!(
-        "!  Config \u{00B7} {} {}",
-        lines.len(),
-        if lines.len() == 1 {
-            "notice"
-        } else {
-            "notices"
-        }
+    let band = band_text(lines, cols, panel_rows);
+    write_str(
+        &mut rows[0],
+        cols,
+        MARGIN,
+        &band.title,
+        c.warn,
+        c.bar_bg,
+        true,
     );
-    write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
     const HINT: &str = "dismisses on its own";
     let hint_col = cols.saturating_sub(HINT.len() + MARGIN);
-    if hint_col > MARGIN + title.chars().count() + 2 {
+    if hint_col > MARGIN + band.title.chars().count() + 2 {
         write_str(&mut rows[0], cols, hint_col, HINT, c.label, c.bar_bg, false);
     }
 
-    // Capacity for warning rows, reserving one for the "+N more" tally when the list
-    // overflows and there is room to say so.
-    let capacity = panel_rows.saturating_sub(1);
-    let overflow = lines.len() > capacity;
-    let shown = if overflow && capacity >= 2 {
-        capacity - 1
-    } else {
-        capacity
-    };
-    let text_w = cols.saturating_sub(BULLET_INDENT + MARGIN);
-    for (i, line) in lines.iter().take(shown).enumerate() {
+    for (i, line) in band.warnings.iter().enumerate() {
         write_str(
             &mut rows[1 + i],
             cols,
@@ -229,19 +277,18 @@ pub(crate) fn notice_rows(
             &mut rows[1 + i],
             cols,
             BULLET_INDENT,
-            &ellipsized(line, text_w),
+            line,
             c.value,
             c.bar_bg,
             false,
         );
     }
-    if overflow && shown < capacity {
-        let more = format!("+{} more \u{2014} see the log", lines.len() - shown);
+    if let Some(more) = &band.more {
         write_str(
-            &mut rows[1 + shown],
+            &mut rows[1 + band.warnings.len()],
             cols,
             BULLET_INDENT,
-            &ellipsized(&more, text_w),
+            more,
             c.label,
             c.bar_bg,
             false,

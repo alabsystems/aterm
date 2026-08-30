@@ -145,7 +145,14 @@ impl App {
         let bounds = self
             .native_accessibility_window_bounds(wid)
             .ok_or_else(|| "native accessibility window is no longer live".to_string())?;
-        compose_native_accessibility(projections, focused_native, bounds)
+        // The window's chrome title names the accessible window whichever kind of tab is
+        // in front, so a screen reader user hears one window's identity, not two.
+        let title = self
+            .windows
+            .get(&wid)
+            .map(|ws| ws.current_title.as_str())
+            .unwrap_or_default();
+        compose_native_accessibility(projections, focused_native, bounds, title)
             .map_err(|error| format!("native accessibility composition failed: {error:?}"))
     }
 
@@ -508,6 +515,10 @@ mod tests {
             Some(view),
             app.native_accessibility_window_bounds(wid)
                 .expect("window bounds"),
+            app.windows
+                .get(&wid)
+                .map(|ws| ws.current_title.as_str())
+                .unwrap_or_default(),
         )
         .expect("expected accessibility projection")
         .into_update();
@@ -1408,6 +1419,11 @@ mod tests {
             projections,
             focused_native,
             stale_app.native_accessibility_window_bounds(wid).unwrap(),
+            stale_app
+                .windows
+                .get(&wid)
+                .map(|ws| ws.current_title.as_str())
+                .unwrap_or_default(),
         )
         .unwrap();
         let (_, routes, virtual_text) = projection.into_update_routes_and_virtual_text();

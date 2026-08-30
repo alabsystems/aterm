@@ -4551,17 +4551,26 @@ impl Config {
                      effect is disabled; add its manifest to cursor_trail_packs = [\"…\"]"
                 ))
             }
-            Some(TrailStyleIssue::Unknown) => {
-                let default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
-                Some(format!(
-                    "cursor_trail_style: unknown style {raw:?} — falling back to {default:?}; \
-                     expected one of phaser|rainbow kitty|rainbow kitty pet|rainbow dog pet|\
-                     rainbow kitty flying|rainbow kitty underline|rainbow kitty tall|comet|\
-                     lumen|sparkle|fire|laser|water|beam|off (or a documented alias like \
-                     nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean), or pack:<id> for a \
-                     loaded Trail Pack"
-                ))
-            }
+            // The vocabulary is JOINED from `CURSOR_TRAIL_STYLES`, which is the
+            // domain the picker offers; spelling it out here would let the
+            // sentence and the picker disagree about what this build accepts the
+            // moment a style joins the roster. The near miss leads the sentence
+            // because the in-window banner paints one line per notice and
+            // truncates at the terminal width — the recovery has to survive an
+            // 80-column window, the vocabulary is the part that can be cut.
+            Some(TrailStyleIssue::Unknown) => Some(format!(
+                "cursor_trail_style: unknown style {raw:?}{suggestion} (falling back to \
+                 {default:?}; expected one of {options}, a documented alias like \
+                 nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean, or pack:<id> for a \
+                 loaded Trail Pack)",
+                default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+                options = crate::prefs::CURSOR_TRAIL_STYLES.join("|"),
+                suggestion = crate::native_config_language::nearest_enum_value(
+                    raw,
+                    crate::prefs::CURSOR_TRAIL_STYLES
+                )
+                .map_or_else(String::new, |near| format!(" — did you mean {near:?}?")),
+            )),
         }
     }
 
@@ -6492,6 +6501,67 @@ pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
         );
     }
     out
+}
+
+/// How many ignored-key lines the transient banner may carry before rolling the
+/// rest up. The banner paints at most `config_notice::MAX_NOTICE_ROWS` rows in
+/// total, and a config with a broken `[section]` can produce dozens of ignored
+/// leaves — without a cap they would evict every dropped-keybinding and
+/// restart-only line the same reload also needs to show.
+const MAX_BANNER_IGNORED_KEYS: usize = 3;
+
+/// The banner's view of [`crate::native_config_language::ignored_key_warnings`]:
+/// the keys `aterm.toml` sets that this build will do nothing with, capped, and
+/// carrying the `config …` prefix every other line on this banner uses.
+///
+/// The whole point of the banner is that stderr reaches nobody who launched from
+/// a dock, a Start-menu tile or Finder. A misspelled KEY is the silent no-op that
+/// most needs it — the setting simply never applies, and until the reader is told
+/// the near-miss spelling there is no way to find out why. Startup and reload
+/// both call this so a typo introduced by a live edit is reported exactly like
+/// one that was there at launch.
+pub(crate) fn ignored_key_notices(text: &str) -> Vec<String> {
+    capped_banner_notices(
+        crate::native_config_language::ignored_key_warnings(text),
+        "ignored key(s)",
+    )
+}
+
+/// The banner's view of
+/// [`crate::native_config_language::unaccepted_value_warnings`]: keys whose
+/// authored VALUE this build does not accept, minus any that `already_told`
+/// explains, capped and prefixed like [`ignored_key_notices`].
+///
+/// The same silent no-op one level down, and the same reason for a window
+/// surface: `window_theme = "drak"` keeps the default and says so only on a
+/// stderr a dock launch does not have. Call this LAST — after every
+/// loader-specific warning this launch or reload collected — because the filter
+/// reads them, and a key whose own resolver already named the value it refused
+/// must keep that fuller sentence instead of also getting the generic one.
+pub(crate) fn unaccepted_value_notices(text: &str, already_told: &[String]) -> Vec<String> {
+    capped_banner_notices(
+        crate::native_config_language::unaccepted_value_warnings(text, already_told),
+        "unaccepted value(s)",
+    )
+}
+
+/// Cap one group of config lines to [`MAX_BANNER_IGNORED_KEYS`] and give them
+/// the `config …` prefix every other banner line uses, rolling the remainder up
+/// into a single line that names where the full list lives. Shared so the two
+/// groups cannot drift into different caps or different prefixes.
+fn capped_banner_notices(mut lines: Vec<String>, noun: &str) -> Vec<String> {
+    let overflow = lines.len().saturating_sub(MAX_BANNER_IGNORED_KEYS);
+    lines.truncate(MAX_BANNER_IGNORED_KEYS);
+    let mut notices = lines
+        .into_iter()
+        .map(|line| format!("config {line}"))
+        .collect::<Vec<_>>();
+    if overflow > 0 {
+        notices.push(format!(
+            "config … and {overflow} more {noun} — run `aterm --validate-config` for the full list"
+        ));
+    }
+    notices
 }
 
 /// Parse a non-zero `u16` from an environment variable, returning `None` when the
@@ -8954,6 +9024,11 @@ impl App {
         // Restart-only edits (columns/lines) ride the SAME banner as dropped-rule
         // warnings — both are "your edit didn't fully take effect" messages.
         warns.extend(restart_notices);
+        // …as does a key this build ignores. A hand edit that misspells the key
+        // is the same class taken to its limit — the edit took no effect at all —
+        // and it is the class the reader has no other way to discover, since the
+        // parsed config the rest of this reload inspects has no record of it.
+        warns.extend(ignored_key_notices(&config_snapshot.text));
         // …and so does a refused Secure Keyboard Entry transition (see the
         // apply site above): same class exactly — an edit that did not take.
         if let Some(status) = secure_input_refusal {
@@ -9015,6 +9090,13 @@ impl App {
             .as_ref()
             .map(|prepared| prepared.config.clone())
             .unwrap_or_else(|| self.font_config.clone());
+        // LAST on this banner, once every resolver above has had its say: a key
+        // spelled right whose VALUE this build does not accept keeps the default
+        // just as silently as a misspelled key ignores the edit. The filter reads
+        // the lines already collected, so a resolver that named the value it
+        // refused keeps its fuller sentence and this adds nothing for that key.
+        let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns);
+        warns.extend(unaccepted);
         for w in &warns {
             eprintln!("aterm-gui: {w}");
         }
@@ -10326,8 +10408,9 @@ window_title_format = "description"
 #[cfg(test)]
 mod cfg_engine_tests {
     use super::{
-        Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES,
-        MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogWatchError, open_regular_theme_file,
+        Config, KittySpriteAsset, MAX_BANNER_IGNORED_KEYS, MAX_KITTY_SPRITE_FILE_BYTES,
+        MAX_USER_THEME_FILE_BYTES, MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogWatchError,
+        TrailPackCatalog, ignored_key_notices, open_regular_theme_file, unaccepted_value_notices,
     };
     use aterm_core::config::BiDiMode;
 
@@ -10900,6 +10983,107 @@ mod cfg_engine_tests {
         let cleared = cfg("lines = 40");
         assert_eq!(restart_notices(&a, &cleared).len(), 1);
         assert!(restart_notices(&a, &both)[0].contains("next launch"));
+    }
+
+    /// A vocabulary is only a recovery if it is THE vocabulary and it points at
+    /// the option that was meant. Both halves of the sentence are answered from
+    /// [`crate::prefs::CURSOR_TRAIL_STYLES`] — the domain the picker offers — so
+    /// a style cannot join the picker and be either missing from the list or
+    /// unreachable from a typo of it. Pinning the join verbatim is what a
+    /// hand-written copy of the list cannot satisfy for long: it holds only
+    /// while every entry, its order and its separator agree with the picker's.
+    #[test]
+    fn the_trail_style_message_offers_the_pickers_domain_and_names_a_near_miss_in_it() {
+        let catalog = TrailPackCatalog::default();
+        let message = cfg("cursor_trail_style = \"definitely not a style\"")
+            .cursor_trail_style_warning(&catalog)
+            .expect("an unknown style warns");
+        assert!(
+            message.contains(&crate::prefs::CURSOR_TRAIL_STYLES.join("|")),
+            "the offered list must BE the picker's domain, in its order: {message}"
+        );
+        for style in crate::prefs::CURSOR_TRAIL_STYLES {
+            let dropped_letter = &style[..style.len() - 1];
+            let message = cfg(&format!("cursor_trail_style = \"{dropped_letter}\""))
+                .cursor_trail_style_warning(&catalog)
+                .expect("a truncated style is not a style");
+            assert!(
+                message.contains(&format!("did you mean {style:?}")),
+                "{dropped_letter:?} must name {style:?}: {message}"
+            );
+        }
+    }
+
+    /// The typo the lane is named for: one dropped letter inside a two-word
+    /// value. The list alone leaves the reader to diff fifteen options by eye,
+    /// and in an 80-column window the list is what the banner truncates — so the
+    /// near miss is stated before it, not after.
+    #[test]
+    fn a_mistyped_trail_style_names_the_style_it_meant_before_listing_the_rest() {
+        let catalog = TrailPackCatalog::default();
+        let message = cfg("cursor_trail_style = \"rainbow kity\"")
+            .cursor_trail_style_warning(&catalog)
+            .expect("an unknown style warns");
+        let suggestion = message
+            .find("did you mean \"rainbow kitty\"")
+            .unwrap_or_else(|| panic!("{message}"));
+        let vocabulary = message.find("expected one of").expect("the message lists");
+        assert!(
+            suggestion < vocabulary,
+            "the recovery must precede the list the banner cuts: {message}"
+        );
+    }
+
+    /// The banner has six rows for every config problem there is. A file whose
+    /// `[section]` header is misspelled produces one ignored leaf per entry, and
+    /// without a cap those would evict the dropped-keybinding and restart-only
+    /// lines that the same reload also needs to show.
+    #[test]
+    fn ignored_key_notices_are_capped_so_one_bad_table_cannot_own_the_banner() {
+        let many = (0..12)
+            .map(|index| format!("not_a_key_{index} = 1"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notices = ignored_key_notices(&many);
+        assert_eq!(notices.len(), MAX_BANNER_IGNORED_KEYS + 1, "{notices:?}");
+        assert!(
+            notices
+                .last()
+                .is_some_and(|line| line.contains("9 more") && line.contains("--validate-config")),
+            "the roll-up must say how many are hidden and where to read them: {notices:?}"
+        );
+        assert!(
+            ignored_key_notices("columns = 100\n").is_empty(),
+            "an accepted config raises no banner"
+        );
+    }
+
+    /// stderr reaches nobody who launched from a dock, a Start-menu tile or
+    /// Finder, and a value this build does not accept is exactly as silent there
+    /// as a misspelled key: the resolver keeps the default and the window says
+    /// nothing. Carries the same `config …` prefix and the same cap as its
+    /// ignored-key twin, and stands down for a key whose own resolver line
+    /// already named the value it refused.
+    #[test]
+    fn an_unaccepted_value_reaches_the_banner_unless_a_resolver_already_named_it() {
+        let notices = unaccepted_value_notices("window_theme = \"drak\"\n", &[]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("config ") && notices[0].contains("did you mean \"dark\""),
+            "{notices:?}"
+        );
+        assert!(
+            unaccepted_value_notices(
+                "window_theme = \"drak\"\n",
+                &["config window_theme: expected auto|light|dark, got \"drak\"".to_string()],
+            )
+            .is_empty(),
+            "a resolver that named the value keeps its own fuller sentence"
+        );
+        assert!(
+            unaccepted_value_notices("window_theme = \"dark\"\n", &[]).is_empty(),
+            "an accepted value raises no banner"
+        );
     }
 
     #[test]

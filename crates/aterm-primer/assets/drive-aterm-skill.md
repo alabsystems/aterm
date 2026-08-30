@@ -77,9 +77,14 @@ Stamp yourself on arrival so peers can tell the same about you:
 | `ATERM_CTL` | `drive`, `fleet` | Path to the `aterm-ctl` client they shell out to (`fleet` uses it for the `events` streamers and `exec`; its fleet **discovery** is in-process). |
 | `ATERM_CONTROL_TOKEN` | **only `aterm drive --dial`** | Not read by `aterm ctl` — that reads the sibling token *file*. |
 
-Auth is automatic: a per-launch 32-byte token file sits beside the socket
-(`aterm-<pid>.token` for a default socket; the fixed `aterm.token` for an explicit
-`$ATERM_CONTROL_SOCK` path — **not** `<basename>.token`). Socket is 0600, same-uid only.
+Auth is automatic: a per-launch 32-byte token file sits beside the socket —
+`aterm-<pid>.token` for a default socket, and for an explicit
+`$ATERM_CONTROL_SOCK` path a token named after that socket (`x.sock` →
+`x.sock.token`). Socket and token are 0600, same-uid only. The per-socket name
+is what lets **two private instances share one directory**: they used to both
+write `aterm.token`, so the second to start silently took the first's
+credential and the first's clients were refused `ERR auth` against a socket
+that was still listening.
 
 ## Spin up a target (optional)
 

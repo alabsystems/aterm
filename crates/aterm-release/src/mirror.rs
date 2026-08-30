@@ -326,6 +326,15 @@ pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<
 /// Called against a fresh listing of the mirrored draft before it is flipped
 /// visible, and again after the flip: a channel head is only useful if the
 /// election rule can actually resolve it.
+/// The SOURCE publish's attestation pair, allowed to share the release with the
+/// binary asset set. Since the source/binary tag unification (v0.65.0), the
+/// enforced order — `pub publish` first, `ship cut` second — means the public
+/// vX.Y.0 release ALREADY carries these when the mirror arrives. They are not
+/// updater-elected (election binds the exact binary names), so their presence
+/// cannot change what a client resolves; each is allowed AT MOST ONCE, and any
+/// other foreign name is still refused outright.
+pub const SOURCE_ATTESTATION_ASSETS: [&str; 2] = ["SHA256SUMS", "SHA256SUMS.sig"];
+
 pub fn validate_mirror_asset_set(
     names: &[String],
     version: &str,
@@ -333,7 +342,20 @@ pub fn validate_mirror_asset_set(
     rostered: bool,
 ) -> Result<()> {
     let required = required_asset_names(version, signed, rostered);
-    let mut observed: Vec<String> = names.to_vec();
+    // Split off the source-attestation pair before the exactness check: at most
+    // one of each, and what remains must match the required set EXACTLY.
+    for src in SOURCE_ATTESTATION_ASSETS {
+        if names.iter().filter(|n| n.as_str() == src).count() > 1 {
+            return Err(Error::new(format!(
+                "mirrored release carries a duplicated source-attestation asset                  {src:?} — the client's unique_asset_index refuses duplicates"
+            )));
+        }
+    }
+    let mut observed: Vec<String> = names
+        .iter()
+        .filter(|n| !SOURCE_ATTESTATION_ASSETS.contains(&n.as_str()))
+        .cloned()
+        .collect();
     observed.sort();
     if observed == required {
         return Ok(());
@@ -406,6 +428,35 @@ mod tests {
     /// channel head still carrying one of them is refused as a foreign
     /// object rather than converged.
     #[test]
+    /// PINS THE SHARED TAG. The source publish and the binary cut meet on one
+    /// vX.Y.0 release since v0.65.0, so the pub attestation pair rides beside
+    /// the elected set — at most once each, with every other foreign name (and
+    /// any duplicate) still refused. The first shared-tag cut failed exactly
+    /// here, with the release complete and the mirror refusing its own tag.
+    #[test]
+    fn the_source_attestation_pair_may_share_the_release_and_nothing_else_may() {
+        let mut with_pair = required_asset_names("0.65.0", true, true);
+        with_pair.push("SHA256SUMS".to_string());
+        with_pair.push("SHA256SUMS.sig".to_string());
+        validate_mirror_asset_set(&with_pair, "0.65.0", true, true)
+            .expect("the pub pair shares the tag by design");
+
+        let mut dup = with_pair.clone();
+        dup.push("SHA256SUMS".to_string());
+        validate_mirror_asset_set(&dup, "0.65.0", true, true)
+            .expect_err("a duplicated attestation asset is still refused");
+
+        let mut foreign = with_pair.clone();
+        foreign.push("aterm-offline.dmg".to_string());
+        validate_mirror_asset_set(&foreign, "0.65.0", true, true)
+            .expect_err("a retired container beside the pair is still foreign");
+
+        let only_pair: Vec<String> =
+            SOURCE_ATTESTATION_ASSETS.iter().map(|s| s.to_string()).collect();
+        validate_mirror_asset_set(&only_pair, "0.65.0", true, true)
+            .expect_err("the pair alone is a source release, not a mirrored cut");
+    }
+
     fn the_required_set_carries_exactly_one_dmg_and_no_retired_names() {
         assert_eq!(dmg_asset_name("0.62.0"), "aterm-0.62.0.dmg");
         assert_eq!(stable_dmg_asset_name(), "aterm.dmg");

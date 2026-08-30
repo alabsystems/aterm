@@ -239,20 +239,38 @@ pub fn unpublish_session(sid: &SessionId) {
 }
 
 /// Read the per-launch AUTH token of the SIBLING instance whose socket is
-/// `sock_path` (`<dir>/aterm-<pid>.sock` → `<dir>/aterm-<pid>.token`, 0600,
-/// same-uid). This is the exact credential a same-uid `aterm-ctl --pid <pid>`
-/// client reads for itself, so presenting it on a forward grants nothing the
-/// caller could not already obtain directly. `None` (fail closed) for an
-/// unreadable/empty token or a path with no filename.
+/// `sock_path` (`<dir>/aterm-<pid>.sock` → `<dir>/aterm-<pid>.token`, and an
+/// explicit socket → its own `<sock>.token`; 0600, same-uid). This is the
+/// exact credential a same-uid `aterm-ctl --sock <path>` client reads for
+/// itself, so presenting it on a forward grants nothing the caller could not
+/// already obtain directly. `None` (fail closed) for an unreadable/empty token
+/// or a path with no filename.
+///
+/// The candidates come from the shared rule
+/// ([`aterm_types::control_socket::token_names_for_sock`]) and are tried in ITS
+/// order: the sibling's own per-socket file first, and the legacy shared
+/// `aterm.token` only when that one is ABSENT — which is what a sibling from a
+/// build before the per-socket token wrote. A per-socket file that exists but
+/// is empty ends the search (fail closed): it belongs to the instance being
+/// dialed, and reaching past it for a directory-shared file would be reaching
+/// for someone else's credential. Even then nothing is granted — a sibling
+/// compares `AUTH` against the token it minted in memory, so a foreign value
+/// is refused exactly as no token is.
 #[must_use]
 pub fn read_sibling_token(sock_path: &str) -> Option<String> {
     let p = Path::new(sock_path);
     let dir = p.parent()?;
     let name = p.file_name()?.to_string_lossy();
-    let token_file = aterm_types::control_socket::token_name_for_sock(&name);
-    let raw = std::fs::read_to_string(dir.join(token_file)).ok()?;
-    let t = raw.trim().to_string();
-    if t.is_empty() { None } else { Some(t) }
+    for token_file in aterm_types::control_socket::token_names_for_sock(&name) {
+        // The first candidate that EXISTS decides; only a missing (or
+        // unreadable) file moves on to the legacy name.
+        let Ok(raw) = std::fs::read_to_string(dir.join(token_file)) else {
+            continue;
+        };
+        let t = raw.trim().to_string();
+        return if t.is_empty() { None } else { Some(t) };
+    }
+    None
 }
 
 /// Write the discovery graph entry an inner aterm publishes at bind time so its

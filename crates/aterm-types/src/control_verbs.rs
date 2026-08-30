@@ -683,7 +683,7 @@ pub const VERBS: &[VerbSpec] = &[
         "write raw bytes to the PTY",
         "",
     ),
-      v(
+    v(
         "hwkey",
         Write,
         Status,

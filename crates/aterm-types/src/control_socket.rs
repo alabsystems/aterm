@@ -10,10 +10,14 @@
 //!
 //! 1. **Whether to bind at all.** `ATERM_CONTROL_SOCK=0` / `=off` (or
 //!    `ATERM_NO_CONTROL_SOCK=1`) disables the socket entirely.
-//! 2. **Per-instance naming.** Each instance owns `aterm-<pid>.sock` plus a
+//! 2. **Per-socket naming.** Each instance owns `aterm-<pid>.sock` plus a
 //!    matching `aterm-<pid>.token`, so a second instance never hijacks the
 //!    first one's socket; a `aterm.sock` symlink points at the newest
-//!    instance so single-instance usage is unchanged.
+//!    instance so single-instance usage is unchanged. An instance on an
+//!    explicit `$ATERM_CONTROL_SOCK` path pairs the same way — its token is
+//!    named after ITS socket ([`token_name_for_sock`]) — because the two
+//!    private headless instances an agent boots in one scratch directory
+//!    otherwise shared one token file and locked each other's clients out.
 //! 3. **Stale-file tolerance.** A crashed instance leaves its files behind;
 //!    they are removable exactly when their embedded pid is dead.
 //!
@@ -34,9 +38,25 @@ use std::path::Path;
 /// newest instance's `aterm-<pid>.sock`, so clients with no flags reach it.
 pub const LATEST_SOCK_FILE: &str = "aterm.sock";
 
-/// Token filename used beside a socket that is NOT per-instance (an explicit
-/// `$ATERM_CONTROL_SOCK` path override).
+/// The LEGACY shared token filename: the ONE file every explicit-socket
+/// instance in a directory used to write, and therefore to overwrite for each
+/// other — the second private headless instance in a scratch directory took
+/// the first one's credential with it, and every client of the first was
+/// refused `ERR auth` while it was still listening (F9).
+///
+/// Nothing writes it any more; [`token_name_for_sock`] gives every socket a
+/// token of its own. It survives as the LAST candidate a client reads
+/// ([`token_names_for_sock`]) so a client from this build still authenticates
+/// against an instance from a build that wrote it.
 pub const SIBLING_TOKEN_FILE: &str = "aterm.token";
+
+/// Prefix that keeps the token of an oddly-named socket out of the two
+/// RESERVED names — [`SIBLING_TOKEN_FILE`] and the per-instance
+/// `aterm-<pid>.token`. Appending `.token` to a socket named `aterm` yields
+/// the first and to one named `aterm-4242` the second, so those names (any
+/// name not ending in `.sock`) are prefixed instead. Without it the rule
+/// stops being injective, which is the one property the whole fix rests on.
+const EXPLICIT_TOKEN_PREFIX: &str = "aterm-sock-";
 
 /// What the host should do about the control socket, decided from the
 /// environment by [`socket_directive`].
@@ -115,15 +135,86 @@ pub fn instance_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// The token filename that authenticates the socket named `sock_name`: a
-/// per-instance socket pairs with its per-instance token, anything else falls
-/// back to the sibling [`SIBLING_TOKEN_FILE`].
+/// The pid a SOCKET filename encodes (`aterm-<pid>.sock`), and only that
+/// spelling. [`instance_pid`] also accepts `aterm-<pid>.token` because the
+/// stale sweep walks both kinds of leftover; the token rule must not, because
+/// it answers "which file authenticates THIS socket" — handed a socket path
+/// ending `.token`, the tolerant parse names the socket file ITSELF, and the
+/// server would then write its capability token over its own listening
+/// socket. It also keeps this rule byte-identical to the `aterm-uds` mirror,
+/// which has always keyed on `.sock` alone.
+fn sock_name_pid(sock_name: &str) -> Option<u32> {
+    if !sock_name.ends_with(".sock") {
+        return None;
+    }
+    instance_pid(sock_name)
+}
+
+/// The token filename that authenticates the socket named `sock_name` — the
+/// one name the server WRITES beside that socket, and the first one a client
+/// reads.
+///
+/// * `aterm-<pid>.sock` → `aterm-<pid>.token`: byte for byte the pairing
+///   every release has shipped, so no default install changes.
+/// * any other name — an explicit `$ATERM_CONTROL_SOCK` path — → that
+///   socket's OWN filename with `.token` appended (`a.sock` → `a.sock.token`),
+///   carrying [`EXPLICIT_TOKEN_PREFIX`] when the name does not end in `.sock`.
+///
+/// The rule is INJECTIVE over socket filenames, and that is the whole point:
+/// two sockets in one directory can never name one token file. It used to
+/// collapse every non-instance name onto the shared [`SIBLING_TOKEN_FILE`],
+/// so a second explicit-socket instance in a directory overwrote the first
+/// one's token and locked out its clients while it was still listening (F9).
+///
+/// Note the pid ROUND-TRIP: the digits are parsed to a `u32` and re-formatted,
+/// so `aterm-01.sock` pairs with `aterm-1.token` (not `aterm-01.token`) and a
+/// pid past `u32::MAX` falls through to the explicit form. That is unchanged
+/// behaviour, and `pid.to_string()` never emits a leading zero, so no name the
+/// server itself creates can reach it.
 #[must_use]
 pub fn token_name_for_sock(sock_name: &str) -> String {
-    match instance_pid(sock_name) {
-        Some(pid) => instance_token_name(pid),
-        None => SIBLING_TOKEN_FILE.to_string(),
+    if let Some(pid) = sock_name_pid(sock_name) {
+        return instance_token_name(pid);
     }
+    // Trust gate: concatenation instead of `format!` — see `instance_sock_name`.
+    let mut name = String::new();
+    if !sock_name.ends_with(".sock") {
+        name.push_str(EXPLICIT_TOKEN_PREFIX);
+    }
+    name.push_str(sock_name);
+    name.push_str(".token");
+    name
+}
+
+/// Every token filename a CLIENT may read for the socket named `sock_name`,
+/// in the order it must try them. The first is always
+/// [`token_name_for_sock`] — the file this build's server writes.
+///
+/// An explicit socket adds exactly one fallback, the legacy
+/// [`SIBLING_TOKEN_FILE`]: that is what a server built BEFORE the per-socket
+/// token wrote for the very same socket, so a client from this build still
+/// authenticates against an older instance instead of failing for a reason
+/// no message could explain. It is a read-only bridge — nothing writes that
+/// name any more — and it can be deleted once no supported build does.
+///
+/// It cannot be used to present a DIFFERENT instance's token. A server
+/// compares `AUTH` against the token it minted in memory for itself, never
+/// against a file, so a shared `aterm.token` belonging to some other instance
+/// yields `ERR auth` — precisely what presenting nothing yields. And it is
+/// reached ONLY when the per-socket file is ABSENT, so an instance that wrote
+/// its own token can never have a client of its own fall off it.
+///
+/// A per-instance `aterm-<pid>.sock` gets NO fallback: it has paired with
+/// `aterm-<pid>.token` since the first release, so a miss there means the
+/// instance is gone, and the shared file could only ever be someone else's.
+#[must_use]
+pub fn token_names_for_sock(sock_name: &str) -> Vec<String> {
+    let mut names = Vec::with_capacity(2);
+    names.push(token_name_for_sock(sock_name));
+    if sock_name_pid(sock_name).is_none() {
+        names.push(SIBLING_TOKEN_FILE.to_string());
+    }
+    names
 }
 
 /// The `sock <abs-path>` line of a discovery graph entry (`<dir>/graph/<sid>`,
@@ -291,11 +382,111 @@ mod tests {
 
     #[test]
     fn token_choice_follows_symlink_target() {
-        // The `latest` symlink resolves to an instance sock; its token pairs.
+        // The `latest` symlink resolves to an instance sock BEFORE the name
+        // rule is applied (the client `readlink`s first), so the pairing that
+        // matters for a flagless client is this one — unchanged for ever.
         assert_eq!(token_name_for_sock("aterm-7.sock"), "aterm-7.token");
-        // Non-instance names (explicit overrides, legacy fixed name) fall back.
-        assert_eq!(token_name_for_sock("aterm.sock"), SIBLING_TOKEN_FILE);
-        assert_eq!(token_name_for_sock("a.sock"), SIBLING_TOKEN_FILE);
+        assert_eq!(token_name_for_sock("aterm-1.sock"), "aterm-1.token");
+        assert_eq!(
+            token_name_for_sock("aterm-4294967295.sock"),
+            "aterm-4294967295.token"
+        );
+        // The pid ROUND-TRIPS through `u32`: leading zeros normalize, and a pid
+        // past `u32::MAX` is not an instance name at all.
+        assert_eq!(token_name_for_sock("aterm-01.sock"), "aterm-1.token");
+        assert_eq!(
+            token_name_for_sock("aterm-99999999999.sock"),
+            "aterm-99999999999.sock.token"
+        );
+    }
+
+    /// F9: two explicit sockets in ONE directory must not name one token file.
+    /// Each carries its own socket filename, so the second instance to start
+    /// cannot overwrite the first one's credential.
+    #[test]
+    fn explicit_sockets_get_their_own_token_each() {
+        assert_eq!(token_name_for_sock("a.sock"), "a.sock.token");
+        assert_eq!(token_name_for_sock("b.sock"), "b.sock.token");
+        assert_ne!(token_name_for_sock("a.sock"), token_name_for_sock("b.sock"));
+        // A socket literally named `aterm.sock` is only ever REACHED here when
+        // it is a real socket (the alias is resolved first), and it too gets
+        // its own file rather than the legacy shared one.
+        assert_eq!(token_name_for_sock("aterm.sock"), "aterm.sock.token");
+        assert_ne!(token_name_for_sock("aterm.sock"), SIBLING_TOKEN_FILE);
+    }
+
+    /// Odd names stay inside the rule, and — the load-bearing part — outside
+    /// the two RESERVED names. A bare `.token` append would hand a socket
+    /// named `aterm` the legacy shared file and one named `aterm-4242` pid
+    /// 4242's file, re-creating the collision under a different spelling.
+    #[test]
+    fn odd_socket_names_never_land_on_a_reserved_token_name() {
+        for (sock, token) in [
+            ("ctl", "aterm-sock-ctl.token"),
+            ("aterm", "aterm-sock-aterm.token"),
+            ("aterm-4242", "aterm-sock-aterm-4242.token"),
+            ("aterm-42.token", "aterm-sock-aterm-42.token.token"),
+            ("a.b.c.sock", "a.b.c.sock.token"),
+            ("\u{65e5}\u{672c}.sock", "\u{65e5}\u{672c}.sock.token"),
+            ("aterm-.sock", "aterm-.sock.token"),
+            ("aterm-+1.sock", "aterm-+1.sock.token"),
+            ("", "aterm-sock-.token"),
+        ] {
+            assert_eq!(token_name_for_sock(sock), token, "for {sock:?}");
+            assert_ne!(token_name_for_sock(sock), SIBLING_TOKEN_FILE);
+            assert_eq!(
+                instance_pid(&token_name_for_sock(sock)),
+                None,
+                "{sock:?} must not derive a per-instance token name"
+            );
+        }
+    }
+
+    /// The property the whole fix rests on: distinct socket filenames derive
+    /// distinct token filenames, so no directory can host two sockets sharing
+    /// one credential file.
+    #[test]
+    fn the_token_name_rule_is_injective_over_socket_names() {
+        let names = [
+            "aterm-1.sock",
+            "aterm-2.sock",
+            "a.sock",
+            "b.sock",
+            "aterm.sock",
+            "aterm",
+            "aterm-1",
+            "aterm-1.token",
+            "ctl",
+            "",
+        ];
+        let mut tokens: Vec<String> = names.iter().map(|n| token_name_for_sock(n)).collect();
+        tokens.sort();
+        let count = tokens.len();
+        tokens.dedup();
+        assert_eq!(tokens.len(), count, "two socket names shared a token name");
+    }
+
+    /// A client tries the per-socket file first and the legacy shared name
+    /// only for an explicit socket — never for `aterm-<pid>.sock`, whose token
+    /// has never been shared and whose absence means the instance is gone.
+    #[test]
+    fn read_candidates_put_the_per_socket_token_first() {
+        assert_eq!(token_names_for_sock("aterm-7.sock"), vec!["aterm-7.token"]);
+        assert_eq!(
+            token_names_for_sock("a.sock"),
+            vec!["a.sock.token".to_string(), SIBLING_TOKEN_FILE.to_string()]
+        );
+        assert_eq!(
+            token_names_for_sock("ctl"),
+            vec![
+                "aterm-sock-ctl.token".to_string(),
+                SIBLING_TOKEN_FILE.to_string()
+            ]
+        );
+        // The first candidate is always the name the server writes.
+        for n in ["aterm-7.sock", "a.sock", "ctl", ""] {
+            assert_eq!(token_names_for_sock(n)[0], token_name_for_sock(n));
+        }
     }
 
     #[test]

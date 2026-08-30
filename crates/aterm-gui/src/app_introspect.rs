@@ -3801,6 +3801,10 @@ impl App {
                 cursor_style: term.cursor_style(),
                 blink_phase: ws.blink_phase,
                 live_cursor_rgb: crate::app_render::terminal_cursor_rgb(&term),
+                // The capture reports the SAME pinned-ness the present decides,
+                // so `aterm-ctl image` cannot show a caret the window does not.
+                cursor_color_pinned: self.config.cursor_color.is_some()
+                    || term.cursor_color_recoloured(),
                 default_bg: aterm_render::rgb_to_u32([dbg.r, dbg.g, dbg.b]),
                 // THE PAIR FROM ONE BLANK CELL. The hand-rolled `dbg` branch
                 // above swaps in the BACKGROUND direction only; asking the

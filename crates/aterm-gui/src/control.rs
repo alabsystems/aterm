@@ -6370,7 +6370,16 @@ fn handle(
     // an ignored attempt and be borrowed by subsequent PTY output.
     // Authorization has already completed above; denied callers cannot mutate
     // visible-window effect state through this side channel.
-    if control_attempt_closes_cursor_license(verb) {
+    // …EXCEPT a well-formed plain typed glyph `key` — the control twin of the
+    // input seams' mash exception. That press dispatches through the same
+    // `Wake::Input` seam a physical key uses and stamps its own typed licence,
+    // so pre-clearing here wiped the banked stamps of earlier keys whose
+    // echoes were still in flight and manufactured no-fresh-hint declines —
+    // permanently unlit ribbon cells — under any control-driven typing burst.
+    // Malformed bodies, modified chords, and named keys still fence.
+    if control_attempt_closes_cursor_license(verb)
+        && !(verb == "key" && control_input::key_is_plain_typed_glyph(rest))
+    {
         let cleared = front_routed_license_clear(proxy, session);
         if !cleared.starts_with("OK") {
             return cleared;

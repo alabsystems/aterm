@@ -24,6 +24,8 @@ use std::time::Duration;
 
 use aterm_render::TrailCell;
 
+use crate::cursor_glow::TypedStamps;
+
 /// Coverage of the comet HEAD (the cell nearest the cursor) at a GENTLE move — the
 /// "just a few keys / slow typing" baseline the user asked to keep subtle.
 /// Deliberately well below the ignited head so a lone keystroke barely tints the
@@ -264,7 +266,10 @@ pub struct CursorTrail {
     /// as a TUI repaint RE-ANCHOR (Claude Code's Ink prompt rewraps its whole
     /// inset input box per keystroke) — the caret never swept those cells, so
     /// `spawn` lays NO comet across them.
-    type_hint: Option<Instant>,
+    /// BANKED per press, one stamp per echo sweep (the glow engine's
+    /// [`TypedStamps`] contract, kept in lockstep so the two engines license
+    /// exactly the same flood-typing moves).
+    type_hint: TypedStamps,
     /// Fresh-navigation veto twin of `CursorGlow::nav_hint` (armed from the
     /// same host site): a deliberate Ctrl-A/E leap must never re-anchor even
     /// when a typed hint + blink are live (adversarial review — the two
@@ -350,7 +355,7 @@ impl CursorTrail {
     pub fn note_typed(&mut self, now: Instant) {
         self.move_hint = None;
         self.nav_hint = None;
-        self.type_hint = Some(now);
+        self.type_hint.stamp(now);
     }
 
     /// HOST COALESCED TYPING: an embedder may batch several key events between
@@ -407,7 +412,16 @@ impl CursorTrail {
     /// swallowed typed or generic move. A stationary or unsupported event
     /// intentionally arms nothing.
     pub fn clear_typed(&mut self) {
-        self.type_hint = None;
+        self.type_hint.clear();
+        self.nav_hint = None;
+        self.move_hint = None;
+    }
+
+    /// The typed-press supersede — `CursorGlow::supersede_typed_press`'s trail
+    /// twin (lockstep): a press that is itself a typed glyph closes the nav and
+    /// generic-move classes but KEEPS the banked typed stamps, each of which is
+    /// a real key whose echo is still in flight.
+    pub fn supersede_typed_press(&mut self) {
         self.nav_hint = None;
         self.move_hint = None;
     }
@@ -416,7 +430,7 @@ impl CursorTrail {
     /// the following move (a key was pressed) and classifies it as scrubbing,
     /// which the comet deliberately does not paint.
     pub fn note_navigation(&mut self, now: Instant) {
-        self.type_hint = None;
+        self.type_hint.clear();
         self.move_hint = None;
         self.nav_hint = Some(now);
     }
@@ -424,7 +438,7 @@ impl CursorTrail {
     /// Arm one generic movement LICENSE, superseding any swallowed
     /// typed/navigation classifier.
     fn note_move(&mut self, now: Instant) {
-        self.type_hint = None;
+        self.type_hint.clear();
         self.nav_hint = None;
         self.move_hint = Some(now);
     }
@@ -460,7 +474,8 @@ impl CursorTrail {
     /// Cancel only the license written by one not-yet-egressed dispatch. See
     /// `CursorGlow::revoke_input_hints_at` for the host contract.
     pub fn revoke_input_hints_at(&mut self, at: Instant) {
-        for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
+        self.type_hint.revoke_at(at);
+        for hint in [&mut self.nav_hint, &mut self.move_hint] {
             if *hint == Some(at) {
                 *hint = None;
             }
@@ -506,7 +521,7 @@ impl CursorTrail {
         self.sparks.clear();
         self.last = None;
         self.last_visible = None;
-        self.type_hint = None;
+        self.type_hint.clear();
         self.nav_hint = None;
         self.move_hint = None;
         self.blink_hint = None;
@@ -535,7 +550,7 @@ impl CursorTrail {
             self.sparks.clear();
             self.last = cur;
             self.last_visible = cur.map(|c| (c, now));
-            self.type_hint = None;
+            self.type_hint.clear();
             self.nav_hint = None;
             self.move_hint = None;
             self.blink_hint = None;
@@ -555,9 +570,7 @@ impl CursorTrail {
             // — `spawn` still owns the license and its consumption):
             // batched echoes hop farther than 2 cells inside one hide window;
             // unhinted moves keep the classic source law.
-            let typed_fresh = self.type_hint.is_some_and(|t| {
-                now.saturating_duration_since(t).as_secs_f32() <= Self::TYPE_HINT_FRESH
-            });
+            let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
             let reach = hide_bridge_reach(typed_fresh);
             let plausible = cur.is_some_and(|(cr, cc)| cr.abs_diff(r).max(cc.abs_diff(c)) <= reach);
             (fresh && plausible).then_some((r, c))
@@ -582,7 +595,7 @@ impl CursorTrail {
             // borrow the typed/nav/gesture stamp and mint a detached comet.
             // The RESIDENT bed is untouched: a hidden relocation is someone
             // else's output, and earned light is never destroyed by that.
-            self.type_hint = None;
+            self.type_hint.clear();
             self.nav_hint = None;
             self.move_hint = None;
         } else if completed_hidden_reappearance {
@@ -590,7 +603,7 @@ impl CursorTrail {
             // still the completion boundary for one-shot input state.
             // No move reached `spawn`, so consume the hints dark; otherwise the
             // next unrelated PTY/CUP delta could borrow them.
-            self.type_hint = None;
+            self.type_hint.clear();
             self.nav_hint = None;
             self.move_hint = None;
         } else if unseeded_visible {
@@ -598,7 +611,7 @@ impl CursorTrail {
             // render this landing. Seed the visible anchor, but spend every
             // one-shot license now: retaining it would let the following
             // unrelated CUP borrow it.
-            self.type_hint = None;
+            self.type_hint.clear();
             self.nav_hint = None;
             self.move_hint = None;
         }
@@ -712,7 +725,7 @@ impl CursorTrail {
         let fresh = |hint: Option<Instant>, window: f32| {
             hint.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
         };
-        fresh(self.type_hint, Self::TYPE_HINT_FRESH)
+        self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
             || fresh(self.nav_hint, Self::NAV_HINT_FRESH)
             || fresh(self.move_hint, Self::MOVE_HINT_FRESH)
     }
@@ -761,7 +774,7 @@ impl CursorTrail {
         });
         let paired = self
             .type_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::TYPE_HINT_FRESH)
+            .take_fresh(now, Self::TYPE_HINT_FRESH)
             .is_some();
         // ALT-SCREEN blink requirement (the glow classifier's twin): on the
         // alt screen only a repaint-BLINKING app (Claude Code's
@@ -1312,7 +1325,7 @@ mod tests {
 
         trail.note_user_gesture(now);
         assert!(
-            trail.type_hint.is_none() && trail.nav_hint.is_none(),
+            !trail.type_hint.armed() && trail.nav_hint.is_none(),
             "the gesture establishes one unambiguous generic class"
         );
         let moved = now + Duration::from_millis(10);
@@ -1349,7 +1362,7 @@ mod tests {
         projected.insert("credit_arms", 2);
         projected.insert(
             "superseded",
-            i64::from(trail.type_hint.is_none() && trail.nav_hint.is_none()),
+            i64::from(!trail.type_hint.armed() && trail.nav_hint.is_none()),
         );
         let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
             &base_model,
@@ -1545,7 +1558,7 @@ mod tests {
             );
             assert!(out.is_empty(), "far reappearance declines the bridge");
             assert!(
-                hidden.type_hint.is_none()
+                !hidden.type_hint.armed()
                     && hidden.nav_hint.is_none()
                     && hidden.move_hint.is_none(),
                 "declined hidden relocation consumes every movement class"
@@ -1579,7 +1592,7 @@ mod tests {
             hidden.tick(Some((2, 4)), now + Duration::from_millis(3), &hot, &mut out);
             assert!(out.is_empty(), "same-cell reappearance paints nothing");
             assert!(
-                hidden.type_hint.is_none()
+                !hidden.type_hint.armed()
                     && hidden.nav_hint.is_none()
                     && hidden.move_hint.is_none(),
                 "same-cell hidden completion consumes its movement class"
@@ -1618,7 +1631,7 @@ mod tests {
                 );
                 assert!(out.is_empty(), "a source-less seed paints nothing");
                 assert!(
-                    unseeded.type_hint.is_none()
+                    !unseeded.type_hint.armed()
                         && unseeded.nav_hint.is_none()
                         && unseeded.move_hint.is_none(),
                     "a source-less seed consumes every movement class"

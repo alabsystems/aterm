@@ -117,7 +117,9 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
 /// The socket comes from `--socket`/`$ATERM_CONTROL_SOCK`; the token from
 /// `$ATERM_CONTROL_TOKEN`, else the sibling token file located by the SHARED
 /// convention (`aterm_uds::latest::token_path_for_sock`) — `aterm-<pid>.token`
-/// for an instance socket, otherwise `aterm.token` in the socket's directory.
+/// for an instance socket, and for an explicitly-named one a token named after
+/// that socket (`x.sock` -> `x.sock.token`), so two private instances sharing a
+/// directory cannot overwrite each other's credential (F9).
 fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
     let sock = opts
         .socket
@@ -132,12 +134,12 @@ fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             // The SHARED convention, not a hand-rolled one: an instance socket
-            // (`aterm-<pid>.sock`) pairs with `aterm-<pid>.token`, everything
-            // else — including an explicit `$ATERM_CONTROL_SOCK` path — with the
-            // sibling `aterm.token`, resolved in the socket's own directory and
-            // through the `latest` alias. This used to derive `<stem>.token`,
-            // which the server never writes for a custom socket path, so
-            // `--dial` silently failed to authenticate where `aterm ctl` worked.
+            // (`aterm-<pid>.sock`) pairs with `aterm-<pid>.token`, and an explicit
+            // `$ATERM_CONTROL_SOCK` path with a token named after that socket,
+            // resolved in the socket's own directory and through the `latest`
+            // alias. This used to derive `<stem>.token`, which the server never
+            // wrote, so `--dial` silently failed to authenticate where `aterm ctl`
+            // worked; deriving it here AGAIN is how that came back.
             let tok_path = aterm_uds::latest::token_path_for_sock(&sock)?;
             std::fs::read_to_string(&tok_path)
                 .ok()
@@ -147,7 +149,7 @@ fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
         .ok_or(
             "could not resolve the LOCAL control token: set ATERM_CONTROL_TOKEN, or ensure the \
              token file beside the socket is readable (`aterm-<pid>.token` for an instance \
-             socket, else `aterm.token` in the socket's directory)",
+             socket, else the token named after the socket itself)",
         )?;
     Ok((sock, token))
 }
@@ -336,15 +338,40 @@ mod tests {
 
     /// Regression: the drive CLI must not re-derive the token path itself. The
     /// shared helper is the single source of truth for the convention.
+    ///
+    /// This used to pin the RESULT (`…/aterm.token`) rather than the agreement,
+    /// which made it a second statement of the convention — and it went red the
+    /// day the convention moved: an explicit socket now pairs with a token named
+    /// after ITSELF, because one shared `aterm.token` per directory meant two
+    /// private instances there overwrote each other's credential (F9). The guard
+    /// that actually holds is the one asserted here — whatever the rule says, the
+    /// drive CLI says the same thing, because it asks the same function.
     #[test]
     fn token_path_uses_the_shared_convention_not_a_stem_swap() {
+        for sock in ["/tmp/run/c.sock", "/tmp/run/aterm-42.sock", "/tmp/run/ctl"] {
+            let resolved = aterm_uds::latest::token_path_for_sock(sock).expect("resolves");
+            // Named through the SAME mirror the CLI itself calls, so this crate
+            // gains no dependency to state the rule twice.
+            let expected = std::path::Path::new(sock)
+                .parent()
+                .expect("a directory")
+                .join(aterm_uds::latest::token_name_for_sock(
+                    std::path::Path::new(sock)
+                        .file_name()
+                        .expect("a file name")
+                        .to_string_lossy()
+                        .as_ref(),
+                ));
+            assert_eq!(
+                resolved, expected,
+                "{sock}: the drive CLI must name the token the shared rule names"
+            );
+        }
+        // And the hand-rolled stem swap this test was born to forbid stays gone:
+        // `c.sock` pairs with `c.sock.token`, never `c.token`.
         let p = aterm_uds::latest::token_path_for_sock("/tmp/run/c.sock").expect("resolves");
         assert!(
-            p.ends_with("aterm.token"),
-            "an explicitly-named socket pairs with the SIBLING token, got {p:?}"
-        );
-        assert!(
-            !p.to_string_lossy().contains("c.token"),
+            !p.to_string_lossy().ends_with("/c.token"),
             "the old hand-rolled <stem>.token derivation is gone, got {p:?}"
         );
     }
