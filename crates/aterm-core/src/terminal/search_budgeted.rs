@@ -335,7 +335,9 @@ impl Terminal {
             let text = if i < state.scrollback {
                 self.grid
                     .get_history_line(i)
-                    .map(|l| line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES))
+                    .map(|l| {
+                        line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
+                    })
                     .unwrap_or_default()
             } else {
                 let visible_row = i - state.scrollback;
@@ -344,7 +346,7 @@ impl Terminal {
                     .and_then(|r| self.get_line_text(i32::from(r), None))
                     .unwrap_or_default()
             };
-            state.engine.feed_row(&text);
+            state.engine.feed_row_owned(text);
         }
 
         let results = state

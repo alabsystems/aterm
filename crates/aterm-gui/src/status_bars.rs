@@ -29,7 +29,12 @@
 //!   control-stripped and capped ([`atpkg::progress::sanitize_for_tty`]).
 //! * The update bar renders [`aterm_update::Progress`] as the updater reported it
 //!   from inside its own check — download bytes are the `.part` file's size
-//!   against the release asset's declared size (0 ⇒ no meter, honestly).
+//!   against the release asset's declared size (0 ⇒ no meter, honestly). For a
+//!   STAGED build it also states the apply posture the App computed
+//!   ([`ApplyPosture`]): HOW the build will be applied — in place, by itself or
+//!   on a click — never a landing the lane has not been asked for, and never a
+//!   restart, because the mechanism is the in-session overlap handoff and the
+//!   shells keep running.
 //!
 //! # Lifecycle, and why a bar can never get stuck
 //!
@@ -55,6 +60,7 @@ use std::time::{Duration, Instant};
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_render::Theme;
 
+use crate::app_update_handoff::HandoffUnavailable;
 use crate::chrome_band::{self, BandColors};
 use crate::settings::{blank_row, write_str};
 
@@ -102,6 +108,141 @@ pub(crate) enum Lane {
     Update,
 }
 
+/// How a STAGED build will be applied — what the update bar's detail line may
+/// promise. Computed by the App (`App::apply_posture_for`), which is the only
+/// holder of the policy, the environment vetoes and the lane's own state; the
+/// bar just says it. The mechanism behind every arm is the in-session overlap
+/// handoff — the successor adopts every window, tab, split and live shell — so
+/// none of them asks for a restart; the last arm is the one where that handoff
+/// has been switched off, and there the honest line is that nothing applies
+/// while a terminal is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyPosture {
+    /// `update.auto_apply` on (the default) and no veto: the seamless lane lands
+    /// it at the first quiet moment, forced no later than
+    /// `AUTOMATIC_UPDATE_ACTIVITY_GRACE`.
+    Automatic,
+    /// `[update] auto_apply = false`.
+    ManualByConfig,
+    /// An environment veto for this run: `ATERM_NO_AUTO_APPLY` or the
+    /// `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam.
+    VetoedByEnv { var: &'static str },
+    /// The automatic lane stood down for THIS build (failed / blocked attempts,
+    /// or the typing hold). `lapses`: the latch carries a deadline and re-arms by
+    /// itself.
+    ManualOnlyLatched { lapses: bool },
+    /// The in-session handoff cannot run in this process — `why` names the
+    /// reason ([`HandoffUnavailable`]: the `ATERM_NO_SEAMLESS_UPDATE` opt-out,
+    /// an explicit `--control-sock`, `--headless`, no event loop), read from the
+    /// SAME predicate the apply gate reads (`App::seamless_handoff_unavailable`).
+    /// That is NOT "a cold re-exec instead": the admission classifier
+    /// (`native_update_admission::classify`) admits the cold lane only with
+    /// zero live PTYs and REFUSES the apply while any terminal is open — no
+    /// shell dies, nothing applies. With the automatic lane armed (`veto:
+    /// None`) the update lands at the next launch (or once every terminal is
+    /// closed); with it vetoed (`veto` names what stands in the way) that
+    /// closed-terminals landing is a promise the lane never arms, so the
+    /// sentence names the veto and the manual affordance instead. The one
+    /// posture whose honest sentence is a warning, and the warning is "will not
+    /// apply", never "will not survive"; it outranks every other arm, because
+    /// the others change WHEN the build applies and this one changes WHETHER.
+    HandoffDisabled {
+        why: HandoffUnavailable,
+        veto: Option<AutoApplyVeto>,
+    },
+}
+
+/// Why the AUTOMATIC apply lane would not arm even if the handoff were
+/// available — carried into [`ApplyPosture::HandoffDisabled`] so its fallback
+/// clause cannot promise the cold apply "once every terminal is closed" over a
+/// lane that never attempts it. Same precedence as the standalone arms:
+/// the environment veto, then config, then the screenshot seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoApplyVeto {
+    /// `[update] auto_apply = false`.
+    Config,
+    /// `$ATERM_NO_AUTO_APPLY` or the `$ATERM_DEBUG_RELAUNCH_NUDGE` screenshot
+    /// seam.
+    Env { var: &'static str },
+}
+
+impl AutoApplyVeto {
+    /// The clause the sentence leads the fallback with — what the reader can
+    /// act on, worded like the standalone arms for the same states.
+    fn clause(self) -> String {
+        match self {
+            Self::Config => "auto-apply is off".to_string(),
+            Self::Env { var } => format!("${var} is set"),
+        }
+    }
+}
+
+/// The manual affordance, named the same way on every surface. Off macOS the
+/// Version menu is the palette's Version section and the in-grid tab strip
+/// carries the `↻`.
+const APPLY_FROM_MENU: &str = if cfg!(target_os = "macos") {
+    "apply it from the Version menu"
+} else {
+    "apply it from the Version menu or the \u{21bb} button"
+};
+
+/// The Staged bar's detail: `build N — verified; <how it applies>`. One sentence
+/// per posture, each true of the mechanism it names and none of them a restart.
+#[must_use]
+pub(crate) fn staged_detail(build: u64, posture: ApplyPosture) -> String {
+    let how = match posture {
+        ApplyPosture::Automatic => {
+            // The promise tracks the constant that enforces it.
+            let minutes = crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE
+                .as_secs()
+                .div_ceil(60);
+            format!("applies in place within ~{minutes} min — your shells keep running")
+        }
+        ApplyPosture::ManualByConfig => format!(
+            "auto-apply is off — {APPLY_FROM_MENU} or Software Update (in place; your shells \
+             keep running)"
+        ),
+        ApplyPosture::VetoedByEnv { var } => {
+            format!("${var} is set — {APPLY_FROM_MENU} (in place; your shells keep running)")
+        }
+        ApplyPosture::ManualOnlyLatched { lapses: true } => format!(
+            "automatic apply stood down for now — it retries by itself, or {APPLY_FROM_MENU}"
+        ),
+        ApplyPosture::ManualOnlyLatched { lapses: false } => format!(
+            "automatic apply stood down — it will not try again until you {APPLY_FROM_MENU}"
+        ),
+        // The load-bearing clause comes first: the layout truncates the detail
+        // from the right when the window is narrow.
+        ApplyPosture::HandoffDisabled { why, veto: None } => format!(
+            "{} — the handoff is off: it will NOT apply while any terminal is open; \
+             it lands at the next launch (or once every terminal is closed)",
+            why.cause()
+        ),
+        // With the automatic lane ALSO vetoed, "once every terminal is closed"
+        // would promise a landing the lane never arms: name the veto and the
+        // manual affordance instead (the next-launch boot apply stays true —
+        // it is not policy-gated).
+        ApplyPosture::HandoffDisabled {
+            why,
+            veto: Some(veto),
+        } => format!(
+            "{} — the handoff is off: it will NOT apply while any terminal is open; \
+             {} — {APPLY_FROM_MENU} once every terminal is closed, or it lands at the next launch",
+            why.cause(),
+            veto.clause()
+        ),
+    };
+    format!("build {build} — verified; {how}")
+}
+
+/// The Staged line for a caller that computed no posture: only the manual
+/// affordance, which is true whatever the policy — never a promise about the
+/// automatic lane, and never "auto-apply is off" painted over a lane that may
+/// be armed.
+fn staged_detail_unknown(build: u64) -> String {
+    format!("build {build} — verified; {APPLY_FROM_MENU} (in place; your shells keep running)")
+}
+
 /// The bar's colour mood — information, a good end, or something the user
 /// should look at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +285,10 @@ pub(crate) struct Bar {
     /// live meter is clamped to its own high-water mark and never inherits a
     /// different pass's. `None` off the toolchain lane / before a snapshot.
     pub pass_id: Option<(String, u64)>,
+    /// The build a STAGED update bar is about, so a later, better-informed
+    /// posture can be re-stated on it ([`StatusBars::restate_apply_posture`]) and
+    /// on nothing else. `None` on every other bar.
+    pub staged_build: Option<u64>,
 }
 
 impl Bar {
@@ -383,6 +528,7 @@ impl StatusBars {
             fold_at: None,
             stale_at: Some(now + ANNOUNCE_STALE),
             pass_id: None,
+            staged_build: None,
         });
     }
 
@@ -433,6 +579,7 @@ impl StatusBars {
                 },
                 stale_at: snap.running.then_some(now + TAILED_STALE),
                 pass_id: None,
+                staged_build: None,
             });
             return;
         }
@@ -501,6 +648,7 @@ impl StatusBars {
                 fold_at: None,
                 stale_at: Some(now + TAILED_STALE),
                 pass_id,
+                staged_build: None,
             });
             return;
         }
@@ -543,15 +691,20 @@ impl StatusBars {
                 fold_at: Some(now + hold),
                 stale_at: None,
                 pass_id: None,
+                staged_build: None,
             });
         } else {
             // A live-looking file whose writer is gone (dead pid / stale
-            // heartbeat): say so, name the next act, and never animate.
+            // heartbeat): say so, name the next act, and never animate. The
+            // next act is a command (or simply waiting: the 6-hourly pass
+            // retries by itself) — never a reopen, which nothing here needs.
             self.toolchain = Some(Bar {
                 text: BarText {
                     glyph: '\u{23f8}',
                     title: title.to_string(),
-                    detail: "stopped — reopen aterm or run: aterm pkg update".to_string(),
+                    detail:
+                        "stopped — run: aterm pkg update (the background pass retries on its own)"
+                            .to_string(),
                     stats: if total > 0 {
                         format!("{done} of {total}")
                     } else {
@@ -563,6 +716,7 @@ impl StatusBars {
                 fold_at: Some(now + HOLD_WARN),
                 stale_at: None,
                 pass_id: None,
+                staged_build: None,
             });
         }
     }
@@ -588,6 +742,7 @@ impl StatusBars {
             fold_at: Some(now + HOLD_OK),
             stale_at: None,
             pass_id: None,
+            staged_build: None,
         });
     }
 
@@ -608,6 +763,7 @@ impl StatusBars {
             fold_at: Some(now + HOLD_WARN),
             stale_at: None,
             pass_id: None,
+            staged_build: None,
         });
     }
 
@@ -616,7 +772,17 @@ impl StatusBars {
     /// One report from inside the updater's own check ([`aterm_update::Progress`]).
     /// Only DOWNLOAD-and-later phases raise the bar: a check that finds nothing
     /// to do (the common case, every few minutes) must never move the grid.
-    pub(crate) fn update_progress(&mut self, p: &aterm_update::Progress, now: Instant) {
+    ///
+    /// `posture` is how a STAGED build will be applied, as the App computed it
+    /// (`App::apply_posture_for`) — read only by the `Staged` arm, whose detail
+    /// line states it. `None` (a caller that computed none) states only the
+    /// manual affordance.
+    pub(crate) fn update_progress(
+        &mut self,
+        p: &aterm_update::Progress,
+        posture: Option<ApplyPosture>,
+        now: Instant,
+    ) {
         use aterm_update::Progress as P;
         let v = |version: &str| sanitize_for_tty(version, 32);
         match p {
@@ -646,6 +812,7 @@ impl StatusBars {
                     fold_at: None,
                     stale_at: Some(now + UPDATE_STALE),
                     pass_id: None,
+                    staged_build: None,
                 });
             }
             P::Verifying { version } => {
@@ -661,14 +828,23 @@ impl StatusBars {
                     fold_at: None,
                     stale_at: Some(now + UPDATE_STALE),
                     pass_id: None,
+                    staged_build: None,
                 });
             }
             P::Staged { version, build } => {
+                // HOW IT APPLIES — never "restart aterm to apply", which this line
+                // said over the in-session handoff until 2026-08-30. The App
+                // re-states the line once the lane has actually armed or stood
+                // down for this build (`restate_apply_posture`), typically well
+                // inside the hold.
                 self.update = Some(Bar {
                     text: BarText {
                         glyph: '\u{2713}',
                         title: format!("aterm v{} is ready", v(version)),
-                        detail: format!("build {build} — verified; restart aterm to apply"),
+                        detail: posture.map_or_else(
+                            || staged_detail_unknown(*build),
+                            |posture| staged_detail(*build, posture),
+                        ),
                         stats: String::new(),
                         tone: Tone::Success,
                     },
@@ -676,6 +852,7 @@ impl StatusBars {
                     fold_at: Some(now + HOLD_OK),
                     stale_at: None,
                     pass_id: None,
+                    staged_build: Some(*build),
                 });
             }
             P::Deferred { detail } => {
@@ -691,6 +868,7 @@ impl StatusBars {
                     fold_at: Some(now + HOLD_OK),
                     stale_at: None,
                     pass_id: None,
+                    staged_build: None,
                 });
             }
             P::Failed { detail } => {
@@ -709,9 +887,31 @@ impl StatusBars {
                     fold_at: Some(now + HOLD_WARN),
                     stale_at: None,
                     pass_id: None,
+                    staged_build: None,
                 });
             }
         }
+    }
+
+    /// Re-state HOW a staged build applies on the live update bar — the
+    /// refinement the App posts once the lane has actually armed (or stood down)
+    /// for `build`, a moment after the `Staged` report painted the policy line.
+    /// Rewrites only the detail of a Staged bar for exactly `build`; the fold
+    /// deadline is untouched, so the bar still leaves on time. Returns whether the
+    /// words changed, so the caller can skip a repaint that would present nothing.
+    pub(crate) fn restate_apply_posture(&mut self, build: u64, posture: ApplyPosture) -> bool {
+        let Some(bar) = self.update.as_mut() else {
+            return false;
+        };
+        if bar.staged_build != Some(build) {
+            return false;
+        }
+        let detail = staged_detail(build, posture);
+        if bar.text.detail == detail {
+            return false;
+        }
+        bar.text.detail = detail;
+        true
     }
 }
 
@@ -1308,6 +1508,19 @@ mod tests {
             bar.text.detail
         );
         assert!(!bar.text.detail.contains("extracting"));
+        // The next act is the command (or nothing: the background pass retries by
+        // itself) — a stalled toolchain pass never asks for a reopen.
+        assert!(
+            bar.text.detail.contains("aterm pkg update"),
+            "{}",
+            bar.text.detail
+        );
+        let lower = bar.text.detail.to_lowercase();
+        assert!(
+            !lower.contains("reopen") && !lower.contains("restart") && !lower.contains("relaunch"),
+            "{}",
+            bar.text.detail
+        );
         assert_eq!(bar.fold_at, Some(now + HOLD_WARN));
     }
 
@@ -1358,6 +1571,7 @@ mod tests {
                 version: "0.48.0".into(),
                 build: 99,
             },
+            None,
             now,
         );
         assert_eq!(bars.rows(), 2);
@@ -1388,6 +1602,7 @@ mod tests {
                 version: "0.48.0".into(),
                 build: 99,
             },
+            Some(ApplyPosture::Automatic),
             now,
         );
         assert_eq!(bars.ledger().count(), 0, "nothing has folded yet");
@@ -1401,6 +1616,11 @@ mod tests {
         assert!(
             !rows[0].title.is_empty(),
             "the words the user could have read survive the fold"
+        );
+        assert!(
+            rows[0].detail.contains("applies in place") && !rows[0].detail.contains("restart"),
+            "the ledger row carries the honest sentence: {:?}",
+            rows[0].detail
         );
 
         assert!(bars.settle(now + HOLD_WARN), "then the warn bar");
@@ -1469,6 +1689,7 @@ mod tests {
                 bytes_done: 45,
                 bytes_total: 90,
             },
+            None,
             now + HOLD_WARN,
         );
 
@@ -1503,6 +1724,7 @@ mod tests {
                     version: format!("0.{i}.0"),
                     build: i as u64,
                 },
+                None,
                 now,
             );
             now += HOLD_OK;
@@ -1532,6 +1754,7 @@ mod tests {
                 bytes_done: 45_000_000,
                 bytes_total: 74_000_000,
             },
+            None,
             now,
         );
         let bar = bars.bars().next().unwrap().1;
@@ -1546,6 +1769,7 @@ mod tests {
                 bytes_done: 45_000_000,
                 bytes_total: 0,
             },
+            None,
             now,
         );
         let bar = bars.bars().next().unwrap().1;
@@ -1555,6 +1779,7 @@ mod tests {
             &P::Verifying {
                 version: "0.48.0".into(),
             },
+            None,
             now,
         );
         assert_eq!(
@@ -1562,9 +1787,27 @@ mod tests {
             "verifying and staging…"
         );
         bars.update_progress(
+            &P::Staged {
+                version: "0.48.0".into(),
+                build: 99,
+            },
+            Some(ApplyPosture::Automatic),
+            now,
+        );
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "aterm v0.48.0 is ready");
+        assert_eq!(
+            bar.text.detail,
+            "build 99 — verified; applies in place within ~2 min — your shells keep running"
+        );
+        assert!(!bar.text.detail.contains("restart"));
+        assert_eq!(bar.staged_build, Some(99));
+        assert_eq!(bar.fold_at, Some(now + HOLD_OK));
+        bars.update_progress(
             &P::Failed {
                 detail: "zip sha256 mismatch".into(),
             },
+            None,
             now,
         );
         let bar = bars.bars().next().unwrap().1;
@@ -1676,6 +1919,7 @@ mod tests {
                 bytes_done: 45_000_000,
                 bytes_total: 74_000_000,
             },
+            None,
             now,
         );
         // Wide enough for every piece of the toolchain row (the detail outranks
@@ -1720,5 +1964,582 @@ mod tests {
         assert_eq!(fmt_bytes(812_000), "812 KB");
         assert_eq!(fmt_bytes(512_000_000), "512 MB");
         assert_eq!(fmt_bytes(1_200_000_000), "1.2 GB");
+    }
+
+    /// THE STAGED BAR SAYS HOW THE UPDATE APPLIES, AND NEVER ASKS FOR A RESTART.
+    ///
+    /// This line read "build N — verified; restart aterm to apply" over the
+    /// in-session overlap handoff — the mechanism that exists so that nobody
+    /// restarts — until 2026-08-30. Every posture the App can compute has its own
+    /// honest sentence; the one that warns (`HandoffDisabled`, for every reason
+    /// the handoff can be unavailable) warns that nothing applies while a
+    /// terminal is open — not that shells die, which the admission classifier
+    /// never permits (see
+    /// `the_disabled_handoff_line_says_what_the_admission_classifier_does`).
+    #[test]
+    fn a_staged_bar_says_how_the_update_applies_and_never_asks_for_a_restart() {
+        use ApplyPosture as P;
+        let staged = aterm_update::Progress::Staged {
+            version: "0.67.0".into(),
+            build: 7,
+        };
+        let now = t0();
+        let mut cases: Vec<(P, Vec<&str>)> = vec![
+            (
+                P::Automatic,
+                vec!["applies in place", "~2 min", "shells keep running"],
+            ),
+            (P::ManualByConfig, vec!["auto-apply is off", "Version menu"]),
+            (
+                P::VetoedByEnv {
+                    var: "ATERM_NO_AUTO_APPLY",
+                },
+                vec!["$ATERM_NO_AUTO_APPLY", "Version menu"],
+            ),
+            (
+                P::VetoedByEnv {
+                    var: "ATERM_DEBUG_RELAUNCH_NUDGE",
+                },
+                vec!["$ATERM_DEBUG_RELAUNCH_NUDGE"],
+            ),
+            (
+                P::ManualOnlyLatched { lapses: true },
+                vec!["retries by itself", "Version menu"],
+            ),
+            (
+                P::ManualOnlyLatched { lapses: false },
+                vec!["until you apply it"],
+            ),
+        ];
+        // Every reason the handoff can be unavailable gets the same warning, led
+        // by its own cause — the thing the reader can act on.
+        for why in HandoffUnavailable::ALL {
+            cases.push((
+                P::HandoffDisabled { why, veto: None },
+                vec![
+                    why.cause(),
+                    "will NOT apply while any terminal is open",
+                    "lands at the next launch (or once every terminal is closed)",
+                ],
+            ));
+        }
+        // With the automatic lane ALSO vetoed the fallback names the veto and
+        // the manual affordance instead of the closed-terminals landing the
+        // lane never attempts.
+        cases.push((
+            P::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: Some(AutoApplyVeto::Config),
+            },
+            vec![
+                "auto-apply is off",
+                "will NOT apply while any terminal is open",
+                "Version menu",
+                "once every terminal is closed",
+            ],
+        ));
+        cases.push((
+            P::HandoffDisabled {
+                why: HandoffUnavailable::OptedOut,
+                veto: Some(AutoApplyVeto::Env {
+                    var: "ATERM_NO_AUTO_APPLY",
+                }),
+            },
+            vec!["$ATERM_NO_AUTO_APPLY is set", "Version menu"],
+        ));
+        for (posture, must_say) in cases {
+            let mut bars = StatusBars::default();
+            bars.update_progress(&staged, Some(posture), now);
+            let bar = bars.bars().next().unwrap().1;
+            assert_eq!(bar.text.title, "aterm v0.67.0 is ready");
+            assert_eq!(bar.staged_build, Some(7));
+            assert_eq!(bar.text.detail, staged_detail(7, posture));
+            assert!(
+                bar.text.detail.starts_with("build 7 — verified; "),
+                "{posture:?}: {}",
+                bar.text.detail
+            );
+            for words in must_say {
+                assert!(
+                    bar.text.detail.contains(words),
+                    "{posture:?} must say {words:?}: {}",
+                    bar.text.detail
+                );
+            }
+            // The one veto's NAME carries the word (`$ATERM_DEBUG_RELAUNCH_NUDGE`
+            // is an identifier the line must name so the reader can unset it);
+            // the sentence around it may not.
+            let lower = bar
+                .text
+                .detail
+                .replace("ATERM_DEBUG_RELAUNCH_NUDGE", "<seam>")
+                .to_lowercase();
+            assert!(
+                !lower.contains("restart") && !lower.contains("relaunch"),
+                "{posture:?} asks for a restart: {}",
+                bar.text.detail
+            );
+            if matches!(posture, P::HandoffDisabled { .. }) {
+                assert!(
+                    !lower.contains("keep running") && !lower.contains("survive"),
+                    "with the handoff off the line may neither promise an in-place \
+                     landing nor threaten a kill the admission gate forbids: {}",
+                    bar.text.detail
+                );
+            }
+        }
+
+        // A caller with no posture states only the manual affordance — true in
+        // every posture the seamless lane serves, a promise in none.
+        let mut bars = StatusBars::default();
+        bars.update_progress(&staged, None, now);
+        let detail = bars.bars().next().unwrap().1.text.detail.clone();
+        assert!(
+            detail.contains("Version menu")
+                && !detail.contains("auto-apply is off")
+                && !detail.contains("~2 min")
+                && !detail.to_lowercase().contains("restart"),
+            "{detail}"
+        );
+
+        // RESTATE: the App refines the line once the lane has actually armed —
+        // the same bar, the same hold.
+        let fold_at = bars.bars().next().unwrap().1.fold_at;
+        assert!(
+            bars.restate_apply_posture(7, P::Automatic),
+            "the live Staged bar for build 7 is rewritten"
+        );
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.detail, staged_detail(7, P::Automatic));
+        assert_eq!(bar.fold_at, fold_at, "the hold is untouched");
+        assert!(
+            !bars.restate_apply_posture(7, P::Automatic),
+            "the same words again are not a repaint"
+        );
+        assert!(
+            !bars.restate_apply_posture(8, P::ManualByConfig),
+            "another build's posture is not this bar's"
+        );
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.detail,
+            staged_detail(7, P::Automatic)
+        );
+        assert!(bars.settle(now + HOLD_OK), "the bar folds on time");
+        assert!(
+            !bars.restate_apply_posture(7, P::ManualOnlyLatched { lapses: true }),
+            "nothing to restate once the bar has folded"
+        );
+        // A bar that is not a Staged bar is never restated.
+        bars.update_progress(
+            &aterm_update::Progress::Verifying {
+                version: "0.67.0".into(),
+            },
+            None,
+            now,
+        );
+        assert!(!bars.restate_apply_posture(7, P::Automatic));
+    }
+
+    /// THE DISABLED-HANDOFF LINE SAYS WHAT THE ADMISSION CLASSIFIER DOES.
+    ///
+    /// With `$ATERM_NO_SEAMLESS_UPDATE` set the apply is not "cold instead of
+    /// seamless": `seamless_capable` is false, and
+    /// `native_update_admission::classify` REFUSES the apply while any PTY is
+    /// live — only an exact zero-PTY process may take the cold lane. The bar said
+    /// "applies by cold re-exec; your shells will NOT survive" — a kill the
+    /// classifier never permits — until 2026-08-30. The sentence and the gate are
+    /// pinned together here so they cannot drift apart again.
+    #[test]
+    fn the_disabled_handoff_line_says_what_the_admission_classifier_does() {
+        use crate::native_update_admission::{
+            AdmissionBlock, AdmissionDecision, AdmissionFacts, ApplyLane, classify,
+        };
+        let opted_out = |live_ptys: usize| AdmissionFacts {
+            staged_verified: true,
+            // `overlap_available && !live.is_empty()` with the opt-out set.
+            seamless_capable: false,
+            native_state_certified: true,
+            live_ptys,
+            foreground_jobs: 0,
+            unknown_foregrounds: 0,
+        };
+        assert_eq!(
+            classify(opted_out(1)),
+            AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless),
+            "one open terminal: the apply is refused and nothing dies"
+        );
+        assert_eq!(
+            classify(opted_out(0)),
+            AdmissionDecision::Apply(ApplyLane::Cold),
+            "no terminal at all: the cold re-exec"
+        );
+        // `seamless_capable` is one predicate's `is_none()`
+        // (`App::seamless_handoff_unavailable`), so every reason it can name gets
+        // this same sentence, led by its own cause.
+        for why in HandoffUnavailable::ALL {
+            let line = staged_detail(7, ApplyPosture::HandoffDisabled { why, veto: None });
+            assert!(
+                line.starts_with(&format!(
+                    "build 7 — verified; {} — the handoff is off: ",
+                    why.cause()
+                )) && line.contains("will NOT apply while any terminal is open")
+                    && line.contains("lands at the next launch (or once every terminal is closed)"),
+                "{line}"
+            );
+            let lower = line.to_lowercase();
+            assert!(
+                !lower.contains("survive")
+                    && !lower.contains("keep running")
+                    && !lower.contains("cold re-exec")
+                    && !lower.contains("restart")
+                    && !lower.contains("relaunch")
+                    && !lower.contains("version menu"),
+                "the line may neither threaten a kill the gate forbids nor promise a \
+                 landing (or a click) it refuses: {line}"
+            );
+        }
+        assert_eq!(
+            staged_detail(
+                7,
+                ApplyPosture::HandoffDisabled {
+                    why: HandoffUnavailable::OptedOut,
+                    veto: None
+                }
+            ),
+            "build 7 — verified; $ATERM_NO_SEAMLESS_UPDATE is set — the handoff is off: \
+             it will NOT apply while any terminal is open; \
+             it lands at the next launch (or once every terminal is closed)"
+        );
+        assert!(
+            staged_detail(
+                7,
+                ApplyPosture::HandoffDisabled {
+                    why: HandoffUnavailable::ExplicitControlSock,
+                    veto: None
+                }
+            )
+            .starts_with("build 7 — verified; $ATERM_CONTROL_SOCK is set (--control-sock) — ")
+        );
+        // The vetoed twin: names the veto, points at the manual affordance
+        // (qualified by the zero-terminal admission), keeps the true
+        // next-launch fallback — and drops the closed-terminals promise of the
+        // armed lane.
+        let vetoed = staged_detail(
+            7,
+            ApplyPosture::HandoffDisabled {
+                why: HandoffUnavailable::OptedOut,
+                veto: Some(AutoApplyVeto::Config),
+            },
+        );
+        assert_eq!(
+            vetoed,
+            format!(
+                "build 7 — verified; $ATERM_NO_SEAMLESS_UPDATE is set — the handoff is off: \
+                 it will NOT apply while any terminal is open; auto-apply is off — \
+                 {APPLY_FROM_MENU} once every terminal is closed, or it lands at the next launch"
+            )
+        );
+        assert!(
+            !vetoed.contains("(or once every terminal is closed)"),
+            "the vetoed lane may not promise the automatic closed-terminals landing: {vetoed}"
+        );
+    }
+
+    /// NOTHING IN THE UPDATE LANE ASKS FOR A RESTART OR A RELAUNCH (owner ruling,
+    /// 2026-08-30). The mechanism is the in-session overlap handoff; every sentence
+    /// a person can read on the way to it — this bar, the Version-menu / palette
+    /// row, the trouble tails, the admission refusals, the close-preflight
+    /// blockers, the installed-on-disk outcomes, the status pill — is pinned here
+    /// ONCE, so the words cannot drift back one surface at a time. "Restart" and
+    /// "relaunch" stay reserved for the things that genuinely need one
+    /// (`columns`/`lines`, the GPU renderer choice, the Windows backdrop, Rosetta),
+    /// none of which is an update.
+    #[test]
+    fn no_update_surface_asks_for_a_restart_or_a_relaunch() {
+        use crate::native_update_admission::{AdmissionBlock, AdmissionFacts};
+        use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
+        use ApplyPosture as P;
+
+        let mut surfaces: Vec<(&str, String)> = Vec::new();
+        let mut postures = vec![
+            P::Automatic,
+            P::ManualByConfig,
+            P::VetoedByEnv {
+                var: "ATERM_NO_AUTO_APPLY",
+            },
+            P::VetoedByEnv {
+                var: "ATERM_DEBUG_RELAUNCH_NUDGE",
+            },
+            P::ManualOnlyLatched { lapses: true },
+            P::ManualOnlyLatched { lapses: false },
+        ];
+        postures.extend(HandoffUnavailable::ALL.map(|why| P::HandoffDisabled { why, veto: None }));
+        postures.push(P::HandoffDisabled {
+            why: HandoffUnavailable::Headless,
+            veto: Some(AutoApplyVeto::Config),
+        });
+        postures.push(P::HandoffDisabled {
+            why: HandoffUnavailable::Headless,
+            veto: Some(AutoApplyVeto::Env {
+                var: "ATERM_NO_AUTO_APPLY",
+            }),
+        });
+        for posture in postures {
+            surfaces.push(("status bar", staged_detail(7, posture)));
+        }
+        surfaces.push(("status bar (no posture)", staged_detail_unknown(7)));
+        surfaces.push((
+            "Version menu row",
+            crate::menu::staged_apply_label("\u{2191}", 7, "9.9.9", None),
+        ));
+        surfaces.push((
+            "Version menu row (same version)",
+            crate::menu::staged_apply_label(
+                "\u{2191}",
+                7,
+                crate::build_info::version_display(),
+                None,
+            ),
+        ));
+        for retry in [ApplyRetry::Scheduled, ApplyRetry::ManualOnly] {
+            let trouble = ApplyTrouble::new(
+                2,
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+                retry,
+            )
+            .expect("two failed applies");
+            surfaces.push(("trouble row tail", trouble.row_tail()));
+            surfaces.push(("trouble sentence", trouble.sentence()));
+            surfaces.push(("trouble compact", trouble.compact()));
+            surfaces.push(("trouble micro", trouble.micro()));
+            surfaces.push((
+                "Version menu row (troubled)",
+                crate::menu::staged_apply_label("\u{2191}", 7, "9.9.9", Some(&trouble)),
+            ));
+        }
+        let facts = AdmissionFacts {
+            staged_verified: true,
+            seamless_capable: false,
+            native_state_certified: false,
+            live_ptys: 2,
+            foreground_jobs: 1,
+            unknown_foregrounds: 1,
+        };
+        for block in [
+            AdmissionBlock::UnverifiedStage,
+            AdmissionBlock::NativeStateUncertified,
+            AdmissionBlock::LivePtysNeedSeamless,
+            AdmissionBlock::ForegroundProbeUnknown,
+        ] {
+            surfaces.push(("admission refusal", block.message(facts)));
+        }
+        surfaces.push((
+            "close-preflight blocker",
+            crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string(),
+        ));
+        surfaces.push((
+            "close-preflight blocker",
+            crate::App::RESTORE_IN_FLIGHT_BLOCKS_APPLY.to_string(),
+        ));
+        surfaces.push((
+            "installed-on-disk outcome",
+            crate::App::INSTALLED_ACTIVATES_IN_PLACE.to_string(),
+        ));
+        surfaces.push((
+            "updater outcome",
+            crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(7),
+        ));
+        surfaces.push((
+            "updater outcome",
+            crate::native_updater_service::NativeUpdaterService::apply_attempt_stopped_outcome(
+                "child died",
+            ),
+        ));
+        surfaces.push((
+            "status pill",
+            crate::app_update_screen::UPDATE_INSTALLED_ACTIVATING.to_string(),
+        ));
+        assert!(surfaces.len() >= 25, "the guard covers the whole lane");
+        for (surface, text) in surfaces {
+            // An environment variable's NAME is an identifier, not a prompt.
+            let lower = text
+                .replace("ATERM_DEBUG_RELAUNCH_NUDGE", "<seam>")
+                .to_lowercase();
+            assert!(
+                !lower.contains("restart")
+                    && !lower.contains("relaunch")
+                    && !lower.contains("reopen"),
+                "{surface} asks for a restart: {text:?}"
+            );
+        }
+    }
+
+    /// AND THE SOURCE SAYS IT NOWHERE. The guard above checks the VALUES of an
+    /// enumerated list, so a surface nobody added to the list, or a sentence its
+    /// three words cannot see — "quit and open aterm again", "activates it at the
+    /// next launch" — passes it. This one reads the SHIPPING lines of every
+    /// update-lane file in this crate, plus every `.rs` file of `aterm-cli` and
+    /// `aterm-update` (test code dropped, comment lines dropped), for the
+    /// shapes a restart prompt takes. The things that genuinely
+    /// apply at the next launch (`columns`/`lines`, the GPU backend, `net.key`,
+    /// the `[packages]` service, the Windows backdrop, the config validator's
+    /// dead worker) are allow-listed by an anchor on the same line, and the
+    /// handoff-off posture's fallback clause ("… or once every terminal is
+    /// closed") carries its own. The shell twin, `tools/grep_guard.sh` B12, reads
+    /// every file in the crate with the same needles and anchors. Both lists are
+    /// assembled at runtime so no test source can trip them.
+    #[test]
+    fn no_update_lane_source_prompts_a_restart() {
+        let join = |parts: &[(&str, &str)]| -> Vec<String> {
+            parts.iter().map(|(a, b)| format!("{a}{b}")).collect()
+        };
+        let needles = join(&[
+            ("restart ", "aterm"),
+            ("restart ", "now"),
+            ("restart ", "to apply"),
+            ("restart ", "to finish"),
+            ("restart ", "to update"),
+            ("relaunch ", "aterm"),
+            ("relaunch ", "once"),
+            ("relaunch ", "now"),
+            ("relaunch ", "to "),
+            ("before ", "relaunch"),
+            (" on ", "relaunch"),
+            ("& ", "relaunch"),
+            ("quit and ", "open"),
+            ("quit and ", "reopen"),
+            ("open aterm ", "again"),
+            ("start aterm ", "again"),
+            ("re-", "launch"),
+            ("re-open ", "aterm"),
+            ("re-open ", "the app"),
+            ("re-open ", "it"),
+            ("re", "boot"),
+            ("next ", "launch"),
+            ("restart ", "required"),
+            ("requires ", "a restart"),
+            ("needs ", "a restart"),
+            ("reopen ", "aterm"),
+            ("reopen ", "the app"),
+            ("relaunch ", "required"),
+            ("needs ", "a relaunch"),
+            ("relaunch ", "the app"),
+        ]);
+        let anchors = join(&[
+            ("once every ", "terminal is closed"),
+            ("applies ", "next launch"),
+            ("closing or ", "next launch"),
+            ("automatic ", "checks"),
+            ("manual ", "now"),
+            ("[", "packages]"),
+            ("next ", "package operation"),
+            ("net", ".key"),
+            ("columns", "/lines"),
+            ("gpu ", "applies"),
+            ("gpu rendering ", "(restart)"),
+            ("this ", "launch"),
+            ("open a new window ", "or restart"),
+            ("config ", "validator"),
+            ("back", "drop"),
+            ("own apply ", "lane"),
+            ("launch is the ", "fallback"),
+            ("retired-wording ", "detector"),
+        ]);
+        let gui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<std::path::PathBuf> = [
+            "status_bars.rs",
+            "menu.rs",
+            "palette.rs",
+            "app_palette.rs",
+            "notice.rs",
+            "relaunch_notice.rs",
+            "app_update_screen.rs",
+            "app_update_handoff.rs",
+            "app_native.rs",
+            "native_settings.rs",
+            "native_ui.rs",
+            "native_updater_service.rs",
+            "native_update_admission.rs",
+            "update_apply_trouble.rs",
+            "control.rs",
+        ]
+        .iter()
+        .map(|file| gui.join(file))
+        .collect();
+        // The CLI and the updater ship update-lane strings of their own (the
+        // `update` verb's output, the updater's log and status lines), which
+        // the include-set above could never see — every `.rs` file of both
+        // crates, derived, so a new module cannot dodge the scan.
+        for dir in ["../aterm-cli/src", "../aterm-update/src"] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+            let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+                .map(|entry| entry.expect("read_dir entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .collect();
+            siblings.sort();
+            assert!(!siblings.is_empty(), "{} scanned no files", dir.display());
+            files.append(&mut siblings);
+        }
+        let mut scanned = 0usize;
+        for path in files {
+            let file = path.display();
+            let source =
+                std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
+            // Test code is not a shipping line. The gui files keep their tests
+            // in one trailing `mod tests`; the CLI and the updater interleave
+            // several `#[cfg(test)] mod …` blocks with production, so gate on
+            // the attribute the way grep_guard's `np_strip` does: a column-0
+            // `#[cfg(test)]` opens a skip that a block ends at its column-0 `}`
+            // and a single item ends at its `;`.
+            let mut in_test_block = false;
+            let mut test_item_armed = false;
+            for (n, line) in source.lines().enumerate() {
+                if in_test_block {
+                    if line == "}" {
+                        in_test_block = false;
+                    }
+                    continue;
+                }
+                if test_item_armed {
+                    if line.ends_with('{') {
+                        in_test_block = true;
+                        test_item_armed = false;
+                    } else if line.ends_with(';') {
+                        test_item_armed = false;
+                    }
+                    continue;
+                }
+                if line == "#[cfg(test)]" {
+                    test_item_armed = true;
+                    continue;
+                }
+                if line == "mod tests {" {
+                    break;
+                }
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with('*') || code.starts_with("/*") {
+                    continue;
+                }
+                scanned += 1;
+                let lower = line.to_lowercase();
+                if anchors.iter().any(|anchor| lower.contains(anchor.as_str())) {
+                    continue;
+                }
+                for needle in &needles {
+                    assert!(
+                        !lower.contains(needle.as_str()),
+                        "{file}:{} prompts a restart ({needle:?}): {}\n\
+                         an update is applied in place by the in-session handoff — the \
+                         shells keep running — and no update surface asks for a restart; \
+                         a setting that genuinely applies at the next launch names its \
+                         anchor on the same line",
+                        n + 1,
+                        line.trim()
+                    );
+                }
+            }
+        }
+        assert!(scanned > 20_000, "the guard read the lane: {scanned} lines");
     }
 }

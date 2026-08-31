@@ -86,6 +86,18 @@ fn eintr() -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
 }
 
+/// Whether `poll(2)` says a stream fd must be read now.
+///
+/// `POLLHUP` is deliberately included even without `POLLIN`: Unix variants may
+/// report the buffered tail and final EOF as either `POLLIN|POLLHUP` or a bare
+/// hangup. Reading every observation preserves the tail and turns the final one
+/// into `read == 0`; ignoring a terminal-only event leaves the fd registered and
+/// can make `poll` return immediately forever. Error/invalid-fd readiness has the
+/// same terminal shape and must reach the existing read-error path instead.
+const fn poll_must_read(revents: libc::c_short) -> bool {
+    revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
 /// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
 /// returns the shell's exit status (non-exit → 1). The body is the parent-side
 /// session loop moved verbatim from `main()`.
@@ -158,7 +170,7 @@ pub(crate) fn run(
         }
 
         // host keystrokes -> the shell.
-        if fds[0].revents & libc::POLLIN != 0 {
+        if poll_must_read(fds[0].revents) {
             let r = unsafe {
                 libc::read(
                     libc::STDIN_FILENO,
@@ -178,7 +190,7 @@ pub(crate) fn run(
         // shell output -> host terminal (passthrough), and the engine (model)
         // only when one is armed. The write comes FIRST either way, so the
         // bytes are out the door before anything else touches them.
-        if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if poll_must_read(fds[1].revents) {
             let r = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if r < 0 && eintr() {
                 continue;
@@ -222,5 +234,77 @@ pub(crate) fn run(
         libc::WEXITSTATUS(status)
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+
+    #[test]
+    fn every_terminal_poll_flag_reaches_the_read_path() {
+        for flag in [libc::POLLHUP, libc::POLLERR, libc::POLLNVAL, libc::POLLIN] {
+            assert!(poll_must_read(flag), "flag {flag:#x} must be consumed");
+            assert!(
+                poll_must_read(flag | libc::POLLOUT),
+                "unrelated readiness must not mask {flag:#x}"
+            );
+        }
+        assert!(!poll_must_read(0));
+        assert!(!poll_must_read(libc::POLLOUT));
+    }
+
+    /// A real pipe closes with buffered bytes still readable, then becomes a
+    /// terminal readiness (bare `POLLHUP` on some Unix variants,
+    /// `POLLIN|POLLHUP` on others). Driving every observation through
+    /// `poll_must_read` must recover the complete tail and finally observe EOF;
+    /// the former POLLIN-only loop could ignore terminal-only readiness forever.
+    #[test]
+    fn closed_pipe_drains_buffered_bytes_then_consumes_hangup() {
+        let mut raw = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` returned two fresh owned descriptors above; each is
+        // transferred exactly once into a `File` and closed by that owner.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(raw[0]) };
+        // SAFETY: same ownership transfer as the read descriptor above.
+        let mut writer = unsafe { std::fs::File::from_raw_fd(raw[1]) };
+        let expected = b"buffered-after-close";
+        writer.write_all(expected).expect("seed pipe");
+        drop(writer);
+
+        let mut got = Vec::new();
+        let mut saw_terminal_readiness = false;
+        let mut saw_eof = false;
+        for _ in 0..expected.len() + 2 {
+            let mut event = libc::pollfd {
+                fd: raw[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut event, 1, 1_000) }, 1);
+            assert!(
+                poll_must_read(event.revents),
+                "revents={:#x}",
+                event.revents
+            );
+            saw_terminal_readiness |=
+                event.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+            let mut chunk = [0_u8; 3];
+            let n = reader.read(&mut chunk).expect("consume ready pipe");
+            if n == 0 {
+                saw_eof = true;
+                break;
+            }
+            got.extend_from_slice(&chunk[..n]);
+        }
+
+        assert_eq!(got, expected);
+        assert!(
+            saw_terminal_readiness,
+            "the closed writer must surface terminal readiness"
+        );
+        assert!(saw_eof, "terminal readiness must be consumed through EOF");
     }
 }

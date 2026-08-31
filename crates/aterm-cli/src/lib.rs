@@ -98,7 +98,7 @@ const HELP_HEAD: &str = concat!(
     "    aterm --window [args]      Open the GPU window explicitly; --session forces\n",
     "                              the shell session (e.g. for piped/CI runs).\n",
     "    aterm help [topic]        The manual — what aterm is and how to drive it, plus every\n",
-    "                              tool (trust/clean/ty/ay/ny/my/nn). Inside a session it prints\n",
+    "                              tool (trust/clean/ty/ay/ny/nn). Inside a session it prints\n",
     "                              the agent operating brief. START HERE.\n",
     "    aterm <verb> [args]       A platform verb (see VERBS) or a toolchain tool (see TOOLCHAIN).\n",
     "    aterm <SUBCOMMAND>         Print diagnostics and exit (see SUBCOMMANDS).\n",
@@ -301,7 +301,7 @@ impl Verb {
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
             Verb::Fleet => &["Federate many sessions' events; dispatch commands back."],
-            Verb::Drive => &["The agent drive CLI (await / send / turn helpers)."],
+            Verb::Drive => &["The agent drive CLI (prompt / read / await / shot)."],
             Verb::Ship => &[
                 "Publish aterm: provision a signing machine, cut and",
                 "release a build. Needs a source checkout — the release",

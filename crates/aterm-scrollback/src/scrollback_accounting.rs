@@ -29,6 +29,40 @@ impl Scrollback {
         self.pressure_evicted_lines
     }
 
+    /// Monotonic count of history lines whose INLINE IMAGE was discarded
+    /// because the line was compressed — the out-of-band signal for the image
+    /// retention horizon, the sibling of
+    /// [`pressure_evicted_lines`](Self::pressure_evicted_lines) (audit E10a:
+    /// the loss is reported, never papered over with sentinel content).
+    ///
+    /// # The horizon, as a permanent property of this store
+    ///
+    /// An inline image is retained for exactly as long as its line is held
+    /// UNCOMPRESSED, in the hot tier. The wire format that the warm (LZ4) and
+    /// cold (zstd, in RAM or on disk) tiers store lines in carries no image
+    /// section — see [`Line::serialize`] for why a shared payload cannot be
+    /// written per line without multiplying it by the footprint's height — so
+    /// crossing out of the hot tier is where the picture ends and this counter
+    /// starts moving.
+    ///
+    /// What a person scrolling into that history sees is therefore DECIDED, not
+    /// accidental: the line keeps its text, attributes, hyperlinks and
+    /// underline colours, and loses only the picture, so a footprint ages out
+    /// of history one row at a time from its top — the same direction, and at
+    /// the same boundary, as the history above it. Nothing is half-restored and
+    /// nothing is invented; the row an image no longer covers renders exactly
+    /// as the empty row it always was underneath.
+    ///
+    /// The count is in footprint ROWS (one per history line), so a ten-row
+    /// picture reports ten as it crosses. It never decreases and is not reset
+    /// by [`clear`](Self::clear).
+    ///
+    /// [`Line::serialize`]: crate::Line::serialize
+    #[must_use]
+    pub fn image_rows_dropped_by_compression(&self) -> u64 {
+        self.image_rows_dropped_by_compression
+    }
+
     /// Update both diagnostic and budget aggregates from per-tier counters.
     ///
     /// Spelled `saturating_add`: each operand is bytes of memory this process

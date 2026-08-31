@@ -173,7 +173,13 @@ fn scenario_edit() -> Scenario {
 fn scenario_space() -> Scenario {
     let mut cues = Vec::new();
     let mut t = 0.5f32;
-    t = type_text(&mut cues, t, 9.0, "the quick brown fox jumps over it\n", 0.5);
+    t = type_text(
+        &mut cues,
+        t,
+        9.0,
+        "the quick brown fox jumps over it\n",
+        0.5,
+    );
     t += 1.0;
     t = type_text(&mut cues, t, 9.0, "a a a a a a a a\n", 0.5);
     t += 1.0;
@@ -539,9 +545,7 @@ fn analyze(name: &str, volume: f32, r: &Rendered, window: (f32, f32)) -> Row {
         .count();
     let span = f64::from(window.1 - window.0);
     let peak = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let pre = seg
-        .iter()
-        .fold(0.0f32, |m, &v| m.max(pre_clip(v).abs()));
+    let pre = seg.iter().fold(0.0f32, |m, &v| m.max(pre_clip(v).abs()));
     let rms_v = rms(seg);
     let (centroid, _) = spectrum(&r.mono, from, to);
     let audio_s = f64::from(r.mono.len() as f32 / SR as f32);
@@ -619,10 +623,7 @@ fn probe(
         .collect();
     let peak = mono.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     // Score the gesture's own body: onset to 250 ms past it.
-    let start = mono
-        .iter()
-        .position(|v| v.abs() > peak * 0.05)
-        .unwrap_or(0);
+    let start = mono.iter().position(|v| v.abs() > peak * 0.05).unwrap_or(0);
     let end = (start + SR as usize / 4).min(mono.len());
     let (centroid, hi) = spectrum(&mono, start, end);
     let row = ProbeRow {

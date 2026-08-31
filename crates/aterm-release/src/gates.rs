@@ -147,6 +147,10 @@ pub struct GateOpts {
     /// disable the gate for a REAL cut, which is precisely the failure that
     /// shipped the mismatched v0.6.0 tag.
     pub offline: bool,
+    /// Only a true `--dry-run` may execute from a cutter older than the tree.
+    /// A rehearsal mutates its scratch repository, so it must use the tree's
+    /// own binary just like a production cut.
+    pub allow_stale_cutter: bool,
 }
 
 /// What the gates learned — everything the cut transcript's `gates` lines
@@ -181,6 +185,8 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     clean_tree(git)?;
     on_main(git)?;
     let head = head_matches_origin(git)?;
+    // The tree is proven; now prove the binary proving it.
+    cutter_identity_gate(&head, opts.allow_stale_cutter)?;
     tag_free(git, &opts.version)?;
     let cl = changelog_gate(
         repo,
@@ -433,6 +439,82 @@ pub fn head_matches_origin(git: &dyn GitRunner) -> Result<String> {
         )));
     }
     Ok(head)
+}
+
+/// The commit THIS BINARY was built from, stamped by `build.rs`; the reserved
+/// null object ID means its repository source closure was dirty, and
+/// `"unknown"` means the build could not establish either fact.
+pub const BUILD_COMMIT: &str = env!("ATERM_RELEASE_BUILD_COMMIT");
+const DIRTY_BUILD_COMMIT: &str = "0000000000000000000000000000000000000000";
+
+/// Prove the cutter is the tree's own — the binary-side twin of
+/// [`head_matches_origin`].
+///
+/// Every other pre-claim gate proves something about the TREE and nothing about
+/// the binary doing the proving, which is the hole v0.63.0 fell through: a
+/// cutter built from an older tree cut a seeded 1.07 GB image plus an
+/// `-x86_64.dmg` from source that had been lean since 52c1936f, validated that
+/// output against its OWN older `required_asset_names`, and passed. The tree was
+/// clean, on main, and equal to origin/main the whole time. `cargo clean -p
+/// aterm-release` in the runbook is the manual version of this check; a runbook
+/// step is not a gate.
+///
+/// Every remote-mutating cut must match. Only `--dry-run` may proceed with a
+/// mismatch, because it stops before any upload; the mismatch is still
+/// reported so its local result is not mistaken for evidence about the tree.
+/// A rehearsal publishes to a scratch repository and therefore gets no
+/// exemption.
+pub fn cutter_identity_gate(head: &str, allow_stale: bool) -> Result<()> {
+    match cutter_identity_verdict(BUILD_COMMIT, head, allow_stale) {
+        Ok(Some(note)) => {
+            println!("==> {note}");
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Pure core of [`cutter_identity_gate`] (the stamp is an input, so every case
+/// is a unit test rather than a rebuild). `Ok(Some(note))` is a dry-run that
+/// should say something; `Ok(None)` is silence.
+pub fn cutter_identity_verdict(
+    stamp: &str,
+    head: &str,
+    allow_stale: bool,
+) -> Result<Option<String>> {
+    if stamp == head {
+        return Ok(None);
+    }
+    // An unknown stamp is NOT a pass. "Cannot tell" is how the stale cutter got
+    // through, so it is the refusing answer here, exactly as an unreachable
+    // channel is for `channel_version_gate`.
+    let what = if stamp == "unknown" {
+        "this aterm-release binary carries no build commit (built without git, or from an export)"
+            .to_string()
+    } else if stamp == DIRTY_BUILD_COMMIT {
+        "this aterm-release binary was built from a dirty repository source closure".to_string()
+    } else {
+        format!("this aterm-release binary was built from {stamp}, but the tree is at {head}")
+    };
+    if allow_stale {
+        return Ok(Some(format!(
+            "cutter identity: {what} — allowed because this dry-run publishes nowhere,              but it is running OTHER code than the tree"
+        )));
+    }
+    Err(Error::new(format!(
+        "{what}.
+fix:  cargo clean -p aterm-release   (then re-run; the cutter is rebuilt from this tree)
+         why:  v0.63.0 was cut by a binary older than its own source and shipped the seeded          image the tree had already retired"
+    )))
+}
+
+/// Apply the real-mutation cutter check to the checkout the caller is about
+/// to act from. Resume, recovery, abandon, retire and yank do not enter
+/// [`run_all`], so each of those paths uses this shared boundary before its
+/// first remote mutation.
+pub fn current_cutter_identity_gate(git: &dyn GitRunner) -> Result<()> {
+    cutter_identity_gate(&rev_parse(git, "HEAD")?, false)
 }
 
 /// Tag vX.Y.Z must be absent BOTH locally and on origin: the publish step mints
@@ -697,4 +779,94 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
         )));
     }
     Ok(free_gib)
+}
+
+#[cfg(test)]
+mod cutter_identity_tests {
+    use super::*;
+
+    const HEAD: &str = "2617295d1111111111111111111111111111aaaa";
+    const OLDER: &str = "15f2b5b6bc51d9ef56e5e4fa50f434fca07f40ee";
+
+    #[test]
+    fn the_trees_own_binary_passes_silently() {
+        assert!(matches!(
+            cutter_identity_verdict(HEAD, HEAD, false),
+            Ok(None)
+        ));
+    }
+
+    /// The v0.63.0 shape: a real cut by a binary older than its own source.
+    #[test]
+    fn a_stale_binary_cannot_cut_for_real() {
+        let err = cutter_identity_verdict(OLDER, HEAD, false)
+            .expect_err("a stale cutter must not cut a real release");
+        let msg = err.to_string();
+        assert!(msg.contains(OLDER), "{msg}");
+        assert!(msg.contains(HEAD), "{msg}");
+        assert!(msg.contains("cargo clean -p aterm-release"), "{msg}");
+        assert!(
+            msg.contains("v0.63.0"),
+            "the refusal should say why it exists: {msg}"
+        );
+    }
+
+    /// "Cannot tell" must refuse, not pass — an unstamped binary is exactly as
+    /// unproven as a stale one.
+    #[test]
+    fn an_unstamped_binary_fails_closed() {
+        let err = cutter_identity_verdict("unknown", HEAD, false)
+            .expect_err("an unstamped cutter must fail closed");
+        assert!(err.to_string().contains("no build commit"), "{err}");
+    }
+
+    #[test]
+    fn a_dirty_built_binary_fails_closed() {
+        let err = cutter_identity_verdict(DIRTY_BUILD_COMMIT, HEAD, false)
+            .expect_err("uncommitted build-time code must never publish after the tree is clean");
+        assert!(
+            err.to_string().contains("dirty repository source closure"),
+            "{err}"
+        );
+    }
+
+    /// A dry-run publishes nowhere, so it proceeds — but says so, because its
+    /// results came from code other than the tree.
+    #[test]
+    fn a_dry_run_proceeds_but_says_so() {
+        let note = cutter_identity_verdict(OLDER, HEAD, true)
+            .expect("a dry-run must not be blocked")
+            .expect("a mismatched dry-run must say something");
+        assert!(note.contains("dry-run publishes nowhere"), "{note}");
+        assert!(note.contains("OTHER code"), "{note}");
+        assert!(
+            cutter_identity_verdict("unknown", HEAD, true).is_ok(),
+            "an unstamped dry-run is not blocked either"
+        );
+        // ...and a matching dry-run stays silent.
+        assert!(matches!(
+            cutter_identity_verdict(HEAD, HEAD, true),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_stale_rehearsal_is_refused_because_it_mutates_a_remote() {
+        let err = cutter_identity_verdict(OLDER, HEAD, false)
+            .expect_err("a scratch-repository publication still needs the tree's own cutter");
+        assert!(err.to_string().contains(OLDER), "{err}");
+    }
+
+    /// The stamp must actually be wired. A dirty test build deliberately carries
+    /// the null OID; a clean one carries its real commit. Either is a bounded,
+    /// fail-closed value rather than the source-export placeholder.
+    #[test]
+    fn this_binary_carries_a_bounded_git_stamp() {
+        assert_ne!(BUILD_COMMIT, "unknown", "build.rs did not stamp the commit");
+        assert_eq!(BUILD_COMMIT.len(), 40, "not a full sha: {BUILD_COMMIT}");
+        assert!(
+            BUILD_COMMIT.chars().all(|c| c.is_ascii_hexdigit()),
+            "not hex: {BUILD_COMMIT}"
+        );
+    }
 }

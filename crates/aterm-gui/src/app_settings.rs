@@ -1626,6 +1626,15 @@ impl App {
     /// the first tree a screen reader sees is unchanged.
     #[cfg(a11y_tree)]
     pub(crate) fn push_a11y_tree(&mut self, wid: crate::WindowId) {
+        self.push_a11y_tree_with_plan(wid, None);
+    }
+
+    #[cfg(a11y_tree)]
+    pub(crate) fn push_a11y_tree_with_plan(
+        &mut self,
+        wid: crate::WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         if self
             .windows
             .get(&wid)
@@ -1646,8 +1655,13 @@ impl App {
         // Initial-tree requests before first paint compile one projection here. `None`
         // means the front content is terminal; `Some(Err)` is a native projection failure
         // and must fail closed rather than announce a hidden terminal grid.
+        // A `match`, not `map_or_else`: both arms need `&mut self`, and handing two
+        // closures to one call asks the borrow checker to hold both at once.
         let native_update = (!has_overlay)
-            .then(|| self.take_native_accessibility_update(wid))
+            .then(|| match frame_plan {
+                Some(plan) => self.take_native_accessibility_update_from_plan(wid, plan),
+                None => self.take_native_accessibility_update(wid),
+            })
             .flatten();
         let grid_snap = (!has_overlay && native_update.is_none())
             .then(|| self.grid_snapshot(wid))
@@ -1670,10 +1684,17 @@ impl App {
         // composed from, the painted selection, and the find panel's own field. All read
         // from the SAME presented `input_scratch` the rows came from, so a screen reader
         // is described the frame that is on the glass, not a fresher one.
-        let grid_panes = if grid_snap.is_some() {
-            self.grid_a11y_panes(wid)
+        let initial_grid_plan = if grid_snap.is_some() && frame_plan.is_none() {
+            self.active_visible_leaf_plan(wid)
         } else {
-            Vec::new()
+            None
+        };
+        let grid_panes = match (
+            grid_snap.is_some(),
+            frame_plan.or(initial_grid_plan.as_ref()),
+        ) {
+            (true, Some(plan)) => self.grid_a11y_panes(wid, plan),
+            _ => Vec::new(),
         };
         let grid_selection = grid_snap
             .as_ref()
@@ -1844,31 +1865,34 @@ impl App {
     /// the survivors' rows, which is correct: a closed pane is a structural change, not a
     /// line of output, and the consumer should rebuild rather than diff.
     #[cfg(a11y_tree)]
-    fn grid_a11y_panes(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridPane> {
-        let Some(tree) = self.active_tree(wid) else {
-            return Vec::new();
-        };
-        if tree.len() < 2 || tree.is_zoomed() {
+    fn grid_a11y_panes(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Vec<crate::accesskit_tree::GridPane> {
+        if plan.leaves.len() < 2 || plan.zoomed {
             return Vec::new();
         }
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
-        let focus = tree.focus();
-        let rects = tree.compute_layout(ws.rows, ws.cols);
         let strip = usize::from(self.chrome_rows());
-        let total = rects.len();
-        rects
+        let total = plan.leaves.len();
+        plan.leaves
             .iter()
             .enumerate()
-            .map(|(slot, r)| {
-                let row_off = usize::from(r.row_off);
-                let col_off = usize::from(r.col_off);
-                let rows = usize::from(r.rows);
-                let cols = usize::from(r.cols);
+            .map(|(slot, leaf)| {
+                self.view_store
+                    .get(leaf.view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)?;
+                let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
+                let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
+                let rows = (leaf.rect.size.height.round() as usize).max(1);
+                let cols = (leaf.rect.size.width.round() as usize).max(1);
                 // The composed frame carries ONE cursor — the focused pane's — so a
                 // sibling honestly publishes none rather than borrowing it.
-                let cursor = (ws.input_scratch.cursor_visible && r.session == focus)
+                let cursor = (ws.input_scratch.cursor_visible && leaf.focused)
                     .then(|| {
                         let crow = ws.input_scratch.cursor_row.saturating_sub(strip);
                         let ccol = ws.input_scratch.cursor_col;
@@ -1887,7 +1911,7 @@ impl App {
                 );
                 let selection =
                     self.grid_a11y_selection(wid, &snap, row_off, col_off..col_off + cols);
-                crate::accesskit_tree::GridPane {
+                Some(crate::accesskit_tree::GridPane {
                     slot,
                     label: format!(
                         "{} — pane {} of {total}",
@@ -1897,11 +1921,12 @@ impl App {
                     snap,
                     row_off,
                     col_off,
-                    focused: r.session == focus,
+                    focused: leaf.focused,
                     selection,
-                }
+                })
             })
-            .collect()
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
     }
 
     /// The PAINTED selection covering one published document — the whole visible grid
@@ -3538,6 +3563,76 @@ mod tests {
         );
     }
 
+    #[cfg(a11y_tree)]
+    #[test]
+    fn split_accessibility_consumes_the_presented_plan_not_live_layout() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.split_active_stub_tab(wid);
+        let (rows, cols) = {
+            let window = &app.windows[&wid];
+            (usize::from(window.rows), usize::from(window.cols))
+        };
+        assert!(
+            app.redraw_compose(wid, rows, cols, false, false, None, 0, Instant::now())
+                .is_some(),
+            "the two-pane fixture materializes a composed frame"
+        );
+        let presented = app
+            .active_visible_leaf_plan(wid)
+            .expect("presented canonical plan");
+        assert_eq!(presented.leaves.len(), 2);
+        let presented_focus = presented.focused;
+        let presented_focus_leaf = presented
+            .leaf(presented_focus)
+            .expect("presented focused leaf")
+            .clone();
+
+        // Negative controls: advance BOTH the live cardinality and the focused
+        // leaf's geometry without composing another frame. Re-resolving the
+        // legacy tree here would describe three panes and the shrunken live
+        // rectangle over the still-presented two-pane cell snapshot.
+        app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
+        let live = app
+            .active_visible_leaf_plan(wid)
+            .expect("new live canonical plan");
+        assert_eq!(live.leaves.len(), 3, "live cardinality really advanced");
+        assert_ne!(
+            live.leaf(presented_focus)
+                .expect("the formerly focused leaf survives")
+                .rect,
+            presented_focus_leaf.rect,
+            "live geometry really diverged from the frame on glass"
+        );
+
+        let panes = app.grid_a11y_panes(wid, &presented);
+        assert_eq!(
+            panes.len(),
+            presented.leaves.len(),
+            "accessibility keeps the presented two-pane cardinality"
+        );
+        let slot = presented
+            .leaves
+            .iter()
+            .position(|leaf| leaf.view == presented_focus)
+            .unwrap();
+        let pane = &panes[slot];
+        assert_eq!(
+            (pane.row_off, pane.col_off, pane.snap.rows, pane.snap.cols),
+            (
+                presented_focus_leaf.rect.origin.y.round().max(0.0) as usize,
+                presented_focus_leaf.rect.origin.x.round().max(0.0) as usize,
+                (presented_focus_leaf.rect.size.height.round() as usize).max(1),
+                (presented_focus_leaf.rect.size.width.round() as usize).max(1),
+            ),
+            "pane geometry comes from the exact successful-present plan"
+        );
+        assert!(
+            pane.focused,
+            "focus is likewise the presented frame's focus, not the newer live tree's"
+        );
+    }
+
     /// Accessibility actions bypass keyboard and pointer ingress. Even a stale
     /// or unsupported request is a newer external-input boundary, so it must
     /// retire an older exact cursor candidate before native/overlay routing can
@@ -3715,7 +3810,8 @@ mod a11y_message_wiring_tests {
             bytes_done: done * 1024 * 1024,
             bytes_total: 480 * 1024 * 1024,
         };
-        app.status_bars.update_progress(&downloading(120), now);
+        app.status_bars
+            .update_progress(&downloading(120), None, now);
         app.sync_status_bar_rows();
         assert_eq!(app.status_bar_rows, 1, "the update lane reserved its row");
 
@@ -3736,7 +3832,8 @@ mod a11y_message_wiring_tests {
         );
 
         // Further bytes move the description and leave the announced sentence alone.
-        app.status_bars.update_progress(&downloading(400), now);
+        app.status_bars
+            .update_progress(&downloading(400), None, now);
         let later = message(&app, wid, ChromeMessage::UpdateStatus);
         assert_eq!(later.text, band.text, "no announcement for a byte count");
         assert_ne!(later.detail, band.detail);

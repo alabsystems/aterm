@@ -149,10 +149,7 @@ mod tests {
             detect_flavor(UPSTREAM_VV, "/opt/homebrew/bin/rustc", None),
             "r"
         );
-        assert_eq!(
-            detect_flavor(UPSTREAM_VV, "rustc", Some("stable")),
-            "r"
-        );
+        assert_eq!(detect_flavor(UPSTREAM_VV, "rustc", Some("stable")), "r");
     }
 
     #[test]
@@ -223,9 +220,6 @@ mod tests {
         // build, not the fork.
         let p = parse_rustc_vv(TRUST_VV);
         assert!(p.version_line.contains("-dev"));
-        assert_eq!(
-            detect_flavor(TRUST_VV, "/usr/local/bin/rustc", None),
-            "r"
-        );
+        assert_eq!(detect_flavor(TRUST_VV, "/usr/local/bin/rustc", None), "r");
     }
 }

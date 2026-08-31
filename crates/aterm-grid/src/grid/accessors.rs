@@ -1001,6 +1001,25 @@ impl Grid {
             )
     }
 
+    /// Monotonic count of history ROWS that kept their text but lost their
+    /// INLINE IMAGE, because the attached tiered store compressed the line
+    /// (audit E10a, out-of-band — the row is left exactly as blank as it always
+    /// was under the picture; no sentinel is injected).
+    ///
+    /// This grid's own ring tier holds scrolled rows as extras and never
+    /// compresses, so a picture inside the ring is intact and counted nowhere;
+    /// the horizon is entirely the store's, and a grid with no store attached
+    /// never crosses it. See
+    /// [`Scrollback::image_rows_dropped_by_compression`](aterm_scrollback::Scrollback::image_rows_dropped_by_compression)
+    /// for what a person scrolling past it sees.
+    #[must_use]
+    pub fn image_rows_dropped_by_compression(&self) -> u64 {
+        self.storage.scrollback.as_ref().map_or(
+            0,
+            aterm_scrollback::ScrollbackStorage::image_rows_dropped_by_compression,
+        )
+    }
+
     /// Set the RING byte watermark budget (audit E10a): ring-only grids with
     /// an unlimited line limit have no other memory signal — with a budget
     /// set, [`ring_watermark_level`](Self::ring_watermark_level) reports

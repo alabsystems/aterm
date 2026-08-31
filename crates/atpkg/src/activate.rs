@@ -4,8 +4,8 @@
 //! Activation (§10): the atomic POSIX symlink swap that makes a staged store build the
 //! live one, plus the `bin/` shim installation.
 //!
-//! Activation is **not** the updater's `renamex_np`/re-exec (that is the macOS `.app`
-//! path). A CLI program's active build is selected by a symlink: `channels/<name>/current`
+//! Activation is **not** the app updater's in-session handoff (that is aterm-gui/
+//! aterm-update's `.app` path). A CLI program's active build is selected by a symlink: `channels/<name>/current`
 //! points at the chosen `store/<program>/<build>/`, and one `bin/<tool>` symlink per
 //! exposed binary points into it. Each flip is an **atomic replace** — write a sibling
 //! temp symlink, then `rename(2)` it over the target — so a reader never sees a missing or

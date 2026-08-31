@@ -285,7 +285,7 @@ impl App {
                     _ => {}
                 }
             }
-            InputEvent::Text(t) | InputEvent::Paste(t) => {
+            InputEvent::Text(t) | InputEvent::Paste(t, _) => {
                 for c in t.chars().filter(|c| !c.is_control()) {
                     self.session_picker_filter_push(wid, c);
                 }

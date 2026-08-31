@@ -4,9 +4,10 @@
 // SEARCH-BENCH harness (E0): committed floors for the trigram search engine —
 // the audit's "search had ZERO in-tree benchmarks" gap. Measures, per corpus:
 //
-//   build    full index build through the PRODUCT path (`Terminal::indexed_search`
-//            after a content change — the all-or-nothing rebuild every live search
-//            pays today), in thousand lines/s.
+//   build    full index fallback through the PRODUCT path
+//            (`Terminal::release_search_index` + `indexed_search`), in thousand
+//            lines/s. Ordinary appended-output churn takes the incremental refresh
+//            path and is measured separately by `search_churn_harness`.
 //   query    per-query cost on the CACHED index (unchanged content), queries/s.
 //   memory   net heap RETAINED by the built index (counting global allocator),
 //            reported bigger-is-better as lines-per-MiB for the gate, plus the
@@ -118,6 +119,12 @@ fn median(samples: &[f64]) -> f64 {
     }
 }
 
+fn full_search_rebuilds(term: &Terminal) -> u64 {
+    term.search_index_rebuilds()
+        .checked_sub(term.search_index_refreshes())
+        .expect("search refresh count cannot exceed total cache-miss rebuilds")
+}
+
 /// One corpus's measured lane values.
 struct CorpusReport {
     build_klps: f64,
@@ -141,21 +148,40 @@ fn measure_corpus(corpus: &[u8], query: &str) -> CorpusReport {
     let bytes_per_line = retained / indexed_lines.max(1) as f64;
     let lines_per_mib = indexed_lines as f64 / (retained / (1024.0 * 1024.0)).max(1e-9);
 
-    // -- full rebuild (the product path's per-content-change cost) --
+    // -- full fallback rebuild (cache absent, so refresh is impossible) --
     let mut build = Vec::with_capacity(N_ITERS);
     let rebuild_pass = |term: &mut Terminal| -> f64 {
-        // Bump content_gen (one appended cell) so `indexed_search` MISSES and
-        // pays the whole all-or-nothing rebuild — exactly what any live search
-        // pays after any output arrives today.
+        // Bump content_gen so every pass has a real content change, then drop
+        // the cache explicitly. Appended-output misses normally take the
+        // O(churn) refresh lane now; a missing cache is the product fallback
+        // that still owes the full-build performance floor.
         term.process(b"x");
+        term.release_search_index();
+        let refreshes_before = term.search_index_refreshes();
+        let full_rebuilds_before = full_search_rebuilds(term);
         let t0 = Instant::now();
         let idx = term.indexed_search();
         let secs = t0.elapsed().as_secs_f64();
-        black_box(idx.indexed_line_count());
+        let rebuilt_lines = idx.indexed_line_count();
+        black_box(rebuilt_lines);
+        assert_eq!(
+            term.search_index_refreshes(),
+            refreshes_before,
+            "REACH guard: a cacheless search must not report an incremental refresh"
+        );
+        assert_eq!(
+            full_search_rebuilds(term),
+            full_rebuilds_before + 1,
+            "REACH guard: every timed pass must execute exactly one full rebuild"
+        );
+        assert_eq!(
+            rebuilt_lines, indexed_lines,
+            "full rebuild must cover the same retained row set as the priming build"
+        );
         if secs <= 0.0 {
             return f64::INFINITY;
         }
-        (indexed_lines as f64 / 1000.0) / secs
+        (rebuilt_lines as f64 / 1000.0) / secs
     };
     for _ in 0..WARMUP {
         let _ = rebuild_pass(&mut term);

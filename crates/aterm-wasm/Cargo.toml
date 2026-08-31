@@ -10,7 +10,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # aterm engine + pure-Rust CPU rasterizer (vendored under rust/aterm). aterm-render
-# is fontdue + rustybuzz + ttf-parser — all pure Rust, wasm32-safe. The engine's
+# parses and rasterizes fonts FIRST-PARTY (`aterm_render::font` over ttf-parser,
+# which retired fontdue) and shapes with rustybuzz — all pure Rust, wasm32-safe.
+# The engine's
 # default closure is no-platform (PTY/libc/zstd are opt-in, off), so it compiles to
 # wasm32-unknown-unknown.
 # default-features = false drops the disk-tier cold scrollback (libc mmap + zstd-sys

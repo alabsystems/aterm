@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — a native windowed terminal: winit + softbuffer presenting the aterm-render framebuffer over a real PTY shell."
+description = "aterm — a native windowed terminal: winit presenting the aterm-render framebuffer over a real PTY shell (first-party CoreGraphics on macOS, softbuffer elsewhere)."
 
 [[bin]]
 name = "aterm-gui"
@@ -179,9 +179,10 @@ aterm-types = { workspace = true }
 # table instead of an inline match that drifts.
 aterm-winit-keymap = { workspace = true }
 aterm-policy = { workspace = true }
-# Silent in-app self-update: checks the private GitHub Release, verifies the
-# notarized + Team-ID-pinned DMG, and swaps aterm.app on next launch. Inert in a
-# plain `cargo build` (no pinned Team ID) and a no-op outside an installed .app.
+# Silent in-app self-update: checks the release channel, verifies the notarized +
+# Team-ID-pinned DMG, and stages it for the in-session apply lane (the next-launch
+# swap is only the fallback). Inert in a plain build (no pinned Team ID) and a
+# no-op outside an installed .app.
 aterm-update = { workspace = true }
 # Manual's config language service validates package-owner slugs with the exact
 # URL-safety predicate consumed by both the updater and atpkg. The crate is
@@ -195,21 +196,6 @@ aterm-update-core = { workspace = true }
 atpkg = { workspace = true }
 libc = { workspace = true }
 winit = { workspace = true }
-# DEFAULT FEATURES OFF, and the omission that matters is `kms`. softbuffer's
-# default set is [kms, x11, x11-dlopen, wayland, wayland-dlopen]; `kms` pulls
-# drm + drm-ffi + drm-sys + drm-fourcc + linux-raw-sys 0.9.4 — 5 packages,
-# 376,763 lines and 6,046 unsafe tokens, ALL of it on the linux cell only, to
-# drive a DRM/KMS framebuffer aterm never presents to (it presents to a winit
-# window). `kms = ["bytemuck", "drm", "rustix"]` and both bytemuck and rustix
-# are ALSO held by the x11 and wayland arms, so nothing else falls out with it.
-# The feature list is `vendor/winit/Cargo.toml:332-340` verbatim — winit already
-# made exactly this trim for exactly this reason.
-softbuffer = { version = "0.4", default-features = false, features = [
-    "x11",
-    "x11-dlopen",
-    "wayland",
-    "wayland-dlopen",
-] }
 # Cross-platform accessibility tree (behind the default-on `a11y-accesskit` feature).
 # accesskit_winit =0.33.1 targets winit ^0.30.5, satisfied by the vendored winit 0.30.13
 # through the workspace `[patch.crates-io]` redirect (so a SINGLE winit instance links).
@@ -261,15 +247,9 @@ aterm-http = { workspace = true }
 # on the way in. The SAME first-party crate aterm-render uses for the `image`
 # verb's framebuffer PNG, so this adds no dep to the tree.
 aterm-png = { workspace = true }
-# Glyph rasterization for the widget-tray text labels (free-positioned, multi-size).
-# The SAME crate + version aterm-render uses, so it adds no new dep to the tree.
-# DEFAULT FEATURES OFF to drop the OPTIONAL `hashbrown` arm: fontdue's default
-# is ["simd", "hashbrown"], and its only use of it is `HashMap`/`HashSet` with
-# new/with_capacity/get/insert — src/lib.rs:25-28 falls back to std::collections
-# with no `std`-feature guard, so this compiles unchanged and rasterizes
-# identically. Costs hashbrown 0.15.5 + foldhash + allocator-api2: 3 packages,
-# 32,597 lines, mac-arm and wasm. `simd` is kept — it is the rasterizer.
-fontdue = { version = "0.9", default-features = false, features = ["simd"] }
+# NOTE: the tray's glyph rasterization no longer takes a font dependency of its
+# own — `aterm_render::font::Font` (first-party, ttf-parser + this workspace's
+# own coverage fill) retired `fontdue` here and in aterm-render together.
 
 [build-dependencies]
 # The build script derives the exact 64-byte lowercase updater-key fingerprint
@@ -395,6 +375,55 @@ x11rb = { version = "0.13", default-features = false }
 # Orca reads; without it a Linux build exposes nothing at all.
 accesskit = "0.24"
 accesskit_winit = "=0.33.1"
+
+# THE ROW, softbuffer half: the CPU present path is FIRST-PARTY on macOS, so
+# this dependency is target-gated OFF that cell.
+#
+# `crates/aterm-gui/src/present/` is the seam. `softbuffer_surface.rs` is
+# already `#[cfg(not(target_os = "macos"))]` and `CpuSurface` already resolves
+# to `mac::MacCpuPresenter` there (hand-written CoreGraphics + CoreAnimation
+# FFI, landed with the seam), so on macOS this crate was compiling softbuffer
+# and then naming it from ZERO lines. Moving the row here removes the compile,
+# not a call: the macOS present path does not change by one instruction, and
+# linux/windows keep softbuffer byte-for-byte behind the same seam.
+#
+# MEASURED, `cargo forge survey --cell mac-arm`, before -> after:
+#   91 -> 89 packages, 1,275,882 -> 1,248,254 lines (-27,628), 60,309 -> 58,435
+#   unsafe tokens (-1,874). That is `dom(softbuffer)` from
+#   docs/measured/wgpu-metal-decision-2026-08-30.md §2 to the package, the line
+#   and the token.
+#
+# WHICH TWO PACKAGES, from a package-set diff of
+# `cargo tree -p aterm --target aarch64-apple-darwin -e normal --no-dedupe`
+# rather than from the dominator prediction: `softbuffer 0.4.8` and
+# `objc2-core-graphics 0.3.2`. NOT `raw-window-metal 1.1.0`, which an earlier
+# draft of this comment named — it has a SECOND parent, `wgpu-hal 29.0.3`
+# (`cargo tree -i raw-window-metal`), so it stays until wgpu goes. dom() gives
+# the right count and says nothing about which members; only the diff does.
+#
+# The 0.3.x/0.6.x `objc2` stack does NOT leave, and that is the row's whole
+# point rather than a shortfall: it is a JOINT hostage of softbuffer and wgpu
+# (`objc2-quartz-core <- softbuffer` and `objc2-metal <- wgpu-hal` are disjoint
+# paths), so it is held by wgpu alone now and only falls — 199,233 lines, 6
+# packages — when the Metal renderer retires wgpu here too. Same for
+# raw-window-metal. See that document's §2.
+#
+# DEFAULT FEATURES OFF, and the omission that matters is `kms`. softbuffer's
+# default set is [kms, x11, x11-dlopen, wayland, wayland-dlopen]; `kms` pulls
+# drm + drm-ffi + drm-sys + drm-fourcc + linux-raw-sys 0.9.4 — 5 packages,
+# 376,763 lines and 6,046 unsafe tokens, ALL of it on the linux cell only, to
+# drive a DRM/KMS framebuffer aterm never presents to (it presents to a winit
+# window). `kms = ["bytemuck", "drm", "rustix"]` and both bytemuck and rustix
+# are ALSO held by the x11 and wayland arms, so nothing else falls out with it.
+# The feature list is `vendor/winit/Cargo.toml:332-340` verbatim — winit already
+# made exactly this trim for exactly this reason.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+softbuffer = { version = "0.4", default-features = false, features = [
+    "x11",
+    "x11-dlopen",
+    "wayland",
+    "wayland-dlopen",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSBeep for the audible bell + NSWindow.setColorSpace to drop the per-frame

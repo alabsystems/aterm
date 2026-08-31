@@ -186,46 +186,46 @@ pub struct Baseline {
 
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 167,
-    workspace: 66,
-    third_party: 101,
-    third_party_loc: 1_487_430,
-    build_scripts: 21,
+    resolved: 156,
+    workspace: 67,
+    third_party: 89,
+    third_party_loc: 1_248_254,
+    build_scripts: 20,
     proc_macros: 6,
-    duplicate_names: 8,
+    duplicate_names: 5,
 };
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 272,
-    workspace: 67,
-    third_party: 205,
-    third_party_loc: 3_366_041,
-    build_scripts: 36,
+    resolved: 259,
+    workspace: 68,
+    third_party: 191,
+    third_party_loc: 2_765_600,
+    build_scripts: 31,
     proc_macros: 16,
-    duplicate_names: 8,
+    duplicate_names: 6,
 };
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 172,
-    workspace: 65,
-    third_party: 107,
-    third_party_loc: 3_991_411,
-    build_scripts: 23,
+    resolved: 160,
+    workspace: 66,
+    third_party: 94,
+    third_party_loc: 3_612_829,
+    build_scripts: 19,
     proc_macros: 7,
-    duplicate_names: 4,
+    duplicate_names: 2,
 };
 
 pub const WASM: Baseline = Baseline {
     cell: "wasm",
-    resolved: 159,
-    workspace: 65,
-    third_party: 94,
-    third_party_loc: 1_404_079,
-    build_scripts: 22,
+    resolved: 147,
+    workspace: 66,
+    third_party: 81,
+    third_party_loc: 1_172_582,
+    build_scripts: 21,
     proc_macros: 7,
-    duplicate_names: 3,
+    duplicate_names: 1,
 };
 
 /// The four cells, in [`crate::resolve::default_cells`] order, so a test that
@@ -237,16 +237,19 @@ pub const CELLS: [Baseline; 4] = [MAC_ARM, LINUX, WIN, WASM];
 pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] = [
     "bitflags",
     "block2",
-    "core-foundation",
-    "foldhash",
     "hashbrown",
     "objc2",
     "objc2-foundation",
-    "ttf-parser",
 ];
 
-/// `hashbrown` is the worst of them: three live versions in one binary.
-pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 3;
+/// `hashbrown`'s version count, pinned separately because it was for a long
+/// time the worst duplicate in the cell at THREE live versions in one binary.
+/// It is two now, and it is no longer the worst: the biggest dedup prize on
+/// mac-arm is `objc2-foundation` at 59,492 LOC (0.2.2 beside 0.3.2), against
+/// hashbrown's 24,676. That ordering flips again the day `wgpu` leaves, because
+/// the 0.3.2 copy is wgpu's alone — which is the point of pinning the NAMES and
+/// not just the count.
+pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 2;
 
 // --------------------------------------------------------- dominator anchors
 
@@ -261,9 +264,11 @@ pub struct Dom {
     /// The version, when the NAME alone does not identify one package in the
     /// cell. `None` asserts uniqueness — the test fails loudly if a name it
     /// was given without a version later resolves twice, which is a real
-    /// change worth seeing. `Some` is required for a duplicated name: eight of
-    /// them exist on mac-arm ([`MAC_ARM_DUPLICATE_NAMES`]), and
-    /// `objc2-foundation` is one of the five anchors.
+    /// change worth seeing. `Some` is required for a duplicated name: five of
+    /// them exist on mac-arm ([`MAC_ARM_DUPLICATE_NAMES`]). None of the five
+    /// anchors is currently a duplicated name, so every one carries `None` —
+    /// which means the anchors also assert, as a side effect, that no anchor has
+    /// silently started resolving twice.
     pub version: Option<&'static str>,
     /// Packages removed, INCLUDING the target. A leaf costs 1, never 0.
     pub pkgs: usize,
@@ -314,6 +319,26 @@ pub struct Dom {
 /// 1,497,967, exactly the dominator, with 108 → 105 packages. The tail falls to
 /// `objc2-foundation 0.3.2`.
 ///
+/// `softbuffer` is the FOURTH instance of the growth shape above, the largest
+/// so far, and the one that finally cost this list its `libc` row. Retiring
+/// softbuffer on the macOS cell (2026-08-30) removed 2 packages / 27,628 LOC
+/// from the total — and moved `wgpu` from 32 / 460,964 to **38 / 660,197**,
+/// because the `objc2` 0.3.x/0.6.x stack was a JOINT hostage reachable through
+/// both and therefore billed to NEITHER. With one parent gone it transferred
+/// wholesale: 199,233 lines and 6 packages, to the line. `wgpu` now holds 43% of
+/// this cell's packages and 53% of its lines by itself.
+///
+/// The same retirement reordered the head twice over. `wgpu-hal` (8 / 251,320)
+/// rose to rank two for exactly the same reason — it is where the objc2 stack
+/// actually attaches — and `winit` (12 / 78,956) took the fifth slot.
+///
+/// `libc` is GONE from this list, and it left the SURFACE, not just the head:
+/// `blame libc --cell mac-arm` now reports `dom 0 package(s) / 0 LOC` and names
+/// its source as `crates/aterm-libc — PATCHED path package. aterm OWNS and
+/// maintains this copy.` A first-party patch target is a workspace member, so it
+/// is not third-party and cannot have a third-party dominator. Its old pin of
+/// 1 / 127,772 was the largest single stale row in this file.
+///
 /// ONE MEASUREMENT TRAP is worth recording, because it silently under-reported
 /// this by a factor of seven: `loc::package_dir` used to resolve
 /// `<name>-<version>` against the registry checkout BEFORE the workspace, which
@@ -325,8 +350,14 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
     Dom {
         name: "wgpu",
         version: None,
-        pkgs: 31,
-        loc: 460_851,
+        pkgs: 38,
+        loc: 660_197,
+    },
+    Dom {
+        name: "wgpu-hal",
+        version: None,
+        pkgs: 8,
+        loc: 251_320,
     },
     Dom {
         name: "naga",
@@ -335,38 +366,16 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         loc: 212_320,
     },
     Dom {
-        name: "libc",
-        version: None,
-        pkgs: 1,
-        loc: 127_772,
-    },
-    // See the note above: these are the entries that moved, and they moved
-    // because a dependency was retired somewhere else entirely.
-    // `regex` stood at the tail here at 4 packages / 158,471 lines until
-    // crates/aterm-regex retired it, then `objc2-app-kit` (1 / 82,976) held the
-    // slot, then `ureq` (12 / 89,080) and `tracing` (3 / 84,483) took the
-    // fourth in turn. The array does not shrink when the campaign succeeds — an
-    // anchor list that thins out with every win stops being a regression net —
-    // so the slot goes to whatever now ranks by LOC. The list is ORDERED, so a
-    // wrong pick here fails the ranking test rather than passing quietly.
-    Dom {
         name: "objc2-app-kit",
         version: None,
         pkgs: 1,
         loc: 82_976,
     },
-    // The tail after `tracing` was replaced. Worth noting what these five are:
-    // a GPU abstraction, a shader compiler, the platform ABI, and two ObjC
-    // binding surfaces — every one a Lane 1 crate. The extraction lane has run
-    // out of things it can honestly reach, which is the campaign's own progress
-    // showing up in its regression net. (`objc2-foundation` is one of the eight
-    // duplicated names on this cell; this is the 0.3.2 copy, and the 0.2.2 one
-    // ranks separately at 2 / 60,733.)
     Dom {
-        name: "objc2-foundation",
-        version: Some("0.3.2"),
-        pkgs: 1,
-        loc: 78_448,
+        name: "winit",
+        version: None,
+        pkgs: 12,
+        loc: 78_956,
     },
 ];
 
@@ -469,6 +478,85 @@ mod tests {
                 base.cell
             );
             assert!(base.third_party_loc > 0 && base.proc_macros > 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ratchet_agreement {
+    use super::*;
+
+    /// THE TRIPWIRE THAT WAS MISSING. This repository keeps the same
+    /// measurement in TWO places — the ceilings in `tools/forge-budget.tsv`
+    /// (enforced by `cargo run -p xtask -- gate forge`) and the baselines above
+    /// (enforced only by `cargo test -p aterm-forge`) — and only one of them is
+    /// in the required gate.
+    ///
+    /// So they drifted, and nobody was told. Every retirement wave ran
+    /// `cargo forge budget --update` and left this file alone, until on
+    /// 2026-08-30 the baselines were **12 to 14 packages stale on every cell**:
+    /// mac-arm claimed 101 packages / 1,487,430 LOC against a live 89 /
+    /// 1,248,254, and `cargo test -p aterm-forge` had been RED with 13 failures
+    /// for several waves. The largest single stale row asserted a dominator for
+    /// `libc`, which by then was not third-party at all — it had been retired to
+    /// the workspace member `crates/aterm-libc`.
+    ///
+    /// The two files are re-derived from the same live graph by the same code,
+    /// so EQUALITY is the honest relation, not "ceiling >= baseline". Slack
+    /// between them is exactly the state that hid the drift. A wave that
+    /// ratchets one and forgets the other now fails here immediately, naming
+    /// both numbers.
+    #[test]
+    fn the_ratchet_and_these_baselines_are_the_same_measurement() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/aterm-forge sits two levels under the workspace root")
+            .to_path_buf();
+        let rows = match crate::budget::load(&root) {
+            Ok(r) => r,
+            // A checkout with no ratchet file yet is not a drift.
+            Err(_) => return,
+        };
+        if rows.is_empty() {
+            return;
+        }
+
+        let triples = [
+            ("mac-arm", "aarch64-apple-darwin"),
+            ("linux", "x86_64-unknown-linux-gnu"),
+            ("win", "x86_64-pc-windows-msvc"),
+            ("wasm", "wasm32-unknown-unknown"),
+        ];
+        for (base, (cell, triple)) in CELLS.iter().zip(triples) {
+            assert_eq!(base.cell, cell, "CELLS order changed");
+            let scope = format!("shipped.{triple}");
+            let ceiling = |metric: &str| -> Option<u64> {
+                rows.iter()
+                    .find(|r| r.scope == scope && r.metric == metric)
+                    .map(|r| r.ceiling)
+            };
+            if let Some(pkgs) = ceiling("third_party_packages") {
+                assert_eq!(
+                    pkgs,
+                    base.third_party as u64,
+                    "{cell}: tools/forge-budget.tsv says {pkgs} third-party packages but \
+                     measured::{} says {}. These are one measurement in two files — ratchet \
+                     BOTH, in the same change.",
+                    cell.to_uppercase().replace('-', "_"),
+                    base.third_party
+                );
+            }
+            if let Some(loc) = ceiling("third_party_loc") {
+                assert_eq!(
+                    loc,
+                    base.third_party_loc,
+                    "{cell}: tools/forge-budget.tsv says {loc} third-party LOC but \
+                     measured::{} says {}. Ratchet BOTH, in the same change.",
+                    cell.to_uppercase().replace('-', "_"),
+                    base.third_party_loc
+                );
+            }
         }
     }
 }

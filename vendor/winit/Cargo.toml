@@ -234,8 +234,35 @@ version = "2"
 default-features = false
 
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.ahash]
+# FORK TRIM (aterm): DEFAULT FEATURES OFF, and `std` re-added explicitly.
+# ahash's default set is ["std", "runtime-rng"]; the omitted arm is `runtime-rng`,
+# which is the ONLY thing activating its optional `getrandom`.
+# COST: -1 package / -2,920 lines on the LINUX cell only (getrandom 0.3.4). ahash
+# sits under this unix-not-apple target table, so mac/win/wasm never saw it; the
+# getrandom 0.2.17 that `ring` pulls is a different package-version and stays.
+# WHY THIS LINE WAS ALREADY WRONG: the row asked for `no-rng` but never set
+# `default-features = false`, and features are additive — so `runtime-rng` came in
+# anyway and WON. In ahash-0.8.12/src/random_state.rs:47-106 the cfg_if cascade
+# tests `else if #[cfg(all(feature = "runtime-rng", not(fuzzing)))]` (line 67)
+# BEFORE the bare `else` fallthrough (line 101), so the declared `no-rng` intent
+# was a no-op. `no-rng = []` is an empty feature; it selects nothing by itself.
+# getrandom has exactly ONE call site in the crate: random_state.rs:77
+# `getrandom::fill(&mut result)`, inside that arm.
+# `std` MUST be re-added: it gates the `hash_map`/`hash_set` modules and the
+# AHashMap / AHashSet / HashMap / HashSet aliases (ahash src/lib.rs:122-135), which
+# are the only items this fork imports (src/platform_impl/linux/wayland/state.rs:7,
+# wayland/seat/mod.rs:7, wayland/window/state.rs:7). `no-rng` MUST be kept: it is
+# one of the three features gating `impl Default for RandomState`
+# (random_state.rs:370), which would otherwise disappear.
+# HONEST CAVEAT — THIS IS A BEHAVIOUR CHANGE, NOT DEAD CODE. The selected arm
+# seeds the Wayland backend's internal AHashMaps with the fixed PI/PI2 constants
+# (random_state.rs:33-45) instead of OS randomness. Those maps are keyed by
+# compositor object ids (WlOutput / WlSeat / WindowId), never by attacker-supplied
+# strings, so the HashDoS argument for random seeding does not apply here — and
+# this is the posture upstream winit declared it wanted on this very line.
 version = "0.8.7"
-features = ["no-rng"]
+default-features = false
+features = ["std", "no-rng"]
 optional = true
 
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.bytemuck]
@@ -348,8 +375,30 @@ version = "1"
 [target.'cfg(target_family = "wasm")'.dependencies.wasm-bindgen]
 version = "0.2.93"
 
+# FORK TRIM (aterm): DEFAULT FEATURES OFF. wasm-bindgen-futures' default set is
+# just ["std"], and `std` = ["wasm-bindgen/std", "js-sys/std", "web-sys/std",
+# "futures-util"] — the omitted arm is that last, OPTIONAL `futures-util`.
+# COST: -5 packages / -36,126 lines on the WASM cell only (futures-util 26,215 +
+# futures-core 840 + futures-task 815 + slab 2,609 + pin-project-lite 5,647); the
+# crate is absent from mac/win, and the futures-util on linux belongs to
+# accesskit_unix and is untouched.
+# WHY THE ARM IS DEAD: `futures_util` is named in exactly ONE place in the crate,
+# wasm-bindgen-futures-0.4.58/src/lib.rs:50 `use futures_util::FutureExt;`, under
+# `#[cfg(all(target_arch = "wasm32", feature = "std", panic = "unwind"))]`. Its
+# sole consumer is the catch_unwind variant of `future_to_promise` (src/lib.rs:261);
+# the equivalent ungated variant at src/lib.rs:223 is compiled instead. NOTHING in
+# this graph calls `future_to_promise` — winit's web backend touches only
+# `spawn_local` (src/platform_impl/web/main_thread.rs:42, web/cursor.rs:143 and
+# :260, web/async/wrapper.rs:46) and `JsFuture` (web/cursor.rs:17), declared
+# UNGATED at wasm-bindgen-futures src/lib.rs:92 and :113.
+# The no_std arm is clean: `#![cfg_attr(not(feature = "std"), no_std)]` at
+# src/lib.rs:33, and the only `std::` path in the whole src tree is src/lib.rs:263,
+# inside that same cfg.
+# `wasm-bindgen/std`, `js-sys/std` and `web-sys/std` are NOT lost with it: winit
+# declares all three plainly with defaults on in this same wasm target table below.
 [target.'cfg(target_family = "wasm")'.dependencies.wasm-bindgen-futures]
 version = "0.4.43"
+default-features = false
 
 [target.'cfg(target_family = "wasm")'.dependencies.web-time]
 version = "1"

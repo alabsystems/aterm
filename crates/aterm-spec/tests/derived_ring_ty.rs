@@ -22,8 +22,9 @@ use aterm_spec::derive::{
     Model, aa_edge_hardening_model, active_handle_model, alt_selection_park_model,
     anchored_artifact_transaction_model, artifact_reader_lease_model,
     artifact_reply_publication_model, asymmetric_pad_layout_model, capture_after_present_model,
-    channel_bind_model, chrome_face_gate_model, closed_recovery_ledgers_model, coalesce_model,
-    composed_sync_hold_model, composite_accessibility_route_model, config_catalog_snapshot_model,
+    channel_bind_model, chrome_face_gate_model, clipboard_mailbox_model,
+    closed_recovery_ledgers_model, coalesce_model, composed_sync_hold_model,
+    composite_accessibility_route_model, config_catalog_snapshot_model,
     config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
     ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
     cursor_cat_fold_model, cursor_cat_model, cursor_cat_motion_pulse_routing_model,
@@ -46,14 +47,15 @@ use aterm_spec::derive::{
     manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
     native_async_delivery_model, native_capture_source_model, native_close_plan_model,
     native_config_observation_handoff_model, native_config_transaction_model,
-    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
-    native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
-    native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
-    native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
-    native_save_intent_latch_model, native_settings_draft_close_model,
-    native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
-    native_update_attempt_identity_model, native_update_auto_intent_model,
-    native_update_channel_scan_model, native_update_disk_transaction_model,
+    native_control_routing_model, native_document_publication_model, native_document_queue_model,
+    native_draft_journal_model, native_editor_command_palette_model, native_editor_modal_model,
+    native_editor_viewport_model, native_file_watch_model, native_markdown_history_model,
+    native_markdown_viewport_model, native_packages_worker_model,
+    native_recovery_interaction_model, native_reopen_ledger_model, native_save_intent_latch_model,
+    native_settings_draft_close_model, native_settings_singleton_model, native_tab_identity_model,
+    native_update_admission_model, native_update_attempt_identity_model,
+    native_update_auto_intent_model, native_update_channel_scan_model,
+    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
     native_update_hidden_output_quiet_model, native_update_menu_activation_model,
     native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
     native_update_status_reconciliation_model, native_update_worker_queue_model,
@@ -138,6 +140,118 @@ fn derived_ring_spec_model_checks() {
 fn derived_cursor_spec_model_checks() {
     // Exercises the multi-action / UNCHANGED generation path through `ty`.
     assert_model_checks(&cursor_model());
+}
+
+#[test]
+fn derived_clipboard_mailbox_proves_one_latest_pending_write() {
+    let model = clipboard_mailbox_model();
+    assert_proves_and_catches(&model);
+
+    let mut state = model.init_state();
+    for action in [
+        "PublishClipboard",
+        "PublishPrimary",
+        "PublishClipboard",
+        "Consume",
+    ] {
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        assert!(model.check_invariant("OneLatestPendingWrite", &state));
+    }
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut unbounded = buggy.init_state();
+    assert!(buggy.fire("PublishClipboard", &mut unbounded));
+    assert!(buggy.check_invariant("OneLatestPendingWrite", &unbounded));
+    assert!(buggy.fire("PublishClipboard", &mut unbounded));
+    assert!(
+        !buggy.check_invariant("OneLatestPendingWrite", &unbounded),
+        "the retired queue must fail the bounded/latest invariant"
+    );
+}
+
+#[test]
+fn derived_native_document_queue_proves_bounded_nonblocking_admission() {
+    let model = native_document_queue_model();
+    assert_proves_and_catches(&model);
+
+    let mut state = model.init_state();
+    for action in [
+        "SubmitAccepted",
+        "WorkerStarts",
+        "ConsumeDrainEdge",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitDeferred",
+        "WorkerCompletes",
+        "WorkerStarts",
+        "RetryAccepted",
+    ] {
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
+        for invariant in [
+            "BoundedFullImageJobs",
+            "DeferredIntentRetained",
+            "OpenSlotHasRetryEdge",
+        ] {
+            assert!(
+                model.check_invariant(invariant, &state),
+                "{action}: {state:?}"
+            );
+        }
+    }
+    assert_eq!(state["queued"], 4);
+    assert_eq!(state["executing"], 1);
+    assert_eq!(state["retry_pending"], 0);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut unbounded = buggy.init_state();
+    assert!(buggy.fire("SubmitAccepted", &mut unbounded));
+    assert!(buggy.fire("WorkerStarts", &mut unbounded));
+    for _ in 0..5 {
+        assert!(buggy.fire("SubmitAccepted", &mut unbounded));
+    }
+    assert!(
+        !buggy.check_invariant("BoundedFullImageJobs", &unbounded),
+        "one executing plus five queued images must exceed the retained cap"
+    );
+
+    let mut lost = buggy.init_state();
+    for action in [
+        "SubmitAccepted",
+        "WorkerStarts",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitDeferred",
+    ] {
+        assert!(buggy.fire(action, &mut lost), "{action}: {lost:?}");
+    }
+    assert!(
+        !buggy.check_invariant("DeferredIntentRetained", &lost),
+        "the retired Full path must expose its dropped retry intent"
+    );
+
+    let mut missing_wake = model.init_state();
+    for action in [
+        "SubmitAccepted",
+        "WorkerStarts",
+        "ConsumeDrainEdge",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitAccepted",
+        "SubmitDeferred",
+        "WorkerCompletes",
+    ] {
+        assert!(model.fire(action, &mut missing_wake));
+    }
+    assert!(buggy.fire("WorkerStarts", &mut missing_wake));
+    assert!(
+        !buggy.check_invariant("OpenSlotHasRetryEdge", &missing_wake),
+        "capacity release without a wake must strand the retained intent"
+    );
 }
 
 #[test]
@@ -5109,6 +5223,95 @@ fn derived_native_update_status_reconciliation_proves_caller_and_ready_authority
     assert!(!buggy.check_invariant("CallerBuildIsAuthoritative", &stale));
     assert!(!buggy.check_invariant("AbsentReadyCannotAdvertiseStage", &stale));
     assert!(!buggy.check_invariant("MismatchedAbsentReadyIsNeutralized", &stale));
+}
+
+/// The FailedMark writer/reader suppression contract: a quarantine verdict is
+/// recorded in the field the reader consults and suppresses at EVERY probe
+/// time, while a stage-failure backoff suppresses exactly until its deadline.
+/// `Buggy=1` replays both halves of the 5ffcc15d crash-loop regression — the
+/// verdict written as a plain timed memo (writer half) and the deadline
+/// comparison direction flipped (reader half) — each falsifying its own
+/// invariant without masking the other.
+#[test]
+fn derived_native_update_failed_mark_suppression_proves_quarantine_and_backoff() {
+    let model = native_update_failed_mark_suppression_model();
+    assert_proves_and_catches(&model);
+
+    // Healthy witness, quarantine lane: the verdict lands in the field and a
+    // matching probe is suppressed regardless of the probed timeline class.
+    let quarantine_picked = model
+        .successors("PickSuppressionInputs", &model.init_state())
+        .into_iter()
+        .find(|state| {
+            state["writer_kind"] == 1 && state["probe_now"] == 3 && state["candidate_matches"] == 1
+        })
+        .expect("bounded quarantine fixture");
+    let recorded = model.successors("RecordQuarantine", &quarantine_picked)[0].clone();
+    assert_eq!(recorded["quarantined"], 1);
+    assert_eq!(recorded["deadline"], 0, "the legacy sentinel stays 0");
+    let probed = model.successors("ProbeSuppresses", &recorded)[0].clone();
+    assert_eq!(probed["suppressed"], 1);
+    assert!(model.check_invariant("QuarantineVerdictLandsInTheQuarantineField", &probed));
+    assert!(model.check_invariant("QuarantineSuppressesAtEveryProbe", &probed));
+
+    // Healthy witness, backoff lane: suppressed strictly before the deadline,
+    // retryable from the deadline on.
+    for (probe_now, suppressed) in [(1, 1), (2, 0), (3, 0)] {
+        let picked = model
+            .successors("PickSuppressionInputs", &model.init_state())
+            .into_iter()
+            .find(|state| {
+                state["writer_kind"] == 2
+                    && state["probe_now"] == probe_now
+                    && state["candidate_matches"] == 1
+            })
+            .expect("bounded backoff fixture");
+        let recorded = model.successors("RecordStageFailure", &picked)[0].clone();
+        assert_eq!(recorded["quarantined"], 0);
+        assert_eq!(recorded["deadline"], 2);
+        let probed = model.successors("ProbeSuppresses", &recorded)[0].clone();
+        assert_eq!(probed["suppressed"], suppressed);
+        assert!(model.check_invariant("BackoffSuppressesIffBeforeDeadline", &probed));
+    }
+
+    // Buggy writer half: the quarantine verdict goes out as a plain timed memo
+    // and the very next matching probe reads it as already elapsed — the memo
+    // written and then ignored.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let buggy_picked = buggy
+        .successors("PickSuppressionInputs", &buggy.init_state())
+        .into_iter()
+        .find(|state| {
+            state["writer_kind"] == 1 && state["probe_now"] == 0 && state["candidate_matches"] == 1
+        })
+        .expect("bounded buggy quarantine fixture");
+    let leaked = buggy.successors("RecordQuarantine", &buggy_picked)[0].clone();
+    assert_eq!(leaked["quarantined"], 0);
+    assert!(!buggy.check_invariant("QuarantineVerdictLandsInTheQuarantineField", &leaked));
+    let retried = buggy.successors("ProbeSuppresses", &leaked)[0].clone();
+    assert_eq!(
+        retried["suppressed"], 0,
+        "the crash-looped build is retried"
+    );
+    assert!(!buggy.check_invariant("QuarantineSuppressesAtEveryProbe", &retried));
+
+    // Buggy reader half: the flipped comparison suppresses FROM the deadline
+    // instead of until it, falsifying the iff in both directions.
+    for (probe_now, wrong_suppressed) in [(1, 0), (3, 1)] {
+        let picked = buggy
+            .successors("PickSuppressionInputs", &buggy.init_state())
+            .into_iter()
+            .find(|state| {
+                state["writer_kind"] == 2
+                    && state["probe_now"] == probe_now
+                    && state["candidate_matches"] == 1
+            })
+            .expect("bounded buggy backoff fixture");
+        let recorded = buggy.successors("RecordStageFailure", &picked)[0].clone();
+        let probed = buggy.successors("ProbeSuppresses", &recorded)[0].clone();
+        assert_eq!(probed["suppressed"], wrong_suppressed);
+        assert!(!buggy.check_invariant("BackoffSuppressesIffBeforeDeadline", &probed));
+    }
 }
 
 /// The input thread owns only a bounded nonblocking enqueue. Filling the abstract

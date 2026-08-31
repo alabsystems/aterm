@@ -28,7 +28,7 @@ fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
         w: cw as u16,
         h: ch as u16,
         color: 0x0020_2020,
-    
+
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
     }

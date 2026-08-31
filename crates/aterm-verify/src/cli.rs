@@ -216,6 +216,11 @@ A skip is an honest \"tool absent\", never a silent pass: skips are counted and
 NAMED, and any run that skipped a stage or narrowed its scope is refused the
 merge-contract verdict.
 
+A stage child that never exits is a FAILURE, not a hang: every child runs under
+a 45-minute wall-clock ceiling and is killed and reported past it, because a
+gate that hangs has decided nothing and says nothing. $ATERM_VERIFY_STAGE_TIMEOUT
+moves that ceiling (seconds); =off removes it and restores the unbounded wait.
+
 exit 0  everything that ran was green (the verdict says which green)
 exit 1  a gate FAILED — a real finding about the tree
 exit 2  usage error

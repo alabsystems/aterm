@@ -154,6 +154,12 @@ struct SavedBaseline {
 }
 
 #[derive(Clone, Debug)]
+struct InflightRewrite {
+    plan: JournalRewritePlan,
+    checkpoint: SavedBaseline,
+}
+
+#[derive(Clone, Debug)]
 struct JournalEntry {
     key: JournalDocumentKey,
     path: PathBuf,
@@ -163,7 +169,7 @@ struct JournalEntry {
     desired: DocumentSnapshot,
     append_text: Option<Arc<str>>,
     next_rewrite_generation: u64,
-    rewrite_inflight: Option<JournalRewritePlan>,
+    rewrite_inflight: Option<InflightRewrite>,
     pending_checkpoint: Option<SavedBaseline>,
 }
 
@@ -309,7 +315,7 @@ impl DocumentJournalStore {
                 .next_rewrite_generation
                 .checked_add(1)
                 .ok_or_else(|| "journal checkpoint generation exhausted".to_string())?;
-            let disk = synthetic_snapshot(document, saved.seq, saved.text);
+            let disk = synthetic_snapshot(document, saved.seq, saved.text.clone());
             let plan = checkpoint_plan(
                 entry.key,
                 generation,
@@ -319,7 +325,10 @@ impl DocumentJournalStore {
                 &entry.desired,
             )
             .map_err(|error| format!("could not encode journal checkpoint: {error:?}"))?;
-            entry.rewrite_inflight = Some(plan.clone());
+            entry.rewrite_inflight = Some(InflightRewrite {
+                plan: plan.clone(),
+                checkpoint: saved,
+            });
             return Ok(Some(JournalEffect::Rewrite {
                 path: entry.path.clone(),
                 plan,
@@ -400,6 +409,65 @@ impl DocumentJournalStore {
         }
     }
 
+    /// Roll back an append that never crossed the worker queue boundary.
+    ///
+    /// Queue saturation is not an I/O failure: the latest desired snapshot is
+    /// still owned by this store and will be planned again after a worker slot
+    /// becomes available. Only the small retry registry in `app_documents`
+    /// survives this call; the encoded append image is released here.
+    pub(crate) fn defer_append(
+        &mut self,
+        document: DocumentId,
+        generation: crate::native_document_io::JournalGeneration,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&document) else {
+            return false;
+        };
+        if !matches!(
+            entry
+                .reducer
+                .complete(generation, JournalAppendResult::Cancelled),
+            JournalReduction::Cancelled
+        ) {
+            return false;
+        }
+        entry.append_text = None;
+        true
+    }
+
+    /// Restore a checkpoint rewrite that was planned but never admitted to the
+    /// worker. A newer checkpoint requested meanwhile wins by sequence; either
+    /// way, no proven file baseline is consumed merely because the queue was
+    /// full.
+    pub(crate) fn defer_rewrite(
+        &mut self,
+        document: DocumentId,
+        generation: JournalRewriteGeneration,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&document) else {
+            return false;
+        };
+        let Some(inflight) = entry.rewrite_inflight.as_ref() else {
+            return false;
+        };
+        if inflight.plan.generation != generation {
+            return false;
+        }
+        let deferred = entry
+            .rewrite_inflight
+            .take()
+            .expect("generation checked against live rewrite")
+            .checkpoint;
+        if entry
+            .pending_checkpoint
+            .as_ref()
+            .is_none_or(|pending| deferred.seq > pending.seq)
+        {
+            entry.pending_checkpoint = Some(deferred);
+        }
+        true
+    }
+
     pub(crate) fn complete_rewrite(
         &mut self,
         document: DocumentId,
@@ -412,13 +480,14 @@ impl DocumentJournalStore {
         let Some(plan) = entry.rewrite_inflight.as_ref() else {
             return JournalCompletion::Stale;
         };
-        if plan.generation != generation {
+        if plan.plan.generation != generation {
             return JournalCompletion::Stale;
         }
         let plan = entry
             .rewrite_inflight
             .take()
-            .expect("generation checked against live rewrite");
+            .expect("generation checked against live rewrite")
+            .plan;
         match result {
             JournalRewriteResult::Committed(proof) if plan.verifies(proof) => {
                 entry.reducer =
@@ -2067,6 +2136,141 @@ mod tests {
                 .text,
             "abc"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saturated_append_deferral_replans_the_latest_desired_head() {
+        let root = test_root("append-deferral");
+        let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
+        let (mut store, id, disk) = snapshots("a");
+        let decision = journals
+            .inspect_open("file:///tmp/deferred-draft.md", disk.text.as_bytes())
+            .unwrap();
+        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+
+        let _ = store.transact(
+            id,
+            disk.seq,
+            vec![TextEdit {
+                range: 1..1,
+                insert: "b".into(),
+            }],
+        );
+        let first_desired = store.snapshot(id).unwrap();
+        journals.observe_commit(&first_desired).unwrap();
+        let JournalEffect::Append { plan: first, .. } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("first append expected")
+        };
+
+        // A `try_send(Full)` with no later document event must still leave a
+        // plan ready for the capacity-release wake to pump.
+        assert!(journals.defer_append(id, first.generation));
+        let JournalEffect::Append {
+            plan: same_head_retry,
+            ..
+        } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("deferred append must be replanned without another edit")
+        };
+        assert_ne!(same_head_retry.generation, first.generation);
+        assert_eq!(same_head_retry.target_seq, first_desired.seq);
+
+        // Model another `Full` while a newer edit lands in the UI reducer. The
+        // rejected encoded image is not retained; retry replans directly to the
+        // store's existing latest snapshot.
+        let _ = store.transact(
+            id,
+            first_desired.seq,
+            vec![TextEdit {
+                range: 2..2,
+                insert: "c".into(),
+            }],
+        );
+        let latest = store.snapshot(id).unwrap();
+        journals.observe_commit(&latest).unwrap();
+        assert!(journals.defer_append(id, same_head_retry.generation));
+        let entry = journals.entries.get(&id).unwrap();
+        assert!(entry.append_text.is_none());
+        assert!(matches!(
+            entry.reducer.phase(),
+            crate::native_document_io::JournalPhase::Idle
+        ));
+
+        let JournalEffect::Append {
+            plan: latest_retry, ..
+        } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("deferred append must be replanned")
+        };
+        assert_ne!(latest_retry.generation, same_head_retry.generation);
+        assert_eq!(latest_retry.base_durable, first.base_durable);
+        assert_eq!(latest_retry.target_seq, latest.seq);
+        assert!(Arc::ptr_eq(
+            journals
+                .entries
+                .get(&id)
+                .unwrap()
+                .append_text
+                .as_ref()
+                .unwrap(),
+            &latest.text
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saturated_rewrite_deferral_restores_checkpoint_intent() {
+        let root = test_root("rewrite-deferral");
+        let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
+        let (mut store, id, disk) = snapshots("base");
+        let decision = journals
+            .inspect_open("file:///tmp/deferred-checkpoint.md", disk.text.as_bytes())
+            .unwrap();
+        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let _ = store.transact(
+            id,
+            disk.seq,
+            vec![TextEdit {
+                range: disk.text.len()..disk.text.len(),
+                insert: " saved".into(),
+            }],
+        );
+        let saved = store.snapshot(id).unwrap();
+        journals.observe_commit(&saved).unwrap();
+        journals
+            .request_checkpoint(
+                DurableCheckpoint {
+                    document: id,
+                    seq: saved.seq,
+                    source: DurableSource::AtomicFile,
+                },
+                saved.text.clone(),
+            )
+            .unwrap();
+
+        let JournalEffect::Rewrite { plan: first, .. } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("checkpoint rewrite expected")
+        };
+        assert!(journals.defer_rewrite(id, first.generation));
+        let entry = journals.entries.get(&id).unwrap();
+        assert!(entry.rewrite_inflight.is_none());
+        assert!(Arc::ptr_eq(
+            &entry.pending_checkpoint.as_ref().unwrap().text,
+            &saved.text
+        ));
+
+        let JournalEffect::Rewrite { plan: retry, .. } = journals.next_effect(id).unwrap().unwrap()
+        else {
+            panic!("deferred checkpoint must be replanned")
+        };
+        assert_ne!(retry.generation, first.generation);
+        assert_eq!(retry.base_durable, first.base_durable);
+        assert_eq!(retry.target_seq, first.target_seq);
+        assert_eq!(retry.fingerprint, first.fingerprint);
+        assert_eq!(retry.bytes, first.bytes);
         let _ = fs::remove_dir_all(root);
     }
 

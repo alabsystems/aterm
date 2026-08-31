@@ -990,7 +990,11 @@ impl App {
         }
         self.resize_panes(wid);
         self.resync_active_or_window(wid);
-        debug_assert!(self.structural_invariants_ok());
+        debug_assert!(
+            self.structural_invariants_ok(),
+            "{}",
+            self.structural_invariant_violation().unwrap_or_default(),
+        );
         Ok(view)
     }
 
@@ -1917,7 +1921,11 @@ impl App {
         // content has no reader/PTY stamp at all.
         self.sync_window(wid_a);
         self.sync_active_session(); // frontmost = B
-        debug_assert!(self.structural_invariants_ok());
+        debug_assert!(
+            self.structural_invariants_ok(),
+            "window/session structural invariants violated after tearing a tab into its own window: {}",
+            self.structural_invariant_violation().unwrap_or_default(),
+        );
         Some(wid_b)
     }
 
@@ -2084,7 +2092,9 @@ impl App {
         }
         debug_assert!(
             self.structural_invariants_ok(),
-            "window/session structural invariants violated after migrate_active_tab_to_next_window",
+            "window/session structural invariants violated after \
+             migrate_active_tab_to_next_window: {}",
+            self.structural_invariant_violation().unwrap_or_default(),
         );
     }
 
@@ -2153,7 +2163,11 @@ impl App {
         // canonically contain `s` — so the shared session's output repaints both viewers
         // with no re-stamp (the multi-viewer fan-out is now genuinely exercised).
         self.sync_active_session(); // frontmost = B
-        debug_assert!(self.structural_invariants_ok());
+        debug_assert!(
+            self.structural_invariants_ok(),
+            "window/session structural invariants violated after tearing a tab into its own window: {}",
+            self.structural_invariant_violation().unwrap_or_default(),
+        );
         Some(wid_b)
     }
 
@@ -2248,6 +2262,20 @@ impl App {
         wid: WindowId,
         axis: crate::tab_model::SplitAxis,
     ) -> (u64, crate::tab_model::ViewId) {
+        // THIS IS THE CANONICAL ARM ONLY: it splits `tab_set` and never mirrors
+        // into `layouts`. That is correct exactly when the active tab owns no
+        // compatibility entry — a native or heterogeneous tab. An ALL-TERMINAL
+        // tab DOES own one and must go through `split_active_stub_tab*`, which
+        // splits the legacy tree and calls `sync_tab_model_from_layout`.
+        //
+        // Without this guard the two topologies desync silently and the failure
+        // surfaces later as `structural_invariants_ok` firing inside
+        // `sync_active_session`, naming neither this helper nor the caller.
+        debug_assert!(
+            self.active_tree(wid).is_none(),
+            "split_active_with_stub_terminal is the heterogeneous arm; an \
+             all-terminal active tab must use split_active_stub_tab"
+        );
         let sid = self.next_session_id;
         let view = self
             .view_store
@@ -4962,13 +4990,33 @@ impl App {
     // release-only "never called" warning (debug builds do call it).
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn structural_invariants_ok(&self) -> bool {
+        self.structural_invariant_violation().is_none()
+    }
+
+    /// The same oracle as [`Self::structural_invariants_ok`], but NAMING the first
+    /// clause that is false — and the values that make it false — instead of only
+    /// reporting that one was. Every `debug_assert!` on the bool passes this as its
+    /// panic message, so a trip arrives as a diagnosis rather than as a fact still
+    /// to be diagnosed.
+    ///
+    /// An oracle over a model this wide is only worth the sentence it can produce
+    /// when it fires: it guards eleven distinct relationships across `tab_set`,
+    /// `layouts`, `tabs`, `front_content`, `active_terminal`, `window_focus`, the
+    /// view store, the session pool and the native runtime, and it fires at seams
+    /// (`sync_active_session`, `close_window_logical`, session restore) reached
+    /// from every tab add/switch/cycle/close — so a bare bool names neither the
+    /// broken relationship nor the window it broke in. The message costs a passing
+    /// frame nothing: `assert!` evaluates its format arguments ONLY on the failing
+    /// branch.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub(crate) fn structural_invariant_violation(&self) -> Option<String> {
         let Some(fid) = self.frontmost_window else {
-            return false;
+            return Some("frontmost_window is None: no window holds the front".to_string());
         };
         if !self.windows.contains_key(&fid) {
-            return false;
+            return Some(format!("frontmost_window {fid:?} names no live window"));
         }
-        self.windows.values().all(|ws| {
+        self.windows.iter().find_map(|(wid, ws)| {
             let terminal_tabs: Vec<&crate::tab_model::Tab> = ws
                 .tab_set
                 .tabs()
@@ -5037,50 +5085,136 @@ impl App {
                     ws.tabs.active < ws.layouts.len()
                 };
 
-            (!ws.tab_set.is_empty() || ws.pending_close)
-                && projection_shape
-                && terminal_tabs.len() == ws.layouts.len()
-                && ws.tab_set.invariant_holds(&self.view_store)
-                && front_truth
-                && focus_truth
-                // An all-terminal active tab has a matching compatibility entry
-                // and the optional front capability names its focused session.
-                && active_terminal.is_none_or(|index| {
-                    index == ws.tabs.active
-                        && ws
-                            .front_terminal()
-                            .is_some_and(|mirror| mirror.session == ws.layouts[index].focus())
-                })
-                && ws.layouts.iter().zip(&terminal_tabs).all(|(layout, tab)| {
-                    let projected = tab.root.map(&mut |view| {
+            if ws.tab_set.is_empty() && !ws.pending_close {
+                return Some(format!("{wid:?}: window has no tabs and is not closing"));
+            }
+            if !projection_shape {
+                return Some(format!(
+                    "{wid:?}: tabs mirror {{count: {}, active: {}}} is not a shape for {} layouts",
+                    ws.tabs.count,
+                    ws.tabs.active,
+                    ws.layouts.len(),
+                ));
+            }
+            if terminal_tabs.len() != ws.layouts.len() {
+                return Some(format!(
+                    "{wid:?}: {} all-terminal tabs project onto {} layouts",
+                    terminal_tabs.len(),
+                    ws.layouts.len(),
+                ));
+            }
+            if !ws.tab_set.invariant_holds(&self.view_store) {
+                return Some(format!(
+                    "{wid:?}: tab_set is self-inconsistent — the active id is absent or \
+                     duplicated, or some tab's focus is not a leaf it owns, or a leaf names a \
+                     view the store no longer holds",
+                ));
+            }
+            if !front_truth {
+                return Some(format!(
+                    "{wid:?}: front_content {:?} does not mirror the active tab's focused view \
+                     {:?} ({:?}); active_terminal names {:?}",
+                    ws.front_content,
+                    active_tab.map(|tab| tab.focus),
+                    active_tab.and_then(|tab| self.view_store.get(tab.focus).copied()),
+                    ws.active_terminal.as_ref().map(|mirror| mirror.session),
+                ));
+            }
+            if !focus_truth {
+                return Some(format!(
+                    "{wid:?}: window_focus {:?} disagrees with front_content {:?}",
+                    ws.window_focus, ws.front_content,
+                ));
+            }
+            // An all-terminal active tab has a matching compatibility entry
+            // and the optional front capability names its focused session.
+            if let Some(index) = active_terminal {
+                if index != ws.tabs.active {
+                    return Some(format!(
+                        "{wid:?}: the active tab is terminal projection {index}, but the tabs \
+                         mirror says active={}",
+                        ws.tabs.active,
+                    ));
+                }
+                if !ws
+                    .front_terminal()
+                    .is_some_and(|mirror| mirror.session == ws.layouts[index].focus())
+                {
+                    return Some(format!(
+                        "{wid:?}: front_terminal {:?} does not name layouts[{index}]'s focused \
+                         session {:?}",
+                        ws.front_terminal().map(|mirror| mirror.session),
+                        ws.layouts[index].focus(),
+                    ));
+                }
+            }
+            for (index, (layout, tab)) in ws.layouts.iter().zip(&terminal_tabs).enumerate() {
+                let projected = tab.root.map(&mut |view| {
+                    self.view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                });
+                if projected != layout.map_sessions(Some) {
+                    return Some(format!(
+                        "{wid:?}: tab {:?}'s pane tree does not project onto layouts[{index}] — \
+                         tab sessions {:?} vs layout sessions {:?}",
+                        tab.id,
+                        projected.leaves(),
+                        layout.map_sessions(Some).leaves(),
+                    ));
+                }
+                if self
+                    .view_store
+                    .get(tab.focus)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    != Some(layout.focus())
+                {
+                    return Some(format!(
+                        "{wid:?}: tab {:?}'s focused leaf {:?} names session {:?}, but \
+                         layouts[{index}] is focused on session {:?}",
+                        tab.id,
+                        tab.focus,
                         self.view_store
-                            .get(*view)
-                            .copied()
-                            .and_then(crate::tab_model::View::terminal_session)
-                    });
-                    projected == layout.map_sessions(Some)
-                        && self
-                            .view_store
                             .get(tab.focus)
                             .copied()
-                            .and_then(crate::tab_model::View::terminal_session)
-                            == Some(layout.focus())
-                        && tab.zoomed == layout.is_zoomed()
-                })
-                && ws.tab_set.tabs().iter().all(|tab| {
-                    tab.root.leaves().into_iter().all(|view| {
-                        match self.view_store.get(view).copied() {
-                            Some(crate::tab_model::View::Terminal(terminal)) => {
-                                self.pool.get(terminal.session).is_some()
-                            }
-                            Some(crate::tab_model::View::Native(native)) => {
-                                self.native_runtime.app(native.instance).is_some()
-                                    && self.native_runtime.view_state(view).is_some()
-                            }
-                            None => false,
+                            .and_then(crate::tab_model::View::terminal_session),
+                        layout.focus(),
+                    ));
+                }
+                if tab.zoomed != layout.is_zoomed() {
+                    return Some(format!(
+                        "{wid:?}: tab {:?} is zoomed={} but layouts[{index}] is zoomed={}",
+                        tab.id,
+                        tab.zoomed,
+                        layout.is_zoomed(),
+                    ));
+                }
+            }
+            for tab in ws.tab_set.tabs() {
+                for view in tab.root.leaves() {
+                    let owned = match self.view_store.get(view).copied() {
+                        Some(crate::tab_model::View::Terminal(terminal)) => {
+                            self.pool.get(terminal.session).is_some()
                         }
-                    })
-                })
+                        Some(crate::tab_model::View::Native(native)) => {
+                            self.native_runtime.app(native.instance).is_some()
+                                && self.native_runtime.view_state(view).is_some()
+                        }
+                        None => false,
+                    };
+                    if !owned {
+                        return Some(format!(
+                            "{wid:?}: tab {:?}'s leaf {view:?} ({:?}) is not owned by the session \
+                             pool / native runtime",
+                            tab.id,
+                            self.view_store.get(view).copied(),
+                        ));
+                    }
+                }
+            }
+            None
         })
     }
 
@@ -8135,6 +8269,113 @@ mod pane_close_render_seam_tests {
             "the canonical tree collapsed onto the survivor"
         );
         assert_window_keeps_rendering(&mut app, wid, "after closing the focused split pane");
+    }
+
+    /// The oracle guarding the window/session model reports WHICH relationship
+    /// broke, in WHICH window. A bare bool has twice sent someone to find that out
+    /// by hand; the sentence is the part of the oracle that does the work.
+    #[test]
+    fn the_structural_oracle_names_the_clause_it_trips_on() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_eq!(
+            app.structural_invariant_violation(),
+            None,
+            "the headless fixture is a stable point"
+        );
+
+        // A front that names no window is reported as exactly that.
+        let front = app.frontmost_window.take();
+        let violation = app
+            .structural_invariant_violation()
+            .expect("a frontless app is rejected");
+        assert!(
+            violation.contains("frontmost_window"),
+            "the front clause names itself: {violation}"
+        );
+        app.frontmost_window = front;
+        assert_eq!(app.structural_invariant_violation(), None);
+
+        // The desync class that has cost two diagnoses: the canonical tab gains a
+        // pane while `layouts` — the terminal-only projection nothing re-derives —
+        // still reads one. Built by hand: the split helpers assert a heterogeneous
+        // tab, which this deliberately is not.
+        let sid = app.next_session_id;
+        app.next_session_id += 1;
+        let view = app
+            .view_store
+            .insert_terminal(sid)
+            .expect("finite test view id");
+        app.pool.insert(crate::stub_session(sid));
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .and_then(|window| window.tab_set.active_mut())
+                .expect("active tab")
+                .split_focused(crate::tab_model::SplitAxis::Horizontal, view)
+        );
+
+        let violation = app
+            .structural_invariant_violation()
+            .expect("the desynced window is rejected");
+        assert!(!app.structural_invariants_ok(), "the bool agrees");
+        assert!(
+            violation.contains("WindowId(0)"),
+            "the oracle names the offending window: {violation}"
+        );
+        assert!(
+            violation.contains("front_content"),
+            "the oracle names the broken relationship, not just that one broke: {violation}"
+        );
+    }
+
+    /// What the `pane` verb is allowed to say, and it is only ever true: focus
+    /// moved, or there was no pane that way.
+    ///
+    /// The bool comes from the traversal itself rather than from a second look at
+    /// the layout afterwards, so `moved=1` and the focus actually changing are one
+    /// fact. Both refusal shapes are covered — a single-pane tab, and an edge pane
+    /// with no neighbour in the requested direction.
+    #[test]
+    fn pane_focus_reports_only_whether_focus_actually_moved() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        // A single-pane tab has nowhere to go, in any direction.
+        for dir in [
+            pane::FocusDir::Left,
+            pane::FocusDir::Right,
+            pane::FocusDir::Up,
+            pane::FocusDir::Down,
+        ] {
+            assert!(
+                !app.focus_pane_in(wid, dir),
+                "a single-pane tab reports no move"
+            );
+        }
+
+        // Split: focus lands on the new pane, so LEFT has a neighbour and moves…
+        let split = app.split_active_stub_tab(wid);
+        assert_eq!(app.windows[&wid].layouts[0].focus(), split);
+        assert!(
+            app.focus_pane_in(wid, pane::FocusDir::Left),
+            "there is a pane to the left of the new one"
+        );
+        assert_eq!(
+            app.windows[&wid].layouts[0].focus(),
+            0,
+            "moved=1 means the focused pane really changed"
+        );
+        // …and from the leftmost pane, LEFT is an edge: no move, focus unchanged.
+        assert!(!app.focus_pane_in(wid, pane::FocusDir::Left));
+        assert_eq!(
+            app.windows[&wid].layouts[0].focus(),
+            0,
+            "moved=0 means the focused pane really did not change"
+        );
+        // Non-vacuity for the edge case: the other direction still moves.
+        assert!(app.focus_pane_in(wid, pane::FocusDir::Right));
+        assert_eq!(app.windows[&wid].layouts[0].focus(), split);
     }
 
     /// The UNFOCUSED neighbour: focus back onto the original pane, close it, and

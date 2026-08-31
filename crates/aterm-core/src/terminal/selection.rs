@@ -6,6 +6,8 @@
 //! Contains `selection_to_string()` and `get_line_text()`.
 //! Extracted from mod.rs to reduce file size.
 
+use std::borrow::Cow;
+
 use super::Terminal;
 use super::content::visible_row_bounds_to_string;
 
@@ -56,13 +58,13 @@ pub(crate) const MAX_SCROLLBACK_LINE_SCAN_BYTES: usize = 1024 * 1024;
 /// injected line. Used by the search-index build, whose history rows would
 /// otherwise materialize every `Line` whole. Borrows valid UTF-8 under the ceiling
 /// zero-copy; lossy-converts only a bounded prefix otherwise.
-pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> String {
+pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> Cow<'_, str> {
     let scan = if bytes.len() <= max_scan_bytes {
         bytes
     } else {
         &bytes[..max_scan_bytes]
     };
-    String::from_utf8_lossy(scan).into_owned()
+    String::from_utf8_lossy(scan)
 }
 
 /// Single-pass column range to byte offset conversion (#5581).
@@ -798,6 +800,31 @@ mod tests {
     // can inject a multi-MiB Line. scrollback_line_range_text must NOT materialize
     // or scan the whole line: it borrows at most `max_scan_bytes`. Tested at a small
     // ceiling since the production ceiling is far above any expressible request.
+    #[test]
+    fn line_text_bounded_borrows_valid_utf8_and_owns_lossy_text() {
+        use std::borrow::Cow;
+
+        use super::line_text_bounded;
+
+        let valid = line_text_bounded(b"alpha beta", 1024);
+        assert!(
+            matches!(valid, Cow::Borrowed("alpha beta")),
+            "valid UTF-8 should stay borrowed"
+        );
+
+        let truncated = line_text_bounded(b"alpha beta", 5);
+        assert!(
+            matches!(truncated, Cow::Borrowed("alpha")),
+            "a valid bounded prefix should also stay borrowed"
+        );
+
+        let lossy = line_text_bounded(b"alpha\xff", 1024);
+        match lossy {
+            Cow::Owned(text) => assert_eq!(text, "alpha\u{fffd}"),
+            Cow::Borrowed(_) => panic!("invalid UTF-8 must use the owned lossy path"),
+        }
+    }
+
     #[test]
     fn scrollback_line_range_text_bounds_scan_to_ceiling() {
         use super::scrollback_line_range_text;

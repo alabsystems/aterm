@@ -25,7 +25,7 @@
 //!   request-smuggling signature and is rejected outright.
 
 use std::io::{BufReader, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::proxy::{self, EnvSource, ProcessEnv, ProxyMode};
@@ -86,12 +86,51 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// One lazily-built TLS configuration, shared by every clone of a [`Client`].
+/// The error is cached too: a broken trust configuration must fail consistently
+/// without rescanning or reparsing the same trust store on every request.
+#[derive(Default)]
+struct TlsConfigCache {
+    value: OnceLock<Result<Arc<rustls::ClientConfig>, String>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+impl TlsConfigCache {
+    fn get(&self, trust: &Trust) -> Result<Arc<rustls::ClientConfig>, String> {
+        self.value
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tls::client_config(trust)
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn builds(&self) -> usize {
+        self.builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Client configuration shared by every request it issues.
+///
+/// Clones share one lazy TLS configuration. Plain HTTP never constructs it;
+/// the first HTTPS request snapshots the configured roots (or platform trust
+/// verifier) and every later HTTPS request from this client reuses that result.
+/// On non-Apple Unix, that means `SSL_CERT_FILE`/`SSL_CERT_DIR` and the on-disk
+/// platform store are read at the first HTTPS request; create a new client to
+/// adopt later trust-store changes. Proxy environment variables are different:
+/// [`RequestBuilder::send`] resolves them afresh for every request, and each
+/// builder retains its own authority [`Guard`].
+#[derive(Clone)]
 pub struct Client {
-    trust: Trust,
+    trust: Arc<Trust>,
     proxy_mode: ProxyMode,
     timeout: Duration,
     connector: Arc<dyn Connect>,
+    tls_config: Arc<TlsConfigCache>,
 }
 
 impl std::fmt::Debug for Client {
@@ -102,6 +141,10 @@ impl std::fmt::Debug for Client {
             .field("proxy_mode", &self.proxy_mode)
             .field("timeout", &self.timeout)
             .field("connector", &self.connector)
+            .field(
+                "tls_config_initialized",
+                &self.tls_config.value.get().is_some(),
+            )
             .finish()
     }
 }
@@ -110,11 +153,22 @@ impl Client {
     /// A client with the given trust model, proxy policy and global timeout.
     #[must_use]
     pub fn new(trust: Trust, proxy_mode: ProxyMode, timeout: Duration) -> Self {
+        Self::with_shared_trust(Arc::new(trust), proxy_mode, timeout)
+    }
+
+    /// A client that shares an already-owned trust model.
+    ///
+    /// This is useful for caches that retain custom CA roots as their identity:
+    /// the cache and every cloned client then share the DER allocation instead
+    /// of copying it at each client construction.
+    #[must_use]
+    pub fn with_shared_trust(trust: Arc<Trust>, proxy_mode: ProxyMode, timeout: Duration) -> Self {
         Self {
             trust,
             proxy_mode,
             timeout,
             connector: Arc::new(TcpConnector),
+            tls_config: Arc::new(TlsConfigCache::default()),
         }
     }
 
@@ -262,7 +316,10 @@ impl Client {
         guard: &Arc<dyn Guard>,
         deadline: Deadline,
     ) -> Result<Stream, Error> {
-        let config = tls::client_config(&self.trust).map_err(Error::Invalid)?;
+        let config = self
+            .tls_config
+            .get(self.trust.as_ref())
+            .map_err(Error::Invalid)?;
         Ok(Stream::start_tls(
             tcp,
             config,
@@ -595,6 +652,99 @@ mod tests {
 
     fn uri(text: &str) -> Uri {
         Uri::parse(text).unwrap()
+    }
+
+    fn plain_stub(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(response).unwrap();
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn repeated_https_requests_and_client_clones_build_one_tls_config() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("https://{}/request", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            // Closing immediately makes each TLS handshake fail after the client
+            // has obtained its configuration; no private test key is required.
+            for _ in 0..2 {
+                drop(listener.accept().unwrap().0);
+            }
+        });
+        let client = Client::new(
+            Trust::Roots(vec![include_bytes!("testdata/tls/root.der").to_vec()]),
+            ProxyMode::Direct,
+            Duration::from_secs(2),
+        );
+        let clone = client.clone();
+
+        assert!(
+            Arc::ptr_eq(&client.trust, &clone.trust),
+            "Client::clone must not copy configured CA bytes"
+        );
+
+        for requester in [&client, &clone] {
+            requester
+                .post(&endpoint)
+                .send(b"{}")
+                .expect_err("the TLS peer deliberately closes during handshake");
+        }
+        server.join().unwrap();
+
+        assert!(Arc::ptr_eq(&client.tls_config, &clone.tls_config));
+        assert_eq!(client.tls_config.builds(), 1);
+    }
+
+    #[test]
+    fn shared_trust_constructor_retains_the_callers_root_allocation() {
+        let trust = Arc::new(Trust::Roots(vec![vec![1, 2, 3, 4]]));
+        let client = Client::with_shared_trust(
+            Arc::clone(&trust),
+            ProxyMode::Direct,
+            Duration::from_secs(2),
+        );
+        let clone = client.clone();
+
+        assert!(Arc::ptr_eq(&trust, &client.trust));
+        assert!(Arc::ptr_eq(&client.trust, &clone.trust));
+    }
+
+    #[test]
+    fn cached_tls_configuration_errors_are_shared_by_clones() {
+        let client = Client::new(
+            Trust::Roots(Vec::new()),
+            ProxyMode::Direct,
+            Duration::from_secs(2),
+        );
+        let clone = client.clone();
+        let first = client.tls_config.get(client.trust.as_ref()).unwrap_err();
+        let second = clone.tls_config.get(clone.trust.as_ref()).unwrap_err();
+        assert_eq!(first, second);
+        assert_eq!(client.tls_config.builds(), 1);
+    }
+
+    #[test]
+    fn plain_http_never_constructs_the_deferred_tls_configuration() {
+        let (endpoint, server) =
+            plain_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        // This trust input is intentionally unusable. The HTTP request must
+        // still succeed because only HTTPS is allowed to touch the lazy cache.
+        let client = Client::new(
+            Trust::Roots(Vec::new()),
+            ProxyMode::Direct,
+            Duration::from_secs(2),
+        );
+        let response = client.post(&endpoint).send(b"{}").unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body(), b"ok");
+        assert_eq!(client.tls_config.builds(), 0);
     }
 
     #[test]

@@ -4442,6 +4442,83 @@ pub struct VerifiedReleaseAsset {
 // this side to 2 GiB, the client's container site kept 512 MiB, and 0.15.0
 // installs could accept a manifest whose payload they could never download).
 const UPDATER_MAX_DMG_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
+
+/// The most a LEAN `aterm-<v>.dmg` may weigh, in decimal bytes — the units the
+/// Finder and the download page speak, so the number in a refusal is the number
+/// a human sees.
+///
+/// This is a different question from [`UPDATER_MAX_DMG_BYTES`], which is the
+/// CLIENT's 2 GiB download bound: the one asks "can a client fetch this at
+/// all", the other "is this the one lean download we promised". A seeded image
+/// answers yes to the first and no to the second, which is precisely why
+/// v0.63.0 sailed through — 1.07 GB is comfortably inside 2 GiB. The lean image
+/// is ~31 MB, so 200 MB is roughly six times the real figure: loose enough that
+/// ordinary growth never trips it, tight enough that a seeded container cannot.
+///
+/// Deliberately no environment opt-out, for the reason recorded on
+/// `channel_version_gate`: an exported variable disables the check for a real
+/// cut too, which is the failure mode the check exists to prevent.
+const LEAN_DMG_CEILING_BYTES: u64 = 200 * 1000 * 1000;
+
+/// Refuse a macOS image that is not the lean download.
+///
+/// Pure, so the boundary is a unit test rather than a 31 MB build: `Ok(())` up
+/// to and including the ceiling, an error naming both figures past it.
+pub fn validate_lean_dmg_size(size: u64) -> Result<()> {
+    if size > LEAN_DMG_CEILING_BYTES {
+        return Err(Error::new(format!(
+            "aterm-<version>.dmg is {:.2} GB ({size} bytes), over the {} MB lean ceiling — \
+             this is a seeded image, not the one lean download.\n\
+             fix:  cargo clean -p aterm-release, confirm dist/toolchain-seed is absent, re-cut\n\
+             why:  v0.63.0 shipped exactly this and nothing at cut time objected; the client's \
+             {UPDATER_MAX_DMG_BYTES}-byte bound is about downloadability, not leanness",
+            size as f64 / 1e9,
+            LEAN_DMG_CEILING_BYTES / 1_000_000,
+        )));
+    }
+    Ok(())
+}
+
+/// Apply the lean-image contract to the bytes that actually exist on disk.
+///
+/// `step_build` knows the packager's returned size, but every resumable suffix
+/// must distrust that historical observation: `dist/` is mutable, and a
+/// published recovery downloads a fresh object. Reading metadata at each
+/// publication boundary makes the ceiling stable across both paths without
+/// hashing or buffering a potentially gigabyte-sized seeded image first.
+fn validate_lean_dmg_on_disk(path: &Path, checkpoint: &str) -> Result<()> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        Error::new(format!(
+            "{checkpoint}: read on-disk DMG metadata {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::new(format!(
+            "{checkpoint}: on-disk DMG is not a regular file: {}",
+            path.display()
+        )));
+    }
+    validate_lean_dmg_size(metadata.len()).map_err(|error| {
+        Error::new(format!(
+            "{checkpoint}: on-disk DMG {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Retain a digest-verified published DMG, then judge the retained file rather
+/// than trusting release metadata or the downloader's prior size observation.
+/// The closure seam keeps the crash-recovery boundary directly testable
+/// without a GitHub release fixture.
+fn recover_lean_dmg_to<F>(destination: &Path, download: F) -> Result<VerifiedReleaseAsset>
+where
+    F: FnOnce(&Path) -> Result<VerifiedReleaseAsset>,
+{
+    let asset = download(destination)?;
+    validate_lean_dmg_on_disk(destination, "published recovery")?;
+    Ok(asset)
+}
 static RELEASE_ASSET_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn validate_release_asset_download_size(size: u64) -> Result<()> {
@@ -6518,6 +6595,7 @@ pub fn ordinary_resume_claim_preflight(
 ) -> Result<()> {
     recovery_resume_worktree_preflight(repo, git, journal)?;
     gates::on_main(git)?;
+    gates::current_cutter_identity_gate(git)?;
 
     git_ok(git, &["fetch", "origin", "main"])
         .map_err(|error| Error::new(format!("cannot refresh origin/main for resume: {error}")))?;
@@ -6651,6 +6729,10 @@ pub fn run_recover_lost(
     let slug = repo_slug(&cargo_text)
         .ok_or_else(|| Error::new("Cargo.toml repository is not an exact GitHub OWNER/REPO URL"))?;
     let git = GitCli::new(repo);
+    // Recovery can rotate the old publisher fence and mutate a live release
+    // without entering the fresh-cut gate ladder. Prove this binary belongs to
+    // the checkout before any such mutation.
+    gates::current_cutter_identity_gate(&git)?;
     assert_origin_repo_binding(&git, &slug)?;
     let journal_path = repo.join("dist/cut-state.toml");
     let journal = Journal::load(&journal_path)?;
@@ -7292,24 +7374,24 @@ fn recover_published_cut(
     let dist = repo.join("dist");
     fs::create_dir_all(&dist)
         .map_err(|error| Error::new(format!("create {}: {error}", dist.display())))?;
-    verify_release_asset_digest_for_release_id_to(
-        slug,
-        release_object.id,
-        &tag,
-        &manifest.dmg,
-        &manifest.sha256,
-        &dist.join(&manifest.dmg),
-    )?;
+    let recovered_dmg = dist.join(&manifest.dmg);
+    recover_lean_dmg_to(&recovered_dmg, |destination| {
+        verify_release_asset_digest_for_release_id_to(
+            slug,
+            release_object.id,
+            &tag,
+            &manifest.dmg,
+            &manifest.sha256,
+            destination,
+        )
+    })?;
     // Regenerate the stable download twins from the digest-verified canonical
     // containers: recovery must leave dist/ able to satisfy
     // required_asset_names(), and each twin is by definition a byte copy of
     // its canonical asset: `aterm.dmg` is a byte copy of manifest.dmg, the ONE
     // DMG (RETIRED 2026-08-26: the lean/seeded split the alias once tracked).
-    fs::copy(
-        dist.join(&manifest.dmg),
-        dist.join(mirror::stable_dmg_asset_name()),
-    )
-    .map_err(|error| Error::new(format!("reconstruct stable dmg twin: {error}")))?;
+    fs::copy(&recovered_dmg, dist.join(mirror::stable_dmg_asset_name()))
+        .map_err(|error| Error::new(format!("reconstruct stable dmg twin: {error}")))?;
     verify_release_asset_digest_for_release_id_to(
         slug,
         release_object.id,
@@ -7660,6 +7742,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         // is the sole opt-out and it is structural — derived from the flags,
         // never readable from the environment.
         offline: !matches!(kind, CutKind::Real),
+        allow_stale_cutter: matches!(kind, CutKind::DryRun),
     };
     let gr = gates::run_all(&git, repo, &gate_opts)?;
     step(
@@ -7706,6 +7789,16 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             None => "public channel source version: not checked (no channel/manifest)".to_string(),
         },
     );
+    // THE L0 OBLIGATIONS ARE MANDATORY. Unlike the deep gate below this is one
+    // short build, and it is the only thing standing between an ungated commit
+    // on main and a release cut from it — see `run_freeze_safety_gate`.
+    run_freeze_safety_gate(repo)?;
+    step(
+        "gate",
+        "L0 freeze-safety gate: 6 obligations GREEN (temporal proof · main-loop · \
+         lock-order · wasm-process · scope-cardinality · lazy-init reentrancy)",
+    );
+
     if opts.gate {
         run_gate_script(repo)?;
     }
@@ -8573,7 +8666,10 @@ fn step_site(ctx: &mut CutCtx) -> Result<()> {
         })?;
     match site_hook_outcome(status.code()) {
         SiteHookOutcome::Synced => {
-            step("site", "alab.systems synced (or deferred with instructions above)");
+            step(
+                "site",
+                "alab.systems synced (or deferred with instructions above)",
+            );
             Ok(())
         }
         SiteHookOutcome::NoSiteCheckout => {
@@ -8633,6 +8729,60 @@ pub(crate) fn regen_release_files(repo: &Path, version: &str, date: &str) -> Res
         .map_err(|e| Error::new(format!("write {}: {e}", changelog::CHANGELOG_FILE)))?;
 
     Ok(vec![changelog::CHANGELOG_FILE.into()])
+}
+
+/// MANDATORY L0 gate: build `tools/freeze-safety-gate`, whose build script runs
+/// all six fail-closed obligations (temporal proof + the main-loop, lock-order,
+/// wasm-process, scope-cardinality and lazy-init-reentrancy censuses) and fails
+/// the compile on any violation.
+///
+/// WHY THIS IS NOT OPT-IN, when `tools/verify.sh --full` deliberately is. Spec
+/// decisions 15/22 make the DEEP gate opt-in, and that is right: it is minutes
+/// long and it is the merge contract's job, not the cutter's. This is a
+/// different thing — one build of one dependency-free crate, MEASURED at 8.71 s
+/// from scratch and ~3.8 s warm (that crate's manifest carries the numbers) —
+/// and it is the only mechanical link between "the census exists" and "what
+/// users run was checked by it".
+///
+/// The gap it closes was walked, not imagined: the merge contract DOES run the
+/// censuses (an unconditional stage, in `--fast`), but nothing ENFORCES that
+/// the contract was run. `.githooks/pre-push` was demoted to advisory on
+/// 2026-08-24 and runs nothing; there is no CI, by owner decision. So a commit
+/// can reach origin/main ungated, and the pre-claim gates — clean tree, on
+/// main, HEAD == origin/main — will happily cut a release from it. That is the
+/// path by which v0.65.0 shipped a self-recursive `OnceLock` that froze the
+/// main thread on the first automatic update apply.
+///
+/// It runs BEFORE the ledger claim, so a failure costs seconds and burns no
+/// build number — the same posture as every other gate in `gates.rs`.
+fn run_freeze_safety_gate(repo: &Path) -> Result<()> {
+    let manifest = repo.join("tools/freeze-safety-gate/Cargo.toml");
+    if !manifest.is_file() {
+        return Err(Error::new(format!(
+            "the L0 freeze-safety gate is missing at {} — a release is not cut without \
+             it; restore the crate rather than deleting this gate",
+            manifest.display()
+        )));
+    }
+    let targo = crate::gates::trust_stage2_bin()?.join("targo");
+    let status = Command::new(&targo)
+        .arg("--unverified")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| Error::new(format!("spawn {}: {e}", targo.display())))?;
+    if !status.success() {
+        return Err(Error::new(
+            "L0 FREEZE-SAFETY GATE FAILED — see the ✗ FAIL [OB-n] diagnostic(s) above. \
+             Nothing was claimed or committed. This gate has no waiver channel: fix the \
+             finding, then cut."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Opt-in deep gate: `tools/verify.sh --full`, streamed (spec decisions 15/22).
@@ -8936,6 +9086,11 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // of the 2 GiB `RELEASE_ASSET_DOWNLOAD_BOUND`; the lean image is ~28 MB,
     // and the check stays because the bound is the client's, not ours.)
     validate_release_asset_download_size(dmg_size)?;
+    // ...and the SHAPE question the bound above cannot answer: a seeded image is
+    // perfectly downloadable and still the wrong artifact. Checked here, on the
+    // bytes just produced, so a stale cutter's output is refused on the cutting
+    // machine rather than discovered on the download page.
+    validate_lean_dmg_size(dmg_size)?;
     // The stable download twins are copied only HERE, after
     // `notarize_and_package` has produced the FINAL container bytes
     // (codesign/staple rewrites included), so each twin is byte-identical to
@@ -9208,7 +9363,7 @@ pub fn selfcheck_signing(
 }
 
 // ---------------------------------------------------------------------------
-// The cut's PAINT SMOKE — ten keystrokes against the just-built bundle
+// The cut's PAINT SMOKE — a 29-key typed line against the just-built bundle
 // (2026-08-24 blackout audit, docs/RELEASE-PROOF-DISCIPLINE.md)
 // ---------------------------------------------------------------------------
 
@@ -9266,7 +9421,18 @@ impl PaintProbe for RealPaintProbe {
         let out = Command::new(&script)
             .arg(bundle_binary)
             .args(["--shape", "fake-claude"])
-            .args(["--keys", "r,a,i,n,b,o,w,space,o,n"])
+            // 29 keys, no spaces: the per-mark traverse spreads the arc over
+            // the mark being typed (clamp floor ~26 cells), so a 10-key take
+            // hovers exactly at the claim's `ribbon_hue_bands >= 4` boundary —
+            // measured claims 0 and 12 across runs of the SAME binary, i.e.
+            // the smoke rode a cliff (0 refuses on the non-vacuity floor).
+            // A mark past the clamp floor claims maturity robustly (42/42
+            // across runs) and audits the design at the length its arc
+            // actually completes.
+            .args([
+                "--keys",
+                "t,h,e,r,a,i,n,b,o,w,k,i,t,t,y,p,a,i,n,t,s,t,h,e,a,r,c,o,k",
+            ])
             // UNPINNED, UNFOCUSED — the only configuration that can catch the
             // failure this smoke exists for. `--capture video` drives
             // `ctl video`, and an in-flight recording PINS `App::motion_focus`
@@ -9279,6 +9445,15 @@ impl PaintProbe for RealPaintProbe {
             // windows never hold it).
             .args(["--capture", "image", "--focus", "out"])
             .args(["--record", "3", "--expect", "ink", "--budget", "25"])
+            // THE BACKEND FENCE, stated rather than inherited. The bundle this
+            // smoke judges ships with the GPU renderer, and
+            // `App::ensure_pixel_backend` used to fall back to CPU SILENTLY —
+            // into a `gui.log` the probe dumps only when the socket never
+            // appears — so a bundle whose GPU backend could not initialize at
+            // all produced a GREEN paint smoke drawn entirely on the CPU, and
+            // the cut proceeded. The probe now makes that a COULD-NOT-RUN,
+            // which the `Some(1 | 2)` arm below already refuses.
+            .args(["--backend", "gpu"])
             .output()
             .map_err(|e| format!("could not spawn {}: {e}", script.display()))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -9382,6 +9557,10 @@ pub fn selfcheck_paint_then_signing(
 /// (binary == plist == manifest == n), DMG digest, codesign, the shared +
 /// vendored-v0.25 manifest proof, and the client-rule monotonic check.
 fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
+    // A resume may skip `step_build`, and dist/ is intentionally mutable. Re-read
+    // the artifact itself before any publication-facing step can trust the
+    // historical packager result journaled by the original process.
+    validate_lean_dmg_on_disk(&ctx.dmg_path(), "self-check")?;
     let app = ctx.app_path();
 
     // Sealed CFBundleVersion == n.
@@ -10775,6 +10954,10 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
         );
         return Ok(());
     }
+    // A journal can resume directly at `mirror`, after every ordinary
+    // self-check is marked complete. Refuse a replaced/legacy seeded dist DMG
+    // before creating or mutating any public-channel object.
+    validate_lean_dmg_on_disk(&ctx.dmg_path(), "mirror preflight")?;
     ensure_ctx_release_lease(ctx)?;
     // THE MIRROR IS A COPY OF THE ORIGIN RELEASE, NOT OF dist/. The roster pair in
     // dist/ is the one file a separate, un-lease-gated ceremony (`atpkg-keys join`,
@@ -10916,7 +11099,10 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
                 // which must read as ours-in-progress, never as foreign.
                 step(
                     "mirror",
-                    &format!("{} on {slug} — resuming this cut's own shared-tag convergence", ctx.tag),
+                    &format!(
+                        "{} on {slug} — resuming this cut's own shared-tag convergence",
+                        ctx.tag
+                    ),
                 );
                 adopted_published = true;
                 release.id
@@ -10939,26 +11125,26 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
                 adopted_published = true;
                 release.id
             } else {
-            prove_mirror_channel_head(ctx, &slug, release.id)?;
-            // AND THE ANONYMOUS PROOF, for the same reason the flip path runs it —
-            // every check above rode the release-org credential. Omitting it here made
-            // the probe bypassable by the one action an operator always takes when it
-            // fails: `step_mirror` PATCHes the release live, the anonymous probe then
-            // fails (mirror still membership-restricted, or the CDN not yet serving
-            // the DMG inside the probe's window), so the step returns Err and the
-            // journal never marks "mirror". The re-run resolves to ConvergePublished,
-            // passes the authenticated head proof, and reports the channel live while
-            // an unauthenticated GET of the DMG still 404s — the silent
-            // never-updates state this probe was added after v0.8.0 to remove.
-            prove_channel_is_anonymously_readable(ctx, &slug)?;
-            step(
-                "mirror",
-                &format!(
-                    "{} already live on {slug} carrying build {} — converged",
-                    ctx.tag, ctx.build
-                ),
-            );
-            return Ok(());
+                prove_mirror_channel_head(ctx, &slug, release.id)?;
+                // AND THE ANONYMOUS PROOF, for the same reason the flip path runs it —
+                // every check above rode the release-org credential. Omitting it here made
+                // the probe bypassable by the one action an operator always takes when it
+                // fails: `step_mirror` PATCHes the release live, the anonymous probe then
+                // fails (mirror still membership-restricted, or the CDN not yet serving
+                // the DMG inside the probe's window), so the step returns Err and the
+                // journal never marks "mirror". The re-run resolves to ConvergePublished,
+                // passes the authenticated head proof, and reports the channel live while
+                // an unauthenticated GET of the DMG still 404s — the silent
+                // never-updates state this probe was added after v0.8.0 to remove.
+                prove_channel_is_anonymously_readable(ctx, &slug)?;
+                step(
+                    "mirror",
+                    &format!(
+                        "{} already live on {slug} carrying build {} — converged",
+                        ctx.tag, ctx.build
+                    ),
+                );
+                return Ok(());
             }
         }
     };
@@ -10973,7 +11159,8 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
         // after every byte it names, or a client arriving mid-mirror elects a
         // head whose assets 404. On the draft path order is irrelevant.
         upload_paths.sort_by_key(|p| {
-            p.file_name().is_some_and(|n| n.to_string_lossy().contains("appcast"))
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("appcast"))
         });
     }
     for file in upload_paths {
@@ -12148,4 +12335,128 @@ sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
     ];
     const ROSTER_SEQ2_SIG: &str =
         "vNOvNYPssbUN3F/SmnoPDk6za2BAaewu9Vopl5YU7EDd+KUM0Y84eUryvFE9OWUywT/yggXE92SYQ2Qz7k56DA==";
+}
+
+#[cfg(test)]
+mod lean_dmg_ceiling_tests {
+    use super::*;
+
+    /// The real figures, so the boundary is pinned to the world rather than to
+    /// a round number someone can drift.
+    const LEAN_0_67_0: u64 = 31_018_076; // the shipped lean image
+    const SEEDED_0_63_0: u64 = 1_067_044_990; // what the stale cutter produced
+
+    fn sparse_dmg(label: &str, size: u64) -> (PrivateTempDir, PathBuf) {
+        let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
+            "aterm-lean-dmg-{label}-{}-{sequence}",
+            std::process::id()
+        )))
+        .expect("create lean-DMG test directory");
+        let path = dir.path().join("aterm-test.dmg");
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .expect("create sparse test DMG");
+        file.set_len(size).expect("set sparse test DMG size");
+        (dir, path)
+    }
+
+    #[test]
+    fn the_lean_image_passes_with_room_to_spare() {
+        assert!(validate_lean_dmg_size(LEAN_0_67_0).is_ok());
+        // ~6x headroom: ordinary growth must never trip this.
+        let measured_size = std::hint::black_box(LEAN_0_67_0);
+        assert!(measured_size * 6 < LEAN_DMG_CEILING_BYTES);
+    }
+
+    /// The whole point: the cut that actually happened is refused, at the
+    /// packaging step, on the cutting machine.
+    #[test]
+    fn the_v0_63_0_image_is_refused_naming_both_figures() {
+        let err =
+            validate_lean_dmg_size(SEEDED_0_63_0).expect_err("a seeded image must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("1.07 GB"), "{msg}");
+        assert!(msg.contains("200 MB"), "{msg}");
+        assert!(msg.contains("seeded image"), "{msg}");
+        assert!(
+            msg.contains("v0.63.0"),
+            "the refusal should say why it exists: {msg}"
+        );
+    }
+
+    /// The client's bound cannot answer this question — which is exactly how
+    /// v0.63.0 passed. Both checks run, and only the new one objects.
+    #[test]
+    fn the_client_bound_accepts_what_the_lean_ceiling_rejects() {
+        assert!(
+            validate_release_asset_download_size(SEEDED_0_63_0).is_ok(),
+            "the 2 GiB client bound accepts a 1.07 GB image — that is the gap"
+        );
+        assert!(validate_lean_dmg_size(SEEDED_0_63_0).is_err());
+    }
+
+    #[test]
+    fn the_boundary_is_inclusive() {
+        assert!(validate_lean_dmg_size(LEAN_DMG_CEILING_BYTES).is_ok());
+        assert!(validate_lean_dmg_size(LEAN_DMG_CEILING_BYTES + 1).is_err());
+        // A zero-byte image is the download bound's business, not this one's.
+        assert!(validate_lean_dmg_size(0).is_ok());
+        assert!(validate_release_asset_download_size(0).is_err());
+    }
+
+    /// A completed `build` journal entry is not authority for mutable dist/.
+    /// This sparse file is cheap, but its metadata is the exact oversized shape
+    /// a resumed `step_selfcheck` must catch before hashing or publication.
+    #[test]
+    fn an_oversized_resumed_dmg_is_refused_from_the_actual_file() {
+        let (_dir, path) = sparse_dmg("resume", LEAN_DMG_CEILING_BYTES + 1);
+        let err = validate_lean_dmg_on_disk(&path, "self-check")
+            .expect_err("resume must re-check the current dist DMG");
+        let message = err.to_string();
+        assert!(message.contains("self-check"), "{message}");
+        assert!(
+            message.contains(&(LEAN_DMG_CEILING_BYTES + 1).to_string()),
+            "the refusal must report the observed on-disk size: {message}"
+        );
+    }
+
+    /// Recovery metadata can be stale or simply describe a release produced by
+    /// the old seeded-image cutter. Even when the downloader reports a tiny
+    /// size, the retained object's real metadata remains the authority.
+    #[test]
+    fn an_oversized_recovered_dmg_is_refused_before_the_mirror_suffix() {
+        let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
+            "aterm-lean-dmg-recovery-{}-{sequence}",
+            std::process::id()
+        )))
+        .expect("create recovered-DMG test directory");
+        let path = dir.path().join("aterm-recovered.dmg");
+        let err = recover_lean_dmg_to(&path, |destination| {
+            let file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(destination)
+                .map_err(|error| Error::new(format!("create recovered test DMG: {error}")))?;
+            file.set_len(LEAN_DMG_CEILING_BYTES + 1)
+                .map_err(|error| Error::new(format!("size recovered test DMG: {error}")))?;
+            Ok(VerifiedReleaseAsset {
+                id: 7,
+                // Deliberately lie: the post-retention filesystem observation,
+                // not this historical/API field, must make the decision.
+                size: 1,
+                sha256: "00".repeat(32),
+            })
+        })
+        .expect_err("recovery must reject the retained seeded image");
+        let message = err.to_string();
+        assert!(message.contains("published recovery"), "{message}");
+        assert!(
+            message.contains(&(LEAN_DMG_CEILING_BYTES + 1).to_string()),
+            "the refusal must report the retained file's size: {message}"
+        );
+    }
 }

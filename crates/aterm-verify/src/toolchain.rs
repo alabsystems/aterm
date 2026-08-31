@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Finding THE toolchain — the Trust stage2 tree, which is what
-//! `rust-toolchain.toml`'s `trust` pin actually resolves to. rustup is not
-//! required and is not the pin's ground truth.
+//! Finding THE toolchain — a SEALED, PROMOTED toolchain directory, which is what
+//! `rust-toolchain.toml`'s `trust` pin actually resolves to. A LIVE BUILD TREE IS
+//! NOT A TOOLCHAIN: `x.py build --stage 2` empties the stage bins and refills
+//! them only at the end, so a discovery order that reaches into `$HOME/trust/build`
+//! first is broken for the entire length of every rebuild. Measured 2026-08-30
+//! mid-rebuild on the dev box: `$HOME/trust/build/host/stage2/bin` held `targo` and
+//! `targo-trust` — no `trustc`, and no sibling `lib/` at all. The build tree stays
+//! reachable, explicitly, and LAST.
 //!
 //! Three rules carried over from the script, all load-bearing:
 //!
@@ -88,21 +93,57 @@ fn is_upstream_channel(channel: &str) -> bool {
 ///
 /// A non-upstream channel is a fork with BRANDED drivers, and Trust brands its
 /// rustc `trustc` — `<channel>c` — beside the `targo` this directory was
-/// selected for. Measured 2026-08-22 in the linked `trust` sysroot: `bin/` holds
-/// `targo targo-fmt targo-tippy tippy tippy-driver trustc trustdoc trustfmt`,
-/// and holds NO `cargo-clippy` or `cargo-fmt` at all. A stock rust install is
-/// the mirror image, which is what makes the pairing decisive.
+/// selected for. Measured 2026-08-30 in `~/toolchains/trust-current/bin`:
+/// `ay cargo clean rustc rustdoc targo targo-fmt targo-tippy targo-trust tippy
+/// tippy-driver trust-analyzer trustc trustd trustdoc trustfmt ty`. A stock rust
+/// install ships no branded driver at all, which is what makes the pairing
+/// decisive.
+///
+/// AND THE DRIVER MUST ANSWER FOR ITSELF. Presence of the file was the whole
+/// check until 2026-08-30, and three things got past it, all of them live:
+///
+///  * a MID-REBUILD stage tree still holding the previous run's `trustc` while
+///    the rest of the tree is half-written;
+///  * a bin directory with NO SYSROOT — a driver compiles nothing without
+///    `lib/rustlib`, and the measured stage2 above had `bin` and no `lib`;
+///  * ANY EXECUTABLE NAMED `trust`, which the second arm accepted on name alone.
+///
+/// So the candidate is asked `--print sysroot`, in the one dialect only a
+/// rustc-family driver speaks, and the answer must name a real directory
+/// carrying `lib/rustlib`. An EXIT CODE would not have been enough: a zero-byte
+/// file with the execute bit set runs as an empty shell script and exits 0
+/// (measured), so `--version` "succeeds" on a truncated driver. Demanding output
+/// that must resolve to a directory is what makes the question decisive.
 ///
 /// `None` means the repo declares no pin: pass through, unchanged behaviour.
 fn is_pinned_toolchain(dir: &Path, pinned: Option<&str>) -> bool {
-    match pinned {
-        None => true,
-        Some(channel) if is_upstream_channel(channel) => true,
-        Some(channel) => {
-            is_executable_file(&dir.join(format!("{channel}c")))
-                || is_executable_file(&dir.join(channel))
-        }
+    let channel = match pinned {
+        None => return true,
+        Some(channel) if is_upstream_channel(channel) => return true,
+        Some(channel) => channel,
+    };
+    let Some(driver) = [format!("{channel}c"), channel.to_string()]
+        .into_iter()
+        .map(|n| dir.join(n))
+        .find(|p| is_executable_file(p))
+    else {
+        return false;
+    };
+    let Ok(out) = std::process::Command::new(&driver)
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
     }
+    let Ok(sysroot) = String::from_utf8(out.stdout) else {
+        return false;
+    };
+    let sysroot = sysroot.trim();
+    !sysroot.is_empty() && Path::new(sysroot).join("lib/rustlib").is_dir()
 }
 
 /// The `bin` of the sysroot `rustc` resolves to under `path_env`.
@@ -155,8 +196,20 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    /// `$TRUST_STAGE2_BIN`, defaulting to `$HOME/trust/build/host/stage2/bin`,
-    /// canonicalised when it exists.
+    /// `$TRUST_STAGE2_BIN`, else the first PROMOTED toolchain under `home` that
+    /// satisfies the pin, canonicalised when it exists.
+    ///
+    /// SEALED FIRST, BUILD TREE LAST. The default used to be
+    /// `$HOME/trust/build/host/stage2/bin` outright — a live build tree, checked
+    /// before anything finished. See the module header for why that is broken for
+    /// the whole length of every rebuild. The order is now
+    /// `~/toolchains/<channel>-current/bin` (the sealed promote target, moved
+    /// atomically by `trust/scripts/promote-toolchain.sh` and nothing else), then
+    /// `~/.rustup/toolchains/<channel>/bin` (the rustup link — the same directory
+    /// today, but an independent spelling that survives a layout change on either
+    /// side), then the stage2 tree. A candidate must carry a `targo` AND be the
+    /// pin to win; when none does, the stage2 path stays as the reported location
+    /// so the "no targo" diagnosis keeps naming a place the reader recognises.
     ///
     /// GOLDEN-PATH FALLBACK: when the DEFAULT stage2 tree carries no targo and
     /// no explicit `$TRUST_STAGE2_BIN` named one, the drivers are looked up on
@@ -179,8 +232,19 @@ impl Toolchain {
         pinned: Option<&str>,
     ) -> Self {
         let explicit = stage2_bin.is_some();
+        let stage2_tree = home.join("trust/build/host/stage2/bin");
         let declared = stage2_bin.map_or_else(
-            || home.join("trust/build/host/stage2/bin"),
+            || {
+                let channel = pinned.unwrap_or("trust");
+                [
+                    home.join(format!("toolchains/{channel}-current/bin")),
+                    home.join(format!(".rustup/toolchains/{channel}/bin")),
+                    stage2_tree.clone(),
+                ]
+                .into_iter()
+                .find(|d| is_executable_file(&d.join("targo")) && is_pinned_toolchain(d, pinned))
+                .unwrap_or_else(|| stage2_tree.clone())
+            },
             Path::to_path_buf,
         );
         let mut tool_dir = if declared.is_dir() {
@@ -338,8 +402,28 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    /// A stub that answers `--print sysroot` like a real driver, with the
+    /// `lib/rustlib` that makes the answer credible. `exec_stub` alone is now a
+    /// TRUNCATED driver as far as [`is_pinned_toolchain`] is concerned — which is
+    /// the point of the strengthening, and why the pin tests use this instead.
+    /// The sysroot is `<bin>/..`, the real layout.
+    fn driver_stub(path: &Path) {
+        let sysroot = path.parent().expect("bin dir").parent().expect("sysroot");
+        fs::create_dir_all(sysroot.join("lib/rustlib")).expect("mkdir rustlib");
+        fs::write(
+            path,
+            format!("#!/bin/sh\necho '{}'\n", sysroot.display()).as_bytes(),
+        )
+        .expect("write");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
     #[test]
-    fn the_default_location_is_the_stage2_tree_under_home() {
+    fn the_reported_location_when_nothing_resolves_is_the_stage2_tree_under_home() {
+        // Not a statement about PREFERENCE — the sealed toolchain is preferred,
+        // see `the_sealed_toolchain_is_preferred_over_the_live_build_tree`. This
+        // pins what the gate REPORTS when no candidate exists at all: the stage2
+        // path, because that is the place the "no targo" remedy talks about.
         let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""), None);
         assert_eq!(
             t.targo,
@@ -449,10 +533,12 @@ mod tests {
         // driver beside it the gate would run a different frontend under the
         // pinned one's name and still print the merge-contract sentence.
         let tmp = crate::mktemp_dir("atv-pin").expect("mktemp");
-        exec_stub(&tmp.join("targo"));
+        let bin = tmp.join("bin");
+        fs::create_dir_all(&bin).expect("mkdir");
+        exec_stub(&bin.join("targo"));
 
         let t = Toolchain::discover(
-            Some(&tmp),
+            Some(&bin),
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
@@ -464,10 +550,27 @@ mod tests {
         assert!(label.contains("rustup toolchain link"), "{label}");
         assert!(label.contains("$HOME/.cargo/bin:$PATH"), "{label}");
 
-        // The branded rustc beside it is what makes the directory the pin.
-        exec_stub(&tmp.join("trustc"));
+        // A `trustc` that is PRESENT but cannot answer for itself is the
+        // mid-rebuild stage tree, and it must still be refused: `x.py build
+        // --stage 2` leaves exactly this shape behind while it runs.
+        exec_stub(&bin.join("trustc"));
         let t = Toolchain::discover(
-            Some(&tmp),
+            Some(&bin),
+            Path::new("/unused"),
+            OsStr::new(""),
+            Some("trust"),
+        );
+        assert!(
+            !t.have_targo(),
+            "a driver that names no sysroot is not the pin (mid-rebuild stage tree)"
+        );
+        assert!(t.refused.is_some());
+
+        // The branded rustc beside it, ANSWERING with a real sysroot, is what
+        // makes the directory the pin.
+        driver_stub(&bin.join("trustc"));
+        let t = Toolchain::discover(
+            Some(&bin),
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
@@ -477,15 +580,52 @@ mod tests {
 
         // An UPSTREAM channel ships no branded driver, so it passes through —
         // the check must not invent a `stablec` nobody has.
-        fs::remove_file(tmp.join("trustc")).expect("rm");
+        fs::remove_file(bin.join("trustc")).expect("rm");
         let t = Toolchain::discover(
-            Some(&tmp),
+            Some(&bin),
             Path::new("/unused"),
             OsStr::new(""),
             Some("stable"),
         );
         assert!(t.have_targo(), "upstream channels are a passthrough");
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn the_sealed_toolchain_is_preferred_over_the_live_build_tree() {
+        // THE ITEM 2 REGRESSION NET. Both directories are the pin; the sealed one
+        // must win, because the build tree is empty for the whole length of every
+        // `x.py build --stage 2` and a gate that prefers it is dead while a
+        // rebuild runs.
+        let home = crate::mktemp_dir("atv-order").expect("mktemp");
+        let sealed = home.join("toolchains/trust-current/bin");
+        let tree = home.join("trust/build/host/stage2/bin");
+        for d in [&sealed, &tree] {
+            fs::create_dir_all(d).expect("mkdir");
+            exec_stub(&d.join("targo"));
+            driver_stub(&d.join("trustc"));
+        }
+
+        let t = Toolchain::discover(None, &home, OsStr::new(""), Some("trust"));
+        assert!(t.have_targo());
+        assert_eq!(
+            t.stage2_dir,
+            fs::canonicalize(&sealed).expect("canonicalize")
+        );
+
+        // With the sealed one gone, the build tree is still reachable — the
+        // fallback is explicit, not deleted.
+        fs::remove_dir_all(home.join("toolchains")).expect("rm");
+        let t = Toolchain::discover(None, &home, OsStr::new(""), Some("trust"));
+        assert!(t.have_targo());
+        assert_eq!(t.stage2_dir, fs::canonicalize(&tree).expect("canonicalize"));
+
+        // And a build tree that is MID-REBUILD (targo relinked, no answering
+        // driver) fails closed rather than becoming the gate's compiler.
+        fs::remove_file(tree.join("trustc")).expect("rm");
+        let t = Toolchain::discover(None, &home, OsStr::new(""), Some("trust"));
+        assert!(!t.have_targo(), "fail-closed on a half-built stage2");
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -499,7 +639,7 @@ mod tests {
         fs::create_dir_all(&real).expect("mkdir");
         exec_stub(&impostor.join("targo"));
         exec_stub(&real.join("targo"));
-        exec_stub(&real.join("trustc"));
+        driver_stub(&real.join("trustc"));
         let path = format!("{}:{}", impostor.display(), real.display());
 
         let t = Toolchain::discover(

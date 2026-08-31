@@ -659,14 +659,11 @@ impl EffectsPipeline {
             // The ribbon's presentation is a SPELLING of the style (like the pet
             // companions), so it re-derives from the raw string on every
             // reconfigure, by the same law the native resolver uses
-            // (`app_config`): the four explicit `… tall` spellings opt into the
-            // v0.43 full-height shoulder, and everything else — which is every
-            // ordinary rainbow spelling — gets the default
-            // highlighter-plus-under-baseline mark.
-            // The tall body is the DEFAULT again (owner, 2026-08-29: "WHERE
-            // IS MY TALL RIBBON") — only an explicit `… underline` spelling
-            // selects the highlighter. Matches `app_config`'s resolver; this
-            // embedder twin was the one site the ruling's sweep missed.
+            // (`app_config`): the v0.43 full-height shoulder is the default for
+            // every ordinary rainbow spelling (including explicit `… tall`
+            // aliases). Only an explicit `… underline` alias selects the
+            // highlighter-plus-under-baseline alternate. Keep this embedder
+            // twin aligned with the native resolver.
             ribbon_tall: !crate::cursor_glow::GlowStyle::style_names_underline_ribbon(style),
             // CARRIED FORWARD, not reset — the same discipline `pack` and
             // `wake_persist_s` follow below. A reconfigure between two frames
@@ -2188,6 +2185,35 @@ mod tests {
             assert_eq!(
                 content_scroll_decision(Some(baseline), invalid),
                 ContentScrollDecision::Invalidate
+            );
+        }
+    }
+
+    #[test]
+    fn web_pipeline_resolves_default_tall_and_explicit_underline() {
+        let mut pipeline = EffectsPipeline::new();
+        for (style, expected_tall) in [
+            ("rainbow kitty", true),
+            ("rainbow kitty pet", true),
+            ("rainbow kitty flying", true),
+            ("rainbow kitty tall", true),
+            ("rainbow kitty underline", false),
+        ] {
+            pipeline.set_cursor_glow(
+                true,
+                style,
+                None,
+                None,
+                400,
+                24,
+                1.0,
+                0.9,
+                true,
+                0x0050_FA7B,
+            );
+            assert_eq!(
+                pipeline.glow_cfg.ribbon_tall, expected_tall,
+                "web/WASM resolver chose the wrong presentation for {style:?}"
             );
         }
     }

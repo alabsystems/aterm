@@ -32,5 +32,17 @@ aterm-uds = { workspace = true }
 aterm-digest = { workspace = true }
 rustls = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Readiness wait for the non-blocking network-drive listener. `libc` is already
+# present in every native aterm binary; this adds no package to that graph.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# `WSAPoll` is Winsock's readiness primitive. `windows-sys` 0.61 is already in
+# the Windows graph; this only enables the narrow WinSock binding surface.
+windows-sys = { version = "0.61", default-features = false, features = [
+  "Win32_Networking_WinSock",
+] }
+
 [dev-dependencies]
 aterm-spec = { workspace = true }

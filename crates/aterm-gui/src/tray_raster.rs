@@ -24,6 +24,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use aterm_grapheme::GraphemeClusters;
+// THE chrome's face type. `aterm_render::font::Font` is the workspace's
+// first-party face — the one that retired `fontdue` — and the tray draws
+// through the SAME parsed faces the terminal renderer does, so it takes no
+// font dependency of its own. Aliased because the chrome names it in ~15
+// signatures and the full path buries them.
+use aterm_render::font::{Font as ChromeFont, Metrics as ChromeMetrics};
 
 /// Serialize the rare heavyweight Unicode-font warmups. Hot reload can replace
 /// a pending semantic fork; its dropped receiver prevents stale installation,
@@ -388,7 +394,7 @@ struct ChromeFace {
     /// DejaVu the default renderer parses, so every chrome face here was a
     /// byte-identical second copy of a face the process already held
     /// (~6.9 MB of live heap each). See `aterm_render::shared_parsed_face`.
-    font: std::sync::Arc<fontdue::Font>,
+    font: std::sync::Arc<ChromeFont>,
     /// Cap height as a fraction of the em (drives [`row_baseline`]).
     cap_ratio: f32,
     /// Memoized advance-per-em by char (advances scale linearly with px).
@@ -437,8 +443,8 @@ struct ChromeFonts {
     /// Host-prepared proportional UI faces. These immutable parsed assets are
     /// installed by `set_chrome_fonts`; measure/compile/raster never probe a
     /// platform path or initialize a font lazily.
-    ui_regular: Option<Arc<fontdue::Font>>,
-    ui_semibold: Option<Arc<fontdue::Font>>,
+    ui_regular: Option<Arc<ChromeFont>>,
+    ui_semibold: Option<Arc<ChromeFont>>,
     /// An exact owned fork of the live renderer's font engine. It is prepared
     /// off the UI/raster thread because a first CJK face can cost hundreds of
     /// milliseconds and hundreds of MB to parse; parsed fallbacks themselves
@@ -863,7 +869,7 @@ pub(crate) enum ChromeFacePick {
 }
 
 impl ChromeFonts {
-    fn ui_font(&self, face: TextFace) -> Option<&Arc<fontdue::Font>> {
+    fn ui_font(&self, face: TextFace) -> Option<&Arc<ChromeFont>> {
         if face == TextFace::UiBold {
             self.ui_semibold.as_ref().or(self.ui_regular.as_ref())
         } else {
@@ -1155,7 +1161,7 @@ thread_local! {
     /// `(candidate, snapshot.ready_epoch)`.
     ///
     /// A fork is NOT cheap: `Renderer::fork_semantic_surface` re-parses the
-    /// whole primary face (`fontdue::Font::from_bytes`, again for the real bold
+    /// whole primary face ([`ChromeFont::from_bytes`], again for the real bold
     /// sibling) plus its metric/feature tables. [`prepare_semantic_font`] runs
     /// on EVERY native compile and every preview tick while a Settings page is
     /// front, so an animating preview paid two full font parses per frame for a
@@ -1271,8 +1277,8 @@ pub(crate) fn baseline_centered_at(cy: f32, size: f32) -> f32 {
 /// back to the closest real face in the terminal stack.
 #[derive(Clone, Default)]
 struct UiFontAssets {
-    regular: Option<Arc<fontdue::Font>>,
-    semibold: Option<Arc<fontdue::Font>>,
+    regular: Option<Arc<ChromeFont>>,
+    semibold: Option<Arc<ChromeFont>>,
     /// T3, the FULL cut for one caller: when the regular is a VARIABLE face
     /// with a `wght` axis (Segoe UI Variable on Win11), its raw bytes and the
     /// resolved semibold coords, so a pixel-space painter can instance the
@@ -1303,7 +1309,7 @@ pub(crate) struct UiVariableSemibold {
     /// The SAME regular face parsed from `bytes`: its cmap resolves glyph ids
     /// for the varied raster (identical glyph numbering — one file), and its
     /// `kern` pairs are the static kerning a weight instance shares.
-    pub(crate) cmap: Arc<fontdue::Font>,
+    pub(crate) cmap: Arc<ChromeFont>,
 }
 
 /// The CSS/OpenType weight the chrome's `UiBold` stands for (Fluent's
@@ -1317,9 +1323,9 @@ const UI_SEMIBOLD_WGHT: f32 = 600.0;
 /// would hand `UiBold` a look-alike — the exact contrast loss the "never pair
 /// SegUIVar with itself" rule guards against, in another coat).
 fn variable_semibold_of(
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     index: u32,
-    regular: &Arc<fontdue::Font>,
+    regular: &Arc<ChromeFont>,
 ) -> Option<UiVariableSemibold> {
     use aterm_render::variation::{REGULAR_WGHT, WGHT_TAG, clamp_axis, probe};
     let probe = probe(&bytes, index)?;
@@ -1329,7 +1335,7 @@ fn variable_semibold_of(
         return None;
     }
     Some(UiVariableSemibold {
-        bytes: bytes.into(),
+        bytes,
         index,
         coords: vec![(WGHT_TAG, weight)],
         cmap: Arc::clone(regular),
@@ -1474,15 +1480,21 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
 }
 
 /// Parse one UI face; the file bytes ride back beside it so the resolver can
-/// keep them for a variable face ([`variable_semibold_of`]) — fontdue copies
-/// what it parses and does not retain the buffer, so this is the only handle.
-fn parse_ui_font(path: &std::path::Path, index: u32) -> Option<(Arc<fontdue::Font>, Vec<u8>)> {
-    let bytes = std::fs::read(path).ok()?;
-    let font = fontdue::Font::from_bytes(
-        &bytes[..],
-        fontdue::FontSettings {
+/// keep them for a variable face ([`variable_semibold_of`]), which re-parses
+/// them through `ttf-parser` to instance a `wght` axis the face type itself
+/// does not expose.
+///
+/// ONE copy of the file, shared three ways — the handle returned here, the
+/// parsed face (which reads outlines on demand and so holds the file), and the
+/// [`UiVariableSemibold`] the resolver may build from it. It read into a `Vec`
+/// and then made two more copies before `fontdue` was retired, which was
+/// invisible while the parsed face kept no bytes at all.
+fn parse_ui_font(path: &std::path::Path, index: u32) -> Option<(Arc<ChromeFont>, Arc<[u8]>)> {
+    let bytes: Arc<[u8]> = std::fs::read(path).ok()?.into();
+    let font = ChromeFont::from_shared_slice(
+        Arc::clone(&bytes),
+        aterm_render::font::FontSettings {
             collection_index: index,
-            ..fontdue::FontSettings::default()
         },
     )
     .ok()?;
@@ -1499,7 +1511,7 @@ static UI_FONT_RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 =
 fn resolve_ui_font_assets() -> UiFontAssets {
     #[cfg(test)]
     UI_FONT_RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut first_regular: Option<(Arc<fontdue::Font>, Vec<u8>, u32)> = None;
+    let mut first_regular: Option<(Arc<ChromeFont>, Arc<[u8]>, u32)> = None;
     for candidate in ui_font_candidates() {
         let regular = parse_ui_font(&candidate.regular_path, candidate.regular_index);
         let semibold = parse_ui_font(&candidate.semibold_path, candidate.semibold_index);
@@ -1869,7 +1881,7 @@ fn linear_to_srgb_u8(l: f32) -> u8 {
 /// A straight-alpha RGBA8 canvas with src-over compositing in LINEAR LIGHT (the
 /// gamma-correct blend the main glyph path uses), plus a device-px clip stack.
 type GlyphCacheKey = (usize, u32, char);
-type GlyphCacheEntry = (fontdue::Metrics, std::sync::Arc<[u8]>);
+type GlyphCacheEntry = (ChromeMetrics, std::sync::Arc<[u8]>);
 
 struct Canvas {
     /// Device-pixel origin of this retained tile in the full tray. Raster math
@@ -1953,15 +1965,11 @@ impl Canvas {
 
     fn raster_glyph(
         &mut self,
-        font: &fontdue::Font,
+        font: &ChromeFont,
         character: char,
         px: f32,
-    ) -> (fontdue::Metrics, std::sync::Arc<[u8]>) {
-        let key = (
-            font as *const fontdue::Font as usize,
-            px.to_bits(),
-            character,
-        );
+    ) -> (ChromeMetrics, std::sync::Arc<[u8]>) {
+        let key = (font as *const ChromeFont as usize, px.to_bits(), character);
         if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
             return (*metrics, std::sync::Arc::clone(bitmap));
         }
@@ -2744,7 +2752,7 @@ impl Canvas {
         &mut self,
         pen: f32,
         baseline: f32,
-        metrics: &fontdue::Metrics,
+        metrics: &ChromeMetrics,
         bitmap: &[u8],
         color: [u8; 4],
     ) {
@@ -3339,19 +3347,30 @@ mod tests {
         let debian_bold = std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf");
         if debian_regular.exists() && debian_bold.exists() {
             let assets = resolve_ui_font_assets();
-            let regular = assets.regular.expect("Noto regular resolves");
             assert!(
-                regular.name().is_some_and(|name| name.contains("Noto")),
-                "regular face is Noto: {:?}",
-                regular.name()
+                assets.regular.is_some(),
+                "Noto regular resolves on a host carrying the Debian core cuts"
             );
-            let semibold = assets
-                .semibold
-                .expect("a heavier companion resolves beside the regular");
             assert!(
-                semibold.name().is_some_and(|name| name.contains("Noto")),
-                "the UiBold face stays in the Noto family: {:?}",
-                semibold.name()
+                assets.semibold.is_some(),
+                "a heavier companion resolves beside the regular"
+            );
+            // WHICH family those two faces came from is asserted through the
+            // CANDIDATE LADDER above, not through the loaded faces: a parsed
+            // face is addressed by glyph id and metrics here, and the crate
+            // deliberately exposes no family name to interrogate it by. The
+            // ladder is the thing that decides Noto over DejaVu, so it is also
+            // the honest place to pin that decision.
+            let first_complete = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.regular_path.exists() && candidate.semibold_path.exists()
+                })
+                .expect("some pair resolves on a host with fonts installed");
+            assert!(
+                file(&first_complete.regular_path).contains("noto"),
+                "the first complete pair is Noto, never the DejaVu fallback: {:?}",
+                first_complete.regular_path
             );
         }
     }
@@ -4231,9 +4250,9 @@ mod tests {
 
     #[test]
     fn glyph_rasterization_is_memoized_for_one_retained_surface() {
-        let font = fontdue::Font::from_bytes(
+        let font = ChromeFont::from_bytes(
             aterm_render::embedded_font(),
-            fontdue::FontSettings::default(),
+            aterm_render::font::FontSettings::default(),
         )
         .expect("embedded font parses");
         let mut canvas = Canvas::new(1, 1, [0, 0, 0, 0]);

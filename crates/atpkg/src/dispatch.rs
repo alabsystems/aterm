@@ -17,9 +17,11 @@
 //!
 //! The design deliberately does **not** apply every member the same way (§16.4): a CLI
 //! tool flips immediately (a `bin/` shim), `trust`/`trust-mc` need a sysroot relocation
-//! (§10.1), and `aterm.app` itself is **not** a tarball at all — it is a notarized DMG
-//! staged for the self-swap on next launch (the two-anchor gate, §16.2/§16.4), never the
-//! immediate shim flip. A VENDOR's `.app` (Emacs from its DMG) is a different thing again:
+//! (§10.1), and `aterm.app` itself is **not** a tarball at all — it is a notarized DMG the
+//! app's own updater applies IN-SESSION by the overlap handoff (a successor is spawned and
+//! every PTY is handed across; the cold-launch swap is only the fallback), never the
+//! immediate shim flip — atpkg refuses it closed (the two-anchor gate, §16.2/§16.4). A
+//! VENDOR's `.app` (Emacs from its DMG) is a different thing again:
 //! it lands in the store and is shimmed through its `links`, and it must never be confused
 //! with the self-update topology — so it gets its own variant. [`strategy_for`] is that
 //! pure mapping; an unknown pair is **fail-closed** ([`Unknown`]) so a member the client
@@ -40,18 +42,20 @@ pub enum ApplyStrategy {
     /// toolchain link to its resolved toolchain, gated
     /// on the four-component nightly being installed (§10.1). Its `exposes` still shim.
     SysrootBundle,
-    /// The `aterm.app` DMG: NOT extracted as a tarball — staged for the **notarized
-    /// self-swap on next launch** (`renamex_np(RENAME_SWAP)` + re-exec), AND-gated by the
-    /// two anchors (notarization + the signed-index sha256), never the immediate flip
-    /// (§16.2/§16.4). A different apply *topology*, dispatched here so it can never be
-    /// symlink-flipped like a tool. `app-bundle` over `github-release` ONLY.
+    /// The `aterm.app` DMG: NOT extracted as a tarball — applied **in-session by the app's
+    /// own updater** (the seamless overlap handoff in aterm-gui; `renamex_np(RENAME_SWAP)`
+    /// lives in aterm-update, never here), AND-gated by the two anchors (notarization + the
+    /// signed-index sha256), never the immediate flip (§16.2/§16.4). A different apply
+    /// *topology*, dispatched here so it can never be symlink-flipped like a tool — atpkg's
+    /// role is to REFUSE it closed and defer, not to stage or swap. `app-bundle` over
+    /// `github-release` ONLY.
     AppBundle,
     /// A VENDOR's `.app` (`app-bundle` over `https`, `payload = "dmg"`): the single
     /// `.app` at the image root is copied into the store with its mode bits preserved and
     /// exposed through the row's `links` — i.e. it activates like [`Shim`], through the
     /// ordinary `bin/` flip. A DISTINCT variant so the self-update
     /// [`AppBundle`](ApplyStrategy::AppBundle) gate is never taken for a vendor app, and
-    /// a vendor app is never mistaken for the aterm self-swap.
+    /// a vendor app is never mistaken for the aterm self-update.
     ///
     /// [`Shim`]: ApplyStrategy::Shim
     VendorApp,
@@ -151,8 +155,9 @@ mod tests {
     }
 
     /// The vendor `.app` and the aterm self-update are DIFFERENT strategies: the former
-    /// lands in the store and shims, the latter is the two-anchor self-swap. Neither may
-    /// ever be taken for the other, and neither is a plain Shim.
+    /// lands in the store and shims, the latter is the two-anchor gate that defers to the
+    /// app's own in-session updater. Neither may ever be taken for the other, and neither
+    /// is a plain Shim.
     #[test]
     fn a_vendor_app_is_not_the_self_update_app_bundle() {
         assert_ne!(

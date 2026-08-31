@@ -139,7 +139,8 @@ pub(crate) struct PaletteRow {
     pub section: Cow<'static, str>,
     /// The command label, exactly as the native menu item reads. `Cow` because ONE row is
     /// dynamic: the Version section's ApplyUpdate row carries the LIVE staged/realized
-    /// version ("↑ Update to v0.26 — restart now"), rewritten by [`PaletteState::resolve`];
+    /// version ("↑ Update to v0.26 — apply now, shells keep running"), rewritten by
+    /// [`PaletteState::resolve`];
     /// every other row keeps its static model label.
     pub label: Cow<'static, str>,
     /// The command this row dispatches. Menu and native authority never alias.
@@ -216,10 +217,11 @@ pub(crate) struct PaletteLive {
     /// disabled where `menu::choose_local_file` cannot produce a path.
     pub local_file_picker_available: bool,
     /// A strictly-newer `(build, version)` is STAGED (the `App.relaunch` nudge): the
-    /// Version section shows the one-click "↑ Update to v<staged> — restart now" row.
+    /// Version section shows the one-click "↑ Update to v<staged> — apply now, shells
+    /// keep running" row.
     pub staged: Option<(u64, String)>,
     /// The apply lane's STANDING failure for that staged build, when there is one
-    /// (`App::apply_trouble_for`). It replaces the row's "restart now" tail with the
+    /// (`App::apply_trouble_for`). It replaces the row's "apply now" tail with the
     /// attempt count, the cause in human words, and whether the automatic lane is
     /// still going to try — the palette twin of the Version menu's row, kept in
     /// lockstep by construction because both render the same value through
@@ -391,8 +393,8 @@ impl PaletteState {
     /// The Version section's ApplyUpdate row is additionally DYNAMIC — the one place the
     /// palette diverges from the static model, mirroring the live macOS Version menu
     /// (`menu::update_version_menu`):
-    ///   * STAGED: "↑ Update to v<staged> — restart now" — ONE Enter applies (the
-    ///     owner's "click-upgrade" ask);
+    ///   * STAGED: "↑ Update to v<staged> — apply now, shells keep running" — ONE Enter
+    ///     applies in place (the owner's "click-upgrade" ask);
     ///   * REALIZED (fresh post-update): the TIME-FADED "↑ Updated to v<new>" arrow
     ///     (activating it takes ApplyUpdate's nothing-staged fallback: the details
     ///     overlay — informative, never a blind restart);
@@ -562,7 +564,7 @@ impl PaletteState {
             return 1.0;
         }
         let Some(since) = self.realized_since else {
-            return 1.0; // the staged "restart now" row never fades
+            return 1.0; // the staged "apply now" row never fades
         };
         if self.realized_frozen {
             return 1.0;
@@ -2074,7 +2076,8 @@ mod tests {
     }
 
     /// STAGED (complaint 2, "click-upgrade"): resolve adds the one-click
-    /// "↑ Update to v<staged> — restart now" row at the HEAD of the Version section,
+    /// "↑ Update to v<staged> — apply now, shells keep running" row at the HEAD of the
+    /// Version section,
     /// enabled, full-alpha, and activatable straight to `ApplyUpdate`.
     #[test]
     fn resolve_staged_adds_one_click_update_row() {
@@ -2095,14 +2098,18 @@ mod tests {
             .expect("staged resolve keeps the ApplyUpdate row");
         let row = &s.rows[i];
         assert_eq!(row.section, "Version");
-        assert_eq!(row.label, "\u{2191} Update to v9.9 \u{2014} restart now");
+        assert_eq!(
+            row.label,
+            "\u{2191} Update to v9.9 \u{2014} apply now, shells keep running"
+        );
+        assert!(!row.label.contains("restart"), "{}", row.label);
         assert!(row.enabled, "one click must work");
         // It sits directly BEFORE the About row (head of the Version section).
         assert_eq!(s.rows[i + 1].action, MenuAction::Version);
         // The staged row never fades (it is not the realized arrow).
         assert_eq!(s.row_alpha(&s.rows[i], Instant::now()), 1.0);
         // Filtering to it and pressing Enter dispatches ApplyUpdate.
-        for c in "restart now".chars() {
+        for c in "apply now".chars() {
             s.push_char(c);
         }
         assert_eq!(s.selected_action(), Some(MenuAction::ApplyUpdate));

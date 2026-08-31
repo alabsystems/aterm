@@ -197,6 +197,21 @@ pub(super) struct TransientState {
     /// OSC 133 shell mark. Distinct from `response_buffer` (PTY replies); drained
     /// like `take_response()`. Capped in `queue_osc_event`. Cleared on reset.
     pub(super) osc_events: VecDeque<(u32, String)>,
+    /// Where the most recent PTY PRINT run ended — the active-grid cursor
+    /// `(row, col)` sampled immediately after each parser print action
+    /// (`print` / `print_ascii_bulk` / `print_unicode_bulk`). This is the
+    /// ECHO ANCHOR the cursor-effect host samples (`Terminal::print_anchor`):
+    /// a TUI whose repaint bracket hides or parks the DEC cursor still ends
+    /// each keystroke's whole-row rewrite exactly `typed cells` past the
+    /// previous rewrite's end, so end-to-end is the echo sweep the hidden
+    /// cursor cannot witness. Observability only — never read by any parser
+    /// or grid decision. Cleared on reset.
+    pub(super) print_anchor: Option<(u16, u16)>,
+    /// Monotonic count of print actions, paired with [`Self::print_anchor`]
+    /// so an unchanged end position still reads as "output landed". Never
+    /// reset to zero (a host compares equality against its last-seen value,
+    /// and a reset that replayed an old seq could alias a stale sample).
+    pub(super) print_anchor_seq: u64,
 }
 
 impl TransientState {
@@ -236,6 +251,8 @@ impl TransientState {
             kitty_pending: None,
             bell_pending: false,
             osc_events: VecDeque::new(),
+            print_anchor: None,
+            print_anchor_seq: 0,
         }
     }
 
@@ -273,6 +290,9 @@ impl TransientState {
         self.last_osc_bel_terminated = false;
         self.bell_pending = false;
         self.osc_events.clear();
+        // The echo anchor names a pre-reset coordinate space; the seq is
+        // deliberately NOT rezeroed (see its field doc).
+        self.print_anchor = None;
         // RIS clears the Kitty graphics store (matching kitty/xterm and the
         // `a=d` delete-all path); the global byte budget must drop in lockstep
         // so it cannot drift from the now-empty store and wrongly reject a later

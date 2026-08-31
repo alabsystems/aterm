@@ -146,16 +146,160 @@ enum NativeDocumentJob {
     },
 }
 
-fn native_document_queue() -> Result<&'static std::sync::mpsc::Sender<NativeDocumentJob>, String> {
-    static QUEUE: std::sync::OnceLock<Result<std::sync::mpsc::Sender<NativeDocumentJob>, String>> =
-        std::sync::OnceLock::new();
+impl NativeDocumentJob {
+    fn proxy(&self) -> &winit::event_loop::EventLoopProxy<crate::Wake> {
+        match self {
+            Self::Save { proxy, .. }
+            | Self::JournalAppend { proxy, .. }
+            | Self::JournalRewrite { proxy, .. } => proxy,
+        }
+    }
+}
+
+/// Jobs can retain a complete 32 MiB document image. The channel holds at most
+/// four waiting jobs and the single disk worker owns at most one executing job:
+/// five retained full images total. Journal saturation retains only a coalesced
+/// document ID and replans from the reducer after a slot-release wake, so the UI
+/// neither blocks nor grows another queue of encoded images.
+const NATIVE_DOCUMENT_QUEUE_CAPACITY: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentQueueAdmissionError {
+    Saturated,
+    WorkerStopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalDriveOutcome {
+    Idle,
+    Enqueued,
+    Deferred,
+}
+
+#[derive(Default)]
+struct JournalRetrySet {
+    documents: BTreeSet<DocumentId>,
+}
+
+impl JournalRetrySet {
+    fn retain(&mut self, document: DocumentId) -> bool {
+        self.documents.insert(document)
+    }
+
+    fn remove(&mut self, document: DocumentId) -> bool {
+        self.documents.remove(&document)
+    }
+
+    fn pop_first(&mut self) -> Option<DocumentId> {
+        self.documents.pop_first()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, document: DocumentId) -> bool {
+        self.documents.contains(&document)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JournalAdmissionEffect {
+    Append(crate::native_document_io::JournalGeneration),
+    Rewrite(JournalRewriteGeneration),
+}
+
+/// Admit an already-planned journal effect without blocking the UI. `Full` is
+/// an ordinary scheduling outcome: roll the reducer back to replannable state
+/// and retain only its document ID. A disconnected worker preserves the reducer
+/// intent too, but reports the permanent error instead of arming a wake-less
+/// retry.
+fn try_enqueue_document_journal_job<T>(
+    sender: &std::sync::mpsc::SyncSender<T>,
+    job: T,
+    document: DocumentId,
+    effect: JournalAdmissionEffect,
+    journals: &mut DocumentJournalStore,
+    retries: &mut JournalRetrySet,
+) -> Result<JournalDriveOutcome, String> {
+    match try_enqueue_document_job(sender, job) {
+        Ok(()) => {
+            retries.remove(document);
+            Ok(JournalDriveOutcome::Enqueued)
+        }
+        Err(error) => {
+            let (deferred, name) = match effect {
+                JournalAdmissionEffect::Append(generation) => {
+                    (journals.defer_append(document, generation), "append")
+                }
+                JournalAdmissionEffect::Rewrite(generation) => {
+                    (journals.defer_rewrite(document, generation), "rewrite")
+                }
+            };
+            if !deferred {
+                return Err(format!(
+                    "document journal {name} changed during queue admission"
+                ));
+            }
+            if error == DocumentQueueAdmissionError::Saturated {
+                retries.retain(document);
+                Ok(JournalDriveOutcome::Deferred)
+            } else {
+                retries.remove(document);
+                Err(format!("document journal {error}"))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DocumentQueueAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Saturated => formatter.write_str(
+                "document worker is saturated; retry after the current disk operations finish",
+            ),
+            Self::WorkerStopped => formatter.write_str("document worker stopped"),
+        }
+    }
+}
+
+/// Shared admission primitive. Its non-blocking `Full` verdict is Tier-1-bound
+/// to `native_document_queue_model` below; production uses the same generic
+/// function with `NativeDocumentJob`.
+fn try_enqueue_document_job<T>(
+    sender: &std::sync::mpsc::SyncSender<T>,
+    job: T,
+) -> Result<(), DocumentQueueAdmissionError> {
+    match sender.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::TrySendError::Full(_)) => Err(DocumentQueueAdmissionError::Saturated),
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            Err(DocumentQueueAdmissionError::WorkerStopped)
+        }
+    }
+}
+
+fn native_document_queue_slot_available_wake() -> crate::Wake {
+    crate::Wake::NativeDocumentQueueSlotAvailable
+}
+
+fn native_document_queue() -> Result<&'static std::sync::mpsc::SyncSender<NativeDocumentJob>, String>
+{
+    static QUEUE: std::sync::OnceLock<
+        Result<std::sync::mpsc::SyncSender<NativeDocumentJob>, String>,
+    > = std::sync::OnceLock::new();
     QUEUE
         .get_or_init(|| {
-            let (sender, receiver) = std::sync::mpsc::channel::<NativeDocumentJob>();
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<NativeDocumentJob>(NATIVE_DOCUMENT_QUEUE_CAPACITY);
             std::thread::Builder::new()
                 .name("aterm-native-document".to_string())
                 .spawn(move || {
                     while let Ok(job) = receiver.recv() {
+                        // `recv` released exactly one of the four waiting slots.
+                        // Notify the UI before doing disk I/O so one coalesced
+                        // journal intent can claim it without waiting for this
+                        // potentially slow job to finish.
+                        let _ = job
+                            .proxy()
+                            .send_event(native_document_queue_slot_available_wake());
                         match job {
                             NativeDocumentJob::Save {
                                 document,
@@ -266,6 +410,10 @@ pub(crate) struct DocumentHostRuntime {
     journals: Option<DocumentJournalStore>,
     journal_unavailable: Option<String>,
     recovery_status: BTreeMap<DocumentId, String>,
+    /// Journal intents that observed a full worker queue. This is an ID-only,
+    /// latest-wins latch: full encoded plans are released before insertion and
+    /// rebuilt from `DocumentJournalStore` when a worker receive frees a slot.
+    journal_retries: JournalRetrySet,
     /// Documents whose on-disk generation no longer matches the saver baseline.
     /// This host-owned latch blocks every save entry point until an explicit
     /// reload/reconciliation installs a fresh stable observation.
@@ -300,6 +448,7 @@ impl DocumentHostRuntime {
             journals,
             journal_unavailable,
             recovery_status: BTreeMap::new(),
+            journal_retries: JournalRetrySet::default(),
             disk_conflicts: BTreeSet::new(),
             inflight: BTreeSet::new(),
             pending_saves: BTreeMap::new(),
@@ -971,6 +1120,13 @@ impl App {
     }
 
     fn drive_document_journal(&mut self, document: DocumentId) -> Result<(), String> {
+        self.drive_document_journal_once(document).map(|_| ())
+    }
+
+    fn drive_document_journal_once(
+        &mut self,
+        document: DocumentId,
+    ) -> Result<JournalDriveOutcome, String> {
         let proxy = self.proxy.clone();
         let queue = if proxy.is_some() {
             Some(native_document_queue()?)
@@ -985,35 +1141,31 @@ impl App {
                 .ok_or_else(|| "document journal is unavailable".to_string())?
                 .next_effect(document)?;
             let Some(effect) = effect else {
-                return Ok(());
+                self.native_documents.journal_retries.remove(document);
+                return Ok(JournalDriveOutcome::Idle);
             };
             match effect {
                 JournalEffect::Append { path, key, plan } => {
                     if let (Some(proxy), Some(queue)) = (proxy.clone(), queue) {
-                        if queue
-                            .send(NativeDocumentJob::JournalAppend {
+                        let native_documents = &mut self.native_documents;
+                        let journals = native_documents
+                            .journals
+                            .as_mut()
+                            .expect("journal store checked above");
+                        return try_enqueue_document_journal_job(
+                            queue,
+                            NativeDocumentJob::JournalAppend {
                                 document,
                                 path,
                                 key,
                                 plan: plan.clone(),
                                 proxy,
-                            })
-                            .is_err()
-                        {
-                            let completion = self
-                                .native_documents
-                                .journals
-                                .as_mut()
-                                .expect("journal store checked above")
-                                .complete_append(
-                                    document,
-                                    plan.generation,
-                                    crate::native_document_io::JournalAppendResult::Cancelled,
-                                );
-                            return Err(journal_completion_error(completion)
-                                .unwrap_or_else(|| "document journal worker stopped".to_string()));
-                        }
-                        return Ok(());
+                            },
+                            document,
+                            JournalAdmissionEffect::Append(plan.generation),
+                            journals,
+                            &mut native_documents.journal_retries,
+                        );
                     }
                     // NO worker to hand this to (`proxy` is None, so the queue
                     // was never built), and this is the thread that owns `App`.
@@ -1034,31 +1186,24 @@ impl App {
                 }
                 JournalEffect::Rewrite { path, plan } => {
                     if let (Some(proxy), Some(queue)) = (proxy.clone(), queue) {
-                        if queue
-                            .send(NativeDocumentJob::JournalRewrite {
+                        let native_documents = &mut self.native_documents;
+                        let journals = native_documents
+                            .journals
+                            .as_mut()
+                            .expect("journal store checked above");
+                        return try_enqueue_document_journal_job(
+                            queue,
+                            NativeDocumentJob::JournalRewrite {
                                 document,
                                 path,
                                 plan: plan.clone(),
                                 proxy,
-                            })
-                            .is_err()
-                        {
-                            let completion = self
-                                .native_documents
-                                .journals
-                                .as_mut()
-                                .expect("journal store checked above")
-                                .complete_rewrite(
-                                    document,
-                                    plan.generation,
-                                    JournalRewriteResult::Failed(
-                                        "document journal worker stopped".to_string(),
-                                    ),
-                                );
-                            return Err(journal_completion_error(completion)
-                                .unwrap_or_else(|| "document journal worker stopped".to_string()));
-                        }
-                        return Ok(());
+                            },
+                            document,
+                            JournalAdmissionEffect::Rewrite(plan.generation),
+                            journals,
+                            &mut native_documents.journal_retries,
+                        );
                     }
                     let result =
                         execute_journal_rewrite(&path, &plan, JournalLockPatience::EventLoop);
@@ -1072,6 +1217,22 @@ impl App {
                         return Err(message);
                     }
                 }
+            }
+        }
+    }
+
+    /// Pump one coalesced journal intent for the one channel slot just released
+    /// by the worker. Idle/stale IDs cost no slot and are skipped; a successful
+    /// enqueue or another `Full` verdict ends this wake, keeping UI work bounded.
+    pub(crate) fn native_document_queue_slot_available(&mut self) {
+        loop {
+            let Some(document) = self.native_documents.journal_retries.pop_first() else {
+                return;
+            };
+            match self.drive_document_journal_once(document) {
+                Ok(JournalDriveOutcome::Idle) => {}
+                Ok(JournalDriveOutcome::Enqueued | JournalDriveOutcome::Deferred) => return,
+                Err(message) => self.set_document_recovery_status(document, Some(message)),
             }
         }
     }
@@ -1596,23 +1757,23 @@ impl App {
                 .map(|_| {
                     std::sync::Arc::clone(&self.native_config_service.snapshot().assets.themes)
                 });
-            if queue
-                .send(NativeDocumentJob::Save {
+            if let Err(error) = try_enqueue_document_job(
+                queue,
+                NativeDocumentJob::Save {
                     document,
                     source_view,
                     grant,
                     plan: pending.plan.clone(),
                     config_themes,
                     proxy,
-                })
-                .is_err()
-            {
+                },
+            ) {
                 let _ = self.native_documents.persistence.complete(
                     document,
                     pending.plan.generation,
                     crate::native_document_io::AtomicSaveResult::Cancelled,
                 );
-                return Err("document worker stopped".to_string());
+                return Err(error.to_string());
             }
             self.native_documents.inflight.insert(document);
             self.native_runtime.set_document_saving(document, true);
@@ -2863,6 +3024,133 @@ mod tests {
     /// deadline in `control.rs`'s `read_until` failed exactly this way.) One second
     /// looked generous and was not; this does not, and is.
     const REFUSES_WITHOUT_BLOCKING: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Tier-1 guard binding: the exact generic admission primitive used by the
+    /// shipping document worker agrees with the derived bounded-queue model at
+    /// every full/not-full decision, including the worker-owned fifth image and
+    /// the deferred retry transition. The unbounded channel is the negative
+    /// control: it accepts a fifth waiting job where the model refuses it.
+    #[test]
+    fn native_document_queue_admission_conforms_to_the_derived_model() {
+        let model = aterm_spec::derive::native_document_queue_model();
+        let mut state = model.init_state();
+        let mut documents = crate::document_store::DocumentStore::new();
+        let uri = "file:///queue-retry.md";
+        let document = documents.open(uri.to_string(), "draft".to_string());
+        let disk = documents.snapshot(document).unwrap();
+        let journal_root = std::env::temp_dir().join(format!(
+            "aterm-document-queue-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut journals = DocumentJournalStore::for_test(journal_root.clone()).unwrap();
+        let decision = journals.inspect_open(uri, disk.text.as_bytes()).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
+        let _ = documents.transact(
+            document,
+            disk.seq,
+            vec![crate::document_store::TextEdit {
+                range: disk.text.len()..disk.text.len(),
+                insert: " newer".to_string(),
+            }],
+        );
+        let desired = documents.snapshot(document).unwrap();
+        journals.observe_commit(&desired).unwrap();
+        let JournalEffect::Append {
+            plan: first_plan, ..
+        } = journals.next_effect(document).unwrap().unwrap()
+        else {
+            panic!("journal append fixture")
+        };
+        let mut retries = JournalRetrySet::default();
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<u8>(NATIVE_DOCUMENT_QUEUE_CAPACITY);
+
+        try_enqueue_document_job(&sender, 0).expect("first capacity slot");
+        assert!(model.fire("SubmitAccepted", &mut state));
+        assert_eq!(receiver.recv().unwrap(), 0);
+        assert!(matches!(
+            native_document_queue_slot_available_wake(),
+            crate::Wake::NativeDocumentQueueSlotAvailable
+        ));
+        assert!(model.fire("WorkerStarts", &mut state));
+        assert!(model.fire("ConsumeDrainEdge", &mut state));
+
+        for value in 1..=NATIVE_DOCUMENT_QUEUE_CAPACITY as u8 {
+            assert!(model.action_enabled("SubmitAccepted", &state));
+            try_enqueue_document_job(&sender, value).expect("capacity slot");
+            assert!(model.fire("SubmitAccepted", &mut state));
+        }
+        assert!(!model.action_enabled("SubmitAccepted", &state));
+        assert!(model.action_enabled("SubmitDeferred", &state));
+        assert_eq!(
+            try_enqueue_document_journal_job(
+                &sender,
+                u8::MAX,
+                document,
+                JournalAdmissionEffect::Append(first_plan.generation),
+                &mut journals,
+                &mut retries,
+            )
+            .unwrap(),
+            JournalDriveOutcome::Deferred
+        );
+        assert!(retries.contains(document));
+        assert!(model.fire("SubmitDeferred", &mut state));
+        assert_eq!(state["queued"], 4);
+        assert_eq!(state["executing"], 1);
+        assert_eq!(state["retry_pending"], 1);
+        assert!(model.check_invariant("BoundedFullImageJobs", &state));
+        assert!(model.check_invariant("DeferredIntentRetained", &state));
+
+        assert!(model.fire("WorkerCompletes", &mut state));
+        assert_eq!(receiver.recv().unwrap(), 1);
+        assert!(model.fire("WorkerStarts", &mut state));
+        let JournalEffect::Append {
+            plan: retry_plan, ..
+        } = journals.next_effect(document).unwrap().unwrap()
+        else {
+            panic!("capacity release must replan without another edit")
+        };
+        assert_ne!(retry_plan.generation, first_plan.generation);
+        assert_eq!(retry_plan.target_seq, desired.seq);
+        assert_eq!(
+            try_enqueue_document_journal_job(
+                &sender,
+                42,
+                document,
+                JournalAdmissionEffect::Append(retry_plan.generation),
+                &mut journals,
+                &mut retries,
+            )
+            .unwrap(),
+            JournalDriveOutcome::Enqueued
+        );
+        assert!(!retries.contains(document));
+        assert!(model.fire("RetryAccepted", &mut state));
+        assert_eq!(state["queued"], 4);
+        assert_eq!(state["executing"], 1);
+        assert_eq!(state["retry_pending"], 0);
+        assert!(model.check_invariant("BoundedFullImageJobs", &state));
+        assert!(model.check_invariant("OpenSlotHasRetryEdge", &state));
+
+        let (unbounded, retained) = std::sync::mpsc::channel();
+        unbounded.send(0).unwrap();
+        assert_eq!(retained.recv().unwrap(), 0, "one image is executing");
+        for value in 1..=NATIVE_DOCUMENT_QUEUE_CAPACITY + 1 {
+            unbounded
+                .send(value)
+                .expect("retired channel never refuses");
+        }
+        assert!(
+            !model.action_enabled("SubmitAccepted", &state),
+            "the bounded model refuses where the retired channel accepted"
+        );
+        let _ = fs::remove_dir_all(journal_root);
+    }
 
     fn file_uri(path: &std::path::Path) -> String {
         // Built by the SHIPPING encoder, not a hand-rolled `format!` — the

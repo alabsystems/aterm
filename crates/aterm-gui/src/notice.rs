@@ -10,7 +10,7 @@
 //!     (`App::apply_update_or_details` — details-overlay fallback when nothing is
 //!     actually staged). The persistent affordances (version-menu ⬆️ on macOS /
 //!     tab-strip ↻ elsewhere) stay after it fades.
-//!   * [`NoticeKind::LevelUp`] — the app just RELAUNCHED into a newer build (a re-exec
+//!   * [`NoticeKind::LevelUp`] — the app just TOOK OVER as a newer build (a seamless
 //!     handoff set `$ATERM_UPDATED_FROM`). A quiet, cursor-themed "leveled-up" flourish
 //!     ("Updated to build N") that celebrates the swap, then fades — the "level up" analog
 //!     the design asked for, without literally saying "level up" or blocking the flow.
@@ -94,7 +94,7 @@ pub(crate) enum NoticeKind {
     /// A strictly-newer build staged and is ready to install. Clickable → APPLY (one
     /// click; see `App::notice_click`).
     UpdateReady { version: String, build: u64 },
-    /// The app relaunched into a newer build (post-update celebration).
+    /// The app took over as a newer build (post-update celebration).
     LevelUp { build: u64 },
     /// Nonmodal updater status used by automatic/background paths. It is deliberately
     /// not clickable: details remain in Settings/the Version menu.

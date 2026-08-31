@@ -122,8 +122,8 @@ impl App {
         // celebration row. Both may be live at once — `resolve` gives staged precedence.
         let staged = self.relaunch.as_ref().map(|r| (r.build, r.version.clone()));
         // The palette row is the cross-platform twin of the macOS Version-menu item,
-        // so it carries the same apply-lane verdict: a row that offers a restart must
-        // say when restarting has already been tried and did not work.
+        // so it carries the same apply-lane verdict: a row that offers an apply must
+        // say when applying has already been tried and did not work.
         let staged_trouble = staged
             .as_ref()
             .and_then(|(build, _)| self.apply_trouble_for(*build));
@@ -553,7 +553,7 @@ impl App {
                     _ => {}
                 }
             }
-            InputEvent::Text(t) | InputEvent::Paste(t) => {
+            InputEvent::Text(t) | InputEvent::Paste(t, _) => {
                 for c in t.chars().filter(|c| !c.is_control()) {
                     self.palette_filter_push(c);
                 }

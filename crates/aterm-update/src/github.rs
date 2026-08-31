@@ -2214,9 +2214,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // that a newer generation was SEEN; this acts on what that generation SAYS.
     //
     // A stage is an authorization made earlier, and nothing revisited it: a build
-    // staged at 10:00 by a machine revoked at 10:30 installed at the next launch
-    // regardless, and only a separate `min_build` yank could have stopped a
-    // withdrawn machine's artifact.
+    // staged at 10:00 by a machine revoked at 10:30 was applied anyway (in-session,
+    // or at the next launch), and only a separate `min_build` yank could have
+    // stopped a withdrawn machine's artifact.
     //
     // IT BELONGS HERE, NOT IN THE APPLY LANE. Revocation is a LIST, and this is the
     // only place the roster document is in hand; the apply lane holds a floor NUMBER,
@@ -5706,7 +5706,7 @@ mod tests {
     ///
     /// The stage lane refuses a release whose signer the roster withdrew, but a build
     /// already on disk was authorized earlier and nothing revisited it: staged at 10:00
-    /// by a machine revoked at 10:30, installed at the next launch regardless.
+    /// by a machine revoked at 10:30, applied anyway (in-session, or at the next launch).
     #[test]
     fn a_revoked_signer_withdraws_the_stage_it_authorized_and_no_other() {
         let revoked = vec!["m11".to_string(), "m19".to_string()];

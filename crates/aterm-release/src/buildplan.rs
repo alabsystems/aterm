@@ -9,13 +9,11 @@
 //! caveat — plus UUID match), `strip -x` on shipped copies, and the dSYM zip.
 //!
 //! ONE compiler lane (owner decision, 2026-07): the repo's rust-toolchain.toml
-//! pins the Trust toolchain and .cargo/config.toml carries the single
-//! documented verification opt-out, so the native slice here is a PLAIN
-//! `cargo build` — no `RUSTC=…`, no `RUSTC_BOOTSTRAP`, no RUSTFLAGS
-//! surgery, no `--no-trust` escape hatch. Dev builds, tests, and the shipped
-//! native slice are byte-for-byte the same lane. The build hard-fails unless
-//! the produced binary self-reports the `+t` flavor (see [`run`]'s provenance
-//! gate): a release that silently fell back to upstream must be impossible.
+//! pins Trust and .cargo/config.toml carries the documented verification
+//! opt-out. Both architectures build from one read-only source take and one
+//! lock-checksummed, offline dependency bundle; only their compiler differs.
+//! No `RUSTC=…`, `RUSTC_BOOTSTRAP`, RUSTFLAGS surgery, or `--no-trust` escape
+//! hatch exists. The native binary must still self-report `+t` (see [`run`]).
 //!
 //! The ONE exception: the x86_64-apple-darwin compat slice of the universal
 //! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable`. The reason is
@@ -38,12 +36,13 @@
 //!     silently missing arch slice or missing atpkg/aterm-ctl/aterm-cli must
 //!     be impossible.
 
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// THE shipped binary: `(cargo package, cargo bin name, basename it ships
 /// under)` — all three are `aterm`. One binary is the whole surface: the
@@ -62,7 +61,8 @@ const LIPO_X86_64: &str = "x86_64";
 /// Everything [`run`] needs, resolved by the caller (cli/gates own flag
 /// parsing and the ledger claim; this module only builds).
 pub struct BuildPlan {
-    /// Workspace root — every child process runs with this as its cwd.
+    /// Workspace root — release orchestration runs here; Cargo builds receive
+    /// its sealed snapshot manifest explicitly from an inert root cwd.
     pub repo_root: PathBuf,
     /// `dist/` — receives the dSYM + dSYM zip (the .app lands there later,
     /// via `bundle::assemble`).
@@ -103,24 +103,1200 @@ pub struct BuildOutput {
     pub dsym_zip: Option<PathBuf>,
 }
 
+#[cfg(unix)]
+fn current_release_uid() -> Result<u32, String> {
+    let output = Command::new("/usr/bin/id")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .arg("-u")
+        .current_dir("/")
+        .output()
+        .map_err(|error| format!("inspect release user identity: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspect release user identity failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("release user identity is not UTF-8: {error}"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("release user identity is malformed: {error}"))
+}
+
+#[cfg(not(unix))]
+fn current_release_uid() -> Result<u32, String> {
+    Err("release target privacy requires Unix ownership and mode semantics".into())
+}
+
+/// Open one release-owned directory without accepting a symlink substitution.
+///
+/// The first metadata read rejects a static symlink. Opening and comparing the
+/// device/inode pair before any chmod closes the check/use gap: if the path was
+/// swapped while it was opened, no referent is modified. All later permission
+/// changes apply to the opened directory descriptor, and the final path check
+/// proves the same directory remains published at `path`.
+#[cfg(unix)]
+fn open_release_directory(
+    path: &Path,
+    expected_uid: u32,
+    private: bool,
+    what: &str,
+) -> Result<File, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {what} {}: {error}", path.display()))?;
+    if !before.file_type().is_dir() {
+        return Err(format!(
+            "{what} is not a real directory: {}",
+            path.display()
+        ));
+    }
+    if before.uid() != expected_uid {
+        return Err(format!(
+            "{what} is owned by uid {}, expected {expected_uid}: {}",
+            before.uid(),
+            path.display()
+        ));
+    }
+    let directory =
+        File::open(path).map_err(|error| format!("open {what} {}: {error}", path.display()))?;
+    let opened = directory
+        .metadata()
+        .map_err(|error| format!("inspect opened {what} {}: {error}", path.display()))?;
+    if !opened.file_type().is_dir()
+        || opened.uid() != expected_uid
+        || (opened.dev(), opened.ino()) != (before.dev(), before.ino())
+    {
+        return Err(format!(
+            "{what} changed while it was opened: {}",
+            path.display()
+        ));
+    }
+    if !private && opened.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{what} is group/other-writable (mode {:03o}): {}",
+            opened.mode() & 0o777,
+            path.display()
+        ));
+    }
+    if private {
+        let mut permissions = opened.permissions();
+        permissions.set_mode(0o700);
+        directory
+            .set_permissions(permissions)
+            .map_err(|error| format!("make {what} private {}: {error}", path.display()))?;
+    }
+    let after = directory
+        .metadata()
+        .map_err(|error| format!("reinspect opened {what} {}: {error}", path.display()))?;
+    let published = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect {what} {}: {error}", path.display()))?;
+    if !published.file_type().is_dir()
+        || published.uid() != expected_uid
+        || (published.dev(), published.ino()) != (after.dev(), after.ino())
+        || private && published.mode() & 0o777 != 0o700
+        || !private && published.mode() & 0o022 != 0
+    {
+        return Err(format!(
+            "{what} is not the opened owned directory: {}",
+            path.display()
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_release_directory(
+    _path: &Path,
+    _expected_uid: u32,
+    _private: bool,
+    _what: &str,
+) -> Result<File, String> {
+    Err("release target privacy requires Unix ownership and mode semantics".into())
+}
+
+#[cfg(unix)]
+fn open_release_file(
+    path: &Path,
+    expected_uid: u32,
+    expected_mode: u32,
+    what: &str,
+) -> Result<File, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {what} {}: {error}", path.display()))?;
+    if !before.file_type().is_file() {
+        return Err(format!("{what} is not a regular file: {}", path.display()));
+    }
+    if before.uid() != expected_uid {
+        return Err(format!(
+            "{what} is owned by uid {}, expected {expected_uid}: {}",
+            before.uid(),
+            path.display()
+        ));
+    }
+    let file =
+        File::open(path).map_err(|error| format!("open {what} {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("inspect opened {what} {}: {error}", path.display()))?;
+    if !opened.file_type().is_file()
+        || opened.uid() != expected_uid
+        || (opened.dev(), opened.ino()) != (before.dev(), before.ino())
+    {
+        return Err(format!(
+            "{what} changed while it was opened: {}",
+            path.display()
+        ));
+    }
+    let mut permissions = opened.permissions();
+    permissions.set_mode(expected_mode);
+    file.set_permissions(permissions)
+        .map_err(|error| format!("make {what} private {}: {error}", path.display()))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("reinspect opened {what} {}: {error}", path.display()))?;
+    let published = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect {what} {}: {error}", path.display()))?;
+    if !published.file_type().is_file()
+        || published.uid() != expected_uid
+        || (published.dev(), published.ino()) != (after.dev(), after.ino())
+        || published.mode() & 0o777 != expected_mode
+    {
+        return Err(format!(
+            "{what} is not the opened private file: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_release_file(
+    _path: &Path,
+    _expected_uid: u32,
+    _expected_mode: u32,
+    _what: &str,
+) -> Result<File, String> {
+    Err("release target privacy requires Unix ownership and mode semantics".into())
+}
+
+fn create_private_release_directory(
+    path: &Path,
+    expected_uid: u32,
+    what: &str,
+) -> Result<(), String> {
+    std::fs::create_dir(path)
+        .map_err(|error| format!("create {what} {}: {error}", path.display()))?;
+    open_release_directory(path, expected_uid, true, what).map(drop)
+}
+
+fn prepare_release_target_parent(repo_root: &Path) -> Result<(PathBuf, u32), String> {
+    let expected_uid = current_release_uid()?;
+    let target_root = repo_root.join("target");
+    match std::fs::create_dir(&target_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create release target root {}: {error}",
+                target_root.display()
+            ));
+        }
+    }
+    // Reject an ignored `target` symlink before constructing or collecting any
+    // child beneath it. Otherwise a clean checkout could redirect residue GC.
+    drop(open_release_directory(
+        &target_root,
+        expected_uid,
+        false,
+        "release target root",
+    )?);
+
+    let parent = target_root.join("release-takes");
+    match std::fs::create_dir(&parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create release target parent {}: {error}",
+                parent.display()
+            ));
+        }
+    }
+    drop(open_release_directory(
+        &parent,
+        expected_uid,
+        true,
+        "release target parent",
+    )?);
+    Ok((parent, expected_uid))
+}
+
+/// One immutable source/dependency take shared by both release architectures.
+struct SealedCargoTake {
+    repo_root: PathBuf,
+    source_fingerprint: String,
+    source_root: PathBuf,
+    workspace_config: PathBuf,
+    cargo_config: PathBuf,
+    target_dir: PathBuf,
+    cargo_home: PathBuf,
+    temporary_dir: PathBuf,
+    lease_pid: u32,
+    lease_token: String,
+    release_uid: u32,
+    target_cleaned: bool,
+    lease_cleaned: bool,
+}
+
+impl SealedCargoTake {
+    fn acquire(repo_root: &Path) -> Result<Self, String> {
+        let fingerprinter = repo_root.join("tools/artifact_source_fingerprint.py");
+        let snapshotter = repo_root.join("tools/proof_snapshot.py");
+        for tool in [&fingerprinter, &snapshotter] {
+            let metadata = std::fs::symlink_metadata(tool).map_err(|error| {
+                format!("inspect release proof tool {}: {error}", tool.display())
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "release proof tool is not a regular file: {}",
+                    tool.display()
+                ));
+            }
+        }
+        let mut fingerprint_command = release_proof_python(repo_root, &fingerprinter)?;
+        fingerprint_command
+            .arg("--root")
+            .arg(repo_root)
+            .args(["--package", "aterm", "--source-only"])
+            .current_dir(repo_root);
+        let fingerprint_output = checked_output(
+            &mut fingerprint_command,
+            "derive release source fingerprint",
+        )?;
+        let fingerprint =
+            one_output_line(&fingerprint_output, "release source fingerprint")?.to_owned();
+        if fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("release source fingerprint is not canonical SHA-256".into());
+        }
+        let lease_pid = std::process::id();
+        let lease_token = fresh_lease_token()?;
+        let mut snapshot_command = release_proof_python(repo_root, &snapshotter)?;
+        snapshot_command
+            .arg("--root")
+            .arg(repo_root)
+            .args(["--package", "aterm", "--fingerprint"])
+            .arg(&fingerprint)
+            .arg("--source-fingerprint")
+            .arg(&fingerprint)
+            .arg("--lease-pid")
+            .arg(lease_pid.to_string())
+            .arg("--lease-token")
+            .arg(&lease_token)
+            .current_dir(repo_root);
+        let snapshot_output =
+            checked_output(&mut snapshot_command, "materialize release source take")?;
+        let acquired = (|| {
+            let source_root =
+                PathBuf::from(one_output_line(&snapshot_output, "release source take")?.to_owned());
+            if !source_root.is_absolute() {
+                return Err("release source take path is not absolute".into());
+            }
+            let source_root = source_root
+                .canonicalize()
+                .map_err(|error| format!("canonicalize release source take: {error}"))?;
+            let workspace_config = source_root.join(".cargo/config.toml");
+            let cargo_config = source_root.join(".aterm-proof-registry/.cargo/config.toml");
+            for (kind, config) in [
+                ("workspace", &workspace_config),
+                ("sealed source", &cargo_config),
+            ] {
+                let metadata = std::fs::symlink_metadata(config)
+                    .map_err(|error| format!("inspect {kind} Cargo config: {error}"))?;
+                if !metadata.file_type().is_file() {
+                    return Err(format!("{kind} Cargo config is not a regular file"));
+                }
+            }
+            let (target_parent, release_uid) = prepare_release_target_parent(repo_root)?;
+            cleanup_release_target_residue(&target_parent)?;
+            let take_name = source_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("release source take has no UTF-8 identity")?;
+            let target_dir = target_parent.join(format!("{take_name}-{lease_pid}-{lease_token}"));
+            create_private_release_directory(&target_dir, release_uid, "fresh release target")?;
+            let cargo_home = target_dir.join("cargo-home");
+            let temporary_dir = target_dir.join("tmp");
+            let setup = (|| {
+                let start = process_start_identity(lease_pid)?
+                    .ok_or("release process disappeared while creating its target")?;
+                write_release_target_owner(&target_dir, lease_pid, &start, &lease_token)?;
+                create_private_release_directory(&cargo_home, release_uid, "release Cargo home")?;
+                create_private_release_directory(
+                    &temporary_dir,
+                    release_uid,
+                    "release temporary directory",
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = setup {
+                return match std::fs::remove_dir_all(&target_dir) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!(
+                        "{error}; additionally, remove partial target: {cleanup}"
+                    )),
+                };
+            }
+            Ok(Self {
+                repo_root: repo_root.to_path_buf(),
+                source_fingerprint: fingerprint.clone(),
+                source_root,
+                workspace_config,
+                cargo_config,
+                target_dir,
+                cargo_home,
+                temporary_dir,
+                lease_pid,
+                lease_token: lease_token.clone(),
+                release_uid,
+                target_cleaned: false,
+                lease_cleaned: false,
+            })
+        })();
+        match acquired {
+            Ok(take) => Ok(take),
+            Err(error) => match release_snapshot_lease(repo_root, lease_pid, &lease_token) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; additionally, {cleanup}")),
+            },
+        }
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        if self.target_cleaned && self.lease_cleaned {
+            return Ok(());
+        }
+        let mut errors = Vec::new();
+        if !self.target_cleaned {
+            match remove_owned_release_target(
+                &self.target_dir,
+                self.release_uid,
+                self.lease_pid,
+                &self.lease_token,
+            ) {
+                Ok(()) => self.target_cleaned = true,
+                Err(error) => errors.push(format!(
+                    "remove private release target {}: {error}",
+                    self.target_dir.display()
+                )),
+            }
+        }
+        if !self.lease_cleaned {
+            match release_snapshot_lease(&self.repo_root, self.lease_pid, &self.lease_token) {
+                Ok(()) => self.lease_cleaned = true,
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; additionally, "))
+        }
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        let script = self.repo_root.join("tools/proof_snapshot.py");
+        let mut command = release_proof_python(&self.repo_root, &script)?;
+        command
+            .arg("--root")
+            .arg(&self.repo_root)
+            .args(["--package", "aterm", "--source-fingerprint"])
+            .arg(&self.source_fingerprint)
+            .arg("--verify-registry-archives")
+            .arg("--verify-snapshot")
+            .arg(&self.source_root);
+        checked_output(
+            &mut command,
+            "verify sealed release source take after build",
+        )?;
+        Ok(())
+    }
+}
+
+fn cleanup_release_target_residue(parent: &Path) -> Result<(), String> {
+    cleanup_release_target_residue_with(parent, process_start_identity)
+}
+
+fn cleanup_release_target_residue_with(
+    parent: &Path,
+    process_start: impl Fn(u32) -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    let expected_uid = current_release_uid()?;
+    cleanup_release_target_residue_with_uid(parent, expected_uid, process_start)
+}
+
+fn cleanup_release_target_residue_with_uid(
+    parent: &Path,
+    expected_uid: u32,
+    process_start: impl Fn(u32) -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    // Validate the base itself before `read_dir`: an ignored symlink here must
+    // never redirect the collector outside this checkout's owned target tree.
+    drop(open_release_directory(
+        parent,
+        expected_uid,
+        true,
+        "release target parent",
+    )?);
+    for entry in std::fs::read_dir(parent)
+        .map_err(|error| format!("scan release target residue: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("read release target residue: {error}"))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or("release target residue has a non-UTF-8 name")?;
+        let parts = name.split('-').collect::<Vec<_>>();
+        let (pid, token) = match parts.as_slice() {
+            [take, pid] if is_lower_hex(take, 64) => (pid.parse::<u32>().ok(), None),
+            [take, pid, token] if is_lower_hex(take, 64) && is_lower_hex(token, 64) => {
+                (pid.parse::<u32>().ok(), Some(*token))
+            }
+            _ => continue,
+        };
+        let Some(pid) = pid.filter(|pid| *pid > 0) else {
+            continue;
+        };
+        let path = entry.path();
+        drop(open_release_directory(
+            &path,
+            expected_uid,
+            true,
+            "release target residue",
+        )?);
+        let current_start = process_start(pid)?;
+        let owner = path.join(".owner");
+        let stale = match std::fs::symlink_metadata(&owner) {
+            Ok(owner_metadata) => {
+                if !owner_metadata.file_type().is_file() {
+                    return Err(format!(
+                        "release target owner is not a regular file: {name}"
+                    ));
+                }
+                let (owner_pid, owner_start, owner_token) =
+                    read_release_target_owner(&owner, expected_uid)?;
+                if owner_pid != pid || token != Some(owner_token.as_str()) {
+                    return Err(format!(
+                        "release target owner disagrees with its name: {name}"
+                    ));
+                }
+                current_start.as_deref() != Some(owner_start.as_str())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => current_start.is_none(),
+            Err(error) => return Err(format!("inspect release target owner {name}: {error}")),
+        };
+        if stale {
+            std::fs::remove_dir_all(&path).map_err(|error| {
+                format!(
+                    "remove abandoned release target {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_release_product_parent(repo_root: &Path, expected_uid: u32) -> Result<PathBuf, String> {
+    let target_root = repo_root.join("target");
+    drop(open_release_directory(
+        &target_root,
+        expected_uid,
+        false,
+        "release target root",
+    )?);
+    let parent = target_root.join("release-products");
+    match std::fs::create_dir(&parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create release product parent {}: {error}",
+                parent.display()
+            ));
+        }
+    }
+    drop(open_release_directory(
+        &parent,
+        expected_uid,
+        true,
+        "release product parent",
+    )?);
+    cleanup_release_target_residue_with_uid(&parent, expected_uid, process_start_identity)?;
+    Ok(parent)
+}
+
+fn write_release_target_owner(
+    target: &Path,
+    pid: u32,
+    start: &str,
+    token: &str,
+) -> Result<(), String> {
+    let expected_uid = current_release_uid()?;
+    drop(open_release_directory(
+        target,
+        expected_uid,
+        true,
+        "release target",
+    )?);
+    let temporary = target.join(".owner.pending");
+    let owner = target.join(".owner");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("create release target owner: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("make release target owner private: {error}"))?;
+    }
+    write!(file, "version=1\npid={pid}\nstart={start}\ntoken={token}\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("persist release target owner: {error}"))?;
+    drop(file);
+    std::fs::rename(&temporary, &owner)
+        .map_err(|error| format!("publish release target owner: {error}"))?;
+    drop(open_release_file(
+        &owner,
+        expected_uid,
+        0o600,
+        "release target owner",
+    )?);
+    File::open(target)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("persist release target owner directory: {error}"))
+}
+
+fn read_release_target_owner(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(u32, String, String), String> {
+    let mut file = open_release_file(path, expected_uid, 0o600, "release target owner")?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("inspect release target owner {}: {error}", path.display()))?
+        .len();
+    if length > 512 {
+        return Err(format!(
+            "release target owner is oversized: {}",
+            path.display()
+        ));
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| format!("read release target owner {}: {error}", path.display()))?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    if lines.len() != 4 || lines[0] != "version=1" {
+        return Err(format!(
+            "malformed release target owner: {}",
+            path.display()
+        ));
+    }
+    let pid = lines[1]
+        .strip_prefix("pid=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("malformed release target owner PID: {}", path.display()))?;
+    let start = lines[2]
+        .strip_prefix("start=")
+        .filter(|value| !value.is_empty() && value.len() <= 80 && value.is_ascii())
+        .ok_or_else(|| format!("malformed release target owner start: {}", path.display()))?;
+    let token = lines[3]
+        .strip_prefix("token=")
+        .filter(|value| is_lower_hex(value, 64))
+        .ok_or_else(|| format!("malformed release target owner token: {}", path.display()))?;
+    Ok((pid, start.to_owned(), token.to_owned()))
+}
+
+fn remove_owned_release_target(
+    target: &Path,
+    expected_uid: u32,
+    expected_pid: u32,
+    expected_token: &str,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "inspect release target {}: {error}",
+                target.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    drop(open_release_directory(
+        target,
+        expected_uid,
+        true,
+        "release target",
+    )?);
+    let (pid, _, token) = read_release_target_owner(&target.join(".owner"), expected_uid)?;
+    if pid != expected_pid || token != expected_token {
+        return Err("release target owner does not match this source-take lease".into());
+    }
+    std::fs::remove_dir_all(target)
+        .map_err(|error| format!("remove release target {}: {error}", target.display()))
+}
+
+fn process_start_identity(pid: u32) -> Result<Option<String>, String> {
+    let output = Command::new("/bin/ps")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("inspect release target process {pid}: {error}"))?;
+    if output.status.success() {
+        let raw = std::str::from_utf8(&output.stdout)
+            .map_err(|error| format!("release target process identity is not UTF-8: {error}"))?;
+        let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() || normalized.len() > 80 || !normalized.is_ascii() {
+            return Err(format!(
+                "release target process {pid} has a malformed identity"
+            ));
+        }
+        return Ok(Some(normalized));
+    }
+    let probe = Command::new("/bin/kill")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("probe release target process {pid}: {error}"))?;
+    if probe.status.success() {
+        return Err(format!(
+            "live release target process {pid} could not be identified"
+        ));
+    }
+    let diagnostic = String::from_utf8_lossy(&probe.stderr);
+    if diagnostic.contains("No such process") {
+        Ok(None)
+    } else {
+        Err(format!(
+            "release target process {pid} absence was not proven: {}",
+            diagnostic.trim()
+        ))
+    }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn fresh_lease_token() -> Result<String, String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("derive release lease time: {error}"))?
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        "{nanos:032x}{:08x}{sequence:024x}",
+        std::process::id()
+    ))
+}
+
+fn release_snapshot_lease(
+    repo_root: &Path,
+    lease_pid: u32,
+    lease_token: &str,
+) -> Result<(), String> {
+    let script = repo_root.join("tools/proof_snapshot.py");
+    let mut command = release_proof_python(repo_root, &script)?;
+    command
+        .arg("--root")
+        .arg(repo_root)
+        .arg("--release-pid")
+        .arg(lease_pid.to_string())
+        .arg("--lease-token")
+        .arg(lease_token)
+        .current_dir(repo_root);
+    checked_output(&mut command, "release sealed Cargo take lease")?;
+    Ok(())
+}
+
+const HOMEBREW_RUSTUP_SHIM_DIR: &str = "/opt/homebrew/opt/rustup/bin";
+const RELEASE_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+fn release_tool_path(tool_dir: &Path) -> Result<OsString, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        if tool_dir.as_os_str().as_bytes().contains(&b':') {
+            return Err(format!(
+                "release tool directory contains a PATH separator: {}",
+                tool_dir.display()
+            ));
+        }
+    }
+    let mut path = tool_dir.as_os_str().to_owned();
+    path.push(":");
+    path.push(RELEASE_SYSTEM_PATH);
+    Ok(path)
+}
+
+fn release_rustup_shim_dir(home: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    let home = Path::new(home);
+    if !home.is_absolute() {
+        return Err("release HOME must be absolute".into());
+    }
+    resolve_release_rustup_shim_dir(
+        home,
+        Path::new(HOMEBREW_RUSTUP_SHIM_DIR),
+        current_release_uid()?,
+    )
+}
+
+fn resolve_release_rustup_shim_dir(
+    home: &Path,
+    homebrew_fallback: &Path,
+    expected_uid: u32,
+) -> Result<PathBuf, String> {
+    let standard = home.join(".cargo/bin");
+    match std::fs::symlink_metadata(&standard) {
+        Ok(_) => validate_release_rustup_shim_dir(&standard, expected_uid),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            validate_release_rustup_shim_dir(homebrew_fallback, expected_uid).map_err(|fallback| {
+                format!(
+                    "rustup shim directory is absent at {}; fallback failed: {fallback}",
+                    standard.display()
+                )
+            })
+        }
+        Err(error) => Err(format!(
+            "inspect standard rustup shim directory {}: {error}",
+            standard.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn validate_release_rustup_shim_dir(
+    candidate: &Path,
+    expected_uid: u32,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let canonical = candidate.canonicalize().map_err(|error| {
+        format!(
+            "canonicalize rustup shim directory {}: {error}",
+            candidate.display()
+        )
+    })?;
+    let directory = open_release_directory(
+        &canonical,
+        expected_uid,
+        false,
+        "release rustup shim directory",
+    )?;
+    let directory_metadata = directory
+        .metadata()
+        .map_err(|error| format!("inspect release rustup shim directory: {error}"))?;
+    for tool in ["cargo", "rustup"] {
+        let path = canonical.join(tool);
+        let before = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect release {tool} shim {}: {error}", path.display()))?;
+        if !before.file_type().is_file() {
+            return Err(format!(
+                "release {tool} shim is not a real regular file: {}",
+                path.display()
+            ));
+        }
+        if before.uid() != expected_uid {
+            return Err(format!(
+                "release {tool} shim is owned by uid {}, expected {expected_uid}: {}",
+                before.uid(),
+                path.display()
+            ));
+        }
+        if before.mode() & 0o022 != 0 || before.mode() & 0o111 == 0 {
+            return Err(format!(
+                "release {tool} shim has unsafe mode {:03o}: {}",
+                before.mode() & 0o777,
+                path.display()
+            ));
+        }
+        let file = File::open(&path)
+            .map_err(|error| format!("open release {tool} shim {}: {error}", path.display()))?;
+        let opened = file.metadata().map_err(|error| {
+            format!(
+                "inspect opened release {tool} shim {}: {error}",
+                path.display()
+            )
+        })?;
+        if !opened.file_type().is_file()
+            || opened.uid() != expected_uid
+            || (opened.dev(), opened.ino()) != (before.dev(), before.ino())
+        {
+            return Err(format!(
+                "release {tool} shim changed while it was opened: {}",
+                path.display()
+            ));
+        }
+    }
+    let published = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        format!(
+            "reinspect release rustup shim directory {}: {error}",
+            canonical.display()
+        )
+    })?;
+    if !published.file_type().is_dir()
+        || published.uid() != expected_uid
+        || published.mode() & 0o022 != 0
+        || (published.dev(), published.ino())
+            != (directory_metadata.dev(), directory_metadata.ino())
+    {
+        return Err(format!(
+            "release rustup shim directory changed during validation: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(not(unix))]
+fn validate_release_rustup_shim_dir(
+    _candidate: &Path,
+    _expected_uid: u32,
+) -> Result<PathBuf, String> {
+    Err("release rustup shim validation requires Unix ownership and mode semantics".into())
+}
+
+fn release_proof_python(repo_root: &Path, script: &Path) -> Result<Command, String> {
+    let home = std::env::var_os("HOME").ok_or("release proof tooling requires HOME")?;
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .unwrap_or_else(|| Path::new(&home).join(".cargo").into_os_string());
+    let rustup_home = release_rustup_home(&home)?;
+    let shim_dir = release_rustup_shim_dir(&home)?;
+    let path = release_tool_path(&shim_dir)?;
+    let mut command = Command::new("/usr/bin/python3");
+    command
+        .args([
+            "-I",
+            "-S",
+            "-c",
+            "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+        ])
+        .arg(
+            script
+                .parent()
+                .ok_or("release proof script has no parent directory")?,
+        )
+        .arg(script)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("TMPDIR", "/tmp")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("CARGO_HOME", cargo_home)
+        .env("RUSTUP_HOME", rustup_home)
+        .current_dir(repo_root);
+    Ok(command)
+}
+
+fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
+    let value = std::env::var_os("RUSTUP_HOME")
+        .unwrap_or_else(|| Path::new(home).join(".rustup").into_os_string());
+    if !Path::new(&value).is_absolute() {
+        return Err("release RUSTUP_HOME must be absolute".into());
+    }
+    Ok(value)
+}
+
+impl Drop for SealedCargoTake {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn checked_output(command: &mut Command, what: &str) -> Result<Output, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("could not {what}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output)
+}
+
+fn one_output_line<'a>(output: &'a Output, what: &str) -> Result<&'a str, String> {
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("{what} is not UTF-8: {error}"))?;
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    if line.is_empty() || line.contains(['\n', '\r']) {
+        return Err(format!("{what} did not emit exactly one line"));
+    }
+    Ok(line)
+}
+
 /// Run the whole build phase: per-arch cargo builds → lipo → dsymutil →
 /// strip → dSYM zip. Returns the ship-ready binaries.
 pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
-    // dist/ receives the dSYM below; create it up front (and keep the build
-    // OUTPUT out of Spotlight — see bundle.rs for the full WHY; touching the
-    // marker here too keeps a `--resume` that re-enters mid-pipeline covered).
-    std::fs::create_dir_all(&plan.out_dir)
-        .map_err(|e| format!("create {}: {e}", plan.out_dir.display()))?;
-    let _ = std::fs::write(plan.out_dir.join(".metadata_never_index"), "");
+    let mut take = SealedCargoTake::acquire(&plan.repo_root)?;
+    let staged_out = take.target_dir.join("dist");
+    let built = run_with_take(plan, &take, &staged_out);
+    let verified = take.verify();
+    let published = match (built, verified) {
+        (Ok(output), Ok(())) => publish_verified_output(&take, output, &plan.out_dir),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(build), Err(verify)) => Err(format!("{build}; additionally, {verify}")),
+    };
+    let released = take.release();
+    let mut errors = Vec::new();
+    if let Err(error) = &published {
+        errors.push(error.clone());
+    }
+    if let Err(error) = released {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        published
+    } else {
+        Err(errors.join("; additionally, "))
+    }
+}
+
+/// Move the verified release products out of the disposable Cargo target.
+///
+/// The binary is published first into a unique, private, owner-recorded
+/// directory. The hard link is one atomic filesystem operation and binds the
+/// handoff path to the exact inode that passed every post-strip gate. Only
+/// after that durable handoff succeeds are symbols moved into `dist/`.
+fn publish_verified_output(
+    take: &SealedCargoTake,
+    mut output: BuildOutput,
+    out_dir: &Path,
+) -> Result<BuildOutput, String> {
+    let take_identity = take
+        .source_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("release source take has no UTF-8 identity")?;
+    output.aterm = publish_verified_binary(
+        &take.repo_root,
+        &output.aterm,
+        take_identity,
+        take.lease_pid,
+        &take.lease_token,
+        take.release_uid,
+    )?;
+    publish_verified_symbols(output, out_dir, take.release_uid)
+}
+
+fn publish_verified_binary(
+    repo_root: &Path,
+    staged: &Path,
+    take_identity: &str,
+    lease_pid: u32,
+    lease_token: &str,
+    expected_uid: u32,
+) -> Result<PathBuf, String> {
+    if !is_lower_hex(take_identity, 64) {
+        return Err("release source take identity is not canonical SHA-256".into());
+    }
+    if lease_pid == 0 || !is_lower_hex(lease_token, 64) {
+        return Err("release product lease identity is malformed".into());
+    }
+
+    let parent = prepare_release_product_parent(repo_root, expected_uid)?;
+    let product = parent.join(format!("{take_identity}-{lease_pid}-{lease_token}"));
+    create_private_release_directory(&product, expected_uid, "release product")?;
+    let start = match process_start_identity(lease_pid) {
+        Ok(Some(start)) => start,
+        Ok(None) => {
+            let error = "release process disappeared while publishing its binary".to_owned();
+            return match std::fs::remove_dir_all(&product) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; additionally, remove product: {cleanup}")),
+            };
+        }
+        Err(error) => {
+            return match std::fs::remove_dir_all(&product) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; additionally, remove product: {cleanup}")),
+            };
+        }
+    };
+    if let Err(error) = write_release_target_owner(&product, lease_pid, &start, lease_token) {
+        return match std::fs::remove_dir_all(&product) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; additionally, remove product: {cleanup}")),
+        };
+    }
+
+    let publish = (|| {
+        let staged_file = open_release_file(
+            staged,
+            expected_uid,
+            0o500,
+            "verified staged release binary",
+        )?;
+        staged_file
+            .sync_all()
+            .map_err(|error| format!("persist verified staged release binary: {error}"))?;
+
+        let published = product.join("aterm");
+        std::fs::hard_link(staged, &published).map_err(|error| {
+            format!(
+                "atomically publish verified release binary {} -> {}: {error}",
+                staged.display(),
+                published.display()
+            )
+        })?;
+        let published_file =
+            open_release_file(&published, expected_uid, 0o500, "published release binary")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let staged_metadata = staged_file
+                .metadata()
+                .map_err(|error| format!("reinspect verified staged release binary: {error}"))?;
+            let published_metadata = published_file
+                .metadata()
+                .map_err(|error| format!("reinspect published release binary: {error}"))?;
+            if (staged_metadata.dev(), staged_metadata.ino())
+                != (published_metadata.dev(), published_metadata.ino())
+            {
+                return Err("published release binary is not the verified staged inode".to_owned());
+            }
+        }
+        published_file
+            .sync_all()
+            .map_err(|error| format!("persist published release binary: {error}"))?;
+        File::open(&product)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("persist release product directory: {error}"))?;
+        File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("persist release product parent: {error}"))?;
+        Ok(published)
+    })();
+
+    match publish {
+        Ok(published) => Ok(published),
+        Err(error) => {
+            match remove_owned_release_target(&product, expected_uid, lease_pid, lease_token) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; additionally, remove product: {cleanup}")),
+            }
+        }
+    }
+}
+
+fn publish_verified_symbols(
+    mut output: BuildOutput,
+    out_dir: &Path,
+    expected_uid: u32,
+) -> Result<BuildOutput, String> {
+    match std::fs::create_dir(out_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create release output directory {}: {error}",
+                out_dir.display()
+            ));
+        }
+    }
+    // `dist` is ignored and therefore can pre-exist as an attacker-controlled
+    // symlink. Validate and tighten it before any marker write or destructive
+    // replacement below can be redirected outside this checkout.
+    drop(open_release_directory(
+        out_dir,
+        expected_uid,
+        true,
+        "release output directory",
+    )?);
+    std::fs::write(out_dir.join(".metadata_never_index"), "")
+        .map_err(|error| format!("mark {} metadata-inert: {error}", out_dir.display()))?;
+    if let Some(staged) = output.dsym.take() {
+        let published = out_dir.join("aterm.dSYM");
+        match std::fs::remove_dir_all(&published) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("replace {}: {error}", published.display())),
+        }
+        std::fs::rename(&staged, &published).map_err(|error| {
+            format!(
+                "publish verified dSYM {} -> {}: {error}",
+                staged.display(),
+                published.display()
+            )
+        })?;
+        output.dsym = Some(published);
+    }
+    if let Some(staged) = output.dsym_zip.take() {
+        let name = staged
+            .file_name()
+            .ok_or("staged dSYM zip has no file name")?;
+        let published = out_dir.join(name);
+        match std::fs::remove_file(&published) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("replace {}: {error}", published.display())),
+        }
+        std::fs::rename(&staged, &published).map_err(|error| {
+            format!(
+                "publish verified dSYM zip {} -> {}: {error}",
+                staged.display(),
+                published.display()
+            )
+        })?;
+        output.dsym_zip = Some(published);
+    }
+    Ok(output)
+}
+
+fn run_with_take(
+    plan: &BuildPlan,
+    take: &SealedCargoTake,
+    symbol_out: &Path,
+) -> Result<BuildOutput, String> {
+    // dSYM output stays under the private release target until source and
+    // dependencies have passed their post-build verification. Only then is it
+    // moved into dist/, so an intentional output cannot perturb that check.
+    create_private_release_directory(symbol_out, take.release_uid, "release symbol stage")?;
 
     // --- per-arch builds --------------------------------------------------
     // arm64 first (the native slice), then x86_64 unless --arm64-only.
     //
-    // The native slice is a PLAIN cargo build: rust-toolchain.toml pins the
-    // Trust toolchain and .cargo/config.toml carries the one verification
-    // opt-out, so THE dev/test lane is the ship lane. No --target on purpose
-    // (host proc-macros and build scripts ride the same config rustflags).
-    // Provenance is hard-gated below: the built binary must self-report +t.
+    // The native slice is the ordinary Trust lane, now rooted in the immutable
+    // take acquired above. No --target on purpose (host proc-macros and build
+    // scripts ride the same config rustflags). Provenance remains hard-gated.
     let mut slices: Vec<Vec<PathBuf>> = vec![Vec::new(); PACKAGES.len()];
     let t = Instant::now();
     println!(
@@ -132,11 +1308,11 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
         // One crate can ship several bins (aterm-agent → fleet + drive);
         // `cargo build -p` produces them all, so build each package once.
         if !built.contains(pkg) {
-            build_one(plan, pkg, None)?;
+            build_one(plan, take, pkg, None)?;
             built.push(pkg);
         }
         // Native build (no --target) → artifacts under target/release.
-        slices[i].push(plan.repo_root.join("target/release").join(bin));
+        slices[i].push(take.target_dir.join("release").join(bin));
     }
     println!("    arm64 done in {}", fmt_elapsed(t));
 
@@ -148,14 +1324,14 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
         // --arm64-only to ship single-arch.
         let t = Instant::now();
         println!("==> [{X86_64}] upstream stable (+r): --target compat slice");
-        require_rustup_target(&plan.repo_root, X86_64)?;
+        require_rustup_target(X86_64)?;
         let mut built: Vec<&str> = Vec::new();
         for (i, (pkg, bin, _)) in PACKAGES.iter().enumerate() {
             if !built.contains(pkg) {
-                build_one(plan, pkg, Some(X86_64))?;
+                build_one(plan, take, pkg, Some(X86_64))?;
                 built.push(pkg);
             }
-            slices[i].push(target_bin(&plan.repo_root, X86_64, bin));
+            slices[i].push(target_bin(&take.target_dir, X86_64, bin));
         }
         println!("    x86_64 done in {}", fmt_elapsed(t));
     }
@@ -169,9 +1345,8 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
     }
 
     // --- lipo to universal (single-arch pass-through) ----------------------
-    let universal = plan.repo_root.join("target/universal");
-    std::fs::create_dir_all(&universal)
-        .map_err(|e| format!("create {}: {e}", universal.display()))?;
+    let universal = take.target_dir.join("universal");
+    create_private_release_directory(&universal, take.release_uid, "release universal stage")?;
     let mut fat: Vec<PathBuf> = Vec::new();
     for (i, (_, _, ship_name)) in PACKAGES.iter().enumerate() {
         let out = universal.join(ship_name);
@@ -186,17 +1361,15 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
     }
 
     // --- dSYM from the UN-stripped binary ----------------------------------
-    let (dsym, dsym_zip) =
-        extract_dsym(&fat[0], &plan.out_dir, &plan.short_version, &plan.repo_root)?;
+    let (dsym, dsym_zip) = extract_dsym(&fat[0], symbol_out, &plan.short_version, &plan.repo_root)?;
 
     // --- strip the SHIPPED copies ------------------------------------------
     // Symbols live in the archived .dSYM (matched by the Mach-O UUID, which
     // strip preserves); the bundle binaries stay small while crash reports
-    // remain symbolicatable. Stripping COPIES (target/universal/ship/) keeps
-    // the unstripped originals for a later re-run of dsymutil under --resume.
+    // remain symbolicatable. Stripping a private COPY keeps the unstripped
+    // original available to dsymutil until this source take is released.
     let ship_dir = universal.join("ship");
-    std::fs::create_dir_all(&ship_dir)
-        .map_err(|e| format!("create {}: {e}", ship_dir.display()))?;
+    create_private_release_directory(&ship_dir, take.release_uid, "release ship stage")?;
     let mut shipped: Vec<PathBuf> = Vec::new();
     for (src, (_, _, ship_name)) in fat.iter().zip(PACKAGES.iter()) {
         let dst = ship_dir.join(ship_name);
@@ -294,6 +1467,37 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
     })
 }
 
+fn cargo_build_args(
+    workspace_config: &Path,
+    source_config: &Path,
+    manifest: &Path,
+    pkg: &str,
+    target: Option<&str>,
+) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(16);
+    if target.is_none() {
+        args.push("--unverified".into());
+    }
+    args.extend([
+        "--config".into(),
+        workspace_config.as_os_str().to_owned(),
+        "--config".into(),
+        source_config.as_os_str().to_owned(),
+        "build".into(),
+        "--manifest-path".into(),
+        manifest.as_os_str().to_owned(),
+        "--release".into(),
+        "--locked".into(),
+        "--offline".into(),
+        "-p".into(),
+        pkg.into(),
+    ]);
+    if let Some(triple) = target {
+        args.extend(["--target".into(), triple.into()]);
+    }
+    args
+}
+
 /// One `cargo build --release -p <pkg>` invocation. `target` = None for the
 /// native Trust slice (the toolchain file supplies the compiler);
 /// `target` = Some(triple) for the upstream-stable compat slice.
@@ -301,59 +1505,81 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
 /// Output is streamed (not captured): release builds run for minutes and the
 /// operator needs cargo's own progress; on failure cargo has already printed
 /// the errors, so the returned Err only names the step.
-fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), String> {
+fn build_one(
+    plan: &BuildPlan,
+    take: &SealedCargoTake,
+    pkg: &str,
+    target: Option<&str>,
+) -> Result<(), String> {
+    for config in ["/.cargo/config.toml", "/.cargo/config"] {
+        match std::fs::symlink_metadata(config) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect root Cargo config {config}: {error}")),
+            Ok(_) => {
+                return Err(format!(
+                    "refusing ambient root Cargo config during sealed release build: {config}"
+                ));
+            }
+        }
+    }
     // The build driver, per lane. Native slice: `targo` from the Trust stage2
     // tool dir — never a PATH `cargo`, which since the stock-name purge is a
     // rustup shim the repo's toolchain pin can no longer satisfy. Compat
     // slice: upstream stable's `cargo` via the rustup shim — the ONE
     // deliberately stock lane (see the module docs; Trust DOES have an
     // x86_64-apple-darwin std, so that is not the reason).
-    let driver: (PathBuf, &'static str) = if target.is_some() {
-        (PathBuf::from("cargo"), "cargo")
+    let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
+    let compat_shim = if target.is_some() {
+        Some(release_rustup_shim_dir(&home)?)
+    } else {
+        None
+    };
+    let driver: (PathBuf, &'static str) = if let Some(shim) = &compat_shim {
+        (shim.join("cargo"), "cargo")
     } else {
         let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
         (stage2.join("targo"), "targo")
     };
     let (driver_path, driver_name) = driver;
     let mut cmd = Command::new(&driver_path);
-    cmd.current_dir(&plan.repo_root);
-    // targo refuses a bare verb: every artifact is EXPLICITLY verified
-    // (`targo trust build`) or explicitly not (`--unverified`). The workspace
-    // rides the unverified lane until the Trust-Std campaign greens — the
-    // same statement .cargo/config.toml's off-switch makes, now visible in
-    // the invocation. The compat slice's cargo has no such flag.
-    if target.is_none() {
-        cmd.arg("--unverified");
-    }
-    cmd.args(["build", "--release", "--locked", "-p", pkg]);
-    if let Some(triple) = target {
-        cmd.args(["--target", triple]);
-    }
+    cmd.current_dir("/");
+    // Targo's explicit unverified lane, the exact sealed dependency source,
+    // and offline resolution are one tested argument vector for both arches.
+    cmd.args(cargo_build_args(
+        &take.workspace_config,
+        &take.cargo_config,
+        &take.source_root.join("Cargo.toml"),
+        pkg,
+        target,
+    ));
 
     // Toolchain PATH, per lane. Native: the Trust stage2 bin dir first, so
     // targo resolves its co-located trustc/trustdoc (the physical dir —
-    // protected Trust drivers refuse symlinked toolchain paths). Compat:
-    // ~/.cargo/bin first so `cargo` resolves to the rustup shim and the
-    // RUSTUP_TOOLCHAIN=stable below picks the toolchain that carries the
-    // other Apple arch's std (port of build-app.sh's PATH preference; no-op
-    // when rustup isn't installed).
-    let old_path = std::env::var("PATH").unwrap_or_default();
-    if target.is_some() {
-        if let Some(home) = std::env::var_os("HOME") {
-            let shim = Path::new(&home).join(".cargo/bin");
-            if shim.join("rustup").is_file() {
-                cmd.env("PATH", format!("{}:{}", shim.display(), old_path));
-            }
-        }
-    } else if let Some(bin_dir) = driver_path.parent() {
-        cmd.env("PATH", format!("{}:{}", bin_dir.display(), old_path));
-    }
+    // protected Trust drivers refuse symlinked toolchain paths). Compat: the
+    // validated, canonical rustup shim directory first, so stable supplies
+    // the other Apple arch's std without an ambient PATH lookup.
+    let tool_dir = if let Some(shim) = &compat_shim {
+        shim
+    } else {
+        driver_path
+            .parent()
+            .ok_or("Trust build driver has no parent directory")?
+    };
+    let path = release_tool_path(tool_dir)?;
+    cmd.env_clear();
+    cmd.env("PATH", path)
+        .env("HOME", &home)
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TMPDIR", &take.temporary_dir)
+        .env("CARGO_HOME", &take.cargo_home);
 
     // THE build-number conduit (spec §2 propagation): build.rs reads
     // SOURCE_DATE_EPOCH for ATERM_BUILD_NUMBER **and** ATERM_BUILD_TIME, and a
     // valid epoch WINS over its live-git fallback — so the binary, the plist
     // stamp, and the manifest all carry the one claimed u64.
     cmd.env("SOURCE_DATE_EPOCH", plan.build_number.to_string());
+    cmd.env("CARGO_TARGET_DIR", &take.target_dir);
 
     // Real .dSYM: line-table debug info AND no stripping (the release
     // profile's strip=true would erase the debug map dsymutil follows).
@@ -390,7 +1616,8 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
     // exact app identity while Cargo.toml remains on its source-version line.
     cmd.env("ATERM_APP_RELEASE_VERSION", &plan.short_version);
     let lane = if target.is_some() {
-        cmd.env("RUSTUP_TOOLCHAIN", "stable");
+        cmd.env("RUSTUP_HOME", release_rustup_home(&home)?)
+            .env("RUSTUP_TOOLCHAIN", "stable");
         "upstream stable (+r) compat"
     } else {
         "Trust (+t)"
@@ -417,11 +1644,19 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
 /// `RUSTUP_TOOLCHAIN=stable`, and a bare `rustup target list` here would
 /// resolve the repo's `trust` toolchain (rust-toolchain.toml), which never
 /// carries rustup-managed targets. Also refuses when rustup itself is missing.
-fn require_rustup_target(repo_root: &Path, triple: &str) -> Result<(), String> {
-    let out = Command::new("rustup")
+fn require_rustup_target(triple: &str) -> Result<(), String> {
+    let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
+    let rustup_home = release_rustup_home(&home)?;
+    let shim = release_rustup_shim_dir(&home)?;
+    let rustup = shim.join("rustup");
+    let out = Command::new(&rustup)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", release_tool_path(&shim)?)
+        .env("RUSTUP_HOME", rustup_home)
         .env("RUSTUP_TOOLCHAIN", "stable")
         .args(["target", "list", "--installed"])
-        .current_dir(repo_root)
+        .current_dir("/")
         .output()
         .map_err(|e| format!("rustup not runnable ({e}) — install rustup or pass --arm64-only"))?;
     if !out.status.success() {
@@ -1139,12 +2374,8 @@ fn run_quiet(mut cmd: Command, what: &str) -> Result<(), String> {
 
 /// Where a `--target` build put a cargo binary (by its [`PACKAGES`] bin name;
 /// the SHIP rename happens at the lipo/copy step).
-fn target_bin(repo_root: &Path, triple: &str, bin: &str) -> PathBuf {
-    repo_root
-        .join("target")
-        .join(triple)
-        .join("release")
-        .join(bin)
+fn target_bin(target_dir: &Path, triple: &str, bin: &str) -> PathBuf {
+    target_dir.join(triple).join("release").join(bin)
 }
 
 /// "4m12s" / "38s" — per-step timing for the cut transcript (spec §6).
@@ -1160,13 +2391,19 @@ fn fmt_elapsed(start: Instant) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::sync::{Arc, Barrier};
 
     use super::{
-        LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, SECTION_64_LEN,
-        SEGMENT_COMMAND_64_LEN, parse_thin_macho_update_pin, validate_app_version_reports,
+        BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
+        RELEASE_SYSTEM_PATH, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, cargo_build_args,
+        cleanup_release_target_residue_with, create_private_release_directory, current_release_uid,
+        fresh_lease_token, is_lower_hex, parse_thin_macho_update_pin,
+        prepare_release_target_parent, publish_verified_binary, publish_verified_symbols,
+        release_tool_path, resolve_release_rustup_shim_dir, validate_app_version_reports,
         validate_cli_app_version, validate_embedded_update_pin, validate_final_slice_records,
         validate_lipo_architectures, validate_named_cli_app_version,
-        validate_slice_update_pin_reports,
+        validate_slice_update_pin_reports, write_release_target_owner,
     };
 
     const EXPECTED: &str = "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4";
@@ -1180,6 +2417,439 @@ mod tests {
 
     fn report(pin: &str) -> String {
         format!("aterm diagnostics\nupdate-pin-sha256: {pin}\nrenderer: gpu\n")
+    }
+
+    fn create_test_rustup_shims(directory: &std::path::Path) {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for tool in ["cargo", "rustup"] {
+            let path = directory.join(tool);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rustup_shim_resolver_prefers_standard_and_builds_a_closed_path() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let home = scratch.0.join("home");
+        let standard = home.join(".cargo/bin");
+        let fallback = scratch.0.join("fallback/bin");
+        create_test_rustup_shims(&standard);
+        create_test_rustup_shims(&fallback);
+
+        let resolved =
+            resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
+                .unwrap();
+        assert_eq!(resolved, standard.canonicalize().unwrap());
+        assert_eq!(
+            release_tool_path(&resolved).unwrap(),
+            std::ffi::OsString::from(format!("{}:{RELEASE_SYSTEM_PATH}", resolved.display()))
+        );
+    }
+
+    #[test]
+    fn rustup_shim_resolver_canonicalizes_the_homebrew_fallback() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let home = scratch.0.join("home");
+        let cellar = scratch.0.join("Cellar/rustup/1.0");
+        let opt = scratch.0.join("opt");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&opt).unwrap();
+        create_test_rustup_shims(&cellar.join("bin"));
+        symlink(&cellar, opt.join("rustup")).unwrap();
+
+        let resolved = resolve_release_rustup_shim_dir(
+            &home,
+            &opt.join("rustup/bin"),
+            current_release_uid().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved, cellar.join("bin").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn rustup_shim_resolver_refuses_an_unsafe_standard_instead_of_falling_back() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let home = scratch.0.join("home");
+        let standard = home.join(".cargo/bin");
+        let fallback = scratch.0.join("fallback/bin");
+        create_test_rustup_shims(&standard);
+        create_test_rustup_shims(&fallback);
+        std::fs::set_permissions(&standard, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let error =
+            resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
+                .unwrap_err();
+        assert!(error.contains("group/other-writable"), "{error}");
+    }
+
+    #[test]
+    fn rustup_shim_resolver_requires_owned_real_executables() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let home = scratch.0.join("home");
+        let standard = home.join(".cargo/bin");
+        let fallback = scratch.0.join("fallback/bin");
+        create_test_rustup_shims(&standard);
+        create_test_rustup_shims(&fallback);
+        std::fs::remove_file(standard.join("cargo")).unwrap();
+        symlink("rustup", standard.join("cargo")).unwrap();
+
+        let error =
+            resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
+                .unwrap_err();
+        assert!(error.contains("not a real regular file"), "{error}");
+    }
+
+    #[test]
+    fn both_release_arches_use_one_locked_offline_dependency_source() {
+        let workspace_config = std::path::Path::new("/private/take/.cargo/config.toml");
+        let source_config =
+            std::path::Path::new("/private/take/.aterm-proof-registry/.cargo/config.toml");
+        let manifest = std::path::Path::new("/private/take/Cargo.toml");
+        let native = cargo_build_args(workspace_config, source_config, manifest, "aterm", None);
+        let compat = cargo_build_args(
+            workspace_config,
+            source_config,
+            manifest,
+            "aterm",
+            Some("x86_64-apple-darwin"),
+        );
+        let text = |args: &[std::ffi::OsString]| {
+            args.iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let native = text(&native);
+        let compat = text(&compat);
+        for args in [&native, &compat] {
+            for config in [workspace_config, source_config] {
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--config", config.to_str().unwrap()])
+                );
+            }
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--manifest-path", manifest.to_str().unwrap()])
+            );
+            assert!(args.contains(&"--locked".to_owned()));
+            assert!(args.contains(&"--offline".to_owned()));
+        }
+        assert_eq!(native.first().map(String::as_str), Some("--unverified"));
+        assert!(!compat.contains(&"--unverified".to_owned()));
+        assert!(
+            compat
+                .windows(2)
+                .any(|pair| pair == ["--target", "x86_64-apple-darwin"])
+        );
+    }
+
+    #[test]
+    fn release_take_tokens_are_unique_canonical_hex() {
+        let first = fresh_lease_token().unwrap();
+        let second = fresh_lease_token().unwrap();
+        assert!(is_lower_hex(&first, 64));
+        assert!(is_lower_hex(&second, 64));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn release_target_gc_removes_only_positively_dead_owners() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let parent = scratch.0.join("release-takes");
+        std::fs::create_dir(&parent).unwrap();
+        let take = "a".repeat(64);
+        let token = "b".repeat(64);
+        for pid in 1..=6 {
+            std::fs::create_dir(parent.join(format!("{take}-{pid}-{token}"))).unwrap();
+        }
+        let abandoned = parent.join(format!("{take}-7-{token}"));
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::create_dir(parent.join("unrelated")).unwrap();
+
+        cleanup_release_target_residue_with(&parent, |pid| {
+            Ok((pid <= 6).then(|| "live process".to_owned()))
+        })
+        .unwrap();
+
+        let retained = std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != "unrelated")
+            .count();
+        assert_eq!(retained, 6);
+        assert!(!abandoned.exists());
+        assert!(parent.join("unrelated").is_dir());
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for pid in 1..=6 {
+            assert_eq!(
+                std::fs::metadata(parent.join(format!("{take}-{pid}-{token}")))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn release_build_directories_and_owner_are_private_and_owned() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let uid = current_release_uid().unwrap();
+        let parent = scratch.0.join("release-takes");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let target = parent.join(format!("{}-1-{}", "a".repeat(64), "b".repeat(64)));
+        create_private_release_directory(&target, uid, "test release target").unwrap();
+        let cargo_home = target.join("cargo-home");
+        let temporary = target.join("tmp");
+        create_private_release_directory(&cargo_home, uid, "test Cargo home").unwrap();
+        create_private_release_directory(&temporary, uid, "test temporary directory").unwrap();
+        write_release_target_owner(&target, 1, "test process", &"b".repeat(64)).unwrap();
+
+        // The production parent preparation tightens an existing owned base.
+        super::open_release_directory(&parent, uid, true, "test release parent").unwrap();
+        for directory in [&parent, &target, &cargo_home, &temporary] {
+            let metadata = std::fs::symlink_metadata(directory).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert_eq!(metadata.uid(), uid);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        let owner = std::fs::symlink_metadata(target.join(".owner")).unwrap();
+        assert!(owner.file_type().is_file());
+        assert_eq!(owner.uid(), uid);
+        assert_eq!(owner.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn release_target_gc_refuses_a_symlinked_base() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let outside = scratch.0.join("outside");
+        let base = scratch.0.join("release-takes");
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("keep");
+        std::fs::write(&sentinel, "not residue").unwrap();
+        symlink(&outside, &base).unwrap();
+
+        let error = cleanup_release_target_residue_with(&base, |_| Ok(None)).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "not residue");
+    }
+
+    #[test]
+    fn release_target_parent_refuses_a_symlinked_target_root() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        let outside = scratch.0.join("outside-target");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, repo.join("target")).unwrap();
+
+        let error = prepare_release_target_parent(&repo).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(!outside.join("release-takes").exists());
+    }
+
+    #[test]
+    fn verified_binary_publication_is_atomic_and_concurrency_isolated() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        prepare_release_target_parent(&repo).unwrap();
+        let target = repo.join("target");
+        let first_stage = target.join("first-stage");
+        let second_stage = target.join("second-stage");
+        std::fs::create_dir(&first_stage).unwrap();
+        std::fs::create_dir(&second_stage).unwrap();
+        let first_binary = first_stage.join("aterm");
+        let second_binary = second_stage.join("aterm");
+        std::fs::write(&first_binary, "first verified binary").unwrap();
+        std::fs::write(&second_binary, "second verified binary").unwrap();
+
+        let uid = current_release_uid().unwrap();
+        let pid = std::process::id();
+        let take = "a".repeat(64);
+        let first_token = "b".repeat(64);
+        let second_token = "c".repeat(64);
+        let barrier = Arc::new(Barrier::new(3));
+        let spawn_publish = |staged: std::path::PathBuf, token: String| {
+            let repo = repo.clone();
+            let take = take.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                publish_verified_binary(&repo, &staged, &take, pid, &token, uid)
+            })
+        };
+        let first = spawn_publish(first_binary.clone(), first_token);
+        let second = spawn_publish(second_binary.clone(), second_token);
+        barrier.wait();
+        let first_published = first.join().unwrap().unwrap();
+        let second_published = second.join().unwrap().unwrap();
+
+        assert_ne!(first_published, second_published);
+        assert_eq!(
+            std::fs::read_to_string(&first_published).unwrap(),
+            "first verified binary"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_published).unwrap(),
+            "second verified binary"
+        );
+        for (staged, published) in [
+            (&first_binary, &first_published),
+            (&second_binary, &second_published),
+        ] {
+            let staged = std::fs::symlink_metadata(staged).unwrap();
+            let published_metadata = std::fs::symlink_metadata(published).unwrap();
+            assert!(published_metadata.file_type().is_file());
+            assert_eq!(published_metadata.uid(), uid);
+            assert_eq!(published_metadata.permissions().mode() & 0o777, 0o500);
+            assert_eq!(
+                (staged.dev(), staged.ino()),
+                (published_metadata.dev(), published_metadata.ino())
+            );
+            let directory = std::fs::symlink_metadata(published.parent().unwrap()).unwrap();
+            assert_eq!(directory.uid(), uid);
+            assert_eq!(directory.permissions().mode() & 0o777, 0o700);
+        }
+        let product_parent = std::fs::symlink_metadata(target.join("release-products")).unwrap();
+        assert_eq!(product_parent.uid(), uid);
+        assert_eq!(product_parent.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn verified_binary_publication_refuses_a_symlinked_product_base() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        let outside = scratch.0.join("outside-products");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        prepare_release_target_parent(&repo).unwrap();
+        let sentinel = outside.join("keep");
+        std::fs::write(&sentinel, "outside").unwrap();
+        symlink(&outside, repo.join("target/release-products")).unwrap();
+        let staged = repo.join("target/staged-aterm");
+        std::fs::write(&staged, "verified").unwrap();
+
+        let error = publish_verified_binary(
+            &repo,
+            &staged,
+            &"a".repeat(64),
+            std::process::id(),
+            &"b".repeat(64),
+            current_release_uid().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "outside");
+        assert!(!outside.join("aterm").exists());
+    }
+
+    #[test]
+    fn verified_binary_publication_refuses_an_unowned_destination() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        prepare_release_target_parent(&repo).unwrap();
+        let staged = repo.join("target/staged-aterm");
+        std::fs::write(&staged, "verified").unwrap();
+        let uid = current_release_uid().unwrap();
+        let wrong_uid = if uid == 0 { 1 } else { 0 };
+
+        let error = publish_verified_binary(
+            &repo,
+            &staged,
+            &"a".repeat(64),
+            std::process::id(),
+            &"b".repeat(64),
+            wrong_uid,
+        )
+        .unwrap_err();
+        assert!(error.contains("owned by uid"), "{error}");
+        assert!(!repo.join("target/release-products").exists());
+    }
+
+    #[test]
+    fn verified_symbols_publish_only_from_the_private_stage() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let stage = scratch.0.join("stage");
+        let out = scratch.0.join("dist");
+        let dsym = stage.join("aterm.dSYM");
+        let zip = stage.join("aterm-0.67.0-dSYM.zip");
+        std::fs::create_dir_all(&dsym).unwrap();
+        std::fs::write(dsym.join("symbol"), "verified").unwrap();
+        std::fs::write(&zip, "archive").unwrap();
+
+        let published = publish_verified_symbols(
+            BuildOutput {
+                aterm: scratch.0.join("aterm"),
+                archs: "arm64".into(),
+                compiler_line: "trust".into(),
+                dsym: Some(dsym),
+                dsym_zip: Some(zip),
+            },
+            &out,
+            current_release_uid().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(published.dsym, Some(out.join("aterm.dSYM")));
+        assert_eq!(published.dsym_zip, Some(out.join("aterm-0.67.0-dSYM.zip")));
+        assert_eq!(
+            std::fs::read_to_string(out.join("aterm.dSYM/symbol")).unwrap(),
+            "verified"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("aterm-0.67.0-dSYM.zip")).unwrap(),
+            "archive"
+        );
+        assert!(out.join(".metadata_never_index").is_file());
+        let out_metadata = std::fs::symlink_metadata(out).unwrap();
+        assert_eq!(out_metadata.uid(), current_release_uid().unwrap());
+        assert_eq!(out_metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn verified_symbols_refuse_a_symlinked_output_directory() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let stage = scratch.0.join("stage");
+        let outside = scratch.0.join("outside-dist");
+        let out = scratch.0.join("dist");
+        let dsym = stage.join("aterm.dSYM");
+        std::fs::create_dir_all(&dsym).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("aterm.dSYM");
+        std::fs::create_dir(&sentinel).unwrap();
+        std::fs::write(sentinel.join("keep"), "outside").unwrap();
+        symlink(&outside, &out).unwrap();
+
+        let error = match publish_verified_symbols(
+            BuildOutput {
+                aterm: scratch.0.join("aterm"),
+                archs: "arm64".into(),
+                compiler_line: "trust".into(),
+                dsym: Some(dsym.clone()),
+                dsym_zip: None,
+            },
+            &out,
+            current_release_uid().unwrap(),
+        ) {
+            Ok(_) => panic!("symlinked release output was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("not a real directory"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(sentinel.join("keep")).unwrap(),
+            "outside"
+        );
+        assert!(dsym.is_dir());
     }
 
     fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {

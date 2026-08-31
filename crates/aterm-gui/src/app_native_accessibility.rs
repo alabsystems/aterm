@@ -24,8 +24,18 @@ impl App {
         wid: WindowId,
         view: ViewId,
         _compiled: &CompiledUi,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) {
-        let Ok((owners, focused_native)) = self.visible_native_accessibility_owners(wid) else {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|window| !window.a11y_active)
+        {
+            self.clear_staged_native_accessibility(wid);
+            return;
+        }
+        let Ok((owners, focused_native)) = self.visible_native_accessibility_owners_from_plan(plan)
+        else {
             self.clear_staged_native_accessibility(wid);
             return;
         };
@@ -36,21 +46,39 @@ impl App {
             self.clear_staged_native_accessibility(wid);
             return;
         }
-        let Ok(projection) =
-            self.retained_native_accessibility_projection(wid, &owners, focused_native, false)
-        else {
+        let Ok(projection) = self.retained_native_accessibility_projection(
+            wid,
+            &owners,
+            focused_native,
+            false,
+            plan,
+        ) else {
             self.clear_staged_native_accessibility(wid);
             return;
         };
+        let staged = StagedNativeAccessibility::new(owners, projection);
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.native_a11y_staged = Some(StagedNativeAccessibility { owners, projection });
+            ws.native_a11y_staged = Some(staged);
         }
     }
 
     /// Stage one composite from the retained semantic artifacts painted for all
     /// visible native siblings in a heterogeneous frame.
-    pub(crate) fn stage_visible_native_accessibility(&mut self, wid: WindowId) {
-        let Ok((owners, focused_native)) = self.visible_native_accessibility_owners(wid) else {
+    pub(crate) fn stage_visible_native_accessibility(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|window| !window.a11y_active)
+        {
+            self.clear_staged_native_accessibility(wid);
+            return;
+        }
+        let Ok((owners, focused_native)) = self.visible_native_accessibility_owners_from_plan(plan)
+        else {
             self.clear_staged_native_accessibility(wid);
             return;
         };
@@ -58,14 +86,19 @@ impl App {
             self.clear_staged_native_accessibility(wid);
             return;
         }
-        let Ok(projection) =
-            self.retained_native_accessibility_projection(wid, &owners, focused_native, false)
-        else {
+        let Ok(projection) = self.retained_native_accessibility_projection(
+            wid,
+            &owners,
+            focused_native,
+            false,
+            plan,
+        ) else {
             self.clear_staged_native_accessibility(wid);
             return;
         };
+        let staged = StagedNativeAccessibility::new(owners, projection);
         if let Some(window) = self.windows.get_mut(&wid) {
-            window.native_a11y_staged = Some(StagedNativeAccessibility { owners, projection });
+            window.native_a11y_staged = Some(staged);
         }
     }
 
@@ -76,16 +109,33 @@ impl App {
         &mut self,
         wid: WindowId,
     ) -> Option<Result<(accesskit::TreeUpdate, PublishedNativeAccessibility), String>> {
-        let (owners, focused_native) = match self.visible_native_accessibility_owners(wid) {
-            Ok((owners, focused_native)) if !owners.is_empty() => (owners, focused_native),
-            Ok(_) => return None,
-            Err(error) => return Some(Err(error)),
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return Some(Err(
+                "native accessibility window is no longer live".to_string()
+            ));
         };
-        let staged = self
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.native_a11y_staged.take())
-            .filter(|staged| staged.owners == owners);
+        self.take_native_accessibility_update_from_plan(wid, &plan)
+    }
+
+    pub(crate) fn take_native_accessibility_update_from_plan(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<Result<(accesskit::TreeUpdate, PublishedNativeAccessibility), String>> {
+        let (owners, focused_native) =
+            match self.visible_native_accessibility_owners_from_plan(plan) {
+                Ok((owners, focused_native)) if !owners.is_empty() => (owners, focused_native),
+                Ok(_) => return None,
+                Err(error) => return Some(Err(error)),
+            };
+        let staged = self.windows.get_mut(&wid).and_then(|ws| {
+            let staged = ws.native_a11y_staged.take()?;
+            // Native preparation stages before `apply_title`, while publish
+            // follows it. A title-only same-frame change therefore invalidates
+            // the staged root even though every view generation still matches;
+            // reject it and recompose from this frame's retained leaves below.
+            staged.matches(&owners, &ws.current_title).then_some(staged)
+        });
 
         let projection = match staged {
             Some(staged) => staged.projection,
@@ -95,6 +145,7 @@ impl App {
                     &owners,
                     focused_native,
                     true,
+                    plan,
                 ) {
                     Ok(projection) => projection,
                     Err(error) => return Some(Err(error)),
@@ -117,11 +168,12 @@ impl App {
         owners: &[AccessibilityOwner],
         focused_native: Option<ViewId>,
         require_presented: bool,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) -> Result<NativeAccessibilityProjection, String> {
         let mut projections = Vec::with_capacity(owners.len());
         for owner in owners {
             let artifact = self
-                .retained_native_leaf_artifact(wid, owner.view, require_presented)
+                .retained_native_leaf_artifact_from_plan(wid, owner.view, require_presented, plan)
                 .ok_or_else(|| "native accessibility retained leaf is stale".to_string())?;
             if artifact.generation != owner.generation {
                 return Err("native accessibility retained leaf is stale".to_string());
@@ -163,6 +215,13 @@ impl App {
         let plan = self
             .active_visible_leaf_plan(wid)
             .ok_or_else(|| "native accessibility window is no longer live".to_string())?;
+        self.visible_native_accessibility_owners_from_plan(&plan)
+    }
+
+    fn visible_native_accessibility_owners_from_plan(
+        &self,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Result<(Vec<AccessibilityOwner>, Option<ViewId>), String> {
         let mut owners = Vec::new();
         let mut focused_native = None;
         for leaf in &plan.leaves {
@@ -395,6 +454,91 @@ mod tests {
     use crate::native_settings::SettingsRoute;
     use crate::native_ui::UiKey;
 
+    fn set_a11y_active(app: &mut App, wid: WindowId, active: bool) {
+        app.windows
+            .get_mut(&wid)
+            .expect("headless window")
+            .a11y_active = active;
+    }
+
+    #[test]
+    fn native_staging_is_idle_until_an_accessibility_client_attaches() {
+        let wid = WindowId(0);
+        let mut single = App::headless_for_test();
+        assert!(single.open_settings_tab(SettingsRoute::About));
+        assert!(single.prepare_native_input_scratch(wid));
+        assert!(
+            single.windows[&wid].native_a11y_staged.is_none(),
+            "an inactive adapter must not build a staged tree"
+        );
+        let (_, view) = single.active_native_view(wid).unwrap();
+        let compiled = single.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("the visual native frame was still prepared")
+            .compiled
+            .clone();
+        assert!(
+            !compiled.semantics.is_empty(),
+            "negative control: this frame would build a non-empty accessibility tree"
+        );
+        let plan = single.active_visible_leaf_plan(wid).unwrap();
+        set_a11y_active(&mut single, wid, true);
+        single.stage_native_accessibility(wid, view, &compiled, &plan);
+        assert_eq!(
+            single.windows[&wid]
+                .native_a11y_staged
+                .as_ref()
+                .expect("attachment enables staging")
+                .owners
+                .len(),
+            1
+        );
+        set_a11y_active(&mut single, wid, false);
+        single.stage_native_accessibility(wid, view, &compiled, &plan);
+        assert!(
+            single.windows[&wid].native_a11y_staged.is_none(),
+            "deactivation clears an older stage"
+        );
+
+        let mut composite = App::headless_for_test();
+        assert!(composite.open_settings_tab(SettingsRoute::Home));
+        let (instance, _) = composite.active_native_view(wid).unwrap();
+        composite
+            .split_active_with_native(
+                wid,
+                crate::tab_model::SplitAxis::Horizontal,
+                instance,
+                AppViewState::Settings(Box::new(crate::native_settings::SettingsViewState::new(
+                    &composite.config,
+                ))),
+            )
+            .unwrap();
+        assert!(composite.prepare_heterogeneous_input_scratch(wid).is_some());
+        assert!(composite.windows[&wid].native_a11y_staged.is_none());
+        assert_eq!(
+            composite.windows[&wid]
+                .leaf_render_cache
+                .values()
+                .filter(|cache| cache.native.is_some())
+                .count(),
+            2,
+            "negative control: both native leaves were visually prepared"
+        );
+        let plan = composite.active_visible_leaf_plan(wid).unwrap();
+        set_a11y_active(&mut composite, wid, true);
+        composite.stage_visible_native_accessibility(wid, &plan);
+        assert_eq!(
+            composite.windows[&wid]
+                .native_a11y_staged
+                .as_ref()
+                .expect("attachment enables composite staging")
+                .owners
+                .len(),
+            2
+        );
+    }
+
     #[derive(Clone, Copy)]
     struct RouteProjection {
         owner_one_generation: i64,
@@ -475,6 +619,7 @@ mod tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         assert!(app.open_settings_tab(SettingsRoute::About));
+        set_a11y_active(&mut app, wid, true);
         let (_, view) = app.active_native_view(wid).expect("native Settings view");
         let generation = app
             .native_runtime
@@ -523,7 +668,8 @@ mod tests {
         .expect("expected accessibility projection")
         .into_update();
 
-        app.stage_native_accessibility(wid, view, &compiled);
+        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+        app.stage_native_accessibility(wid, view, &compiled, &plan);
         let (actual, published) = app
             .take_native_accessibility_update(wid)
             .expect("active native view")
@@ -571,6 +717,70 @@ mod tests {
     }
 
     #[test]
+    fn title_advanced_after_staging_is_authoritative_in_the_same_publish() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(SettingsRoute::About));
+        set_a11y_active(&mut app, wid, true);
+        app.windows.get_mut(&wid).unwrap().current_title = "before redraw".into();
+        assert!(app.prepare_native_input_scratch(wid));
+
+        let staged = app.windows[&wid]
+            .native_a11y_staged
+            .as_ref()
+            .expect("native preparation stages accessibility");
+        let staged_root = staged
+            .projection
+            .update()
+            .tree
+            .as_ref()
+            .expect("staged window tree")
+            .root;
+        assert_eq!(
+            staged
+                .projection
+                .update()
+                .nodes
+                .iter()
+                .find(|(node, _)| *node == staged_root)
+                .unwrap()
+                .1
+                .label(),
+            Some("before redraw"),
+            "negative control: staging really captured the preceding title"
+        );
+
+        let (_, view) = app.active_native_view(wid).expect("native Settings view");
+        app.windows
+            .get_mut(&wid)
+            .and_then(|window| window.leaf_render_cache.get_mut(&view))
+            .and_then(|cache| cache.native.as_mut())
+            .expect("retained native raster")
+            .presented = true;
+        // This is the ordering in a live redraw: native paint staged the tree,
+        // then `apply_title` advanced `current_title`, then a successful present
+        // asks accessibility to publish.
+        app.windows.get_mut(&wid).unwrap().current_title = "same-frame title".into();
+
+        let (update, _) = app
+            .take_native_accessibility_update(wid)
+            .expect("active native view")
+            .expect("same-frame projection");
+        let root = update.tree.as_ref().expect("published window tree").root;
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .find(|(node, _)| *node == root)
+                .unwrap()
+                .1
+                .label(),
+            Some("same-frame title"),
+            "publish must reject the stale staged label and recompose from the retained frame"
+        );
+    }
+
+    #[test]
     fn editor_publish_retains_visible_text_coordinates_and_canonical_source_bytes() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -582,6 +792,7 @@ mod tests {
         std::fs::write(&path, "alpha\naé\tz\nomega\n").unwrap();
         let uri = format!("file://{}", path.to_string_lossy());
         app.open_document_tab(AppKind::Editor, &uri).unwrap();
+        set_a11y_active(&mut app, wid, true);
 
         let (instance, view) = app.active_native_view(wid).expect("native editor view");
         let document = app
@@ -596,7 +807,8 @@ mod tests {
             .unwrap()
             .compiled
             .clone();
-        app.stage_native_accessibility(wid, view, &compiled);
+        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+        app.stage_native_accessibility(wid, view, &compiled, &plan);
         let (update, published) = app
             .take_native_accessibility_update(wid)
             .expect("native update")
@@ -802,6 +1014,7 @@ mod tests {
             )
             .expect("second Settings view");
         assert_eq!(app.active_native_view(wid), Some((instance, second)));
+        set_a11y_active(&mut app, wid, true);
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
 
         let (frame_x, frame_y) = app.frame_origin(wid);
@@ -1178,6 +1391,7 @@ mod tests {
             app.active_visible_leaf_plan(wid).unwrap().focused,
             terminal_view
         );
+        set_a11y_active(&mut app, wid, true);
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
         let root_key = app.windows[&wid].leaf_render_cache[&native_view]
             .native
@@ -1237,6 +1451,7 @@ mod tests {
                 ))),
             )
             .unwrap();
+        set_a11y_active(&mut app, wid, true);
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
         let first_key = app.windows[&wid].leaf_render_cache[&first]
             .native

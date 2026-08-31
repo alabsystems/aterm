@@ -182,19 +182,22 @@ impl DocumentStore {
         let nonzero = NonZeroU64::new(raw).expect("document ids start at one");
         let id = DocumentId(nonzero);
         let mut surface = Surface::new(SurfaceId(nonzero));
-        surface.apply(&WriteCap, SurfaceEdit::AppendLine(text.clone()));
+        // Surface owns the original String allocation; the flat Arc projection
+        // is the separate immutable cache shared by every document snapshot.
+        let projection: Arc<str> = Arc::from(text.as_str());
+        surface.apply(&WriteCap, SurfaceEdit::AppendLine(text));
         let head = surface.seq();
-        let text_rope = crate::native_text::TextRope::from(text.as_str());
-        let projection: Arc<str> = Arc::from(text);
+        let text_rope = crate::native_text::TextRope::from(projection.as_ref());
+        let content_fingerprint = fingerprint(&projection);
         let document = Document {
             id,
             canonical_uri: canonical_uri.clone(),
             surface,
             text: text_rope,
-            projection: projection.clone(),
+            projection,
             revision: 1,
             file_version: FileVersion {
-                content_fingerprint: fingerprint(&projection),
+                content_fingerprint,
             },
             checkpoint_seq: head,
             views: BTreeMap::new(),
@@ -350,7 +353,11 @@ impl DocumentStore {
         let Ok(next_text) = document.text.replace_many(&rope_edits) else {
             return DocumentTxnOutcome::Rejected(DocumentError::InvalidRange);
         };
+        // Flatten once for Surface, then publish a separate immutable projection
+        // allocation shared by every read snapshot. Keeping the frozen Surface
+        // Edit(String) API costs this one copy at the ownership boundary.
         let next = next_text.to_flat_string();
+        let next_projection: Arc<str> = Arc::from(next.as_str());
         let deltas = edits
             .iter()
             .map(|edit| EditDelta {
@@ -358,11 +365,10 @@ impl DocumentStore {
                 inserted_len: edit.insert.len(),
             })
             .collect::<Vec<_>>();
-        let outcome = document.surface.transact(
-            &WriteCap,
-            base,
-            vec![SurfaceEdit::SetLine(LineId(0), next.clone())],
-        );
+        let outcome =
+            document
+                .surface
+                .transact(&WriteCap, base, vec![SurfaceEdit::SetLine(LineId(0), next)]);
         let Seq(seq) = match outcome {
             TxnOutcome::Committed(seq) => seq,
             TxnOutcome::Conflict => {
@@ -373,7 +379,7 @@ impl DocumentStore {
         };
         let committed = Seq(seq);
         document.text = next_text;
-        document.projection = Arc::from(next);
+        document.projection = next_projection;
         document.revision = document.revision.saturating_add(1);
         document.file_version = FileVersion {
             content_fingerprint: fingerprint(&document.projection),
@@ -701,6 +707,29 @@ mod tests {
         assert_eq!(seq.0, base.0 + 1, "one transaction is one spine event");
         assert_eq!(store.snapshot(id).unwrap().text.as_ref(), "goodbye\nmoon");
         assert_eq!(store.surface_text(id).as_deref(), Some("goodbye\nmoon"));
+    }
+
+    #[test]
+    fn snapshots_share_the_committed_projection_allocation() {
+        let (mut store, id) = open();
+        let before = store.snapshot(id).unwrap();
+        let DocumentTxnOutcome::Committed { .. } = store.transact(
+            id,
+            before.seq,
+            vec![TextEdit {
+                range: 5..5,
+                insert: "!".into(),
+            }],
+        ) else {
+            panic!("expected commit");
+        };
+
+        let projection = &store.documents.get(&id).unwrap().projection;
+        let first = store.snapshot(id).unwrap();
+        let second = store.snapshot(id).unwrap();
+        assert!(Arc::ptr_eq(projection, &first.text));
+        assert!(Arc::ptr_eq(&first.text, &second.text));
+        assert_eq!(first.text.as_ref(), "hello!\nworld");
     }
 
     #[test]

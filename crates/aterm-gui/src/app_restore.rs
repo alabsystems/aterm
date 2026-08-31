@@ -1050,7 +1050,11 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| !ws.tab_set.is_empty())
         {
-            debug_assert!(self.structural_invariants_ok());
+            debug_assert!(
+                self.structural_invariants_ok(),
+                "{}",
+                self.structural_invariant_violation().unwrap_or_default(),
+            );
         }
     }
 
@@ -1164,7 +1168,11 @@ impl App {
             .get(&wid)
             .is_some_and(|window| !window.tab_set.is_empty())
         {
-            debug_assert!(self.structural_invariants_ok());
+            debug_assert!(
+                self.structural_invariants_ok(),
+                "{}",
+                self.structural_invariant_violation().unwrap_or_default(),
+            );
         }
     }
 
@@ -1994,7 +2002,11 @@ impl App {
         let switched = window.tab_set.switch_to(id);
         debug_assert!(switched);
         self.resync_active_or_window(wid);
-        debug_assert!(self.structural_invariants_ok());
+        debug_assert!(
+            self.structural_invariants_ok(),
+            "{}",
+            self.structural_invariant_violation().unwrap_or_default(),
+        );
         Ok(id)
     }
 

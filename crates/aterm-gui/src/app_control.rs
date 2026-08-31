@@ -1854,9 +1854,13 @@ mod tests {
         ));
 
         let before_paste_revision = find_inspection[0].clone();
-        assert!(
-            app.native_input_event(wid, &crate::input::InputEvent::Paste("needle".to_string()),)
-        );
+        assert!(app.native_input_event(
+            wid,
+            &crate::input::InputEvent::Paste(
+                "needle".to_string(),
+                crate::input::PasteFraming::AtDrain
+            ),
+        ));
         let Some(crate::native_app::AppViewState::Editor(state)) =
             app.native_runtime.view_state(view)
         else {

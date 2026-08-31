@@ -10,6 +10,7 @@ use super::*;
 
 mod basic;
 mod decompression;
+mod image_horizon;
 mod line_limit;
 mod memory_budget;
 mod repaired_trimmed;

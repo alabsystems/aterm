@@ -200,7 +200,7 @@ pub(crate) struct ColdMetrics {
 // Devirtualized dispatch over the two concrete backends. The former
 // `inner()`/`inner_mut()` helpers erased the backend to `&dyn ScrollbackAccess`,
 // so every delegated call was a virtual call whose callee body the strict L0
-// gate could not resolve in the lowered bundle — each of the 19 delegations
+// gate could not resolve in the lowered bundle — each of the 20 delegations
 // carried a [trust-absent-callee-assumption] "may panic" obligation. Matching
 // on the enum and invoking the trait method on the CONCRETE backend performs
 // the exact dispatch decision the vtable would have made (the `#[non_exhaustive]`
@@ -221,7 +221,7 @@ macro_rules! dispatch {
 }
 
 impl ScrollbackStorage {
-    // --- Delegated via ScrollbackAccess (19 methods) ---
+    // --- Delegated via ScrollbackAccess (20 methods) ---
 
     /// Get the total number of lines.
     #[must_use]
@@ -323,6 +323,19 @@ impl ScrollbackStorage {
             #[cfg(feature = "disk-tier")]
             ScrollbackStorage::Disk(_) => 0,
         }
+    }
+
+    /// History lines whose INLINE IMAGE was discarded because the line was
+    /// compressed — the image retention horizon, reported out-of-band by BOTH
+    /// backends (unlike [`pressure_evicted_lines`](Self::pressure_evicted_lines),
+    /// which the disk store answers 0 to: spilling a warm block to disk retains
+    /// the line, but compressing it has already ended the picture either way).
+    ///
+    /// See [`Scrollback::image_rows_dropped_by_compression`] for the horizon
+    /// and for what a person scrolling past it sees.
+    #[must_use]
+    pub fn image_rows_dropped_by_compression(&self) -> u64 {
+        dispatch!(self, image_rows_dropped_by_compression())
     }
 
     /// Push a new line to the scrollback.

@@ -50,8 +50,9 @@ pub enum Progress {
     /// The container arrived: size/digest checks, extraction, codesign/Gatekeeper
     /// policy and the atomic stage publish — seconds each, one phase.
     Verifying { version: String },
-    /// Verified and published: the build applies at the next launch (or when the
-    /// in-session apply lane decides to).
+    /// Verified and published: the in-session apply lane applies it in place
+    /// (automatic by default, forced within ~2 min); the next launch picks it up
+    /// only if no handoff ever completes.
     Staged { version: String, build: u64 },
     /// The download was cut short by something that will heal on its own (a
     /// GitHub rate limit); the check backs off and retries later.

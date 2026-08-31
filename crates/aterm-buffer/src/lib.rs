@@ -26,6 +26,24 @@
 #![forbid(unsafe_code)]
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Comparisons performed by the ordered line-id lower bound. Unit tests use
+    /// this as a deterministic work counter; thread-local keeps parallel tests
+    /// independent.
+    static LINE_ID_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_line_id_comparisons() -> usize {
+    LINE_ID_COMPARISONS.with(|count| {
+        let observed = count.get();
+        count.set(0);
+        observed
+    })
+}
 
 /// A monotonic position on the one event-log spine (§4.3 clause 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -207,10 +225,12 @@ pub struct SpanId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Span {
     id: SpanId,
-    surface: SurfaceId,
     extent: Extent,
     kind: SpanKind,
-    payload: SpanPayload,
+    /// Reference-count the owned String rather than the bytes themselves: moving
+    /// a public `SpanPayload` here preserves its allocation, while detaching a
+    /// shared span spine clones only this pointer.
+    payload: Arc<String>,
 }
 
 /// The public view of a resolved span (§4.2 `span_resolve`).
@@ -360,11 +380,14 @@ impl EventLog {
 #[derive(Clone, Debug)]
 pub struct Surface {
     id: SurfaceId,
-    lines: Vec<(LineId, String)>,
+    /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector
+    /// only when a writer actually changes a retained line.
+    lines: Arc<Vec<(LineId, Arc<String>)>>,
     next_line: u64,
-    log: EventLog,
+    /// The sequence spine shared by snapshots until the next real event.
+    log: Arc<EventLog>,
     /// Spans are a SEPARATE decoration stream, not per-cell fields (§4.2).
-    spans: Vec<Span>,
+    spans: Arc<Vec<Span>>,
     next_span: u64,
 }
 
@@ -372,10 +395,10 @@ impl Surface {
     pub fn new(id: SurfaceId) -> Self {
         Surface {
             id,
-            lines: Vec::new(),
+            lines: Arc::new(Vec::new()),
             next_line: 0,
-            log: EventLog::default(),
-            spans: Vec::new(),
+            log: Arc::new(EventLog::default()),
+            spans: Arc::new(Vec::new()),
             next_span: 0,
         }
     }
@@ -391,8 +414,48 @@ impl Surface {
         self.log.head()
     }
 
+    /// First ordered line whose id is not less than `id`.
+    ///
+    /// Line ids are appended monotonically and never reordered. Keeping the
+    /// lower bound explicit avoids a borrowing closure in the Trust lane while
+    /// reducing lookup from a prefix scan to O(log lines).
+    fn line_lower_bound(&self, id: LineId) -> usize {
+        let mut low = 0usize;
+        let mut high = self.lines.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            #[cfg(test)]
+            LINE_ID_COMPARISONS.with(|count| count.set(count.get().saturating_add(1)));
+            // `mid < high <= len` on every reachable iteration. The total
+            // access spelling carries that bound for Trust; returning the
+            // current insertion point only handles the impossible miss.
+            let Some((candidate, _)) = self.lines.get(mid) else {
+                return low;
+            };
+            if *candidate < id {
+                low = mid.saturating_add(1);
+            } else {
+                high = mid;
+            }
+        }
+        low
+    }
+
     fn line_index(&self, id: LineId) -> Option<usize> {
-        self.lines.iter().position(|(l, _)| *l == id)
+        let index = self.line_lower_bound(id);
+        match self.lines.get(index) {
+            Some((found, _)) if *found == id => Some(index),
+            Some(_) | None => None,
+        }
+    }
+
+    /// Ordered half-open bounds for `r`; inverted/empty ranges stay empty.
+    fn line_range_bounds(&self, r: Range) -> (usize, usize) {
+        let start = self.line_lower_bound(r.start);
+        if r.end <= r.start {
+            return (start, start);
+        }
+        (start, self.line_lower_bound(r.end))
     }
 
     /// MUTATE — the one buffer-edit verb. Returns the monotone Seq it was
@@ -407,20 +470,36 @@ impl Surface {
                 // gate accepts (same idiom as the `total` counter in
                 // `EventLog::append_at`).
                 self.next_line = self.next_line.saturating_add(1);
-                self.lines.push((id, text));
-                self.log.append(Op::Append(id))
+                // `Arc<String>` moves the public String header without copying
+                // its text allocation, and makes a later spine detach shallow.
+                Arc::make_mut(&mut self.lines).push((id, Arc::new(text)));
+                Arc::make_mut(&mut self.log).append(Op::Append(id))
             }
             Edit::SetLine(id, text) => {
+                // Resolve before make_mut: an absent id still rides the event
+                // spine, but must not copy a shared line spine it cannot change.
                 if let Some(i) = self.line_index(id) {
-                    self.lines[i].1 = text;
+                    let changed = match self.lines.get(i) {
+                        Some((_, current)) => current.as_str() != text.as_str(),
+                        None => false,
+                    };
+                    if changed {
+                        Arc::make_mut(&mut self.lines)[i].1 = Arc::new(text);
+                    }
                 }
-                self.log.append(Op::Write(id))
+                Arc::make_mut(&mut self.log).append(Op::Write(id))
             }
             Edit::ClearLine(id) => {
                 if let Some(i) = self.line_index(id) {
-                    self.lines[i].1.clear();
+                    let nonempty = match self.lines.get(i) {
+                        Some((_, current)) => !current.is_empty(),
+                        None => false,
+                    };
+                    if nonempty {
+                        Arc::make_mut(&mut self.lines)[i].1 = Arc::new(String::new());
+                    }
                 }
-                self.log.append(Op::Clear(id))
+                Arc::make_mut(&mut self.log).append(Op::Clear(id))
             }
         }
     }
@@ -429,8 +508,9 @@ impl Surface {
     /// Seq (§4.2 READ, §4.3 clause 4). First slice tags all output `Source`.
     pub fn read_text(&self, _c: &ReadCap, r: Range) -> TextWithOrigin {
         let mut out = String::new();
-        for (id, text) in &self.lines {
-            if *id >= r.start && *id < r.end {
+        let (start, end) = self.line_range_bounds(r);
+        if let Some(lines) = self.lines.get(start..end) {
+            for (_, text) in lines {
                 out.push_str(text);
                 out.push('\n');
             }
@@ -450,10 +530,11 @@ impl Surface {
         // instead of filter/map/collect: the strict L0 gate cannot derive a
         // bound for `collect`'s bulk allocation and cannot lower the borrowing
         // closure aggregates, while this shape mirrors the proved `read_text`
-        // loop (push growth is bounded by `self.lines.len()`).
+        // loop (push growth is bounded by the selected line range).
         let mut out = Vec::new();
-        for (id, text) in &self.lines {
-            if *id >= r.start && *id < r.end {
+        let (start, end) = self.line_range_bounds(r);
+        if let Some(lines) = self.lines.get(start..end) {
+            for (id, text) in lines {
                 let hit = match p {
                     Predicate::TextContains(needle) => text.contains(needle.as_str()),
                 };
@@ -489,8 +570,9 @@ impl Surface {
         self.lines.first().map(|(l, _)| *l)
     }
 
-    /// COMPOSE — O(1)-COW snapshot (§4.2). First slice is a cheap clone behind a
-    /// SnapshotId; the structural-sharing COW lands with the grid integration.
+    /// COMPOSE — O(1)-COW snapshot (§4.2). The immutable line, event-log and
+    /// span spines are shared; the first corresponding mutation detaches only
+    /// that spine via [`Arc::make_mut`].
     pub fn snapshot(&self, _c: &ReadCap) -> Snapshot {
         Snapshot {
             at: self.seq(),
@@ -513,28 +595,45 @@ impl Surface {
         // saturation can never fire on a real path (same L0 idiom as
         // `next_line` in `apply` and `total` in `EventLog::append_at`).
         self.next_span = self.next_span.saturating_add(1);
-        self.spans.push(Span {
+        Arc::make_mut(&mut self.spans).push(Span {
             id,
-            surface: self.id,
             extent,
             kind,
-            payload,
+            payload: Arc::new(payload),
         });
-        self.log.append(Op::SpanDefine(id));
+        Arc::make_mut(&mut self.log).append(Op::SpanDefine(id));
         id
+    }
+
+    /// Locate a monotonically assigned span id without scanning the prefix.
+    fn span_index(&self, id: SpanId) -> Option<usize> {
+        let mut low = 0usize;
+        let mut high = self.spans.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let candidate = self.spans.get(mid)?;
+            if candidate.id < id {
+                low = mid.saturating_add(1);
+            } else {
+                high = mid;
+            }
+        }
+        match self.spans.get(low) {
+            Some(span) if span.id == id => Some(low),
+            Some(_) | None => None,
+        }
     }
 
     /// Resolve a span to its public view, or `None` if dropped/unknown.
     pub fn span_resolve(&self, _c: &ReadCap, id: SpanId) -> Option<ResolvedSpan> {
-        self.spans
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| ResolvedSpan {
-                id: s.id,
-                extent: s.extent,
-                kind: s.kind,
-                payload: s.payload.clone(),
-            })
+        let index = self.span_index(id)?;
+        let span = self.spans.get(index)?;
+        Some(ResolvedSpan {
+            id: span.id,
+            extent: span.extent,
+            kind: span.kind,
+            payload: span.payload.as_ref().clone(),
+        })
     }
 
     /// Query spans of a kind overlapping a line range (§4.2). The span/query fold
@@ -544,7 +643,7 @@ impl Surface {
         // strict-gate reasons as `query`: no `collect` bulk-allocation
         // recognizer, no closure aggregates to lower.
         let mut out = Vec::new();
-        for s in &self.spans {
+        for s in self.spans.iter() {
             if s.kind == kind && Self::overlaps(s.extent, r) {
                 out.push(s.id);
             }
@@ -563,17 +662,24 @@ impl Surface {
 
     /// Restyle a span in place (no id change); rides the spine.
     pub fn span_restyle(&mut self, _c: &WriteCap, id: SpanId, payload: SpanPayload) {
-        if let Some(s) = self.spans.iter_mut().find(|s| s.id == id) {
-            s.payload = payload;
-            self.log.append(Op::SpanRestyle(id));
+        // Resolve before make_mut so an absent id copies neither shared spine.
+        if let Some(i) = self.span_index(id) {
+            let changed = match self.spans.get(i) {
+                Some(span) => span.payload.as_str() != payload.as_str(),
+                None => false,
+            };
+            if changed {
+                Arc::make_mut(&mut self.spans)[i].payload = Arc::new(payload);
+            }
+            Arc::make_mut(&mut self.log).append(Op::SpanRestyle(id));
         }
     }
 
     /// Drop a span; rides the spine.
     pub fn span_drop(&mut self, _c: &WriteCap, id: SpanId) {
-        if let Some(i) = self.spans.iter().position(|s| s.id == id) {
-            self.spans.remove(i);
-            self.log.append(Op::SpanDrop(id));
+        if let Some(i) = self.span_index(id) {
+            Arc::make_mut(&mut self.spans).remove(i);
+            Arc::make_mut(&mut self.log).append(Op::SpanDrop(id));
         }
     }
 
@@ -606,14 +712,14 @@ impl Surface {
                 return (SubUpdate::Gap { resync_to: head }, Cursor { at: head });
             }
         }
-        // Explicit loop + push (identical filter, identical order) instead of
-        // filter/cloned/collect — the strict gate cannot bound `collect`'s
-        // bulk allocation (push growth is bounded by the live ring's length).
+        // Seek directly to the first event after the cursor. A caught-up
+        // subscriber is the common case; starting from `live()` would scan the
+        // entire retained ring (up to `MAX_LOG_EVENTS`) just to return empty.
+        // Keep the explicit loop + push instead of cloned/collect: the strict
+        // gate can bound this growth by the live ring's length.
         let mut events: Vec<Event> = Vec::new();
-        for e in self.log.live() {
-            if e.seq.0 > cursor.at.0 {
-                events.push(e.clone());
-            }
+        for e in self.log.live_after(cursor.at) {
+            events.push(e.clone());
         }
         (SubUpdate::Events(events), Cursor { at: head })
     }
@@ -758,6 +864,233 @@ mod tests {
         assert_eq!(snap_text, "frozen\n");
         assert_eq!(live_text, "frozen\nafter\n");
         assert_eq!(snap.at, Seq(1));
+    }
+
+    #[test]
+    fn snapshot_shares_line_allocation_until_replaced() {
+        let mut s = Surface::new(sid(1));
+        let original = String::from("frozen allocation");
+        let original_ptr = original.as_ptr();
+        let original_capacity = original.capacity();
+        s.apply(&WriteCap, Edit::AppendLine(original));
+        assert_eq!(s.lines[0].1.as_ptr(), original_ptr);
+        assert_eq!(s.lines[0].1.capacity(), original_capacity);
+
+        let snap = s.snapshot(&ReadCap);
+        assert!(Arc::ptr_eq(&s.lines[0].1, &snap.surface.lines[0].1));
+
+        let replacement = String::from("live replacement allocation");
+        let replacement_ptr = replacement.as_ptr();
+        let replacement_capacity = replacement.capacity();
+        s.apply(&WriteCap, Edit::SetLine(LineId(0), replacement));
+        assert_eq!(s.lines[0].1.as_ptr(), replacement_ptr);
+        assert_eq!(s.lines[0].1.capacity(), replacement_capacity);
+        assert!(!Arc::ptr_eq(&s.lines[0].1, &snap.surface.lines[0].1));
+        assert_eq!(snap.surface.lines[0].1.as_str(), "frozen allocation");
+    }
+
+    #[test]
+    fn snapshot_and_branch_share_all_spines_until_corresponding_mutation() {
+        let mut live = Surface::new(sid(1));
+        live.apply(&WriteCap, Edit::AppendLine("frozen".into()));
+        let span = live.span_define(
+            &WriteCap,
+            Extent {
+                start: LineId(0),
+                end: LineId(1),
+            },
+            SpanKind::Region,
+            "bold".into(),
+        );
+        let untouched_payload = String::from("large untouched payload");
+        let untouched_ptr = untouched_payload.as_ptr();
+        let untouched_span = live.span_define(
+            &WriteCap,
+            Extent {
+                start: LineId(0),
+                end: LineId(1),
+            },
+            SpanKind::Mark,
+            untouched_payload,
+        );
+        assert_eq!(live.spans[1].payload.as_ptr(), untouched_ptr);
+
+        let snap = live.snapshot(&ReadCap);
+        let mut branch = snap.branch(sid(2));
+        for candidate in [&snap.surface, &branch] {
+            assert!(Arc::ptr_eq(&live.lines, &candidate.lines));
+            assert!(Arc::ptr_eq(&live.log, &candidate.log));
+            assert!(Arc::ptr_eq(&live.spans, &candidate.spans));
+        }
+
+        // A line write detaches exactly lines + log. The snapshot and branch
+        // keep sharing the frozen line/span/log spines.
+        live.apply(&WriteCap, Edit::SetLine(LineId(0), "live".into()));
+        assert!(!Arc::ptr_eq(&live.lines, &snap.surface.lines));
+        assert!(!Arc::ptr_eq(&live.log, &snap.surface.log));
+        assert!(Arc::ptr_eq(&live.spans, &snap.surface.spans));
+        assert!(Arc::ptr_eq(&snap.surface.lines, &branch.lines));
+        assert!(Arc::ptr_eq(&snap.surface.log, &branch.log));
+        assert!(Arc::ptr_eq(&snap.surface.spans, &branch.spans));
+        assert_eq!(snap.surface.lines[0].1.as_ref(), "frozen");
+        assert_eq!(live.lines[0].1.as_ref(), "live");
+
+        // A span write on the branch detaches spans + log, but not lines; the
+        // snapshot's payload remains isolated.
+        branch.span_restyle(&WriteCap, span, "italic".into());
+        assert!(Arc::ptr_eq(&branch.lines, &snap.surface.lines));
+        assert!(!Arc::ptr_eq(&branch.log, &snap.surface.log));
+        assert!(!Arc::ptr_eq(&branch.spans, &snap.surface.spans));
+        assert_eq!(untouched_span, SpanId(1));
+        assert!(Arc::ptr_eq(
+            &branch.spans[1].payload,
+            &snap.surface.spans[1].payload
+        ));
+        assert_eq!(
+            snap.surface.span_resolve(&ReadCap, span).unwrap().payload,
+            "bold"
+        );
+        assert_eq!(
+            branch.span_resolve(&ReadCap, span).unwrap().payload,
+            "italic"
+        );
+    }
+
+    #[test]
+    fn absent_mutations_do_not_detach_untouched_shared_spines() {
+        let mut source = Surface::new(sid(1));
+        source.apply(&WriteCap, Edit::AppendLine("line".into()));
+        source.span_define(
+            &WriteCap,
+            Extent {
+                start: LineId(0),
+                end: LineId(1),
+            },
+            SpanKind::Region,
+            "payload".into(),
+        );
+        let snap = source.snapshot(&ReadCap);
+
+        for edit in [
+            Edit::SetLine(LineId(99), "absent".into()),
+            Edit::ClearLine(LineId(99)),
+        ] {
+            let mut branch = snap.branch(sid(2));
+            branch.apply(&WriteCap, edit);
+            assert!(
+                Arc::ptr_eq(&branch.lines, &snap.surface.lines),
+                "an absent line edit must not copy the shared line spine"
+            );
+            assert!(
+                !Arc::ptr_eq(&branch.log, &snap.surface.log),
+                "Set/Clear still append their existing one-spine event"
+            );
+        }
+
+        let mut restyle = snap.branch(sid(3));
+        restyle.span_restyle(&WriteCap, SpanId(99), "absent".into());
+        assert!(Arc::ptr_eq(&restyle.spans, &snap.surface.spans));
+        assert!(Arc::ptr_eq(&restyle.log, &snap.surface.log));
+
+        let mut drop_absent = snap.branch(sid(4));
+        drop_absent.span_drop(&WriteCap, SpanId(99));
+        assert!(Arc::ptr_eq(&drop_absent.spans, &snap.surface.spans));
+        assert!(Arc::ptr_eq(&drop_absent.log, &snap.surface.log));
+    }
+
+    #[test]
+    fn equal_mutations_advance_the_log_without_detaching_content_spines() {
+        let mut source = Surface::new(sid(1));
+        source.apply(&WriteCap, Edit::AppendLine("same".into()));
+        source.apply(&WriteCap, Edit::AppendLine(String::new()));
+        let span = source.span_define(
+            &WriteCap,
+            Extent {
+                start: LineId(0),
+                end: LineId(1),
+            },
+            SpanKind::Region,
+            "same style".into(),
+        );
+        let snap = source.snapshot(&ReadCap);
+
+        let mut equal_set = snap.branch(sid(2));
+        equal_set.apply(&WriteCap, Edit::SetLine(LineId(0), "same".into()));
+        assert!(Arc::ptr_eq(&equal_set.lines, &snap.surface.lines));
+        assert!(!Arc::ptr_eq(&equal_set.log, &snap.surface.log));
+        assert_eq!(equal_set.seq().0, snap.at.0 + 1);
+
+        let mut empty_clear = snap.branch(sid(3));
+        empty_clear.apply(&WriteCap, Edit::ClearLine(LineId(1)));
+        assert!(Arc::ptr_eq(&empty_clear.lines, &snap.surface.lines));
+        assert!(!Arc::ptr_eq(&empty_clear.log, &snap.surface.log));
+        assert_eq!(empty_clear.seq().0, snap.at.0 + 1);
+
+        let mut equal_restyle = snap.branch(sid(4));
+        equal_restyle.span_restyle(&WriteCap, span, "same style".into());
+        assert!(Arc::ptr_eq(&equal_restyle.spans, &snap.surface.spans));
+        assert!(!Arc::ptr_eq(&equal_restyle.log, &snap.surface.log));
+        assert_eq!(equal_restyle.seq().0, snap.at.0 + 1);
+    }
+
+    #[test]
+    fn narrow_tail_line_operations_do_logarithmic_work() {
+        const LINES: usize = 4096;
+        let mut s = Surface::new(sid(1));
+        for i in 0..LINES {
+            let text = if i + 1 == LINES {
+                "tail needle"
+            } else {
+                "prefix"
+            };
+            s.apply(&WriteCap, Edit::AppendLine(text.into()));
+        }
+        let tail = Range {
+            start: LineId((LINES - 1) as u64),
+            end: LineId(LINES as u64),
+        };
+
+        let _ = take_line_id_comparisons();
+        assert_eq!(s.read_text(&ReadCap, tail).text, "tail needle\n");
+        let read_comparisons = take_line_id_comparisons();
+        assert!(read_comparisons > 0, "read must reach the lower bound");
+        assert!(
+            read_comparisons <= 2 * usize::BITS as usize,
+            "tail read made {read_comparisons} id comparisons for {LINES} lines"
+        );
+
+        let hits = s.query(&ReadCap, tail, &Predicate::TextContains("needle".into()));
+        let query_comparisons = take_line_id_comparisons();
+        assert_eq!(hits, vec![Addr::Line(sid(1), LineId((LINES - 1) as u64))]);
+        assert!(query_comparisons > 0, "query must reach the lower bound");
+        assert!(
+            query_comparisons <= 2 * usize::BITS as usize,
+            "tail query made {query_comparisons} id comparisons for {LINES} lines"
+        );
+
+        s.apply(
+            &WriteCap,
+            Edit::SetLine(LineId((LINES - 1) as u64), "updated".into()),
+        );
+        let lookup_comparisons = take_line_id_comparisons();
+        assert!(lookup_comparisons > 0, "SetLine must reach ordered lookup");
+        assert!(
+            lookup_comparisons <= usize::BITS as usize,
+            "tail SetLine made {lookup_comparisons} id comparisons for {LINES} lines"
+        );
+
+        assert!(
+            s.read_text(
+                &ReadCap,
+                Range {
+                    start: LineId(12),
+                    end: LineId(3),
+                },
+            )
+            .text
+            .is_empty(),
+            "an inverted range stays empty"
+        );
     }
 
     #[test]

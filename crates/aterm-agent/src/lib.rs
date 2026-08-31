@@ -408,6 +408,12 @@ impl<S: Read + Write> RelayClient<S> {
 
     /// Write one request line (`line` + `\n`) and flush.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        if line.contains(['\n', '\r']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control request must not contain an embedded line terminator",
+            ));
+        }
         self.io.write_all(line.as_bytes())?;
         self.io.write_all(b"\n")?;
         self.io.flush()
@@ -549,8 +555,8 @@ aterm-drive — drive an interactive agent (e.g. Claude Code) running inside ate
 
 MENTAL MODEL
     A HOST aterm runs your target program as its child and exposes a Unix control
-    socket. This tool reads the live screen and drives keystrokes over that socket
-    via `aterm-ctl` — the same engine a human types into. The key primitive is
+    socket. This tool reads the live screen and drives keystrokes with the same
+    control verbs exposed by `aterm-ctl`. The key primitive is
     `await`: block until the surface reaches a condition, so you never sleep-and-
     hope or scrape for a spinner.
 
@@ -838,6 +844,16 @@ mod tests {
             client.io.sent.is_empty(),
             "nothing written on a rejected payload"
         );
+    }
+
+    #[test]
+    fn relay_client_rejects_line_terminators_at_the_framing_boundary() {
+        let mut client = RelayClient::new(RecordingTransport::new(b""));
+        let error = client
+            .write_line("AUTH token\nsend injected")
+            .expect_err("a request must occupy exactly one line");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(client.io.sent.is_empty());
     }
 
     #[test]

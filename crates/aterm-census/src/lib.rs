@@ -67,6 +67,17 @@
 //!   acquire-while-holding pair across the GUI-process crates, the global lock
 //!   graph required ACYCLIC, any cycle failing the build with both sites of
 //!   every edge. NO waiver channel, ever.
+//! * OB-19..OB-21  LAZY-INIT REENTRANCY CENSUS ([`lazy_init`],
+//!   `run_lazy_init_census`) — the REENTRANCY sense of the same L0-DEADLOCK
+//!   entry, which OB-7 is structurally blind to: OB-7 asks whether two threads
+//!   can take two locks in opposite orders, this asks whether ONE thread can
+//!   arrive twice at the same lazy cell. A `OnceLock`/`LazyLock`/`Once`
+//!   initializer that reaches a blocking touch of the cell it is itself
+//!   initializing parks its own thread forever. The lazy-init graph is
+//!   required ACYCLIC (OB-19 self-loops, OB-20 components) and the walk itself
+//!   must stay non-blind (OB-21). NO waiver channel, ever. Added after that
+//!   exact shape shipped in v0.65.0/v0.66.0 and froze the terminal on the main
+//!   thread at the first automatic update apply.
 //!
 //! PRECISION: see [`PRECISION_NOTE`] / [`lock_order::LOCK_PRECISION_NOTE`] —
 //! printed in every RED diagnostic and documented in
@@ -76,10 +87,12 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+mod lazy_init;
 mod lock_order;
 pub mod scan_set;
 mod scope_census;
 mod wasm_census;
+pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
 pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
 pub use wasm_census::run_wasm_census;
@@ -371,6 +384,17 @@ fn parse_fn_def(line: &str) -> Option<(usize, String)> {
         }
         // `pub(in path) ` / `extern "C" ` — skip a single parenthesised or quoted
         // qualifier token, then continue.
+        // `pub(in path) ` — the comment above promised this and the code did
+        // not do it, so such a fn was never segmented and every call in it was
+        // missing from the graph. Zero instances in the tree today; the gap was
+        // latent, which is the moment to close it.
+        if !advanced
+            && let Some(s) = rest.strip_prefix("pub(in ")
+            && let Some((_, after)) = s.split_once(") ")
+        {
+            rest = after.trim_start();
+            advanced = true;
+        }
         if !advanced && let Some(s) = rest.strip_prefix("extern ") {
             rest = s.trim_start().trim_start_matches('"');
             rest = rest

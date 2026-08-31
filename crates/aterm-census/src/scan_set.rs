@@ -1763,10 +1763,11 @@ mod tests {
             "pkg-config is the one build-dep-only patch"
         );
         assert_eq!(set.vendored_build_only[0].0, "pkg-config");
-        // The FIVE FIRST-PARTY patch targets — workspace members aterm wrote,
+        // The SIX FIRST-PARTY patch targets — workspace members aterm wrote,
         // reached only by third-party consumers through the patch table:
         //   `arrayvec`  crates/aterm-arrayvec   re-export of aterm_alloc::ArrayVec
         //   `cfg-if`    crates/aterm-cfg-if     the cfg_if! macro
+        //   `libc`      crates/aterm-libc       first-party libc replacement
         //   `log`       crates/aterm-log-shim   no-op facade (NOT crates/aterm-log,
         //                                       which is aterm's real logger)
         //   `profiling` crates/aterm-profiling  no-op facade
@@ -1779,6 +1780,7 @@ mod tests {
             vec![
                 ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
                 ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
+                ("libc".to_string(), "crates/aterm-libc".to_string()),
                 ("log".to_string(), "crates/aterm-log-shim".to_string()),
                 (
                     "profiling".to_string(),

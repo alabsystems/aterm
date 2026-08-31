@@ -114,6 +114,24 @@ struct PresentedWindowCapture {
     frame: PresentedFrameCapture,
 }
 
+/// Borrowed visible-layout authority valid only for one synchronous main-loop
+/// control turn. It may be reused across bounded present retries, which cannot
+/// mutate tabs, pane topology, zoom, or window cell bounds, but must never be
+/// retained across an event-loop yield.
+type VisibleFrameLayoutRef<'a> = (
+    &'a crate::tab_model::VisibleLeafPlan,
+    crate::VisibleContentRoute,
+);
+
+#[derive(Clone, Copy)]
+struct ImageFrameFacts {
+    phase: &'static str,
+    capture_serial: Option<u64>,
+    width: u32,
+    height: u32,
+    pixel_fingerprint: u64,
+}
+
 /// One `image` request already resolved to the window it renders, on its way to
 /// the compiled native/heterogeneous route.
 ///
@@ -129,6 +147,13 @@ struct NativeImageRequest<'a> {
     /// The successful application present this capture is bound to. `None` means
     /// no present authority exists, so the route stages its own input scratch.
     presented: Option<PresentedFrameCapture>,
+    /// Canonical layout already resolved by `render_image` in this same
+    /// synchronous control turn. Direct test callers and presented-authority
+    /// captures leave it absent and resolve or ignore geometry as appropriate.
+    request_layout: Option<(
+        crate::tab_model::VisibleLeafPlan,
+        crate::VisibleContentRoute,
+    )>,
     /// Success-time template carried only by a headless recording artifact.
     /// Windowed synchronous captures build metadata immediately from the same
     /// successful-present turn and therefore leave this `None`.
@@ -3089,18 +3114,28 @@ impl App {
         &self,
         wid: crate::WindowId,
     ) -> Option<crate::app_render::TerminalCaptureGrid> {
+        let (plan, route) = self.active_visible_frame_layout(wid)?;
+        self.presented_terminal_capture_grid_from_layout(wid, &plan, route)
+    }
+
+    /// Reconstruct the presented terminal inventory from the exact layout that
+    /// authorized the synchronous redraw, without resolving the visible tree a
+    /// second time.
+    fn presented_terminal_capture_grid_from_layout(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        route: crate::VisibleContentRoute,
+    ) -> Option<crate::app_render::TerminalCaptureGrid> {
         let mut grid = crate::app_render::TerminalCaptureGrid {
             composed: false,
             focus: None,
             leaves: Vec::new(),
         };
-        let crate::VisibleContentRoute::Terminal { composed } =
-            self.active_visible_content_route(wid)?
-        else {
+        let crate::VisibleContentRoute::Terminal { composed } = route else {
             return None;
         };
-        let plan = self.active_visible_leaf_plan(wid)?;
-        self.refill_presented_terminal_capture_grid(wid, composed, &plan, &mut grid)
+        self.refill_presented_terminal_capture_grid(wid, composed, plan, &mut grid)
             .then_some(grid)
     }
 
@@ -3333,9 +3368,18 @@ impl App {
         &self,
         wid: crate::WindowId,
         before: u64,
+        frame_layout: Option<(
+            &crate::tab_model::VisibleLeafPlan,
+            crate::VisibleContentRoute,
+        )>,
     ) -> Option<PresentedTerminalCapture> {
         let presented = self.presented_frame_capture_after(wid, before)?;
-        let grid = self.presented_terminal_capture_grid(wid)?;
+        let grid = match frame_layout {
+            Some((plan, route)) => {
+                self.presented_terminal_capture_grid_from_layout(wid, plan, route)?
+            }
+            None => self.presented_terminal_capture_grid(wid)?,
+        };
         Some(PresentedTerminalCapture {
             input: presented.input,
             grid,
@@ -3399,9 +3443,8 @@ impl App {
             .get(&wid)
             .ok_or_else(|| "image deferred: recorded window closed before capture".to_string())?;
 
-        let current_route = self.active_visible_content_route(wid);
-        let current_plan = self
-            .active_visible_leaf_plan(wid)
+        let (current_plan, current_route) = self
+            .active_visible_frame_layout(wid)
             .ok_or_else(|| "image deferred: recording layout changed before capture".to_string())?;
         let current_destination_height = window.win_px.map(|size| size.height.max(1) as usize);
         let current_card = Self::recording_card_identity(window.present_card());
@@ -3414,7 +3457,7 @@ impl App {
         let current_cursor_override = (!window.focused && window.os_window.is_some())
             .then_some(aterm_core::terminal::CursorStyle::HollowBlock);
         let current_selection_inactive = self.render_knobs.selection_inactive && !window.focused;
-        if current_route != Some(presented.route)
+        if current_route != presented.route
             || window.capture_present_serial != presented.serial
             || window.metrics != presented.metrics
             || self.win_cell_size(wid) != presented.cell_size
@@ -3475,7 +3518,17 @@ impl App {
         }
 
         let native_metadata = if include_native_metadata && presented.route.has_visible_native() {
-            Some(self.native_image_metadata(wid, "presented", Some(presented.serial), 0, 0, 0)?)
+            Some(self.native_image_metadata_from_plan(
+                wid,
+                &current_plan,
+                ImageFrameFacts {
+                    phase: "presented",
+                    capture_serial: Some(presented.serial),
+                    width: 0,
+                    height: 0,
+                    pixel_fingerprint: 0,
+                },
+            )?)
         } else {
             None
         };
@@ -3591,12 +3644,27 @@ impl App {
         })
     }
 
+    /// Present one capture frame from caller-supplied synchronous layout
+    /// authority when available, otherwise resolve the ordinary redraw layout.
+    fn redraw_capture_frame(
+        &mut self,
+        wid: crate::WindowId,
+        frame_layout: Option<VisibleFrameLayoutRef<'_>>,
+    ) {
+        if let Some((plan, route)) = frame_layout {
+            self.redraw_window_from_layout(wid, plan, route);
+        } else {
+            self.redraw_window(wid);
+        }
+    }
+
     /// Route-neutral successful-present barrier. Windowed terminal, native and
     /// heterogeneous captures all authorize pixels through the same serial.
     /// Headless callers receive `None` and stage one explicit present-real frame.
     fn present_before_frame_capture(
         &mut self,
         wid: crate::WindowId,
+        frame_layout: Option<VisibleFrameLayoutRef<'_>>,
     ) -> Result<Option<PresentedFrameCapture>, String> {
         let has_os_window = self
             .windows
@@ -3618,7 +3686,7 @@ impl App {
                 };
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
-                self.redraw_window(wid);
+                self.redraw_capture_frame(wid, frame_layout);
                 captured = self.presented_frame_capture_after(wid, before);
                 captured.is_some()
             });
@@ -3641,6 +3709,7 @@ impl App {
     fn present_before_terminal_capture(
         &mut self,
         wid: crate::WindowId,
+        frame_layout: Option<VisibleFrameLayoutRef<'_>>,
     ) -> Result<Option<PresentedTerminalCapture>, String> {
         let has_os_window = self
             .windows
@@ -3662,9 +3731,9 @@ impl App {
                 };
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
-                self.redraw_window(wid);
+                self.redraw_capture_frame(wid, frame_layout);
 
-                captured = self.presented_terminal_capture_after(wid, before);
+                captured = self.presented_terminal_capture_after(wid, before, frame_layout);
                 captured.is_some()
             });
         if presented {
@@ -3816,6 +3885,10 @@ impl App {
                 ),
                 row_probe,
                 row_probe_neighbors: None,
+                // ECHO ANCHOR, headless parity: same guard as the windowed
+                // present, so a capture-driven session exercises the
+                // hidden/parked-caret lane identically.
+                print_anchor: (display_offset == 0).then(|| term.print_anchor()).flatten(),
             }
         };
         let Some(fx) = self.tick_cursor_fx(wid, inputs) else {
@@ -3882,15 +3955,15 @@ impl App {
         &self,
         wid: WindowId,
         route: crate::VisibleContentRoute,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
         input: &aterm_render::RenderInput,
         strip_rows: usize,
         cols: usize,
     ) -> String {
         let terminal = terminal_capture_text(input, strip_rows, cols);
         let native = if route.has_visible_native() {
-            self.active_visible_leaf_plan(wid)
-                .zip(self.windows.get(&wid))
-                .map(|(plan, window)| {
+            let project = |plan: &crate::tab_model::VisibleLeafPlan| {
+                self.windows.get(&wid).map(|window| {
                     let mut native = String::new();
                     for leaf in &plan.leaves {
                         if !matches!(
@@ -3919,6 +3992,14 @@ impl App {
                     }
                     native
                 })
+            };
+            match frame_plan {
+                Some(plan) => project(plan),
+                None => self
+                    .active_visible_leaf_plan(wid)
+                    .as_ref()
+                    .and_then(project),
+            }
         } else {
             None
         };
@@ -3958,7 +4039,7 @@ impl App {
         let Some(front) = self.frontmost_window else {
             return;
         };
-        let Some(route) = self.active_visible_content_route(front) else {
+        let Some((request_plan, request_route)) = self.active_visible_frame_layout(front) else {
             return;
         };
         // A snapshot is a PIXEL demand: redeem a headless launch's deferred GPU
@@ -4000,7 +4081,9 @@ impl App {
         };
         let route = recording_destination
             .as_ref()
-            .map_or(route, |presented| presented.route);
+            .map_or(request_route, |presented| presented.route);
+        let request_layout_authoritative =
+            recording_destination.is_none() && route == request_route;
         let exact_presented = if has_os_window {
             let has_gpu_surface = self.windows.get(&front).is_some_and(|window| {
                 matches!(window.present, Some(crate::PresentTarget::Gpu { .. }))
@@ -4021,7 +4104,10 @@ impl App {
                 eprintln!("aterm-gui: snapshot refused: {error}");
                 return;
             }
-            match self.present_before_window_capture(front) {
+            match self.present_before_window_capture(
+                front,
+                request_layout_authoritative.then_some((&request_plan, request_route)),
+            ) {
                 Ok(presented) => Some(presented),
                 Err(error) => {
                     eprintln!("aterm-gui: snapshot refused: {error}");
@@ -4035,6 +4121,12 @@ impl App {
             .as_ref()
             .map(|presented| presented.frame.clone())
             .or_else(|| recording_presented.map(|presented| presented.frame));
+        // Keep the request plan as semantic authority whenever it also
+        // authorized the synchronous present. Headless terminal preparation
+        // temporarily consumes it and returns the exact capture plan; native
+        // routes only borrow it. Either way text projection and link hover reuse
+        // one plan instead of walking the visible tree again.
+        let mut frame_plan = request_layout_authoritative.then_some(request_plan);
         if presented.is_none() {
             // Headless has no surface destination to copy. Stage one
             // zoom-aware semantic-renderer artifact; this path intentionally
@@ -4052,10 +4144,19 @@ impl App {
                     // the damage paired with this explicit present-real capture.
                     let capture_now = Instant::now();
                     let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
-                    let Some(capture_grid) =
-                        self.prepare_terminal_capture_grid_with_cursor_fx(front, clock)
-                    else {
-                        return;
+                    let prepared = if let Some(plan) = frame_plan.take() {
+                        self.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
+                            front, plan, clock,
+                        )
+                    } else {
+                        self.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
+                            front, clock,
+                        )
+                    };
+                    let (capture_grid, capture_plan) = match prepared {
+                        crate::app_render::CapturePreparation::Ready(prepared) => prepared,
+                        crate::app_render::CapturePreparation::Held { .. }
+                        | crate::app_render::CapturePreparation::Unavailable => return,
                     };
                     let Some(capture_focus) = capture_grid.focus else {
                         return;
@@ -4070,9 +4171,15 @@ impl App {
                     self.splice_build_badge(front);
                     self.splice_notice(front);
                     self.splice_level_up(front);
+                    frame_plan = Some(capture_plan);
                 }
                 crate::VisibleContentRoute::Native { .. } => {
-                    if !self.prepare_native_input_scratch(front) {
+                    let prepared = if let Some(plan) = frame_plan.as_ref() {
+                        self.prepare_native_input_scratch_from_capture_plan(front, plan)
+                    } else {
+                        self.prepare_native_input_scratch(front)
+                    };
+                    if !prepared {
                         return;
                     }
                     self.splice_find_bar(front);
@@ -4085,10 +4192,19 @@ impl App {
                 }
                 crate::VisibleContentRoute::Heterogeneous => {
                     let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
-                    if self
-                        .prepare_heterogeneous_input_scratch_with_cursor_fx(front, Some(clock))
-                        .is_none()
-                    {
+                    let prepared = if let Some(plan) = frame_plan.as_ref() {
+                        self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
+                            front,
+                            Some(clock),
+                            plan,
+                        )
+                    } else {
+                        self.prepare_heterogeneous_input_scratch_with_cursor_fx_outcome(
+                            front,
+                            Some(clock),
+                        )
+                    };
+                    if !matches!(prepared, crate::app_render::CapturePreparation::Ready(_)) {
                         return;
                     }
                     self.splice_find_bar(front);
@@ -4106,7 +4222,11 @@ impl App {
             // hyperlink is undisclosed while a human is reading its destination.
             // Last of the row bands, as on the presentation routes: it takes
             // only a row no other band declared.
-            self.splice_link_target(front);
+            if let Some(plan) = frame_plan.as_ref() {
+                self.splice_link_target_from_plan(front, plan);
+            } else {
+                self.splice_link_target(front);
+            }
             // C5: the open tab context menu is the topmost chrome on the glass,
             // so it must be the topmost chrome in the capture too — an
             // introspection frame that omits it would tell a driving AI the
@@ -4125,7 +4245,14 @@ impl App {
             Some(presented) => presented.input,
             None => self.windows[&front].input_scratch.clone(),
         };
-        let text = self.snapshot_visible_text(front, route, &capture_input, strip_rows, cols);
+        let text = self.snapshot_visible_text(
+            front,
+            route,
+            frame_plan.as_ref(),
+            &capture_input,
+            strip_rows,
+            cols,
+        );
         if let Some(recording_destination) = recording_destination {
             self.submit_encode_job(EncodeJob::Snapshot {
                 frame: recording_destination.frame,
@@ -4352,6 +4479,7 @@ impl App {
             front,
             clean,
             presented,
+            request_layout,
             presented_metadata,
             exact_frame,
             target,
@@ -4370,13 +4498,18 @@ impl App {
         // call from `render_image` is a no-op.
         self.ensure_pixel_backend();
         let exact_frame = (!clean).then_some(exact_frame).flatten();
+        let mut resolved_layout = request_layout;
         if presented.is_none() && exact_frame.is_none() {
-            let prepared = match self.active_visible_content_route(front) {
-                Some(crate::VisibleContentRoute::Heterogeneous) => {
+            if resolved_layout.is_none() {
+                resolved_layout = self.active_visible_frame_layout(front);
+            }
+            let prepared = match resolved_layout.as_ref() {
+                Some((plan, crate::VisibleContentRoute::Heterogeneous)) => {
                     let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
-                    match self.prepare_heterogeneous_input_scratch_with_cursor_fx_outcome(
+                    match self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
                         front,
                         Some(clock),
+                        plan,
                     ) {
                         crate::app_render::CapturePreparation::Ready(_) => true,
                         crate::app_render::CapturePreparation::Held { retry_at } => {
@@ -4392,10 +4525,10 @@ impl App {
                         crate::app_render::CapturePreparation::Unavailable => false,
                     }
                 }
-                Some(crate::VisibleContentRoute::Native { .. }) => {
-                    self.prepare_native_input_scratch(front)
+                Some((plan, crate::VisibleContentRoute::Native { .. })) => {
+                    self.prepare_native_input_scratch_from_capture_plan(front, plan)
                 }
-                Some(crate::VisibleContentRoute::Terminal { .. }) | None => false,
+                Some((_, crate::VisibleContentRoute::Terminal { .. })) | None => false,
             };
             if !prepared {
                 let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
@@ -4413,7 +4546,11 @@ impl App {
             // diagnostic cells afterward, exactly like the application-present path.
             self.splice_config_notice(front);
             self.splice_paste_banner(front);
-            self.splice_link_target(front);
+            if let Some((plan, _)) = resolved_layout.as_ref() {
+                self.splice_link_target_from_plan(front, plan);
+            } else {
+                self.splice_link_target(front);
+            }
             // C5 — topmost chrome; see the `chrome`-capture route above.
             self.splice_tab_menu(front);
         }
@@ -4516,20 +4653,23 @@ impl App {
             };
             let pixel_fingerprint =
                 Self::image_pixel_fingerprint(frame.width, frame.height, &frame.pixels);
+            let facts = ImageFrameFacts {
+                phase,
+                capture_serial,
+                width,
+                height,
+                pixel_fingerprint,
+            };
             let metadata = if let Some(mut metadata) = presented_metadata {
                 metadata.width = width;
                 metadata.height = height;
                 metadata.pixel_fingerprint = pixel_fingerprint;
                 Ok(metadata)
             } else {
-                self.native_image_metadata(
-                    front,
-                    phase,
-                    capture_serial,
-                    width,
-                    height,
-                    pixel_fingerprint,
-                )
+                match resolved_layout.as_ref() {
+                    Some((plan, _)) => self.native_image_metadata_from_plan(front, plan, facts),
+                    None => self.native_image_metadata(front, facts),
+                }
             };
             match metadata {
                 Ok(metadata) => {
@@ -4553,13 +4693,29 @@ impl App {
     fn native_image_metadata(
         &self,
         front: WindowId,
-        phase: &'static str,
-        capture_serial: Option<u64>,
-        width: u32,
-        height: u32,
-        pixel_fingerprint: u64,
+        facts: ImageFrameFacts,
+    ) -> Result<crate::control::ImageFrameMetadata, String> {
+        let plan = self
+            .active_visible_leaf_plan(front)
+            .ok_or_else(|| "native image metadata has no visible leaf plan".to_string())?;
+        self.native_image_metadata_from_plan(front, &plan, facts)
+    }
+
+    fn native_image_metadata_from_plan(
+        &self,
+        front: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        facts: ImageFrameFacts,
     ) -> Result<crate::control::ImageFrameMetadata, String> {
         use std::hash::{Hash, Hasher};
+
+        let ImageFrameFacts {
+            phase,
+            capture_serial,
+            width,
+            height,
+            pixel_fingerprint,
+        } = facts;
 
         let fingerprint = |width: u32, height: u32, rgba: &[u8]| {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -4568,9 +4724,6 @@ impl App {
             rgba.hash(&mut hash);
             hash.finish() | 1
         };
-        let plan = self
-            .active_visible_leaf_plan(front)
-            .ok_or_else(|| "native image metadata has no visible leaf plan".to_string())?;
         let window = self
             .windows
             .get(&front)
@@ -5020,7 +5173,7 @@ impl App {
             let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
             return;
         };
-        let Some(route) = self.active_visible_content_route(front) else {
+        let Some((request_plan, request_route)) = self.active_visible_frame_layout(front) else {
             let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
             return;
         };
@@ -5041,7 +5194,7 @@ impl App {
         };
         let route = recording_destination
             .as_ref()
-            .map_or(route, |destination| destination.route);
+            .map_or(request_route, |destination| destination.route);
         if !want_metadata && let Some(destination) = recording_destination.take() {
             // The common live-repro path: no semantic clone, hash or reraster.
             // The explicit request pays one destination copy/readback only.
@@ -5054,6 +5207,8 @@ impl App {
             });
             return;
         }
+        let request_layout_authoritative =
+            recording_destination.is_none() && route == request_route;
         if matches!(
             route,
             crate::VisibleContentRoute::Native { .. } | crate::VisibleContentRoute::Heterogeneous
@@ -5065,7 +5220,10 @@ impl App {
             // Synchronize windowed callers through the ordinary present serial
             // without acquiring Screen Recording permission or changing image
             // dimensions when focus crosses a terminal/native split.
-            let presented = match self.present_before_frame_capture(front) {
+            let presented = match self.present_before_frame_capture(
+                front,
+                request_layout_authoritative.then_some((&request_plan, request_route)),
+            ) {
                 Ok(presented) => presented,
                 Err(error) => {
                     let _ = reply.send(Err(error));
@@ -5091,6 +5249,8 @@ impl App {
                 front,
                 clean,
                 presented,
+                request_layout: request_layout_authoritative
+                    .then_some((request_plan, request_route)),
                 presented_metadata,
                 exact_frame: recording_destination.map(|destination| destination.frame),
                 target,
@@ -5110,7 +5270,10 @@ impl App {
         // only its focused terminal, and every pane keeps its OWN live default
         // background instead of inheriting the front pane's. That path stays a READ
         // — no damage consumed, no present stamped.
-        let presented = match self.present_before_terminal_capture(front) {
+        let presented = match self.present_before_terminal_capture(
+            front,
+            request_layout_authoritative.then_some((&request_plan, request_route)),
+        ) {
             Ok(presented) => presented,
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -5163,10 +5326,17 @@ impl App {
             // present-real tick, built from current terminals.
             let capture_now = Instant::now();
             let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
-            let capture_grid = match self
-                .prepare_terminal_capture_grid_with_cursor_fx_outcome(front, clock)
-            {
-                crate::app_render::CapturePreparation::Ready(grid) => grid,
+            let prepared = if request_layout_authoritative {
+                self.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
+                    front,
+                    request_plan,
+                    clock,
+                )
+            } else {
+                self.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(front, clock)
+            };
+            let (capture_grid, capture_plan) = match prepared {
+                crate::app_render::CapturePreparation::Ready(prepared) => prepared,
                 crate::app_render::CapturePreparation::Held { retry_at } => {
                     let retry_ms = retry_at
                         .saturating_duration_since(Instant::now())
@@ -5198,7 +5368,7 @@ impl App {
             self.splice_level_up(front);
             self.splice_config_notice(front);
             self.splice_paste_banner(front);
-            self.splice_link_target(front);
+            self.splice_link_target_from_plan(front, &capture_plan);
             // C5 — topmost chrome; see the `chrome`-capture route above.
             self.splice_tab_menu(front);
             capture_grid
@@ -5692,7 +5862,7 @@ impl App {
             }
         }
         let presented = match wid {
-            Some(wid) => match self.present_before_window_capture(wid) {
+            Some(wid) => match self.present_before_window_capture(wid, None) {
                 Ok(presented) => Some(presented),
                 Err(error) => {
                     let _ = reply.send(Err(error));
@@ -5742,6 +5912,7 @@ impl App {
     fn present_before_window_capture(
         &mut self,
         wid: WindowId,
+        frame_layout: Option<VisibleFrameLayoutRef<'_>>,
     ) -> Result<PresentedWindowCapture, String> {
         let has_os_window = self
             .windows
@@ -5774,7 +5945,7 @@ impl App {
                 // failed-present gate or a steady-frame early-out.
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
-                self.redraw_window(wid);
+                self.redraw_capture_frame(wid, frame_layout);
                 let serial = self
                     .windows
                     .get(&wid)
@@ -6286,7 +6457,7 @@ impl App {
             let _ = reply.send(Err("no window to capture (headless)".to_string()));
             return;
         };
-        let presented = match self.present_before_window_capture(wid) {
+        let presented = match self.present_before_window_capture(wid, None) {
             Ok(presented) => presented,
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -8192,7 +8363,11 @@ mod chrome_output_tests {
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn submit_encode_job").next())
             .expect("SIGUSR snapshot source");
-        assert!(snapshot.contains("present_before_window_capture(front)"));
+        assert!(snapshot.contains("present_before_window_capture("));
+        assert!(
+            snapshot
+                .contains("request_layout_authoritative.then_some((&request_plan, request_route))")
+        );
         let exact_branch = snapshot
             .split("if let Some(exact) = exact_presented")
             .nth(1)
@@ -8434,6 +8609,40 @@ mod terminal_split_capture_tests {
     }
 
     #[test]
+    fn presented_terminal_inventory_reuses_the_authoritative_request_plan() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid)
+            .expect("terminal model");
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.capture_leaf_snapshot_seqs = vec![window.input_scratch.snapshot_seq];
+            window.capture_present_serial = 1;
+        }
+
+        crate::reset_visible_leaf_plan_builds();
+        let (plan, route) = app
+            .active_visible_frame_layout(wid)
+            .expect("request layout");
+        let capture = app
+            .presented_terminal_capture_after(wid, 0, Some((&plan, route)))
+            .expect("presented inventory");
+        assert_eq!(capture.grid.leaves.len(), 1);
+        assert_eq!(
+            crate::visible_leaf_plan_builds(),
+            1,
+            "request routing and presented inventory share one visible plan",
+        );
+
+        // Negative control: the retired shape resolved an outer request plan,
+        // then let presented inventory independently walk the same tree.
+        crate::reset_visible_leaf_plan_builds();
+        assert!(app.active_visible_frame_layout(wid).is_some());
+        assert!(app.presented_terminal_capture_after(wid, 0, None).is_some());
+        assert_eq!(crate::visible_leaf_plan_builds(), 2);
+    }
+
+    #[test]
     fn presented_terminal_authority_rejects_unpresented_staging_and_binds_geometry() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -8447,7 +8656,7 @@ mod terminal_split_capture_tests {
         }
 
         assert!(
-            app.presented_terminal_capture_after(wid, 0).is_none(),
+            app.presented_terminal_capture_after(wid, 0, None).is_none(),
             "pre-first-present staged pixels have no capture authority"
         );
 
@@ -8465,7 +8674,7 @@ mod terminal_split_capture_tests {
             window.input_scratch.cursor_col = 7;
         }
         let frame_a = app
-            .presented_terminal_capture_after(wid, 0)
+            .presented_terminal_capture_after(wid, 0, None)
             .expect("successful A is authorized");
         assert_eq!(frame_a.serial, 1);
         assert!(frame_a.invert);
@@ -8484,7 +8693,7 @@ mod terminal_split_capture_tests {
             window.metrics = crate::MetricsView::applied(27.0, 9, 4, 3);
         }
         assert!(
-            app.presented_terminal_capture_after(wid, 1).is_none(),
+            app.presented_terminal_capture_after(wid, 1, None).is_none(),
             "a dropped B cannot authorize mutable staged buffers"
         );
         assert_eq!(frame_a.input.cells[0][0].ch, 'A');
@@ -8499,7 +8708,7 @@ mod terminal_split_capture_tests {
         // main-thread success turn.
         app.windows.get_mut(&wid).unwrap().capture_present_serial = 2;
         let frame_b = app
-            .presented_terminal_capture_after(wid, 1)
+            .presented_terminal_capture_after(wid, 1, None)
             .expect("successful B is authorized");
         assert_eq!(frame_b.input.cells[0][0].ch, 'B');
         assert_eq!(
@@ -8575,7 +8784,7 @@ mod terminal_split_capture_tests {
         );
         app.windows.get_mut(&wid).unwrap().capture_present_serial = 1;
         let frame_a = app
-            .presented_terminal_capture_after(wid, 0)
+            .presented_terminal_capture_after(wid, 0, None)
             .expect("initial split frame");
         assert!(frame_a.grid.composed);
         assert_eq!(frame_a.grid.leaves.len(), 2);
@@ -8615,7 +8824,7 @@ mod terminal_split_capture_tests {
             .is_some()
         );
         assert!(
-            app.presented_terminal_capture_after(wid, 1).is_none(),
+            app.presented_terminal_capture_after(wid, 1, None).is_none(),
             "the resized divider remains staged until a real present succeeds"
         );
         assert_eq!(
@@ -8631,7 +8840,7 @@ mod terminal_split_capture_tests {
 
         app.windows.get_mut(&wid).unwrap().capture_present_serial = 2;
         let frame_b = app
-            .presented_terminal_capture_after(wid, 1)
+            .presented_terminal_capture_after(wid, 1, None)
             .expect("resized split B");
         let widths_b: Vec<_> = frame_b.grid.leaves.iter().map(|leaf| leaf.cols).collect();
         assert_ne!(widths_b, widths_a);
@@ -10508,6 +10717,7 @@ mod encode_worker_tests {
 
         let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
         let (tx, rx) = std::sync::mpsc::channel();
+        crate::reset_visible_leaf_plan_builds();
         app.render_image(crate::control::ImageReq {
             target: confined(&dir, "terminal.png"),
             clean: false,
@@ -10518,6 +10728,11 @@ mod encode_worker_tests {
             cancel: crate::control::CaptureCancellation::new(),
             reply: tx,
         });
+        assert_eq!(
+            crate::visible_leaf_plan_builds(),
+            1,
+            "full terminal image routing, preparation, hover and metadata share one visible plan",
+        );
         let (width, height, png) = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("terminal image reply")
@@ -10596,6 +10811,7 @@ mod encode_worker_tests {
             front: wid,
             clean: false,
             presented: None,
+            request_layout: None,
             presented_metadata: None,
             exact_frame: None,
             target: confined(&dir, "binding.png"),
@@ -10689,25 +10905,27 @@ mod encode_worker_tests {
         ));
         ensure_private_dir(&dir).unwrap();
         let mut app = App::headless_for_test();
-        let wid = crate::WindowId(0);
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
 
         let capture = |app: &mut App, name: &str| {
             let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
             let (tx, rx) = std::sync::mpsc::channel();
-            app.render_native_image(NativeImageRequest {
-                front: wid,
-                clean: false,
-                presented: None,
-                presented_metadata: None,
-                exact_frame: None,
+            crate::reset_visible_leaf_plan_builds();
+            app.render_image(crate::control::ImageReq {
                 target: confined(&dir, name),
+                clean: false,
+                session: None,
                 want_bytes: true,
                 want_metadata: true,
+                frame_metadata: std::sync::Arc::clone(&metadata),
                 cancel: crate::control::CaptureCancellation::new(),
-                frame_metadata: &metadata,
                 reply: tx,
             });
+            assert_eq!(
+                crate::visible_leaf_plan_builds(),
+                1,
+                "full native image routing, preparation, hover and metadata share one visible plan",
+            );
             let image = rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("paint identity image reply")
@@ -10758,6 +10976,7 @@ mod encode_worker_tests {
         let terminal_text = terminal_app.snapshot_visible_text(
             wid,
             terminal_route,
+            None,
             &terminal_input,
             0,
             usize::from(terminal_app.windows[&wid].cols),
@@ -10782,6 +11001,7 @@ mod encode_worker_tests {
         let native_text = native_app.snapshot_visible_text(
             wid,
             native_route,
+            None,
             &native_input,
             usize::from(native_app.tab_strip_rows),
             usize::from(native_app.windows[&wid].cols),
@@ -10806,6 +11026,7 @@ mod encode_worker_tests {
         let mixed_text = native_app.snapshot_visible_text(
             wid,
             mixed_route,
+            None,
             &mixed_input,
             usize::from(native_app.tab_strip_rows),
             usize::from(native_app.windows[&wid].cols),
@@ -10849,6 +11070,7 @@ mod encode_worker_tests {
         let palette_text = native_app.snapshot_visible_text(
             wid,
             palette_route,
+            None,
             &palette_input,
             usize::from(native_app.tab_strip_rows),
             usize::from(native_app.windows[&wid].cols),
@@ -11066,19 +11288,22 @@ mod encode_worker_tests {
         let capture = |app: &mut App, name: &str| {
             let (tx, rx) = std::sync::mpsc::channel();
             let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-            app.render_native_image(NativeImageRequest {
-                front: wid,
-                clean: false,
-                presented: None,
-                presented_metadata: None,
-                exact_frame: None,
+            crate::reset_visible_leaf_plan_builds();
+            app.render_image(crate::control::ImageReq {
                 target: confined(&dir, name),
+                clean: false,
+                session: None,
                 want_bytes: true,
                 want_metadata: true,
+                frame_metadata: std::sync::Arc::clone(&frame_metadata),
                 cancel: crate::control::CaptureCancellation::new(),
-                frame_metadata: &frame_metadata,
                 reply: tx,
             });
+            assert_eq!(
+                crate::visible_leaf_plan_builds(),
+                1,
+                "full mixed image routing, preparation, hover and metadata share one visible plan",
+            );
             let image = rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("mixed capture reply")
@@ -11197,6 +11422,7 @@ mod encode_worker_tests {
                 front: wid,
                 clean,
                 presented: Some(frame),
+                request_layout: None,
                 presented_metadata: None,
                 exact_frame: None,
                 target: confined(&dir, name),

@@ -951,10 +951,13 @@ fn native_hook_ext() -> &'static str {
 /// that the eleventh, the one answering, was months old.
 ///
 /// The app cannot simply BECOME an atpkg program: swapping a running, notarized `.app`
-/// needs Gatekeeper assessment, a crash-loop boot sentinel, and a live-process handoff,
-/// none of which the shim-and-store model provides. What atpkg can do — and now does — is
-/// stop pretending the app is not there, by reading the updater's own records rather than
-/// forming a second opinion about them.
+/// needs Gatekeeper assessment, a crash-loop boot sentinel, and the in-session overlap
+/// handoff (the running app spawns its successor and hands every PTY across), none of which
+/// the shim-and-store model provides. What atpkg can do — and now does — is stop pretending
+/// the app is not there, by reading the updater's own records rather than forming a second
+/// opinion about them. What it must NEVER do is tell the user to reopen the app for an
+/// update: the app applies a staged build to itself in-session, so there is nothing to
+/// reopen — a note that said otherwise stood over the live mechanism until 2026-08-30.
 ///
 /// Silent when there is no updater state: a bare CLI install is a legitimate posture, not a
 /// fault.
@@ -977,17 +980,26 @@ fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn st
         field("status.toml", "staged_build"),
     ) {
         (Some(current), Some(staged)) if current != staged => {
+            // The staged build is applied IN-SESSION by the app's own overlap handoff
+            // (automatic at the first quiet moment — forced within ~2 min — by default, one
+            // click otherwise); the shells keep running. atpkg names that lane and the
+            // `aterm ctl update` verbs, and never asks the user to reopen anything.
             let _ = writeln!(
                 out,
-                "{p}: note — aterm is RUNNING build {current}, installed {installed}, with \
-             build {staged} staged and waiting for a restart"
+                "{p}: note — aterm is running build {current} (installed {installed}); build \
+                 {staged} is staged and aterm applies it at its next quiet moment, in-session \
+                 and in place — your shells keep running (`aterm ctl update status` shows it; \
+                 `aterm ctl update apply` presses it now)"
             );
         }
         (Some(current), _) if current != installed => {
+            // A newer bundle is already on disk: the GUI activates it in place, the same
+            // in-session lane.
             let _ = writeln!(
                 out,
-                "{p}: note — aterm is RUNNING build {current} but build {installed} is \
-             installed; the running process predates it"
+                "{p}: note — aterm is running build {current} but build {installed} is \
+                 installed on disk; aterm activates it in-session, in place — your shells \
+                 keep running (`aterm ctl update status` shows it)"
             );
         }
         _ => {
@@ -2104,5 +2116,84 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ATPKG NEVER TELLS THE USER TO RESTART FOR AN APP UPDATE. A staged build is applied
+    /// in-session by the app's own overlap handoff (automatic by default, one click
+    /// otherwise) and the shells keep running, so the posture note names that lane and the
+    /// `aterm ctl update` verbs — never a reopen. Both note arms are pinned (a newer build
+    /// staged; a newer bundle already on disk), plus the quiet case, against the words that
+    /// stood here until 2026-08-30.
+    #[test]
+    fn aterm_posture_never_prompts_a_restart() {
+        let base = layout("posture");
+        // The updater's ledger lives BESIDE the pkg prefix (`<support>/Updates`), so the
+        // layout under test is `<scratch>/pkg` and the ledger goes in `<scratch>/Updates`.
+        let lay = Layout {
+            prefix: base.prefix.join("pkg"),
+        };
+        std::fs::create_dir_all(&lay.prefix).unwrap();
+        let updates = base.prefix.join("Updates");
+        std::fs::create_dir_all(&updates).unwrap();
+        let forbidden = ["restart", "relaunch", "reopen"];
+        let report = |lay: &Layout| -> String {
+            let mut out = Vec::new();
+            report_aterm_posture(lay, "atpkg", &mut out);
+            String::from_utf8(out).unwrap()
+        };
+
+        // A strictly-newer build staged while an older one runs: the in-session apply lane.
+        std::fs::write(
+            updates.join("installed.toml"),
+            "build_number = 1788035619\n",
+        )
+        .unwrap();
+        std::fs::write(
+            updates.join("status.toml"),
+            "current_build = 1788035619\nstaged_build = 1788077184\n",
+        )
+        .unwrap();
+        let text = report(&lay);
+        assert!(text.starts_with("atpkg: note — "), "{text}");
+        for want in [
+            "in-session",
+            "staged",
+            "1788077184",
+            "in place — your shells keep running",
+            "aterm ctl update status",
+            "aterm ctl update apply",
+        ] {
+            assert!(text.contains(want), "{want:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        for w in forbidden {
+            assert!(!lower.contains(w), "{w:?} must never appear: {text}");
+        }
+
+        // A newer bundle already on disk (the running process predates it): activation,
+        // still in-session and still no reopen.
+        std::fs::write(
+            updates.join("installed.toml"),
+            "build_number = 1788077184\n",
+        )
+        .unwrap();
+        std::fs::write(updates.join("status.toml"), "current_build = 1788035619\n").unwrap();
+        let text = report(&lay);
+        assert!(text.contains("activates it in-session"), "{text}");
+        assert!(
+            text.contains("in place — your shells keep running"),
+            "{text}"
+        );
+        let lower = text.to_lowercase();
+        for w in forbidden {
+            assert!(!lower.contains(w), "{w:?} must never appear: {text}");
+        }
+
+        // Running what is installed, nothing staged: the plain ok line, no note.
+        std::fs::write(updates.join("status.toml"), "current_build = 1788077184\n").unwrap();
+        let text = report(&lay);
+        assert_eq!(text, "atpkg: ok — aterm build 1788077184 installed\n");
+
+        let _ = std::fs::remove_dir_all(&base.prefix);
     }
 }

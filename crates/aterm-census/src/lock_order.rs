@@ -730,8 +730,99 @@ fn mask_cfg_test_items(text: &str) -> String {
 /// wasm32 build never compiles). Exact-match is the fail-closed direction: an
 /// unrecognized cfg spelling is NOT masked, so a hazard token under it still
 /// fails the census and forces a human re-audit (never a silent skip).
+///
+/// HOW A GATED ITEM ENDS — and why it is NOT a brace count. Until 2026-08-30
+/// this walker found the end by counting `{` and `}` over the RAW line text,
+/// literals INCLUDED. One `"}"`, one `'{'`, one `format!("{{")` inside a
+/// `#[cfg(test)]` module desynchronised the depth; the `depth <= 0` close then
+/// never held again and EVERY REMAINING LINE OF THE FILE was blanked. Measured
+/// on this tree the day of the repair: `#[cfg(test)] mod pkg_progress_tests` at
+/// `crates/aterm-gui/src/lib.rs:20281` swallowed the remaining 19 553 lines of
+/// that 39 833-line file, hiding SHIPPING code from every census that reads it
+/// — `spawn_pkg_update_check` (20493), `static JUST_UPDATED: OnceLock<bool>`
+/// (21201), `attach_parent_console` (21208); `aterm-gui/src/seamless.rs`, the
+/// subsystem the v0.65.0 freeze lived in, lost everything after line 3 046 of
+/// 5 813. THREE censuses were calling this one function while it was broken —
+/// lock-order (through [`mask_cfg_test_items`]), wasm and scope — so all three
+/// were reading roughly the first two thirds of the tree and calling it the
+/// whole of it. (Four, now that `lazy_init` has folded its private copy back in
+/// — that copy existed only to route around this bug. The finding that recorded
+/// the bug also said four, but by counting the main-loop census, which masks
+/// nothing at all; that is its own posture, not this function's.) Un-blinding
+/// the three is worth 5 050 newly VISIBLE lines across
+/// `crates/**` and, in the other direction, 3 236 lines of test code the old
+/// counter had left visible after an early break — all of `atpkg/src/flow.rs`'s
+/// test module after `assert!(.., "{index_body}")`, all of
+/// `aterm-gui/src/video_key_analysis.rs`'s after a `split([',', '\n', '}'])`.
+/// On this tree the lock-order census goes from 821 acquisition sites and 118
+/// identities to 826 and 119 (a new `progress_proxy`), and the graph stays
+/// ACYCLIC.
+///
+/// The end of an item is now found the way rustfmt guarantees it can be, with
+/// literals masked before every token test:
+///   - a `;` at the end of a line — the body-less item (`use`, `const`, a
+///     statement, a `fn` declaration);
+///   - a `,` at the end of a line WHOSE OWN INDENT EQUALS THE GATE'S — the
+///     brace-less item that has no `;`: an enum variant, a struct field, a
+///     match arm, a struct-literal field. The indent equality is what keeps a
+///     wrapped signature (`fn f(`↵`    a: u32,`↵`) -> T {`) out: its parameter
+///     lines are indented DEEPER, and reading `a: u32,` as the end is exactly
+///     the over-mask this rule must not commit;
+///   - otherwise the first `{` opens a body, which ends at the first later line
+///     that is `<indent>}` — rustfmt's closing-brace-at-item-indent invariant,
+///     the same one the fn segmenter ([`crate::parse_source_fns`]) already
+///     trusts. `},` / `});` / `};` count (an item can be a variant, a macro
+///     call or a `let`); `} else {` does not, because a line that reopens a
+///     brace is a continuation, not an end.
+///
+/// The seed of this is `lazy_init::mask_unshipped`, written and proven in that
+/// lane first (docs/temporal-safety-gate.md, "CLOSED FINDING (2026-08-30): the
+/// shared `#[cfg(test)]` mask blanked to EOF" — which is where the whole
+/// adjudication is written down); the `,`-terminated and literal-masked
+/// rules are what the fallout adjudication added — without them a
+/// `#[cfg(test)]` enum variant in `aterm-gui/src/lib.rs:2570` ate the next 830
+/// lines of shipped `enum` and a `#[cfg(test)] debug_assert!(` in
+/// `aterm-scrollback/src/cold_tier.rs:612` was cut off at its own format string.
+///
+/// FAIL-OPEN ON AN UNRECOGNISED SHAPE, deliberately — the opposite direction
+/// from the exact-match gate spelling above, because the two errors are not
+/// symmetric. Masking is SUBTRACTIVE: leaving a gated body VISIBLE costs at
+/// worst a false positive that a human reads and answers, while blanking
+/// shipped code removes it from the census's sight and the census then reports
+/// GREEN. So when no `<indent>}` closes the body, or the walk runs off the end
+/// of the file without any terminator, the lines already marked are RESTORED
+/// rather than guessed at.
+///
+/// WHY THE RESTORE MATTERS BEYOND HONESTY: the masked text is re-parsed
+/// downstream by brace counters ([`crate::scope_census`]'s `all_struct_bodies`
+/// and `fn_body`). Blanking a `{` without its `}` would splice the file and
+/// hand them a struct body that runs to the next unbalanced brace — which is
+/// how the first cut of this repair moved the close of `struct WindowState`'s
+/// body from `crates/aterm-gui/src/lib.rs:8681` to 10783 and made a
+/// struct-LITERAL line at 9814 read as a field declaration — a phantom OB-14
+/// "UNACCOUNTED owner of `WordDecorations`", six red tests deep. Every
+/// blanked span is now a COMPLETE item, and the check that holds it to that is
+/// external: masking `crates/**/*.rs` and re-parsing each result with rustfmt
+/// leaves 1 file of 1 638 unparseable, against 18 for the brace counter — and,
+/// under the wasm census's longer gate list, 1 against 27.
+///
+/// That one file is this crate's own `lazy_init.rs`, and it is the caveat the
+/// repair does not remove: a RAW STRING containing a line that is exactly
+/// `<indent>}` can still close a body early. It happens only in files that
+/// quote whole Rust programs — in practice this crate's fixtures, which is why
+/// [`crate::scope_census`] and `lazy_init` exclude `crates/aterm-census/src`
+/// from their scans, and why the lock-order and wasm scan sets (derived from
+/// `aterm-gui`'s and the wasm root's dependency closures) never contain it.
+/// Closing early is the subtractive direction, so it costs at most a false
+/// positive.
 pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
     let lines: Vec<&str> = text.lines().collect();
+    // The code of a line: comments stripped, then string/char literals blanked
+    // to spaces (length-preserving, so column indices still line up). EVERY
+    // token test below reads this, never the raw line — a literal brace is
+    // what broke the counter this replaced.
+    let code_of = |line: &str| mask_literals(strip_line_comment(line));
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
     let mut keep = vec![true; lines.len()];
     let mut i = 0;
     while i < lines.len() {
@@ -751,45 +842,72 @@ pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
         if j >= lines.len() {
             break;
         }
-        keep[j] = false;
         // WHERE THE ITEM'S BODY STARTS may be lines below its first line: a
         // wrapped signature (`fn f(` … `) -> T {`) opens no brace on the line
         // the attribute introduces. Reading only that line declared such an
         // item body-less and left it UNMASKED — so a `#[cfg(not(target_arch =
         // "wasm32"))]` function with a multi-line signature had its body
         // scanned as if it shipped, which is exactly how a gated thread spawn
-        // failed the wasm posture check. Walk forward to the first `{`, and
-        // treat a `;` reached first as the genuine body-less case (a `fn`
-        // declaration, a `use`, a const).
-        let mut depth = 0i32;
-        let mut opened = false;
+        // failed the wasm posture check. Walk forward to the first `{`, taking
+        // a `;` or a gate-indent `,` reached first as the genuine end.
         let mut k = j;
+        let mut opened = false;
+        let mut terminated = false;
         while k < lines.len() {
-            let item = strip_line_comment(lines[k]);
-            for ch in item.chars() {
-                match ch {
-                    '{' => {
-                        depth += 1;
-                        opened = true;
-                    }
-                    '}' => depth -= 1,
-                    ';' if !opened && depth == 0 => {
-                        // Body-less item: this line is the whole of it.
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let item = code_of(lines[k]);
             keep[k] = false;
-            if opened && depth <= 0 {
+            if item.contains('{') {
+                opened = true;
+                terminated = true;
                 break;
             }
-            if !opened && strip_line_comment(lines[k]).trim_end().ends_with(';') {
+            let s = item.trim_end();
+            if s.ends_with(';') || (s.ends_with(',') && indent_of(lines[k]) == indent) {
+                terminated = true;
                 break;
             }
             k += 1;
         }
-        let _ = indent;
+        if !terminated {
+            // Ran off the end of the file with no terminator: an unrecognised
+            // shape. Restore rather than blank the tail — see FAIL-OPEN above.
+            for slot in keep.iter_mut().take(lines.len()).skip(j) {
+                *slot = true;
+            }
+            break;
+        }
+        if opened {
+            // A body that closes on the line it opened (`fn f() -> u8 { 1 }`,
+            // `mod m {}`, `Variant { a: u32 },`) has no `<indent>}` line of its
+            // own; anything else runs to rustfmt's.
+            let first = code_of(lines[k]);
+            let single = first.matches('{').count() == first.matches('}').count();
+            if !single {
+                let pad = " ".repeat(indent);
+                let end = (k + 1..lines.len()).find(|m| {
+                    let c = code_of(lines[*m]);
+                    lines[*m].starts_with(&pad)
+                        && c.as_bytes().get(indent) == Some(&b'}')
+                        && !c.contains('{')
+                });
+                match end {
+                    Some(end) => {
+                        for slot in keep.iter_mut().take(end + 1).skip(k) {
+                            *slot = false;
+                        }
+                        k = end;
+                    }
+                    // Unrecognised shape: restore the item's lines. Blanking a
+                    // `{` whose `}` survives would splice the file for the
+                    // brace counters downstream.
+                    None => {
+                        for slot in keep.iter_mut().take(k + 1).skip(j) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
         i = k + 1;
     }
     let mut out = String::with_capacity(text.len());
@@ -3489,6 +3607,187 @@ mod tests {
         );
         let masked = mask_literals(r#"let b = matches!(c, '{');"#);
         assert_eq!(masked.matches('{').count(), 0);
+    }
+
+    /// THE RUNAWAY THIS MASKER WAS REWRITTEN TO STOP, plus every shape the
+    /// rewrite had to learn before it stopped over-masking instead.
+    ///
+    /// Each case is a shape the brace-counting predecessor got WRONG on this
+    /// tree, cited with where it was measured. The predecessor counted `{` and
+    /// `}` over raw line text, so one literal brace desynchronised it forever;
+    /// the first cut of the replacement ended a body only at `<indent>}`, which
+    /// is right for a `mod`/`fn` and catastrophic for the brace-less items
+    /// (enum variant, match arm, struct field) that end at a comma.
+    ///
+    /// A fixture is a slice of LINES rather than one `\n`-spliced literal
+    /// because every assertion here is about column-0 vs column-4 indentation,
+    /// and an escaped literal hides exactly that.
+    #[test]
+    fn gated_items_end_at_their_own_shape_not_at_a_brace_count() {
+        fn src(lines: &[&str]) -> String {
+            let mut s = lines.join("\n");
+            s.push('\n');
+            s
+        }
+        let gates: &[&str] = &["#[cfg(test)]"];
+
+        // (1) THE RUNAWAY. One `'{'` char literal (net +1 to a counter that
+        // reads raw text; the `"{}"` beside it nets 0) left the depth stuck
+        // above zero, the close never held again, and every later line of the
+        // file was blanked. crates/aterm-gui/src/lib.rs lost 19 553 lines and
+        // three shipping items this way, `spawn_pkg_update_check` among them.
+        let m = mask_gated_items(
+            &src(&[
+                "#[cfg(test)]",
+                "mod tests {",
+                "    fn t() {",
+                "        assert!(matches!(c, '{'), \"{}\", render());",
+                "    }",
+                "}",
+                "fn spawn_pkg_update_check() {",
+                "    let g = pkg.lock();",
+                "}",
+            ]),
+            gates,
+        );
+        assert!(
+            !m.contains("render()"),
+            "the test mod must be blanked:\n{m}"
+        );
+        assert!(
+            m.contains("fn spawn_pkg_update_check") && m.contains("pkg.lock()"),
+            "shipped code AFTER a gated mod must survive:\n{m}"
+        );
+        assert_eq!(
+            m.matches('{').count(),
+            m.matches('}').count(),
+            "the mask must leave the file brace-balanced:\n{m}"
+        );
+
+        // (2) AN ENUM VARIANT ends at its comma, not at the next brace it can
+        // find. crates/aterm-gui/src/lib.rs:2570 gates one variant of the
+        // event enum; ending it at a brace swallowed the next 830 lines of
+        // shipped variants.
+        let m = mask_gated_items(
+            &src(&[
+                "enum Ev {",
+                "    Shipped(u8),",
+                "    #[cfg(test)]",
+                "    TestOnly,",
+                "    AlsoShipped {",
+                "        payload: u8,",
+                "    },",
+                "}",
+            ]),
+            gates,
+        );
+        assert!(!m.contains("TestOnly"), "the gated variant must go:\n{m}");
+        assert!(
+            m.contains("AlsoShipped") && m.contains("payload"),
+            "the variants AFTER it must survive:\n{m}"
+        );
+
+        // (3) A MATCH ARM, same rule, one nesting level deeper — the shape at
+        // crates/aterm-gui/src/lib.rs:9427.
+        let m = mask_gated_items(
+            &src(&[
+                "fn settings(&self) -> Option<&S> {",
+                "    match &self.overlay {",
+                "        #[cfg(test)]",
+                "        Some(Overlay::Settings(s)) => Some(s),",
+                "        _ => None,",
+                "    }",
+                "}",
+            ]),
+            gates,
+        );
+        assert!(!m.contains("Overlay::Settings"), "arm must go:\n{m}");
+        assert!(m.contains("_ => None"), "the next arm must survive:\n{m}");
+
+        // (4) THE COMMA RULE MUST NOT REACH A WRAPPED SIGNATURE: `a: u32,` is
+        // indented DEEPER than the gate, so it is a parameter, not an end.
+        // Reading it as one would leave a gated body scanned as if it shipped
+        // — the wasm-posture bug the predecessor's forward walk was added for.
+        let m = mask_gated_items(
+            &src(&[
+                "#[cfg(test)]",
+                "fn helper(",
+                "    a: u32,",
+                ") -> u32 {",
+                "    alpha.lock();",
+                "}",
+                "fn shipped() {}",
+            ]),
+            gates,
+        );
+        assert!(!m.contains("alpha.lock()"), "gated body must go:\n{m}");
+        assert!(m.contains("fn shipped"), "the next item must survive:\n{m}");
+
+        // (5) A GATED STATEMENT whose argument list carries a brace in a
+        // FORMAT STRING — crates/aterm-scrollback/src/cold_tier.rs:612. The
+        // walk looking for the body's `{` must read literal-masked text, or it
+        // mistakes the format string for the body and cuts the statement in
+        // half (which then splices the file for the brace counters downstream).
+        let m = mask_gated_items(
+            &src(&[
+                "fn truncate(&mut self, n: usize) {",
+                "    #[cfg(test)]",
+                "    debug_assert!(",
+                "        n <= self.count,",
+                "        \"truncate({n}) exceeds count({})\",",
+                "        self.count",
+                "    );",
+                "    self.count -= n;",
+                "}",
+            ]),
+            gates,
+        );
+        assert!(!m.contains("debug_assert"), "the assert must go:\n{m}");
+        assert!(
+            m.contains("self.count -= n;"),
+            "the shipped statement after it must survive:\n{m}"
+        );
+        assert_eq!(
+            m.matches('{').count(),
+            m.matches('}').count(),
+            "the enclosing fn must still be brace-balanced:\n{m}"
+        );
+
+        // (6) FAIL-OPEN. A body whose close is not at the gate's indent is a
+        // shape this walker does not recognise, and the answer is to mask
+        // NOTHING of it: a visible test lock is a false positive a human
+        // answers, a blanked shipped one is a census that reports GREEN
+        // because it cannot see. It must also stay brace-BALANCED — blanking
+        // the `{` while its `}` survives is what moved the close of
+        // `struct WindowState`'s body, under the first cut of this repair,
+        // from crates/aterm-gui/src/lib.rs:8681 to 10783.
+        let m = mask_gated_items(
+            &src(&[
+                "#[cfg(test)]",
+                "fn odd() {",
+                "    let g = alpha.lock();",
+                "  }",
+                "fn shipped() {}",
+            ]),
+            gates,
+        );
+        assert!(
+            m.contains("fn odd") && m.contains("alpha.lock()"),
+            "an unrecognised shape must be masked LESS, not more:\n{m}"
+        );
+        assert_eq!(
+            m.matches('{').count(),
+            m.matches('}').count(),
+            "the mask must never splice a brace off its partner:\n{m}"
+        );
+
+        // Line count is preserved in every case, or every span the censuses
+        // print afterwards is off by the size of the mask.
+        let raw = src(&["#[cfg(test)]", "mod t {", "    fn a() {}", "}", "fn b() {}"]);
+        assert_eq!(
+            mask_gated_items(&raw, gates).lines().count(),
+            raw.lines().count()
+        );
     }
 
     // ------------------------------------------------------------------

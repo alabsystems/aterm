@@ -18,6 +18,7 @@ use aterm_render::{DamageOutcome, Frame, RenderInput, Theme};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use crate::present::{CpuFrameBuffer as _, CpuPresenter as _};
 use crate::{
     App, BLINK_INTERVAL, Backend, PresentDropAccounting, PresentTarget, RepaintKey,
     SelectionFingerprint, SyncObservation, WindowId, WindowState, chrome_band, metrics, pane,
@@ -2394,6 +2395,193 @@ mod window_renderer_state_binding_tests {
 #[cfg(test)]
 mod canonical_layout_scheduler_tests {
     use super::*;
+    use crate::{reset_visible_leaf_plan_builds, visible_leaf_plan_builds};
+
+    fn assert_planned_frame_builds_once(mut app: App, expected: crate::VisibleContentRoute) {
+        let wid = WindowId(0);
+        reset_visible_leaf_plan_builds();
+        let (plan, route) = app.active_visible_frame_layout(wid).expect("frame layout");
+        assert_eq!(route, expected, "negative-control fixture route");
+        app.windows.get_mut(&wid).unwrap().panes_stale = true;
+        if app.windows[&wid].panes_stale {
+            app.resize_panes_scoped_with_active_plan(wid, true, Some(&plan));
+        }
+        app.prepare_layout_coordinate_space_from_plan(wid, route, &plan);
+        let prepared = match route {
+            crate::VisibleContentRoute::Terminal { .. } => true,
+            crate::VisibleContentRoute::Native { .. } => {
+                app.prepare_native_input_scratch_from_plan(wid, &plan)
+            }
+            crate::VisibleContentRoute::Heterogeneous => app
+                .prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(
+                    wid,
+                    Some(ComposedCursorFxClock::Advance(Instant::now())),
+                    &plan,
+                )
+                .is_some(),
+        };
+        assert!(prepared, "planned route preparation must succeed");
+        app.splice_link_target_from_plan(wid, &plan);
+        let successful_route = match route {
+            crate::VisibleContentRoute::Terminal { .. } => SuccessfulPresentRoute::Terminal,
+            crate::VisibleContentRoute::Heterogeneous => SuccessfulPresentRoute::Heterogeneous,
+            crate::VisibleContentRoute::Native { view, .. } => SuccessfulPresentRoute::Native {
+                view,
+                presented_stamp: app.windows[&wid]
+                    .native_ui_compiled
+                    .as_ref()
+                    .map(|frame| frame.stamp),
+            },
+        };
+        app.first_present_done = true;
+        app.finalize_successful_present(
+            wid,
+            crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
+            0,
+            None,
+            successful_route,
+            route,
+            HostVisualState::default(),
+            &plan,
+        );
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "route, geometry, preparation, cursor effects, chrome and finalization reuse one plan",
+        );
+
+        // Negative control: model the retired frame plumbing by resolving an
+        // outer plan, then invoking a standalone consumer that owns another.
+        // The counter must observe both builds for every route shape.
+        reset_visible_leaf_plan_builds();
+        let (_, route) = app.active_visible_frame_layout(wid).expect("outer layout");
+        let prepared = match route {
+            crate::VisibleContentRoute::Terminal { .. } => {
+                app.prepare_layout_coordinate_space(wid, route);
+                true
+            }
+            crate::VisibleContentRoute::Native { .. } => app.prepare_native_input_scratch(wid),
+            crate::VisibleContentRoute::Heterogeneous => app
+                .prepare_heterogeneous_input_scratch_with_cursor_fx(wid, None)
+                .is_some(),
+        };
+        assert!(prepared, "standalone negative-control preparation");
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            2,
+            "an unthreaded outer frame plus standalone consumer rebuilds the plan",
+        );
+    }
+
+    #[test]
+    fn terminal_frame_threads_one_visible_plan() {
+        assert_planned_frame_builds_once(
+            App::headless_for_test(),
+            crate::VisibleContentRoute::Terminal { composed: false },
+        );
+    }
+
+    #[test]
+    fn terminal_capture_threads_one_fresh_visible_plan() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let now = Instant::now();
+
+        reset_visible_leaf_plan_builds();
+        let (request_plan, request_route) = app
+            .active_visible_frame_layout(wid)
+            .expect("request layout");
+        assert_eq!(
+            request_route,
+            crate::VisibleContentRoute::Terminal { composed: false }
+        );
+        let (grid, plan) = match app.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
+            wid,
+            request_plan,
+            ComposedCursorFxClock::Advance(now),
+        ) {
+            CapturePreparation::Ready(prepared) => prepared,
+            other => panic!("terminal capture was not ready: {other:?}"),
+        };
+        assert!(!grid.composed);
+        app.splice_link_target_from_plan(wid, &plan);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "request routing, capture, cursor effects and chrome reuse one owned plan",
+        );
+
+        reset_visible_leaf_plan_builds();
+        assert!(
+            app.prepare_terminal_capture_grid_with_cursor_fx(
+                wid,
+                ComposedCursorFxClock::Retain {
+                    observed_at: now + Duration::from_millis(1),
+                },
+            )
+            .is_some()
+        );
+        assert_eq!(visible_leaf_plan_builds(), 1, "single-pane Retain");
+
+        // AN ALL-TERMINAL TAB OWNS A `layouts` ENTRY, so the split has to go
+        // through the legacy tree and be mirrored forward — production's
+        // `!canonical_split` arm. `split_active_stub_tab` is that helper: it
+        // splits `layouts` AND calls `sync_tab_model_from_layout`.
+        // `split_active_with_stub_terminal` is the CANONICAL/heterogeneous arm
+        // and never touches `layouts`, so aiming it at a pure-terminal tab
+        // desyncs the two topologies and `sync_active_session`'s structural
+        // invariant rejects the window before this test asserts anything.
+        app.split_active_stub_tab(wid);
+        for (label, clock) in [
+            (
+                "composed Advance",
+                ComposedCursorFxClock::Advance(now + Duration::from_millis(2)),
+            ),
+            (
+                "composed Retain",
+                ComposedCursorFxClock::Retain {
+                    observed_at: now + Duration::from_millis(3),
+                },
+            ),
+        ] {
+            reset_visible_leaf_plan_builds();
+            let grid = app
+                .prepare_terminal_capture_grid_with_cursor_fx(wid, clock)
+                .expect(label);
+            assert!(grid.composed, "{label}");
+            assert_eq!(visible_leaf_plan_builds(), 1, "{label}");
+        }
+
+        // Negative control: the retired capture spelling independently resolved
+        // those three consumers at the same synchronous capture boundary.
+        reset_visible_leaf_plan_builds();
+        let route = app
+            .active_visible_content_route(wid)
+            .expect("terminal route");
+        assert!(app.prepare_layout_coordinate_space(wid, route));
+        assert!(app.active_visible_leaf_plan(wid).is_some());
+        assert_eq!(visible_leaf_plan_builds(), 3);
+    }
+
+    #[test]
+    fn native_frame_threads_one_visible_plan() {
+        let mut app = App::headless_for_test();
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, view) = app.active_native_view(WindowId(0)).expect("native front");
+        assert_planned_frame_builds_once(
+            app,
+            crate::VisibleContentRoute::Native { instance, view },
+        );
+    }
+
+    #[test]
+    fn heterogeneous_frame_threads_one_visible_plan() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        assert_planned_frame_builds_once(app, crate::VisibleContentRoute::Heterogeneous);
+    }
 
     fn charge_cursor_body(state: &mut WindowState, now: Instant) {
         let geom = crate::cursor_glow::Geom {
@@ -4544,6 +4732,7 @@ mod trail_present_pacing_tests {
             wash_a: 17,
             border_a: 203,
         };
+        let plan = app.active_visible_leaf_plan(id).expect("visible plan");
 
         app.finalize_successful_present(
             id,
@@ -4556,6 +4745,7 @@ mod trail_present_pacing_tests {
                 invert: true,
                 overlay: Some(stale),
             },
+            &plan,
         );
         let terminal_serial = app.windows[&id].capture_present_serial;
         assert!(app.windows[&id].capture_present_invert);
@@ -4569,6 +4759,7 @@ mod trail_present_pacing_tests {
             SuccessfulPresentRoute::Heterogeneous,
             crate::VisibleContentRoute::Heterogeneous,
             HostVisualState::default(),
+            &plan,
         );
         let state = &app.windows[&id];
         assert_eq!(state.capture_present_serial, terminal_serial + 1);
@@ -5669,7 +5860,7 @@ mod native_damage_tests {
         let (cw, ch) = app.win_cell_size(wid);
         let scale = app.windows[&wid].scale.max(f64::EPSILON) as f32;
         let mut modal_prims = Vec::new();
-        assert!(app.append_native_modal_prims(wid, &mut modal_prims, 0.0));
+        assert!(app.append_native_modal_prims(wid, &mut modal_prims, 0.0, None));
         let modal = crate::tray_raster::rasterize_tray_pixels(
             &modal_prims,
             width,
@@ -8006,6 +8197,121 @@ pub(crate) fn dirty_row_runs(dirty: &[bool]) -> impl Iterator<Item = (usize, usi
     })
 }
 
+/// Build the exact CPU-present damage rectangles for dirty renderer row bands.
+/// The caller owns `out`, so a stable row count retains its allocation. Geometry
+/// is pure: `row_pixel_band` supplies the renderer's source `[y0, y1)` for one
+/// grid row; cropping and the 1x1 empty fallback are resolved here once for both
+/// the live presenter and deterministic tests.
+fn cpu_damage_rects_into(
+    out: &mut Vec<crate::present::DamageRect>,
+    dirty: &[bool],
+    x0: usize,
+    span: usize,
+    off_y: i64,
+    surface_height: usize,
+    mut row_pixel_band: impl FnMut(usize) -> (usize, usize),
+) -> bool {
+    out.clear();
+    out.reserve(dirty.len().div_ceil(2).max(1));
+    let Some(width) = NonZeroU32::new(span as u32) else {
+        let one = NonZeroU32::new(1).expect("one is non-zero");
+        out.push(crate::present::DamageRect {
+            x: 0,
+            y: 0,
+            width: one,
+            height: one,
+        });
+        return false;
+    };
+    let surface_height = i64::try_from(surface_height).unwrap_or(i64::MAX);
+    for (r0, r1) in dirty_row_runs(dirty) {
+        let (fy0, _) = row_pixel_band(r0);
+        let (_, fy1) = row_pixel_band(r1);
+        let lo = i64::try_from(fy0)
+            .unwrap_or(i64::MAX)
+            .saturating_add(off_y)
+            .clamp(0, surface_height);
+        let hi = i64::try_from(fy1)
+            .unwrap_or(i64::MAX)
+            .saturating_add(off_y)
+            .clamp(0, surface_height);
+        if lo < hi
+            && let Some(height) = NonZeroU32::new(u32::try_from(hi - lo).unwrap_or(u32::MAX))
+        {
+            out.push(crate::present::DamageRect {
+                x: x0 as u32,
+                y: lo as u32,
+                width,
+                height,
+            });
+        }
+    }
+    let copied = !out.is_empty();
+    if !copied {
+        let one = NonZeroU32::new(1).expect("one is non-zero");
+        out.push(crate::present::DamageRect {
+            x: 0,
+            y: 0,
+            width: one,
+            height: one,
+        });
+    }
+    copied
+}
+
+#[cfg(test)]
+mod cpu_damage_rect_tests {
+    use super::cpu_damage_rects_into;
+
+    fn tuples(rects: &[crate::present::DamageRect]) -> Vec<(u32, u32, u32, u32)> {
+        rects
+            .iter()
+            .map(|rect| (rect.x, rect.y, rect.width.get(), rect.height.get()))
+            .collect()
+    }
+
+    #[test]
+    fn dirty_damage_geometry_is_exact_and_reuses_its_allocation() {
+        let dirty = [true, true, false, true, false, true, true];
+        let mut rects = Vec::new();
+        let build = |rects: &mut Vec<crate::present::DamageRect>| {
+            cpu_damage_rects_into(rects, &dirty, 3, 8, -5, 55, |row| {
+                (row * 10, (row + 1) * 10)
+            })
+        };
+
+        assert!(build(&mut rects));
+        assert_eq!(
+            tuples(&rects),
+            vec![(3, 0, 8, 15), (3, 25, 8, 10), (3, 45, 8, 10)],
+            "contiguous rows coalesce and top/bottom cropping stays exact",
+        );
+
+        let allocation = rects.as_ptr();
+        let capacity = rects.capacity();
+        assert!(build(&mut rects));
+        assert_eq!(rects.as_ptr(), allocation, "steady rows reuse the Vec");
+        assert_eq!(rects.capacity(), capacity, "steady rows do not grow it");
+    }
+
+    #[test]
+    fn empty_or_zero_span_uses_the_same_minimal_fallback() {
+        for (dirty, span) in [([false, false], 8), ([true, true], 0)] {
+            let mut rects = Vec::new();
+            assert!(!cpu_damage_rects_into(
+                &mut rects,
+                &dirty,
+                3,
+                span,
+                0,
+                20,
+                |row| (row * 10, (row + 1) * 10),
+            ));
+            assert_eq!(tuples(&rects), vec![(0, 0, 1, 1)]);
+        }
+    }
+}
+
 /// The `RepaintKey::system_dark` term (and the settings preview's
 /// `PreviewCtx::system_dark`), as a PURE function of the App-tracked OS
 /// appearance (`sync_app_theme_to_appearance`). The ONE population source for
@@ -8757,15 +9063,26 @@ pub(crate) fn selection_autoscroll_lines(
     if y < top {
         // Above the top edge → scroll into history. One line per cell-height of
         // overshoot (min 1), so the further out, the faster.
-        let over = (top - y) as usize;
-        (over / ch + 1) as i32
+        autoscroll_step(top - y, ch)
     } else if y >= bottom {
         // Below the bottom edge → scroll toward the live bottom (negative offset).
-        let over = (y - bottom) as usize;
-        -((over / ch + 1) as i32)
+        -autoscroll_step(y - bottom, ch)
     } else {
         0
     }
+}
+
+/// Step count for a drag held `overshoot` device pixels past a grid edge: one
+/// line per cell height, minimum one. Both callers hand it a non-negative
+/// distance (each branch tests the edge it subtracts).
+///
+/// SATURATING. The overshoot descends from a raw pointer coordinate, and a drag
+/// that leaves the window is reported in whatever space the windowing system
+/// pleases — nothing bounds it to the window's own extent. A wrapped `i32` would
+/// not merely scroll a wrong distance, it would flip the SIGN and reverse the
+/// gesture's DIRECTION, so the magnitude pins instead.
+fn autoscroll_step(overshoot: f64, ch: usize) -> i32 {
+    (overshoot / ch.max(1) as f64 + 1.0).min(i32::MAX as f64) as i32
 }
 
 /// Shift the composed frame `dst` DOWN by `strip_rows.len()` rows and prepend those
@@ -11062,6 +11379,170 @@ fn wallpaper_cell_tints(
         }
     }
     out
+}
+
+/// Merge wallpaper-derived default-foreground tints into the frame's existing
+/// sorted-unique ink channel. Existing producers win on an occupied cell. The
+/// two vectors swap at the end so a steady frame reuses resident allocations.
+/// This deliberately does not memoize the cell projection: changed terminal
+/// glyphs must be observed, so a tinted present still performs the O(rows*cols)
+/// eligibility scan.
+fn merge_wallpaper_tint_ink(
+    cells: &[Vec<RenderCell>],
+    rows: usize,
+    cols: usize,
+    default_fg: [u8; 3],
+    tint: &[Option<[u8; 3]>],
+    existing: &mut Vec<aterm_core::render::InkCell>,
+    scratch: &mut Vec<aterm_core::render::InkCell>,
+) {
+    scratch.clear();
+    scratch.reserve(existing.len().saturating_add(rows.saturating_mul(cols) / 4));
+    let mut ex = existing.iter().copied().peekable();
+    for (r, row) in cells.iter().enumerate().take(rows) {
+        if r > usize::from(u16::MAX) {
+            break;
+        }
+        for (c, cell) in row.iter().enumerate().take(cols) {
+            while ex
+                .peek()
+                .is_some_and(|entry| (usize::from(entry.row), usize::from(entry.col)) < (r, c))
+            {
+                scratch.push(ex.next().expect("peeked"));
+            }
+            if ex
+                .peek()
+                .is_some_and(|entry| usize::from(entry.row) == r && usize::from(entry.col) == c)
+            {
+                scratch.push(ex.next().expect("peeked"));
+                continue;
+            }
+            // Blanks paint no glyph; a wide continuation has no lead glyph of
+            // its own; non-default foreground keeps its SGR color.
+            if cell.ch == ' ' || cell.wide || cell.fg != default_fg || c > usize::from(u16::MAX) {
+                continue;
+            }
+            let Some(color) = tint.get(r * cols + c).copied().flatten() else {
+                continue;
+            };
+            scratch.push(aterm_core::render::InkCell {
+                row: r as u16,
+                col: c as u16,
+                color,
+            });
+        }
+    }
+    scratch.extend(ex);
+    std::mem::swap(existing, scratch);
+}
+
+#[cfg(test)]
+mod wallpaper_tint_ink_tests {
+    use super::merge_wallpaper_tint_ink;
+    use aterm_core::render::InkCell;
+    use aterm_core::terminal::{RenderCell, UnderlineStyle};
+
+    fn cell(ch: char, fg: [u8; 3], wide: bool) -> RenderCell {
+        RenderCell {
+            ch,
+            fg,
+            bg: [0, 0, 0],
+            wide,
+            emoji_presentation: false,
+            text_presentation: false,
+            bold: false,
+            italic: false,
+            underline: UnderlineStyle::None,
+            strikethrough: false,
+            overline: false,
+            underline_color: None,
+            overline_color: None,
+        }
+    }
+
+    fn tuples(ink: &[InkCell]) -> Vec<(u16, u16, [u8; 3])> {
+        ink.iter()
+            .map(|entry| (entry.row, entry.col, entry.color))
+            .collect()
+    }
+
+    #[test]
+    fn merge_preserves_precedence_order_and_swaps_warm_allocations() {
+        let default_fg = [200, 200, 200];
+        let cells = vec![
+            vec![
+                cell('a', default_fg, false),
+                cell('b', default_fg, false),
+                cell(' ', default_fg, false),
+                cell('c', default_fg, true),
+            ],
+            vec![
+                cell('d', default_fg, false),
+                cell('e', [1, 2, 3], false),
+                cell('f', default_fg, false),
+                cell('g', default_fg, false),
+            ],
+        ];
+        let tint = vec![
+            Some([1, 1, 1]),
+            Some([2, 2, 2]),
+            Some([3, 3, 3]),
+            Some([4, 4, 4]),
+            Some([5, 5, 5]),
+            Some([6, 6, 6]),
+            None,
+            Some([7, 7, 7]),
+        ];
+        let producers = vec![
+            InkCell {
+                row: 0,
+                col: 1,
+                color: [90, 90, 90],
+            },
+            InkCell {
+                row: 1,
+                col: 0,
+                color: [80, 80, 80],
+            },
+            InkCell {
+                row: 2,
+                col: 0,
+                color: [70, 70, 70],
+            },
+        ];
+        let expected = vec![
+            (0, 0, [1, 1, 1]),
+            (0, 1, [90, 90, 90]),
+            (1, 0, [80, 80, 80]),
+            (1, 3, [7, 7, 7]),
+            (2, 0, [70, 70, 70]),
+        ];
+        let mut ink = producers.clone();
+        let mut scratch = Vec::new();
+        let merge = |ink: &mut Vec<InkCell>, scratch: &mut Vec<InkCell>| {
+            merge_wallpaper_tint_ink(&cells, 2, 4, default_fg, &tint, ink, scratch);
+        };
+
+        merge(&mut ink, &mut scratch);
+        assert_eq!(tuples(&ink), expected);
+
+        // Warm both alternating vectors, then prove the next merge merely swaps
+        // their allocations. This catches a fresh per-frame merged Vec while
+        // remaining independent of the process-global test allocator.
+        ink.clear();
+        ink.extend_from_slice(&producers);
+        merge(&mut ink, &mut scratch);
+        ink.clear();
+        ink.extend_from_slice(&producers);
+        let (ink_allocation, scratch_allocation) = (ink.as_ptr(), scratch.as_ptr());
+        let (ink_capacity, scratch_capacity) = (ink.capacity(), scratch.capacity());
+        merge(&mut ink, &mut scratch);
+        assert_eq!(tuples(&ink), expected);
+        assert_eq!(ink.as_ptr(), scratch_allocation);
+        assert_eq!(scratch.as_ptr(), ink_allocation);
+        assert_eq!(ink.capacity(), scratch_capacity);
+        assert_eq!(scratch.capacity(), ink_capacity);
+    }
 }
 
 /// WCAG contrast ratio between two relative luminances.
@@ -17164,6 +17645,16 @@ pub(crate) enum CapturePreparation<T> {
 }
 
 impl<T> CapturePreparation<T> {
+    #[cfg(test)]
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> CapturePreparation<U> {
+        match self {
+            Self::Ready(value) => CapturePreparation::Ready(f(value)),
+            Self::Held { retry_at } => CapturePreparation::Held { retry_at },
+            Self::Unavailable => CapturePreparation::Unavailable,
+        }
+    }
+
+    #[cfg(test)]
     fn into_option(self) -> Option<T> {
         match self {
             Self::Ready(grid) => Some(grid),
@@ -17404,6 +17895,17 @@ fn paint_suggestion(
         col += 1;
     }
     painted
+}
+
+/// Hand a consumer the predictor's resident overlay slice. Keeping the borrow
+/// inside this closure lets callers mutate a disjoint render scratch without a
+/// transient `Vec<Prediction>` copy.
+fn with_borrowed_prediction_overlay<R>(
+    predictor: &mut crate::predict::Predictor,
+    now: Instant,
+    consume: impl FnOnce(&[crate::predict::Prediction]) -> R,
+) -> R {
+    consume(predictor.overlay(now))
 }
 
 /// Overlay pending speculative-echo GHOSTS onto a terminal-coordinate snapshot —
@@ -17891,10 +18393,11 @@ mod suggestion_paint_tests {
 
 #[cfg(test)]
 mod prediction_ghost_tests {
-    use super::{paint_prediction_ghosts, terminal_blank_cell};
-    use crate::predict::Prediction;
+    use super::{paint_prediction_ghosts, terminal_blank_cell, with_borrowed_prediction_overlay};
+    use crate::predict::{PredictMode, Prediction, Predictor};
     use aterm_core::terminal::{RenderCell, Terminal};
     use aterm_render::RenderInput;
+    use std::time::Instant;
 
     fn blank() -> RenderCell {
         RenderCell {
@@ -18012,6 +18515,52 @@ mod prediction_ghost_tests {
         let ok = [Prediction::test_at(0, 4, 'd')]; // last in-rect column paints
         assert!(paint_prediction_ghosts(&mut s, &ok, 5, blank()));
         assert_eq!(s.cells[0][4].ch, 'd');
+    }
+
+    #[test]
+    fn predictor_overlay_is_borrowed_and_paints_byte_identically() {
+        let now = Instant::now();
+        let mut predictor = Predictor::new(PredictMode::Always);
+        assert!(predictor.predict_char('a', (0, 0), 5, now));
+        assert!(predictor.predict_char('b', (0, 0), 5, now));
+
+        let mut actual = scratch(1);
+        actual.cells[0] = vec![blank(); 5];
+        let mut expected = actual.clone();
+        assert!(paint_prediction_ghosts(
+            &mut expected,
+            &[
+                Prediction::test_at(0, 0, 'a'),
+                Prediction::test_at(0, 1, 'b'),
+            ],
+            5,
+            blank(),
+        ));
+
+        let source_allocation = predictor.overlay(now).as_ptr();
+        let row_allocation = actual.cells[0].as_ptr();
+        let row_capacity = actual.cells[0].capacity();
+        let (borrowed_allocation, painted, last) =
+            with_borrowed_prediction_overlay(&mut predictor, now, |predictions| {
+                (
+                    predictions.as_ptr(),
+                    paint_prediction_ghosts(&mut actual, predictions, 5, blank()),
+                    predictions.last().map(|p| (p.row, p.col)),
+                )
+            });
+
+        assert!(painted);
+        assert_eq!(last, Some((0, 1)));
+        assert_eq!(
+            actual.cells, expected.cells,
+            "borrowed and copied overlays agree"
+        );
+        assert_eq!(
+            borrowed_allocation, source_allocation,
+            "the painter receives Predictor's resident slice, not a copied Vec",
+        );
+        assert_eq!(actual.cells[0].as_ptr(), row_allocation);
+        assert_eq!(actual.cells[0].capacity(), row_capacity);
     }
 }
 
@@ -19281,6 +19830,13 @@ pub(crate) struct CursorFxInputs {
     /// the pair must come from ONE observation or a DECSCNM-swapped frame gets
     /// a foreground from one side and a background from the other.
     pub default_fg: u32,
+    /// The ECHO ANCHOR (`Terminal::print_anchor`): where the most recent PTY
+    /// print run ended — `(row, col, seq)` in the SAME window coordinate
+    /// space as `cur` (pane-translated by composed callers), sampled under
+    /// the same terminal lock. Feeds the glow engine's hidden/parked-caret
+    /// lane; `None` (a scrolled-back viewport, an unwired caller) leaves the
+    /// engine's previous sample in place and the lane idle.
+    pub print_anchor: Option<(u16, u16, u64)>,
 }
 
 // bench-support: the frame-latency bench builds its per-frame inputs by
@@ -19321,6 +19877,7 @@ impl CursorFxInputs {
             row_probe: None,
             row_probe_neighbors: None,
             default_fg: Theme::default().fg,
+            print_anchor: None,
         }
     }
 }
@@ -19676,6 +20233,9 @@ struct FocusedComposedCursorFxSample {
     row_below_probe: Vec<char>,
     row_above_present: bool,
     row_below_present: bool,
+    /// The ECHO ANCHOR (`Terminal::print_anchor`), from the same lock hold —
+    /// pane-local like `cursor`; the inputs build translates it.
+    print_anchor: Option<(u16, u16, u64)>,
 }
 
 fn focused_composed_cursor_fx_sample(
@@ -19732,6 +20292,7 @@ fn focused_composed_cursor_fx_sample(
         row_below_probe,
         row_above_present,
         row_below_present,
+        print_anchor: terminal.print_anchor(),
     }
 }
 
@@ -19840,6 +20401,18 @@ impl App {
     /// the deferred tabs; an AllTabs pass clears it. Also called directly by
     /// `redraw_window` to size the active tab before presenting.
     pub(crate) fn resize_panes_scoped(&mut self, wid: WindowId, active_only: bool) {
+        self.resize_panes_scoped_with_active_plan(wid, active_only, None);
+    }
+
+    /// Resize panes while borrowing the active frame's already-resolved plan.
+    /// Background tabs still build their own plans when their shared sessions
+    /// require eager sizing; the visible tab never pays a second layout.
+    fn resize_panes_scoped_with_active_plan(
+        &mut self,
+        wid: WindowId,
+        active_only: bool,
+        active_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         let Some(ws) = self.windows.get(&wid) else {
             return;
         };
@@ -19896,28 +20469,16 @@ impl App {
             {
                 continue;
             }
-            let plan = tab.visible_plan(
-                crate::tab_model::LogicalRect::new(
-                    0.0,
-                    0.0,
-                    f32::from(cols.max(1)),
-                    f32::from(rows.max(1)),
-                ),
-                1.0,
-                |view| match self.view_store.get(view) {
-                    Some(crate::tab_model::View::Terminal(_)) => crate::tab_model::LeafSizing::new(
-                        crate::tab_model::LogicalSize::new(2.0, 1.0),
-                        crate::tab_model::LogicalSize::new(80.0, 24.0),
-                    ),
-                    Some(crate::tab_model::View::Native(_)) | None => {
-                        crate::tab_model::LeafSizing::new(
-                            crate::tab_model::LogicalSize::new(24.0, 10.0),
-                            crate::tab_model::LogicalSize::new(72.0, 36.0),
-                        )
-                    }
-                },
-            );
-            for leaf in plan.leaves {
+            let owned_plan;
+            let plan = if ti == active
+                && let Some(plan) = active_plan
+            {
+                plan
+            } else {
+                owned_plan = self.plan_tab(tab, rows.max(1), cols.max(1));
+                &owned_plan
+            };
+            for leaf in &plan.leaves {
                 let Some(session) = self
                     .view_store
                     .get(leaf.view)
@@ -20485,8 +21046,17 @@ impl App {
         &self,
         wid: WindowId,
     ) -> Option<crate::OverlayCoordinateTransform> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        self.overlay_coordinate_transform_from_plan(wid, &plan)
+    }
+
+    fn overlay_coordinate_transform_from_plan(
+        &self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<crate::OverlayCoordinateTransform> {
         let window = self.windows.get(&wid)?;
-        let route = self.active_visible_content_route(wid)?;
+        let route = self.visible_content_route_from_plan(plan)?;
         let panel_rows = if route.has_visible_native() {
             window.overlay_rows_with_available(usize::from(window.rows))
         } else {
@@ -21095,8 +21665,8 @@ impl App {
                 0.0
             },
             // The presentation the same resolved config draws: the default
-            // underline/highlighter mark, or the full-height v0.43 stream an
-            // explicit `… tall` spelling selects. Stable wire tokens.
+            // full-height v0.43 stream, or the underline/highlighter alternate
+            // an explicit `… underline` spelling selects. Stable wire tokens.
             ribbon_look: if glow_cfg.ribbon_tall {
                 "tall"
             } else {
@@ -21112,6 +21682,8 @@ impl App {
             momentum: ws.cursor_glow.typing_momentum(now),
             momentum_display: ws.cursor_glow.momentum_display(),
             speed: ws.cursor_glow.glide_speed(),
+            resume_grant: ws.cursor_glow.resume_grant(),
+            woken: ws.cursor_glow.woken_cells(),
             glow_active: ws.cursor_glow.is_active(),
             pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
             cat_active: ws.cursor_cat.is_active(),
@@ -21177,6 +21749,7 @@ impl App {
             default_fg,
             row_probe,
             row_probe_neighbors,
+            print_anchor,
         } = fx;
         // MOTION POLICY (W11): the one resolved gate for every decorative
         // animation this present composes — config `motion` × the live OS
@@ -21360,6 +21933,10 @@ impl App {
                 below_present.then_some(ws.poof_row_below_buf.as_slice()),
             );
         }
+        // ECHO-ANCHOR feed, immediately before the tick like the row probe:
+        // where the terminal's last print run ended, so the hidden/parked-
+        // caret lane can anchor a licensed echo to its real mutation site.
+        ws.cursor_glow.observe_print_anchor(print_anchor);
         let glow_fp = ws.cursor_glow.tick(
             cur,
             frame_started,
@@ -22032,39 +22609,25 @@ impl App {
     /// This pass reads cursor/style/colour state only.  In particular it never
     /// consumes terminal damage, reconciles predictive echo, or stamps a present;
     /// the `Retain` arm also advances no effect clock.
+    #[cfg(test)]
     pub(crate) fn splice_focused_composed_cursor_effects(
         &mut self,
         wid: WindowId,
         clock: ComposedCursorFxClock,
     ) -> bool {
-        self.splice_focused_composed_cursor_effects_sampled(wid, clock, None)
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return false;
+        };
+        self.splice_focused_composed_cursor_effects_sampled_with_plan(wid, clock, None, &plan)
     }
 
-    /// Mixed-compositor twin of [`Self::splice_focused_composed_cursor_effects`].
-    /// `sample` came from the exact lock hold that extracted the focused pane's
-    /// cells; unlike the public fallback seam this path is forbidden to re-lock.
-    fn splice_focused_composed_cursor_effects_from_sample(
-        &mut self,
-        wid: WindowId,
-        now: Instant,
-        sample: FocusedComposedCursorFxSample,
-    ) -> bool {
-        self.splice_focused_composed_cursor_effects_sampled(
-            wid,
-            ComposedCursorFxClock::Advance(now),
-            Some(sample),
-        )
-    }
-
-    fn splice_focused_composed_cursor_effects_sampled(
+    fn splice_focused_composed_cursor_effects_sampled_with_plan(
         &mut self,
         wid: WindowId,
         clock: ComposedCursorFxClock,
         exact_sample: Option<FocusedComposedCursorFxSample>,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) -> bool {
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return false;
-        };
         let Some(leaf) = plan.leaves.iter().find(|leaf| leaf.focused) else {
             return false;
         };
@@ -22202,6 +22765,7 @@ impl App {
             row_below_probe: sampled_row_below_probe,
             row_above_present,
             row_below_present,
+            print_anchor: sampled_print_anchor,
         } = sample;
         let (row_probe, row_above_present, row_below_present) = {
             let Some(window) = self.windows.get_mut(&wid) else {
@@ -22308,6 +22872,18 @@ impl App {
                 default_fg,
                 row_probe,
                 row_probe_neighbors: Some((row_above_present, row_below_present)),
+                // Pane-translate the echo anchor exactly like `cur`; a
+                // scrolled-back viewport feeds none (the engine's lane idles).
+                print_anchor: (display_offset == 0)
+                    .then_some(sampled_print_anchor)
+                    .flatten()
+                    .map(|(ar, ac, seq)| {
+                        (
+                            ar.saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                            ac.saturating_add(u16::try_from(col).unwrap_or(u16::MAX)),
+                            seq,
+                        )
+                    }),
             },
         ) else {
             return false;
@@ -22477,6 +23053,7 @@ impl App {
         id: WindowId,
         prims: &mut Vec<crate::widget::DrawPrim>,
         logical_x: f32,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> bool {
         let Some(window) = self.windows.get(&id) else {
             return false;
@@ -22484,7 +23061,11 @@ impl App {
         let Some(overlay) = window.overlay.as_ref() else {
             return false;
         };
-        let Some(transform) = self.overlay_coordinate_transform(id) else {
+        let transform = frame_plan.map_or_else(
+            || self.overlay_coordinate_transform(id),
+            |plan| self.overlay_coordinate_transform_from_plan(id, plan),
+        );
+        let Some(transform) = transform else {
             return false;
         };
         let ctx = crate::settings::PreviewCtx {
@@ -22622,13 +23203,23 @@ impl App {
     /// preparation here makes paint pixels, hit regions, inspection, and PNG
     /// capture projections of the same compiled UI tree.
     pub(crate) fn prepare_native_input_scratch(&mut self, id: WindowId) -> bool {
-        let Some(route @ crate::VisibleContentRoute::Native { .. }) =
-            self.active_visible_content_route(id)
+        let Some((plan, route @ crate::VisibleContentRoute::Native { .. })) =
+            self.active_visible_frame_layout(id)
         else {
             return false;
         };
-        self.prepare_layout_coordinate_space(id, route);
-        let Some((instance, view)) = self.active_native_view(id) else {
+        self.prepare_layout_coordinate_space_from_plan(id, route, &plan);
+        self.prepare_native_input_scratch_from_plan(id, &plan)
+    }
+
+    fn prepare_native_input_scratch_from_plan(
+        &mut self,
+        id: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> bool {
+        let Some(crate::VisibleContentRoute::Native { instance, view }) =
+            self.visible_content_route_from_plan(plan)
+        else {
             return false;
         };
         let Some((rows, cols)) = self
@@ -22644,13 +23235,16 @@ impl App {
             .windows
             .get(&id)
             .map_or(1.0, |ws| ws.scale.max(f64::EPSILON) as f32);
-        let Ok(viewport) = self.native_ui_viewport(id) else {
+        // A native route has exactly one visible leaf; zoomed mixed roots still
+        // use the full viewport. Derive every semantic input from this frame's
+        // routed identity instead of re-planning the hidden root three times.
+        let Ok(viewport) = self.native_ui_full_viewport(id) else {
             return false;
         };
-        let Ok(stamp) = self.native_ui_compile_stamp(id) else {
+        let Ok(stamp) = self.native_ui_compile_stamp_for(id, instance, view, viewport) else {
             return false;
         };
-        let Ok(compiled) = self.compiled_native_ui(id) else {
+        let Ok(compiled) = self.compiled_native_ui_for(id, instance, view, viewport) else {
             return false;
         };
         let width = u32::try_from(
@@ -22742,7 +23336,7 @@ impl App {
             });
         let raster = should_raster.then(|| {
             let mut prims = Vec::new();
-            if self.append_native_modal_prims(id, &mut prims, pad as f32 / scale) {
+            if self.append_native_modal_prims(id, &mut prims, pad as f32 / scale, Some(plan)) {
                 // A modal must be lowered after the app in one raster pass: its
                 // translucent edges then blend in the same linear-light space as
                 // the native surface underneath.
@@ -22815,9 +23409,26 @@ impl App {
         self.splice_tab_strip_with(id, tab_strip);
         #[cfg(a11y_tree)]
         if !overlay_open {
-            self.stage_native_accessibility(id, view, &compiled);
+            self.stage_native_accessibility(id, view, &compiled, plan);
         }
         true
+    }
+
+    /// Prepare a native capture from geometry resolved by this synchronous
+    /// control turn. Callers may not retain the plan across event-loop turns or
+    /// topology/window-cell changes.
+    pub(crate) fn prepare_native_input_scratch_from_capture_plan(
+        &mut self,
+        id: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> bool {
+        let Some(route @ crate::VisibleContentRoute::Native { .. }) =
+            self.visible_content_route_from_plan(plan)
+        else {
+            return false;
+        };
+        self.prepare_layout_coordinate_space_from_plan(id, route, plan);
+        self.prepare_native_input_scratch_from_plan(id, plan)
     }
 
     /// Compose every visible canonical leaf in a mixed/native split. Terminal
@@ -22833,12 +23444,52 @@ impl App {
     /// clock owner.  The public preparation-only seam above remains deterministic
     /// for structural tests; live/capture callers select `Advance` versus `Retain`
     /// explicitly and project before the tab-strip shifts cell streams.
+    #[cfg(test)]
     pub(crate) fn prepare_heterogeneous_input_scratch_with_cursor_fx(
         &mut self,
         id: WindowId,
         cursor_fx: Option<ComposedCursorFxClock>,
     ) -> Option<String> {
-        self.prepare_heterogeneous_input_scratch_with_cursor_fx_after(id, cursor_fx, || {}, None)
+        let plan = self.prepare_heterogeneous_layout_plan(id)?;
+        self.prepare_heterogeneous_input_scratch_with_cursor_fx_after(
+            id,
+            cursor_fx,
+            &plan,
+            || {},
+            None,
+        )
+    }
+
+    fn prepare_heterogeneous_layout_plan(
+        &mut self,
+        id: WindowId,
+    ) -> Option<crate::tab_model::VisibleLeafPlan> {
+        let (plan, route) = self.active_visible_frame_layout(id)?;
+        if route != crate::VisibleContentRoute::Heterogeneous {
+            return None;
+        }
+        self.prepare_layout_coordinate_space_from_plan(id, route, &plan);
+        Some(plan)
+    }
+
+    fn prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(
+        &mut self,
+        id: WindowId,
+        cursor_fx: Option<ComposedCursorFxClock>,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<String> {
+        if self.visible_content_route_from_plan(plan)
+            != Some(crate::VisibleContentRoute::Heterogeneous)
+        {
+            return None;
+        }
+        self.prepare_heterogeneous_input_scratch_with_cursor_fx_after(
+            id,
+            cursor_fx,
+            plan,
+            || {},
+            None,
+        )
     }
 
     /// Exact-outcome capture arm. Live redraw retains the compatibility
@@ -22849,10 +23500,44 @@ impl App {
         id: WindowId,
         cursor_fx: Option<ComposedCursorFxClock>,
     ) -> CapturePreparation<String> {
+        let Some(plan) = self.prepare_heterogeneous_layout_plan(id) else {
+            return CapturePreparation::Unavailable;
+        };
         let mut held_retry_at = None;
         match self.prepare_heterogeneous_input_scratch_with_cursor_fx_after(
             id,
             cursor_fx,
+            &plan,
+            || {},
+            Some(&mut held_retry_at),
+        ) {
+            Some(title) => CapturePreparation::Ready(title),
+            None => held_retry_at.map_or(CapturePreparation::Unavailable, |retry_at| {
+                CapturePreparation::Held { retry_at }
+            }),
+        }
+    }
+
+    /// Exact-outcome heterogeneous capture from a plan owned by this same
+    /// synchronous paint/capture turn. This keeps route selection, panes and
+    /// cursor effects on one canonical geometry allocation.
+    pub(crate) fn prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
+        &mut self,
+        id: WindowId,
+        cursor_fx: Option<ComposedCursorFxClock>,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> CapturePreparation<String> {
+        let Some(route @ crate::VisibleContentRoute::Heterogeneous) =
+            self.visible_content_route_from_plan(plan)
+        else {
+            return CapturePreparation::Unavailable;
+        };
+        self.prepare_layout_coordinate_space_from_plan(id, route, plan);
+        let mut held_retry_at = None;
+        match self.prepare_heterogeneous_input_scratch_with_cursor_fx_after(
+            id,
+            cursor_fx,
+            plan,
             || {},
             Some(&mut held_retry_at),
         ) {
@@ -22872,9 +23557,11 @@ impl App {
         cursor_fx: Option<ComposedCursorFxClock>,
         after_extract: impl FnOnce(),
     ) -> Option<String> {
+        let plan = self.prepare_heterogeneous_layout_plan(id)?;
         self.prepare_heterogeneous_input_scratch_with_cursor_fx_after(
             id,
             cursor_fx,
+            &plan,
             after_extract,
             None,
         )
@@ -22884,17 +23571,11 @@ impl App {
         &mut self,
         id: WindowId,
         cursor_fx: Option<ComposedCursorFxClock>,
+        plan: &crate::tab_model::VisibleLeafPlan,
         after_extract: impl FnOnce(),
         mut held_out: Option<&mut Option<Instant>>,
     ) -> Option<String> {
         use std::hash::{Hash, Hasher};
-
-        let route = self.active_visible_content_route(id)?;
-        if route != crate::VisibleContentRoute::Heterogeneous {
-            return None;
-        }
-        self.prepare_layout_coordinate_space(id, route);
-        let plan = self.active_visible_leaf_plan(id)?;
         let (rows, cols, scale) = self.windows.get(&id).map(|window| {
             (
                 usize::from(window.rows),
@@ -23431,7 +24112,8 @@ impl App {
             // terminal lanes remain visible below the modal card. It replaces the
             // whole layer, so the recorded per-leaf blits are skipped outright —
             // they were overwritten unread before this change.
-            let appended = self.append_native_modal_prims(id, &mut modal_native_prims, 0.0);
+            let appended =
+                self.append_native_modal_prims(id, &mut modal_native_prims, 0.0, Some(plan));
             debug_assert!(appended, "an open overlay must provide modal primitives");
             Some(crate::tray_raster::rasterize_tray_pixels(
                 &modal_native_prims,
@@ -23511,24 +24193,36 @@ impl App {
         }
         #[cfg(a11y_tree)]
         if !overlay_open {
-            self.stage_visible_native_accessibility(id);
+            self.stage_visible_native_accessibility(id, plan);
         }
         after_extract();
         if let Some(clock) = cursor_fx {
             let projected = match clock {
-                ComposedCursorFxClock::Advance(now) => match focused_terminal_session {
+                ComposedCursorFxClock::Advance(_) => match focused_terminal_session {
                     Some(session) => {
                         let sample = focused_cursor_fx_sample?;
                         debug_assert_eq!(sample.session, session);
-                        self.splice_focused_composed_cursor_effects_from_sample(id, now, sample)
+                        self.splice_focused_composed_cursor_effects_sampled_with_plan(
+                            id,
+                            clock,
+                            Some(sample),
+                            plan,
+                        )
                     }
-                    None => self.splice_focused_composed_cursor_effects(id, clock),
+                    None => self.splice_focused_composed_cursor_effects_sampled_with_plan(
+                        id, clock, None, plan,
+                    ),
                 },
                 ComposedCursorFxClock::Retain { .. } => match focused_cursor_fx_sample {
-                    Some(sample) => {
-                        self.splice_focused_composed_cursor_effects_sampled(id, clock, Some(sample))
-                    }
-                    None => self.splice_focused_composed_cursor_effects(id, clock),
+                    Some(sample) => self.splice_focused_composed_cursor_effects_sampled_with_plan(
+                        id,
+                        clock,
+                        Some(sample),
+                        plan,
+                    ),
+                    None => self.splice_focused_composed_cursor_effects_sampled_with_plan(
+                        id, clock, None, plan,
+                    ),
                 },
             };
             if !projected {
@@ -23741,6 +24435,9 @@ impl App {
         visible_route: crate::VisibleContentRoute,
         visuals: HostVisualState,
     ) {
+        let Some(plan) = self.active_visible_leaf_plan(id) else {
+            return;
+        };
         self.finalize_successful_present(
             id,
             metrics::StartupPresentTiming::collapsed(Instant::now()),
@@ -23749,14 +24446,15 @@ impl App {
             SuccessfulPresentRoute::Terminal,
             visible_route,
             visuals,
+            &plan,
         );
     }
 
-    // EIGHT ARGUMENTS, ON PURPOSE. Every one is a distinct fact the five call
+    // NINE ARGUMENTS, ON PURPOSE. Every one is a distinct fact the five call
     // sites genuinely differ on — which window, which route, whether a real
     // `Window` is in hand, what the compositor showed — and none of them is
     // derivable from the others here. Bundling them into a params struct would
-    // move the same eight assignments to the callers and buy a lint, not a
+    // move the same nine assignments to the callers and buy a lint, not a
     // reader: the SuccessfulPresentRoute/VisibleContentRoute pair in particular
     // must stay two independent words, since "which surface presented" and
     // "what content the user can see" diverge on exactly the flashing-terminal
@@ -23771,6 +24469,7 @@ impl App {
         route: SuccessfulPresentRoute,
         visible_route: crate::VisibleContentRoute,
         visuals: HostVisualState,
+        presented_plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         let frame_started = startup_timing.frame_started();
         self.reveal_successfully_presented_window(id);
@@ -23830,14 +24529,12 @@ impl App {
         // in WindowGpu's resident buffer; this records only its epoch plus the
         // exact route/metadata tuple before recovery or fallback convergence can
         // stage another model.
-        let presented_plan = self.active_visible_leaf_plan(id);
         if self
             .video_rec
             .as_ref()
             .is_some_and(|recording| recording.window == id)
-            && let Some(plan) = presented_plan.as_ref()
         {
-            self.commit_recording_presented_meta(id, visible_route, plan);
+            self.commit_recording_presented_meta(id, visible_route, presented_plan);
         }
 
         // A loss can latch during an otherwise successful submit. Recover only
@@ -23845,9 +24542,7 @@ impl App {
         // edge that the old GPU success must not immediately clear.
         let _recovered = self.recover_latched_gpu_loss(id, None, frame_started);
 
-        let present_latency_ns = presented_plan
-            .as_ref()
-            .map_or(0, |plan| self.present_latency_ns_with_plan(id, plan));
+        let present_latency_ns = self.present_latency_ns_with_plan(id, presented_plan);
         // Publish this frame's timing to the process-global metrics counters,
         // read back over the control socket's `metrics` verb. `render_ns` is
         // causal CPU wall time (compose plus raster/copy or GPU submit); surface
@@ -23957,7 +24652,7 @@ impl App {
         // clears the retained key and requests another windowed frame until the
         // asynchronously parsed face replaces provisional tofu.
         if let Some(window) = window {
-            self.update_accessibility(id, window);
+            self.update_accessibility(id, window, presented_plan);
         }
         let fallback_pending = self.backend.fallback_parse_pending();
         if let Some(state) = self.windows.get_mut(&id) {
@@ -23987,7 +24682,10 @@ impl App {
     /// The key includes focused view identity and rectangle, so a divider drag,
     /// zoom transition, focus move, or window resize resets coordinate-bound
     /// retained effects even when the coarse single/composed class is unchanged.
-    /// Returns whether this route uses composed terminal coordinates.
+    /// Returns whether this route uses composed terminal coordinates. Production
+    /// callers resolve a plan once and use the `_from_plan` seam below; this
+    /// wrapper remains as a negative-control seam for plan-build tests.
+    #[cfg(test)]
     fn prepare_layout_coordinate_space(
         &mut self,
         id: WindowId,
@@ -23996,6 +24694,18 @@ impl App {
         let Some(plan) = self.active_visible_leaf_plan(id) else {
             return false;
         };
+        self.prepare_layout_coordinate_space_from_plan(id, route, &plan)
+    }
+
+    /// Borrow the frame's already-resolved plan. The redraw entry uses this
+    /// seam so route classification and coordinate binding share one owned
+    /// leaf/divider allocation; the wrapper above exists only for tests.
+    fn prepare_layout_coordinate_space_from_plan(
+        &mut self,
+        id: WindowId,
+        route: crate::VisibleContentRoute,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> bool {
         let Some(focused) = plan.leaf(plan.focused) else {
             return false;
         };
@@ -24077,10 +24787,12 @@ impl App {
         id: WindowId,
         frame_started: Instant,
         window: &Option<Arc<winit::window::Window>>,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) {
-        let Some(title) = self.prepare_heterogeneous_input_scratch_with_cursor_fx(
+        let Some(title) = self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(
             id,
             Some(ComposedCursorFxClock::Advance(frame_started)),
+            plan,
         ) else {
             return;
         };
@@ -24103,7 +24815,7 @@ impl App {
         // the one that yields: it takes a row only where the register says no
         // other band claimed one, so every band that can outrank it must have
         // declared itself first. A no-op with no link hovered.
-        self.splice_link_target(id);
+        self.splice_link_target_from_plan(id, plan);
         // C5: the tab context menu is the topmost chrome while it is open — it
         // owns the pointer and the keyboard, so it paints after everything, the
         // config banner included. A no-op with no menu up.
@@ -24135,6 +24847,7 @@ impl App {
             SuccessfulPresentRoute::Heterogeneous,
             crate::VisibleContentRoute::Heterogeneous,
             visuals,
+            plan,
         );
     }
 
@@ -24145,8 +24858,9 @@ impl App {
         view: crate::tab_model::ViewId,
         frame_started: Instant,
         window: &Option<Arc<winit::window::Window>>,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) {
-        if !self.prepare_native_input_scratch(id) {
+        if !self.prepare_native_input_scratch_from_plan(id, plan) {
             return;
         }
         self.splice_find_bar(id);
@@ -24187,7 +24901,10 @@ impl App {
             }
         };
         let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns);
-        let presented_stamp = self.native_ui_compile_stamp(id).ok();
+        let presented_stamp = self
+            .windows
+            .get(&id)
+            .and_then(|state| state.native_ui_compiled.as_ref().map(|frame| frame.stamp));
         self.finalize_successful_present(
             id,
             startup_timing,
@@ -24199,10 +24916,40 @@ impl App {
             },
             crate::VisibleContentRoute::Native { instance, view },
             visuals,
+            plan,
         );
     }
 
     pub(crate) fn redraw_window(&mut self, id: WindowId) {
+        self.redraw_window_with_layout(id, None);
+    }
+
+    /// Redraw from a canonical visible-leaf layout resolved by the caller in
+    /// this same synchronous main-thread turn.
+    ///
+    /// Capture barriers use this seam to make their request layout the exact
+    /// presentation layout too. The borrow must never cross an event-loop turn,
+    /// nor may the caller mutate the active tab, pane topology, zoom, or window
+    /// cell bounds between resolution and this call. Bounded surface retries and
+    /// backend recovery satisfy that contract: they may replace presentation
+    /// resources, but they do not change visible-layout authority.
+    pub(crate) fn redraw_window_from_layout(
+        &mut self,
+        id: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        route: crate::VisibleContentRoute,
+    ) {
+        self.redraw_window_with_layout(id, Some((plan, route)));
+    }
+
+    fn redraw_window_with_layout(
+        &mut self,
+        id: WindowId,
+        frame_layout: Option<(
+            &crate::tab_model::VisibleLeafPlan,
+            crate::VisibleContentRoute,
+        )>,
+    ) {
         metrics::note_redraw_attempt();
         // A retry deadline owns the next surface attempt until it is consumed;
         // after exhaustion/persistent failure the episode remains parked until
@@ -24314,10 +25061,26 @@ impl App {
         // has one visible terminal or native leaf; dispatching from the hidden
         // root inventory would send it to the heterogeneous compositor, whose
         // one-leaf rejection used to leave the window frozen.
-        let Some(route) = self.active_visible_content_route(id) else {
-            return;
+        let owned_layout = frame_layout
+            .is_none()
+            .then(|| self.active_visible_frame_layout(id))
+            .flatten();
+        let (plan, route) = match frame_layout {
+            Some(layout) => layout,
+            None => {
+                let Some((plan, route)) = owned_layout.as_ref() else {
+                    return;
+                };
+                (plan, *route)
+            }
         };
-        self.prepare_layout_coordinate_space(id, route);
+        // The event loop cannot interleave a tab/focus/divider/resize mutation
+        // with this synchronous redraw. The only later resize helper changes
+        // terminal grid dimensions to match this plan; it does not mutate the
+        // active tab, pane topology, zoom, or window cell bounds. `plan` is
+        // therefore the exact frame snapshot through preparation, hover,
+        // cursor-effect projection and successful-present finalization.
+        self.prepare_layout_coordinate_space_from_plan(id, route, plan);
         // ROBI's in-flight click-dismissal, settled before any route reads the
         // gate: a completed lane reply (success or failure) must be consumed on
         // the next frame wherever it lands, not only on the single-pane path.
@@ -24355,7 +25118,7 @@ impl App {
                 composed
             }
             crate::VisibleContentRoute::Heterogeneous => {
-                self.redraw_heterogeneous_window(id, frame_started, &window);
+                self.redraw_heterogeneous_window(id, frame_started, &window, plan);
                 return;
             }
             crate::VisibleContentRoute::Native { instance, view } => {
@@ -24363,7 +25126,7 @@ impl App {
                     window.composed_cursor_effect_valid = false;
                     window.composed_cursor_effect_session = None;
                 }
-                self.redraw_native_window(id, instance, view, frame_started, &window);
+                self.redraw_native_window(id, instance, view, frame_started, &window, plan);
                 return;
             }
         };
@@ -24377,7 +25140,7 @@ impl App {
         // early-outs per pane already at the right size (the just-drawn active tab), so
         // it is cheap even while the flag stands. Cleared by the AllTabs settle.
         if self.windows.get(&id).is_some_and(|ws| ws.panes_stale) {
-            self.resize_panes_scoped(id, true);
+            self.resize_panes_scoped_with_active_plan(id, true, Some(plan));
         }
         let Some(ws0) = self.windows.get(&id) else {
             return;
@@ -24658,6 +25421,10 @@ impl App {
             let wrap_serial = term.wrap_serial();
             let cursor_visible = term.cursor_visible();
             let cursor_style = term.cursor_style();
+            // The ECHO ANCHOR, from the same lock hold as the caret it stands
+            // in for when a TUI hides/parks that caret (single pane → no pane
+            // translation needed).
+            let print_anchor = term.print_anchor();
             // VI-1: when keyboard copy-mode is active, its cursor (grid line/col) is
             // painted INSTEAD of the terminal cursor — mapped to a screen row via the
             // display offset below. `None` when vi mode is off (the normal cursor shows).
@@ -25050,6 +25817,7 @@ impl App {
                     default_fg: default_fg_u32,
                     row_probe,
                     row_probe_neighbors: None,
+                    print_anchor: (display_offset == 0).then_some(print_anchor).flatten(),
                 },
             ) else {
                 if sync_hold {
@@ -26947,9 +27715,12 @@ impl App {
                     }
                 };
                 if !scrolled {
-                    let preds = ws.predictor.overlay(now).to_vec();
-                    paint_prediction_ghosts(&mut ws.input_scratch, &preds, cols, pred_blank);
-                    if !preds.is_empty() {
+                    let (predictor, input_scratch) = (&mut ws.predictor, &mut ws.input_scratch);
+                    let last = with_borrowed_prediction_overlay(predictor, now, |preds| {
+                        paint_prediction_ghosts(input_scratch, preds, cols, pred_blank);
+                        preds.last().map(|last| (last.row, last.col))
+                    });
+                    if let Some((last_row, last_col)) = last {
                         painted_pred = true;
                         // Our post-fill cell mutation must not be masked by the
                         // snapshot-keyed render cache, so invalidate it.
@@ -26962,11 +27733,9 @@ impl App {
                         // reconcile still compares against the real grid, and every
                         // displayed-prediction frame already bypasses the early-out
                         // (`is_displaying` / `pred_shown`), so no staleness window.
-                        if let Some(last) = preds.last() {
-                            ws.input_scratch.cursor_row = last.row as usize;
-                            ws.input_scratch.cursor_col =
-                                (last.col as usize + 1).min(cols.saturating_sub(1));
-                        }
+                        ws.input_scratch.cursor_row = last_row as usize;
+                        ws.input_scratch.cursor_col =
+                            (last_col as usize + 1).min(cols.saturating_sub(1));
                     }
                 }
             }
@@ -27078,7 +27847,7 @@ impl App {
         // The hovered link's destination — LAST of the row bands; see the note
         // at the heterogeneous route above. A no-op (and a byte-identical
         // frame) with no link under the pointer.
-        self.splice_link_target(id);
+        self.splice_link_target_from_plan(id, plan);
         // C5 — topmost chrome; see the note at the heterogeneous route above.
         self.splice_tab_menu(id);
         if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
@@ -27167,6 +27936,7 @@ impl App {
             SuccessfulPresentRoute::Terminal,
             route,
             visuals,
+            plan,
         );
     }
 
@@ -27396,7 +28166,7 @@ impl App {
     }
 
     /// Ensure a windowed CPU-backend window owns a CPU presentation target. The
-    /// old target is dropped before either fallible softbuffer constructor, so a
+    /// old target is dropped before the fallible presenter constructor, so a
     /// failure can never strand a dead `PresentTarget::Gpu` behind a CPU backend.
     /// Headless windows and an already-matching target are no-ops.
     fn ensure_cpu_present_target(
@@ -27420,17 +28190,12 @@ impl App {
             ws.present = None;
             ws.last_present = None;
         }
-        let context = softbuffer::Context::new(window.clone())
-            .map_err(|_| metrics::PresentDropReason::CpuAcquire)?;
-        let surface = softbuffer::Surface::new(&context, window)
+        let surface = crate::present::CpuSurface::new(window)
             .map_err(|_| metrics::PresentDropReason::CpuAcquire)?;
         let Some(ws) = self.windows.get_mut(&id) else {
             return Err(metrics::PresentDropReason::TargetMismatch);
         };
-        ws.present = Some(PresentTarget::Cpu {
-            surface,
-            _context: context,
-        });
+        ws.present = Some(PresentTarget::Cpu { surface });
         Ok(())
     }
 
@@ -27742,47 +28507,18 @@ impl App {
                 ((default_fg >> 8) & 0xff) as u8,
                 (default_fg & 0xff) as u8,
             ];
-            // Merge-walk: the existing (sorted, unique) ink entries win their
-            // cells; the tint fills the default-fg glyph cells between them,
-            // preserving the channel's sorted-unique contract.
-            let existing = std::mem::take(&mut ws.input_scratch.ink);
-            let mut merged = Vec::with_capacity(existing.len() + rows.saturating_mul(cols) / 4);
-            let mut ex = existing.iter().copied().peekable();
-            for (r, row) in ws.input_scratch.cells.iter().enumerate().take(rows) {
-                if r > usize::from(u16::MAX) {
-                    break;
-                }
-                for (c, cell) in row.iter().enumerate().take(cols) {
-                    while ex
-                        .peek()
-                        .is_some_and(|e| (usize::from(e.row), usize::from(e.col)) < (r, c))
-                    {
-                        merged.push(ex.next().expect("peeked"));
-                    }
-                    if ex
-                        .peek()
-                        .is_some_and(|e| usize::from(e.row) == r && usize::from(e.col) == c)
-                    {
-                        merged.push(ex.next().expect("peeked"));
-                        continue;
-                    }
-                    // Blanks paint no glyph; a wide continuation has no lead
-                    // glyph of its own; non-default fg keeps its SGR color.
-                    if cell.ch == ' ' || cell.wide || cell.fg != dfg || c > usize::from(u16::MAX) {
-                        continue;
-                    }
-                    let Some(color) = scaled.tint.get(r * cols + c).copied().flatten() else {
-                        continue;
-                    };
-                    merged.push(aterm_core::render::InkCell {
-                        row: r as u16,
-                        col: c as u16,
-                        color,
-                    });
-                }
-            }
-            merged.extend(ex);
-            ws.input_scratch.ink = merged;
+            // Merge-walk: existing (sorted, unique) ink wins its cells; the
+            // wallpaper fills default-fg glyphs between them. The second vector
+            // is window-owned scratch, so steady tinted frames allocate nothing.
+            merge_wallpaper_tint_ink(
+                &ws.input_scratch.cells,
+                rows,
+                cols,
+                dfg,
+                &scaled.tint,
+                &mut ws.input_scratch.ink,
+                &mut ws.wallpaper_ink_scratch,
+            );
         }
     }
 
@@ -28107,7 +28843,7 @@ impl App {
                     causal_work_ns = causal_work_ns.saturating_add(
                         u64::try_from(copy_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     );
-                    buf.present_with_damage(&[softbuffer::Rect {
+                    buf.present_with_damage(&[crate::present::DamageRect {
                         x: 0,
                         y: 0,
                         width: one,
@@ -28133,49 +28869,27 @@ impl App {
                     let x1 = (off_x + fw as i64).clamp(0, dw as i64) as usize;
                     let span = x1.saturating_sub(x0);
                     let sx0 = (x0 as i64 - off_x) as usize;
-                    let mut rects: Vec<softbuffer::Rect> = Vec::new();
-                    for (r0, r1) in dirty_row_runs(ws.cpu_cache.dirty_rows()) {
-                        let (fy0, _) = r.row_pixel_band(r0, ws.input_scratch.rows, fh);
-                        let (_, fy1) = r.row_pixel_band(r1, ws.input_scratch.rows, fh);
-                        let (mut lo, mut hi) = (usize::MAX, 0usize);
-                        for fy in fy0..fy1 {
-                            let dyi = fy as i64 + off_y;
-                            if dyi < 0 || dyi >= dh as i64 {
-                                continue; // content row cropped out of the surface
-                            }
-                            let dy = dyi as usize;
-                            if span > 0 {
+                    let copied = cpu_damage_rects_into(
+                        &mut ws.cpu_damage_rect_scratch,
+                        ws.cpu_cache.dirty_rows(),
+                        x0,
+                        span,
+                        off_y,
+                        dh,
+                        |row| r.row_pixel_band(row, ws.input_scratch.rows, fh),
+                    );
+                    if copied {
+                        for rect in &ws.cpu_damage_rect_scratch {
+                            let dy0 = rect.y as usize;
+                            let height = rect.height.get() as usize;
+                            let fy0 = usize::try_from((dy0 as i64).saturating_sub(off_y))
+                                .expect("a visible damage row maps into the source frame");
+                            for offset in 0..height {
+                                let (dy, fy) = (dy0 + offset, fy0 + offset);
                                 buf[dy * dw + x0..dy * dw + x0 + span]
                                     .copy_from_slice(&pixels[fy * fw + sx0..fy * fw + sx0 + span]);
                             }
-                            lo = lo.min(dy);
-                            hi = hi.max(dy + 1);
                         }
-                        if span > 0
-                            && lo < hi
-                            && let (Some(width), Some(height)) = (
-                                NonZeroU32::new(span as u32),
-                                NonZeroU32::new((hi - lo) as u32),
-                            )
-                        {
-                            rects.push(softbuffer::Rect {
-                                x: x0 as u32,
-                                y: lo as u32,
-                                width,
-                                height,
-                            });
-                        }
-                    }
-                    if rects.is_empty() {
-                        // Every band clamped empty (or zero content span): nothing
-                        // was copied — present the same minimal 1×1 rect.
-                        let one = NonZeroU32::new(1).unwrap();
-                        rects.push(softbuffer::Rect {
-                            x: 0,
-                            y: 0,
-                            width: one,
-                            height: one,
-                        });
                     }
                     if capture_client_requested {
                         captured_client = opaque_cpu_client_frame(&buf, dw, dh);
@@ -28183,7 +28897,7 @@ impl App {
                     causal_work_ns = causal_work_ns.saturating_add(
                         u64::try_from(copy_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     );
-                    buf.present_with_damage(&rects)
+                    buf.present_with_damage(&ws.cpu_damage_rect_scratch)
                 };
                 commit.map(|()| causal_work_ns)
             });
@@ -28377,6 +29091,7 @@ impl App {
         wid: WindowId,
     ) -> Option<TerminalCaptureGrid> {
         self.prepare_terminal_capture_grid_outcome_after(wid, None, || {})
+            .map(|(grid, _)| grid)
             .into_option()
     }
 
@@ -28388,6 +29103,7 @@ impl App {
     /// presented effect tick, but still captures the focused pane's coordinate
     /// class so a newly extracted history viewport can retire that live frame
     /// without advancing animation time.
+    #[cfg(test)]
     pub(crate) fn prepare_terminal_capture_grid_with_cursor_fx(
         &mut self,
         wid: WindowId,
@@ -28399,12 +29115,39 @@ impl App {
 
     /// Exact-outcome arm for control callers that must distinguish a retryable
     /// synchronized-output hold from a route/capability disappearance.
+    #[cfg(test)]
     pub(crate) fn prepare_terminal_capture_grid_with_cursor_fx_outcome(
         &mut self,
         wid: WindowId,
         clock: ComposedCursorFxClock,
     ) -> CapturePreparation<TerminalCaptureGrid> {
+        self.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(wid, clock)
+            .map(|(grid, _)| grid)
+    }
+
+    /// Capture result plus the exact canonical layout used to build it. Chrome
+    /// splices at this same capture boundary consume the returned plan instead
+    /// of resolving the visible tree again.
+    pub(crate) fn prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
+        &mut self,
+        wid: WindowId,
+        clock: ComposedCursorFxClock,
+    ) -> CapturePreparation<(TerminalCaptureGrid, crate::tab_model::VisibleLeafPlan)> {
         self.prepare_terminal_capture_grid_outcome_after(wid, Some(clock), || {})
+    }
+
+    /// Capture from a plan resolved by the same synchronous control turn.
+    ///
+    /// The caller must not retain `plan` across an event-loop turn or any
+    /// topology/window-cell mutation. The worker revalidates every view and
+    /// route capability, but deliberately does not rebuild the owned geometry.
+    pub(crate) fn prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
+        &mut self,
+        wid: WindowId,
+        plan: crate::tab_model::VisibleLeafPlan,
+        clock: ComposedCursorFxClock,
+    ) -> CapturePreparation<(TerminalCaptureGrid, crate::tab_model::VisibleLeafPlan)> {
+        self.prepare_terminal_capture_grid_for_plan_outcome_after(wid, plan, Some(clock), || {})
     }
 
     #[cfg(test)]
@@ -28415,6 +29158,7 @@ impl App {
         after_extract: impl FnOnce(),
     ) -> Option<TerminalCaptureGrid> {
         self.prepare_terminal_capture_grid_outcome_after(wid, Some(clock), after_extract)
+            .map(|(grid, _)| grid)
             .into_option()
     }
 
@@ -28423,37 +29167,56 @@ impl App {
         wid: WindowId,
         cursor_fx: Option<ComposedCursorFxClock>,
         after_extract: impl FnOnce(),
-    ) -> CapturePreparation<TerminalCaptureGrid> {
-        let mut held_retry_at = None;
-        match self.prepare_terminal_capture_grid_sampled_after(
+    ) -> CapturePreparation<(TerminalCaptureGrid, crate::tab_model::VisibleLeafPlan)> {
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return CapturePreparation::Unavailable;
+        };
+        self.prepare_terminal_capture_grid_for_plan_outcome_after(
             wid,
+            plan,
+            cursor_fx,
+            after_extract,
+        )
+    }
+
+    fn prepare_terminal_capture_grid_for_plan_outcome_after(
+        &mut self,
+        wid: WindowId,
+        plan: crate::tab_model::VisibleLeafPlan,
+        cursor_fx: Option<ComposedCursorFxClock>,
+        after_extract: impl FnOnce(),
+    ) -> CapturePreparation<(TerminalCaptureGrid, crate::tab_model::VisibleLeafPlan)> {
+        let mut held_retry_at = None;
+        match self.prepare_terminal_capture_grid_sampled_for_plan_after(
+            wid,
+            plan,
             cursor_fx,
             after_extract,
             Some(&mut held_retry_at),
         ) {
-            Some(grid) => CapturePreparation::Ready(grid),
+            Some(prepared) => CapturePreparation::Ready(prepared),
             None => held_retry_at.map_or(CapturePreparation::Unavailable, |retry_at| {
                 CapturePreparation::Held { retry_at }
             }),
         }
     }
 
-    fn prepare_terminal_capture_grid_sampled_after(
+    fn prepare_terminal_capture_grid_sampled_for_plan_after(
         &mut self,
         wid: WindowId,
+        plan: crate::tab_model::VisibleLeafPlan,
         cursor_fx: Option<ComposedCursorFxClock>,
         after_extract: impl FnOnce(),
         mut held_out: Option<&mut Option<Instant>>,
-    ) -> Option<TerminalCaptureGrid> {
-        let route = self.active_visible_content_route(wid)?;
+    ) -> Option<(TerminalCaptureGrid, crate::tab_model::VisibleLeafPlan)> {
+        let route = self.visible_content_route_from_plan(&plan)?;
         let crate::VisibleContentRoute::Terminal { composed } = route else {
             return None;
         };
-        self.prepare_layout_coordinate_space(wid, route);
-        let (rows, cols, plan, composed) = {
+        self.prepare_layout_coordinate_space_from_plan(wid, route, &plan);
+        let (rows, cols, composed) = {
             let ws = self.windows.get(&wid)?;
-            let plan = self.active_visible_leaf_plan(wid)?;
-            (usize::from(ws.rows), usize::from(ws.cols), plan, composed)
+            (usize::from(ws.rows), usize::from(ws.cols), composed)
         };
 
         // Resolve every canonical visible leaf to its terminal capability before
@@ -28631,28 +29394,33 @@ impl App {
             after_extract();
             match cursor_fx {
                 Some(ComposedCursorFxClock::Advance(now)) => {
-                    if !self.splice_focused_composed_cursor_effects_from_sample(
+                    if !self.splice_focused_composed_cursor_effects_sampled_with_plan(
                         wid,
-                        now,
-                        cursor_fx_sample?,
+                        ComposedCursorFxClock::Advance(now),
+                        Some(cursor_fx_sample?),
+                        &plan,
                     ) {
                         return None;
                     }
                 }
                 Some(clock @ ComposedCursorFxClock::Retain { .. }) => {
-                    let _ = self.splice_focused_composed_cursor_effects_sampled(
+                    let _ = self.splice_focused_composed_cursor_effects_sampled_with_plan(
                         wid,
                         clock,
                         cursor_fx_sample,
+                        &plan,
                     );
                 }
                 None => {}
             }
-            return Some(TerminalCaptureGrid {
-                composed: false,
-                focus: Some(focus),
-                leaves,
-            });
+            return Some((
+                TerminalCaptureGrid {
+                    composed: false,
+                    focus: Some(focus),
+                    leaves,
+                },
+                plan,
+            ));
         }
 
         // Split / zoomed-split capture: seed the actual window geometry with the
@@ -28858,18 +29626,27 @@ impl App {
         match cursor_fx {
             Some(ComposedCursorFxClock::Advance(now)) => {
                 let sample = focused_cursor_fx_sample?;
-                if !self.splice_focused_composed_cursor_effects_from_sample(wid, now, sample) {
+                if !self.splice_focused_composed_cursor_effects_sampled_with_plan(
+                    wid,
+                    ComposedCursorFxClock::Advance(now),
+                    Some(sample),
+                    &plan,
+                ) {
                     return None;
                 }
             }
             Some(clock @ ComposedCursorFxClock::Retain { .. }) => {
                 let sample = focused_cursor_fx_sample?;
-                let _ =
-                    self.splice_focused_composed_cursor_effects_sampled(wid, clock, Some(sample));
+                let _ = self.splice_focused_composed_cursor_effects_sampled_with_plan(
+                    wid,
+                    clock,
+                    Some(sample),
+                    &plan,
+                );
             }
             None => {}
         }
-        Some(grid)
+        Some((grid, plan))
     }
 
     /// SPARKLE WORDS, ANIMATED INK, PEEKING CATS, NOVAS and the CURSOR
@@ -29688,6 +30465,8 @@ impl App {
         let mut focus_probe: Option<(u16, u16, aterm_effects::cursor_glow::ProbeTrust)> = None;
         let mut focus_probe_above = false;
         let mut focus_probe_below = false;
+        // The focused pane's ECHO ANCHOR, window-translated like `focus_probe`.
+        let mut focus_print_anchor: Option<(u16, u16, u64)> = None;
         // PHOSPHOR rain, compose path (split-pane audit): the FOCUSED pane
         // rains — the aurora/comet law ("effects follow focus, clipped to the
         // pane") applied to the ambient effect. These locals snapshot the
@@ -29963,6 +30742,18 @@ impl App {
                     } else {
                         None
                     };
+                    // ECHO ANCHOR from the same lock hold, same live-bottom
+                    // guard and window translation as the probe/cursor.
+                    focus_print_anchor = (d_off == 0)
+                        .then(|| term.print_anchor())
+                        .flatten()
+                        .map(|(ar, ac, seq)| {
+                            (
+                                ar.saturating_add(r.row_off),
+                                ac.saturating_add(r.col_off),
+                                seq,
+                            )
+                        });
                     focus_scrolled_rows = usize::from(scroll_change.translated_rows)
                         + usize::from(scroll_change.invalidated);
                     // VI-1: the pane-local vi cursor (see the declaration) —
@@ -30274,6 +31065,7 @@ impl App {
                 default_fg: aterm_render::rgb_to_u32(focus_blank.fg),
                 row_probe: focus_probe,
                 row_probe_neighbors: Some((focus_probe_above, focus_probe_below)),
+                print_anchor: focus_print_anchor,
             },
         )?;
         let glow_fp = fx.glow_fp;
@@ -31036,10 +31828,19 @@ impl App {
                     let _ = ws.predictor.overlay(now);
                 }
                 Some(true) => {
-                    let preds = ws.predictor.overlay(now).to_vec();
-                    if paint_prediction_ghosts(&mut ws.pane_scratch, &preds, sub_cols, blank) {
+                    let (predictor, pane_scratch) = (&mut ws.predictor, &mut ws.pane_scratch);
+                    let (painted, last) =
+                        with_borrowed_prediction_overlay(predictor, now, |preds| {
+                            (
+                                paint_prediction_ghosts(pane_scratch, preds, sub_cols, blank),
+                                preds
+                                    .last()
+                                    .map(|prediction| (prediction.row, prediction.col)),
+                            )
+                        });
+                    if painted {
                         painted_pred = true;
-                        focus_pred_last = preds.last().map(|p| (p.row, p.col));
+                        focus_pred_last = last;
                         focus_sub_cols = sub_cols;
                     }
                 }
@@ -32990,6 +33791,22 @@ impl App {
     /// free, NOTHING. A row is free when nothing live owns it: see the register
     /// on [`Self::link_caption_row`].
     pub(crate) fn splice_link_target(&mut self, wid: WindowId) {
+        self.splice_link_target_with_frame_plan(wid, None);
+    }
+
+    pub(crate) fn splice_link_target_from_plan(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+        self.splice_link_target_with_frame_plan(wid, Some(plan));
+    }
+
+    fn splice_link_target_with_frame_plan(
+        &mut self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         let Some(hover) = self
             .windows
             .get(&wid)
@@ -33021,7 +33838,17 @@ impl App {
         else {
             return; // whatever was there, it is not a link any more
         };
-        let Some((frame_row, seam)) = self.link_caption_row(wid, hover) else {
+        // Standalone capture/test callers preserve the historical lazy build:
+        // failed hover candidates above never allocate a plan. A live redraw
+        // supplies its frame-owned plan and pays no second tree walk.
+        let owned_plan = frame_plan
+            .is_none()
+            .then(|| self.active_visible_leaf_plan(wid))
+            .flatten();
+        let Some(plan) = frame_plan.or(owned_plan.as_ref()) else {
+            return;
+        };
+        let Some((frame_row, seam)) = self.link_caption_row(wid, hover, plan) else {
             return;
         };
         let mut theme = self.theme;
@@ -33076,8 +33903,9 @@ impl App {
         &self,
         wid: WindowId,
         hover: crate::link_target::LinkHover,
+        plan: &crate::tab_model::VisibleLeafPlan,
     ) -> Option<(usize, bool)> {
-        let carets = self.visible_pane_caret_rows(wid);
+        let carets = self.visible_pane_caret_rows(plan);
         let ws = self.windows.get(&wid)?;
         let term_rows = usize::from(ws.rows);
         let nrows = ws.input_scratch.cells.len();
@@ -33125,10 +33953,7 @@ impl App {
     /// One short lock per visible pane, and only on the frames where a link is
     /// hovered: [`Self::splice_link_target`] returns before this on every
     /// ordinary frame.
-    fn visible_pane_caret_rows(&self, wid: WindowId) -> Vec<usize> {
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return Vec::new();
-        };
+    fn visible_pane_caret_rows(&self, plan: &crate::tab_model::VisibleLeafPlan) -> Vec<usize> {
         let mut rows = Vec::with_capacity(plan.leaves.len());
         for leaf in &plan.leaves {
             let Some(session) = self
@@ -41889,7 +42714,7 @@ mod link_target_caption_tests {
     use std::time::Instant;
 
     use super::{App, ComposedCursorFxClock, WindowId};
-    use crate::term_lock;
+    use crate::{reset_visible_leaf_plan_builds, term_lock, visible_leaf_plan_builds};
 
     /// The phishing shape OSC 8 permits: the visible run reads `google.com`,
     /// the URI addresses `evil.example`. Byte-for-byte the reproduction from
@@ -41998,6 +42823,39 @@ mod link_target_caption_tests {
             .expect("find mode is open")
             .set_query(query.to_string());
         app.search_recompute();
+    }
+
+    #[test]
+    fn hovered_link_reuses_the_frame_plan() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        feed(&app, wid, PHISH);
+        extract_only(&mut app, wid);
+        hover(&mut app, wid, 0, LINK_COL);
+
+        reset_visible_leaf_plan_builds();
+        let (plan, route) = app.active_visible_frame_layout(wid).expect("frame layout");
+        assert_eq!(
+            route,
+            crate::VisibleContentRoute::Terminal { composed: false }
+        );
+        app.splice_link_target_from_plan(wid, &plan);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "hover caret projection borrows the frame plan",
+        );
+
+        // Negative control: the former frame shape resolved its outer plan and
+        // then let the hover consumer independently rebuild the same geometry.
+        reset_visible_leaf_plan_builds();
+        assert!(app.active_visible_frame_layout(wid).is_some());
+        app.splice_link_target(wid);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            2,
+            "an unthreaded hover consumer adds a second plan build",
+        );
     }
 
     /// A LINK MUST SAY WHERE IT GOES. Hovering the `google.com` run puts

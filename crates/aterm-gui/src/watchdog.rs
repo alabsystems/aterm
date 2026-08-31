@@ -33,14 +33,43 @@
 //! real freeze happens *inside* `window_event` / `user_event` / the resize-settle
 //! flush — a WORK breadcrumb that never advances to `AboutToWait` — so it trips.
 //!
-//! ## Off in release
+//! ## ON IN RELEASE, at a coarser threshold
 //!
-//! [`start`] spawns the sampler ONLY when [`enabled`] — `#[cfg(debug_assertions)]`
-//! builds, or any build with `$ATERM_WATCHDOG` set. A release binary with the env
-//! unset spawns no thread and reports nothing; [`beat`] stays two relaxed atomic
-//! writes either way (negligible on the hot event path). Set
-//! `ATERM_WATCHDOG=abort` to `process::abort()` on a detected stall (CI / repro),
-//! otherwise it logs at error level and keeps going.
+//! It used to be off in release: [`enabled`] was `cfg!(debug_assertions) ||
+//! $ATERM_WATCHDOG`, so a shipped binary spawned no sampler and reported
+//! nothing. On 2026-08-30 that cost five hours. A self-recursive `OnceLock`
+//! (`app_update_screen::debug_seamless_reexec_armed`, shipped in v0.65.0 and
+//! v0.66.0) parked the main thread inside `user_event` on the first automatic
+//! update apply. The window stayed up, the process stayed alive, and
+//! `aterm.log` recorded nothing at all from the main thread from that second
+//! on — the only evidence was a macOS hang report, which had to be
+//! hand-symbolicated against the stripped release binary to name the frame.
+//! That is the exact scenario this module's own header says it exists for
+//! ("*without symbols* — exactly what the stripped-release spindump lacked"),
+//! and it was compiled out of the build that needed it.
+//!
+//! So the sampler now runs in EVERY build. What changes with the build is the
+//! threshold, not the existence of the guard:
+//!
+//! * debug builds, or any build with `$ATERM_WATCHDOG` set —
+//!   [`STALL_THRESHOLD`] (500 ms). Tight, for catching a regression while
+//!   developing it.
+//! * a shipped release binary — [`RELEASE_STALL_THRESHOLD`] (5 s). A main
+//!   thread frozen at a WORK root for five seconds is never normal, so the
+//!   coarser bar keeps a slow-but-progressing frame, a huge paste or a cold
+//!   font scan from ever writing an alarming line, while still turning a
+//!   PERMANENT wedge into a named log line within seconds instead of never.
+//!
+//! `ATERM_WATCHDOG=off` disables the sampler entirely; `ATERM_WATCHDOG=abort`
+//! still `process::abort()`s on a detected stall (CI / repro). Everything else
+//! logs at error level and keeps going. [`beat`] is two relaxed atomic writes
+//! in every build either way (negligible on the hot event path), and the
+//! sampler is one thread asleep 99.99% of the time.
+//!
+//! A stall that PERSISTS is re-reported every [`STALL_REPEAT_INTERVAL`] with
+//! the accumulated frozen duration, so the log distinguishes "wedged for a
+//! moment" from "wedged for an hour and never recovered" — the distinction the
+//! 0.65.0 log could not make, because it said nothing at all.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -49,9 +78,28 @@ use std::time::{Duration, Instant};
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long the heartbeat may stay frozen at a WORK breadcrumb before it counts
-/// as a stall. Two sample intervals, so a genuine wedge is caught within ~750 ms
-/// while a single slow-but-progressing frame never trips.
+/// as a stall, in a DEBUG build or under an explicit `$ATERM_WATCHDOG`. Two
+/// sample intervals, so a genuine wedge is caught within ~750 ms while a single
+/// slow-but-progressing frame never trips.
 const STALL_THRESHOLD: Duration = Duration::from_millis(500);
+
+/// The same bar for a SHIPPED release binary, where the reader is a user's
+/// `aterm.log` rather than a developer's terminal.
+///
+/// Ten sample intervals. The trade is deliberate and one-directional: 500 ms of
+/// main-thread work is unusual but not impossible in the field (a cold font
+/// catalog, a very large paste, a first-frame pipeline build), and an error line
+/// for one of those is noise that teaches a reader to ignore the guard. Five
+/// seconds is not survivable UI latency under any reading — nothing in this
+/// program is allowed to hold the main thread that long — so a line at 5 s is
+/// always a real finding. It still converts a PERMANENT park from silence into
+/// a named log line within seconds, which is the whole point.
+const RELEASE_STALL_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// How often a still-frozen main thread is re-reported after its first line.
+/// One line proves a wedge happened; the repeats prove it never ended, and
+/// carry the growing duration.
+const STALL_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Monotonic main-thread liveness counter. [`beat`] increments it on every winit
 /// root entry; the sampler watches it for a frozen span.
@@ -132,10 +180,13 @@ impl Breadcrumb {
 /// The pure stall decision, factored out of the sampler loop so it is
 /// deterministically testable: a frozen heartbeat is a STALL iff the main thread
 /// is sitting in a WORK root (not a park point) and has been frozen at least
-/// [`STALL_THRESHOLD`]. This is the exact predicate that FLAGS the L0 hazard —
-/// e.g. a wedge in the `ResizeSettle` reflow that never reaches `AboutToWait`.
-fn is_stall(bc: Breadcrumb, frozen: Duration) -> bool {
-    !bc.is_park_point() && frozen >= STALL_THRESHOLD
+/// `threshold` — [`STALL_THRESHOLD`] for the dev lane,
+/// [`RELEASE_STALL_THRESHOLD`] for a shipped binary. This is the exact
+/// predicate that FLAGS the L0 hazard — a wedge in the `ResizeSettle` reflow
+/// that never reaches `AboutToWait`, or a main thread parked forever inside
+/// `user_event` on a lazy-init cycle.
+fn is_stall_at(bc: Breadcrumb, frozen: Duration, threshold: Duration) -> bool {
+    !bc.is_park_point() && frozen >= threshold
 }
 
 /// The sampler's detection state machine, split out of the background thread so
@@ -149,25 +200,44 @@ struct Sampler {
     last_advance: Instant,
     /// Whether the current contiguous stall was already reported (fire once).
     reported: bool,
+    /// When the current contiguous stall was last reported, for the repeat
+    /// cadence. `None` until the first report.
+    last_report: Option<Instant>,
+    /// How many times THIS contiguous stall has been reported. Lives here, with
+    /// the rest of the per-stall state, so it re-arms on recovery: kept in the
+    /// sampler loop instead, a second stall hours after the first was announced
+    /// as "STALL CONTINUES" and two distinct incidents read as one wedge.
+    reports: u32,
+    /// The bar this sampler judges against — [`STALL_THRESHOLD`] for the dev
+    /// lane, [`RELEASE_STALL_THRESHOLD`] for a shipped binary.
+    threshold: Duration,
 }
 
 impl Sampler {
-    fn new(now: Instant, beat: u64) -> Self {
+    fn with_threshold(now: Instant, beat: u64, threshold: Duration) -> Self {
         Self {
             last_beat: beat,
             last_advance: now,
             reported: false,
+            last_report: None,
+            reports: 0,
+            threshold,
         }
     }
 
-    /// Fold one sample. Returns `Some(bc)` exactly ONCE per contiguous stall (the
-    /// breadcrumb to name in the log), else `None`.
+    /// Fold one sample. Returns `Some(bc)` when this sample should be REPORTED:
+    /// once when a contiguous stall crosses the threshold, and then once per
+    /// [`STALL_REPEAT_INTERVAL`] for as long as it lasts. A main thread that
+    /// never comes back is the case this guard exists for, and one line an hour
+    /// ago is not the same evidence as a line saying it is still frozen now.
     fn poll(&mut self, now: Instant, cur_beat: u64, bc: Breadcrumb) -> Option<Breadcrumb> {
         if cur_beat != self.last_beat {
             // Progress: the main thread is alive. Reset the stall clock + re-arm.
             self.last_beat = cur_beat;
             self.last_advance = now;
             self.reported = false;
+            self.last_report = None;
+            self.reports = 0;
             return None;
         }
         if bc.is_park_point() {
@@ -175,14 +245,25 @@ impl Sampler {
             // clock reset so leaving idle starts a fresh span.
             self.last_advance = now;
             self.reported = false;
+            self.last_report = None;
+            self.reports = 0;
             return None;
         }
         let frozen = now.saturating_duration_since(self.last_advance);
-        if is_stall(bc, frozen) && !self.reported {
-            self.reported = true;
-            return Some(bc);
+        if !is_stall_at(bc, frozen, self.threshold) {
+            return None;
         }
-        None
+        let due = match self.last_report {
+            None => !self.reported,
+            Some(at) => now.saturating_duration_since(at) >= STALL_REPEAT_INTERVAL,
+        };
+        if !due {
+            return None;
+        }
+        self.reported = true;
+        self.last_report = Some(now);
+        self.reports = self.reports.saturating_add(1);
+        Some(bc)
     }
 }
 
@@ -196,10 +277,25 @@ pub fn beat(bc: Breadcrumb) {
     HEARTBEAT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Whether the watchdog sampler should run: debug builds, or any build with
-/// `$ATERM_WATCHDOG` set. Release binaries with the env unset stay silent.
+/// Whether the watchdog sampler should run. EVERY build, unless explicitly
+/// switched off with `ATERM_WATCHDOG=off` — see the module header for why a
+/// release binary is the build that needs this most.
 fn enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os("ATERM_WATCHDOG").is_some()
+    !std::env::var("ATERM_WATCHDOG").is_ok_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("0") || v.is_empty()
+    })
+}
+
+/// The bar this build judges a stall against: tight when a developer is
+/// watching (debug, or an explicit `$ATERM_WATCHDOG`), coarse in a shipped
+/// binary where the reader is a user's `aterm.log`.
+fn threshold() -> Duration {
+    if cfg!(debug_assertions) || std::env::var_os("ATERM_WATCHDOG").is_some() {
+        STALL_THRESHOLD
+    } else {
+        RELEASE_STALL_THRESHOLD
+    }
 }
 
 /// Whether a detected stall should `process::abort()` (repro / CI) rather than
@@ -217,14 +313,16 @@ pub fn start() {
         return;
     }
     let abort = abort_on_stall();
+    let threshold = threshold();
     let builder = std::thread::Builder::new().name("aterm-watchdog".into());
-    // A spawn failure is non-fatal: the app runs fine without the dev tripwire.
+    // A spawn failure is non-fatal: the app runs fine without the tripwire.
     let _ = builder.spawn(move || {
         aterm_log::info!(
             "main-thread stall watchdog armed (sample {SAMPLE_INTERVAL:?}, threshold \
-             {STALL_THRESHOLD:?}, abort={abort})"
+             {threshold:?}, repeat {STALL_REPEAT_INTERVAL:?}, abort={abort})"
         );
-        let mut sampler = Sampler::new(Instant::now(), HEARTBEAT.load(Ordering::Relaxed));
+        let mut sampler =
+            Sampler::with_threshold(Instant::now(), HEARTBEAT.load(Ordering::Relaxed), threshold);
         loop {
             std::thread::sleep(SAMPLE_INTERVAL);
             let now = Instant::now();
@@ -232,12 +330,22 @@ pub fn start() {
             let bc = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed));
             if let Some(hit) = sampler.poll(now, cur, bc) {
                 let frozen = now.saturating_duration_since(sampler.last_advance);
-                aterm_log::error!(
-                    "MAIN-THREAD STALL: no heartbeat for {frozen:?} while inside \
-                     `{}` — likely unbounded work under a contended lock (L0 \
-                     freeze hazard).",
-                    hit.name()
-                );
+                if sampler.reports == 1 {
+                    aterm_log::error!(
+                        "MAIN-THREAD STALL: no heartbeat for {frozen:?} while inside \
+                         `{}` — the UI is not responding. Either unbounded work under a \
+                         contended lock (the L0 freeze hazard) or a park that will never \
+                         end (a lock or lazy-init cycle). This line names the main-loop \
+                         root without symbols; a hang report is not required to find it.",
+                        hit.name()
+                    );
+                } else {
+                    aterm_log::error!(
+                        "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} \
+                         inside `{}` — this is a wedge, not a slow frame.",
+                        hit.name()
+                    );
+                }
                 if abort {
                     std::process::abort();
                 }
@@ -352,25 +460,37 @@ mod tests {
     #[test]
     fn flags_a_wedged_resize_settle_but_not_a_slow_progressing_frame() {
         // The hazard: stuck in the ResizeSettle reflow past the threshold → FLAG.
-        assert!(is_stall(Breadcrumb::ResizeSettle, STALL_THRESHOLD));
-        assert!(is_stall(
+        assert!(is_stall_at(
             Breadcrumb::ResizeSettle,
-            STALL_THRESHOLD + Duration::from_secs(42)
+            STALL_THRESHOLD,
+            STALL_THRESHOLD
         ));
-        assert!(is_stall(Breadcrumb::WindowEvent, STALL_THRESHOLD));
-        // A sub-threshold freeze (one slow frame) is NOT a stall.
-        assert!(!is_stall(
+        assert!(is_stall_at(
             Breadcrumb::ResizeSettle,
-            STALL_THRESHOLD - Duration::from_millis(1)
+            STALL_THRESHOLD + Duration::from_secs(42),
+            STALL_THRESHOLD
+        ));
+        assert!(is_stall_at(
+            Breadcrumb::WindowEvent,
+            STALL_THRESHOLD,
+            STALL_THRESHOLD
+        ));
+        // A sub-threshold freeze (one slow frame) is NOT a stall.
+        assert!(!is_stall_at(
+            Breadcrumb::ResizeSettle,
+            STALL_THRESHOLD - Duration::from_millis(1),
+            STALL_THRESHOLD
         ));
         // Idle at a park point, even for a long time, is NEVER a stall.
-        assert!(!is_stall(
+        assert!(!is_stall_at(
             Breadcrumb::AboutToWait,
-            STALL_THRESHOLD + Duration::from_secs(600)
+            STALL_THRESHOLD + Duration::from_secs(600),
+            STALL_THRESHOLD
         ));
-        assert!(!is_stall(
+        assert!(!is_stall_at(
             Breadcrumb::Startup,
-            STALL_THRESHOLD + Duration::from_secs(600)
+            STALL_THRESHOLD + Duration::from_secs(600),
+            STALL_THRESHOLD
         ));
     }
 
@@ -381,7 +501,7 @@ mod tests {
         // the term lock). The breadcrumb never advances to AboutToWait.
         let t0 = Instant::now();
         let beat_val = 100; // whatever `beat` left in HEARTBEAT before the wedge
-        let mut s = Sampler::new(t0, beat_val);
+        let mut s = Sampler::with_threshold(t0, beat_val, STALL_THRESHOLD);
 
         // 250 ms in, still frozen but under threshold → no fire yet.
         assert_eq!(
@@ -435,7 +555,7 @@ mod tests {
         // The heartbeat is frozen for ten minutes because the app is IDLE (parked
         // in the OS event wait after about_to_wait). This must never be a stall.
         let t0 = Instant::now();
-        let mut s = Sampler::new(t0, 7);
+        let mut s = Sampler::with_threshold(t0, 7, STALL_THRESHOLD);
         for secs in [1u64, 5, 60, 600] {
             assert_eq!(
                 s.poll(t0 + Duration::from_secs(secs), 7, Breadcrumb::AboutToWait),
@@ -453,6 +573,143 @@ mod tests {
         assert_eq!(
             Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed)),
             Breadcrumb::ResizeSettle
+        );
+    }
+
+    /// REGRESSION (2026-08-30, v0.65.0): the shipped binary must ARM this. The
+    /// watchdog was `cfg!(debug_assertions) || $ATERM_WATCHDOG`, so the release
+    /// that parked its main thread inside `user_event` for five hours spawned no
+    /// sampler and logged nothing — and the only evidence left was a macOS hang
+    /// report that had to be hand-symbolicated against a stripped binary.
+    #[test]
+    fn the_watchdog_is_armed_unless_explicitly_switched_off() {
+        // `enabled()` reads the environment, which is process-global and shared
+        // with every other test in this binary — so assert the DECISION, not by
+        // mutating the env. With nothing set, it must be on.
+        if std::env::var_os("ATERM_WATCHDOG").is_none() {
+            assert!(
+                enabled(),
+                "a shipped build must arm the stall watchdog: silence is what \
+                 cost five hours on 2026-08-30"
+            );
+        }
+        // And the shipped bar is coarse enough that a slow frame is never a line,
+        // while a permanent park still is.
+        assert!(
+            RELEASE_STALL_THRESHOLD > STALL_THRESHOLD,
+            "the release bar must be the coarser of the two"
+        );
+        assert!(
+            RELEASE_STALL_THRESHOLD < Duration::from_secs(30),
+            "a bar this coarse stops being a freeze guard"
+        );
+    }
+
+    /// The shipped lane judges against [`RELEASE_STALL_THRESHOLD`]: a 1 s frozen
+    /// frame is NOT a line (that is a slow frame), a 6 s one is (that is a wedge).
+    #[test]
+    fn the_release_lane_ignores_a_slow_frame_and_reports_a_wedge() {
+        let t0 = Instant::now();
+        let mut s = Sampler::with_threshold(t0, 1, RELEASE_STALL_THRESHOLD);
+        assert!(
+            s.poll(t0 + Duration::from_secs(1), 1, Breadcrumb::WindowEvent)
+                .is_none(),
+            "one second of main-thread work must not write an error line"
+        );
+        assert_eq!(
+            s.poll(t0 + Duration::from_secs(6), 1, Breadcrumb::WindowEvent),
+            Some(Breadcrumb::WindowEvent),
+            "six seconds frozen at a WORK root is a wedge and must be named"
+        );
+    }
+
+    /// A stall that never ends is re-reported on a cadence. One line at the
+    /// start proves a wedge happened; the repeats prove it never ended — the
+    /// distinction the 0.65.0 log could not make, because it said nothing.
+    #[test]
+    fn a_persisting_stall_is_reported_again_on_the_repeat_cadence() {
+        let t0 = Instant::now();
+        let mut s = Sampler::with_threshold(t0, 1, STALL_THRESHOLD);
+        assert_eq!(
+            s.poll(t0 + Duration::from_secs(1), 1, Breadcrumb::UserEvent),
+            Some(Breadcrumb::UserEvent),
+            "the first crossing must report"
+        );
+        assert!(
+            s.poll(t0 + Duration::from_secs(30), 1, Breadcrumb::UserEvent)
+                .is_none(),
+            "inside the repeat interval it stays quiet — no flood"
+        );
+        assert_eq!(
+            s.poll(
+                t0 + Duration::from_secs(1) + STALL_REPEAT_INTERVAL,
+                1,
+                Breadcrumb::UserEvent
+            ),
+            Some(Breadcrumb::UserEvent),
+            "a stall still live one interval later must say so again"
+        );
+        // …and progress re-arms it completely.
+        assert!(
+            s.poll(t0 + Duration::from_secs(200), 2, Breadcrumb::UserEvent)
+                .is_none(),
+            "a heartbeat means the main thread is back"
+        );
+    }
+
+    /// The 0.65.0 breadcrumb, exactly: the automatic apply arrives as
+    /// `Wake::ApplyStagedUpdate` inside `user_event`, which is a WORK root, and
+    /// the park happens before `UpdateHandoff` is ever stamped. So the guard
+    /// covers the state the process was actually in — this is the assertion that
+    /// makes "it would have fired" a fact rather than a claim.
+    #[test]
+    fn the_v065_park_state_is_one_this_watchdog_reports() {
+        assert!(
+            !Breadcrumb::UserEvent.is_park_point(),
+            "user_event is WORK: a frozen heartbeat there is a stall"
+        );
+        assert!(
+            is_stall_at(
+                Breadcrumb::UserEvent,
+                Duration::from_secs(3588),
+                RELEASE_STALL_THRESHOLD
+            ),
+            "the field hang (3588 s unresponsive, parked in user_event) must be \
+             a reported stall in a SHIPPED build"
+        );
+        // The handoff's own park point stays exempt — a quiesced reader wait is
+        // not a wedge, and reporting it would be the noise that gets a guard
+        // ignored.
+        assert!(Breadcrumb::UpdateHandoff.is_park_point());
+    }
+
+    /// TWO SEPARATE WEDGES READ AS TWO. The report counter used to live in the
+    /// sampler LOOP rather than in the sampler, so it never re-armed: a stall
+    /// hours after the first announced itself as "STALL CONTINUES", and two
+    /// distinct incidents read as one. Found by `codex review`.
+    #[test]
+    fn a_second_stall_after_recovery_reports_as_a_first_again() {
+        let t0 = Instant::now();
+        let mut s = Sampler::with_threshold(t0, 1, STALL_THRESHOLD);
+        assert_eq!(
+            s.poll(t0 + Duration::from_secs(1), 1, Breadcrumb::UserEvent),
+            Some(Breadcrumb::UserEvent)
+        );
+        assert_eq!(s.reports, 1, "the first line of the first stall");
+        // The main thread comes back…
+        assert!(
+            s.poll(t0 + Duration::from_secs(2), 2, Breadcrumb::UserEvent)
+                .is_none()
+        );
+        assert_eq!(s.reports, 0, "recovery re-arms the report count");
+        // …and wedges again, hours later. That is a NEW incident.
+        assert_eq!(
+            s.poll(t0 + Duration::from_secs(9000), 2, Breadcrumb::WindowEvent),
+            Some(Breadcrumb::WindowEvent)
+        );
+        assert_eq!(
+            s.reports, 1,
+            "a separate wedge must announce itself in full, not as a continuation"
         );
     }
 }

@@ -693,3 +693,172 @@ pub fn proxy_forward_model() -> Model {
         ],
     }
 }
+
+/// OSC 52's blocking platform-writer handoff is a one-slot, latest-value
+/// mailbox (`aterm-gui/src/spawn.rs`). A producer may replace either destination
+/// while the worker is busy, but it must never append another retained payload:
+/// the slot remains bounded at one and, whenever occupied, names the newest
+/// clipboard and PRIMARY generations independently.
+///
+/// `Buggy=1` models the retired unbounded `mpsc::channel`: every publish grows
+/// the retained count and leaves the first payload in place. The invariant
+/// catches that implementation immediately, so the proof cannot pass vacuously.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn clipboard_mailbox_model() -> Model {
+    crate::ty_model! {
+        ClipboardMailbox {
+            const MaxGeneration = 3;
+            const Buggy = 0;
+            var pending = 0;
+            var clipboard_generation = 0;
+            var pending_clipboard = 0;
+            var pending_clipboard_present = 0;
+            var primary_generation = 0;
+            var pending_primary = 0;
+            var pending_primary_present = 0;
+            action PublishClipboard when (clipboard_generation <= MaxGeneration - 1) {
+                pending = if Buggy == 1 { pending + 1 } else { 1 };
+                clipboard_generation = clipboard_generation + 1;
+                pending_clipboard = if Buggy == 1 {
+                    if pending_clipboard_present == 0 {
+                        clipboard_generation + 1
+                    } else {
+                        pending_clipboard
+                    }
+                } else {
+                    clipboard_generation + 1
+                };
+                pending_clipboard_present = 1;
+            }
+            action PublishPrimary when (primary_generation <= MaxGeneration - 1) {
+                pending = if Buggy == 1 { pending + 1 } else { 1 };
+                primary_generation = primary_generation + 1;
+                pending_primary = if Buggy == 1 {
+                    if pending_primary_present == 0 {
+                        primary_generation + 1
+                    } else {
+                        pending_primary
+                    }
+                } else {
+                    primary_generation + 1
+                };
+                pending_primary_present = 1;
+            }
+            action Consume when (pending > 0) {
+                pending = 0;
+                pending_clipboard_present = 0;
+                pending_primary_present = 0;
+            }
+            invariant OneLatestPendingWrite:
+                pending <= 1
+                && (
+                    (
+                        pending == 0
+                        && pending_clipboard_present == 0
+                        && pending_primary_present == 0
+                    )
+                    || (
+                        pending > 0
+                        && (
+                            pending_clipboard_present > 0
+                            || pending_primary_present > 0
+                        )
+                    )
+                )
+                && (
+                    pending_clipboard_present == 0
+                    || pending_clipboard == clipboard_generation
+                )
+                && (
+                    pending_primary_present == 0
+                    || pending_primary == primary_generation
+                );
+        }
+    }
+}
+
+/// The native-document disk worker has four bounded waiting slots plus one
+/// executing slot (`aterm-gui/src/app_documents.rs`). A full journal submission
+/// coalesces to an ID-only reducer intent; `WorkerStarts` releases one waiting
+/// slot and its UI wake can admit that intent through `RetryAccepted`. The
+/// scalar retry variables project membership for one observed document; they do
+/// not count the runtime's whole ID set.
+///
+/// `Buggy=1` models three retired failures: accepting a fifth waiting image,
+/// dropping the reducer intent on `Full`, and releasing capacity without a retry
+/// wake. The invariants catch each independently.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_document_queue_model() -> Model {
+    crate::ty_model! {
+        NativeDocumentQueue {
+            const QueueCapacity = 4;
+            const RetainedCapacity = 5;
+            const Buggy = 0;
+            var queued = 0;
+            var executing = 0;
+            var deferred_intent = 0;
+            var retry_pending = 0;
+            var drain_edge = 0;
+            action SubmitAccepted when (
+                queued <= if Buggy == 1 {
+                    QueueCapacity
+                } else {
+                    QueueCapacity - 1
+                }
+            ) {
+                queued = queued + 1;
+            }
+            action SubmitDeferred when (queued > QueueCapacity - 1) {
+                deferred_intent = 1;
+                retry_pending = if Buggy == 1 { 0 } else { 1 };
+            }
+            action WorkerStarts when (queued > 0 && executing == 0) {
+                queued = queued - 1;
+                executing = 1;
+                drain_edge = if Buggy == 1 { 0 } else { 1 };
+            }
+            action WorkerCompletes when (executing == 1) {
+                executing = 0;
+            }
+            action RetryAccepted when (
+                deferred_intent == 1
+                && retry_pending == 1
+                && queued <= QueueCapacity - 1
+                && drain_edge == 1
+            ) {
+                queued = queued + 1;
+                deferred_intent = 0;
+                retry_pending = 0;
+                drain_edge = 0;
+            }
+            action RetryStillFull when (
+                deferred_intent == 1
+                && retry_pending == 1
+                && queued > QueueCapacity - 1
+                && drain_edge == 1
+            ) {
+                drain_edge = 0;
+            }
+            action ConsumeDrainEdge when (
+                retry_pending == 0 && drain_edge == 1
+            ) {
+                drain_edge = 0;
+            }
+            invariant BoundedFullImageJobs:
+                queued <= QueueCapacity
+                && executing <= 1
+                && queued + executing <= RetainedCapacity;
+            invariant DeferredIntentRetained:
+                deferred_intent <= 1
+                && retry_pending <= 1
+                && deferred_intent <= retry_pending;
+            invariant OpenSlotHasRetryEdge:
+                drain_edge <= 1
+                && (
+                    retry_pending == 0
+                    || queued > QueueCapacity - 1
+                    || drain_edge == 1
+                );
+        }
+    }
+}

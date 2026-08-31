@@ -10,7 +10,29 @@
 //! anything here, because antialiased glyph coverage is where an off-by-one is
 //! invisible to a "the glyph is not blank" assertion and glaring on screen.
 //!
-//! Every case below feeds the SAME outline, vertex for vertex, into both
+//! # What this oracle covers, and what it deliberately does not
+//!
+//! It covers the FILL: `draw_line` and everything downstream of it — the
+//! two-cell fast path, the `s = 1/(x1 - x0)` trapezoid split, the interior
+//! slabs, the incremental `x += dxdy * dy` march, the accumulator's cross-row
+//! carry. That arithmetic computes exact analytic per-cell area, where two
+//! independent implementations agree to the bit because there is only one right
+//! answer, and it is also the only expression of cross-machine determinism this
+//! crate has (the GPU/CPU parity suites lean on it).
+//!
+//! It does NOT cover the FLATTENING. `raster.rs` used to carry
+//! `ab_glyph_rasterizer`'s `devsq < 0.333` / `tol = 3.0` / `FLATNESS = 0.35`
+//! verbatim, and this file pinned them — but those were the retired crate's
+//! tuning constants, not a correctness property, and they held aterm's
+//! rasterizer 3.2× further from ground truth than the `fontdue` it also
+//! retired. So every case below **flattens ONCE, here in the harness**
+//! ([`flatten`]) and feeds both rasterizers the identical polyline through
+//! `draw_line` only. The flattening is guarded instead by measured accuracy
+//! against an independent analytic reference, in
+//! `tests/raster_accuracy_survey.rs`. The full argument for the split is
+//! `docs/measured/fontdue-oracle-decision-2026-08-29.md`.
+//!
+//! Every case below feeds the SAME polyline, vertex for vertex, into both
 //! rasterizers and compares the full coverage grid at f32 bit-equality — not
 //! "close enough", not the quantised mask, the exact bits. The corpus is:
 //!
@@ -107,44 +129,122 @@ impl Map {
     }
 }
 
-/// Replay `segs` into the FIRST-PARTY rasterizer, closing contours implicitly
-/// the way every caller in the crate does.
-fn fill_mine(segs: &[Seg], m: Map, w: usize, h: usize) -> Vec<f32> {
-    let mut ras = raster::Rasterizer::new(w, h);
-    let mut last = raster::point(0.0, 0.0);
-    let mut start = last;
-    let p = |x: f32, y: f32| {
-        let (gx, gy) = m.at(x, y);
-        raster::point(gx, gy)
-    };
+/// The sagitta, in grid cells, this harness flattens curves to.
+///
+/// A deliberate COPY of `raster.rs`'s own `FLATTEN_SAGITTA_PX` rather than a
+/// reference to it: the value only sets how dense the shared polyline is, and
+/// matching production density is what keeps the fill exercised over the
+/// segment lengths it actually sees — but a change to the product's budget must
+/// not silently change what this oracle exercises, so the number is written
+/// out here and moves only when someone decides it should.
+const HARNESS_SAGITTA_PX: f32 = 1.0 / 255.0;
+
+/// One flattened outline command, in GRID space (y already flipped, y DOWN):
+/// the shared polyline both rasterizers are fed.
+#[derive(Clone, Copy, Debug)]
+enum Flat {
+    Move(f32, f32),
+    Line(f32, f32),
+    Close,
+}
+
+/// Map `segs` into grid space and flatten every curve to [`HARNESS_SAGITTA_PX`]
+/// — the ONE flattening in this file, so neither rasterizer's own curve code is
+/// under test here and both see byte-identical vertices.
+///
+/// Uniform parameter splitting, sized from the second difference: a quadratic's
+/// `n`-segment polyline departs from the curve by at most `|dev| / (4n²)` and a
+/// cubic's by at most `3·max(|d1|, |d2|) / (4n²)`. Written out independently of
+/// `raster.rs` (which derives the same counts) so the two cannot share a bug.
+fn flatten(segs: &[Seg], m: Map) -> Vec<Flat> {
+    let t = HARNESS_SAGITTA_PX;
+    let mut out = Vec::with_capacity(segs.len() * 8);
+    // The pen, in GRID space — curves are subdivided from where they start —
+    // and the contour start, because `Close` returns the pen to it. No corpus
+    // in this file opens a curve straight after a `Close` without a `Move`
+    // first, but the fills downstream both do return the pen, so the flattener
+    // has to as well or it would be modelling a different outline than they do.
+    let (mut cx, mut cy) = (0.0f32, 0.0f32);
+    let (mut sx, mut sy) = (0.0f32, 0.0f32);
+    let lerp =
+        |t: f32, a: (f32, f32), b: (f32, f32)| (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+    let norm = |dx: f32, dy: f32| (dx * dx + dy * dy).sqrt();
     for seg in segs {
         match *seg {
             Seg::Move(x, y) => {
+                let p = m.at(x, y);
+                out.push(Flat::Move(p.0, p.1));
+                (cx, cy) = p;
+                (sx, sy) = p;
+            }
+            Seg::Line(x, y) => {
+                let p = m.at(x, y);
+                out.push(Flat::Line(p.0, p.1));
+                (cx, cy) = p;
+            }
+            Seg::Quad(qx, qy, x, y) => {
+                let p0 = (cx, cy);
+                let c = m.at(qx, qy);
+                let p2 = m.at(x, y);
+                let dev = norm(p0.0 - 2.0 * c.0 + p2.0, p0.1 - 2.0 * c.1 + p2.1);
+                let n = ((dev / (4.0 * t)).sqrt().ceil() as usize).clamp(1, 4096);
+                for i in 1..=n {
+                    let u = i as f32 / n as f32;
+                    let p = lerp(u, lerp(u, p0, c), lerp(u, c, p2));
+                    out.push(Flat::Line(p.0, p.1));
+                }
+                (cx, cy) = p2;
+            }
+            Seg::Cubic(ax, ay, bx, by, x, y) => {
+                let p0 = (cx, cy);
+                let c0 = m.at(ax, ay);
+                let c1 = m.at(bx, by);
+                let p3 = m.at(x, y);
+                let d1 = norm(p0.0 - 2.0 * c0.0 + c1.0, p0.1 - 2.0 * c0.1 + c1.1);
+                let d2 = norm(c0.0 - 2.0 * c1.0 + p3.0, c0.1 - 2.0 * c1.1 + p3.1);
+                let dev = d1.max(d2);
+                let n = ((3.0 * dev / (4.0 * t)).sqrt().ceil() as usize).clamp(1, 4096);
+                for i in 1..=n {
+                    let u = i as f32 / n as f32;
+                    let p = lerp(
+                        u,
+                        lerp(u, lerp(u, p0, c0), lerp(u, c0, c1)),
+                        lerp(u, lerp(u, c0, c1), lerp(u, c1, p3)),
+                    );
+                    out.push(Flat::Line(p.0, p.1));
+                }
+                (cx, cy) = p3;
+            }
+            Seg::Close => {
+                out.push(Flat::Close);
+                (cx, cy) = (sx, sy);
+            }
+        }
+    }
+    out
+}
+
+/// Replay the shared polyline into the FIRST-PARTY rasterizer, closing contours
+/// implicitly the way every caller in the crate does. `draw_line` only.
+fn fill_mine(flat: &[Flat], w: usize, h: usize) -> Vec<f32> {
+    let mut ras = raster::Rasterizer::new(w, h);
+    let mut last = raster::point(0.0, 0.0);
+    let mut start = last;
+    for cmd in flat {
+        match *cmd {
+            Flat::Move(x, y) => {
                 if last != start {
                     ras.draw_line(last, start);
                 }
-                last = p(x, y);
+                last = raster::point(x, y);
                 start = last;
             }
-            Seg::Line(x, y) => {
-                let q = p(x, y);
+            Flat::Line(x, y) => {
+                let q = raster::point(x, y);
                 ras.draw_line(last, q);
                 last = q;
             }
-            Seg::Quad(cx, cy, x, y) => {
-                let c = p(cx, cy);
-                let q = p(x, y);
-                ras.draw_quad(last, c, q);
-                last = q;
-            }
-            Seg::Cubic(ax, ay, bx, by, x, y) => {
-                let a = p(ax, ay);
-                let b = p(bx, by);
-                let q = p(x, y);
-                ras.draw_cubic(last, a, b, q);
-                last = q;
-            }
-            Seg::Close => {
+            Flat::Close => {
                 if last != start {
                     ras.draw_line(last, start);
                     last = start;
@@ -160,45 +260,28 @@ fn fill_mine(segs: &[Seg], m: Map, w: usize, h: usize) -> Vec<f32> {
     out
 }
 
-/// Replay the same `segs` into the RETIRED crate. Deliberately a separate
+/// Replay the same polyline into the RETIRED crate. Deliberately a separate
 /// function rather than a generic one: the two must not be able to share a bug.
-fn fill_oracle(segs: &[Seg], m: Map, w: usize, h: usize) -> Vec<f32> {
+fn fill_oracle(flat: &[Flat], w: usize, h: usize) -> Vec<f32> {
     use ab_glyph_rasterizer as ab;
     let mut ras = ab::Rasterizer::new(w, h);
     let mut last = ab::point(0.0, 0.0);
     let mut start = last;
-    let p = |x: f32, y: f32| {
-        let (gx, gy) = m.at(x, y);
-        ab::point(gx, gy)
-    };
-    for seg in segs {
-        match *seg {
-            Seg::Move(x, y) => {
+    for cmd in flat {
+        match *cmd {
+            Flat::Move(x, y) => {
                 if last != start {
                     ras.draw_line(last, start);
                 }
-                last = p(x, y);
+                last = ab::point(x, y);
                 start = last;
             }
-            Seg::Line(x, y) => {
-                let q = p(x, y);
+            Flat::Line(x, y) => {
+                let q = ab::point(x, y);
                 ras.draw_line(last, q);
                 last = q;
             }
-            Seg::Quad(cx, cy, x, y) => {
-                let c = p(cx, cy);
-                let q = p(x, y);
-                ras.draw_quad(last, c, q);
-                last = q;
-            }
-            Seg::Cubic(ax, ay, bx, by, x, y) => {
-                let a = p(ax, ay);
-                let b = p(bx, by);
-                let q = p(x, y);
-                ras.draw_cubic(last, a, b, q);
-                last = q;
-            }
-            Seg::Close => {
+            Flat::Close => {
                 if last != start {
                     ras.draw_line(last, start);
                     last = start;
@@ -268,8 +351,9 @@ fn compare_glyph(face: &ttf_parser::Face<'_>, gid: u16, px: f32) -> bool {
         ox: x_min - PAD as f32,
         oy: -y_min + PAD as f32,
     };
-    let mine = fill_mine(&rec.segs, m, gw, gh);
-    let theirs = fill_oracle(&rec.segs, m, gw, gh);
+    let flat = flatten(&rec.segs, m);
+    let mine = fill_mine(&flat, gw, gh);
+    let theirs = fill_oracle(&flat, gw, gh);
     assert_identical(&mine, &theirs, gw, &format!("gid {gid} @ {px}px"));
     true
 }
@@ -343,10 +427,16 @@ impl Rng {
 /// The module's own `#[cfg(test)] mod tests` compares its output against
 /// hard-coded numbers, so that evidence survives the day this dev-dependency
 /// goes away. This test is what makes those numbers trustworthy in the first
-/// place: it proves the pinned grids are the retired crate's own answer, not a
-/// snapshot of whatever the first-party code happened to produce on the day it
-/// was written. If someone edits the arithmetic in `raster.rs` and re-records
-/// the goldens from it, this fails.
+/// place — with one boundary, since the flattening left this oracle:
+///
+/// * the SQUARE and the TRIANGLE contain no curves, so [`flatten`] is the
+///   identity on them and this still proves those two pinned grids are the
+///   retired crate's own answer, cell for cell. If someone edits the fill in
+///   `raster.rs` and re-records those goldens from it, this fails;
+/// * the QUAD and the CUBIC arrive here pre-flattened, so what is proved is the
+///   FILL over that polyline. `raster.rs` pins those two grids over its OWN
+///   flattening, which is a strictly larger computation than this test covers,
+///   and `tests/raster_accuracy_survey.rs` is what bounds the extra part.
 #[test]
 fn in_module_golden_shapes_match_the_oracle() {
     let square = vec![
@@ -387,8 +477,9 @@ fn in_module_golden_shapes_match_the_oracle() {
         ("quadratic", quad, 6, 6),
         ("cubic", cubic, 6, 6),
     ] {
-        let mine = fill_mine(&segs, m, w, h);
-        let theirs = fill_oracle(&segs, m, w, h);
+        let flat = flatten(&segs, m);
+        let mine = fill_mine(&flat, w, h);
+        let theirs = fill_oracle(&flat, w, h);
         assert_identical(&mine, &theirs, w, &format!("golden shape: {what}"));
     }
 }
@@ -457,8 +548,9 @@ fn soup(seed: u64, kinds: &[u8], w: usize, h: usize, rounds: usize) {
                 Seg::Close => Seg::Close,
             })
             .collect();
-        let mine = fill_mine(&segs, m, w, h);
-        let theirs = fill_oracle(&segs, m, w, h);
+        let flat = flatten(&segs, m);
+        let mine = fill_mine(&flat, w, h);
+        let theirs = fill_oracle(&flat, w, h);
         assert_identical(
             &mine,
             &theirs,
@@ -479,7 +571,9 @@ fn random_quadratic_contours_match_the_oracle() {
 }
 
 /// Cubics are the CFF outline form; the embedded faces are TrueType, so this is
-/// the only corpus that reaches `draw_cubic`'s recursive flattening.
+/// the only corpus whose polylines come from cubic geometry — long runs of very
+/// short, sharply turning segments, which is where the fill's per-scanline
+/// bookkeeping is least forgiving.
 #[test]
 fn random_cubic_contours_match_the_oracle() {
     soup(0x51ED_0003, &[2], 37, 41, 400);
@@ -520,8 +614,9 @@ fn integer_aligned_geometry_matches_the_oracle() {
                         ox: 0.0,
                         oy: 0.0,
                     };
-                    let mine = fill_mine(&segs, m, w, h);
-                    let theirs = fill_oracle(&segs, m, w, h);
+                    let flat = flatten(&segs, m);
+                    let mine = fill_mine(&flat, w, h);
+                    let theirs = fill_oracle(&flat, w, h);
                     assert_identical(&mine, &theirs, w, &format!("rect {x0},{y0}..{x1},{y1}"));
                 }
             }
@@ -552,8 +647,9 @@ fn subcell_slivers_match_the_oracle() {
             ox: 0.0,
             oy: 0.0,
         };
-        let mine = fill_mine(&segs, m, w, h);
-        let theirs = fill_oracle(&segs, m, w, h);
+        let flat = flatten(&segs, m);
+        let mine = fill_mine(&flat, w, h);
+        let theirs = fill_oracle(&flat, w, h);
         assert_identical(&mine, &theirs, w, &format!("sliver {round}"));
     }
 }

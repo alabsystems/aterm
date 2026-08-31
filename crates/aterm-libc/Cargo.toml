@@ -1,0 +1,55 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with crates/aterm-cfg-if.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect every consumer's
+# `libc = "0.2"` line at this code the package must be called `libc`. The
+# DIRECTORY keeps the `aterm-` prefix so `ls crates/` and stack traces still read
+# as ours and nobody mistakes this for a vendored upstream.
+name = "libc"
+# NOT `version.workspace = true`. This is a SEMVER CONTRACT with the consumers.
+# The graph's strictest requirement is `^0.2.182` (rustix 1.1.4); the next
+# strictest are `^0.2.172` (wgpu-hal) and `^0.2.171` (jobserver), and the lock
+# held 0.2.186 before the swap. 0.2.186 satisfies every one of them AND keeps
+# the lockfile's version line still. A version BELOW any requirement would make
+# the patch silently inert — cargo does not warn, `cargo forge check` does.
+version = "0.2.186"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party platform ABI declarations for aterm (replaces the crates.io libc package)"
+
+# `libc` is the PACKAGE and also what every consumer writes. Declared so the two
+# can never drift.
+[lib]
+name = "libc"
+path = "src/lib.rs"
+
+[features]
+# Upstream's feature table, reproduced so no transitive parent's request can
+# fail to resolve. Measured on the six cells with
+# `cargo tree --workspace --target <cell> -e features -i libc`:
+#   default,extra_traits,std   on the four unix cells
+#   default,std                on x86_64-pc-windows-msvc and wasm32-unknown-unknown
+# `extra_traits` is REAL and is reached through nix 0.29 (termwiz -> mac_address
+# -> nix), a dev-dependency of aterm-bench, so `cargo build --all-targets`
+# compiles it. It gates the same PartialEq/Eq/Hash derives upstream gates.
+default = ["std"]
+extra_traits = []
+# The rest are inert here and say so. `std` and `use_std` select upstream's
+# std-vs-core prelude, which this crate does not have (it is `no_std` always);
+# `align` and `const-extern-fn` are upstream build-configuration switches whose
+# effects are already unconditional in the generated cells; `rustc-dep-of-std`
+# would pull `rustc-std-workspace-core` back INTO the graph, which is the
+# opposite of the point — this crate cannot be used to build `std` itself, and
+# nothing in aterm asks it to.
+std = []
+use_std = ["std"]
+align = []
+const-extern-fn = []
+rustc-dep-of-std = ["align"]
+
+[lints]
+workspace = true

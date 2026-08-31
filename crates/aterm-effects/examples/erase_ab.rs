@@ -82,7 +82,10 @@ fn scripts(delete_voice: Option<SoundKind>) -> Vec<(&'static str, Script)> {
         // the puff should read as the little brother of. In the bell-only arm
         // it is genuinely empty (a kill chord has no bell), which makes its
         // `adds` column the swoosh's own level.
-        ("ctrl-w", delete_voice.map_or_else(Script::new, |_| vec![(0.10, SoundKind::Kill)])),
+        (
+            "ctrl-w",
+            delete_voice.map_or_else(Script::new, |_| vec![(0.10, SoundKind::Kill)]),
+        ),
         // A line kill, after the word it followed — the scale contrast.
         (
             "ctrl-u",
@@ -93,7 +96,9 @@ fn scripts(delete_voice: Option<SoundKind>) -> Vec<(&'static str, Script)> {
         // …and the shape that matters most: a word TYPED, then corrected.
         // If the delete fights the bell, this is where it shows.
         ("typed-then-corrected", {
-            let mut s: Script = (0..6).map(|k| (0.10 + k as f32 * 0.13, SoundKind::Typed)).collect();
+            let mut s: Script = (0..6)
+                .map(|k| (0.10 + k as f32 * 0.13, SoundKind::Typed))
+                .collect();
             s.extend(backspace(0.92, delete_voice));
             s.extend(backspace(1.06, delete_voice));
             s.extend(backspace(1.20, delete_voice));
@@ -225,11 +230,7 @@ fn main() {
             let mono = render(&script, voice, secs);
             let file = format!("{arm}-{name}.wav");
             std::fs::write(out.join(&file), wav_bytes(&mono)).expect("wav");
-            let add: Vec<f32> = mono
-                .iter()
-                .zip(&bells[i])
-                .map(|(a, b)| a - b)
-                .collect();
+            let add: Vec<f32> = mono.iter().zip(&bells[i]).map(|(a, b)| a - b).collect();
             println!(
                 "{file:<34}  {:>9.2}  {:>12}",
                 peak_db(&mono),
@@ -242,7 +243,10 @@ fn main() {
         }
     }
     // The two delete voices in ISOLATION, for a direct A/B of the sound itself.
-    for (name, kind) in [("iso-swoosh", SoundKind::Kill), ("iso-puff", SoundKind::Poof)] {
+    for (name, kind) in [
+        ("iso-swoosh", SoundKind::Kill),
+        ("iso-puff", SoundKind::Poof),
+    ] {
         let mono = render(&vec![(0.05, kind)], voice, 0.9);
         let file = format!("{name}.wav");
         std::fs::write(out.join(&file), wav_bytes(&mono)).expect("wav");

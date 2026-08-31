@@ -550,7 +550,13 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     // `RAINBOW_UNDER_COV_CAP`, 120 of 255) plus the two ends of the byte.
     let mut mixed = add_only.clone();
     for (r, x0, x1, color, alpha) in [
-        (4usize, (30 * cw) as i64, (39 * cw) as i64, 0x0044_5522u32, 120u8),
+        (
+            4usize,
+            (30 * cw) as i64,
+            (39 * cw) as i64,
+            0x0044_5522u32,
+            120u8,
+        ),
         (5, (30 * cw) as i64, (37 * cw) as i64, 0x0090_5008, 61),
         (6, (32 * cw) as i64, (40 * cw) as i64, 0x0012_0d05, 1),
         (7, (30 * cw) as i64, grid_w as i64 + 60, 0x0030_60c0, 255),
@@ -614,7 +620,10 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
             }
         }
     }
-    assert!(sampled > 400, "the comparison must walk a real field: {sampled}");
+    assert!(
+        sampled > 400,
+        "the comparison must walk a real field: {sampled}"
+    );
     assert_eq!(
         lower, sampled,
         "every source-over pixel must sit at or under its additive twin — it \

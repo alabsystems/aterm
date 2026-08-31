@@ -5,7 +5,7 @@
 //!
 //! It answers two questions an AI has when it lands in this environment: *what is
 //! this?* and *how do I use it?* — for aterm's own introspection AND for the whole
-//! verification toolchain (trust, clean, ty, ay, ny, my, nn) that ships alongside it.
+//! verification toolchain (trust, clean, ty, ay, ny, nn) that ships alongside it.
 //!
 //! ## One command, two faces (context-aware)
 //!
@@ -33,8 +33,8 @@ use std::fmt::Write as _;
 const OVERVIEW: &str = "\
 aterm is the front door to a self-owned, AI-native verification toolchain: a stack
 where the compiler PROVES your Rust, the terminal is a programmable surface an AI
-can read and drive, and the entire chain is installed and cryptographically attested
-by one package manager. Every tool is Rust, offline-capable, and built to be driven
+can read and drive, and the whole TOOLCHAIN is installed and cryptographically
+attested by one package manager (aterm itself updates through its own signed appcast). Every tool is Rust, offline-capable, and built to be driven
 by an agent — not just a human at a keyboard.";
 
 /// A deep-dive manual entry for one tool/topic. `name` is what you type after
@@ -76,7 +76,10 @@ KEY USAGE
   aterm <tool> [args]        run a pinned, store-resolved toolchain tool, e.g.
                              `aterm ay`, `aterm ty` (never $PATH — the managed build)
   aterm pkg <args>           the toolchain package manager (see `aterm help pkg`)
-  aterm doctor               pre-flight health check; exit 0 = ready
+  aterm doctor               pre-flight health check; exit 0 = ready. Its `tty` check
+                             FAILS whenever stdout is not a terminal, and that is folded
+                             into the verdict — so a piped, CI or agent run exits 1 on a
+                             healthy machine. Read the lines, not just the code.
   aterm show-config | validate-config | explain-config | list-fonts | list-themes
                              read-only diagnostics; print and exit, no shell spawned
   aterm --sandbox            run the shell under the macOS sandbox (deny net + secrets)
@@ -88,7 +91,10 @@ WHEN TO REACH FOR IT
   or drive a RUNNING instance from the outside.
 
 GOTCHAS
-  * `aterm <tool>` / `aterm pkg` need a co-located `atpkg` (resolved next to the aterm
+  * `aterm <tool>` resolves through the managed STORE, never $PATH — a tool that is not
+    installed falls through to a usage error. (`aterm pkg` is atpkg linked INTO this one
+    binary, not a sibling executable: there is nothing to co-locate and nothing to be
+    missing.) Historic note: pre-one-binary builds exited 127 when the sibling
     binary, never $PATH). Missing ⇒ `aterm pkg` exits 127; an unknown tool is a usage error.
   * Containment precedence: explicit flag > $ATERM_CONTAINMENT_MODE > default `user`;
     a malformed mode fails CLOSED to `containment`. The OS sandbox is actuated on macOS
@@ -184,7 +190,8 @@ KEY USAGE
   aterm agents primer        print the block — paste into any project AGENTS.md/CLAUDE.md
 
 WHEN TO REACH FOR IT
-  Usually never: aterm runs this installer itself, in the background, each time it opens
+  Usually never — in a WINDOW. aterm runs this installer itself, in the background, at
+  most once a minute, each time the window (or a --headless instance) opens
   a session — every DETECTED agent gets the current primer and skills, and nothing is
   written for an agent whose config dir does not exist (`agents_auto_prime = false` in
   aterm.toml turns the pass off; `aterm agents status` names the knob). Run
@@ -198,7 +205,9 @@ GOTCHAS
     content outside the markers is never touched (an unterminated marker fails closed).
   * A bare `install` skips undetected agents (no config dir = not in use) — name an
     agent explicitly to force it.
-  * The primer is intentionally 3 lines: detection, `aterm help`, env hygiene. Depth
+  * The primer is intentionally short — four points in about a dozen lines: detection,
+    `aterm help`, first moves (`aterm ctl windows` / `ls`, and read a peer's `status`
+    before typing into it), and env hygiene. Depth
     lives HERE, behind `aterm help`, not in the agent's context file.
   * SKILLS are whole managed FILES, not blocks, so they carry an `<!-- aterm skill ... -->`
     marker instead. A file at that path WITHOUT the marker is yours: aterm reports it
@@ -218,9 +227,11 @@ speak as "atpkg:".
 WHAT IT IS
   The batteries behind aterm. atpkg installs and keeps current the toolchain
   programs published by one configurable account (trust, clean, ay, ny, ...) —
-  and if you launched the aterm app, it has already run: first launch fills the
-  store from a signed seed sealed inside the app, and the windowed app updates it
-  from then on (CLI-only use never auto-updates; see GOTCHAS). Think "rustup
+  and if you launched the aterm app, it has already run: first launch records
+  adoption and then fills the store FROM THE SIGNED NETWORK INDEX, and the windowed
+  app updates it from then on (CLI-only use never auto-updates; see GOTCHAS). The
+  download is the lean app alone — the sealed offline seed was retired on
+  there is no sealed offline seed any more, so first launch needs a network. Think "rustup
   married to a silent updater". Nothing installs except through a
   compile-time-pinned Ed25519 offline root key over a signed, freshness-stamped
   index, and verification happens BEFORE any parse, enforced by construction: the
@@ -243,6 +254,9 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              groups apply all-or-nothing (the rustc-locked tuple
                              moves together)
   aterm pkg install <program> [--elevate=sudo|osascript|never]
+                             (NOTE: no OS-installed or vendor-fetched member is published
+                             yet — every program in today's index is a signed prebuilt, so
+                             --elevate has nothing to apply to)
                              one program: verify the signed index, then install the
                              pinned build. THE EXPLICIT DOOR for a member the OS
                              installs with an administrator (Homebrew's pkg, Apple's
@@ -266,19 +280,21 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              opt-in
   aterm pkg run <tool> [-- args]
                              exec the store binary — what `aterm <tool>` dispatches to
-  aterm pkg seed             the first-launch bootstrap, runnable by hand: fill an
-                             EMPTY store from the signed registry sealed inside the
-                             app. Offline by construction — it reads only the in-app
-                             seal, never the network fetch chain — so it installs
-                             exactly what the seal carries; anything newer is the
-                             consented `update`'s job. The GUI runs it once per
-                             launch; [packages].seed_install=false turns it from
-                             install into announce-only
+  aterm pkg seed             the first-launch bootstrap, runnable by hand. Since the
+                             sealed seed was retired (2026-08-26) a lean install has
+                             nothing to unpack: it RECORDS ADOPTION — the consent
+                             seam — lays pending stubs for the default set, and
+                             leaves the fetching to `update`, which pulls from the
+                             signed network index. The GUI runs it once per launch;
+                             [packages].seed_install=false turns it from install
+                             into announce-only. Releases cut before 2026-08-26
+                             still carry a seal, and this is what reads it.
 
 OCCASIONAL (recovery and preference)
   aterm pkg uninstall <program> | --all
                              remove one program, or the WHOLE managed toolset and its
-                             disk (~3.2 GB) in one step — the way out is as single-step
+                             disk (~4 GB for the full default set, of which trust is
+                             ~3.2 GB) in one step — the way out is as single-step
                              as the way in. Either form stops atpkg auto-completing the
                              set; [packages].exclude drops one program while keeping it
   aterm pkg rollback <program>
@@ -347,13 +363,16 @@ KEY USAGE
                                  gate: exit 0 only if the selector matches >=1 obligation
                                  and ALL selected are proved (an empty report is NOT a proof)
   targo trust doctor | solvers   backend health; expect `ready: true`, `available: 6/6`
-  targo / trustc                 ordinary cargo / rustc — drop-in, do NOT verify by default
-  aterm pkg install trust        install/upgrade the prebuilt toolchain (signed seed/registry)
+  targo / trustc                 drop-in cargo / rustc that VERIFY by default
+  targo --unverified <cmd>       …the opt-out: an ordinary, vanilla-Rust build
+                                 (`-Ztrust-verify=off` is the same switch)
+  aterm pkg install trust        install/upgrade the prebuilt toolchain (signed network index)
 
 WHEN TO REACH FOR IT
   Use `targo trust check` whenever the goal is to compile AND prove real Rust — it is the
-  only tool that reaches MIR-level invariants. Use plain `targo`/`trustc` for ordinary
-  builds. Reach for a leaf prover (ay/ty/clean/...) directly only to debug that backend.
+  only tool that reaches MIR-level invariants. Use `targo --unverified` for an ordinary
+  vanilla-Rust build — plain `targo`/`trustc` verify, which is why this repo's own
+  .cargo/config.toml passes `-Ztrust-verify=off`. Reach for a leaf prover (ay/ty/clean/...) directly only to debug that backend.
 
 GOTCHAS
   * INSTALL: a prebuilt, self-contained sysroot SHIPS — `aterm pkg install trust`, or the
@@ -398,8 +417,8 @@ WHEN TO REACH FOR IT
   raw SMT (ay), BMC (trust-mc), or NN runtime (ny).
 
 GOTCHAS
-  * SOURCE CHECKOUT ONLY: path-depends on ../ay — if that sibling is missing, no cargo
-    command runs in a dev tree. The installed program carries no such dependency.
+  * clean pins ay as an immutable GIT revision, deliberately NOT a `../ay` path
+    dependency, so a dev tree needs no sibling checkout to build.
   * Always pass `--locked`. NO CI/hooks — enforcement is local (`just ci`, `clean audit`).
   * HONESTY: only say "proved" when the theorem's axiom closure ⊆ the foundational
     axioms; a Theorem wrapping an Axiom is a restatement, not a proof."#,
@@ -410,7 +429,7 @@ GOTCHAS
         tagline: "TLA+ toolchain — model checker (TLC replacement) + prover",
         body: Some(
             r#"ty — a ground-up Rust reimplementation of the TLA+ verification toolchain (a TLC
-replacement and more), shipped as one CLI binary named `ty`.
+replacement and more), shipped as the `ty` CLI (with a `tla` companion shim).
 
 WHAT IT IS
   The core is an explicit-state model checker built to match TLC's semantics (TLC is the
@@ -423,11 +442,14 @@ KEY USAGE  (`aterm pkg install ty` — a signed prebuilt SHIPS; an aterm shell p
             managed bin/ on PATH, or use `aterm pkg run ty -- <SUB>`)
   ty check Spec.tla --config Spec.cfg [--workers N] [--output json]
                                  explicit-state model checking (the TLC replacement)
-  ty prove Spec.tla [--theorem NAME]   deductive proving (discharge THEOREM obligations)
+  ty prove Spec.tla [-c Spec.cfg] [-o cert.json]
+                                 unbounded inductive-safety proof; emits a `ty.cert/v1`
+                                 certificate and re-checks it (`ty recheck` replays one)
   ty induct                      check an inductive invariant
   ty corpus fetch                download the sha256-verified benchmark corpus (not in repo)
-  ty supremacy compare | diagnose   TLC-vs-ty parity evidence (needs a TLC jar + JDK)
-  ty aiger circuit.aig           hardware model checking (only with `--features ay`)
+  ty supremacy compare | reproduce  TLC-vs-ty parity evidence (needs a TLC jar + JDK);
+                                 `ty corpus doctor` is the preflight
+  ty aiger circuit.aig           hardware model checking (AIGER/BTOR2)
 
 WHEN TO REACH FOR IT
   `ty check` for finite/bounded TLA+ model checking; `ty prove`/`ty induct` for an
@@ -438,7 +460,9 @@ GOTCHAS
   * INSTALL: a signed prebuilt SHIPS — `aterm pkg install ty`, or the whole toolset with
     `aterm pkg install --default-set`. Only if you build from source instead: on macOS
     install GNU m4 first (`brew install m4`) — a transitive build dep needs it.
-  * The symbolic/hardware surfaces exist only when compiled `--features ay`.
+  * The symbolic (BMC/k-induction/IC3-PDR) and hardware (AIGER/BTOR2) surfaces are ON by
+    default — `ay` is a default feature of the ty CLI, so the installed prebuilt has them.
+    Only a deliberate `--no-default-features` source build drops them.
   * Do not assume ty is faster than TLC — use `ty supremacy compare` for real evidence."#,
         ),
     },
@@ -456,7 +480,8 @@ WHAT IT IS
   for SAT, ay-chc-cert for CHC) so a false `unsat` cannot hide. The `trust` pipeline
   vendors ay and re-checks its Alethe in a kernel.
 
-KEY USAGE  (needs the `cli` feature: `targo --unverified run -p ay --features cli -- <file>`)
+KEY USAGE  (`aterm pkg install ay` — a signed prebuilt SHIPS in the default set; an aterm
+            shell has it on PATH, or `aterm pkg run ay -- <file>`)
   ay FILE                      solve, auto-detecting format (.cnf DIMACS / HORN CHC / SMT-LIB2);
                                on unsat, writes a proof cert next to the input
   ay --z3-mode -in             read SMT-LIB2 from stdin as a Z3-style drop-in (incremental)
@@ -470,8 +495,9 @@ WHEN TO REACH FOR IT
   not the reverse. Use `ay check` when you only need to verify an existing proof.
 
 GOTCHAS
-  * The PATH `ay` is the trust monorepo's vendored copy, NOT ~/ay — build ~/ay explicitly
-    to exercise its code. The binary needs `--features cli`.
+  * Inside an aterm shell the `ay` on PATH is the SIGNED PREBUILT from the index — the
+    trust bundle vendors an ay internally but does not expose it. In a source checkout,
+    `targo --unverified run -p ay --features cli -- <file>` runs ~/ay's own code instead.
   * Exit codes differ by input: SMT-LIB returns 0 regardless of sat/unsat (Z3 convention);
     DIMACS uses 10=SAT / 20=UNSAT. Don't treat nonzero as failure for SAT input.
   * It is a SCOPED Z3-compatible CLI, not a universal drop-in — unsupported options are
@@ -491,7 +517,7 @@ WHAT IT IS
   beta (beta-CROWN) and an SDP path; complete verification is beta-CROWN branch-and-bound
   with PGD falsification and a MIP fallback. Its soundness core is error-carrying CROWN
   (f64 matmul with a certified per-coefficient error folded outward with directed
-  rounding) — what my/nn call "gamma-crown". On eligible nets it ships an exact-rational,
+  rounding) — what `nn` calls "gamma-crown". On eligible nets it ships an exact-rational,
   machine-checkable `<model>.cert.json` proof sidecar.
 
 KEY USAGE  (`aterm pkg install ny` — a signed prebuilt SHIPS; an aterm shell puts the
@@ -509,7 +535,7 @@ WHEN TO REACH FOR IT
   When you have an ONNX network + a VNN-LIB property (or an epsilon-robustness question)
   and want a trustworthy verdict. `ny verify` for a quick sound answer; `ny beta-crown`
   for a decided sat/unsat with a certificate; `ny vnncomp` for scored runs. ny is the
-  dedicated verifier; my/nn are frameworks that consume it; ay is the solver it delegates to.
+  dedicated verifier; `nn` is the framework that consumes it; ay is the solver it delegates to.
 
 GOTCHAS
   * Default workspace check must exclude the Python crate: `targo --unverified check --workspace
@@ -520,48 +546,13 @@ GOTCHAS
         ),
     },
     Topic {
-        name: "my",
-        tagline: "verified ML framework + compiler — exported PyTorch → Metal",
-        body: Some(
-            r#"my — "Verified ML Framework": a Rust-native ML stack whose `my` CLI compiles exported
-PyTorch artifacts into optimized, Metal-ready inference. (The newer of the my/nn pair.)
-
-WHAT IT IS
-  A framework + compiler, not a standalone verifier. The CLI's working job is an
-  exported-artifact bridge: take a `torch.export` graph.json + `safetensors` weights and
-  lower them (trace -> fuse/peephole -> Metal MSL) into a runnable CompiledModel, emitting
-  a machine-readable ConvertReport. Verification (Kani kernel proofs, partial gamma-crown
-  bounds via ny, z4 SMT) is surfaced as optional report hooks. Metal (Apple GPU) is the
-  only production backend.
-
-KEY USAGE  (not on PATH — `targo --unverified run -p my-cli -- <SUB>`; macOS + Metal required)
-  my convert graph.json weights.safetensors [--optimize normal|aggressive] [--verify bounds|full]
-                               compile exported artifacts -> Metal model + ConvertReport
-  my convert model.pt --from-pytorch --model-spec module:Class --input-shape 1 3 224 224
-                               shell out to my_export.py first, then convert (needs python+torch)
-  my compile ... -o model.myc  compile to a serialized .myc plan (+ report)
-  my run ... --input inputs.safetensors   execute on the Metal GPU
-  my optimize plan.myc ...     search the peephole space to minimize dispatch count/cost
-
-WHEN TO REACH FOR IT
-  Framework/compiler work on Apple GPUs: exported PyTorch -> optimized Metal inference,
-  run/optimize a compiled model, build nn models in Rust. For standalone formal
-  VERIFICATION of a network reach for `ny`; for raw solving, `ay`. my and nn are sibling
-  framework iterations (my is newer, v0.2.0-dev) — prefer my for framework work.
-
-GOTCHAS
-  * Metal-only: every subcommand initializes the Metal backend (macOS + Metal GPU).
-  * Input is NOT raw PyTorch/ONNX — it expects pre-exported torch.export graph.json +
-    safetensors; `--from-pytorch` is the only .pt on-ramp and subprocesses a Python script.
-  * `--verify full` is a REPORT request, not inline Kani kernel-safety proofs."#,
-        ),
-    },
-    Topic {
         name: "nn",
-        tagline: "verified ML framework (earlier line) — torch.export → Metal",
+        tagline: "verified ML framework — torch.export → Metal (the shipping line)",
         body: Some(
-            r#"nn — "NN, Verified ML Framework" (v0.1.0): the earlier sibling of `my`. A Rust ML
-framework whose `nn` CLI compiles exported PyTorch models into verifiable Metal inference.
+            r#"nn — "NN, Verified ML Framework": a Rust ML framework whose `nn` CLI compiles exported
+PyTorch models into verifiable Metal inference. It is a default-set program, pinned in
+the signed index and installed on first launch, so an aterm shell has `nn` on PATH
+already.
 
 WHAT IT IS
   Model code, GPU kernels, and proof tooling in one workspace (nn-core, nn-metal,
@@ -569,7 +560,7 @@ WHAT IT IS
   as the real backend, a torch.export + safetensors import bridge emitting a ConvertReport.
   It links `ny` for IBP/CROWN bound propagation and `ay` for SMT, layering formal checks
   (types -> ny bounds -> ay SMT) on top of compiled Metal inference. Same convert/compile/
-  run/optimize CLI shape as `my`, one version behind.
+  run/optimize CLI shape.
 
 KEY USAGE  (`aterm pkg install nn` — a signed prebuilt SHIPS; an aterm shell puts the
             managed bin/ on PATH, or `aterm pkg run nn -- <SUB>`; macOS + Metal required)
@@ -581,14 +572,14 @@ KEY USAGE  (`aterm pkg install nn` — a signed prebuilt SHIPS; an aterm shell p
 
 WHEN TO REACH FOR IT
   To compile/run/optimize an exported PyTorch model into a Metal pipeline on the nn tree.
-  For framework work in general prefer `my` (newer); reach for `ny` to verify a network's
-  bounds and `ay` for raw solving. nn and my are sibling framework iterations.
+  For framework work reach for `nn`; use `ny` to verify a network's
+  bounds and `ay` for raw solving.
 
 GOTCHAS
   * NEVER run a bare workspace `targo --unverified test` here — it has kernel-panicked the machine (OOM);
     several test binaries are enormous. Use `targo --unverified nextest run` (honors the single-threaded
     `heavy` group) or scripts/test-capped.sh; the biggest GPU tests are #[ignore]'d.
-  * Same intake rule as `my`: pre-exported torch.export graph.json + safetensors, not raw
+  * Intake rule: pre-exported torch.export graph.json + safetensors, not raw
     ONNX/.pt. `--verify` is a report request, feature-gated."#,
         ),
     },
@@ -608,42 +599,56 @@ fn overview_page() -> String {
     s.push_str("aterm — the toolchain manual\n\n");
     s.push_str(OVERVIEW);
     s.push_str("\n\nONE COMMAND, MANY VERBS — `aterm <verb>`\n");
-    let verbs = [
-        (
-            "help [topic]",
-            "this manual — start here (a deep dive on any verb or tool)",
-        ),
-        (
-            "ctl <args>",
-            "introspect & drive any terminal (read / keys / turn / subscribe / image)",
-        ),
-        (
-            "conn [<cmd>]",
-            "session connections — see & wire which sessions pull/push each other",
-        ),
-        ("pkg <args>", "install / update / verify the toolchain"),
-        (
-            "fleet <args>",
-            "opt-in durable attention queue + guarded turns; legacy federation",
-        ),
-        (
-            "drive <args>",
-            "the agent drive CLI (await / send / turn helpers)",
-        ),
-        (
-            "agents [<cmd>]",
-            "make coding agents aterm-aware (the primer; aterm also installs it itself)",
-        ),
-    ];
+    // KEYED ON THE ROSTER, not hand-listed. `crate::Verb` calls itself "THE
+    // front-door verb roster — the ONE place a verb exists", and this page had
+    // drifted out of it: `ship` and `update` were front-door verbs with usage
+    // lines and blurbs that this manual never mentioned, so the only way to
+    // learn `aterm ship` existed was to read the source. `ship` is the verb
+    // that motivated the roster in the first place, which is the whole joke.
+    //
+    // The SIGNATURE column comes from `Verb::usage()` so it can never disagree
+    // with the parser. The description stays here because this table wants one
+    // tuned line, while `blurb()` is a multi-line `--help` paragraph. A verb
+    // with no line here is a compile error (the match is exhaustive) and an
+    // omitted verb is a test failure (`overview_lists_every_front_door_verb`).
+    let line = |v: crate::Verb| -> &'static str {
+        match v {
+            crate::Verb::Ctl => {
+                "introspect & drive any terminal (read / keys / turn / subscribe / image)"
+            }
+            crate::Verb::Conn => {
+                "session connections — see & wire which sessions pull/push each other"
+            }
+            crate::Verb::Pkg => "install / update / verify the toolchain",
+            crate::Verb::Fleet => {
+                "opt-in durable attention queue + guarded turns; legacy federation"
+            }
+            crate::Verb::Drive => "the agent drive CLI (prompt / read / await / shot)",
+            crate::Verb::Ship => {
+                "publish aterm: provision a signing machine, cut a release (source checkout only)"
+            }
+            crate::Verb::Update => "check or report auto-update state headlessly (status | check)",
+            crate::Verb::Agents => {
+                "make coding agents aterm-aware (the primer; aterm also installs it itself)"
+            }
+            crate::Verb::NewTab => "open a terminal tab (where it opens is `windowing_behavior`)",
+            crate::Verb::NewWindow => "open a NEW window, always",
+            crate::Verb::SplitPane => "split the current pane",
+        }
+    };
+    const HELP_USAGE: &str = "aterm help [topic]";
+    const HELP_LINE: &str = "this manual — start here (a deep dive on any verb or tool)";
     // Column width across the verb signatures and the topic names.
     let width = TOPICS
         .iter()
         .map(|t| t.name.len())
-        .chain(verbs.iter().map(|(v, _)| v.len() + "aterm ".len()))
+        .chain(std::iter::once(HELP_USAGE.len()))
+        .chain(crate::Verb::ALL.iter().map(|v| v.usage().len()))
         .max()
         .unwrap_or(14);
-    for (v, desc) in verbs {
-        let _ = writeln!(s, "  {:<width$}  {desc}", format!("aterm {v}"));
+    let _ = writeln!(s, "  {HELP_USAGE:<width$}  {HELP_LINE}");
+    for v in crate::Verb::ALL {
+        let _ = writeln!(s, "  {:<width$}  {}", v.usage(), line(*v));
     }
     s.push_str("\nAND EVERY TOOL — `aterm help <name>` for how to use each\n");
     for t in TOPICS {
@@ -654,6 +659,241 @@ fn overview_page() -> String {
     );
     s
 }
+
+/// `aterm help config` — the page whose absence the 2026-08-30 audit called a
+/// blocker: the manual twice told the reader to set config keys
+/// (`windowing_behavior`, `agents_auto_prime`) and never once said where the
+/// file lives, while `explain-config` — whose blurb is "Explain how aterm
+/// resolves its configuration" — explains only containment modes and three
+/// environment variables. The path and precedence here are
+/// `aterm_gui::app_config::config_path` and the window help's CONFIG block.
+const CONFIG_PAGE: &str = r#"config — where aterm's settings live
+
+THE FILE
+  $XDG_CONFIG_HOME/aterm/aterm.toml   when XDG_CONFIG_HOME is set
+  ~/.config/aterm/aterm.toml          otherwise (macOS and Linux)
+  %APPDATA%\aterm\aterm.toml          on Windows
+  It does not have to exist: every key has a default.
+
+PRECEDENCE
+  command-line flag  >  environment  >  config file  >  built-in default
+  (Exception: `fallback_fonts`, `symbol_font` and `emoji_font` take the CONFIG value
+  over the environment — the reverse of the line above.)
+
+START ONE
+  aterm --window --write-config    writes a documented starter aterm.toml — 158
+                                   keys, each with its default and a comment (not
+                                   quite every key: see THE KEY ROSTER below).
+  Settings are reloaded live: save the file and the running app picks it up.
+  (Launch- and session-scoped keys say so in their comments; they apply to the
+  next window or the next session rather than instantly.)
+
+THE KEY ROSTER
+  aterm --window --help            the largest reference: Appearance, Window/Tabs,
+                                   Cursor, Sound, Text, Behaviour, Security and Keys.
+  Not every key is in that block. `windowing_behavior` (where `aterm new-tab` opens)
+  and `agents_auto_prime` (the coding-agent primer) are documented HERE and in
+  `aterm help windowing` / `aterm help agents` — they appear in neither the window
+  help's CONFIG block nor the starter file. `[packages].seed_install` and
+  `cursor_trail` / `cursor_trail_style` are in the starter file.
+
+WHAT THE DIAGNOSTIC SUBCOMMANDS COVER
+  aterm show-config | validate-config | explain-config
+  These report the RUNTIME resolution — containment mode, the environment
+  variables, shell and terminal size — not the contents of the file above.
+"#;
+
+/// `aterm help ship`. Advertised as a front-door verb since the roster existed;
+/// it answered "unknown topic" until 2026-08-30.
+const SHIP_PAGE: &str = r#"ship — publish aterm: provision a signing machine, cut a release
+
+  aterm ship <args>                  (in a source checkout: `targo --unverified ship <args>`)
+
+This verb is the release cutter, `crates/aterm-release`. It is NOT carried by an
+ordinary install — it needs a source checkout of the aterm repo, because a cut
+builds the app it publishes.
+
+PROVISION — make this machine able to publish
+  aterm ship provision --id <machine-id> --check
+      A NO-WRITES audit: the roster, the Trust toolchain and verifiers, the
+      rustup front door, the x86 slice, Apple's packaging tools, the Developer
+      ID identity, a live-tested notary credential, `gh` auth and the channel
+      token. Run this first; it names every gap and the exact fix.
+  aterm ship provision --id <machine-id>
+      The same audit, then — only on a clean pass — the key-mint ceremony, which
+      asks for the paper master phrase at the terminal. Keys are never copied
+      between machines. The mint is LAST on purpose: a roster id is irreversible,
+      so it is never spent on a machine the audit just failed.
+
+CUT — publish a release
+  aterm ship cut [--dry-run] [--resume] [--arm64-only] [--rehearse OWNER/REPO]
+      gates -> ledger claim -> universal build -> bundle/sign/DMG -> draft-first
+      publish -> late tag -> flip -> verify -> mirror.
+      --dry-run builds everything locally and uploads nothing.
+
+THE ORDER IS ENFORCED
+  Publish the SOURCE first (`pub stage aterm && pub promote aterm`), then cut the
+  BINARY. A cut whose version the public channel does not already carry is
+  refused, and so is a cutter binary older than the tree it is cutting.
+
+  aterm ship --help          every flag, including recovery (--resume, --abandon)
+  docs/RELEASING.md          the full runbook, including what to do when a cut
+                             stops half-way
+"#;
+
+/// `aterm help update`. `aterm update --help` is a usage error (the verb takes
+/// only `status` / `check`), so the manual is the only place this is explained.
+const UPDATE_PAGE: &str = r#"update — check or report aterm's own auto-update state, headlessly
+
+  aterm update status      what this copy knows: the running build, whether a
+                           newer one is staged, and why the updater is idle
+  aterm update check       ask the channel now, instead of waiting for the timer
+
+  (`aterm update --help` is a usage error — those two are the whole verb.)
+
+WHY IT EXISTS
+  The windowed app updates itself silently. This is the lane a terminal-only
+  machine uses to learn it is stale: it needs no window and no control socket.
+
+  macOS ONLY. Auto-update is compiled for macOS; elsewhere `aterm update status`
+  answers "auto-update is macOS-only; nothing to report on this platform", and
+  everything below applies to macOS.
+
+WHEN IT REPORTS THAT IT CANNOT UPDATE
+  Three different reasons, and only two of them are yours to fix:
+    * running from a MOUNTED DISK IMAGE, or from an App-TRANSLOCATED download
+      (unzipped and opened without being moved first) — move aterm into
+      Applications and open it from there. Until then it also cannot put `aterm`
+      on a new shell's PATH.
+    * a DEV BUILD (a `cargo run` or a `target/` binary) — nothing is wrong and
+      there is nothing to move; the updater simply never owns such a copy.
+
+  aterm help atpkg         the TOOLCHAIN's updates, which are a separate thing
+"#;
+
+/// `aterm help windowing` — and the landing page for `new-tab` / `new-window` /
+/// `split-pane`, three rostered verbs that had no documentation.
+const WINDOWING_PAGE: &str = r#"windowing — open tabs, windows and panes from the command line
+
+  aterm new-tab    [-d <dir>]    open a terminal tab
+  aterm new-window [-d <dir>]    open a NEW window, always
+  aterm split-pane [-H|-V] [-d <dir>]   split the current pane
+
+  -d <dir>   start in that directory
+  -H         split stacked (horizontal divider)
+  -V         split side-by-side (the default)
+
+The grammar is deliberately Windows Terminal's: the whole value of a familiar
+grammar is that the words are the same words.
+
+WHERE new-tab ACTUALLY OPENS
+  That is the `windowing_behavior` config key:
+    windowing_behavior = "new_window"   a new window (the DEFAULT)
+    windowing_behavior = "attach"       a tab in the already-running aterm
+  Windows Terminal's spellings work as aliases (`useNew` / `useExisting`), and
+  $ATERM_WINDOWING_BEHAVIOR overrides the file. `new-window` ignores the key and
+  always opens a window. See `aterm help config` for where to set it.
+
+  aterm --window --help          the full window-mode flag reference
+"#;
+
+/// `aterm help drive`. Previously aliased onto the introspection page, which
+/// never mentions `aterm drive` at all.
+const DRIVE_PAGE: &str = r#"drive — drive an interactive agent running inside aterm
+
+  aterm drive [--socket PATH] [--idle MS] [--timeout MS] [--ready REGEX] <command>
+
+A host aterm runs your target program (say a coding agent) as its child and
+exposes a control socket. This reads the live screen and sends keystrokes over
+the same verbs `aterm ctl` uses. The primitive that matters is `await`: block
+until the surface reaches a condition, so you never sleep-and-hope.
+
+COMMANDS
+  prompt <text...>   type it, press Enter, block until the turn SETTLES (no
+                     screen change for --idle ms), then print the settled
+                     screen. This is the one you want in a loop.
+  read               print the live screen, one row per line
+  await <cond>       block until a condition, then print the verdict:
+                       idle <ms>      surface unchanged for <ms> (turn done)
+                       match <regex>  a visible row matches
+                       seq            the next content change lands
+                       block          a shell command completes (OSC-133)
+  shot [path]        save a pixel-true PNG of the terminal content
+
+  aterm drive --help       every flag
+  aterm help introspection the control protocol underneath
+"#;
+
+/// `aterm help fleet`. `fleet` was a front-door verb aliased onto the
+/// introspection page, whose entire fleet content was four lines — while the
+/// verb carries a whole claim lifecycle nothing documented.
+const FLEET_PAGE: &str = r#"fleet — federate many aterm sessions into one fabric
+
+  aterm fleet <command>
+
+The embedded operator is EXPERIMENTAL and OFF by default. Launch an instance with
+$ATERM_OPERATOR=1 to opt in; it then starts with an empty allowlist, so nothing is
+observed until you `manage` a session. $ATERM_NO_OPERATOR overrides the opt-in.
+
+STREAMS (no operator needed)
+  aterm fleet events         merge every live instance's `subscribe events` to stdout as
+                             NDJSON, addressed /fleet/<pid>/events/<sid>
+  aterm fleet exec           read `@<sid> <verb> [args…]` lines on stdin, dispatch each to
+                             the fleet, emit one NDJSON result per line
+
+THE ATTENTION QUEUE (the operator's own lifecycle)
+  aterm fleet status         the operator and the managed allowlist — start here
+  aterm fleet manage <sid>   put a session under observation | unmanage <sid> to stop
+  aterm fleet next [timeout=<ms>]
+                             claim the next event needing attention; returns a CLAIM TOKEN
+  aterm fleet extend <event> <claim-token> [ms=<n>]
+                             keep a claim alive while you work
+  aterm fleet ack <event> <claim-token> <no-action|pause|escalate>
+  aterm fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human
+                             close the loop after acting. `confirm=human` is deliberate:
+                             the fabric will not let an agent silently self-certify
+  aterm fleet inspect <event>
+  aterm fleet clear-fault confirm=human
+  aterm fleet propose        read one JSON proposal for a guarded interactive turn on
+                             stdin — the lane by which an agent asks to type into a
+                             session it does not own
+
+  aterm fleet --help         every command and its arguments
+  aterm help introspection   the control protocol the fabric moves
+"#;
+
+/// `aterm help trust-backends` — the four default-set programs the manual never
+/// named. They install with everything else, so a reader meets them in
+/// `aterm pkg list` and had nowhere to look them up.
+const TRUST_BACKENDS_PAGE: &str = r#"trust-backends — the verifier programs that install alongside trust
+
+These four are default-set programs like any other: pinned in the signed index and
+installed on first launch. You rarely invoke them — `targo trust check` drives them —
+but they appear in `aterm pkg list`, so here is what each is.
+
+THE rustc COHERENCE GROUP  (trust-ir, trust-cg, trust-vc, trust)
+  All four are compiled by the SAME self-hosted Trust stage2 and move
+  all-or-nothing: Rust has no stable ABI, so the members interoperate only when
+  they come from one build. If one member cannot stage, the whole group is held
+  back on every client — deliberately.
+
+  trust-ir   the Trust IR: exposes `trust-ir`, `trust-ir-diff`, `trust-ir-fmt` —
+             inspect and diff the intermediate representation a verification run
+             produced. Reach for it when a proof fails and you want to see the IR.
+  trust-cg   the certificate generator (`trust-cg`).
+  trust-vc   verification-condition checking: `trust-vc` and `cargo-trust-vc`, so
+             it also resolves as `cargo trust-vc`. `check <crate>` parses with syn
+             and discharges VCs on ay in-process.
+  trust      the compiler itself — see `aterm help trust`.
+
+NOT IN THE GROUP
+  trust-mc   the Trust model checker, its own sysroot bundle since 2026-08-19. It
+             does NOT ship inside the trust bundle; the engine that most users
+             actually reach is statically linked into `targo-trust`.
+
+  aterm pkg list             what is installed, and at which build
+  aterm help trust           the compiler these serve
+"#;
 
 /// The `introspection` topic — GENERATED from the live control-verb catalog so it
 /// never drifts from the real protocol, plus the how-to an AI needs to use it.
@@ -671,8 +911,9 @@ WHAT IT IS
   terminal state (as text/styled cells) or application-rendered client pixels, send
   keystrokes, wait on events, and drive a whole fleet through the same application input
   path. OS compositor and display output are outside this interface. A session is addressed by its sid;
-  `@<sid>` routes a verb to that session, relayed transparently even across instances and
-  machines.
+  `@<sid>` routes a verb to that session, relayed transparently to any sibling instance
+  of the same user ON THIS MACHINE. Another machine is the opt-in network path
+  (`aterm ctl dial <name>` / `dial-list`), not this one.
 
 THE MOVES (an AI's loop is see -> decide -> drive -> observe)
   SEE     aterm ctl @sid text | screen | image f.png | cast frames count=8
@@ -780,8 +1021,8 @@ fn agent_page(sid: Option<&str>) -> String {
         "\nTHE TOOLS AT HAND (run `aterm help <name>` for how to use each)\n\
          \x20 trust  compile AND prove Rust (targo trust check)      ay   decide a formula (SAT/SMT/CHC)\n\
          \x20 clean  Lean-shaped theorem proving                     ty   TLA+ model checking + proving\n\
-         \x20 ny     verify a neural network (CROWN/beta-CROWN)       my   exported PyTorch -> Metal (framework)\n\
-         \x20 nn     ML framework (earlier line)                     atpkg  install/update/verify the chain (run as `aterm pkg`)\n",
+         \x20 ny     verify a neural network (CROWN/beta-CROWN)       trust-mc  the Trust model checker\n\
+         \x20 nn     ML framework (torch.export -> Metal)            atpkg  install/update/verify the chain (run as `aterm pkg`)\n",
     );
     s.push_str(
         "\nHOUSE RULES (this toolchain is honesty-first)\n  \
@@ -831,11 +1072,18 @@ pub fn in_session() -> Option<String> {
 /// * an unknown topic -> a usage error listing the topics, exit code 2.
 pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
     // A front-door VERB typed as a help topic resolves to the page that documents it, so
-    // `aterm help ctl`/`pkg`/`fleet`/`drive` (advertised on the front page) never 404 — the
-    // control protocol, package manager, and orchestration all live under existing topics.
+    // EVERY front-door verb resolves — the front page promises `aterm help
+    // [topic]` is "a deep dive on any verb or tool", and five of the eleven
+    // verbs answered "unknown topic" until 2026-08-30 (`ship` among them, which
+    // is how you were supposed to learn this machine can publish at all).
+    // `drive` used to land on the introspection page, which never mentions it.
+    // Pinned by `every_front_door_verb_resolves`.
     let topic = topic.map(|t| match t {
-        "ctl" | "fleet" | "drive" => "introspection",
+        "ctl" => "introspection",
+        "trust-mc" | "trust-ir" | "trust-cg" | "trust-vc" => "trust-backends",
         "pkg" => "atpkg",
+        "new-tab" | "new-window" | "split-pane" => "windowing",
+        "settings" => "config",
         other => other,
     });
     match topic {
@@ -848,6 +1096,13 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         }
         Some("agent") | Some("instructions") => (agent_page(session), 0),
         Some("introspection") => (introspection_page(), 0),
+        Some("config") => (CONFIG_PAGE.to_string(), 0),
+        Some("ship") => (SHIP_PAGE.to_string(), 0),
+        Some("update") => (UPDATE_PAGE.to_string(), 0),
+        Some("windowing") => (WINDOWING_PAGE.to_string(), 0),
+        Some("drive") => (DRIVE_PAGE.to_string(), 0),
+        Some("fleet") => (FLEET_PAGE.to_string(), 0),
+        Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
                 // Only `introspection` has a generated body; it is handled above, so
@@ -865,7 +1120,20 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
                 for t in TOPICS {
                     let _ = writeln!(msg, "  {}", t.name);
                 }
-                msg.push_str("  agent\n");
+                // The pages that are not TOPICS entries: generated or
+                // verb-shaped, but every bit as real to someone guessing.
+                for extra in [
+                    "config",
+                    "ship",
+                    "update",
+                    "windowing",
+                    "drive",
+                    "fleet",
+                    "trust-backends",
+                    "agent",
+                ] {
+                    let _ = writeln!(msg, "  {extra}");
+                }
                 (msg, 2)
             }
         },
@@ -875,6 +1143,120 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overview page must name EVERY front-door verb. It did not: `ship`
+    /// and `update` carried usage lines and blurbs in `crate::Verb` — the roster
+    /// that documents itself as "the ONE place a verb exists" — while this
+    /// manual, the thing a person actually reads, listed neither, so the only
+    /// way to discover `aterm ship` was to read the source. The windowing three
+    /// were missing too. Keyed on the roster now; this pins it.
+    #[test]
+    fn overview_lists_every_front_door_verb() {
+        let page = overview_page();
+        for v in crate::Verb::ALL {
+            assert!(
+                page.contains(v.usage()),
+                "`aterm help` never mentions the {} verb (looked for {:?})",
+                v.name(),
+                v.usage()
+            );
+        }
+        // ...and the verb that motivated the roster, named outright, so a future
+        // refactor that "simplifies" the loop cannot quietly drop it again.
+        assert!(page.contains("aterm ship <args>"), "{page}");
+        assert!(page.contains("aterm help [topic]"), "{page}");
+    }
+
+    /// The front page promises `aterm help [topic]` is "a deep dive on any verb
+    /// or tool". Five of the eleven verbs answered "unknown topic" until
+    /// 2026-08-30 — `ship` among them, so the only way to learn this machine can
+    /// publish was to read the source. Every rostered verb must RESOLVE.
+    #[test]
+    fn every_front_door_verb_resolves() {
+        for v in crate::Verb::ALL {
+            let (page, code) = render(Some(v.name()), None);
+            assert_eq!(code, 0, "`aterm help {}` exits {code}", v.name());
+            assert!(
+                !page.contains("unknown topic"),
+                "`aterm help {}` 404s",
+                v.name()
+            );
+            assert!(page.len() > 200, "`aterm help {}` is a stub", v.name());
+        }
+    }
+
+    /// `drive` used to alias onto the introspection page, which never mentions
+    /// `aterm drive` — a redirect that looks like documentation and is not.
+    #[test]
+    fn a_verbs_page_actually_mentions_that_verb() {
+        for name in ["drive", "ship", "update"] {
+            let (page, _) = render(Some(name), None);
+            assert!(
+                page.contains(name),
+                "`aterm help {name}` never says {name:?}"
+            );
+        }
+    }
+
+    /// The manual told readers to set config keys and never said where the file
+    /// is — the 2026-08-30 audit's one blocker.
+    #[test]
+    fn the_manual_says_where_the_config_file_lives() {
+        let (page, code) = render(Some("config"), None);
+        assert_eq!(code, 0);
+        assert!(page.contains(".config/aterm/aterm.toml"), "{page}");
+        assert!(page.contains("XDG_CONFIG_HOME"), "{page}");
+        assert!(page.contains("--write-config"), "{page}");
+        // ...and the keys the rest of the manual names must be findable from it.
+        assert!(page.contains("windowing_behavior"), "{page}");
+        assert!(page.contains("agents_auto_prime"), "{page}");
+    }
+
+    /// A guessed topic must list the pages that exist — including the ones that
+    /// are not TOPICS entries, which were invisible.
+    #[test]
+    fn the_unknown_topic_listing_names_the_extra_pages() {
+        let (msg, code) = render(Some("no-such-topic"), None);
+        assert_eq!(code, 2);
+        for extra in ["config", "ship", "update", "windowing", "drive", "agent"] {
+            assert!(msg.contains(extra), "the listing omits {extra}: {msg}");
+        }
+    }
+
+    /// The retired lane must not be promised anywhere: the sealed offline seed
+    /// went on 2026-08-26, and the manual still described it as how first launch
+    /// fills the store.
+    #[test]
+    fn no_page_still_promises_the_sealed_offline_seed() {
+        for t in TOPICS {
+            let (page, _) = render(Some(t.name), None);
+            assert!(
+                !page.contains("sealed inside the app"),
+                "{} still promises the retired in-app seal",
+                t.name
+            );
+        }
+    }
+
+    /// Every listed verb carries a description — an aligned table of bare verb
+    /// names would be a listing, not a manual.
+    #[test]
+    fn every_listed_verb_carries_a_description() {
+        let page = overview_page();
+        for line in page.lines() {
+            let Some(rest) = line.strip_prefix("  aterm ") else {
+                continue;
+            };
+            let Some((sig, desc)) = rest.split_once("  ") else {
+                continue;
+            };
+            assert!(
+                !desc.trim().is_empty(),
+                "`aterm {}` is listed with no description",
+                sig.trim()
+            );
+        }
+    }
 
     #[test]
     fn front_page_and_agent_brief_render_nonempty() {

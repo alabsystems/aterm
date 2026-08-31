@@ -7349,9 +7349,9 @@ impl GpuRenderer {
     /// the raw 8-bit colours blitted from the `Rgba8Unorm` offscreen frame land on
     /// screen byte-identical to the readback the AI introspection sees. An `*Srgb`
     /// surface would re-encode every channel and break that invariant.
-    pub fn create_window_surface(
+    pub fn create_window_surface<W: WindowTarget>(
         &mut self,
-        target: impl Into<wgpu::SurfaceTarget<'static>>,
+        target: W,
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
@@ -10594,6 +10594,23 @@ impl GpuRenderer {
     pub fn reset_glow_ease_for_test(&self, win: &mut WindowGpu) {
         win.sdr_glow_level = 0.0;
         win.sdr_glow_level_at = None;
+    }
+
+    /// THE ROW (macOS): the exact `BlitUniform` bytes the last present-path blit
+    /// wrote into `blit_uniform_buf`.
+    ///
+    /// The first-party Metal blit (`crate::metal::blit`) is judged by a
+    /// DIFFERENTIAL against this one, and a differential is only worth
+    /// anything if both sides consume the same inputs. Reconstructing the
+    /// uniform on the Metal side would let the two drift and quietly turn a
+    /// real divergence into two matching bugs, so the Metal arm reads the
+    /// literal 96 bytes this arm wrote instead. `bytemuck::bytes_of` on the
+    /// `Pod` struct is the same view `write_buffer` above took.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn last_blit_uniform_bytes(&self) -> Option<Vec<u8>> {
+        self.blit_uniform_written
+            .as_ref()
+            .map(|u| bytemuck::bytes_of(u).to_vec())
     }
 
     /// TEST HELPER (on-glass blit coverage): run the REAL on-glass blit — the
@@ -18191,4 +18208,95 @@ mod rasterizer_di_tests {
         // And the trait is object-safe (dyn dispatch = the DI the design wants).
         fn _takes_dyn(_: &mut dyn Rasterizer) {}
     }
+}
+
+/// A window a GPU backend can attach a swapchain to.
+///
+/// THE ROW's one public leak, closed. `create_window_surface` used to take
+/// `impl Into<wgpu::SurfaceTarget<'static>>` — the single place any `wgpu` type
+/// crossed `aterm-gpu`'s public API (measured in
+/// `docs/measured/gpu-seam-2026-08-30.md` §3: 1 of 183 public fns, and 1 of the
+/// 75 `GpuRenderer` methods `aterm-gui` calls). A first-party macOS backend
+/// cannot satisfy a `wgpu` bound, and it does not need to: everything it wants
+/// is one `window_handle()` away — `RawWindowHandle::AppKit(h).ns_view` is
+/// precisely the input to "attach a `CAMetalLayer` to this `NSView`".
+///
+/// # This is a rename, not a redesign
+///
+/// The bound is EXTENSIONALLY IDENTICAL to the one it replaces, which is why
+/// both call sites in `aterm-gui` and the wgpu backend's own body are
+/// unchanged. `wgpu-29.0.3/src/api/surface.rs` builds its target set out of
+/// exactly these pieces:
+///
+/// ```text
+/// trait WindowHandle: HasWindowHandle + WasmNotSendSync {}               // :245
+/// impl<T: HasWindowHandle + WasmNotSendSync> WindowHandle for T {}       // :247
+/// trait DisplayAndWindowHandle: WindowHandle + HasDisplayHandle {}       // :250
+/// impl<'a, T: DisplayAndWindowHandle + 'a> From<T> for SurfaceTarget<'a> // :322
+/// ```
+///
+/// # `WasmNotSendSync` is `Send + Sync` on ALL FOUR of aterm's cells
+///
+/// This is the part that is easy to get backwards, and a first draft of this
+/// trait DID: it assumed the wasm arm relaxes `Send + Sync` and split the cfg
+/// that way, which failed to compile against `Instance::create_surface` on
+/// `wasm32-unknown-unknown` — the bound there is TIGHTER than the guess, not
+/// looser. `wgpu-types-29.0.3/src/send_sync.rs:3-18` gates the `Send` arm on
+///
+/// ```text
+/// any(not(target_arch = "wasm32"),
+///     all(feature = "fragile-send-sync-non-atomic-wasm", not(target_feature = "atomics")))
+/// ```
+///
+/// and `crates/aterm-gpu/Cargo.toml`'s wasm32 row enables
+/// `fragile-send-sync-non-atomic-wasm` deliberately (so the non-`Send` browser
+/// GPU handles satisfy wgpu's own bounds on single-threaded wasm). So on the
+/// three native cells the first disjunct holds and on aterm's wasm cell the
+/// second does: `Send + Sync` everywhere aterm actually builds. The predicate
+/// below is that expression with aterm's always-on feature substituted in,
+/// which leaves only the `target_feature = "atomics"` arm — a wasm build with
+/// threads, which aterm does not produce today and which is carried here so
+/// this bound can never be TIGHTER than the wgpu one it stands in for.
+///
+/// # It costs zero packages
+///
+/// `raw-window-handle` resolves to ONE version (0.6.2) in every cell and is
+/// already reachable from `aterm-gpu` through `wgpu`; it survives the mac
+/// retirement because `vendor/winit/Cargo.toml` lists `rwh_06` in winit's
+/// DEFAULT features and the workspace takes winit with defaults. Measured with
+/// `cargo tree -p aterm --target <triple> -e normal` on all four cells: one
+/// `raw-window-handle v0.6.2` each, and `Cargo.lock` gains an edge, not a
+/// `[[package]]`.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+pub trait WindowTarget:
+    raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static
+{
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+impl<T> WindowTarget for T where
+    T: raw_window_handle::HasWindowHandle
+        + raw_window_handle::HasDisplayHandle
+        + Send
+        + Sync
+        + 'static
+{
+}
+
+/// The threaded-wasm arm of [`WindowTarget`]. With `target_feature = "atomics"`
+/// wgpu's `WasmNotSend`/`WasmNotSync` become the EMPTY traits
+/// (`wgpu-types-29.0.3/src/send_sync.rs:19-34`), so requiring `Send + Sync`
+/// there would reject handles `Instance::create_surface` accepts. aterm ships
+/// no such build; this arm exists so that if one is ever added, the seam does
+/// not silently become the narrower of the two.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+pub trait WindowTarget:
+    raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + 'static
+{
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+impl<T> WindowTarget for T where
+    T: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + 'static
+{
 }

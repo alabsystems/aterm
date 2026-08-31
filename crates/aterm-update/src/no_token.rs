@@ -241,6 +241,17 @@ mod tests {
 
     #[test]
     fn the_notification_names_the_consequence_and_the_exact_fix() {
+        // The FALLBACK body is the one under test, and `notification()` reads the
+        // process-global `last_explanation()`, which the sibling
+        // `announce_writes_the_full_explanation_into_the_status_outcome` fills (and
+        // `clear()` deliberately leaves in place). Hold the lock that sibling holds
+        // and start from "nothing recorded", or this test's verdict depends on which
+        // of the two ran first — it failed every time under `--test-threads=1` and
+        // once in an ordinary parallel run (2026-08-30).
+        let _serialized = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) = None;
         let (title, body) = notification();
         // THE CONSEQUENCE, NOT AN ABSOLUTE. "will never auto-update" is a claim the
         // code does not enforce: `clear()` drops the latch on ANY successful releases

@@ -2009,8 +2009,8 @@ mod tests {
         let (master, slave) = open_pty();
         let identities = vec![(7u64, master, 4242i32)];
 
-        let before = proof_identities_in_device_terms(&identities)
-            .expect("a live pty answers fstat");
+        let before =
+            proof_identities_in_device_terms(&identities).expect("a live pty answers fstat");
 
         // Put unread output on the master — the exact condition a park preserves.
         // No newline: the line discipline maps NL to CR NL on the way out, and
@@ -2018,7 +2018,11 @@ mod tests {
         let payload = b"parked bytes";
         // SAFETY: `slave` is a live descriptor and the buffer outlives the call.
         let wrote = unsafe {
-            libc::write(slave, payload.as_ptr().cast::<libc::c_void>(), payload.len())
+            libc::write(
+                slave,
+                payload.as_ptr().cast::<libc::c_void>(),
+                payload.len(),
+            )
         };
         assert!(wrote > 0, "seed the master with unread output");
 
@@ -2046,9 +2050,8 @@ mod tests {
         assert_eq!(ready, 1, "the seeded output is still queued");
         let mut buf = [0u8; 32];
         // SAFETY: `master` is live and the buffer is exactly `buf.len()` bytes.
-        let read = unsafe {
-            libc::read(master, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
-        };
+        let read =
+            unsafe { libc::read(master, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         assert_eq!(
             &buf[..usize::try_from(read).expect("a non-negative read")],
             payload,

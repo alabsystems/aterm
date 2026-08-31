@@ -40,6 +40,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::StartCompare => start_compare(ctx, &mut r),
         StageId::LicenseHeaders => license_headers(ctx, &mut r),
         StageId::FeatureGates => feature_gates(ctx, &mut r),
+        StageId::LibcOracle => libc_oracle(ctx, &mut r),
         StageId::FreezeGate => freeze_gate(ctx, &mut r),
         StageId::ProofInventory => proof_inventory(ctx, &mut r),
         StageId::ControlSocketSmoke => smoke_stages::control_socket_smoke(ctx, &mut r),
@@ -281,6 +282,40 @@ pub fn differential_args() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// The nested workspace's checked-in driver is the oracle contract. Keeping
+/// this as one argv value (with no cargo fallback or reimplementation here)
+/// means changes to its target-cell matrix automatically reach the required
+/// merge gate. The target dir is absolute because `run.sh` deliberately runs
+/// cross-cell Cargo commands from `/`; inheriting a relative caller value would
+/// turn that into `/target`, while inheriting an arbitrary absolute one would
+/// collapse this scheduler lane onto somebody else's Cargo lock.
+///
+/// # Errors
+/// Returns the current-directory error from making a relative repository root
+/// absolute. The stage reports that as COULD-NOT-RUN.
+pub fn libc_oracle_cmd(ctx: &Ctx) -> std::io::Result<Cmd> {
+    let root = std::path::absolute(&ctx.root)?;
+    Ok(Cmd::new(root.join("libc-oracle/run.sh"))
+        .env("CARGO_TARGET_DIR", root.join("libc-oracle/target"))
+        // Python imports inside gen/ are attributed source unless bytecode is
+        // suppressed. Set it here as a required-stage contract as well as in
+        // run.sh, so a gate invocation cannot dirty its own fingerprint.
+        .env("PYTHONDONTWRITEBYTECODE", "1"))
+}
+
+/// `libc-oracle/run.sh` exit contract: 0 proves conformance, 1 is a finding,
+/// and 3 means a preflight/environment inability decided nothing. A missing
+/// status likewise decided nothing; every other status violates the driver's
+/// declared contract and remains a gate finding.
+#[must_use]
+pub fn libc_oracle_outcome(code: Option<i32>) -> Outcome {
+    match code {
+        Some(crate::exit::PASS) => Outcome::Ok,
+        Some(crate::exit::COULD_NOT_RUN) | None => Outcome::Fail(Severity::CouldNotRun),
+        Some(_) => Outcome::Fail(Severity::GateFailed),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,10 +796,50 @@ fn feature_gates(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 4.5a) FIRST-PARTY LIBC ABI ORACLE. The const/layout/type assertions compile
+//    for every target cell, the emitted-symbol gate closes link-name aliases,
+//    and `cargo test` executes the pointer-valued and C-macro checks for the
+//    host's native cell. Therefore a native Linux run is the required Linux
+//    runtime route; cross-compiling that cell alone is deliberately not enough.
+//
+//    Missing/non-executable driver and exit 3 are COULD-NOT-RUN, never a skip;
+//    exit 1 is a conformance finding. There is no stock-workspace fallback:
+//    this separate workspace is what prevents `[patch.crates-io]` from
+//    rewriting the reference libc edge to the shim under test.
+// ---------------------------------------------------------------------------
+fn libc_oracle(ctx: &Ctx, r: &mut Report) {
+    let cmd = match libc_oracle_cmd(ctx) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            r.cannot_run(format!(
+                "cannot resolve the libc-oracle target dir: {error}"
+            ));
+            return;
+        }
+    };
+    if !is_executable_file(&cmd.program) {
+        r.cannot_run(format!(
+            "libc-oracle/run.sh missing or not executable ({})",
+            cmd.program.display()
+        ));
+        return;
+    }
+    let label = "libc-oracle/run.sh (cross-cell ABI + native runtime)";
+    if ctx.selftest {
+        r.skip(format!("{label} (selftest: not executed)"));
+        return;
+    }
+    let out = exec::run(&cmd, ctx.exec_env());
+    r.raw(out.output.as_str());
+    r.record(libc_oracle_outcome(out.code), label);
+}
+
+// ---------------------------------------------------------------------------
 // 4.5b) L0 TEMPORAL-SAFETY GATE — ONE build of tools/freeze-safety-gate enforces
-//    five obligations (temporal proof, main-loop census, lock-order census,
-//    wasm-process census, scope-cardinality census), any one FAILING the build
-//    with a counterexample-backed diagnostic.
+//    six obligations (temporal proof, main-loop census, lock-order census,
+//    wasm-process census, scope-cardinality census, lazy-init reentrancy
+//    census), any one FAILING the build with a counterexample-backed
+//    diagnostic.
 // ---------------------------------------------------------------------------
 fn freeze_gate(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
@@ -774,7 +849,7 @@ fn freeze_gate(ctx: &Ctx, r: &mut Report) {
     run_labeled(
         ctx,
         r,
-        "freeze-safety-gate (5 obligations)",
+        "freeze-safety-gate (6 obligations)",
         &targo(ctx, freeze_gate_args()),
     );
 }
@@ -1006,6 +1081,59 @@ mod tests {
     }
 
     #[test]
+    fn libc_oracle_owns_an_absolute_target_dir_and_suppresses_python_bytecode() {
+        for caller_target in ["caller-relative", "/caller/absolute-target"] {
+            let mut c = ctx(Scope::workspace());
+            c.env.cargo_target_dir = Some(caller_target.into());
+            let cmd = libc_oracle_cmd(&c).expect("the absolute fixture root resolves");
+            assert_eq!(cmd.program, PathBuf::from("/repo/libc-oracle/run.sh"));
+            assert_eq!(
+                cmd.envs,
+                [
+                    ("CARGO_TARGET_DIR".into(), "/repo/libc-oracle/target".into()),
+                    ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+                ],
+                "the required lane must ignore caller CARGO_TARGET_DIR={caller_target}"
+            );
+        }
+
+        let mut relative = ctx(Scope::workspace());
+        relative.root = PathBuf::from("relative-repo");
+        let cmd = libc_oracle_cmd(&relative).expect("a relative repo root can be absolutized");
+        let target = &cmd.envs[0].1;
+        assert!(
+            PathBuf::from(target).is_absolute(),
+            "run.sh executes cross commands from /, so this cannot be relative: {target:?}"
+        );
+        assert!(
+            PathBuf::from(target).ends_with("relative-repo/libc-oracle/target"),
+            "the lane must remain rooted in its repository: {target:?}"
+        );
+    }
+
+    #[test]
+    fn libc_oracle_exit_three_is_could_not_run_not_a_finding() {
+        assert_eq!(libc_oracle_outcome(Some(0)), Outcome::Ok);
+        assert_eq!(
+            libc_oracle_outcome(Some(1)),
+            Outcome::Fail(Severity::GateFailed)
+        );
+        assert_eq!(
+            libc_oracle_outcome(Some(3)),
+            Outcome::Fail(Severity::CouldNotRun)
+        );
+        assert_eq!(
+            libc_oracle_outcome(None),
+            Outcome::Fail(Severity::CouldNotRun)
+        );
+        assert_eq!(
+            libc_oracle_outcome(Some(2)),
+            Outcome::Fail(Severity::GateFailed),
+            "an undeclared driver status is not allowed to masquerade as an environment verdict"
+        );
+    }
+
+    #[test]
     fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_not_left_to_die_at_exec() {
         // targo exists, trustdoc does not, and nothing on the children's PATH
         // answers to the bare name: the test stage must say COULD-NOT-RUN with
@@ -1191,6 +1319,12 @@ mod tests {
                 "--test",
                 "differential"
             ]
+        );
+        assert_eq!(
+            libc_oracle_cmd(&ctx(Scope::workspace()))
+                .expect("absolute fixture root")
+                .argv(),
+            ["/repo/libc-oracle/run.sh"]
         );
         assert_eq!(
             tippy_args(&s),

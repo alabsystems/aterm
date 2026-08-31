@@ -153,7 +153,7 @@ pub enum MenuAction {
     About,
     /// Check for Updates… — the DETAILS update entry point. Opens the Software Update
     /// route in the native Settings tab AND kicks off a fresh
-    /// check: current + staged build, what's-new notes, and Install & Relaunch. The same
+    /// check: current + staged build, what's-new notes, and Update to Latest Now. The same
     /// route the Version menu's "Update details…" item and the [`MenuAction::ApplyUpdate`]
     /// nothing-staged fallback open. (The old separate "Check for Updates…" NSAlert action
     /// — tag 34 — is folded into this one.)
@@ -165,7 +165,8 @@ pub enum MenuAction {
     /// details. Replaces the old floating top-right badge as the primary version surface.
     Version,
     /// ONE-CLICK UPDATE (`App::apply_update_or_details`): the Version menu's
-    /// "⬆️ Update to v<staged> — restart now" item / the palette's Version row / the
+    /// "⬆️ Update to v<staged> — apply now, shells keep running" item / the palette's
+    /// Version row / the
     /// "Update ready" notice pill / the off-macOS tab-strip ↻ all fire this. A
     /// strictly-newer STAGED build applies immediately (the same re-exec path
     /// `Wake::ApplyStagedUpdate` takes — no intermediate route change, per the owner's
@@ -1088,7 +1089,7 @@ const HELP_MENU: &[MenuEntry] = &[Item {
 /// static model), then About.
 const VERSION_MENU: &[MenuEntry] = &[
     Item {
-        label: "↑ Update — restart now",
+        label: "↑ Update — apply now",
         action: MenuAction::ApplyUpdate,
         key: "",
         mods: MenuMods::None,
@@ -1161,17 +1162,23 @@ pub(crate) fn version_menu_bar_title(attention: bool) -> String {
 /// So: name the version when it actually differs, and fall back to the build number
 /// — the thing the updater is really comparing — when it does not.
 ///
-/// # The tail is not always "restart now"
+/// # The tail is not always "apply now"
+///
+/// The clean tail says what pressing the row does and what it costs: "apply now,
+/// shells keep running" — the apply is the in-session overlap handoff, which hands
+/// every window, tab, split and live shell to the successor, so the row never asks
+/// for a restart (it read "restart now" over exactly that mechanism until
+/// 2026-08-30).
 ///
 /// `trouble` is the apply lane's standing failure for this exact build
 /// (`App::apply_trouble_for`). While one is present the call-to-action tail is
-/// REPLACED by [`crate::update_apply_trouble::ApplyTrouble::row_tail`], because
-/// "restart now" beside a build that has already refused to start twice is an
+/// REPLACED by [`crate::update_apply_trouble::ApplyTrouble::row_tail`], because a
+/// clean "apply now" beside a build that has already refused to start twice is an
 /// instruction the machine has no reason to believe. On 2026-08-21 this row read
 /// "⬆️ Update to v0.56.0 — restart now" for hours while `aterm ctl update status`
 /// carried `failing_applies=2` and the reason both attempts died — the whole defect,
 /// in one label. The tail still ends on what the row DOES, so a manual-only latch
-/// keeps "restart now to retry" and a scheduled retry says so instead of demanding
+/// keeps "apply now to retry" and a scheduled retry says so instead of demanding
 /// an action that is already queued.
 #[must_use]
 pub(crate) fn staged_apply_label(
@@ -1180,7 +1187,10 @@ pub(crate) fn staged_apply_label(
     version: &str,
     trouble: Option<&ApplyTrouble>,
 ) -> String {
-    let tail = trouble.map_or_else(|| "restart now".to_string(), ApplyTrouble::row_tail);
+    let tail = trouble.map_or_else(
+        || "apply now, shells keep running".to_string(),
+        ApplyTrouble::row_tail,
+    );
     if version == crate::build_info::version_display() {
         format!("{arrow} Update to build {build} — {tail}")
     } else {
@@ -1528,7 +1538,7 @@ mod macos {
     /// sweep call (`App::refresh_version_menu`). `staged` is the strictly-newer
     /// `(build, version)` ready to apply; `realized` marks the freshly-updated arrow
     /// window. Rebuilding the submenu (rather than toggling item hidden-flags) keeps the
-    /// item set an exact function of the state — no stale "restart now" rows. Best-effort:
+    /// item set an exact function of the state — no stale "apply now" rows. Best-effort:
     /// off the main thread it is a no-op (never a panic), like every AppKit helper here.
     ///
     /// The persistent MENU-BAR arrow tracks `staged` ONLY — it means "an update is
@@ -1637,8 +1647,9 @@ mod macos {
 
     /// The Version submenu for the given update state. Mirrors [`super::VERSION_MENU`]
     /// in the portable model (whose ApplyUpdate row the palette rewrites the same way):
-    ///   * STAGED: "⬆️ Update to v<staged> — restart now" (ONE click applies — the
-    ///     owner's "click-upgrade" ask), then About, then "Update details…" (the
+    ///   * STAGED: "⬆️ Update to v<staged> — apply now, shells keep running" (ONE click
+    ///     applies in place — the owner's "click-upgrade" ask), then About, then
+    ///     "Update details…" (the
     ///     Software Update route stays reachable as the DETAILS surface).
     ///   * REALIZED (fresh post-update, no new stage): "⬆️ Updated to v<current> just
     ///     now" (fires About — the celebration row is informative, not destructive),
@@ -2375,7 +2386,7 @@ mod tests {
     }
 
     /// REGRESSION: the menu bar badged "v0.14.0 ⬆️" over a row reading "Update to
-    /// v0.14.0 — restart now", which reads as an offer to update a build to itself.
+    /// v0.14.0 — apply now", which reads as an offer to update a build to itself.
     ///
     /// Nothing was wrong with the update. The updater orders by BUILD NUMBER (the
     /// display version is documented as never affecting an update comparison), so a
@@ -2413,17 +2424,21 @@ mod tests {
     /// THE ALWAYS-VISIBLE OFFER MUST CARRY THE APPLY LANE'S VERDICT ON ITSELF.
     ///
     /// This row is the affordance the owner actually looked at for hours on
-    /// 2026-08-21: "⬆️ Update to v0.56.0 — restart now", above a control socket
-    /// reporting `failing_applies=2` and the reason both attempts died. A row that
-    /// tells you to restart, over a build that has already refused to start twice, is
-    /// not merely incomplete — it is instructing you to repeat something the program
-    /// privately knows has not worked.
+    /// 2026-08-21: "⬆️ Update to v0.56.0 — restart now" (the tail of the day), above
+    /// a control socket reporting `failing_applies=2` and the reason both attempts
+    /// died. A row that tells you to apply, over a build that has already refused to
+    /// start twice, is not merely incomplete — it is instructing you to repeat
+    /// something the program privately knows has not worked. And the clean row says
+    /// what the apply IS — in place, shells keep running — never a restart.
     #[test]
-    fn the_apply_row_admits_when_restarting_has_already_been_tried() {
+    fn the_apply_row_admits_when_applying_has_already_been_tried() {
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
 
         let clean = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", None);
-        assert_eq!(clean, "\u{2191} Update to v9.9.9 \u{2014} restart now");
+        assert_eq!(
+            clean,
+            "\u{2191} Update to v9.9.9 \u{2014} apply now, shells keep running"
+        );
 
         let trouble = ApplyTrouble::new(
             2,
@@ -2449,7 +2464,7 @@ mod tests {
             "never the proof-outcome enum name: {troubled}"
         );
         assert!(
-            !troubled.contains("restart now"),
+            !troubled.contains("apply now"),
             "a scheduled retry must not demand an action that is already queued: \
              {troubled}"
         );
@@ -2459,8 +2474,15 @@ mod tests {
             .expect("two failed applies");
         let latched = staged_apply_label("\u{2191}", 1_787_699_398, "9.9.9", Some(&latched));
         assert!(
-            latched.contains("restart now to retry"),
-            "a lane that has stopped names the action that restarts it: {latched}"
+            latched.contains("apply now to retry"),
+            "a lane that has stopped names the action that resumes it: {latched}"
+        );
+        // …and none of them asks for a restart: the apply is in place.
+        assert!(
+            !clean.contains("restart")
+                && !troubled.contains("restart")
+                && !latched.contains("restart"),
+            "{clean} / {troubled} / {latched}"
         );
     }
 
@@ -2742,7 +2764,7 @@ mod tests {
             titles[6]
         );
         assert!(
-            titles[6].contains("↑ Update — restart now"),
+            titles[6].contains("↑ Update — apply now"),
             "Version menu carries the one-click update apply: {:?}",
             titles[6]
         );

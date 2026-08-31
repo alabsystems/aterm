@@ -61,6 +61,33 @@ const PAUSE_AFTER_SILENT: u32 = 48;
 /// is live and self-disarms after a successful pause.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 
+/// UI-side staleness threshold for the worker's platform-busy stamp. A healthy
+/// AudioQueue control call returns in milliseconds; one that has not returned
+/// for this long is WEDGED. The 2026-08 field incident — typing sounds silent
+/// for hours while `tone status` read `audio=live` — is the case this exists
+/// for, but its cause is NOT proven: the sample taken then showed the worker in
+/// `dispatch_semaphore_wait`, which is also exactly what a healthy parked
+/// `recv()` looks like. The stamp makes the next occurrence decide it: a
+/// worker stuck inside a platform call reads `audio=wedged`, a parked one
+/// reads `live` with `dropped=0`.
+const WEDGE_AFTER_MS: u64 = 3_000;
+
+/// How long teardown waits for a live worker to finish before detaching it.
+/// Covers the honest worst case — one housekeeping interval plus a healthy
+/// platform call — so an ordinary drop stays effectively synchronous while a
+/// wedge can never carry itself onto the event-loop thread.
+const DETACH_DEADLINE: Duration = Duration::from_millis(600);
+
+/// Poll cadence while waiting out [`DETACH_DEADLINE`].
+const DETACH_POLL: Duration = Duration::from_millis(5);
+
+/// Lifetime budget of worker revivals after wedge detection. Each revival
+/// abandons one blocked thread and its queue by design (a thread stuck inside
+/// a platform call cannot be cancelled; it disposes its own queue if the call
+/// ever returns); the budget bounds that leak, and an exhausted budget seals
+/// ingress so the host reads honestly inert instead of wedging forever.
+const WEDGE_REVIVES: u8 = 3;
+
 #[cfg(target_os = "macos")]
 mod mac {
     use std::ffi::c_void;
@@ -617,6 +644,46 @@ fn cue_channel() -> (
     std::sync::mpsc::sync_channel(COMMAND_CAPACITY)
 }
 
+/// Milliseconds on a process-monotonic clock, for the worker's platform-busy
+/// stamp. Zero is reserved as the "not inside a platform call" sentinel, so
+/// live stamps are floored to 1. The origin sits [`WEDGE_AFTER_MS`] + 1 in
+/// the past — meaningless to a relative clock, but it means a stamp of `1`
+/// is stale from the process's first instant, so a test can fabricate a
+/// wedge deterministically instead of sleeping out the real threshold.
+#[cfg(target_os = "macos")]
+fn monotonic_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let elapsed =
+        u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX);
+    elapsed.saturating_add(WEDGE_AFTER_MS + 1)
+}
+
+/// RAII stamp around every worker platform section (device open, cue apply,
+/// pause housekeeping). While held, the cell carries the section's entry
+/// instant; every exit path — including the failure returns — clears it. The
+/// UI reads the cell to tell a parked worker (0: healthy by definition, the
+/// next send wakes it) from one stuck inside a single platform call (stale
+/// nonzero: the wedge a bare channel-liveness bit can never see).
+#[cfg(target_os = "macos")]
+struct PlatformBusy<'a>(&'a std::sync::atomic::AtomicU64);
+
+#[cfg(target_os = "macos")]
+impl<'a> PlatformBusy<'a> {
+    fn mark(cell: &'a std::sync::atomic::AtomicU64) -> Self {
+        cell.store(monotonic_ms().max(1), std::sync::atomic::Ordering::Release);
+        Self(cell)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PlatformBusy<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The complete UI-thread ingress decision. `try_send` is structurally
 /// nonblocking; a full channel preserves all queued cues, drops only the newest
 /// cue, and records that loss with a saturating counter. Both formal actions
@@ -696,6 +763,7 @@ fn worker_loop<Output, Open>(
     rx: std::sync::mpsc::Receiver<SoundEvent>,
     shutdown: &std::sync::atomic::AtomicBool,
     state: &std::sync::atomic::AtomicU8,
+    busy: &std::sync::atomic::AtomicU64,
     seed: u32,
     housekeeping_interval: Duration,
     mut open: Open,
@@ -719,7 +787,11 @@ fn worker_loop<Output, Open>(
                     let Some(out) = output.as_mut() else {
                         continue;
                     };
-                    match out.on_tick() {
+                    let tick = {
+                        let _busy = PlatformBusy::mark(busy);
+                        out.on_tick()
+                    };
+                    match tick {
                         Ok(true) => state.store(STATE_RUNNING, Ordering::Release),
                         Ok(false) => state.store(STATE_PAUSED, Ordering::Release),
                         Err(()) => {
@@ -749,6 +821,9 @@ fn worker_loop<Output, Open>(
             state.store(STATE_STOPPED, Ordering::Release);
             return;
         }
+        // Everything from here to the loop bottom may enter AudioToolbox
+        // (device open, start, enqueue) — the sections a wedge parks in.
+        let _busy = PlatformBusy::mark(busy);
         if output.is_none() {
             output = open(seed);
             if output.is_none() {
@@ -834,12 +909,14 @@ fn worker_main(
     rx: std::sync::mpsc::Receiver<SoundEvent>,
     shutdown: &std::sync::atomic::AtomicBool,
     state: &std::sync::atomic::AtomicU8,
+    busy: &std::sync::atomic::AtomicU64,
     seed: u32,
 ) {
     worker_loop(
         rx,
         shutdown,
         state,
+        busy,
         seed,
         HOUSEKEEPING_INTERVAL,
         mac::MacOut::new,
@@ -860,6 +937,16 @@ pub struct TrailAudio {
     state: std::sync::Arc<std::sync::atomic::AtomicU8>,
     #[cfg(target_os = "macos")]
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The worker's platform-busy stamp (see [`PlatformBusy`]): 0 while the
+    /// worker is parked or between platform calls, else the entry instant of
+    /// the call it is currently inside. Staleness past [`WEDGE_AFTER_MS`] is
+    /// the wedge verdict [`Self::wedged_for`] reports.
+    #[cfg(target_os = "macos")]
+    busy: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Remaining worker revivals ([`WEDGE_REVIVES`] at birth). Decremented by
+    /// each wedge-triggered revival; at zero the next wedge seals ingress.
+    #[cfg(target_os = "macos")]
+    revives_left: u8,
     #[cfg(target_os = "macos")]
     worker: Option<std::thread::JoinHandle<()>>,
     /// TEST-ONLY cue tap: `Some` makes this host report itself LIVE (so the
@@ -885,12 +972,15 @@ impl TrailAudio {
             let shutdown = Arc::new(AtomicBool::new(false));
             let state = Arc::new(AtomicU8::new(STATE_DORMANT));
             let dropped = Arc::new(AtomicU64::new(0));
+            let busy = Arc::new(AtomicU64::new(0));
             if !active {
                 return Self {
                     tx: None,
                     shutdown,
                     state,
                     dropped,
+                    busy,
+                    revives_left: WEDGE_REVIVES,
                     worker: None,
                     #[cfg(test)]
                     capture: None,
@@ -899,9 +989,18 @@ impl TrailAudio {
             let (tx, rx) = cue_channel();
             let worker_shutdown = Arc::clone(&shutdown);
             let worker_state = Arc::clone(&state);
+            let worker_busy = Arc::clone(&busy);
             let worker = std::thread::Builder::new()
                 .name("aterm-trail-audio".into())
-                .spawn(move || worker_main(rx, &worker_shutdown, &worker_state, 0x5EED_50FD))
+                .spawn(move || {
+                    worker_main(
+                        rx,
+                        &worker_shutdown,
+                        &worker_state,
+                        &worker_busy,
+                        0x5EED_50FD,
+                    );
+                })
                 .ok();
             let tx = worker.as_ref().map(|_| tx);
             if worker.is_none() {
@@ -912,6 +1011,8 @@ impl TrailAudio {
                 shutdown,
                 state,
                 dropped,
+                busy,
+                revives_left: WEDGE_REVIVES,
                 worker,
                 #[cfg(test)]
                 capture: None,
@@ -946,16 +1047,21 @@ impl TrailAudio {
     }
 
     /// Replace the complete audio host with a freshly resolved active/inert one.
-    /// Dropping the previous value is synchronous: it closes cue ingress, wakes and
-    /// joins the worker, and lets the platform output dispose its queue immediately.
-    /// This is the serious-mode edge seam; no already-playing decorative tail can
-    /// survive the call returning.
+    /// Dropping the previous value closes cue ingress, wakes and joins the worker
+    /// (bounded — a wedged or deadline-overrunning worker is detached and
+    /// self-terminates instead of freezing this thread), and lets the platform
+    /// output dispose its queue. This is the serious-mode edge seam; no
+    /// already-playing decorative tail survives a healthy teardown returning.
     pub fn replace(&mut self, active: bool) {
         *self = Self::new(active);
     }
 
     /// Queue one cue without blocking the input/present thread. Full means this
     /// nonessential sound is dropped; disconnected permanently disables ingress.
+    /// A full channel whose worker is WEDGED (stuck inside one platform call
+    /// past [`WEDGE_AFTER_MS`]) additionally spends one revival — see
+    /// [`Self::revive_or_seal`] — so a stuck device costs seconds of silence,
+    /// not the rest of the session.
     pub fn push(&mut self, ev: SoundEvent) {
         #[cfg(test)]
         if let Some(captured) = self.capture.as_mut() {
@@ -963,15 +1069,20 @@ impl TrailAudio {
             return;
         }
         #[cfg(target_os = "macos")]
-        if let Some(disposition) = self
+        match self
             .tx
             .as_ref()
             .map(|tx| enqueue_cue(tx, &self.dropped, ev))
-            && disposition == EnqueueDisposition::Disconnected
         {
-            self.tx = None;
-            self.state
-                .store(STATE_FAILED, std::sync::atomic::Ordering::Release);
+            Some(EnqueueDisposition::Disconnected) => {
+                self.tx = None;
+                self.state
+                    .store(STATE_FAILED, std::sync::atomic::Ordering::Release);
+            }
+            Some(EnqueueDisposition::DroppedFull) if self.busy_stale_ms().is_some() => {
+                self.revive_or_seal();
+            }
+            _ => {}
         }
         #[cfg(not(target_os = "macos"))]
         let _ = ev;
@@ -983,6 +1094,9 @@ impl TrailAudio {
     /// gates on this — inference must never spend a microsecond in a build
     /// whose sound can only be silence (the "never runs headless-muted"
     /// policy).
+    ///
+    /// This is CHANNEL liveness only; a wedged worker keeps it `true`. Pair
+    /// with [`Self::wedged_for`] wherever "live" is reported to a human.
     pub fn is_live(&self) -> bool {
         #[cfg(test)]
         if self.capture.is_some() {
@@ -996,6 +1110,80 @@ impl TrailAudio {
         {
             false
         }
+    }
+
+    /// The worker's current platform call has outlived [`WEDGE_AFTER_MS`]:
+    /// `Some(elapsed)`. `None` means parked/idle, between calls, or a call
+    /// still young enough to be presumed healthy.
+    #[cfg(target_os = "macos")]
+    fn busy_stale_ms(&self) -> Option<u64> {
+        let mark = self.busy.load(std::sync::atomic::Ordering::Acquire);
+        if mark == 0 {
+            return None;
+        }
+        let elapsed = monotonic_ms().saturating_sub(mark);
+        (elapsed >= WEDGE_AFTER_MS).then_some(elapsed)
+    }
+
+    /// WEDGED: ingress is open (so [`Self::is_live`] reads `true`) but the
+    /// worker has been stuck inside ONE platform call past its threshold —
+    /// every new cue is being dropped while a bare liveness bit would keep
+    /// reading healthy. Whether the 2026-08 field incident was this state is
+    /// unproven (see [`WEDGE_AFTER_MS`]); what is certain is that `tone
+    /// status` printed `audio=live` over a dead-silent synth for hours, and
+    /// this verdict is what would have told the two apart. `None` on the
+    /// healthy, sealed, and non-macOS forms.
+    pub fn wedged_for(&self) -> Option<Duration> {
+        #[cfg(test)]
+        if self.capture.is_some() {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // A sealed host (no ingress) outranks wedged.
+            self.tx
+                .as_ref()
+                .and_then(|_| self.busy_stale_ms())
+                .map(Duration::from_millis)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Saturating count of cues dropped on a full ingress channel — the loss
+    /// the wedge (or a plain burst) actually cost, surfaced so status verbs
+    /// can print it instead of keeping it a private counter.
+    pub fn dropped_cues(&self) -> u64 {
+        #[cfg(target_os = "macos")]
+        {
+            self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// A wedge was just observed at the ingress. With budget remaining, spend
+    /// one revival: abandon the stuck worker (its thread cannot be cancelled —
+    /// drop detaches it, and it disposes its own queue if the call ever
+    /// returns) and stand up a fresh channel + worker so sound returns on the
+    /// next cue. With the budget exhausted, seal ingress instead: `is_live`
+    /// goes `false` and every status verb reads inert, rather than a fourth
+    /// hour of healthy-looking silence.
+    #[cfg(target_os = "macos")]
+    fn revive_or_seal(&mut self) {
+        if self.revives_left == 0 {
+            self.tx = None;
+            self.state
+                .store(STATE_FAILED, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        let revives_left = self.revives_left - 1;
+        *self = Self::new(true);
+        self.revives_left = revives_left;
     }
 
     #[cfg(test)]
@@ -1033,6 +1221,8 @@ impl TrailAudio {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 state: Arc::new(AtomicU8::new(STATE_DORMANT)),
                 dropped: Arc::new(AtomicU64::new(0)),
+                busy: Arc::new(AtomicU64::new(0)),
+                revives_left: WEDGE_REVIVES,
                 worker: None,
                 // A REAL channel under test: this fixture proves the enqueue
                 // path itself, so it must not divert into the capture tap.
@@ -1050,7 +1240,29 @@ impl Drop for TrailAudio {
             self.shutdown
                 .store(true, std::sync::atomic::Ordering::Release);
             self.tx = None;
-            if let Some(worker) = self.worker.take() {
+            let Some(worker) = self.worker.take() else {
+                return;
+            };
+            // A WEDGED worker (stuck inside one platform call past the
+            // threshold) cannot observe the shutdown flag; joining it would
+            // carry the wedge onto this — the event-loop — thread. Detach it:
+            // the thread keeps blocking harmlessly, and if its call ever
+            // returns it sees `shutdown` at the loop top, exits, and its
+            // `MacOut` disposes the queue.
+            if self.busy_stale_ms().is_some() {
+                drop(worker);
+                return;
+            }
+            // Healthy teardown stays effectively synchronous: a parked worker
+            // wakes from the closed channel immediately, a running one returns
+            // within a housekeeping interval — both land well inside the
+            // deadline. Only a platform call slower than the deadline is
+            // detached, and it still self-terminates as above.
+            let deadline = std::time::Instant::now() + DETACH_DEADLINE;
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(DETACH_POLL);
+            }
+            if worker.is_finished() {
                 let _ = worker.join();
             }
         }
@@ -1153,8 +1365,9 @@ mod tests {
 
     use super::mac::{QueueCycle, prime_and_start, stop_and_reclaim};
     use super::{
-        AudioWorkerOutput, COMMAND_CAPACITY, STATE_DORMANT, STATE_FAILED, STATE_PAUSED,
-        STATE_RUNNING, STATE_STOPPED, TrailAudio, cue_channel, worker_loop,
+        AudioWorkerOutput, COMMAND_CAPACITY, DETACH_DEADLINE, STATE_DORMANT, STATE_FAILED,
+        STATE_PAUSED, STATE_RUNNING, STATE_STOPPED, TrailAudio, WEDGE_REVIVES, cue_channel,
+        monotonic_ms, worker_loop,
     };
 
     fn cue() -> SoundEvent {
@@ -1579,6 +1792,9 @@ mod tests {
         pause_on_tick: AtomicBool,
         fail_open: AtomicBool,
         fail_push: AtomicBool,
+        /// While set, `push` spins in place — the deterministic stand-in for a
+        /// platform call that has stopped returning (the wedge).
+        block_push: AtomicBool,
     }
 
     struct FakeOutput {
@@ -1589,6 +1805,9 @@ mod tests {
     impl AudioWorkerOutput for FakeOutput {
         fn push(&mut self, _ev: SoundEvent) -> bool {
             self.shared.pushes.fetch_add(1, Ordering::Relaxed);
+            while self.shared.block_push.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             if self.shared.fail_push.load(Ordering::Relaxed) {
                 return false;
             }
@@ -1609,25 +1828,31 @@ mod tests {
         }
     }
 
-    fn spawn_fake_worker(
-        shared: Arc<FakeShared>,
-    ) -> (
+    /// What [`spawn_fake_worker`] hands back: cue ingress, the shutdown flag,
+    /// the state and busy cells, and the worker's join handle.
+    type FakeWorkerHandles = (
         std::sync::mpsc::SyncSender<SoundEvent>,
         Arc<AtomicBool>,
         Arc<AtomicU8>,
+        Arc<std::sync::atomic::AtomicU64>,
         std::thread::JoinHandle<()>,
-    ) {
+    );
+
+    fn spawn_fake_worker(shared: Arc<FakeShared>) -> FakeWorkerHandles {
         let (tx, rx) = cue_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let state = Arc::new(AtomicU8::new(STATE_DORMANT));
+        let busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_state = Arc::clone(&state);
+        let worker_busy = Arc::clone(&busy);
         let worker = std::thread::spawn(move || {
             let factory_shared = Arc::clone(&shared);
             worker_loop(
                 rx,
                 &worker_shutdown,
                 &worker_state,
+                &worker_busy,
                 7,
                 std::time::Duration::from_millis(2),
                 move |_| {
@@ -1643,7 +1868,7 @@ mod tests {
                 },
             );
         });
-        (tx, shutdown, state, worker)
+        (tx, shutdown, state, busy, worker)
     }
 
     #[test]
@@ -1766,7 +1991,7 @@ mod tests {
         use super::trail_audio_conformance::project_worker;
 
         let shared = Arc::new(FakeShared::default());
-        let (tx, shutdown, state, worker) = spawn_fake_worker(Arc::clone(&shared));
+        let (tx, shutdown, state, _busy, worker) = spawn_fake_worker(Arc::clone(&shared));
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(shared.opens.load(Ordering::Relaxed), 0);
         assert_eq!(shared.pushes.load(Ordering::Relaxed), 0);
@@ -1837,7 +2062,7 @@ mod tests {
     fn worker_device_failure_is_terminal_and_never_retried() {
         let shared = Arc::new(FakeShared::default());
         shared.fail_open.store(true, Ordering::Relaxed);
-        let (tx, _shutdown, state, worker) = spawn_fake_worker(Arc::clone(&shared));
+        let (tx, _shutdown, state, _busy, worker) = spawn_fake_worker(Arc::clone(&shared));
         tx.send(cue()).unwrap();
         wait_until("explicit open failure", || {
             state.load(Ordering::Acquire) == STATE_FAILED
@@ -1876,6 +2101,154 @@ mod tests {
         );
         assert!(audio.is_inert_for_test());
         assert_eq!(audio.state(), STATE_DORMANT);
+    }
+
+    /// The busy stamp brackets exactly the platform sections: nonzero and
+    /// stable while the worker sits inside one call, zero once it parks. This
+    /// is the observable the wedge verdict is built from.
+    #[test]
+    fn platform_busy_stamps_calls_and_clears_at_park() {
+        let shared = Arc::new(FakeShared::default());
+        shared.block_push.store(true, Ordering::Release);
+        let (tx, shutdown, state, busy, worker) = spawn_fake_worker(Arc::clone(&shared));
+
+        tx.send(cue()).unwrap();
+        wait_until("worker entered the blocked platform call", || {
+            shared.pushes.load(Ordering::Relaxed) == 1
+        });
+        let mark = busy.load(Ordering::Acquire);
+        assert_ne!(mark, 0, "a worker inside a platform call is busy");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(
+            busy.load(Ordering::Acquire),
+            mark,
+            "the stamp is the call's ENTRY instant, not a heartbeat"
+        );
+
+        shared.block_push.store(false, Ordering::Release);
+        shared.pause_on_tick.store(true, Ordering::Release);
+        wait_until("idle pause", || {
+            state.load(Ordering::Acquire) == STATE_PAUSED
+        });
+        assert_eq!(
+            busy.load(Ordering::Acquire),
+            0,
+            "a parked worker is not busy — park is healthy by definition"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        let _ = tx.send(cue());
+        worker.join().unwrap();
+    }
+
+    /// A full channel alone is a burst, not a wedge: with the busy stamp
+    /// young (or clear), the drop is accounted and nothing is revived.
+    #[test]
+    fn young_platform_call_is_not_a_wedge() {
+        let (mut audio, rx) = TrailAudio::test_ingress();
+        for _ in 0..COMMAND_CAPACITY {
+            audio.push(cue());
+        }
+        audio
+            .busy
+            .store(monotonic_ms().max(1), std::sync::atomic::Ordering::Release);
+        audio.push(cue());
+        assert!(audio.wedged_for().is_none());
+        assert_eq!(audio.revives_left, WEDGE_REVIVES, "no revival spent");
+        assert!(audio.tx.is_some(), "ingress stays open");
+        assert_eq!(audio.dropped_cues(), 1, "the drop is still accounted");
+        assert_eq!(rx.try_iter().count(), COMMAND_CAPACITY);
+    }
+
+    /// The field incident's shape: channel full AND the worker stuck inside
+    /// one platform call past the threshold. One push both reports the wedge
+    /// and spends a revival — fresh channel, fresh worker, old ingress dead.
+    #[test]
+    fn wedged_full_ingress_revives_within_budget() {
+        let (mut audio, rx) = TrailAudio::test_ingress();
+        audio.revives_left = 1;
+        for _ in 0..COMMAND_CAPACITY {
+            audio.push(cue());
+        }
+        // Stamp 1 = the clock's origin, which sits past the threshold by
+        // construction (see `monotonic_ms`) — a wedge, deterministically.
+        audio.busy.store(1, std::sync::atomic::Ordering::Release);
+        assert!(
+            audio.wedged_for().is_some(),
+            "a stale platform call over open ingress is the wedge"
+        );
+
+        audio.push(cue());
+        assert_eq!(audio.revives_left, 0, "one revival spent");
+        assert!(audio.tx.is_some(), "fresh ingress is open");
+        assert!(audio.worker.is_some(), "a fresh worker exists");
+        assert!(audio.wedged_for().is_none(), "the fresh worker is not busy");
+        assert_eq!(audio.state(), STATE_DORMANT);
+        assert_eq!(rx.try_iter().count(), COMMAND_CAPACITY);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "the wedged channel is abandoned with its worker"
+        );
+        // The fresh worker never receives a cue, so it parks without touching
+        // the device and this drop joins it synchronously.
+    }
+
+    /// An exhausted revival budget seals ingress: `is_live` goes false, so
+    /// every status verb reads inert instead of eternally-healthy silence.
+    #[test]
+    fn wedge_with_spent_budget_seals_ingress() {
+        let (mut audio, _rx) = TrailAudio::test_ingress();
+        audio.revives_left = 0;
+        for _ in 0..COMMAND_CAPACITY {
+            audio.push(cue());
+        }
+        audio.busy.store(1, std::sync::atomic::Ordering::Release);
+        audio.push(cue());
+        assert!(audio.tx.is_none(), "ingress is sealed");
+        assert!(!audio.is_live());
+        assert!(audio.wedged_for().is_none(), "sealed outranks wedged");
+        assert_eq!(audio.state(), STATE_FAILED);
+    }
+
+    /// Dropping a WEDGED host must not carry the wedge onto the calling
+    /// (event-loop) thread: the stuck worker is detached, not joined. The
+    /// regression this pins: the former unconditional `join()` would have
+    /// frozen the UI forever on the serious-mode toggle and on quit.
+    #[test]
+    fn dropping_a_wedged_host_detaches_instead_of_freezing() {
+        let (mut audio, _rx) = TrailAudio::test_ingress();
+        // Stand-in for a thread stuck in a platform call: parked until the
+        // keeper is dropped, which this test does only AFTER the drop returns.
+        let (keeper_tx, keeper_rx) = std::sync::mpsc::channel::<()>();
+        audio.worker = Some(std::thread::spawn(move || {
+            let _ = keeper_rx.recv();
+        }));
+        audio.busy.store(1, std::sync::atomic::Ordering::Release);
+
+        let begun = std::time::Instant::now();
+        drop(audio);
+        assert!(
+            begun.elapsed() < DETACH_DEADLINE,
+            "a wedged worker is detached immediately, never joined"
+        );
+        drop(keeper_tx);
+    }
+
+    /// The healthy teardown contract survives the bounded join: a parked
+    /// shipping worker is woken by the closing channel and joined well inside
+    /// the deadline.
+    #[test]
+    fn dropping_a_healthy_host_stays_synchronous() {
+        let audio = TrailAudio::new(true);
+        let begun = std::time::Instant::now();
+        drop(audio);
+        assert!(
+            begun.elapsed() < DETACH_DEADLINE,
+            "a parked worker joins promptly on teardown"
+        );
     }
 
     /// IGNORED by default: opens the REAL output device and audibly plays a

@@ -329,12 +329,7 @@ mod tests {
     /// `(t_us, seq)` — captured frame stamps.
     type Frames = Vec<(u64, u64)>;
 
-    fn take(
-        interval_us: u64,
-        echo_us: u64,
-        keys: &[u64],
-        span_us: u64,
-    ) -> (Inputs, Frames) {
+    fn take(interval_us: u64, echo_us: u64, keys: &[u64], span_us: u64) -> (Inputs, Frames) {
         let inputs = keys
             .iter()
             .map(|t| (*t, "\"ch\":\"x\"".to_string()))

@@ -38,6 +38,23 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, UserAttentionType, Window, WindowId as WinitWindowId};
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread observation seam for the redraw plan-build cardinality. Tests
+    /// reset it after fixture construction, so parallel GUI tests cannot race.
+    static VISIBLE_LEAF_PLAN_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_visible_leaf_plan_builds() {
+    VISIBLE_LEAF_PLAN_BUILDS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn visible_leaf_plan_builds() -> usize {
+    VISIBLE_LEAF_PLAN_BUILDS.with(std::cell::Cell::get)
+}
+
 mod about;
 mod accessibility;
 /// Cross-platform AccessKit adapter for transient/compatibility overlays; native
@@ -205,6 +222,10 @@ mod pinned_dir;
 /// The native Windows application-runtime (DWM chrome): `AppRt` peer of `AppRtMacOS`.
 #[cfg(windows)]
 mod platform_win;
+/// The CPU present seam: the trait pair the fail-soft (GPU-failure) renderer
+/// presents through, plus the per-cell backend behind it — first-party
+/// CoreGraphics on macOS, `softbuffer` everywhere else.
+mod present;
 mod press_custody_conformance;
 mod relaunch_notice;
 mod status_bars;
@@ -375,8 +396,11 @@ mod vi_keys;
 /// The `video … keys` self-evaluation, and the disclosures that keep it from
 /// being read as key→photon latency. See the module header.
 mod video_key_analysis;
-/// Dev/CI main-thread STALL watchdog (L0 freeze-hazard guard). Off in release
-/// unless `$ATERM_WATCHDOG` is set; see `watchdog::beat` / `watchdog::start`.
+/// Main-thread STALL watchdog (L0 freeze-hazard guard). Armed in EVERY build —
+/// 500 ms in debug or under `$ATERM_WATCHDOG`, 5 s in a shipped binary,
+/// `ATERM_WATCHDOG=off` to disable. It used to be compiled out of release,
+/// which is how the v0.65.0 update-apply park produced five hours of silence;
+/// see the module header. `watchdog::beat` / `watchdog::start`.
 mod watchdog;
 mod widget;
 
@@ -2187,7 +2211,7 @@ struct RepaintKey {
     /// smooth glide would stutter to whole-row jumps. `0` on every whole-row / non-
     /// scrolling frame ⇒ byte-identical to the pre-M1b key (idle invariant).
     scroll_frac_px: i32,
-    /// Fingerprint of the Rung 2 relaunch nudge (staged build + version), so the
+    /// Fingerprint of the Rung 2 update-ready nudge (staged build + version), so the
     /// banner's appear / dismiss / build-change repaints even on a static grid. `0`
     /// when no nudge is shown — then the key is byte-identical to the no-nudge path.
     /// (GLOBAL App state folded into every window's key, like a config banner would be.)
@@ -2611,6 +2635,10 @@ enum Wake {
     /// worker or only confirm boot health and would otherwise emit no UI wake; this
     /// edge retries a coalesced reconcile intent that previously saw `Full`.
     NativeUpdateWorkerDrained,
+    /// The native-document worker dequeued one of the four waiting jobs. This
+    /// capacity-release edge pumps one ID-only journal retry before the worker's
+    /// disk operation completes; it never carries another document image.
+    NativeDocumentQueueSlotAvailable,
     /// Boot-health proof/disarm completed off the UI thread. A transient failure
     /// preserves rollback authority and re-arms one bounded retry; success closes
     /// the one-shot latch for this process.
@@ -2679,15 +2707,18 @@ enum Wake {
     /// `status.toml` entry nobody reads (build 826).
     UpdateHealth { title: String, body: String },
     /// PROOF-CARRYING DSU (RFC Rung 1): a controller (`aterm-ctl update apply`) — or the
-    /// GUI [Relaunch] nudge (Rung 2) — asked to APPLY a staged update now. The main
-    /// thread re-execs; the staged build swaps in at the top of the new `main`
-    /// (`apply_staged_if_ready`). Rung 1b will preserve the live PTY/session across
-    /// this exec; today it is a clean relaunch. This is what lets an AI running IN the
+    /// GUI's update-ready nudge (Rung 2) — asked to APPLY a staged update now. The main
+    /// thread hands the live session to the staged build IN PLACE: Rung 1b (live,
+    /// default-on) is the seamless overlap handoff, which gives every PTY, screen and
+    /// window to the successor, so the shells keep running; a cold re-exec (the staged
+    /// build swapping in at the top of the new `main`, `apply_staged_if_ready`) is only
+    /// the `ATERM_NO_SEAMLESS_UPDATE` fallback. This is what lets an AI running IN the
     /// session see the staged build (`update status`) and press the button itself.
     ApplyStagedUpdate,
     /// PROOF-CARRYING DSU (RFC Rung 2): the background update thread staged a
-    /// strictly-newer build. The main thread shows the persistent "relaunch to apply"
-    /// nudge (`App.relaunch`) unless the user already `[ Later ]`-dismissed THIS build.
+    /// strictly-newer build. The main thread reconciles it, arms the in-session apply
+    /// lane, and shows the persistent update-ready nudge (`App.relaunch`: the Version
+    /// menu's ⬆️ item, the tab-strip ↻, the notice pill — one click applies in place).
     UpdateStaged { build: u64, version: String },
     /// `settings [open|close|toggle]` control verb: drive the cross-platform native
     /// Settings tab from the control socket (so a driver can open it then introspect
@@ -2903,9 +2934,7 @@ enum Wake {
     ///
     /// Answers `0` when there is no frontmost window (headless, every window
     /// closed) — the injector refuses rather than posting into nothing.
-    HwKeyTarget {
-        reply: std::sync::mpsc::Sender<i64>,
-    },
+    HwKeyTarget { reply: std::sync::mpsc::Sender<i64> },
     /// The Linux/X11 paste worker finished reading a FOREIGN clipboard owner off the
     /// UI thread — `text` is the clipboard body to deliver into `wid` (the paste's
     /// [`InputEvent::Paste`] source `source`). Constructed ONLY by the
@@ -2943,6 +2972,10 @@ enum Wake {
         wid: WindowId,
         text: String,
         source: Source,
+        /// The bracketed-paste reading the SHEET's question was asked under, so
+        /// the answer is framed by it and not by whatever DEC 2004 says once the
+        /// person has answered (see [`input::PasteFraming`]).
+        framing: input::PasteFraming,
         proceed: bool,
     },
     /// A macOS menu-bar item was clicked (see `menu.rs`). The item's action
@@ -3159,6 +3192,33 @@ enum Wake {
     SetDragHover {
         hovering: bool,
         reply: std::sync::mpsc::Sender<bool>,
+    },
+    /// The `find` control verb drives the FIND BAR of the front window through one
+    /// [`app_search::FindAction`] and reads the resulting state back. On the main
+    /// thread because the find bar is `App` state and every action it runs is the
+    /// keystroke handler's own (`find_requested` / `search_edit_in` /
+    /// `search_step_in` / …). `None` = no front window at all.
+    FindCmd {
+        action: app_search::FindAction,
+        reply: std::sync::mpsc::Sender<Option<app_search::FindStatus>>,
+    },
+    /// The `pane` control verb moves keyboard focus to the adjacent pane of the
+    /// front window's active tab, through the SAME `focus_pane_in` the
+    /// `focus_pane_*` key bindings run. Replies `Some(moved)`, or `None` when there
+    /// is no front window.
+    PaneFocus {
+        dir: pane::FocusDir,
+        reply: std::sync::mpsc::Sender<Option<bool>>,
+    },
+    /// The `pointer` control verb drives the front window's pointer through
+    /// `App::on_cursor_moved` / `on_cursor_left` — the very functions winit's
+    /// `CursorMoved`/`CursorLeft` call — so hover resolution runs for real. Main
+    /// thread because those handlers are `App`'s. The reply is the cell the pointer
+    /// ACTUALLY holds afterwards, `None` when it holds no position (see
+    /// [`App::pointer_cmd`]).
+    PointerCmd {
+        action: app_mouse::PointerAction,
+        reply: std::sync::mpsc::Sender<Result<Option<(u16, u16)>, &'static str>>,
     },
     /// The `window` introspection verb produces a full-window artifact: native OS
     /// chrome (titlebar, traffic lights, unified toolbar, and tab strip) stitched
@@ -4002,13 +4062,13 @@ mod bottom_padding_geometry_tests {
         let mut input = RenderInput::empty();
         input.cursor_glow_add = vec![GlowQuad {
             y: 20,
-                        // ADDITIVE light (see `GlowQuad::alpha`).
+            // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
             ..GlowQuad::default()
         }];
         input.glow_under = vec![GlowQuad {
             y: 21,
-                        // ADDITIVE light (see `GlowQuad::alpha`).
+            // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
             ..GlowQuad::default()
         }];
@@ -4025,7 +4085,7 @@ mod bottom_padding_geometry_tests {
         // Renderer-offset/grid-relative streams must not be double-shifted.
         input.nova_add = vec![GlowQuad {
             y: 30,
-                        // ADDITIVE light (see `GlowQuad::alpha`).
+            // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
             ..GlowQuad::default()
         }];
@@ -4060,7 +4120,7 @@ mod bottom_padding_geometry_tests {
         let mut invalid = RenderInput::empty();
         invalid.cursor_glow_add = vec![GlowQuad {
             y: u16::MAX,
-                        // ADDITIVE light (see `GlowQuad::alpha`).
+            // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
             ..GlowQuad::default()
         }];
@@ -6470,7 +6530,7 @@ fn visit_controller_video_attempt_samples(
     use aterm_types::keyboard::KeyEventType;
 
     match ev {
-        InputEvent::Text(text) | InputEvent::Paste(text) => {
+        InputEvent::Text(text) | InputEvent::Paste(text, _) => {
             for ch in text.chars() {
                 if !visit(VideoInputSample::Char(ch)) {
                     break;
@@ -6693,8 +6753,11 @@ fn fold_owned_deadline(
 )]
 enum PresentTarget {
     Cpu {
-        surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
-        _context: softbuffer::Context<Arc<Window>>,
+        /// This cell's CPU presenter — first-party CoreGraphics on macOS,
+        /// `softbuffer` elsewhere (see [`crate::present`]). The display context
+        /// the `softbuffer` backend needs is folded inside it, so no
+        /// third-party type is named here any more.
+        surface: present::CpuSurface,
     },
     Gpu {
         gpu_surface: aterm_gpu::GpuSurface,
@@ -7304,6 +7367,17 @@ struct WindowState {
     /// carries no pixel position of its own) can tell whether the pointer is over
     /// the tab strip ([`Self::strip_col_at`]) before mapping to a terminal cell.
     last_cursor_px: (f64, f64),
+    /// Whether [`Self::last_cursor_px`] and the two cell memos above it describe a
+    /// pointer position this window CURRENTLY holds — set by the motion path that
+    /// writes them, cleared by `App::on_cursor_left` when the pointer withdraws.
+    ///
+    /// The pixel/cell memos alone cannot answer this: they are `(0, 0)` before the
+    /// first motion and they KEEP the departed position after `CursorLeft`, because
+    /// a button press arriving in either state must still hit-test against the last
+    /// place the pointer was. So the coordinates are deliberately stale-tolerant and
+    /// this flag is what says whether they mean anything — which is the difference
+    /// between reporting where the pointer is and inventing a cell it is not on.
+    pointer_position_known: bool,
     /// Sub-cell pixel offset of the last pointer move inside its grid cell, so a
     /// button press / wheel notch (winit delivers no pixel position on those) can
     /// still report a genuine sub-cell PIXEL coordinate under DEC 1016 (SGR-pixel
@@ -8448,6 +8522,10 @@ struct WindowState {
     /// input and hand one window the other's pixels. Threaded into
     /// `Renderer::render_input_cached` at the CPU present call site.
     cpu_cache: WindowCpu,
+    /// Persistent CPU damage-rectangle scratch. A stable dirty-row frame
+    /// clears and refills this allocation before `present_with_damage` instead
+    /// of allocating one `Vec` per successful CPU present.
+    cpu_damage_rect_scratch: Vec<present::DamageRect>,
     /// The [`RepaintKey`] of the last frame actually presented (D-1), or `None`
     /// before the first present. `redraw()` skips the whole extract + rasterize +
     /// present when the current key equals this (see [`should_repaint`]).
@@ -8603,6 +8681,10 @@ struct WindowState {
     /// rebuilt only when (asset, dim, theme bg, frame dims) change. `None`
     /// when no wallpaper is admitted. See [`crate::app_render::WallpaperScaled`].
     pub(crate) wallpaper_scaled: Option<crate::app_render::WallpaperScaled>,
+    /// Second half of the wallpaper-tint ink merge. The completed ink vector and
+    /// this cleared scratch swap allocations each tinted frame, so both sparkle
+    /// precedence and sorted-unique order stay unchanged without malloc/free.
+    wallpaper_ink_scratch: Vec<aterm_core::render::InkCell>,
 }
 
 impl WindowState {
@@ -9646,6 +9728,7 @@ impl WindowState {
             last_mouse_cell: (0, 0),
             last_mouse_window_cell: (0, 0),
             last_cursor_px: (0.0, 0.0),
+            pointer_position_known: false,
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
             scroll_residual_x: 0.0,
@@ -9833,6 +9916,7 @@ impl WindowState {
             tab_chrome_titles: std::collections::HashMap::new(),
             tab_chrome_titles_by_tab: std::collections::HashMap::new(),
             cpu_cache: WindowCpu::new(),
+            cpu_damage_rect_scratch: Vec::new(),
             last_present: None,
             pending_reveal: None,
             preedit: String::new(),
@@ -9862,6 +9946,7 @@ impl WindowState {
             pending_close: false,
             pending_close_attribution: None,
             wallpaper_scaled: None,
+            wallpaper_ink_scratch: Vec::new(),
         }
     }
 }
@@ -9949,7 +10034,7 @@ const AUTOMATIC_UPDATE_QUIET_EPOCH: Duration =
 /// output into one pane while a human works in another app — that conjunction
 /// is essentially never true, so the previous unbounded wait meant a verified,
 /// staged, notarized build simply never applied itself: the user watched an
-/// "Install & Relaunch" button instead of getting an update. Two minutes is
+/// "Update to Latest Now" button instead of getting an update. Two minutes is
 /// long enough that an ordinary pause still wins the race (and the update lands
 /// invisibly), and short enough that never pausing costs a single brief hitch
 /// rather than the whole feature. The lane it unblocks is the LOSSLESS seamless
@@ -9973,7 +10058,8 @@ const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = Duration::from_secs(120);
 /// word or a held repeat, short enough that an ordinary think-pause opens the
 /// gate and the update lands invisibly, exactly as it does today for a user who
 /// is reading rather than typing. It gates the AUTOMATIC lanes only; an explicit
-/// "Install & Relaunch" is the user asking for the freeze and is never held.
+/// "Update to Latest Now" (or the Version menu's "apply now") is the user asking
+/// for the freeze and is never held.
 const AUTOMATIC_UPDATE_KEYSTROKE_GAP: Duration = Duration::from_millis(2_500);
 
 /// How long the keystroke gate may hold a PAST-GRACE automatic apply before the
@@ -9983,8 +10069,8 @@ const AUTOMATIC_UPDATE_KEYSTROKE_GAP: Duration = Duration::from_millis(2_500);
 /// forever is a feature that silently stops working. A user who literally never
 /// pauses for 2.5 s over this long is not going to be given a frozen terminal to
 /// prove a point: the intent stands down (the ordinary manual-only latch, which
-/// lapses and re-arms on its own), and the staged build still applies for free at
-/// the next launch, where there is no session to freeze at all.
+/// lapses and re-arms on its own — or on a click from the Version menu, still in
+/// place); the next launch picks the stage up only if no handoff ever ran.
 const AUTOMATIC_UPDATE_TYPING_HOLD: Duration = Duration::from_secs(10 * 60);
 
 /// True once the most recently consumed PTY burst is old enough for automatic
@@ -10050,12 +10136,42 @@ struct AutoApplyManualOnly {
 struct AutoOverlapRetry {
     build: u64,
     dmg_sha256: [u8; 32],
+    /// `dmg_sha256` is an `installed_activation_digest`, not a download's DMG
+    /// hash: the same logical update, observed AFTER our own candidate swapped
+    /// the bundle. See [`AutoOverlapRetry::covers`] for why that distinction has
+    /// to exist inside the key rather than beside it.
+    activation: bool,
     cycles: u8,
     /// When the most recent activity-revoked attempt was budgeted. A busy hour
     /// must not permanently spend an artifact's budget: after
     /// [`ACTIVITY_RETRY_BUDGET_REPLENISH`] of not attempting, the budget starts
     /// over. Bounded either way — the backoff schedule still paces attempts.
     last_attempt: std::time::Instant,
+}
+
+impl AutoOverlapRetry {
+    /// Does this record already budget the LOGICAL update `(build, artifact)`?
+    ///
+    /// THE DIGEST SEPARATES TWO DOWNLOADS, AND THAT IS ALL IT MAY SEPARATE. It
+    /// must not separate a download from the installed-bundle ACTIVATION of the
+    /// same build, because the candidate whose failure spent this budget is
+    /// precisely what installed that bundle: the boot apply swaps the staged
+    /// bundle and re-execs BEFORE the candidate can prove readiness, so every
+    /// attempt that got far enough to cost a cycle leaves the update behind as
+    /// an activation. Keying on the bytes therefore let the artifact identity
+    /// flip as a CONSEQUENCE of the failure being counted, and the ladder
+    /// restarted at rung 0 — the observed "retry in 2s, twice".
+    ///
+    /// A genuinely re-cut download at the same build is still a different
+    /// artifact and still earns a fresh budget; only the swap our own candidate
+    /// performed is folded in.
+    ///
+    /// Coarsening this key can only ever produce FEWER automatic attempts. The
+    /// budget's sole power is to refuse one; every gate that AUTHORIZES an apply
+    /// against particular bytes is a separate byte-exact check elsewhere.
+    fn covers(self, build: u64, dmg_sha256: [u8; 32], activation: bool) -> bool {
+        self.build == build && (self.activation || activation || self.dmg_sha256 == dmg_sha256)
+    }
 }
 
 /// One completed pre-park verification of the staged candidate.
@@ -10500,7 +10616,7 @@ fn input_event_handoff_class(ev: &input::InputEvent) -> UpdateHandoffEventClass 
         | input::InputEvent::MouseMove { .. }
         | input::InputEvent::Wheel { .. }
         | input::InputEvent::ScrollView(_) => UpdateHandoffEventClass::Tolerated,
-        input::InputEvent::Paste(_)
+        input::InputEvent::Paste(..)
         | input::InputEvent::Resize { .. }
         | input::InputEvent::ResizeWindowPx { .. } => UpdateHandoffEventClass::Revoking,
     }
@@ -11947,8 +12063,8 @@ struct App {
     /// path — one capture per sweep for every due session, one per
     /// [`crate::quit_safety::JOB_PROBE_MAX_AGE`] while nothing moves.
     job_probe: crate::quit_safety::JobProbe,
-    /// PROOF-CARRYING DSU (RFC Rung 2): the PERSISTENT "update staged — relaunch to
-    /// apply" nudge. GLOBAL like `config_notice`; painted into every window; does NOT
+    /// PROOF-CARRYING DSU (RFC Rung 2): the PERSISTENT "update ready — apply now"
+    /// nudge. GLOBAL like `config_notice`; painted into every window; does NOT
     /// auto-expire (a pending update stays offered until applied or dismissed). `None`
     /// = no nudge. Set from `Wake::UpdateStaged` when a strictly-newer build stages.
     relaunch: Option<relaunch_notice::RelaunchNotice>,
@@ -12091,8 +12207,10 @@ impl App {
         self.rain_dirty = true;
 
         if enabled {
-            // Drop closes the cue ingress, wakes/joins the worker, and disposes the
-            // platform queue immediately; a playing tail cannot survive this return.
+            // Drop closes the cue ingress, wakes and joins the worker (bounded — a
+            // WEDGED worker is detached and self-terminates instead of freezing this
+            // thread), and disposes the platform queue; a playing tail cannot
+            // survive a healthy teardown returning.
             self.trail_audio.replace(false);
             self.sparkle = None;
             self.level_up = None;
@@ -12455,7 +12573,7 @@ impl App {
     }
 
     /// Request a redraw of EVERY open window. Used by GLOBAL banner state (the
-    /// `config_notice` expiry, the Rung 2 relaunch nudge appear/dismiss): a repaint is
+    /// `config_notice` expiry, the Rung 2 update-ready nudge appear/dismiss): a repaint is
     /// SCHEDULED here, and the corresponding `RepaintKey` term (e.g. `relaunch_fp`)
     /// makes `should_repaint` actually present it even on an otherwise static grid.
     pub(crate) fn request_redraw_all_windows(&self) {
@@ -13062,6 +13180,8 @@ impl App {
     /// which plans the UNZOOMED topology a split is about to produce) without
     /// duplicating the sizing contract.
     fn plan_tab(&self, tab: &tab_model::Tab, rows: u16, cols: u16) -> tab_model::VisibleLeafPlan {
+        #[cfg(test)]
+        VISIBLE_LEAF_PLAN_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
         tab.visible_plan(
             tab_model::LogicalRect::new(0.0, 0.0, f32::from(cols), f32::from(rows)),
             1.0,
@@ -13075,16 +13195,17 @@ impl App {
         self.visible_leaf_plan_for_tab(wid, tab)
     }
 
-    /// Select the one renderer/capture route from the exact visible plan.
+    /// Select the one renderer/capture route from an already-resolved visible
+    /// plan. Frame callers retain that plan for geometry consumers instead of
+    /// rebuilding its owned leaf/divider vectors just to classify the route.
     ///
     /// Every planned identity is resolved before a route is returned. An empty
     /// or stale plan fails closed rather than falling back to a parked terminal
     /// projection or a hidden native sibling.
-    pub(crate) fn active_visible_content_route(
+    fn visible_content_route_from_plan(
         &self,
-        wid: WindowId,
+        plan: &tab_model::VisibleLeafPlan,
     ) -> Option<VisibleContentRoute> {
-        let plan = self.active_visible_leaf_plan(wid)?;
         let [only] = plan.leaves.as_slice() else {
             if plan.leaves.is_empty() {
                 return None;
@@ -13112,6 +13233,28 @@ impl App {
                 view: only.view,
             },
         })
+    }
+
+    /// Resolve the exact visible plan and its route as one frame-stable
+    /// artifact. This is the redraw entry: every immediate geometry consumer
+    /// borrows `plan`, so route selection does not trigger a second build.
+    fn active_visible_frame_layout(
+        &self,
+        wid: WindowId,
+    ) -> Option<(tab_model::VisibleLeafPlan, VisibleContentRoute)> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        let route = self.visible_content_route_from_plan(&plan)?;
+        Some((plan, route))
+    }
+
+    /// Select the one renderer/capture route from the exact visible plan.
+    #[cfg(test)]
+    pub(crate) fn active_visible_content_route(
+        &self,
+        wid: WindowId,
+    ) -> Option<VisibleContentRoute> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        self.visible_content_route_from_plan(&plan)
     }
 
     /// Root-inventory predicate for invalidating retained native state,
@@ -13612,7 +13755,8 @@ impl App {
         // after every tab add/switch/cycle/close.
         debug_assert!(
             self.structural_invariants_ok(),
-            "window/session structural invariants violated after sync_active_session",
+            "window/session structural invariants violated after sync_active_session: {}",
+            self.structural_invariant_violation().unwrap_or_default(),
         );
     }
 
@@ -14004,31 +14148,44 @@ impl App {
         let Some(owner) = self.frontmost_window else {
             return;
         };
+        self.focus_pane_in(owner, dir);
+    }
+
+    /// [`Self::focus_pane`] against an EXPLICIT window, reporting whether focus
+    /// actually moved. The window argument is the seam: the keybinding path and the
+    /// `pane` control verb are one implementation, so the verb cannot drift from the
+    /// chord into a second traversal that disagrees about where a neighbour is.
+    ///
+    /// The bool is the whole of what the verb may say — `false` means "single-pane
+    /// tab, or no neighbour that way", the only two ways the walk declines — and it
+    /// is deliberately NOT derived from a second look at the layout afterwards,
+    /// which could disagree with the traversal that ran.
+    fn focus_pane_in(&mut self, owner: WindowId, dir: pane::FocusDir) -> bool {
         if let Some(tree) = self.active_tree(owner) {
             if tree.len() == 1 {
-                return;
+                return false;
             }
             let Some((rows, cols)) = self.windows.get(&owner).map(|ws| (ws.rows, ws.cols)) else {
-                return;
+                return false;
             };
             let Some(target) = tree.focus_neighbor(dir, rows, cols) else {
-                return;
+                return false;
             };
             if !self
                 .active_tree_mut(owner)
                 .is_some_and(|tree| tree.set_focus(target))
             {
-                return;
+                return false;
             }
             let active = self.windows.get(&owner).map_or(0, |ws| ws.tabs.active);
             let synced = self.sync_tab_model_from_layout(owner, active);
             debug_assert!(synced);
             self.sync_window(owner);
-            return;
+            return true;
         }
 
         let Some(plan) = self.active_visible_leaf_plan(owner) else {
-            return;
+            return false;
         };
         let direction = match dir {
             pane::FocusDir::Left => tab_model::FocusDirection::Left,
@@ -14044,6 +14201,7 @@ impl App {
         if moved {
             self.sync_window(owner);
         }
+        moved
     }
 
     /// Retire the effect state of panes this window no longer shows.
@@ -14867,12 +15025,17 @@ impl App {
     /// rather than becoming stale behind the AppKit-preferred compile-time branch. Called
     /// unconditionally from `redraw`, so the call site stays feature-blind.
     #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
-    fn update_accessibility(&mut self, id: WindowId, window: &Window) {
+    fn update_accessibility(
+        &mut self,
+        id: WindowId,
+        window: &Window,
+        plan: &tab_model::VisibleLeafPlan,
+    ) {
         if let Some(snap) = self.grid_snapshot(id) {
             accessibility::apply_to_ns_view(window, &snap);
         }
         #[cfg(a11y_tree)]
-        self.push_a11y_tree(id);
+        self.push_a11y_tree_with_plan(id, Some(plan));
     }
 
     /// AccessKit (`a11y-accesskit`, the DEFAULT ship, cross-platform): re-publish the tree
@@ -14882,14 +15045,25 @@ impl App {
     /// [`WindowState::a11y_active`], which is what actually makes that true; before the latch
     /// existed the whole tree was materialised first and only then discarded.
     #[cfg(all(a11y_tree, not(all(target_os = "macos", feature = "a11y-appkit"))))]
-    fn update_accessibility(&mut self, id: WindowId, _window: &Window) {
-        self.push_a11y_tree(id);
+    fn update_accessibility(
+        &mut self,
+        id: WindowId,
+        _window: &Window,
+        plan: &tab_model::VisibleLeafPlan,
+    ) {
+        self.push_a11y_tree_with_plan(id, Some(plan));
     }
 
     /// No-op accessibility publish (neither a11y feature enabled).
     #[cfg(not(any(all(target_os = "macos", feature = "a11y-appkit"), a11y_tree)))]
     #[inline]
-    fn update_accessibility(&mut self, _id: WindowId, _window: &Window) {}
+    fn update_accessibility(
+        &mut self,
+        _id: WindowId,
+        _window: &Window,
+        _plan: &tab_model::VisibleLeafPlan,
+    ) {
+    }
 
     /// The Win32 HWND of window `wid`, or `0` when unreachable (headless, or no
     /// OS window yet) — callers treat `0` as "no owner" (task-modal dialogs).
@@ -15000,54 +15174,69 @@ impl App {
     /// `source`), running the pastejacking guard first. Shared by the synchronous
     /// paste path and the Linux/X11 [`Wake::PasteReady`] worker delivery so the guard
     /// + the paste seam apply identically on both.
+    ///
+    /// DEC 2004 IS READ EXACTLY ONCE HERE, and the answer rides the event to the
+    /// writer ([`input::PasteFraming::Gesture`]). The guard's question and the
+    /// bytes' framing are then the SAME observation of the mode; re-reading it at
+    /// drain time made them two, and a program that flips 2004 while the paste is
+    /// queued could put them in either disagreement — a body confirmed as
+    /// unbracketed landing bracketed, or a body judged inert because 2004 was on
+    /// landing unbracketed at a bare prompt, every line submitted, never asked.
     fn deliver_paste(&mut self, wid: WindowId, text: String, source: Source) {
+        // The one read. No terminal to read (headless, or before the window has
+        // content) means nothing was observed and nothing is owed: the writer
+        // frames by the live mode as it always has.
+        let framing = self
+            .front_terminal(wid)
+            .map_or(input::PasteFraming::AtDrain, |terminal| {
+                input::PasteFraming::Gesture {
+                    bracketed: term_lock(&terminal.term).modes().bracketed_paste,
+                }
+            });
         // PASTEJACKING GUARD (HUMAN path only — the control `paste` verb and the file
         // drop are unaffected): when bracketed paste is OFF and the clipboard holds an
         // embedded newline, a hidden line could auto-submit a command at a bare prompt /
         // REPL. Confirm first (default on). bracketed_paste (the modern shell default)
         // and a single trailing newline are never flagged, so the dialog is rare.
         if self.confirm_multiline_paste
-            && let Some(terminal) = self.front_terminal(wid)
+            && let input::PasteFraming::Gesture { bracketed } = framing
+            && paste_needs_confirm(&text, bracketed)
         {
-            let bracketed = term_lock(&terminal.term).modes().bracketed_paste;
-            if paste_needs_confirm(&text, bracketed) {
-                // macOS: present a window SHEET and return. The paste resumes in
-                // `Wake::PasteConfirmed`. A sheet is the correct pattern for a
-                // window-scoped confirmation and it returns immediately, so a modal
-                // answer can never park the loop that serves every other window; the
-                // keystrokes that ANSWER it are routed by `alert_keys` (see the
-                // rewritten doc comment on `present_multiline_paste_sheet`).
-                #[cfg(target_os = "macos")]
-                {
-                    // `None` ⇒ handled here: either the sheet is up and will resume the
-                    // paste itself, or a confirmation was ALREADY outstanding and this
-                    // unconfirmed text was dropped. `Some(text)` ⇒ no AppKit window to
-                    // attach one to (headless, or before `attach_os_window`), so hand
-                    // the text back and deliver it: the guard has no UI to ask through,
-                    // matching the posture of the no-dialog platform fallback below.
-                    if let Some(text) = self.present_multiline_paste_sheet(wid, text, source) {
-                        self.deliver_paste_confirmed(wid, text, source);
-                    }
-                    return;
+            // macOS: present a window SHEET and return. The paste resumes in
+            // `Wake::PasteConfirmed`. A sheet is the correct pattern for a
+            // window-scoped confirmation and it returns immediately, so a modal
+            // answer can never park the loop that serves every other window; the
+            // keystrokes that ANSWER it are routed by `alert_keys` (see the
+            // rewritten doc comment on `present_multiline_paste_sheet`).
+            #[cfg(target_os = "macos")]
+            {
+                // `None` ⇒ handled here: either the sheet is up and will resume the
+                // paste itself, or a confirmation was ALREADY outstanding and this
+                // unconfirmed text was dropped. `Some(text)` ⇒ no AppKit window to
+                // attach one to (headless, or before `attach_os_window`), so hand
+                // the text back and deliver it: the guard has no UI to ask through,
+                // matching the posture of the no-dialog platform fallback below.
+                if let Some(text) = self.present_multiline_paste_sheet(wid, text, source, framing) {
+                    self.deliver_paste_confirmed(wid, text, source, framing);
                 }
-                #[cfg(windows)]
-                {
-                    if !confirm_multiline_paste_dialog(text.lines().count(), self.window_hwnd(wid))
-                    {
-                        return; // user cancelled
-                    }
-                }
-                // Linux (and the remaining platforms): park the text on the
-                // in-window banner and return — the paste resumes only when
-                // Enter answers it in `on_key` (fail-closed, like the sheet).
-                #[cfg(not(any(target_os = "macos", windows)))]
-                {
-                    self.present_multiline_paste_banner(wid, text, source);
-                    return;
+                return;
+            }
+            #[cfg(windows)]
+            {
+                if !confirm_multiline_paste_dialog(text.lines().count(), self.window_hwnd(wid)) {
+                    return; // user cancelled
                 }
             }
+            // Linux (and the remaining platforms): park the text on the
+            // in-window banner and return — the paste resumes only when
+            // Enter answers it in `on_key` (fail-closed, like the sheet).
+            #[cfg(not(any(target_os = "macos", windows)))]
+            {
+                self.present_multiline_paste_banner(wid, text, source, framing);
+                return;
+            }
         }
-        self.deliver_paste_confirmed(wid, text, source);
+        self.deliver_paste_confirmed(wid, text, source, framing);
     }
 
     /// Present the multi-line paste confirmation as a WINDOW SHEET on `wid`, resuming
@@ -15094,6 +15283,7 @@ impl App {
         wid: WindowId,
         text: String,
         source: Source,
+        framing: input::PasteFraming,
     ) -> Option<String> {
         use objc2_app_kit::{NSAlert, NSView};
         use objc2_foundation::{MainThreadMarker, NSString};
@@ -15154,9 +15344,12 @@ impl App {
         // once — park it in a cell the handler `take`s. A sheet answers exactly once,
         // so a second call (which AppKit does not make) would simply find `None` and
         // deliver nothing rather than duplicating the paste.
-        let payload = std::cell::RefCell::new(Some((wid, text, source)));
+        // The sheet's DEC 2004 reading rides with the text for the same reason the
+        // Linux banner parks it: the answer is delivered later still, and the mode
+        // may have moved by then.
+        let payload = std::cell::RefCell::new(Some((wid, text, source, framing)));
         let handler = block2::RcBlock::new(move |response: objc2_app_kit::NSModalResponse| {
-            let Some((wid, text, source)) = payload.borrow_mut().take() else {
+            let Some((wid, text, source, framing)) = payload.borrow_mut().take() else {
                 return;
             };
             let proceed = response == objc2_app_kit::NSAlertFirstButtonReturn;
@@ -15165,6 +15358,7 @@ impl App {
                 wid,
                 text,
                 source,
+                framing,
                 proceed,
             });
         });
@@ -15208,11 +15402,19 @@ impl App {
 
     /// The delivery half of [`Self::deliver_paste`], split out so the asynchronous
     /// macOS sheet can resume it from `Wake::PasteConfirmed` without re-running the
-    /// pastejacking guard (which would ask twice).
-    fn deliver_paste_confirmed(&mut self, wid: WindowId, text: String, source: Source) {
+    /// pastejacking guard (which would ask twice). `framing` is that guard's own
+    /// reading of DEC 2004, carried here rather than re-read: it is the answer the
+    /// person was given, and it must be the answer the PTY gets.
+    fn deliver_paste_confirmed(
+        &mut self,
+        wid: WindowId,
+        text: String,
+        source: Source,
+        framing: input::PasteFraming,
+    ) {
         // Route through the seam so paste-formatting + the snap-to-bottom side
         // effect converge with the controller `paste` verb.
-        self.input(wid, InputEvent::Paste(text), source);
+        self.input(wid, InputEvent::Paste(text, framing), source);
     }
 
     /// Present the multi-line paste confirmation as an IN-WINDOW BANNER over `wid`'s
@@ -15225,7 +15427,13 @@ impl App {
     /// unconfirmed paste arriving while one is parked is DROPPED with a log line
     /// rather than stacking or silently replacing the question the user is reading.
     #[cfg(not(any(target_os = "macos", windows)))]
-    fn present_multiline_paste_banner(&mut self, wid: WindowId, text: String, source: Source) {
+    fn present_multiline_paste_banner(
+        &mut self,
+        wid: WindowId,
+        text: String,
+        source: Source,
+        framing: input::PasteFraming,
+    ) {
         if self.paste_banner.is_some() {
             aterm_log::warn!(
                 "multiline-paste confirmation already open; dropping the new \
@@ -15234,7 +15442,7 @@ impl App {
             );
             return;
         }
-        self.paste_banner = Some(paste_banner::PendingPaste::new(wid, text, source));
+        self.paste_banner = Some(paste_banner::PendingPaste::new(wid, text, source, framing));
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }
@@ -15250,12 +15458,12 @@ impl App {
         let Some(pending) = self.paste_banner.take() else {
             return;
         };
-        let (wid, text, source) = pending.take();
+        let (wid, text, source, framing) = pending.take();
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }
         if proceed {
-            self.deliver_paste_confirmed(wid, text, source);
+            self.deliver_paste_confirmed(wid, text, source, framing);
         }
     }
 
@@ -15341,7 +15549,14 @@ impl App {
         }
         let mut text = input::shell_escape_path(&raw);
         text.push(' ');
-        self.input(wid, InputEvent::Paste(text), Source::Human);
+        // A drop never consults DEC 2004 (no guard, no question — the inserted
+        // token is a path and a space, inert under either framing), so it has no
+        // earlier answer to keep and is framed by the mode at write time.
+        self.input(
+            wid,
+            InputEvent::Paste(text, input::PasteFraming::AtDrain),
+            Source::Human,
+        );
     }
 }
 
@@ -17618,6 +17833,45 @@ impl ApplicationHandler<Wake> for App {
                 self.request_redraw_all_windows();
             }
         }
+
+        // THE FIRST-OPEN INSTALL DOCTOR (owner, 2026-08-30). aterm can be opened
+        // in ways that quietly cripple it: double-clicked inside the mounted disk
+        // image, or unzipped and launched straight from ~/Downloads, where macOS
+        // App-Translocates it into a randomized read-only copy. Both LOOK like
+        // they worked — the window opens, the toolchain downloads — while the
+        // copy silently cannot update itself and cannot put `aterm` on the PATH
+        // of a new shell. The person is given no reason for either.
+        //
+        // So say it, once, where they are looking. The judgement is
+        // `aterm_update`'s, not a second opinion invented here: the same
+        // classification the updater acts on decides the words
+        // (`which_copy::posture_from`), so the card and the refusal can never
+        // disagree about the same install. `remedy()` is `None` for a healthy
+        // install AND for a dev build — nothing is wrong there and the advice
+        // would be false — so this fires only when there is something the person
+        // can actually fix.
+        //
+        // Sited at the END of `resumed`, which returns early when the OS window
+        // is already attached, so this runs on the launch that creates the first
+        // window and not on a second `resumed`. It borrows the admin step's
+        // lifetime rather than the transient one: an install this copy cannot
+        // undo is not a pill that should fade in a few seconds.
+        #[cfg(target_os = "macos")]
+        if let Ok(exe) = std::env::current_exe() {
+            // Canonicalize for the same reason `bundle::resolve_layout` does —
+            // a launcher symlink must resolve to the real bundle executable
+            // before the path is classified. A failure here is not fatal: fall
+            // back to the raw path rather than skipping the check.
+            let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+            let posture = aterm_update::which_copy::posture_from(&exe);
+            if let Some(remedy) = posture.remedy() {
+                aterm_log::info!("install posture: {} ({remedy})", posture.summary());
+                self.surface_update_status_for(
+                    &format!("{} \u{2014} {remedy}", posture.summary()),
+                    crate::notice::ADMIN_STEP_TTL,
+                );
+            }
+        }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: Wake) {
@@ -18392,6 +18646,18 @@ impl ApplicationHandler<Wake> for App {
                 };
                 let _ = reply.send(ok);
             }
+            Wake::FindCmd { action, reply } => {
+                let _ = reply.send(self.find_cmd(action));
+            }
+            Wake::PaneFocus { dir, reply } => {
+                let moved = self
+                    .frontmost_window
+                    .map(|wid| self.focus_pane_in(wid, dir));
+                let _ = reply.send(moved);
+            }
+            Wake::PointerCmd { action, reply } => {
+                let _ = reply.send(self.pointer_cmd(action));
+            }
             // The `window` verb produces a full front-window artifact: platform
             // chrome stitched around the exact submitted client destination. It
             // does not claim compositor visibility or scanout. Only the main thread
@@ -18595,6 +18861,9 @@ impl ApplicationHandler<Wake> for App {
                 // stale, and partial completions leave every view/window installed.
                 self.escalate_document_shutdown(el);
             }
+            Wake::NativeDocumentQueueSlotAvailable => {
+                self.native_document_queue_slot_available();
+            }
             Wake::NativeDocumentJournaled {
                 document,
                 generation,
@@ -18646,9 +18915,11 @@ impl ApplicationHandler<Wake> for App {
                     crate::app_native::NativeUpdateReconcilePurpose::Refresh,
                 );
             }
-            // Proof-carrying DSU (RFC Rung 1): apply a staged update now by re-exec —
-            // the staged build swaps in at the top of the new `main`. Only fires when
-            // a strictly-newer build is actually staged (else a pointless restart).
+            // Proof-carrying DSU (RFC Rung 1): apply a staged update now — in place,
+            // through the seamless overlap handoff (the cold re-exec, where the staged
+            // build swaps in at the top of the new `main`, is only the opt-out
+            // fallback). Only fires when a strictly-newer build is actually staged
+            // (else a pointless re-exec).
             // The controller received only `OK apply requested`; this reducer owns
             // the first truthful acceptance/rejection decision.
             Wake::ApplyStagedUpdate => {
@@ -18706,9 +18977,9 @@ impl ApplicationHandler<Wake> for App {
                     }
                 }
             }
-            // Proof-carrying DSU (RFC Rung 2): a strictly-newer build staged — show the
-            // persistent relaunch nudge on every window, unless the user already
-            // dismissed THIS build with [ Later ]. A NEWER build re-arms the nudge.
+            // Proof-carrying DSU (RFC Rung 2): a strictly-newer build staged — reconcile
+            // it, arm the in-session apply lane, and show the persistent update-ready
+            // nudge on every window. A NEWER build re-arms the nudge.
             Wake::UpdateStaged { build, version } => {
                 if std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_some() {
                     // Visual-only QA seam: it may paint supplied data, but never gains
@@ -18855,8 +19126,7 @@ impl ApplicationHandler<Wake> for App {
             }
             // aterm's own updater reporting from inside its check: the update bar.
             Wake::UpdateProgress(progress) => {
-                self.status_bars.update_progress(&progress, Instant::now());
-                self.sync_status_bars();
+                self.note_update_progress(&progress);
             }
             // `spawn` (control socket). RAISE POLICY (design S3, finding F3): the
             // hosting window is brought to the front only when `raise` says so —
@@ -19100,6 +19370,7 @@ impl ApplicationHandler<Wake> for App {
                 wid,
                 text,
                 source,
+                framing,
                 proceed,
             } => {
                 // Retire the outstanding-confirmation entry — the answer is in, so the
@@ -19116,7 +19387,7 @@ impl ApplicationHandler<Wake> for App {
                 #[cfg(not(target_os = "macos"))]
                 let _ = id;
                 if proceed {
-                    self.deliver_paste_confirmed(wid, text, source);
+                    self.deliver_paste_confirmed(wid, text, source, framing);
                 }
             }
             // A macOS menu item was clicked (menu.rs posted it). Dispatch into the
@@ -21132,10 +21403,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // see crate aterm-update. Running here keeps the env-var loop-guard single-
     // threaded and avoids swapping a bundle with the engine already live.
     // The successor half of the park->dial split (the worker logs the other half).
-    // This is the ONE piece of pre-dial work a design could plausibly remove, so
-    // its cost has to be a number before anyone restructures the parked window
-    // around a guess: the parent's readers are still parked for every millisecond
-    // spent in here.
+    // The parent's readers are still parked for every millisecond spent in here.
+    //
+    // WHAT THIS NUMBER IS NOT. It is only the POST-SWAP prologue. On a download
+    // lane the parent launches the current binary, so the FIRST image dittos the
+    // bundle and `execve`s from inside `apply_staged_if_ready_*` — which never
+    // returns — and therefore never reaches this line. The image that logs here
+    // is the re-exec'd one, whose apply is a fast `NoUpdate`. The swap's own
+    // cost is logged by the image that pays it, from `aterm-update`'s
+    // `install.rs` ("applied update … in N ms … → re-launching").
     let boot_apply_at = std::time::Instant::now();
     let boot_apply = if incoming_exec_fds.blocks_boot_apply() {
         aterm_update::ApplyOutcome::NotApplicable
@@ -22091,8 +22367,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
 
     // Silent background update check: off the event loop, on its own thread. It
     // talks to the private GitHub Release, verifies a notarized + Team-ID-pinned
-    // newer build, and stages it for the NEXT launch (the staged build is applied
-    // by aterm_update::apply_staged_if_ready at the top of main). A no-op for dev
+    // newer build, and stages it for the in-session apply lane (the GUI applies it
+    // in place through the seamless overlap handoff; `apply_staged_if_ready` at the
+    // top of main picks a stage up only if no handoff ever completed). A no-op for dev
     // builds, when the updater is disabled/unpinned, or when no update token is
     // provisioned. Skipped in headless mode so automated introspection never
     // reaches the network.
@@ -22138,7 +22415,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // pipeline can never again fail silently for a whole release.
         let health_proxy = event_loop.create_proxy();
         // Rung 2: when a strictly-newer build stages, surface the persistent
-        // "relaunch to apply" nudge (`Wake::UpdateStaged` -> `App.relaunch`).
+        // update-ready nudge (`Wake::UpdateStaged` -> `App.relaunch`).
         let staged_proxy = event_loop.create_proxy();
         // LIVE PROGRESS of the updater's own downloads → the update STATUS BAR.
         // Process-wide (`OnceLock`): every check this process runs — the loop
@@ -22164,7 +22441,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         );
     }
     // QA/screenshot hook (RFC Rung 2): `ATERM_DEBUG_RELAUNCH_NUDGE=<version>` seeds the
-    // relaunch nudge through the REAL `Wake::UpdateStaged` dispatch path, so the banner
+    // update-ready nudge through the REAL `Wake::UpdateStaged` dispatch path, so the nudge
     // can be exercised/captured without waiting for a genuine background stage. Inert
     // unless the env var is set; never affects a normal launch.
     if let Some(v) = std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE") {
@@ -22174,13 +22451,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .create_proxy()
             .send_event(Wake::UpdateStaged { build, version });
     }
-    // QA/screenshot hook for the STATUS BARS (the relaunch-nudge seam's twin):
+    // QA/screenshot hook for the STATUS BARS (the update-nudge seam's twin):
     // `ATERM_DEBUG_STATUS_BARS=1` seeds both lanes through their REAL wake
     // paths — a toolchain announcement, then a mid-pass snapshot, and an update
     // download in flight — so the rows can be captured with `image` without
-    // waiting for a genuine pass. Inert unless set; never affects a normal
+    // waiting for a genuine pass; `=staged` seeds a STAGED report in place of the
+    // download, so the "how it applies" line (the posture this process really
+    // computes) can be captured too. Inert unless set; never affects a normal
     // launch, and the seeded bars fold at their staleness caps like any other.
-    if std::env::var_os("ATERM_DEBUG_STATUS_BARS").is_some() {
+    if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS") {
         let proxy = event_loop.create_proxy();
         let _ = proxy.send_event(Wake::PkgSeedStarted {
             detail: "installing 10 ALab program(s) over the network (about 3 GB on disk \
@@ -22221,11 +22500,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 running: true,
             })),
         });
-        let _ = proxy.send_event(Wake::UpdateProgress(aterm_update::Progress::Downloading {
-            version: "0.62.0".to_string(),
-            bytes_done: 45_000_000,
-            bytes_total: 74_000_000,
-        }));
+        let update = if mode == "staged" {
+            aterm_update::Progress::Staged {
+                version: "0.62.0".to_string(),
+                build: build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0) + 1,
+            }
+        } else {
+            aterm_update::Progress::Downloading {
+                version: "0.62.0".to_string(),
+                bytes_done: 45_000_000,
+                bytes_total: 74_000_000,
+            }
+        };
+        let _ = proxy.send_event(Wake::UpdateProgress(update));
     }
 
     // Silent toolchain (atpkg) update loop: keeps installed `trust`/`clean`/… programs
@@ -24280,7 +24567,7 @@ mod overlap_handoff_tests {
         // still revoking.
         let _ = app.input(
             WindowId(0),
-            crate::input::InputEvent::Paste("p".to_string()),
+            crate::input::InputEvent::Paste("p".to_string(), crate::input::PasteFraming::AtDrain),
             crate::input::Source::Human,
         );
         assert!(
@@ -29875,7 +30162,7 @@ mod early_out_tests {
             // Whole-row in these unit frames (no sub-row scroll) — the frac-0 sentinel
             // keeps the key byte-identical to the pre-M1b path.
             scroll_frac_px: 0,
-            // No relaunch nudge in these unit frames (the no-nudge sentinel).
+            // No update-ready nudge in these unit frames (the no-nudge sentinel).
             relaunch_fp: 0,
             // No build badge in these unit frames (the hidden sentinel).
             badge_fp: 0,
@@ -34380,7 +34667,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            144,
+            145,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -34481,12 +34768,23 @@ mod spec_xref_gate {
             // shipped trustc rejects `-Zno-trust-verify` with "unknown unstable
             // option", cargo's target-info probe dies on it, and `-q` swallowed the
             // one line saying so, leaving a silent exit 1 this comment now prevents.
+            //
+            // So this EMITS the live spelling, the one `.cargo/config.toml` carries
+            // (`-Ztrust-verify=off`), while the already-set check still RECOGNISES
+            // the retired one: an inherited RUSTFLAGS may legitimately carry either,
+            // and appending a second off-switch to a flag set that already has one is
+            // how the "unknown unstable option" arrives in the first place. Emit one
+            // spelling, accept both — the same asymmetry aterm-gui/build.rs uses when
+            // it reads rustflags it did not write.
             let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-            if lane.is_empty() && !rustflags.contains("-Zno-trust-verify") {
+            if lane.is_empty()
+                && !rustflags.contains("-Ztrust-verify=off")
+                && !rustflags.contains("-Zno-trust-verify")
+            {
                 if !rustflags.is_empty() {
                     rustflags.push(' ');
                 }
-                rustflags.push_str("-Zno-trust-verify=yes");
+                rustflags.push_str("-Ztrust-verify=off");
             }
             // CAPTURED, not inherited: this rung's failure used to panic with a
             // bare "xtask harness-manifest failed" while the child's one line
@@ -37140,6 +37438,39 @@ mod tab_strip_math_tests {
         );
     }
 
+    /// Nothing bounds the pointer coordinate a drag outside the window reports,
+    /// so the step count SATURATES. Direction is the load-bearing half: a
+    /// wrapped magnitude would send a drag held above the top edge scrolling
+    /// toward the live bottom, i.e. backwards.
+    #[test]
+    fn an_absurd_overshoot_pins_the_step_count_without_flipping_direction() {
+        use crate::app_render::selection_autoscroll_lines;
+        let (ch, pad, strip_px, rows) = (16usize, 0usize, 0usize, 24u16);
+        let bottom = (rows as usize * ch) as f64;
+        assert_eq!(
+            selection_autoscroll_lines(-1e12, pad, strip_px, ch, rows),
+            i32::MAX,
+            "far above the top edge still scrolls INTO history"
+        );
+        assert_eq!(
+            selection_autoscroll_lines(bottom + 1e12, pad, strip_px, ch, rows),
+            -i32::MAX,
+            "far below the bottom edge still scrolls TOWARD the live bottom"
+        );
+        for ch in [0, 1] {
+            assert_eq!(
+                selection_autoscroll_lines(f64::NEG_INFINITY, pad, strip_px, ch, rows),
+                i32::MAX,
+                "unbounded top overshoot saturates even at the minimum cell height"
+            );
+            assert_eq!(
+                selection_autoscroll_lines(f64::INFINITY, pad, strip_px, ch, rows),
+                -i32::MAX,
+                "unbounded bottom overshoot saturates even at the minimum cell height"
+            );
+        }
+    }
+
     /// The autoscroll edges shift by the interior `pad` and the tab-strip pixel
     /// band: the terminal grid starts at `pad + strip_px`, so the top edge moves
     /// down by both and the "inside" band is offset accordingly.
@@ -37543,6 +37874,100 @@ mod paste_banner_flow_tests {
             "only the answered paste delivers; the dropped one is gone"
         );
         assert!(app.paste_banner.is_none());
+    }
+
+    /// Flip DEC 2004 on `wid`'s live engine exactly as a program on the other
+    /// end of the PTY would, so a test can stand INSIDE the window between the
+    /// gesture and the drain.
+    fn set_bracketed(app: &App, wid: WindowId, on: bool) {
+        let mirror = app.front_terminal(wid).expect("a terminal to flip");
+        let seq: &[u8] = if on { b"\x1b[?2004h" } else { b"\x1b[?2004l" };
+        super::term_lock(&mirror.term).process(seq);
+    }
+
+    /// THE FRAMING PROMISE, forward direction: the banner asked an UNBRACKETED
+    /// question ("these lines run as commands") and the program turns DEC 2004
+    /// ON while the answer is owed. The confirmed paste must land framed the way
+    /// the person was told it would be — the mode read for the question is the
+    /// mode the bytes are framed by, one observation, not two.
+    #[test]
+    fn a_mode_flip_while_the_question_stands_cannot_reframe_the_answer() {
+        let (mut app, rx) = app_with_pty_observer();
+        let wid = WindowId(0);
+        set_bracketed(&app, wid, false);
+        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        assert!(
+            app.paste_banner.is_some(),
+            "the unbracketed question stands"
+        );
+        // The program races the answer: DEC 2004 on, between gesture and drain.
+        set_bracketed(&app, wid, true);
+        app.answer_paste_banner(true);
+        assert_eq!(
+            drain(rx),
+            b"ls\rrm -rf ~",
+            "the confirmed paste keeps the framing its question was asked under"
+        );
+    }
+
+    /// Bytes larger than any pipe can hold: ONE such frame parks the FIFO
+    /// writer thread inside its blocking write, which is what makes the window
+    /// between a gesture and its drain a place a test can stand rather than a
+    /// race it has to win.
+    const WEDGE_BYTES: usize = 256 * 1024;
+
+    /// Read until `want` bytes have arrived (or `ms` elapses), then take
+    /// whatever else follows within a short idle grace — so an answer SHORTER
+    /// than expected still returns promptly and a longer one is never truncated.
+    fn drain_at_least(fd: i32, want: usize, ms: u64) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            if out.len() >= want || std::time::Instant::now() >= deadline {
+                out.extend_from_slice(&drain_within(fd, 150));
+                return out;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// THE FRAMING PROMISE, reverse direction — the dangerous one. DEC 2004 was
+    /// ON when the person pressed paste, so the guard judged the body inert and
+    /// asked NOTHING; the program then turns 2004 OFF before the writer drains.
+    /// Framing the paste by the mode at drain time would deliver those lines
+    /// UNBRACKETED to a bare prompt — every one of them submitted, which is
+    /// precisely the question the guard exists to ask and never did.
+    ///
+    /// The window is entered deliberately, not raced: a wedge-sized paste ahead
+    /// of it parks the per-session writer thread mid-write, so the paste behind
+    /// it provably has not been formatted yet when the mode flips.
+    #[test]
+    fn a_mode_flip_before_the_drain_cannot_unframe_a_paste_nobody_was_asked_about() {
+        let (mut app, rx) = app_with_pty_observer();
+        let wid = WindowId(0);
+        set_bracketed(&app, wid, true);
+        // No newline in the wedge: it is plumbing, and the guard must stay silent
+        // about it for the same reason it stays silent about the real paste.
+        app.deliver_paste(wid, "w".repeat(WEDGE_BYTES), Source::Human);
+        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        assert!(
+            app.paste_banner.is_none(),
+            "bracketed paste is never flagged — nobody was asked"
+        );
+        // The program races the drain: DEC 2004 off while the paste is in flight.
+        set_bracketed(&app, wid, false);
+        let out = drain_at_least(rx, WEDGE_BYTES + 12 + 11, 5000);
+        assert!(
+            out.ends_with(b"\x1b[200~ls\rrm -rf ~\x1b[201~"),
+            "an unasked paste keeps the framing that made it unaskable; tail was {:?}",
+            String::from_utf8_lossy(&out[out.len().saturating_sub(32)..]).into_owned()
+        );
     }
 
     /// `confirm_multiline_paste = false` (the explicit opt-out) delivers a risky
@@ -38243,7 +38668,12 @@ mod headless_video_tests {
         // kept only `.chars().next()`).
         let mut multi = Vec::new();
         record_controller_video_attempts(&mut multi, &InputEvent::Text("ab".into()), 20, 8);
-        record_controller_video_attempts(&mut multi, &InputEvent::Paste(" c".into()), 21, 8);
+        record_controller_video_attempts(
+            &mut multi,
+            &InputEvent::Paste(" c".into(), crate::input::PasteFraming::AtDrain),
+            21,
+            8,
+        );
         assert_eq!(
             multi,
             vec![
@@ -39156,6 +39586,34 @@ mod headless_video_tests {
 #[cfg(test)]
 mod visible_content_route_tests {
     use super::*;
+
+    #[test]
+    fn redraw_layout_resolver_builds_one_plan() {
+        let app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        reset_visible_leaf_plan_builds();
+        let (plan, route) = app.active_visible_frame_layout(wid).expect("frame layout");
+        assert_eq!(plan.leaves.len(), 1, "negative-control fixture shape");
+        assert_eq!(route, VisibleContentRoute::Terminal { composed: false });
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "one frame layout owns one plan build"
+        );
+
+        // Negative control: the retired redraw spelling asked for a route and
+        // then independently asked for geometry. The observation seam must see
+        // both builds, or the positive assertion above could pass vacuously.
+        reset_visible_leaf_plan_builds();
+        assert!(app.active_visible_content_route(wid).is_some());
+        assert!(app.active_visible_leaf_plan(wid).is_some());
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            2,
+            "old spelling rebuilt the plan"
+        );
+    }
 
     #[test]
     fn route_follows_zoom_aware_visible_content_not_hidden_root_membership() {

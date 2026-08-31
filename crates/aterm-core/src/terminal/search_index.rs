@@ -297,20 +297,23 @@ impl Terminal {
             let grid = &self.grid;
             let start_hist = refresh_start.saturating_sub(hist_base);
             let count = visible_base.saturating_sub(refresh_start);
-            index.index_visible_content(
-                refresh_start,
-                (0..count).map(|j| {
-                    grid.get_history_line(start_hist.saturating_add(j))
-                        .map(|l| line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES))
-                        .unwrap_or_default()
-                }),
-            );
+            index.index_numbered_content_owned((0..count).map(|j| {
+                let absolute_row = refresh_start.saturating_add(j);
+                let text = grid
+                    .get_history_line(start_hist.saturating_add(j))
+                    .map(|l| {
+                        line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
+                    })
+                    .unwrap_or_default();
+                (absolute_row, text)
+            }));
         }
         let rows = self.rows();
-        index.index_visible_content(
-            visible_base,
-            (0..rows).map(|r| self.get_line_text(i32::from(r), None).unwrap_or_default()),
-        );
+        index.index_numbered_content_owned((0..rows).map(|r| {
+            let absolute_row = visible_base.saturating_add(usize::from(r));
+            let text = self.get_line_text(i32::from(r), None).unwrap_or_default();
+            (absolute_row, text)
+        }));
         Some(index)
     }
 
@@ -337,12 +340,11 @@ impl Terminal {
         // `get_line_text`, reachable via the control `search` path. Legitimate lines
         // are far under the ceiling, so this never changes indexed content.
         //
-        // Fed STREAMING, not collected: `index_visible_content` only does
-        // `for (offset, line) in lines.into_iter().enumerate()` — no length, no
-        // random access, no second pass — and `index_line` stores its own
-        // `to_string()` copy, so materializing a `Vec<String>` first bought
-        // nothing but a second simultaneous residency of the WHOLE scrollback
-        // text (plus a 24-byte spine per line) on top of the index being built.
+        // Fed STREAMING, not collected: the owned batch walks the iterator once
+        // and moves each bounded `String` into the index, with no second copy.
+        // Materializing a `Vec<String>` first bought nothing but a second
+        // simultaneous residency of the WHOLE scrollback text (plus a 24-byte
+        // spine per line) on top of the index being built.
         // Behavior is unchanged: the same lines are enumerated in the same order
         // and keyed at `base + offset`, so the line set, absolute-row keys and
         // eviction/INCOMPLETE semantics — and therefore every `SearchMatch`
@@ -355,14 +357,16 @@ impl Terminal {
         // regression guard.
         use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
         let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
-        search.index_visible_content(
-            hist_base,
-            (0..scrollback).map(|i| {
-                grid.get_history_line(i)
-                    .map(|l| line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES))
-                    .unwrap_or_default()
-            }),
-        );
+        search.index_numbered_content_owned((0..scrollback).map(|i| {
+            let absolute_row = hist_base.saturating_add(i);
+            let text = grid
+                .get_history_line(i)
+                .map(|l| {
+                    line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
+                })
+                .unwrap_or_default();
+            (absolute_row, text)
+        }));
 
         // Visible rows 0..rows → absolute oldest + scrollback + r. Combining-aware
         // `get_line_text` so accents / ZWJ clusters survive (FIDELITY I-1).
@@ -370,10 +374,11 @@ impl Terminal {
         // `r as i32` where `r` was a u16-bounded usize). Streamed for the same
         // reason as the history above.
         let vis_base = hist_base.saturating_add(scrollback);
-        search.index_visible_content(
-            vis_base,
-            (0..rows).map(|r| self.get_line_text(i32::from(r), None).unwrap_or_default()),
-        );
+        search.index_numbered_content_owned((0..rows).map(|r| {
+            let absolute_row = vis_base.saturating_add(usize::from(r));
+            let text = self.get_line_text(i32::from(r), None).unwrap_or_default();
+            (absolute_row, text)
+        }));
 
         search
     }

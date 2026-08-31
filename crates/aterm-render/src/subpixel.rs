@@ -69,10 +69,10 @@ impl SubpixelMode {
     }
 
     /// Parse `ATERM_FONT_SUBPIXEL`. Unset or unrecognized = Off;
-    /// `ATERM_RASTERIZER=fontdue` (the byte-stable portable path the
+    /// `ATERM_RASTERIZER` (the byte-stable portable path the
     /// golden/parity tests export) forces Off, exactly like the hint seam.
     pub(crate) fn from_env() -> Self {
-        if crate::hinted::HintMode::fontdue_forced() {
+        if crate::hinted::HintMode::portable_forced() {
             return Self::Off;
         }
         match std::env::var("ATERM_FONT_SUBPIXEL").ok().as_deref() {

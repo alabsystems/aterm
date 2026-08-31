@@ -37,6 +37,23 @@ aterm-hash = { workspace = true }
 # same clock aterm-effects already uses across this crate's wasm closure.
 aterm-time = { workspace = true }
 wgpu = { version = "29", default-features = false }
+# THE ROW's one public leak, closed. `GpuRenderer::create_window_surface` took
+# `impl Into<wgpu::SurfaceTarget<'static>>` — the ONLY place a wgpu type crossed
+# this crate's public API, and the one thing a first-party macOS backend could
+# not satisfy. It now takes `renderer::WindowTarget`, which is
+# `HasWindowHandle + HasDisplayHandle` (+ `Send + Sync` off wasm) — the bound
+# wgpu itself builds `SurfaceTarget` out of, so the set of accepted types is
+# unchanged and both call sites in aterm-gui pass the same `Arc<winit::Window>`.
+#
+# ZERO PACKAGES, ZERO LINES, on every cell — measured, not assumed. This crate
+# already reaches `raw-window-handle 0.6.2` through wgpu, `cargo tree -p aterm
+# --target <triple> -e normal` finds exactly one version of it on all four
+# cells, and it survives the mac retirement because winit lists `rwh_06` in its
+# DEFAULT feature set (vendor/winit/Cargo.toml) and the workspace takes winit
+# with defaults. Declared here because this crate NAMES it in a public bound,
+# which is the house rule: a direct use gets a direct dependency rather than
+# riding another crate's re-export.
+raw-window-handle = "0.6"
 bytemuck = { version = "1", features = ["derive"] }
 # Optional: only pulled in by the off-by-default `spec-anchors` feature.
 aterm-spec = { workspace = true, optional = true }
@@ -46,7 +63,78 @@ aterm-spec = { workspace = true, optional = true }
 # browser equivalent, so it is native-only; the wasm WebGPU init path (the
 # aterm-gpu-web crate) awaits the futures instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wgpu = { version = "29", default-features = false, features = ["metal", "vulkan", "dx12", "gles", "wgsl"] }
+# `dx12` is DELIBERATELY NOT in this list — it lives in the `cfg(windows)` block
+# below. wgpu's own default set here is off entirely (default-features = false);
+# the omission that matters is that a DX12-shaped feature must not be requested
+# on a cell that can never build a DX12 device. The backend itself already knows
+# that — wgpu-hal-29.0.3/build.rs:10 and wgpu-core-29.0.3/build.rs:11 both alias
+# `dx12: { all(target_os = "windows", feature = "dx12") }`, so off Windows the
+# feature compiles no dx12 module in either crate. What it DOES still compile is
+# naga's HLSL writer: wgpu-hal's `dx12` feature forwards `naga/hlsl-out`
+# (wgpu-hal-29.0.3/Cargo.toml:68), and naga-29.0.3/build.rs:5 aliases
+# `hlsl_out: { any(feature = "hlsl-out", ...) }` with the plain arm NOT
+# target-gated, so naga-29.0.3/src/back/mod.rs:18-19 (`#[cfg(hlsl_out)] pub mod
+# hlsl;`) built src/back/hlsl — 10,389 lines — with no possible caller, since the
+# only consumer of `naga::back::hlsl` in this graph is wgpu-hal/src/dx12/, which
+# is cfg'd out there. COST: -10,389 lines / 0 packages on the LINUX cell only.
+# mac-arm loses NO package and NO compiled line, but it is not literally
+# untouched and an earlier draft of this comment said it was: the `wgpu` and
+# `wgpu-core` `dx12` FEATURE rows do disappear from
+# `cargo tree -e features --target aarch64-apple-darwin`. They were enabling
+# nothing — wgpu routes dx12/vulkan forwarding through the target-gated
+# `wgpu-core-deps-*` crates, so mac never reached `naga/hlsl-out` and naga
+# carries `msl-out` only, before and after. Feature rows moved, compiled code
+# did not. wasm32 is untouched; and WINDOWS IS UNCHANGED, because
+# both this block and the `cfg(windows)` one are active there and features union.
+#
+# ONE BACKEND PER CELL, and this is a deliberate behaviour trade, not hygiene.
+# The single `cfg(not(wasm32))` row above used to name every backend on every
+# native target, so each cell carried the OTHERS' code for nothing it could
+# reach by default: `Backends::PRIMARY` is VULKAN|METAL|DX12|BROWSER_WEBGPU
+# (wgpu-types-29.0.3/src/backend.rs:127), so GL is never selected by the default
+# path anywhere, and Windows defaults to DX12 alone (src/lib.rs:310).
+#
+# WHAT IT COSTS, measured per cell:
+#   linux    drops `gles`   -> glow 0.17.0 (54,094) + khronos-egl 6.0.0 (3,398)
+#                             = 2 packages / 57,492 lines. wayland-sys and dlib
+#                             also appear under that arm but have other parents
+#                             (softbuffer, wayland-backend, xkbcommon-dl) and STAY.
+#   windows  drops `vulkan` -> ash 0.38 (127,759) + spirv 0.4 (5,526) +
+#                             gpu-descriptor 0.3.2 + gpu-descriptor-types, AND a
+#                             THIRD hashbrown major (0.15.5, 23,476) + foldhash
+#                             whose only parent chain is gpu-descriptor.
+#            drops `gles`   -> glow + glutin_wgl_sys 0.6.1 + khronos-egl.
+#   mac      drops `vulkan`/`gles`, which cost ZERO there already — wgpu routes
+#            them through the target-gated `wgpu-core-deps-*` shims, so mac never
+#            resolved ash or glow. Hygiene only; the binary does not change.
+#
+# THE TRADE, stated plainly because it is a real regression for one class of user:
+# `ATERM_GPU_BACKEND` (src/lib.rs:263-271, documented at :302-322 as the "escape
+# hatch for a broken driver path") still PARSES `gl` and `vulkan` — the
+# `Backends` bitflags are plain wgpu-types constants with no feature cfg — but on
+# a cell that no longer compiles that backend, `enumerate_adapters` finds no
+# adapter for it. So a Linux box whose Vulkan driver is broken, or a Windows box
+# whose DX12 driver is broken, previously fell to a SECOND GPU backend and now
+# falls to the CPU softbuffer present path instead. That path exists and is the
+# documented fail-soft arm for device loss; this makes it the first fallback
+# rather than the second. Reverting is one feature name per row.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "29", default-features = false, features = ["metal", "wgsl"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
+
+# Windows-only: the DX12 backend. This is the one cell where `dx12` builds a real
+# device, and it is the DEFAULT backend there (src/lib.rs `backends_from_env`) plus
+# the only one wired for the HDR/scRGB present. Every first-party DX12 call site is
+# already `#[cfg(windows)]` — `wgpu::hal::api::Dx12` at src/renderer.rs:8099/:8147
+# (inside `#[cfg(windows)] fn surface_output_hdr_enabled` / `fn tag_swapchain_scrgb`)
+# and `wgpu::Dx12SwapchainKind` at src/lib.rs:506. `wgpu::Backends::DX12`
+# (src/lib.rs:265, :310, :903) is NOT gated by this feature: it is a plain
+# wgpu-types bitflag (wgpu-types-29.0.3/src/backend.rs:110, and wgpu-types has no
+# `dx12` feature at all), so `ATERM_GPU_BACKEND=dx12` still parses on every cell.
+# (declared in the existing `cfg(windows)` dependency table below, next to the
+# `windows` crate that the same DX12 present path needs.)
 
 # wasm32: the WebGL2 backend (wgpu's `webgl` feature targets
 # wasm32-unknown-unknown via wasm-bindgen/web-sys) + WGSL. Orca's terminal
@@ -67,10 +155,25 @@ wgpu = { version = "29", default-features = false, features = ["webgl", "wgsl", 
 # new crate). This is the house-rule carve-out: `windows` behind cfg for a genuinely
 # COM surface. `dx12`-only; a no-op on Vulkan (which has no DXGI swapchain).
 [target.'cfg(windows)'.dependencies]
+# The DX12 backend, Windows-only (see the note above the native wgpu row).
+wgpu = { version = "29", default-features = false, features = ["dx12", "wgsl"] }
 windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Foundation",
+    # DECLARED BECAUSE WE USE IT, not because something upstream did. This crate
+    # calls `IDXGIOutput6::GetDesc1` (src/renderer.rs:8108) and
+    # `DXGI_OUTPUT_DESC1` carries an `HMONITOR`, which lives here — so without
+    # this feature the method is not generated at all and the call is
+    # `E0599: no method named GetDesc1`.
+    #
+    # It compiled for as long as it did by ACCIDENT: wgpu-hal's `gles` arm needs
+    # WGL and pulled Win32_Graphics_Gdi, Win32_Graphics_OpenGL and
+    # Win32_System_LibraryLoader into the union. Narrowing the wgpu backends per
+    # cell took the OpenGL arm off Windows and this went with it — caught by a
+    # cross-compile, and invisible to `cargo tree`, because a missing feature is
+    # a COMPILE error and not a resolution one.
+    "Win32_Graphics_Gdi",
 ] }
 
 [dev-dependencies]

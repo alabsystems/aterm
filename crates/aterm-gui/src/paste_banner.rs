@@ -53,6 +53,11 @@ pub(crate) struct PendingPaste {
     pub(crate) wid: crate::WindowId,
     text: String,
     source: crate::input::Source,
+    /// The DEC 2004 reading the QUESTION was asked under. Parked with the text
+    /// because the answer lands later still (the ordered writer drains it), and
+    /// a program on the other end can flip the mode while the banner stands: the
+    /// paste must reach the PTY framed the way the banner said it would be.
+    framing: crate::input::PasteFraming,
 }
 
 impl PendingPaste {
@@ -60,13 +65,30 @@ impl PendingPaste {
     // `#[cfg(not(any(target_os = "macos", windows)))]`. `test` is in the set because
     // this module's own tests construct one on every platform.
     #[cfg(any(test, not(any(target_os = "macos", windows))))]
-    pub(crate) fn new(wid: crate::WindowId, text: String, source: crate::input::Source) -> Self {
-        Self { wid, text, source }
+    pub(crate) fn new(
+        wid: crate::WindowId,
+        text: String,
+        source: crate::input::Source,
+        framing: crate::input::PasteFraming,
+    ) -> Self {
+        Self {
+            wid,
+            text,
+            source,
+            framing,
+        }
     }
 
     /// Surrender the parked paste for CONFIRMED delivery.
-    pub(crate) fn take(self) -> (crate::WindowId, String, crate::input::Source) {
-        (self.wid, self.text, self.source)
+    pub(crate) fn take(
+        self,
+    ) -> (
+        crate::WindowId,
+        String,
+        crate::input::Source,
+        crate::input::PasteFraming,
+    ) {
+        (self.wid, self.text, self.source, self.framing)
     }
 
     /// The parked text, for the row builder.
@@ -245,7 +267,12 @@ mod tests {
             .map(|i| format!("line {i}\n"))
             .collect::<Vec<_>>()
             .join("");
-        let pending = PendingPaste::new(crate::WindowId(0), text.clone(), test_source());
+        let pending = PendingPaste::new(
+            crate::WindowId(0),
+            text.clone(),
+            test_source(),
+            test_framing(),
+        );
         assert_eq!(pending.wanted_rows(), MAX_BANNER_ROWS);
         let rows = banner_rows(&text, 80, MAX_BANNER_ROWS, Theme::default());
         let last = text_of(&rows[MAX_BANNER_ROWS - 1]);
@@ -283,7 +310,14 @@ mod tests {
     /// `wanted_rows` follows the paste: title + one row per line, capped.
     #[test]
     fn wanted_rows_tracks_the_paste_body() {
-        let p = |text: &str| PendingPaste::new(crate::WindowId(0), text.into(), test_source());
+        let p = |text: &str| {
+            PendingPaste::new(
+                crate::WindowId(0),
+                text.into(),
+                test_source(),
+                test_framing(),
+            )
+        };
         assert_eq!(p("a\nb").wanted_rows(), 3);
         assert_eq!(p("a\nb\nc\nd\ne\nf").wanted_rows(), MAX_BANNER_ROWS);
     }
@@ -295,13 +329,24 @@ mod tests {
             crate::WindowId(7),
             "ls\nrm -rf ~\n".to_string(),
             test_source(),
+            crate::input::PasteFraming::Gesture { bracketed: false },
         );
-        let (wid, text, _source) = pending.take();
+        let (wid, text, _source, framing) = pending.take();
         assert_eq!(wid, crate::WindowId(7));
         assert_eq!(text, "ls\nrm -rf ~\n");
+        // The parked FRAMING is part of "untouched": it is the answer the banner's
+        // question was asked under, and delivery must be framed by it.
+        assert_eq!(
+            framing,
+            crate::input::PasteFraming::Gesture { bracketed: false }
+        );
     }
 
     fn test_source() -> crate::input::Source {
         crate::input::Source::Human
+    }
+
+    fn test_framing() -> crate::input::PasteFraming {
+        crate::input::PasteFraming::Gesture { bracketed: false }
     }
 }

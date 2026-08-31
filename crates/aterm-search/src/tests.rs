@@ -1,7 +1,6 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 use super::*;
 
@@ -1660,6 +1659,39 @@ fn generation_bumps_on_index_visible_content() {
 
     search.index_visible_content(2, vec!["line C"]);
     assert_eq!(search.generation(), 2);
+}
+
+/// The owned batch seam is result-identical to borrowed indexing and advances
+/// the generation once for the whole batch.
+#[test]
+fn owned_numbered_content_matches_borrowed_indexing() {
+    let mut borrowed = TerminalSearch::new();
+    borrowed.index_visible_content(7, ["prefix needle suffix", "second needle"]);
+
+    let mut first_owned = String::with_capacity(128);
+    first_owned.push_str("prefix needle suffix");
+    let first_buffer = first_owned.as_ptr();
+    let first_capacity = first_owned.capacity();
+
+    let mut owned = TerminalSearch::new();
+    owned.index_numbered_content_owned([(7, first_owned), (8, String::from("second needle"))]);
+
+    let retained = owned.index.lines.get(&7).expect("owned row is retained");
+    assert_eq!(
+        retained.as_ptr(),
+        first_buffer,
+        "owned indexing must retain the caller's allocation"
+    );
+    assert_eq!(retained.capacity(), first_capacity);
+
+    let borrowed_results = borrowed
+        .search_results_opts("needle", true, false)
+        .expect("borrowed search is valid");
+    let owned_results = owned
+        .search_results_opts("needle", true, false)
+        .expect("owned search is valid");
+    assert_eq!(owned_results, borrowed_results);
+    assert_eq!(owned.generation(), 1, "owned batch bumps exactly once");
 }
 
 /// `clear` bumps the generation.

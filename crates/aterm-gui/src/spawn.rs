@@ -7,7 +7,7 @@
 //! `App::register_session`. A verbatim relocation of the spawn seam.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use aterm_core::terminal::{ClipboardAccess, ClipboardOperation, Terminal};
@@ -1800,8 +1800,114 @@ const LIVE_SCROLLBACK_RING_LINES: usize = 10_000;
 /// bound for the X11 PRIMARY selection. `None` = "this destination untouched", so
 /// a `'p'`-only set can never clobber the CLIPBOARD and vice versa.
 struct ClipWrite {
-    clipboard: Option<String>,
-    primary: Option<String>,
+    clipboard: Option<Arc<str>>,
+    primary: Option<Arc<str>>,
+}
+
+impl ClipWrite {
+    /// Merge a newer last-writer-wins update without disturbing a destination
+    /// the newer OSC 52 command did not name.
+    fn merge_latest(&mut self, newer: Self) {
+        if newer.clipboard.is_some() {
+            self.clipboard = newer.clipboard;
+        }
+        if newer.primary.is_some() {
+            self.primary = newer.primary;
+        }
+    }
+}
+
+/// Constant-memory handoff from the terminal callback to the blocking
+/// platform-clipboard worker. There is exactly one pending [`ClipWrite`]; a
+/// producer replaces each named destination in that slot instead of enqueueing
+/// another arbitrarily large OSC 52 payload.
+struct ClipMailbox {
+    state: Mutex<ClipMailboxState>,
+    ready: Condvar,
+}
+
+struct ClipMailboxState {
+    pending: Option<ClipWrite>,
+    sender_open: bool,
+}
+
+struct ClipMailboxSender {
+    mailbox: Arc<ClipMailbox>,
+}
+
+struct ClipMailboxReceiver {
+    mailbox: Arc<ClipMailbox>,
+}
+
+fn clip_mailbox() -> (ClipMailboxSender, ClipMailboxReceiver) {
+    let mailbox = Arc::new(ClipMailbox {
+        state: Mutex::new(ClipMailboxState {
+            pending: None,
+            sender_open: true,
+        }),
+        ready: Condvar::new(),
+    });
+    (
+        ClipMailboxSender {
+            mailbox: mailbox.clone(),
+        },
+        ClipMailboxReceiver { mailbox },
+    )
+}
+
+impl ClipMailboxSender {
+    /// Publish without waiting for the worker. The only contended section is a
+    /// pointer swap under the mailbox lock; platform I/O never holds it.
+    fn publish(&self, write: ClipWrite) {
+        let mut state = self
+            .mailbox
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(pending) = state.pending.as_mut() {
+            pending.merge_latest(write);
+        } else {
+            state.pending = Some(write);
+        }
+        drop(state);
+        self.mailbox.ready.notify_one();
+    }
+}
+
+impl Drop for ClipMailboxSender {
+    fn drop(&mut self) {
+        let mut state = self
+            .mailbox
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.sender_open = false;
+        drop(state);
+        self.mailbox.ready.notify_one();
+    }
+}
+
+impl ClipMailboxReceiver {
+    fn recv(&self) -> Option<ClipWrite> {
+        let mut state = self
+            .mailbox
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if let Some(write) = state.pending.take() {
+                return Some(write);
+            }
+            if !state.sender_open {
+                return None;
+            }
+            state = self
+                .mailbox
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
 }
 
 /// PURE routing of an OSC 52 selection list onto the two real destinations
@@ -1827,9 +1933,10 @@ fn route_osc52_write(
     let wants_clipboard = selections.is_empty()
         || selections.iter().any(|s| !matches!(s, Sel::Primary))
         || (wants_primary && !primary_supported);
+    let content: Arc<str> = Arc::from(content);
     ClipWrite {
-        clipboard: wants_clipboard.then(|| content.to_owned()),
-        primary: (wants_primary && primary_supported).then(|| content.to_owned()),
+        clipboard: wants_clipboard.then(|| content.clone()),
+        primary: (wants_primary && primary_supported).then_some(content),
     }
 }
 
@@ -1867,27 +1974,6 @@ fn route_osc52_query(
     }
 }
 
-/// Drain a channel's currently-queued backlog and fold it into `first` (a write
-/// already `recv`'d), keeping the LATEST value PER DESTINATION. Non-blocking:
-/// `try_recv` consumes only what is already queued, so a burst of clipboard sets
-/// collapses to at most one platform write per destination (bounds queue depth).
-/// Behaviour-identical to processing each in turn when each selection is
-/// last-writer-wins, since only a destination's final value survives — and the
-/// fold is per-destination so a trailing `'p'`-only set cannot swallow the
-/// CLIPBOARD half of an earlier `'c'` set in the same burst.
-fn drain_latest_write(first: ClipWrite, rx: &std::sync::mpsc::Receiver<ClipWrite>) -> ClipWrite {
-    let mut latest = first;
-    while let Ok(next) = rx.try_recv() {
-        if next.clipboard.is_some() {
-            latest.clipboard = next.clipboard;
-        }
-        if next.primary.is_some() {
-            latest.primary = next.primary;
-        }
-    }
-    latest
-}
-
 /// OSC 52 clipboard for one session: WRITE authorized (pbcopy/PRIMARY-own on a
 /// dedicated thread so the blocking platform write never runs under the Terminal
 /// lock), QUERY denied — handing the user's clipboard back to a program stays off.
@@ -1896,16 +1982,12 @@ fn drain_latest_write(first: ClipWrite, rx: &std::sync::mpsc::Receiver<ClipWrite
 /// `'c'` and friends own the system CLIPBOARD, `'p'` owns the X11 PRIMARY — and
 /// an authorized query reads back through the SAME map ([`route_osc52_query`]).
 fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
-    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipWrite>();
+    let (clip_tx, clip_rx) = clip_mailbox();
     std::thread::spawn(move || {
-        // Coalesce an OSC-52 set flood: each set is one blocking platform write
-        // (in-process NSPasteboard on macOS, X11 on Linux), so an authorized
-        // burst could grow the queue without bound. Each selection is
-        // last-writer-wins, so after a recv() drain the backlog and write only
-        // the latest per destination — bounding queue depth and collapsing a
-        // burst to at most one write per destination.
-        while let Ok(write) = clip_rx.recv() {
-            let write = drain_latest_write(write, &clip_rx);
+        // The mailbox keeps at most one pending update while a platform call is
+        // blocked. Each selection is last-writer-wins, so a flood collapses to
+        // the latest value per destination without retaining every payload.
+        while let Some(write) = clip_rx.recv() {
             if let Some(text) = write.clipboard {
                 control::pbcopy(&text);
             }
@@ -1926,11 +2008,11 @@ fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
             selections,
             content,
         } => {
-            let _ = clip_tx.send(route_osc52_write(&selections, &content, primary_supported));
+            clip_tx.publish(route_osc52_write(&selections, &content, primary_supported));
             None
         }
         ClipboardOperation::Clear { selections } => {
-            let _ = clip_tx.send(route_osc52_write(&selections, "", primary_supported));
+            clip_tx.publish(route_osc52_write(&selections, "", primary_supported));
             None
         }
         // The engine reaches this arm ONLY through a minted
@@ -3384,14 +3466,70 @@ mod bundle_path_env_tests {
 #[cfg(test)]
 mod clipboard_coalesce_tests {
     use aterm_core::terminal::ClipboardSelection as Sel;
+    use aterm_spec::derive::{Model, clipboard_mailbox_model};
 
-    use super::{ClipWrite, QuerySource, drain_latest_write, route_osc52_query, route_osc52_write};
+    use super::{
+        ClipMailboxReceiver, ClipWrite, QuerySource, clip_mailbox, route_osc52_query,
+        route_osc52_write,
+    };
 
     fn set(clipboard: Option<&str>, primary: Option<&str>) -> ClipWrite {
         ClipWrite {
-            clipboard: clipboard.map(str::to_owned),
-            primary: primary.map(str::to_owned),
+            clipboard: clipboard.map(From::from),
+            primary: primary.map(From::from),
         }
+    }
+
+    fn assert_mailbox_projection(
+        model: &Model,
+        state: &aterm_spec::interp::State,
+        receiver: &ClipMailboxReceiver,
+        clipboard_generation: i64,
+        primary_generation: i64,
+    ) {
+        let actual = receiver
+            .mailbox
+            .state
+            .lock()
+            .expect("clipboard mailbox lock");
+        assert_eq!(state[&"pending"], i64::from(actual.pending.is_some()));
+        assert_eq!(state[&"clipboard_generation"], clipboard_generation);
+        assert_eq!(state[&"primary_generation"], primary_generation);
+        let pending_clipboard_present = actual
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.clipboard.is_some());
+        let pending_primary_present = actual
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.primary.is_some());
+        assert_eq!(
+            state[&"pending_clipboard_present"],
+            i64::from(pending_clipboard_present)
+        );
+        assert_eq!(
+            state[&"pending_primary_present"],
+            i64::from(pending_primary_present)
+        );
+        if let Some(pending) = actual.pending.as_ref() {
+            if let Some(generation) = pending.clipboard.as_deref() {
+                assert_eq!(
+                    state[&"pending_clipboard"],
+                    generation
+                        .parse::<i64>()
+                        .expect("numeric clipboard generation")
+                );
+            }
+            if let Some(generation) = pending.primary.as_deref() {
+                assert_eq!(
+                    state[&"pending_primary"],
+                    generation
+                        .parse::<i64>()
+                        .expect("numeric PRIMARY generation")
+                );
+            }
+        }
+        assert!(model.check_invariant("OneLatestPendingWrite", state));
     }
 
     /// THE AUDIT FINDING: `\x1b]52;p;…` names the PRIMARY selection, so on X11 it
@@ -3485,35 +3623,89 @@ mod clipboard_coalesce_tests {
         crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
     }
 
-    /// A backlog of sets collapses to the LAST value PER DESTINATION, so at most
-    /// one platform write fires per destination per burst — and a trailing
-    /// `'p'`-only set cannot swallow the CLIPBOARD half of an earlier `'c'` set.
+    /// A producer flood occupies ONE pending mailbox slot and preserves the
+    /// latest value PER DESTINATION. A trailing `'p'`-only set cannot swallow
+    /// the CLIPBOARD half of an earlier `'c'` set.
     #[test]
-    fn drain_folds_the_backlog_per_destination() {
-        let (tx, rx) = std::sync::mpsc::channel::<ClipWrite>();
-        // Simulate an OSC-52 set flood already sitting in the queue.
-        tx.send(set(Some("b"), None)).unwrap();
-        tx.send(set(Some("c"), Some("p1"))).unwrap();
-        tx.send(set(None, Some("p2"))).unwrap();
-        let folded = drain_latest_write(set(Some("a"), None), &rx);
+    fn mailbox_folds_a_flood_per_destination_into_one_slot() {
+        let (tx, rx) = clip_mailbox();
+        tx.publish(set(Some("a"), None));
+        for i in 0..10_000 {
+            tx.publish(set(Some(&format!("c{i}")), None));
+        }
+        tx.publish(set(Some("c-final"), Some("p1")));
+        tx.publish(set(None, Some("p2")));
+        let folded = rx.recv().expect("one pending write");
         assert_eq!(
             folded.clipboard.as_deref(),
-            Some("c"),
+            Some("c-final"),
             "clipboard keeps ITS latest even though a primary-only set came later"
         );
         assert_eq!(folded.primary.as_deref(), Some("p2"));
     }
 
-    /// With an empty backlog the first write passes through unchanged — the
-    /// common single-set path is byte-identical to the old behaviour.
+    /// The receiver drains the retained final value before observing closure.
     #[test]
-    fn drain_with_empty_backlog_returns_first() {
-        let (_tx, rx) = std::sync::mpsc::channel::<ClipWrite>();
-        let folded = drain_latest_write(set(Some("only"), None), &rx);
+    fn mailbox_drains_final_write_then_closes() {
+        let (tx, rx) = clip_mailbox();
+        tx.publish(set(Some("only"), None));
+        drop(tx);
+        let folded = rx.recv().expect("retained final write");
         assert_eq!(
             (folded.clipboard.as_deref(), folded.primary),
             (Some("only"), None)
         );
+        assert!(rx.recv().is_none());
+    }
+
+    /// Mixed selection writes share one immutable payload allocation instead
+    /// of copying a potentially large OSC 52 body once per destination.
+    #[test]
+    fn mixed_target_write_shares_its_payload() {
+        let write = route_osc52_write(&[Sel::Clipboard, Sel::Primary], "shared", true);
+        let clipboard = write.clipboard.expect("clipboard payload");
+        let primary = write.primary.expect("primary payload");
+        assert!(std::sync::Arc::ptr_eq(&clipboard, &primary));
+    }
+
+    /// Tier-1: drive the real constant-memory mailbox through the same action
+    /// trace as the derived model checked by `aterm-spec`, and project its one
+    /// physical slot onto the model after every transition. The mutant is the
+    /// retired unbounded/stale queue, so this check is not vacuous.
+    #[test]
+    fn real_mailbox_conforms_to_the_derived_latest_slot_model() {
+        let model = clipboard_mailbox_model();
+        let mut state = model.init_state();
+        let (tx, rx) = clip_mailbox();
+
+        assert!(model.action_enabled("PublishClipboard", &state));
+        tx.publish(set(Some("1"), None));
+        assert!(model.fire("PublishClipboard", &mut state));
+        assert_mailbox_projection(&model, &state, &rx, 1, 0);
+
+        assert!(model.action_enabled("PublishPrimary", &state));
+        tx.publish(set(None, Some("1")));
+        assert!(model.fire("PublishPrimary", &mut state));
+        assert_mailbox_projection(&model, &state, &rx, 1, 1);
+
+        assert!(model.action_enabled("PublishClipboard", &state));
+        tx.publish(set(Some("2"), None));
+        assert!(model.fire("PublishClipboard", &mut state));
+        assert_mailbox_projection(&model, &state, &rx, 2, 1);
+
+        assert!(model.action_enabled("Consume", &state));
+        let delivered = rx.recv().expect("one coalesced write");
+        assert_eq!(delivered.clipboard.as_deref(), Some("2"));
+        assert_eq!(delivered.primary.as_deref(), Some("1"));
+        assert!(model.fire("Consume", &mut state));
+        assert_mailbox_projection(&model, &state, &rx, 2, 1);
+
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mut retired = buggy.init_state();
+        assert!(buggy.fire("PublishClipboard", &mut retired));
+        assert!(buggy.check_invariant("OneLatestPendingWrite", &retired));
+        assert!(buggy.fire("PublishClipboard", &mut retired));
+        assert!(!buggy.check_invariant("OneLatestPendingWrite", &retired));
     }
 }
 

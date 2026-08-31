@@ -1341,6 +1341,235 @@ pub fn native_update_status_reconciliation_model() -> Model {
     }
 }
 
+/// The writer/reader contract on the updater's failed-artifact memo
+/// (`FailedMark`): what a verdict WRITER persists must mean the same thing to
+/// the `suppresses` READER, for every future probe time.
+///
+/// This is the exact shape of the auto-update crash-loop regression fixed at
+/// 5ffcc15d: `revert_to_rollback`'s poison writer recorded `retry_after = 0`
+/// intending "never retry this build again", while `suppresses` read a zero
+/// deadline as "already elapsed, retry now" — the memo was written and then
+/// ignored, and the build that had just crash-looped was re-downloaded and
+/// re-applied on the very next check. No contract bound the writer to the
+/// reader, so the divergence shipped silently. This machine is that contract.
+///
+/// The bounded timeline: `probe_now ∈ 0..3` are equivalence classes of the
+/// probed unix time relative to the recorded deadline, and the two writers pin
+/// the two deadline shapes the real type has — the quarantine verdict keeps the
+/// legacy `retry_after = 0` sentinel (class 0) and carries its meaning in the
+/// `quarantined` FIELD instead, while a stage failure records an interior
+/// deadline (class 2) so classes exist strictly before, at, and after it.
+///
+/// * `RecordQuarantine` / contract 1 (`QuarantineSuppressesAtEveryProbe`):
+///   after the quarantine writer runs, `suppresses` holds for EVERY probe
+///   class of `now` — the verdict never lapses.
+/// * `RecordStageFailure` / contract 2 (`BackoffSuppressesIffBeforeDeadline`):
+///   after the backoff writer runs with deadline D, `suppresses` holds iff
+///   `now < D` — the reader's comparison direction, bound both ways.
+/// * `QuarantineVerdictLandsInTheQuarantineField` is the writer half alone:
+///   the verdict must be recorded in the field the reader consults.
+///
+/// `Buggy=1` reproduces both historical classes without cancellation:
+/// `RecordQuarantine` writes the verdict as a plain timed memo (the shipped
+/// 5ffcc15d writer, falsifying the writer-half and contract-1 invariants), and
+/// `ProbeSuppresses` flips the deadline comparison for stage-failure memos
+/// (falsifying contract 2) while leaving quarantine probes healthy so neither
+/// defect masks the other.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_failed_mark_suppression_model() -> Model {
+    let probed = || eq(var("phase"), int(3));
+    Model {
+        name: "NativeUpdateFailedMarkSuppression",
+        consts: vec![("Buggy", 0)],
+        vars: vec![
+            StateVar {
+                name: "phase",
+                init: 0,
+            },
+            // 1 = quarantine verdict, 2 = download/stage failure backoff.
+            StateVar {
+                name: "writer_kind",
+                init: 1,
+            },
+            // Timeline class of the probed `now` (0 smallest .. 3 past-deadline).
+            StateVar {
+                name: "probe_now",
+                init: 0,
+            },
+            // Whether the probed (build, sha256) equals the recorded identity.
+            StateVar {
+                name: "candidate_matches",
+                init: 0,
+            },
+            StateVar {
+                name: "quarantined",
+                init: 0,
+            },
+            // Timeline class of the recorded `retry_after` (0 = the legacy
+            // "no deadline" sentinel, 2 = an interior backoff deadline).
+            StateVar {
+                name: "deadline",
+                init: 0,
+            },
+            StateVar {
+                name: "suppressed",
+                init: 0,
+            },
+        ],
+        fn_vars: vec![],
+        actions: vec![
+            Action {
+                name: "PickSuppressionInputs",
+                guard: Some(eq(var("phase"), int(0))),
+                updates: vec![
+                    Update {
+                        var: "writer_kind",
+                        expr: in_range(int(1), int(2)),
+                    },
+                    Update {
+                        var: "probe_now",
+                        expr: in_range(int(0), int(3)),
+                    },
+                    Update {
+                        var: "candidate_matches",
+                        expr: in_range(int(0), int(1)),
+                    },
+                    Update {
+                        var: "phase",
+                        expr: int(1),
+                    },
+                ],
+            },
+            Action {
+                name: "RecordQuarantine",
+                guard: Some(and_(
+                    eq(var("phase"), int(1)),
+                    eq(var("writer_kind"), int(1)),
+                )),
+                updates: vec![
+                    Update {
+                        var: "quarantined",
+                        // Buggy = the 5ffcc15d writer: the verdict goes out as a
+                        // plain timed memo (`retry_after = 0`, no field), which
+                        // the reader is entitled to read as "already elapsed".
+                        expr: if_(eq(cst("Buggy"), int(1)), int(0), int(1)),
+                    },
+                    Update {
+                        var: "deadline",
+                        expr: int(0),
+                    },
+                    Update {
+                        var: "phase",
+                        expr: int(2),
+                    },
+                ],
+            },
+            Action {
+                name: "RecordStageFailure",
+                guard: Some(and_(
+                    eq(var("phase"), int(1)),
+                    eq(var("writer_kind"), int(2)),
+                )),
+                updates: vec![
+                    Update {
+                        var: "quarantined",
+                        expr: int(0),
+                    },
+                    Update {
+                        var: "deadline",
+                        expr: int(2),
+                    },
+                    Update {
+                        var: "phase",
+                        expr: int(2),
+                    },
+                ],
+            },
+            Action {
+                name: "ProbeSuppresses",
+                guard: Some(eq(var("phase"), int(2))),
+                updates: vec![
+                    Update {
+                        var: "suppressed",
+                        expr: if_(
+                            and_(
+                                eq(var("candidate_matches"), int(1)),
+                                or_(
+                                    eq(var("quarantined"), int(1)),
+                                    if_(
+                                        and_(
+                                            eq(cst("Buggy"), int(1)),
+                                            eq(var("writer_kind"), int(2)),
+                                        ),
+                                        // Buggy = the comparison direction the
+                                        // contract exists to pin, flipped: a
+                                        // memo suppresses FROM its deadline
+                                        // instead of until it. Scoped to the
+                                        // stage-failure runs so it cannot mask
+                                        // (or be masked by) the quarantine
+                                        // writer defect above.
+                                        le(var("deadline"), var("probe_now")),
+                                        gt(var("deadline"), var("probe_now")),
+                                    ),
+                                ),
+                            ),
+                            int(1),
+                            int(0),
+                        ),
+                    },
+                    Update {
+                        var: "phase",
+                        expr: int(3),
+                    },
+                ],
+            },
+        ],
+        invariants: vec![
+            Invariant {
+                name: "QuarantineVerdictLandsInTheQuarantineField",
+                expr: if_(
+                    and_(gt(var("phase"), int(1)), eq(var("writer_kind"), int(1))),
+                    eq(var("quarantined"), int(1)),
+                    le(var("quarantined"), int(1)),
+                ),
+            },
+            Invariant {
+                name: "QuarantineSuppressesAtEveryProbe",
+                expr: if_(
+                    and_(
+                        probed(),
+                        and_(
+                            eq(var("writer_kind"), int(1)),
+                            eq(var("candidate_matches"), int(1)),
+                        ),
+                    ),
+                    eq(var("suppressed"), int(1)),
+                    le(var("suppressed"), int(1)),
+                ),
+            },
+            Invariant {
+                name: "BackoffSuppressesIffBeforeDeadline",
+                expr: if_(
+                    and_(
+                        probed(),
+                        and_(
+                            eq(var("writer_kind"), int(2)),
+                            eq(var("candidate_matches"), int(1)),
+                        ),
+                    ),
+                    if_(
+                        gt(var("deadline"), var("probe_now")),
+                        eq(var("suppressed"), int(1)),
+                        eq(var("suppressed"), int(0)),
+                    ),
+                    le(var("suppressed"), int(1)),
+                ),
+            },
+        ],
+    }
+}
+
 /// PER-SESSION ownership discipline of the seamless update handoff, over a
 /// bounded two-session pool.
 ///

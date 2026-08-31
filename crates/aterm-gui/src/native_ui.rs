@@ -1568,8 +1568,8 @@ pub(crate) struct CompiledUi {
     /// highlighted default button" convention: the first enabled
     /// `StyleRef::Primary` button in authoring (= visual) order. Pages follow
     /// the platform rule of one primary-styled action per state (Software
-    /// Update swaps Primary between "Check for Updates" and "Install &
-    /// Relaunch" as a build stages), so "first" is the unique one. Recorded
+    /// Update swaps Primary between "Check for Updates" and "Update to
+    /// Latest Now" as a build stages), so "first" is the unique one. Recorded
     /// from the AUTHORED tree before viewport clipping — a route's default is
     /// semantic, not visual, so Return works even with the button scrolled out
     /// of view (clipped subtrees are absent from every other observer here).

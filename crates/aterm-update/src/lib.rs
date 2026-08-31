@@ -18,8 +18,10 @@
 //!   nothing in this workspace uses them.
 //! * [`spawn_background_check`] — call once the GUI is up. Spawns a detached
 //!   thread that talks to the private GitHub Release, downloads the newer DMG,
-//!   verifies it, and stages it for the *next* launch. It never touches the UI
-//!   and never blocks the event loop.
+//!   verifies it, and stages it for the in-session apply lane: the GUI hands the
+//!   live session to it in place, and the next launch picks it up only if no
+//!   handoff ever completes. It never touches the UI and never blocks the event
+//!   loop.
 //!
 //! # Delivery model: what actually reaches a machine, and when
 //!
@@ -30,8 +32,10 @@
 //!   FIRST check immediately at launch and then on the `cadence` schedule. So a
 //!   running app stages a new release within ~a minute of publish; an app that is
 //!   started stages within seconds of start.
-//! * **Applying** happens either at the top of the next `main()` (always works), or
-//!   in-session through the seamless overlap handoff. The in-session lane is
+//! * **Applying** happens in-session through the seamless overlap handoff
+//!   (default-on: automatically at the first quiet moment, forced within ~2 min,
+//!   or on one click); the top of the next `main()` is the fallback for a stage no
+//!   handoff ever completed. The in-session lane is
 //!   FIELD-PROVEN ACROSS A REAL VERSION BOUNDARY as of 2026-07-28: a released
 //!   `v0.6.0` bundle (build 1785122258), installed from the public channel and
 //!   launched cold, staged and applied `v0.7.0` (build 1785125098) in-session,
@@ -43,8 +47,9 @@
 //!   `docs/RFC-proof-carrying-dsu.md`.
 //!
 //! Composing those: a machine that never runs aterm is never updated, but it also
-//! never *needs* to be — and the first launch after a release stages it, so the
-//! machine is at worst **one launch behind**, not indefinitely stale.
+//! never *needs* to be — and the first launch after a release stages it and the
+//! running app applies it, so the machine is at worst **one apply behind**, not
+//! indefinitely stale.
 //!
 //! ## Why there is no LaunchAgent
 //!
@@ -54,8 +59,9 @@
 //!
 //! 1. **It would buy exactly one launch.** Per the bound above, the agent's only
 //!    effect is that a release stages before the launch rather than during it —
-//!    the swap still waits for a `main()`. It cannot update an app nobody runs,
-//!    because applying an update means re-execing a process.
+//!    the fallback swap still waits for a `main()`, and the in-session lane for a
+//!    running app. It cannot update an app nobody runs, because applying an
+//!    update means re-execing a process.
 //! 2. **There is nothing for it to run.** Every verified path (release selection,
 //!    signature/digest checks, DMG mount, staging) lives in this crate, reachable
 //!    only from the one shipped Mach-O — and that binary is the GUI: invoking it
@@ -138,6 +144,13 @@ mod verify;
 // Not macOS-only: every platform names the copy of aterm it is running (S12 of
 // `docs/DESIGN-which-copy-runs-2026-08-27.md`); only the other-copy probe is `.app`-shaped.
 pub mod which_copy;
+
+// The FailedMark writer/reader suppression projection (proof/test builds only),
+// re-exported at the crate root so the `#[refines]` anchors in `manifest` can
+// name it by the same `aterm_update::…` path convention as
+// `status_reconciliation_projection` below.
+#[cfg(all(target_os = "macos", any(test, feature = "spec-anchors")))]
+pub use manifest::failed_mark_suppression_projection;
 
 /// Hard cap for every small TOML ledger/marker consumed by the updater. The cap is
 /// checked on the opened descriptor before allocation or parsing, then enforced again
@@ -960,7 +973,8 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
 pub type HealthNotify = Box<dyn Fn(String, String) + Send>;
 
 /// A GUI-supplied hook fired when a strictly-newer build has just been STAGED, so the
-/// GUI can show the "relaunch to apply" nudge (RFC Rung 2). `(build, version)`.
+/// GUI can arm the in-session apply lane and show the update-ready nudge (the Version
+/// menu ⬆️ / tab-strip ↻; RFC Rung 2). `(build, version)`.
 pub type StagedNotify = Box<dyn Fn(u64, String) + Send>;
 
 /// One process-wide network/staging lane shared by the periodic scheduler and
@@ -1067,9 +1081,9 @@ pub fn spawn_background_check(
         .spawn(move || {
             // Re-check on a short cadence so a running session picks a release up
             // within ~a minute of publish (the owner's "no passive scheduler —
-            // immediate" directive). In practice this cadence buys a fast STAGE and
-            // the swap happens at the next launch (see the module docs' delivery
-            // model for what the seamless handoff does and does not deliver).
+            // immediate" directive). This cadence buys a fast STAGE; the in-session
+            // lane applies it (see the module docs' delivery model — the next-launch
+            // swap is only the fallback for a stage no handoff ever completed).
             // Cost honesty: a steady-state check on the armed tier spends 5 requests
             // (list + manifest + roster + both signatures; 6 with a container). WITH
             // a token that is ~240/h against the 5000/h budget; WITHOUT one (the
@@ -1251,10 +1265,11 @@ pub fn spawn_background_check(
                                 // is only waiting to be applied (its re-download may be
                                 // backed off — a stage backoff never gates an apply).
                                 log(&format!(
-                                    "update {v} is staged — the GUI auto-applies it now (or next launch)"
+                                    "update {v} is staged — the GUI applies it in place (auto-apply); the next launch is the fallback"
                                 ));
-                                // RFC Rung 2: surface the staged build to the GUI so it can show
-                                // the "relaunch to apply" nudge. The staged build number comes
+                                // RFC Rung 2: surface the staged build to the GUI so it can arm
+                                // the in-session apply lane and show the update-ready nudge
+                                // (Version menu ⬆️ / tab-strip ↻). The staged build number comes
                                 // from the ready marker (status reads it, no I/O).
                                 if let Some(cb) = on_staged.as_ref()
                                     && let Some(b) =
@@ -1674,7 +1689,7 @@ fn persisted_claims_stage(persisted: &str) -> bool {
     // it; "ready to apply" is what the stage/backoff lanes write now.
     let persisted = persisted.trim_start();
     persisted.starts_with("staged ")
-        || persisted.contains("applies on next launch")
+        || persisted.contains("applies on next launch") // retired-wording detector, not a promise
         || persisted.contains("ready to apply")
 }
 
@@ -2277,6 +2292,51 @@ updated_at = \"\"
         std::fs::write(&s.status, "not toml at all {{{").expect("write");
         assert!(checker_skip(&s, BASE).is_none(), "unparseable: check");
         let _ = std::fs::remove_dir_all(&s.root);
+    }
+}
+
+#[cfg(test)]
+mod delivery_story_tests {
+    /// The crate's own metadata and its module doc teach the in-session apply
+    /// lane as the mechanism and the next-launch swap as the fallback. The
+    /// description is what `targo metadata`, trustdoc and every crate listing
+    /// show; the module doc is what the next edit copies from — and both said
+    /// "swaps the .app on next launch" / "stages it for the *next* launch" /
+    /// "at the top of the next `main()` (always works)" until 2026-08-30, over a
+    /// lane that had been the mechanism since Rung 1b. Twin of grep_guard's B11,
+    /// which sees the handbooks this file cannot.
+    #[test]
+    fn the_crate_teaches_the_in_session_apply_lane_not_the_next_launch_swap() {
+        let description = env!("CARGO_PKG_DESCRIPTION");
+        assert!(
+            description.contains("in place") && description.contains("fallback"),
+            "{description}"
+        );
+        assert!(
+            !description.contains("on next launch"),
+            "the description teaches the fallback as the mechanism: {description}"
+        );
+        let module_doc: Vec<&str> = include_str!("lib.rs")
+            .lines()
+            .skip_while(|line| !line.starts_with("//!"))
+            .take_while(|line| line.starts_with("//!"))
+            .collect();
+        let module_doc = module_doc.join("\n");
+        for stale in [
+            "stages it for the *next* launch",
+            "(always works)",
+            "one launch behind",
+            "the swap still waits for a `main()`",
+        ] {
+            assert!(
+                !module_doc.contains(stale),
+                "the module doc still teaches {stale:?}"
+            );
+        }
+        assert!(
+            module_doc.contains("seamless overlap handoff") && module_doc.contains("fallback"),
+            "the module doc names the mechanism and the fallback"
+        );
     }
 }
 

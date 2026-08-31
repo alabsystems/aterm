@@ -90,7 +90,8 @@ pub(crate) struct DurableUpdateStatus {
     /// the count alone is all any window had. Measured on the owner's machine
     /// (2026-08-21): `failing_applies=2 apply_failure="overlap handoff failed
     /// safely: handoff proof ended ChildDied"` on the control socket, beside a
-    /// Version menu offering "Update to v0.56.0 — restart now" with no hint that
+    /// Version menu offering "Update to v0.56.0" (its tail of the day, "restart
+    /// now", has since been retired for "apply now") with no hint that
     /// two attempts had already died. Read from `aterm_update::apply_lane_report`
     /// on the same worker thread that reads the status, never on the event loop.
     pub(crate) apply_failure: String,
@@ -559,7 +560,8 @@ pub(crate) enum ReturnedApplyDisposition {
     /// The exact verified artifact still exists durably and was re-armed.
     Rearmed,
     /// The staged marker was consumed and this build (or a superseding one) is now
-    /// installed at the canonical app path; only a user-visible relaunch remains.
+    /// installed at the canonical app path; the App imports it as an ACTIVATION
+    /// stage and the seamless lane applies it in place — nothing to relaunch.
     InstalledNeedsRelaunch { build: u64 },
     /// The attempted artifact is no longer authoritative and was retired in memory.
     Retired,
@@ -890,7 +892,7 @@ impl NativeUpdaterService {
         // same fields from the main thread at the instant the apply fails, inside the
         // lock that recorded it. Nothing orders the two, so a reconcile whose read
         // STARTED before that write lands afterwards carrying the pre-failure state —
-        // and puts "restart now" back on the Version menu seconds after the failure was
+        // and puts the clean "apply now" row back on the Version menu seconds after the failure was
         // surfaced. Appearing and then vanishing is worse than never appearing: it reads
         // as a glitch rather than as news.
         //
@@ -931,7 +933,7 @@ impl NativeUpdaterService {
     /// worker gathers its reconcile facts before the main thread has written
     /// anything, so `failing_applies` reached the window only when some later,
     /// unrelated reconcile happened to land. Settings self-healed on open; the
-    /// Version menu and the palette row went on saying "restart now".
+    /// Version menu and the palette row went on offering a clean "apply now".
     ///
     /// `attempts_for_target` / `target_build` come from
     /// [`aterm_update::RecordedApplyFailure`], read back inside the same lock scope
@@ -1252,6 +1254,22 @@ impl NativeUpdaterService {
         }
     }
 
+    /// The outcome sentence for a build whose bundle is already installed at the
+    /// canonical app path: the App imports it as an ACTIVATION stage and the
+    /// seamless lane applies it in place at the next quiet moment — nothing to
+    /// relaunch. Shared by the consumed-stage and the returned-apply paths.
+    #[must_use]
+    pub(crate) fn installed_activation_outcome(build: u64) -> String {
+        format!("Update build {build} is installed and activates in place at the next quiet moment")
+    }
+
+    /// The outcome sentence for a physical apply attempt that returned safely:
+    /// the stage is still ready and the lane's budget decides the retry.
+    #[must_use]
+    pub(crate) fn apply_attempt_stopped_outcome(message: &str) -> String {
+        format!("Update remains ready; the last apply attempt stopped safely: {message}")
+    }
+
     /// Re-arm an authorized artifact when process replacement left this process alive.
     ///
     /// The attempt identity is generation-bound, so a late failure can never revive an
@@ -1279,7 +1297,7 @@ impl NativeUpdaterService {
         self.snapshot.install_on_clean_quit = false;
         self.snapshot.error = Some(message.clone());
         self.snapshot.outcome = bounded(
-            format!("Update remains ready; last relaunch attempt stopped safely: {message}"),
+            Self::apply_attempt_stopped_outcome(&message),
             MAX_MESSAGE_BYTES,
         );
         self.close_preflight_ready = false;
@@ -1384,10 +1402,7 @@ impl NativeUpdaterService {
         self.snapshot.error = None;
         self.snapshot.outcome = if let Some(installed) = installed {
             bounded(
-                format!(
-                    "Update build {} is installed and will activate on relaunch",
-                    installed.build
-                ),
+                Self::installed_activation_outcome(installed.build),
                 MAX_MESSAGE_BYTES,
             )
         } else {
@@ -1505,12 +1520,7 @@ impl NativeUpdaterService {
         self.active_apply = None;
         self.snapshot.outcome = installed.map_or_else(
             || "Previously staged update is no longer available on disk".to_string(),
-            |installed| {
-                format!(
-                    "Update build {} is installed and will activate on relaunch",
-                    installed.build
-                )
-            },
+            |installed| Self::installed_activation_outcome(installed.build),
         );
         self.record(UpdaterTransitionAction::RetireStage, before);
         self.publish();
@@ -1675,7 +1685,7 @@ mod tests {
     /// apply fails, inside the lock that recorded it. `absorb_failure_state` writes the
     /// same fields from facts a worker read off disk. Nothing orders the two, so a
     /// reconcile whose read STARTED before that write lands afterwards carrying the
-    /// pre-failure state — and put "restart now" back on the Version menu seconds after
+    /// pre-failure state — and put the clean "apply now" row back on the Version menu seconds after
     /// the trouble was surfaced.
     ///
     /// That is worse than never surfacing it: a message that appears and then vanishes
@@ -2215,7 +2225,7 @@ mod tests {
     /// A RETURNED activation attempt (the handoff came back without committing)
     /// re-arms while the bundle still backs it — the App's bounded automatic budget
     /// and manual-only latch decide how many more times — and retires once the
-    /// bundle has moved on. Never a "relaunch once" dead end, never a loop.
+    /// bundle has moved on. Never a dead end that waits for a relaunch, never a loop.
     #[test]
     fn a_returned_activation_rearms_while_backed_and_retires_when_the_bundle_moves_on() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
@@ -2312,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn consumed_durable_stage_retires_memory_and_reports_installed_relaunch() {
+    fn consumed_durable_stage_retires_memory_and_reports_installed_activation() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         stage(&mut service, 11);
         let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
@@ -2338,6 +2348,15 @@ mod tests {
         assert!(service.snapshot().staged.is_none());
         assert_eq!(service.snapshot().reexec_count, 0);
         assert!(service.snapshot().outcome.contains("installed"));
+        assert!(
+            service
+                .snapshot()
+                .outcome
+                .contains("activates in place at the next quiet moment")
+                && !service.snapshot().outcome.contains("relaunch"),
+            "an installed bundle is activated in place, never left for a relaunch: {:?}",
+            service.snapshot().outcome
+        );
         assert_eq!(
             service.last_transitions()[0].action,
             UpdaterTransitionAction::RetireApply

@@ -5018,7 +5018,8 @@ fn bootstrap_singleton(
         }
         Err(crate::FlowError::AppBundleRefused(_)) => {
             println!(
-                "atpkg: {program}: app-bundle member — managed by the app's own updater, skipped"
+                "atpkg: {program}: app-bundle member — aterm updates itself in-session through \
+                 its own updater, skipped"
             );
             note_finished(program, crate::progress::Phase::Skipped, None);
             0
@@ -6999,7 +7000,6 @@ mod tests {
         )
     }
 
-
     /// A FLAG IS NOT A PROGRAM. Measured on a live box: a mistyped
     /// `atpkg install --progress-file` recorded the flag as a wanted program,
     /// and `doctor` then carried a standing warning about a row that "cannot be
@@ -7483,6 +7483,56 @@ mod tests {
                     "{file} still spells a remedy as `atpkg` ({needle:?}) — remedies say \
                      `aterm pkg`, the spelling a user can paste"
                 );
+            }
+        }
+    }
+
+    /// ATPKG NEVER TELLS THE USER TO RESTART FOR AN APP UPDATE. The app applies a staged
+    /// build to itself in-session (aterm-gui's overlap handoff: automatic within ~2 min by
+    /// default, one click otherwise) and the shells keep running, so any atpkg sentence that
+    /// asks for a reopen is false — `atpkg doctor` said exactly that over the live mechanism
+    /// until 2026-08-30. Source-level, across every file that prints about the app; the
+    /// shell twin is `tools/grep_guard.sh` B10. The two Rosetta remedies are allow-listed by
+    /// their anchor: running natively instead of under translation genuinely needs a fresh
+    /// launch and is not about an update.
+    #[test]
+    fn no_atpkg_string_prompts_an_app_restart() {
+        // Needles and the allow-list anchor are assembled at runtime so this test's own
+        // source (inside cli.rs's include_str!) never contains them.
+        let needles: Vec<String> = [
+            ("waiting for a", "restart"),
+            ("restart", "aterm"),
+            ("restart", "the app"),
+            ("relaunch", "aterm"),
+            ("reopen", "aterm"),
+            ("quit and", "reopen"),
+        ]
+        .iter()
+        .map(|(a, b)| format!("{a} {b}"))
+        .collect();
+        let allowed = format!("{} {} natively", "Relaunch", "aterm");
+        for (file, source) in [
+            ("cli.rs", include_str!("cli.rs")),
+            ("doctor.rs", include_str!("doctor.rs")),
+            ("flow.rs", include_str!("flow.rs")),
+            ("status.rs", include_str!("status.rs")),
+            ("state.rs", include_str!("state.rs")),
+        ] {
+            for (n, line) in source.lines().enumerate() {
+                if line.contains(&allowed) {
+                    continue;
+                }
+                let lower = line.to_lowercase();
+                for needle in &needles {
+                    assert!(
+                        !lower.contains(needle.as_str()),
+                        "{file}:{} prompts an app restart ({needle:?}): {}\n\
+                         aterm applies an update in-session — in place, your shells keep \
+                         running — and atpkg never asks for a reopen",
+                        n + 1,
+                        line.trim()
+                    );
+                }
             }
         }
     }

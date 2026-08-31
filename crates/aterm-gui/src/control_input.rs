@@ -402,6 +402,39 @@ pub(crate) fn key_is_plain_typed_glyph(rest: &str) -> bool {
     }
 }
 
+/// Whether a well-formed `key` verb body ARMS ITS OWN LICENSE CLASS when it
+/// dispatches through the `Wake::Input` seam — the fence-exemption predicate
+/// (2026-08-30). A plain typed glyph always did ([`key_is_plain_typed_glyph`]);
+/// plain Enter, Tab and Backspace now do too (`note_return` /
+/// `note_user_gesture` / `note_backspace` at the input boundary), so
+/// pre-clearing for them wiped the banked stamps of keys whose echoes were
+/// still in flight AND destroyed the very license the dispatched key was about
+/// to arm — every control-driven `key enter` deterministically manufactured a
+/// no-fresh-hint decline. Anything malformed, modified (Ctrl/Alt/Super), other
+/// named keys (nav arms via a different host path with its own pre-clear
+/// semantics), or a release answers `false` and keeps the fence.
+pub(crate) fn key_arms_own_license(rest: &str) -> bool {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    if key_is_plain_typed_glyph(rest) {
+        return true;
+    }
+    match parse_key(rest) {
+        Some(InputEvent::Key {
+            key,
+            mods,
+            event_type: KeyEventType::Press,
+            ..
+        }) => {
+            !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                && matches!(
+                    key,
+                    Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)
+                )
+        }
+        _ => false,
+    }
+}
+
 /// `key <name> [mods=<list>]` -> build an [`InputEvent::Key`] and post it to the
 /// seam (the SOLE encoder caller, under the CURRENT keyboard mode). See
 /// [`parse_key`] for the grammar.
@@ -855,10 +888,13 @@ pub(crate) fn apply_copy_on_select_policy(scope: super::Scope, ev: InputEvent) -
 /// it: [`Terminal::format_paste`] strips control bytes that could escape the
 /// guards (ESC, C1 controls), converts line breaks to CR, and wraps the body
 /// in the bracketed-paste guards `ESC[200~` ... `ESC[201~` when the app has
-/// enabled bracketed paste (DECSET 2004). The text is the rest of the line
-/// taken literally; a literal trailing `\n` (backslash + n) becomes a line
-/// break (sent as CR, like a real paste) so a paste can end in one. For raw
-/// unsanitized bytes use `feed`/`send` instead.
+/// enabled bracketed paste (DECSET 2004) AT THE MOMENT THE FRAME IS WRITTEN —
+/// the verb makes no gesture and is shown no confirmation, so it has no earlier
+/// answer to keep faith with ([`crate::input::PasteFraming::AtDrain`]; the human
+/// Cmd-V path captures its answer instead, see `App::deliver_paste`). The text is
+/// the rest of the line taken literally; a literal trailing `\n` (backslash + n)
+/// becomes a line break (sent as CR, like a real paste) so a paste can end in
+/// one. For raw unsanitized bytes use `feed`/`send` instead.
 pub(crate) fn cmd_paste(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // The seam runs `format_paste` (bracketing + sanitize) under the lock and the
     // snap-to-bottom, converging with the human Cmd-V path. Reply-bearing so OK
@@ -866,7 +902,10 @@ pub(crate) fn cmd_paste(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     input_reply_to_str(post_input_reply(
         proxy,
         Op::WriteInput,
-        vec![InputEvent::Paste(paste_text(rest))],
+        vec![InputEvent::Paste(
+            paste_text(rest),
+            crate::input::PasteFraming::AtDrain,
+        )],
     ))
 }
 
@@ -986,6 +1025,227 @@ pub(crate) fn cmd_hover(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// The `find <sub…>` grammar, PURE so it is unit-testable without an event loop
+/// (the discipline [`parse_tab`] / [`parse_resize`] follow). `Err` is the exact
+/// usage line the verb replies with.
+///
+/// `type`'s payload is the rest of the line VERBATIM after the single separating
+/// space — a find query may legitimately begin or end with one, and `split_once`
+/// keeps it, where a `split_whitespace` rejoin would quietly normalize it away.
+pub(crate) fn parse_find(rest: &str) -> Result<crate::app_search::FindAction, String> {
+    use crate::app_search::{FindAction, SearchEdit};
+    let rest = rest.trim_start();
+    let (head, tail) = match rest.split_once(' ') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (rest, None),
+    };
+    // Every no-argument form rejects a trailing argument rather than ignoring it:
+    // `find next 3` is a request this verb cannot honour, and answering `OK` to it
+    // would report a single step as though it had been three.
+    let bare = |action: FindAction| -> Result<FindAction, String> {
+        match tail {
+            None | Some("") => Ok(action),
+            Some(_) => Err(format!("ERR usage: find {head}\n")),
+        }
+    };
+    match head {
+        "" | "status" => bare(FindAction::Status),
+        "open" => bare(FindAction::Open),
+        "next" => bare(FindAction::Step { forward: true }),
+        "prev" => bare(FindAction::Step { forward: false }),
+        "case" => bare(FindAction::ToggleCase),
+        "regex" => bare(FindAction::ToggleRegex),
+        "accept" => bare(FindAction::Accept),
+        "cancel" => bare(FindAction::Cancel),
+        "type" => match tail {
+            Some(text) if !text.is_empty() => Ok(FindAction::Type(text.to_string())),
+            _ => Err("ERR usage: find type <text>\n".to_string()),
+        },
+        "key" => {
+            let edit = match tail.map(str::trim) {
+                Some("back") => SearchEdit::DeleteBack,
+                Some("delete") => SearchEdit::DeleteForward,
+                Some("left") => SearchEdit::MoveCharLeft,
+                Some("right") => SearchEdit::MoveCharRight,
+                Some("word-left") => SearchEdit::MoveWordLeft,
+                Some("word-right") => SearchEdit::MoveWordRight,
+                Some("home") => SearchEdit::MoveStart,
+                Some("end") => SearchEdit::MoveEnd,
+                Some("kill-start") => SearchEdit::KillToStart,
+                Some("kill-end") => SearchEdit::KillToEnd,
+                Some("kill-word-back") => SearchEdit::DeleteWordBack,
+                Some("kill-word-forward") => SearchEdit::DeleteWordForward,
+                _ => {
+                    return Err("ERR usage: find key \
+                                <back|delete|left|right|word-left|word-right|home|end|\
+                                kill-start|kill-end|kill-word-back|kill-word-forward>\n"
+                        .to_string());
+                }
+            };
+            Ok(FindAction::Edit(edit))
+        }
+        _ => Err(
+            "ERR usage: find [open|type <text>|key <name>|next|prev|case|regex|accept|\
+                  cancel|status]\n"
+                .to_string(),
+        ),
+    }
+}
+
+/// `find <sub…>` -> drive the FRONT window's find bar and report what it became.
+///
+/// The action is resolved on the MAIN thread ([`Wake::FindCmd`]) because the find
+/// bar is `App` state and every arm of [`crate::App::find_cmd`] is the keystroke
+/// handler's own function. The reply is formatted from the state read back AFTER
+/// the action ran, so it describes the bar as it now is rather than as the request
+/// asked for it to be.
+pub(crate) fn cmd_find(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let action = match parse_find(rest) {
+        Ok(action) => action,
+        Err(usage) => return usage,
+    };
+    match super::control_media::call_main(proxy, |reply| Wake::FindCmd { action, reply }) {
+        Ok(Some(status)) => find_status_line(&status),
+        Ok(None) => "ERR no window\n".to_string(),
+        Err(error) => format!("ERR find command failed: {error}\n"),
+    }
+}
+
+/// Format a [`crate::app_search::FindStatus`] as the `find` verb's reply.
+///
+/// PURE, and separated from the RPC so the one property that matters here is
+/// testable without a window: an absent match must print `-` and never a
+/// coordinate. `row`/`col`/`len` and `current` come from `Option`s, so there is no
+/// value the formatter could substitute for a match that does not exist.
+pub(crate) fn find_status_line(status: &crate::app_search::FindStatus) -> String {
+    if !status.open {
+        return "OK open=0\n".to_string();
+    }
+    let bit = |b: bool| u8::from(b);
+    // A LENGTH ON THE WIRE, because `search` reports one and a driver comparing the
+    // two verbs must not have to know that one of them silently means something
+    // else. `SearchState::matches` carries `(row, start_col, end_col)` with `end_col`
+    // INCLUSIVE and deliberately unclamped — a hit that straddles a soft wrap runs
+    // past the grid width by exactly the part on the next row — so the length is
+    // `end - start + 1` and it, too, may exceed the width. That is the same
+    // `col + len` overrun `search`'s own help documents as the continuation marker.
+    let (row, col, len) = match status.current_match {
+        Some((row, start, end)) => (
+            row.to_string(),
+            start.to_string(),
+            (end.saturating_sub(u32::from(start)).saturating_add(1)).to_string(),
+        ),
+        None => ("-".to_string(), "-".to_string(), "-".to_string()),
+    };
+    let current = status
+        .current
+        // 1-BASED on the wire, because it is the same "3 of 7" the find bar and the
+        // window title show; a driver comparing the two must not have to know that
+        // one of them silently counts from zero.
+        .map_or_else(|| "-".to_string(), |i| (i + 1).to_string());
+    format!(
+        "OK open=1 query={} case={} regex={} regex_error={} matches={} current={current} \
+         row={row} col={col} len={len} truncated={}\n",
+        super::pct_encode(&status.query),
+        bit(status.case_sensitive),
+        bit(status.is_regex),
+        bit(status.regex_error),
+        status.matches,
+        bit(status.truncated),
+    )
+}
+
+/// PURE parser for `pane <left|right|up|down>`, split out for the same reason
+/// [`parse_focus`] is: the grammar is testable without an event loop.
+pub(crate) fn parse_pane_dir(rest: &str) -> Option<crate::pane::FocusDir> {
+    match rest.trim() {
+        "left" => Some(crate::pane::FocusDir::Left),
+        "right" => Some(crate::pane::FocusDir::Right),
+        "up" => Some(crate::pane::FocusDir::Up),
+        "down" => Some(crate::pane::FocusDir::Down),
+        _ => None,
+    }
+}
+
+/// `pane <left|right|up|down>` -> move keyboard focus to the adjacent pane of the
+/// front window's active tab, through the SAME `focus_pane_in` the `focus_pane_*`
+/// key bindings run, and reply `OK moved=<0|1>`.
+///
+/// `moved=0` is not an error: a single-pane tab and an edge pane are both ordinary
+/// answers to "is there a pane that way", and they are the ONLY two ways the walk
+/// declines. What the reply deliberately does not carry is the layout — `panes`
+/// (read-side) owns that, and a write edge has no read authority to spend here.
+pub(crate) fn cmd_pane(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let Some(dir) = parse_pane_dir(rest) else {
+        return "ERR usage: pane <left|right|up|down>\n".to_string();
+    };
+    match super::control_media::call_main(proxy, |reply| Wake::PaneFocus { dir, reply }) {
+        Ok(Some(moved)) => format!("OK moved={}\n", u8::from(moved)),
+        Ok(None) => "ERR no window\n".to_string(),
+        Err(error) => format!("ERR pane command failed: {error}\n"),
+    }
+}
+
+/// PURE parser for `pointer [move <r> <c>|leave|status]`. `Err` is the exact usage
+/// or range line the verb replies with — an out-of-range cell is REFUSED here
+/// rather than clamped, so a caller is never told the pointer went where it asked
+/// when it went somewhere else.
+pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerAction, String> {
+    use crate::app_mouse::PointerAction;
+    let mut it = rest.split_whitespace();
+    match it.next() {
+        None | Some("status") => match it.next() {
+            None => Ok(PointerAction::Status),
+            Some(_) => Err("ERR usage: pointer status\n".to_string()),
+        },
+        Some("leave") => match it.next() {
+            None => Ok(PointerAction::Leave),
+            Some(_) => Err("ERR usage: pointer leave\n".to_string()),
+        },
+        Some("move") => {
+            let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
+                return Err("ERR usage: pointer move <r> <c>\n".to_string());
+            };
+            if it.next().is_some() {
+                return Err("ERR usage: pointer move <r> <c>\n".to_string());
+            }
+            let (Ok(row), Ok(col)) = (rs.parse::<u16>(), cs.parse::<u16>()) else {
+                return Err("ERR bad args\n".to_string());
+            };
+            if row >= MAX_GRID_ROWS || col >= MAX_GRID_COLS {
+                return Err("ERR out of range\n".to_string());
+            }
+            Ok(PointerAction::Move { row, col })
+        }
+        Some(_) => Err("ERR usage: pointer [move <r> <c>|leave|status]\n".to_string()),
+    }
+}
+
+/// `pointer [move <r> <c>|leave|status]` -> put the front window's POINTER on a
+/// cell (or withdraw it) and reply where it actually is.
+///
+/// This is the verb that makes hover states drivable: it goes through
+/// [`crate::App::pointer_cmd`], whose arms are `on_cursor_moved` / `on_cursor_left`
+/// — the functions winit's own `CursorMoved`/`CursorLeft` call. `mouse move` cannot
+/// substitute: it posts an engine `InputEvent` and never touches the window pointer
+/// state a hover is resolved from.
+///
+/// `OK at=-` is the honest answer for a window holding no pointer position — after
+/// a `leave`, and before any motion has happened. It says only that; the position
+/// fields are not printed at all, so there is nothing there to be believed.
+pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let action = match parse_pointer(rest) {
+        Ok(action) => action,
+        Err(usage) => return usage,
+    };
+    match super::control_media::call_main(proxy, |reply| Wake::PointerCmd { action, reply }) {
+        Ok(Ok(Some((row, col)))) => format!("OK at={row},{col}\n"),
+        Ok(Ok(None)) => "OK at=-\n".to_string(),
+        Ok(Err(why)) => format!("ERR {why}\n"),
+        Err(error) => format!("ERR pointer command failed: {error}\n"),
+    }
+}
+
 /// Parse + range-check a `resize <r> <c>` request (the PURE part, so it is unit
 /// testable without an event loop). Returns the validated `(rows, cols)` or the
 /// exact error string the verb replies with.
@@ -1032,25 +1292,14 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // width-throttle arms — coalescing, the trailing settle, the leading-edge apply
     // — drivable only by a hand on the window edge, and therefore unmeasurable.
     // Fire several of these back to back to reproduce a drag's event pressure.
-    if let Some(px) = rest.trim().strip_prefix("px") {
-        let mut it = px.split_whitespace();
-        let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
-            return "ERR usage: resize px <w> <h>\n".to_string();
-        };
-        let (Ok(w), Ok(h)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
-            return "ERR bad args\n".to_string();
-        };
-        return match post_input_reply(
-            proxy,
-            Op::WriteInput,
-            vec![InputEvent::ResizeWindowPx {
-                width: w,
-                height: h,
-            }],
-        ) {
-            Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
-            Ok(_) => "OK\n".to_string(),
-            Err(e) => e,
+    if let Some(event) = parse_resize_px(rest) {
+        return match event {
+            Err(usage) => usage,
+            Ok(event) => match post_input_reply(proxy, Op::WriteInput, vec![event]) {
+                Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
+                Ok(_) => "OK\n".to_string(),
+                Err(e) => e,
+            },
         };
     }
     // Range-check up front (keeps the precise `ERR out of range` / usage strings),
@@ -1076,6 +1325,28 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// Parse the WINDOW form of `resize` — `px <w> <h>` — into the event that posts
+/// it, or `None` when `rest` names the CELL form the caller parses with
+/// [`parse_resize`].
+///
+/// The two forms address different things and therefore route differently: the
+/// px form asks the OS window for a size (no engine state at all), while the
+/// cell form resizes the engine and the PTY. Three routers now have to tell them
+/// apart — [`cmd_resize`], the front-routed cross-session twin, and the
+/// native-front window lane — so the spelling of the px form and the two `ERR`
+/// strings it can produce live here once instead of beside each router.
+pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> {
+    let px = rest.trim().strip_prefix("px")?;
+    let mut it = px.split_whitespace();
+    let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
+        return Some(Err("ERR usage: resize px <w> <h>\n".to_string()));
+    };
+    let (Ok(width), Ok(height)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
+        return Some(Err("ERR bad args\n".to_string()));
+    };
+    Some(Ok(InputEvent::ResizeWindowPx { width, height }))
+}
+
 /// Funnel all control-verb bytes through the active session's single SinkWriter
 /// (whole-frame atomicity vs the GUI keyboard path + reader-thread replies). Drops
 /// a closed-peer error like the legacy writer did. Used ONLY by the audited raw
@@ -1096,6 +1367,158 @@ pub(crate) fn write_pty(sink: &SinkWriter, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GATE (lane-license, deliverable 2): the control fence exempts exactly
+    /// the `key` bodies that arm their own license class at the input seam —
+    /// plain glyphs (as before) plus plain Enter/Tab/Backspace — and keeps
+    /// fencing everything else.
+    ///
+    /// RED-PROOF (2026-08-30): with `key_arms_own_license` collapsed back to
+    /// `key_is_plain_typed_glyph` (the pre-fix dispatcher predicate), the
+    /// first loop fails at `"enter"` — the shape whose pre-clear made every
+    /// control-driven `key enter` wipe the bank and decline its response.
+    #[test]
+    fn license_fence_exempts_keys_that_arm_their_own_class() {
+        for body in ["enter", "tab", "backspace", "a", "space", "shift+tab"] {
+            assert!(
+                key_arms_own_license(body),
+                "`key {body}` arms its own license and must skip the fence"
+            );
+        }
+        for body in [
+            "esc",
+            "up",
+            "left",
+            "home",
+            "f1",
+            "ctrl+enter",
+            "alt+tab",
+            "ctrl+c",
+            "",
+            "notakey",
+        ] {
+            assert!(
+                !key_arms_own_license(body),
+                "`key {body}` arms no license of its own and must keep the fence"
+            );
+        }
+    }
+
+    /// The whole point of the reply's `-`: with no current match there is no row,
+    /// column or length, and the formatter has no way to print one — the fields come
+    /// from `Option`s. A previous drivable-surface attempt answered a live-looking
+    /// `row=5 col=3` for a position that did not exist, which is the failure this
+    /// pins shut.
+    #[test]
+    fn a_find_reply_names_no_match_position_when_there_is_no_match() {
+        let status = crate::app_search::FindStatus {
+            open: true,
+            query: "needle".to_string(),
+            matches: 0,
+            current: None,
+            current_match: None,
+            ..crate::app_search::FindStatus::CLOSED
+        };
+        let line = find_status_line(&status);
+        assert_eq!(
+            line,
+            "OK open=1 query=needle case=0 regex=0 regex_error=0 matches=0 current=- \
+             row=- col=- len=- truncated=0\n"
+        );
+        // A match present is reported as itself, 1-based like the find bar's own
+        // "3 of 7" — so the pin above is about ABSENCE, not about a dead formatter.
+        //
+        // The fixture is a REACHABLE match: `current_match` carries `(row, start_col,
+        // end_col)` with `end_col` inclusive, so an end below its own start is a value
+        // the engine cannot produce, and a fixture shaped that way would bless a
+        // formatter that reads the third field as a length.
+        let line = find_status_line(&crate::app_search::FindStatus {
+            open: true,
+            query: "needle".to_string(),
+            matches: 7,
+            current: Some(2),
+            current_match: Some((-4, 11, 16)),
+            ..crate::app_search::FindStatus::CLOSED
+        });
+        assert!(
+            line.contains("matches=7 current=3 row=-4 col=11 len=6"),
+            "{line}"
+        );
+    }
+
+    /// A closed find bar says exactly that and nothing else: no query, no counters,
+    /// no coordinates from the zero-valued struct behind them.
+    #[test]
+    fn a_closed_find_bar_answers_only_that_it_is_closed() {
+        assert_eq!(
+            find_status_line(&crate::app_search::FindStatus::CLOSED),
+            "OK open=0\n"
+        );
+    }
+
+    /// A find query may begin or end with a space, and `type` keeps it: the payload
+    /// is the line after the ONE separating space, not a whitespace-split rejoin.
+    #[test]
+    fn find_type_carries_its_text_verbatim_including_the_spaces() {
+        use crate::app_search::FindAction;
+        assert_eq!(
+            parse_find("type hello world"),
+            Ok(FindAction::Type("hello world".to_string()))
+        );
+        assert_eq!(
+            parse_find("type  leading"),
+            Ok(FindAction::Type(" leading".to_string()))
+        );
+        assert_eq!(
+            parse_find("type trailing "),
+            Ok(FindAction::Type("trailing ".to_string()))
+        );
+    }
+
+    /// A bare form REFUSES a trailing argument instead of ignoring it: `find next 3`
+    /// asks for something the verb cannot do, and answering `OK` would report one
+    /// step as though it had been three.
+    #[test]
+    fn a_bare_find_form_refuses_an_argument_it_cannot_honour() {
+        for line in ["next 3", "prev 2", "open now", "cancel please", "case on"] {
+            assert!(
+                parse_find(line).is_err(),
+                "find {line:?} must not be accepted"
+            );
+        }
+        // …and the bare forms themselves still parse, so the guard is not a blanket
+        // rejection of the whole sub-grammar.
+        use crate::app_search::FindAction;
+        assert_eq!(parse_find("next"), Ok(FindAction::Step { forward: true }));
+        assert_eq!(parse_find("prev"), Ok(FindAction::Step { forward: false }));
+        assert_eq!(parse_find("case"), Ok(FindAction::ToggleCase));
+        assert_eq!(parse_find(""), Ok(FindAction::Status));
+    }
+
+    /// `pointer move` REFUSES a cell outside the addressable grid rather than
+    /// clamping it: a clamped move answered `OK` would tell the caller the pointer
+    /// went where it asked when it went somewhere else.
+    #[test]
+    fn pointer_move_refuses_a_cell_it_cannot_address() {
+        use crate::app_mouse::PointerAction;
+        assert_eq!(
+            parse_pointer("move 3 9"),
+            Ok(PointerAction::Move { row: 3, col: 9 })
+        );
+        assert_eq!(parse_pointer("leave"), Ok(PointerAction::Leave));
+        assert_eq!(parse_pointer(""), Ok(PointerAction::Status));
+        assert_eq!(
+            parse_pointer(&format!("move {MAX_GRID_ROWS} 0")),
+            Err("ERR out of range\n".to_string())
+        );
+        assert_eq!(
+            parse_pointer(&format!("move 0 {MAX_GRID_COLS}")),
+            Err("ERR out of range\n".to_string())
+        );
+        for line in ["move 1", "move 1 2 3", "move a b", "leave now", "wiggle"] {
+            assert!(parse_pointer(line).is_err(), "pointer {line:?}");
+        }
+    }
 
     /// `lines=N` reaches `InputEvent::Wheel.lines` for the wheel actions: absent it
     /// defaults to 1 (the pre-existing one-notch behaviour), an explicit count is

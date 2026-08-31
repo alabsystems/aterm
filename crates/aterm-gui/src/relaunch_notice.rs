@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The "update ready" nudge STATE (proof-carrying DSU, RFC Rung 2). The nudge itself is
-//! the ⬆️-suffixed VERSION menu title + its one-click "Update to v<staged> — restart
-//! now" item (see `crate::menu::update_version_menu` / the palette's Version row), plus
+//! the ⬆️-suffixed VERSION menu title + its one-click "Update to v<staged> — apply now,
+//! shells keep running" item (see `crate::menu::update_version_menu` / the palette's
+//! Version row), plus
 //! the subtle LEADING `↻` icon in the off-macOS tab strip (see [`crate::tab_bar`]
 //! `TabHit::Update`) — chrome, not a disruptive banner. This module holds only the small
 //! pieces of App state that drive it: which build/version is staged (the repaint

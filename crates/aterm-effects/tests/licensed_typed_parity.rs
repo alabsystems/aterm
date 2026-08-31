@@ -60,7 +60,9 @@ fn geom() -> Geom {
 
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
-        ribbon_tall: false,
+        // This parity script follows the shipping default; explicit underline
+        // geometry has its own resolver, geometry, and live-paint pins.
+        ribbon_tall: true,
         enabled: true,
         dark_theme: true,
         theme_fg: 0x00C8_D3F5,
@@ -102,7 +104,17 @@ fn trail_cfg() -> TrailConfig {
 /// license. `an_unlicensed_script_moves_every_golden_entry` is the standing
 /// control built on it; see the module header for why a golden that nothing
 /// can redden is the shape this file has to avoid.
-fn typed_script(style: GlowStyle, licensed: bool) -> u64 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypedScriptOutcome {
+    fingerprint: u64,
+    licensed: u64,
+    declined: u64,
+    spawns: u64,
+    peak_live_sparks: usize,
+    peak_ribbon_segments: usize,
+}
+
+fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
     let g = geom();
     let c = cfg(style);
     let tc = trail_cfg();
@@ -112,42 +124,35 @@ fn typed_script(style: GlowStyle, licensed: bool) -> u64 {
     let mut trail_out = Vec::new();
     let t0 = Instant::now();
     let mut acc: u64 = 0;
+    let mut peak_live_sparks = 0;
+    let mut peak_ribbon_segments = 0;
 
-    let step = |glow: &mut CursorGlow,
-                trail: &mut CursorTrail,
-                out: &mut Vec<GlowQuad>,
-                trail_out: &mut Vec<_>,
-                acc: &mut u64,
-                at: Instant,
-                cell: (u16, u16)| {
-        let fp = glow.tick(Some(cell), at, &c, g, out);
-        trail.tick(Some(cell), at, &tc, trail_out);
-        fold(acc, &fp.to_le_bytes());
-        fold(acc, &glow.spawns().to_le_bytes());
-        fold(acc, &(glow.live_sparks() as u64).to_le_bytes());
-        fold(acc, &(glow.ribbon_segments() as u64).to_le_bytes());
-        fold(acc, &glow.typing_momentum(at).to_bits().to_le_bytes());
-        for q in out.iter() {
-            fold(acc, format!("{q:?}").as_bytes());
-        }
-        for cell in trail_out.iter() {
-            fold(acc, format!("{cell:?}").as_bytes());
-        }
-        for cue in glow.drain_sound_cues() {
-            fold(acc, format!("{cue:?}").as_bytes());
-        }
-    };
+    let mut step =
+        |glow: &mut CursorGlow, trail: &mut CursorTrail, at: Instant, cell: (u16, u16)| {
+            let fp = glow.tick(Some(cell), at, &c, g, &mut out);
+            trail.tick(Some(cell), at, &tc, &mut trail_out);
+            let live_sparks = glow.live_sparks();
+            let ribbon_segments = glow.ribbon_segments();
+            peak_live_sparks = peak_live_sparks.max(live_sparks);
+            peak_ribbon_segments = peak_ribbon_segments.max(ribbon_segments);
+            fold(&mut acc, &fp.to_le_bytes());
+            fold(&mut acc, &glow.spawns().to_le_bytes());
+            fold(&mut acc, &(live_sparks as u64).to_le_bytes());
+            fold(&mut acc, &(ribbon_segments as u64).to_le_bytes());
+            fold(&mut acc, &glow.typing_momentum(at).to_bits().to_le_bytes());
+            for q in &out {
+                fold(&mut acc, format!("{q:?}").as_bytes());
+            }
+            for cell in &trail_out {
+                fold(&mut acc, format!("{cell:?}").as_bytes());
+            }
+            for cue in glow.drain_sound_cues() {
+                fold(&mut acc, format!("{cue:?}").as_bytes());
+            }
+        };
 
     // Seed the anchor.
-    step(
-        &mut glow,
-        &mut trail,
-        &mut out,
-        &mut trail_out,
-        &mut acc,
-        t0,
-        (2, 30),
-    );
+    step(&mut glow, &mut trail, t0, (2, 30));
     // Six typed glyph echoes at 90 ms — the licensed typing run.
     for k in 1..=6u64 {
         let at = t0 + Duration::from_millis(90 * k);
@@ -155,15 +160,7 @@ fn typed_script(style: GlowStyle, licensed: bool) -> u64 {
             glow.note_synthetic_typed(at, 1);
             trail.note_synthetic_typed(at);
         }
-        step(
-            &mut glow,
-            &mut trail,
-            &mut out,
-            &mut trail_out,
-            &mut acc,
-            at,
-            (2, 30 + k as u16),
-        );
+        step(&mut glow, &mut trail, at, (2, 30 + k as u16));
     }
     // The wrap at the right margin, then three glyphs on the new row.
     for (k, cell) in [(7u64, (3u16, 0u16)), (8, (3, 1)), (9, (3, 2))] {
@@ -172,15 +169,7 @@ fn typed_script(style: GlowStyle, licensed: bool) -> u64 {
             glow.note_synthetic_typed(at, 1);
             trail.note_synthetic_typed(at);
         }
-        step(
-            &mut glow,
-            &mut trail,
-            &mut out,
-            &mut trail_out,
-            &mut acc,
-            at,
-            cell,
-        );
+        step(&mut glow, &mut trail, at, cell);
     }
     // A licensed gesture jump.
     let jump = t0 + Duration::from_millis(1_100);
@@ -188,29 +177,21 @@ fn typed_script(style: GlowStyle, licensed: bool) -> u64 {
         glow.note_synthetic_move(jump);
         trail.note_synthetic_move(jump);
     }
-    step(
-        &mut glow,
-        &mut trail,
-        &mut out,
-        &mut trail_out,
-        &mut acc,
-        jump,
-        (5, 30),
-    );
+    step(&mut glow, &mut trail, jump, (5, 30));
     // The decay tail.
     for ms in [1_150u64, 1_400, 2_200, 4_000] {
         let at = t0 + Duration::from_millis(ms);
-        step(
-            &mut glow,
-            &mut trail,
-            &mut out,
-            &mut trail_out,
-            &mut acc,
-            at,
-            (5, 30),
-        );
+        step(&mut glow, &mut trail, at, (5, 30));
     }
-    acc
+    let tally = glow.admission_tally();
+    TypedScriptOutcome {
+        fingerprint: acc,
+        licensed: tally.licensed,
+        declined: tally.declined,
+        spawns: glow.spawns(),
+        peak_live_sparks,
+        peak_ribbon_segments,
+    }
 }
 
 /// RED-FIRST, and it was run that way: replayed against the pre-license tree
@@ -423,84 +404,84 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // flips the admission tally, and the tally is frozen — `an_unlicensed_script_
     // moves_every_golden_entry` still passes, as do both sibling tests in this
     // file, untouched.
-        // RE-BASELINED A THIRD TIME 2026-08-27, entry 2 (rainbow) ONLY:
-        // `3_947_126_183_161_842_362` → the value below. The cause is NOT one
-        // repaint but four deliberate rainbow-emitter commits that landed on
-        // the codex lane and were never re-captured here — d0d0b863 (smooth
-        // rainbow, coherent kitty frames), 7d712dc0 (continuous presentation),
-        // 8c85c952 (unified fade + palette) and e2bc14c4 (gaps and colour
-        // seams). They reached main through the merge da2832f0, which kept
-        // origin/main's NUMBER while taking both sides' CODE, so this golden
-        // has been stale — and main red — ever since. (da2832f0 itself does
-        // not compile: it kept a use of `Self::RAINBOW_WAVE_RAD` whose const
-        // the codex side had deleted. A bisect therefore stops at the merge;
-        // the first commit that both builds and disagrees is d0d0b863.)
-        //
-        // The mechanisms are the emitter's clocks and raster: the hue and wave
-        // clocks moved onto the exact phase ring (`rainbow_momentum_bands`
-        // `phase * 2.2` → `rainbow_ring_turns(phase, 359.0/1024.0) * TAU`,
-        // `RAINBOW_LIGHT_RAIL_FLOW` 0.35 → 179/512), `rainbow_glint_profile`
-        // arrived, and a per-pixel sub-cell raster replaced the slab raster.
-        //
-        // WHY THIS IS A REPAINT AND NOT THE SEAM — measured, not argued. The
-        // fold was decomposed per channel at the golden's own tree and at
-        // HEAD. For all NINE styles, and for rainbow in particular, these are
-        // BYTE-IDENTICAL: `spawns`, `live_sparks`, `ribbon_segments`,
-        // `typing_momentum`, the comet-trail cells, the drained sound cues,
-        // the admission tally (licensed=10, declined=0) and the whole
-        // per-step trajectory including both engines' anchors. The other
-        // eight styles do not move on ANY channel. Only rainbow's frame
-        // fingerprint and its over-ink quad fold moved (1593 → 3047 quads).
-        // A seam regression cannot produce that signature: disabling the
-        // `type_hint` disjunct in `move_licensed` moves all NINE entries and
-        // flips the tally to licensed=1/declined=9, while reverting a single
-        // line of `emit_rainbow_mark_dark` moves index 2 alone with the tally
-        // frozen — which is exactly the shape observed here.
-        //
-        // Read the sentence above about "admission … untouched" as a claim
-        // about these MEASURED channels, not about the source: the machinery
-        // did change (e2bc14c4 added `refresh_rainbow_cell_owner` and altered
-        // the `hue_advances` seed), and both are provably counter-neutral on
-        // this script. Note also that the mark emitter's ink reaches this
-        // number only through the frame fingerprint — the ribbon is written
-        // to `under_out`, which the script never folds as quads — so both
-        // `fp` and the quad fold moved, and neither alone explains it.
-        //
-        // RE-BASELINED AGAIN (companion head-hue seam, 2026-08-28). Index 2 is
-        // the RAINBOW style and it moved ALONE; the other eight are unchanged
-        // bytes. That is the repaint signature this comment already documents,
-        // not the seam one: a seam regression "moves all NINE entries and flips
-        // the tally to licensed=1/declined=9", and the tally is frozen here —
-        // both sibling tests in this file (`split_batch_suffix_...` and
-        // `earned_light_survives_a_cold_program_move`) still pass untouched.
-        //
-        // The cause is `rainbow_head_rgb` gaining a `head_hue` colour authority.
-        // It previously read "the newest TYPING spark", but tail repair appends
-        // missing older cells AFTER the fresh head, so that sample was not the
-        // head; it also returned `None` before the first cell and after the last
-        // retired, and the `None <-> Some` swap threw the caret and its inner
-        // halo a whole palette arc on first-key and final-fade frames. Rainbow
-        // is the only style with a companion colour authority, so rainbow is the
-        // only index that can move.
-        //
-        // RECAPTURED 2026-08-27 for ROYGBIV. The palette moved from six
-        // anchors to the canonical seven — red, orange, yellow, green, blue,
-        // INDIGO, violet — on the owner's ruling (*"a rainbow. like in the
-        // sky"*), and the hand-built "neutralized handoff" that drove the
-        // green→blue interval 95.3% of the way to flat grey at its midpoint
-        // was deleted with it. A palette change necessarily moves a byte fold
-        // of the emitter, so this golden is re-captured rather than repaired.
-        // The evidence that it is still the SURGICAL change this file exists
-        // to police: the recapture moved index 2 alone
-        // (`3_947_126_183_161_842_362` was the six-anchor value) and every
-        // other style folded byte-identical, so the license seam still lays
-        // the pixel it always laid.
-        // Re-captured on the MERGED tree: upstream's companion head-hue seam
-        // and this branch's ROYGBIV palette are both present, which is why
-        // neither side's number survived the rebase. Index 2 moved ALONE and
-        // the other eight came back byte-identical to the committed values —
-        // the repaint signature this file's own diagnostic describes, not the
-        // seam one.
+    // RE-BASELINED A THIRD TIME 2026-08-27, entry 2 (rainbow) ONLY:
+    // `3_947_126_183_161_842_362` → the value below. The cause is NOT one
+    // repaint but four deliberate rainbow-emitter commits that landed on
+    // the codex lane and were never re-captured here — d0d0b863 (smooth
+    // rainbow, coherent kitty frames), 7d712dc0 (continuous presentation),
+    // 8c85c952 (unified fade + palette) and e2bc14c4 (gaps and colour
+    // seams). They reached main through the merge da2832f0, which kept
+    // origin/main's NUMBER while taking both sides' CODE, so this golden
+    // has been stale — and main red — ever since. (da2832f0 itself does
+    // not compile: it kept a use of `Self::RAINBOW_WAVE_RAD` whose const
+    // the codex side had deleted. A bisect therefore stops at the merge;
+    // the first commit that both builds and disagrees is d0d0b863.)
+    //
+    // The mechanisms are the emitter's clocks and raster: the hue and wave
+    // clocks moved onto the exact phase ring (`rainbow_momentum_bands`
+    // `phase * 2.2` → `rainbow_ring_turns(phase, 359.0/1024.0) * TAU`,
+    // `RAINBOW_LIGHT_RAIL_FLOW` 0.35 → 179/512), `rainbow_glint_profile`
+    // arrived, and a per-pixel sub-cell raster replaced the slab raster.
+    //
+    // WHY THIS IS A REPAINT AND NOT THE SEAM — measured, not argued. The
+    // fold was decomposed per channel at the golden's own tree and at
+    // HEAD. For all NINE styles, and for rainbow in particular, these are
+    // BYTE-IDENTICAL: `spawns`, `live_sparks`, `ribbon_segments`,
+    // `typing_momentum`, the comet-trail cells, the drained sound cues,
+    // the admission tally (licensed=10, declined=0) and the whole
+    // per-step trajectory including both engines' anchors. The other
+    // eight styles do not move on ANY channel. Only rainbow's frame
+    // fingerprint and its over-ink quad fold moved (1593 → 3047 quads).
+    // A seam regression cannot produce that signature: disabling the
+    // `type_hint` disjunct in `move_licensed` moves all NINE entries and
+    // flips the tally to licensed=1/declined=9, while reverting a single
+    // line of `emit_rainbow_mark_dark` moves index 2 alone with the tally
+    // frozen — which is exactly the shape observed here.
+    //
+    // Read the sentence above about "admission … untouched" as a claim
+    // about these MEASURED channels, not about the source: the machinery
+    // did change (e2bc14c4 added `refresh_rainbow_cell_owner` and altered
+    // the `hue_advances` seed), and both are provably counter-neutral on
+    // this script. Note also that the mark emitter's ink reaches this
+    // number only through the frame fingerprint — the ribbon is written
+    // to `under_out`, which the script never folds as quads — so both
+    // `fp` and the quad fold moved, and neither alone explains it.
+    //
+    // RE-BASELINED AGAIN (companion head-hue seam, 2026-08-28). Index 2 is
+    // the RAINBOW style and it moved ALONE; the other eight are unchanged
+    // bytes. That is the repaint signature this comment already documents,
+    // not the seam one: a seam regression "moves all NINE entries and flips
+    // the tally to licensed=1/declined=9", and the tally is frozen here —
+    // both sibling tests in this file (`split_batch_suffix_...` and
+    // `earned_light_survives_a_cold_program_move`) still pass untouched.
+    //
+    // The cause is `rainbow_head_rgb` gaining a `head_hue` colour authority.
+    // It previously read "the newest TYPING spark", but tail repair appends
+    // missing older cells AFTER the fresh head, so that sample was not the
+    // head; it also returned `None` before the first cell and after the last
+    // retired, and the `None <-> Some` swap threw the caret and its inner
+    // halo a whole palette arc on first-key and final-fade frames. Rainbow
+    // is the only style with a companion colour authority, so rainbow is the
+    // only index that can move.
+    //
+    // RECAPTURED 2026-08-27 for ROYGBIV. The palette moved from six
+    // anchors to the canonical seven — red, orange, yellow, green, blue,
+    // INDIGO, violet — on the owner's ruling (*"a rainbow. like in the
+    // sky"*), and the hand-built "neutralized handoff" that drove the
+    // green→blue interval 95.3% of the way to flat grey at its midpoint
+    // was deleted with it. A palette change necessarily moves a byte fold
+    // of the emitter, so this golden is re-captured rather than repaired.
+    // The evidence that it is still the SURGICAL change this file exists
+    // to police: the recapture moved index 2 alone
+    // (`3_947_126_183_161_842_362` was the six-anchor value) and every
+    // other style folded byte-identical, so the license seam still lays
+    // the pixel it always laid.
+    // Re-captured on the MERGED tree: upstream's companion head-hue seam
+    // and this branch's ROYGBIV palette are both present, which is why
+    // neither side's number survived the rebase. Index 2 moved ALONE and
+    // the other eight came back byte-identical to the committed values —
+    // the repaint signature this file's own diagnostic describes, not the
+    // seam one.
     // RE-DERIVED 2026-08-29 after the caret/composited cyan law. Index 2 (rainbow)
     // ALONE moved; the other EIGHT are byte-identical to the values this branch
     // already carried, which is the evidence the licence seam did not move and only
@@ -543,10 +524,42 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // alone, `10_097_… → 10_857_…`, with the other EIGHT byte-identical
     // (the repaint signature again). Captured from measurement on the merged
     // tree, not hand-merged.
+    // RE-DERIVED 2026-08-30 (the RAINBOW METEOR lane): index 2 (rainbow) ALONE
+    // moved, `10_857_… → 12_019_…`; the other EIGHT came back byte-identical —
+    // the repaint signature this file's diagnostic describes, not the seam one
+    // (the admission tally is frozen and both sibling tests pass untouched).
+    // The rainbow bytes move for four deliberate, owner-driven reasons in the
+    // jump gesture this script fires at ms 1100: (1) the flight phase — the
+    // decay ticks at 1150/1400 now catch the meteor mid-flight/mid-retract on
+    // a re-based clock instead of the old full-span retract; (2) the Starburst
+    // is born at arrival (+RAINBOW_METEOR_FLIGHT_S), so the ring/sparkle
+    // frames shift by the flight; (3) the Land chime rides the arrival edge,
+    // so the cue drains one step later than it did; (4) the per-jump latch
+    // roll advances the caret's worn colour one lay step across the jump.
+    // Captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1), not
+    // hand-merged.
+    // RE-DERIVED 2026-08-30 after the rainbow pile ledger began treating
+    // separated emission runs as one complete particle owner. Only index 2
+    // moved; the other eight and the independent licence controls stayed exact.
+    // RE-DERIVED 2026-08-30 (INTEGRATION, meteor+band merged onto the classic
+    // rework): the rainbow entry alone re-captured on the final tree.
+    // RE-DERIVED 2026-08-30 (the BAND/CLASSIC RECONCILIATION): index 2
+    // (rainbow) ALONE moved, `7_675_… → 331_874_…`; the other EIGHT came back
+    // byte-identical — the repaint signature, not the seam one. The rainbow
+    // bytes move for the reconciliation's four deliberate visible changes:
+    // (1) the classic unroll is the 14-cell short traverse now, so this
+    // script's 6- and 3-key runs lay their cells at 1/14 of the arc per cell
+    // instead of 1/6 (the owner's short-text law); (2) the tall body's core
+    // follows the equal-ledge law, so dim positions hold their plateau deeper
+    // and the emitted quad stack changes; (3) a lone typed cell's wake
+    // continues the classic walk reflected at the anchor instead of reading
+    // flat red; (4) the wrap's fresh row opens on the gated re-anchor. All
+    // captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1), not
+    // hand-merged.
     const GOLDEN: [u64; 9] = [
         10_317_128_623_903_768_537,
         17_965_605_562_081_848_086,
-        10_857_777_412_812_312_039,
+        331_874_870_921_564_289,
         15_654_209_172_669_807_490,
         3_818_617_666_977_618_171,
         17_432_548_801_852_476_563,
@@ -560,8 +573,11 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         let a = typed_script(style, true);
         let b = typed_script(style, true);
         assert_eq!(a, b, "{style:?}: the typed script is nondeterministic");
-        assert_ne!(a, 0, "{style:?}: the typed script folded nothing");
-        actual[i] = a;
+        assert_ne!(
+            a.fingerprint, 0,
+            "{style:?}: the typed script folded nothing"
+        );
+        actual[i] = a.fingerprint;
     }
     if std::env::var_os("ATERM_CAPTURE_TYPED_PARITY").is_some() || GOLDEN.iter().all(|&v| v == 0) {
         panic!("CAPTURE TYPED PARITY GOLDEN = {actual:?}");
@@ -605,8 +621,38 @@ fn an_unlicensed_script_moves_every_golden_entry() {
             "{style:?}: the unlicensed script is nondeterministic — this control \
              cannot mean anything until it is not"
         );
+        assert_eq!(
+            (licensed.licensed, licensed.declined),
+            (10, 0),
+            "{style:?}: the positive arm did not admit every authored move"
+        );
+        assert_eq!(
+            (cold.licensed, cold.declined),
+            (0, 10),
+            "{style:?}: withholding hints did not exercise every denial"
+        );
+        assert_eq!(licensed.spawns, 10, "{style:?}: an admitted move was lost");
+        assert_eq!(cold.spawns, 0, "{style:?}: a denied move minted light");
+        assert!(
+            licensed.peak_live_sparks > 0,
+            "{style:?}: the licensed control never carried live light"
+        );
+        assert_eq!(
+            cold.peak_live_sparks, 0,
+            "{style:?}: the unlicensed control carried live light"
+        );
+        if style == GlowStyle::RainbowKitty {
+            assert!(
+                licensed.peak_ribbon_segments > 0,
+                "the licensed rainbow control never laid its ribbon"
+            );
+            assert_eq!(
+                cold.peak_ribbon_segments, 0,
+                "the unlicensed rainbow control laid a ribbon"
+            );
+        }
         assert_ne!(
-            licensed, cold,
+            licensed.fingerprint, cold.fingerprint,
             "{style:?} (GOLDEN entry {i}): withholding every key hint left the fold \
              UNCHANGED. The golden above is then blind to the license seam it exists \
              to guard — it would stay green through the exact regression it was \

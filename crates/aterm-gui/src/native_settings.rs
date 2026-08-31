@@ -2707,7 +2707,7 @@ impl SettingsApp {
                 format!("Update retained until terminal activity settles · {reason}")
             }
             UpdateOutcome::Blocked { reasons } => {
-                format!("Before relaunch: {}", reasons.join(" · "))
+                format!("Before it can apply: {}", reasons.join(" · "))
             }
             UpdateOutcome::Failed { message } => format!("Update failed: {message}"),
         });
@@ -4037,11 +4037,10 @@ fn setting_choice_label(key: &str, value: &str) -> String {
     // underline" measures 133.6 pt inside a 132.0 pt button at 1.0× text scale
     // and paints clipped ("Rainbow kitty underl…"). It reads as the shorter
     // spelling the engine already accepts for exactly this style — honest about
-    // what it selects (the highlighter-plus-under-baseline mark, which since
-    // 2026-08-28 is also what the unqualified rows draw) and still a valid
+    // what it selects (the highlighter-plus-under-baseline alternate) and still a valid
     // `cursor_trail_style` value, so a user who copies the button into
     // `aterm.toml` lands back on this same option. The row is kept as a
-    // SPELLING, not a second look: removing it would break the configs and the
+    // separately selectable look: removing it would break the configs and the
     // alias table that name it.
     // The config spelling and the picker rows are untouched; this is the
     // button's paint label, like `EDIT_MOTION`'s above.
@@ -16624,7 +16623,7 @@ fn packages_page(
     // means only what its name says: may atpkg pull the set over the NETWORK onto a
     // machine that has none. "Remove ALab Toolset" is the durable way out, and it is
     // named here because a default this large must state its off switch.
-    const PACKAGE_CONSENT_NOTE: &str = "Automatic maintenance controls the background service. Maintenance and auto-update apply on the next launch. aterm keeps the ALab toolset installed and complete by default; Remove ALab Toolset undoes that. Auto-install applies on the next package operation and may download multiple GB; enabling it is multi-GB consent. All three switches write [packages] in aterm.toml.";
+    const PACKAGE_CONSENT_NOTE: &str = "Automatic maintenance controls the background service. Maintenance and the toolset's auto-update apply on the next launch. aterm keeps the ALab toolset installed and complete by default; Remove ALab Toolset undoes that. Auto-install applies on the next package operation and may download multiple GB; enabling it is multi-GB consent. All three switches write [packages] in aterm.toml.";
     const PACKAGE_CONSENT_LINES: [&str; 2] = [
         "ALab toolset kept complete by default; Remove undoes it.",
         "Auto-install: next package operation; multi-GB consent.",
@@ -23992,7 +23991,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        status.outcome = "\t  Update remains ready; last relaunch attempt stopped safely because live terminals and visible screens remain attached;\u{2003}\u{2003}review the sessions before retrying the handoff.\n\nThe protected live-PTY and visible-screen handoff keeps every session running until an explicit retry is safe."
+        status.outcome = "\t  Update remains ready; the last apply attempt stopped safely because live terminals and visible screens remain attached;\u{2003}\u{2003}review the sessions before retrying the handoff.\n\nThe protected live-PTY and visible-screen handoff keeps every session running until an explicit retry is safe."
             .to_string();
         let expected_outcome = status.outcome.clone();
         let without_whitespace = |text: &str| {
@@ -28859,7 +28858,7 @@ mod tests {
         };
         assert_eq!(
             state.feedback.as_deref(),
-            Some("Before relaunch: two sessions are still running")
+            Some("Before it can apply: two sessions are still running")
         );
 
         // …and with nothing staged the SAME button goes and looks, so the user

@@ -1149,6 +1149,10 @@ pub fn model_registry() -> Vec<Model> {
         native_update_menu_activation_model(),
         native_update_worker_queue_model(),
         native_update_status_reconciliation_model(),
+        // The FailedMark writer/reader suppression contract (the 5ffcc15d
+        // crash-loop poison class). Tier-1 conformance + #[refines] anchors
+        // live in aterm-update::manifest.
+        native_update_failed_mark_suppression_model(),
         trail_audio_lifecycle_model(),
         trail_audio_start_latency_model(),
         asymmetric_pad_layout_model(),

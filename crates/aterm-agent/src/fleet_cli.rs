@@ -34,7 +34,7 @@
 //! itself prints); the long-lived `subscribe` streamers and the `exec` dispatch
 //! are still glue over the aterm-ctl BINARY, resolved by [`ctl_bin`].
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -282,6 +282,61 @@ impl ListDiagnostics {
 /// scanner sleeps it in 100ms slices so a downstream close is observed promptly.
 const RESCAN_SECS: u64 = 1;
 
+/// Maximum records waiting behind the one stdout writer. Federation is a live
+/// stream, so a blocked downstream must apply backpressure to the per-instance
+/// readers instead of retaining an unbounded `String` queue.
+const FEDERATED_RECORD_CAPACITY: usize = 32;
+
+/// The events digest is metadata, not a screen dump. Bound the child-facing
+/// line before JSON escaping (which can expand control bytes) so one malformed
+/// or compromised peer cannot make even the bounded queue retain giant records.
+const MAX_FEDERATED_LINE_BYTES: usize = 64 * 1024;
+
+fn federation_channel() -> (mpsc::SyncSender<String>, mpsc::Receiver<String>) {
+    mpsc::sync_channel(FEDERATED_RECORD_CAPACITY)
+}
+
+/// Read one UTF-8 stream line with an accumulation cap. An oversized or invalid
+/// line terminates that instance's streamer; the scanner will retry it on the
+/// next pass, while memory stays bounded.
+fn read_federated_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
+    let mut limited = Read::by_ref(reader).take((MAX_FEDERATED_LINE_BYTES + 1) as u64);
+    let read = limited.read_line(line)?;
+    if read > MAX_FEDERATED_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "federated event line exceeds the 64 KiB bound",
+        ));
+    }
+    Ok(read)
+}
+
+/// Terminate a long-lived subscribe child when the local bridge rejects its
+/// stream, then always reap it. Killing happens before any best-effort
+/// diagnostic publication, so a full output queue cannot retain the child.
+fn terminate_stream_child(child: &mut std::process::Child) -> io::Result<()> {
+    let _ = child.kill();
+    child.wait().map(|_| ())
+}
+
+/// Resolve one local subscription channel, retiring its mapping only after the
+/// terminal event has captured the stable sid. A long-lived `@*` subscription
+/// otherwise remembers every closed tab for the lifetime of the process.
+fn resolve_federated_sid(
+    channels: &mut std::collections::HashMap<String, String>,
+    local: &str,
+    body: &str,
+) -> String {
+    let sid = channels
+        .get(local)
+        .cloned()
+        .unwrap_or_else(|| local.to_string());
+    if body == "exited" || body.starts_with("exited ") {
+        channels.remove(local);
+    }
+    sid
+}
+
 /// FEDERATE: ONE `subscribe @* events` per instance, merged to stdout as NDJSON.
 ///
 /// The fleet is NOT frozen at the startup snapshot, and — since the control plane
@@ -315,7 +370,7 @@ fn federate() {
     // Each instance streams on its own thread; a single writer thread (this one, below)
     // serializes the merged NDJSON so records never interleave mid-line. The scanner and
     // every streamer feed the writer over `tx`.
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = federation_channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Scanner: periodically snapshot the fleet and hold ONE subscribe per instance.
@@ -399,7 +454,7 @@ fn federate() {
 /// having ACKED NOTHING. "Acked at least one channel" is therefore the exact
 /// signal, and it is one this bridge can actually observe from the stdout stream
 /// it already parses.
-fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::Sender<String>) {
+fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::SyncSender<String>) {
     if stream_targets(ctl, pid, "@*", tx) {
         return;
     }
@@ -426,7 +481,7 @@ fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::Sender<Stri
 /// one read.
 ///
 /// Returns whether the server acked at least one channel (see [`stream_instance`]).
-fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::Sender<String>) -> bool {
+fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<String>) -> bool {
     let mut acked = false;
     let mut child = match Command::new(ctl)
         .args(["--pid", pid, "subscribe", targets, "events"])
@@ -441,11 +496,37 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::Sender<String>
         }
     };
     let Some(out) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
         return false;
     };
     let mut chan_to_sid: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for line in BufReader::new(out).lines().map_while(Result::ok) {
+    let mut reader = BufReader::new(out);
+    let mut rejection_diagnostic = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match read_federated_line(&mut reader, &mut line) {
+            // EOF is only a pipe verdict. The child may have closed stdout
+            // while remaining alive, so never enter an unbounded `wait()` on
+            // that assumption.
+            Ok(0) => {
+                break;
+            }
+            Ok(_) => {
+                while line.ends_with(['\r', '\n']) {
+                    line.pop();
+                }
+            }
+            Err(error) => {
+                rejection_diagnostic = Some(err_record(
+                    pid,
+                    &format!("subscribe stream rejected: {error}"),
+                ));
+                break;
+            }
+        }
         // Ack map: `sub <local> <sid>` — learn the channel→sid mapping.
         if let Some(rest) = line.strip_prefix("sub ") {
             let mut it = rest.split_whitespace();
@@ -460,17 +541,22 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::Sender<String>
             let mut it = rest.splitn(2, ' ');
             let local = it.next().unwrap_or("");
             let body = it.next().unwrap_or("");
-            let sid = chan_to_sid
-                .get(local)
-                .cloned()
-                .unwrap_or_else(|| local.to_string());
+            let sid = resolve_federated_sid(&mut chan_to_sid, local, body);
             if tx.send(event_record(pid, &sid, body)).is_err() {
                 break;
             }
         }
         // (GAP frames and anything else are dropped — events is a lossy digest by design.)
     }
-    let _ = child.wait();
+    // A local rejection/disconnect must stop the long-lived subscribe child;
+    // waiting while its stdout pipe is still open can otherwise park forever.
+    drop(reader);
+    let _ = terminate_stream_child(&mut child);
+    if let Some(diagnostic) = rejection_diagnostic {
+        // Diagnostics are useful but subordinate to resource cleanup. Publish
+        // only after the rejected child is gone, and never wait on a full queue.
+        let _ = tx.try_send(diagnostic);
+    }
     acked
 }
 
@@ -601,6 +687,129 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn federation_queue_is_bounded_and_backpressures_at_capacity() {
+        let (tx, rx) = federation_channel();
+        for index in 0..FEDERATED_RECORD_CAPACITY {
+            tx.try_send(index.to_string()).expect("capacity slot");
+        }
+        assert!(
+            matches!(
+                tx.try_send("overflow".to_string()),
+                Err(mpsc::TrySendError::Full(_))
+            ),
+            "a blocked stdout writer must bound retained event records"
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn federated_line_reader_caps_accumulation() {
+        let mut at_cap = vec![b'x'; MAX_FEDERATED_LINE_BYTES - 1];
+        at_cap.push(b'\n');
+        let mut line = String::new();
+        assert_eq!(
+            read_federated_line(&mut io::Cursor::new(at_cap), &mut line).unwrap(),
+            MAX_FEDERATED_LINE_BYTES
+        );
+
+        let over = vec![b'x'; MAX_FEDERATED_LINE_BYTES + 1];
+        line.clear();
+        let error = read_federated_line(&mut io::Cursor::new(over), &mut line).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(line.len() <= MAX_FEDERATED_LINE_BYTES + 1);
+    }
+
+    #[test]
+    fn exited_channels_do_not_accumulate_for_the_stream_lifetime() {
+        let mut channels = std::collections::HashMap::new();
+        for index in 0..1_000 {
+            let local = index.to_string();
+            let sid = format!("sid-{index}");
+            channels.insert(local.clone(), sid.clone());
+            assert_eq!(
+                resolve_federated_sid(&mut channels, &local, "output bytes=1"),
+                sid
+            );
+            assert_eq!(channels.len(), 1, "the live mapping must remain");
+            assert_eq!(resolve_federated_sid(&mut channels, &local, "exited"), sid);
+            assert!(channels.is_empty(), "the terminal mapping must be retired");
+        }
+    }
+
+    /// The cleanup seam must not wait for a long-lived subscribe child after a
+    /// local rejection. This directly guards the helper used after oversized,
+    /// invalid, and disconnected stream exits.
+    #[cfg(unix)]
+    #[test]
+    fn rejected_stream_child_is_killed_and_reaped_promptly() {
+        let mut child = Command::new("sh")
+            // Replace the shell so terminating `child` cannot orphan a sleeping
+            // grandchild in the test process tree.
+            .args(["-c", "exec sleep 3"])
+            .spawn()
+            .expect("spawn long-lived fake subscriber");
+        let started = std::time::Instant::now();
+        terminate_stream_child(&mut child).expect("kill and reap subscriber");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cleanup waited for the long-lived child instead of terminating it"
+        );
+        assert!(
+            child.try_wait().expect("query reaped child").is_some(),
+            "the terminated subscriber must already be reaped"
+        );
+    }
+
+    /// A subscriber may close stdout without exiting. The stream bridge must
+    /// treat that disconnect exactly like a local rejection, not block forever
+    /// waiting for a process that no longer has a readable pipe.
+    #[cfg(unix)]
+    #[test]
+    fn subscriber_that_closes_stdout_is_terminated_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = std::env::temp_dir().join(format!(
+            "aterm-fleet-closed-stdout-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        // THIRTY SECONDS, not three, and the budget below is five, not one.
+        // What this pins is that EOF on a LIVE child's stdout ends the stream
+        // instead of waiting the child out — so the only thing the numbers have
+        // to do is separate "returned on EOF" from "waited for the child", and
+        // the WIDER the gap the more reliably they do it. At 3 s against 1 s the
+        // margin was 3x, which a loaded machine eats: this test spawns a real
+        // process, and it failed in a full `cargo test --workspace` on a box
+        // running several builds while passing every time in isolation. A 6x
+        // gap keeps the discrimination (a regression waits 30 s and blows a 5 s
+        // budget by six times over) and stops charging the property for the
+        // scheduler's mood. The 30 s is only ever paid when the test FAILS.
+        std::fs::write(&script, b"#!/bin/sh\nexec 1>&-\nexec sleep 30\n")
+            .expect("write fake subscriber");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake subscriber executable");
+        let (tx, _rx) = federation_channel();
+
+        let started = std::time::Instant::now();
+        assert!(!stream_targets(
+            script.to_str().expect("utf8 temp path"),
+            "1",
+            "@*",
+            &tx,
+        ));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "EOF from a live child escaped prompt cleanup: returned after {elapsed:?}, \
+             which is the child's own 30 s sleep showing through rather than EOF"
+        );
+        let _ = std::fs::remove_file(script);
+    }
 
     #[test]
     fn event_record_is_astream_addressed_and_valid_json_shape() {

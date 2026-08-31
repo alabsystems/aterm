@@ -2382,6 +2382,13 @@ fn apply_staged_if_ready_inner(
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target_is_this_build: bool,
 ) -> ApplyOutcome {
+    // THE SWAP'S OWN COST, for the image that actually pays it. On a download
+    // lane the parent launches the CURRENT binary, so this image is the one that
+    // dittos the bundle and `execve`s — and `exec_preserving_handoff_fds` never
+    // returns, so a timer in the GUI's `main_entry` below the call can never see
+    // it. If a handoff is in flight, every millisecond spent here is spent with
+    // the OUTGOING process's readers parked.
+    let apply_started = std::time::Instant::now();
     let reexec_nonce = take_reexec_nonce();
     // Consume/clear child authority while startup is single-threaded, but do not
     // let malformed environment suppress crash-loop health observation/revert.
@@ -2456,11 +2463,12 @@ fn apply_staged_if_ready_inner(
     // disk re-exec'd from here would be a build the parent did not authorize; it
     // would refuse the target, drop the adopted PTYs and be booked as a structural
     // failure against a healthy candidate (2026-08-19 audit). The newer stage keeps
-    // for the next launch. `NoUpdate` is not a refusal, so the ledger stays quiet.
+    // for the successor's own apply lane (or the next launch). `NoUpdate` is not a
+    // refusal, so the ledger stays quiet.
     if handoff_target_is_this_build {
         crate::log(&format!(
-            "boot apply: build {current_build} is the handoff's authorized target; leaving any \
-             newer stage on disk for the next launch"
+            "boot apply: build {current_build} is the handoff's authorized target; any newer \
+             stage is left for the successor's own apply lane (or the next launch)"
         ));
         return ApplyOutcome::NoUpdate;
     }
@@ -2819,7 +2827,16 @@ fn apply_staged_if_ready_inner(
     // explicitly CLOEXEC, so success releases it atomically with image replacement;
     // an exec error leaves it held through rollback. No competing process can swap
     // a higher build or overwrite our nonce between this swap and this exec.
-    crate::log(&format!("applied update {} → re-launching", ready.version));
+    crate::log(&format!(
+        "applied update {} in {} ms{} → exec into the new binary",
+        ready.version,
+        apply_started.elapsed().as_millis(),
+        if handoff_fds.is_empty() {
+            ""
+        } else {
+            " (with the outgoing process's readers parked)"
+        }
+    ));
     // `b.exe` is the canonical path we launched from; after the in-place swap it
     // resolves to the NEW binary at the same location.
     let new_exe = &b.exe;

@@ -420,14 +420,6 @@ mod tests {
 
     const REAL_MANIFEST: &str = include_str!("../../../Cargo.toml");
 
-    /// PINS THE ONE-DMG SHAPE. The bare `aterm-<v>.dmg` spelling is
-    /// fleet-load-bearing (the deployed updater and install.sh bind it
-    /// exactly) and it is the ONLY macOS DMG a cut publishes: the retired
-    /// Intel `-x86_64` variant, the `-lite` twin and the `aterm-offline.dmg`
-    /// alias must never re-enter the required set under any flag, and a
-    /// channel head still carrying one of them is refused as a foreign
-    /// object rather than converged.
-    #[test]
     /// PINS THE SHARED TAG. The source publish and the binary cut meet on one
     /// vX.Y.0 release since v0.65.0, so the pub attestation pair rides beside
     /// the elected set — at most once each, with every other foreign name (and
@@ -451,12 +443,22 @@ mod tests {
         validate_mirror_asset_set(&foreign, "0.65.0", true, true)
             .expect_err("a retired container beside the pair is still foreign");
 
-        let only_pair: Vec<String> =
-            SOURCE_ATTESTATION_ASSETS.iter().map(|s| s.to_string()).collect();
+        let only_pair: Vec<String> = SOURCE_ATTESTATION_ASSETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         validate_mirror_asset_set(&only_pair, "0.65.0", true, true)
             .expect_err("the pair alone is a source release, not a mirrored cut");
     }
 
+    /// PINS THE ONE-DMG SHAPE. The bare `aterm-<v>.dmg` spelling is
+    /// fleet-load-bearing (the deployed updater and install.sh bind it
+    /// exactly) and it is the ONLY macOS DMG a cut publishes: the retired
+    /// Intel `-x86_64` variant, the `-lite` twin and the `aterm-offline.dmg`
+    /// alias must never re-enter the required set under any flag, and a
+    /// channel head still carrying one of them is refused as a foreign
+    /// object rather than converged.
+    #[test]
     fn the_required_set_carries_exactly_one_dmg_and_no_retired_names() {
         assert_eq!(dmg_asset_name("0.62.0"), "aterm-0.62.0.dmg");
         assert_eq!(stable_dmg_asset_name(), "aterm.dmg");

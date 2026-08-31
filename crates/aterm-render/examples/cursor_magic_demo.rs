@@ -30,7 +30,9 @@ const COLS: usize = 68;
 
 fn config(style: GlowStyle, theme: Theme) -> GlowConfig {
     GlowConfig {
-        ribbon_tall: false,
+        // Keep the pixel-review example honest about the shipping rainbow
+        // default. This field is ignored by the other style panels.
+        ribbon_tall: true,
         enabled: true,
         style,
         color: theme.cursor & 0x00ff_ffff,

@@ -373,9 +373,11 @@ pub enum FlowError {
     /// Fail-closed (§16.4 dispatch).
     UnsupportedKind(String),
     /// An `app-bundle` member was refused by the two-anchor app-apply gate
-    /// ([`crate::appgate::app_apply_allowed`], §16.2/§16.4). The notarized DMG self-swap is a
-    /// distinct topology the CLI tool-install path does not carry, so the gate's unconditional
-    /// notarization AND-anchor is unproven here and the decision fails closed.
+    /// ([`crate::appgate::app_apply_allowed`], §16.2/§16.4). The app is applied in-session by
+    /// its own updater (aterm-gui's overlap handoff), a topology the CLI tool-install path
+    /// deliberately does not carry, so the gate's unconditional notarization AND-anchor is
+    /// unproven here and the decision fails closed. atpkg never swaps the app (see
+    /// `app_apply_gate_refused` for the deferral rule).
     AppBundleRefused(String),
     /// An artifact row failed per-protocol admission ([`crate::vendor::check_row`]) BEFORE
     /// any byte moved: for `https`, a non-https or non-allow-listed `url`, an unknown
@@ -484,8 +486,12 @@ impl std::fmt::Display for FlowError {
             }
             FlowError::AppBundleRefused(p) => {
                 f.write_str(p)?;
-                f.write_str("'s app-bundle was refused by the app-apply gate (notarized self-swap \
-                             not wired on the CLI install path — the notarization anchor is unproven)")
+                f.write_str(
+                    "'s app-bundle is not installed by atpkg — aterm updates itself in-session \
+                     through its own notarization-gated updater (see `aterm ctl update status`); \
+                     the app-apply gate fails closed here because notarization is unproven on \
+                     the CLI path",
+                )
             }
             FlowError::VendorRefused(why) => {
                 f.write_str("artifact row refused: ")?;
@@ -835,9 +841,10 @@ fn install_inner(
     // ([`apply_sysroot_bundle`]) BEFORE activation plus a fail-loud resolve check AFTER —
     // a failure past activation UNWINDS ([`abort_activated_install`]) so a broken
     // toolchain is neither reported SUCCESS nor left live reading as 'already current'.
-    // `app-bundle` over `github-release` (the aterm notarized self-swap) keeps its own
-    // two-anchor gate and is NEVER the vendor-app lane. The OS-INSTALLER lanes — `pkg`
-    // ([`apply_pkg`]), `softwareupdate` ([`apply_softwareupdate`]) and `system-pm`
+    // `app-bundle` over `github-release` (the aterm self-update, applied in-session by the
+    // app's own updater) keeps its own two-anchor gate and is NEVER the vendor-app lane.
+    // The OS-INSTALLER lanes — `pkg` ([`apply_pkg`]), `softwareupdate`
+    // ([`apply_softwareupdate`]) and `system-pm`
     // ([`apply_system_pm`]) — return HERE with a [`ProtocolOutcome`] and never reach the
     // store path below: nothing is staged, activated or shimmed for them. Unknown pairs
     // remain refused CLOSED. (audit: sysroot-bundle silent-broken-install;
@@ -853,8 +860,8 @@ fn install_inner(
         | crate::dispatch::ApplyStrategy::SysrootBundle
         | crate::dispatch::ApplyStrategy::VendorApp => {}
         crate::dispatch::ApplyStrategy::AppBundle => {
-            // Drive the two-anchor app-apply gate for the notarized self-swap topology and
-            // fail closed (the DMG self-swap itself is a documented TODO, see the helper).
+            // Drive the two-anchor app-apply gate for the app's in-session apply topology and
+            // fail closed (atpkg never swaps the app; see the helper for the deferral rule).
             return Err(app_apply_gate_refused(
                 ch, program, pinned, artifact, installed,
             ));
@@ -1417,17 +1424,33 @@ fn abort_activated_install(layout: &Layout, channel: &str, program: &str, staged
 /// Drive the two-anchor app-apply gate ([`crate::appgate::app_apply_allowed`], §16.2/§16.4)
 /// for an `app-bundle` member met on the tool-install path, and return the fail-closed refusal.
 ///
-/// `aterm.app` is a NOTARIZED DMG applied by a self-swap (`renamex_np(RENAME_SWAP)` + re-exec),
-/// a distinct topology from the `bin/` symlink flip. The atpkg CLI tool-install path does not
-/// carry that swap, so Apple **notarization is unproven here** — and because notarization is
-/// the gate's UNCONDITIONAL AND-anchor, the decision fails closed regardless of the index
-/// conjunct. We still evaluate the REAL gate (with the fresh-index conjunct built from the
-/// signed channel `min_build` + per-build yank state) so the refusal is the gate's decision,
-/// not a blanket reject, and so the swap can later be wired behind a `true` notarization result.
+/// `aterm.app` is a NOTARIZED DMG the running app applies to itself IN-SESSION (aterm-gui's
+/// overlap handoff: a successor is spawned and every PTY is handed across, so the shells keep
+/// running; the cold-launch swap in aterm-update is only the fallback) — a distinct topology
+/// from the `bin/` symlink flip. The atpkg CLI tool-install path does not carry it, so Apple
+/// **notarization is unproven here** — and because notarization is the gate's UNCONDITIONAL
+/// AND-anchor, the decision fails closed regardless of the index conjunct. We still evaluate
+/// the REAL gate (with the fresh-index conjunct built from the signed channel `min_build` +
+/// per-build yank state) so the refusal is the gate's decision, not a blanket reject.
 ///
-/// TODO(app-bundle self-swap): once atpkg can stage the DMG and run the notarized self-swap
-/// (the `aterm-update` topology), pass the real notarization result + staged-DMG sha256 here
-/// and perform the swap when [`crate::appgate::app_apply_allowed`] returns true.
+/// NOTE(app-bundle): atpkg must never swap, re-exec, or ask the user to reopen the app. If the
+/// `aterm` member is ever added to the index, atpkg's whole job is refuse-and-defer plus a
+/// stage handoff to the app's own in-session lane (also recorded in
+/// docs/TOOLCHAIN-PACKAGE-MANAGER.md §16.4):
+///   (a) verify the DMG through [`crate::appgate::app_apply_allowed`] with a REAL notarization
+///       result — call aterm-update's `verify_bundle`, never reimplement codesign/spctl;
+///   (b) stage by calling aterm-update's own publish routine so the bundle lands at
+///       `aterm_update::paths::Staging::staged_app` (`<updates_root>/staged/aterm.app`) with
+///       `ready.toml` written last under `stage.lock`;
+///   (c) release the seal-read marker (`Updates/toolchain-install`, [`crate::net`]'s
+///       `SealReadGuard`) before returning — while it is held the GUI's apply is vetoed by
+///       `aterm_update::is_toolchain_install_active()`, so an app stage must not go through
+///       a DirFetcher on the sealed seed;
+///   (d) poke the running GUI with `aterm ctl update check` (Owner-only), whose `check` arm
+///       must post `Wake::UpdateStaged` for a strictly-newer stage so the App's reconcile
+///       arms the ~2-min auto-apply (today only the `apply` arm posts a Wake);
+///   (e) the only user-visible sentence is "staged for aterm to apply in-session" — never
+///       spawn, exec, or prompt.
 fn app_apply_gate_refused(
     ch: &Channel,
     program: &str,
@@ -1436,14 +1459,14 @@ fn app_apply_gate_refused(
     installed: Option<u64>,
 ) -> FlowError {
     let gate = crate::appgate::AppIndexGate {
-        // No staged DMG to hash on this path yet, so the sha256 conjunct cannot be satisfied
-        // (part of the documented TODO); the notarization anchor already fails the gate closed.
+        // No staged DMG to hash on this path, so the sha256 conjunct cannot be satisfied (see
+        // the NOTE above); the notarization anchor already fails the gate closed.
         sha256_match: false,
         min_build: ch.min_build,
         yanked: crate::gate::is_yanked(ch, program, pinned),
     };
-    // notarized = false: the CLI install path proves no Apple notarization and runs no
-    // self-swap, so the unconditional AND-anchor refuses the apply.
+    // notarized = false: the CLI install path proves no Apple notarization and never applies
+    // the app itself, so the unconditional AND-anchor refuses the apply.
     let allowed =
         crate::appgate::app_apply_allowed(false, pinned, installed.unwrap_or(0), Some(&gate));
     debug_assert!(
@@ -5220,8 +5243,8 @@ mod tests {
 
     #[test]
     fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
-        // app-bundle is the notarized self-swap topology, NOT a tool install — it
-        // stays refused CLOSED on this path.
+        // app-bundle is the app's own in-session apply topology, NOT a tool install — it
+        // stays refused CLOSED on this path (atpkg never swaps the app).
         let adir = scratch("dispatch-app");
         let app = fixture_with_kind(&adir, "app-bundle");
         let alay = layout(&adir);
@@ -5518,9 +5541,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // §16.4 dispatch / §16.2 gate: an `app-bundle` artifact (the notarized self-swap path) is
-    // refused by `atpkg install` — driven through the two-anchor app-apply gate, which fails
-    // closed because notarization is unproven on the CLI install path, before any download.
+    // §16.4 dispatch / §16.2 gate: an `app-bundle` artifact (the app's in-session apply
+    // topology, owned by aterm-gui/aterm-update) is refused by `atpkg install` — driven
+    // through the two-anchor app-apply gate, which fails closed because notarization is
+    // unproven on the CLI install path, before any download.
     #[test]
     fn refuses_app_bundle_kind() {
         let dir = scratch("appkind");

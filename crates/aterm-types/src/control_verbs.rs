@@ -261,8 +261,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         AnyScopeMeta,
-        "self-updater [status|check|apply]: staged build state; apply re-execs a staged build",
-        "",
+        "self-updater [status|check|apply]: staged build state; apply lands a staged build in place",
+        "The apply is the seamless in-session handoff: the running app hands every window, tab, split and live shell to the staged build (your shells keep running; automatic within ~2 min by default, or now via `apply`). `relaunch_ready=` on `status` is a historical key name: a strictly-newer build is staged and can be applied in place now.",
     ),
     va(
         "help",
@@ -386,6 +386,42 @@ pub const VERBS: &[VerbSpec] = &[
         "(a hit straddling a SOFT WRAP is one match whose col+len runs past the grid width \
          and continues at column 0 of the next row; regex ^ and $ bind to the reader's \
          LOGICAL line, so a continuation row has no ^ of its own)",
+    ),
+    // `find` DRIVES the find bar; `search` above ANSWERS the same question without
+    // one. Both are `Read`, and the reason is the op-class boundary rather than the
+    // absence of mutation: find mode exists to DIVERT keystrokes away from the PTY,
+    // so not one byte of a typed query reaches the driven program. What it moves is
+    // the viewport and the highlight — precisely what `scroll` and `select` move,
+    // and they are `Read` for the same reason. It reports the match position, which
+    // is what `search` (`Read`) already answers, so a read edge learns nothing here
+    // it could not already ask for. Classifying it `Write` would have been the real
+    // escalation: `Op::WriteInput` and `Op::ReadScreen` are independent (a `push`
+    // connection carries write WITHOUT read), so a keystroke-only edge could have
+    // typed a query and read match positions back off a screen it may not read.
+    v(
+        "find",
+        Read,
+        Status,
+        App,
+        "find [open|type|key|next|prev|case|regex|accept|cancel|status]: drive the FIND BAR",
+        "- the surface `key ctrl+f` opens and no other verb could reach (`send` writes to the PTY, \
+         which is exactly what find mode diverts keystrokes AWAY from). Forms: `find open` = the \
+         Edit ▸ Find… path itself; `find type <text>` inserts at the caret; `find key <name>` runs \
+         one field edit, `<name>` one of back, delete, left, right, word-left, word-right, home, \
+         end, kill-start, kill-end, kill-word-back, kill-word-forward; `find next`/`find prev` \
+         step matches (⌘S/⌘R, wrapping); `find case`/`find regex` TOGGLE the ⌥⌘C/⌥⌘R flags (read \
+         the reply to learn the new value — there is no set form because the keystroke has none); \
+         `find accept` = ⏎ (exit, stay on the match), `find cancel` = ⎋ (exit, restore the \
+         pre-find viewport); `find status` mutates nothing. Every form answers the SAME line: `OK \
+         open=0` when no find bar is up, else `OK open=1 query=<pct> case= regex= regex_error= \
+         matches=<n> current=<i> row= col= len= truncated=`. row/col/len are the CURRENT match in \
+         `search` coordinates (negative row = scrollback) and are `-` when there is no match — \
+         never a position that does not exist. current/matches are the 1-based `i/n` the find bar \
+         itself paints, so the wire and the glass always agree; `truncated=1` means the search \
+         index capped the batch, so that pair counts within the cap rather than over the whole \
+         history. A form that types or steps while the bar is CLOSED changes nothing and answers \
+         `open=0`; it can never fall through to the PTY. FRONT window of the resolved instance, \
+         like `hover`",
     ),
     v(
         "selection",
@@ -666,13 +702,16 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "bracketed-paste text to the PTY",
         "the payload rides the engine's PASTE seam — bracket guards when the app has set \
-         DEC 2004, control-byte sanitize, LF->CR — but NOT the `confirm_multiline_paste` \
-         prompt a person's paste answers. A driver that asked for a paste has already \
-         decided, and parking this reply on a window banner would hang the caller; so an \
-         unbracketed multi-line payload reaches the shell here without the confirmation \
-         the same text raises from the keyboard, and its first line can run. Same-uid, \
-         token-gated and owner-scoped — whoever can send this can already run commands — \
-         so the difference is stated rather than left to be discovered",
+         DEC 2004 AS THE FRAME IS WRITTEN, control-byte sanitize, LF->CR — but NOT the \
+         `confirm_multiline_paste` prompt a person's paste answers. A driver that asked \
+         for a paste has already decided, and parking this reply on a window banner would \
+         hang the caller; so an unbracketed multi-line payload reaches the shell here \
+         without the confirmation the same text raises from the keyboard, and its first \
+         line can run. Same-uid, token-gated and owner-scoped — whoever can send this can \
+         already run commands — so the difference is stated rather than left to be \
+         discovered. That is also why the framing is read at WRITE time and not captured \
+         earlier the way a keyboard paste's is: a keyboard paste captures the mode its \
+         confirmation was judged under, and this verb was never shown one",
     ),
     v(
         "key",
@@ -719,9 +758,36 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "length-prefixed bytes to the PTY with PASTE semantics",
-        "(bracketed-paste guards + control-byte sanitize + LF->CR); the binary twin of `paste`",
+        "(bracketed-paste guards as DEC 2004 stands when the frame is written + control-byte \
+         sanitize + LF->CR); the binary twin of `paste`, framing contract included",
     ),
     v("mouse", Write, Status, Session, "inject a mouse event", ""),
+    // `pointer` is `Write` because it drives the WINDOW's pointer through the very
+    // entry point winit's `CursorMoved` calls, and under DEC 1000/1002/1003 that
+    // motion is REPORTED to the driven program — `Op::WriteInput`'s own doc lists
+    // the mouse in the human vocabulary. It deliberately reports NOTHING derived
+    // from the grid: `link=` here would hand a keystroke-only edge a fact only
+    // `cell` (`Read`) is entitled to answer, and write does not imply read.
+    v(
+        "pointer",
+        Write,
+        Status,
+        App,
+        "pointer [move <r> <c>|leave|status]: put the POINTER on a cell, so hover resolves",
+        "— `mouse move` posts an engine `InputEvent` and never touches the window's pointer, so \
+         nothing it does makes a link hover, a divider cursor or a tab-strip highlight happen. \
+         This drives `App::on_cursor_moved` — the identical function `WindowEvent::CursorMoved` \
+         calls — after mapping the cell to the centre pixel of the frame it is drawn in, and \
+         `pointer leave` drives `on_cursor_left` (what `WindowEvent::CursorLeft` calls). Reply: \
+         `OK at=<row>,<col>` is where the pointer ACTUALLY resolved, read back from the window \
+         AFTER the real path ran, in window (not pane-local) cells — so it states where the \
+         pointer IS rather than repeating the request. A cell outside the grid is `ERR`, never \
+         silently clamped onto a neighbour and reported as though it had been honoured. `OK at=-` \
+         when the window holds no pointer position at all: after `pointer leave`, and before the \
+         first move of any kind. `at=-` says only that — never a position that does not exist. \
+         Read the hover the pointer resolved with `cell <r> <c>` (`link=`) and see the destination \
+         band with `image`. FRONT window of the resolved instance, like `hover`",
+    ),
     v(
         "resize",
         Write,
@@ -771,6 +837,27 @@ pub const VERBS: &[VerbSpec] = &[
          (the same aim as `@<sid> spawn`), so an agent in a background window walks its own \
          tabs without touching the human's. Replies `OK <active> <count>`; a --headless \
          instance drives its one logical window like a real one (no `ERR headless`)",
+    ),
+    // `pane` is `tab`'s within-a-window twin and carries `tab`'s class for `tab`'s
+    // reason: choosing which pane the keyboard drives is an input-routing authority,
+    // so a read-only edge must not be able to redirect the human's next keystroke.
+    // Its reply is one bit about the caller's OWN act — strictly less than the tab
+    // COUNT `tab` already hands a write edge — so it needs no read authority beside
+    // it; `panes` (`Read`) is what answers where focus went and what the rects are.
+    v(
+        "pane",
+        Write,
+        Status,
+        App,
+        "pane <left|right|up|down>: move keyboard focus to the adjacent pane",
+        "- the ⌘⌥-arrow / `focus_pane_*` binding's own path, so the active-pane mark moves with \
+         it and the window re-mirrors term/master/socket onto the newly focused pane exactly as a \
+         click-to-focus does. `spawn split=v|h` makes the panes; this is what then walks them. \
+         Reply `OK moved=1` when focus changed and `OK moved=0` when it did not — a single-pane \
+         tab, or no neighbour that way — which is a fact about the caller's own request, not a \
+         reading of the layout: ask `panes` (read-side) for the rects and which pane is focused. \
+         FRONT window of the resolved instance, like `hover` — it does NOT aim at the window \
+         hosting an `@<sid>`, the way `tab` and `spawn` do",
     ),
     v(
         "open",
@@ -829,10 +916,11 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "tone [status]: tone-of-typing state for the focused window",
-        "(prints tone= effective= knob= sounds= volume= audio=live|inert active= window_chars= \
-         inferences=; `effective` is what the synth is stamping, `inferences` separates \"the \
-         model ran and said technical\" from \"the model never ran\". The typed window's TEXT is \
-         never reported)",
+        "(prints tone= effective= knob= sounds= volume= audio=live|wedged|inert active= \
+         window_chars= inferences= dropped=; `effective` is what the synth is stamping, \
+         `inferences` separates \"the model ran and said technical\" from \"the model never \
+         ran\", audio=wedged means the audio worker is stuck inside one platform call and cues \
+         are being dropped (dropped= counts them). The typed window's TEXT is never reported)",
     ),
     // Read-only observability for the cursor-trail engine: the last N
     // licensed/declined verdicts from the fixed-size admission diagnosis ring,
@@ -849,16 +937,19 @@ pub const VERBS: &[VerbSpec] = &[
         "(default all, ring cap 32), newest last — one `admission seq= phase=licensed|declined \
          reason= age_ms= origin= target= alt=` row per judged cursor move, from the engine's \
          fixed-size DIAGNOSTIC ring. A move paints only if a keypress LICENSED it, so a \
-         decline carries one of three reasons: `no-fresh-hint` (no key hint was fresh — the \
+         decline carries one of four reasons: `no-fresh-hint` (no key hint was fresh — the \
          move was program output nobody's fingers asked for), `no-credits` (a multi-cell \
          coalesce outran the press CREDIT budget), `off-shape` (licensed and classified, but \
-         the style's shape gates laid nothing). Every observed move is counted exactly once: \
+         the style's shape gates laid nothing), `program-row` (the anchored-echo lane refused \
+         a row that has advanced keylessly, or one contesting a fresher row's echo — a \
+         spinner/status row must never spend a typed stamp). Every observed move is counted \
+         exactly once: \
          licensed + declined is the number of cursor deltas the seam has judged. \
          `trail status`: one standing-state row instead — `trail style= resolved= \
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= field= field_span= sparks= momentum= \
-         momentum_display= speed= \
+         momentum_display= speed= resume_grant= woken= \
          glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \

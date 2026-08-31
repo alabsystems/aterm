@@ -52,6 +52,7 @@
 //! | `[OB-12]` | every fork is LIVE in the resolved graph, with no unpatched sibling | [`crate::resolve`] |
 //! | `[OB-13]` | every CARVED path is still absent | `vendor/forge.toml` `[[carved]]` |
 //! | `[OB-14]` | the measured surface conforms to its ratchet | `tools/forge-budget.tsv` |
+//! | `[OB-15]` | no `[patch]` CAPTURES a differential oracle | `[dev-dependencies]` + `Cargo.lock` |
 //!
 //! # What it deliberately does NOT re-check
 //!
@@ -597,6 +598,88 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         );
     }
 
+    // -- [OB-15] the oracle trap ---------------------------------------------
+    let _ = writeln!(
+        log,
+        "  [OB-15] ORACLE CAPTURE — no `[patch.crates-io]` entry silently redirects a \
+         `[dev-dependencies]` differential oracle at the implementation it exists to check:"
+    );
+    {
+        let mut judged = 0usize;
+        for e in &patches {
+            let oracles = dev_dependency_oracles(root, &e.name);
+            if oracles.is_empty() {
+                continue;
+            }
+            judged += 1;
+            let lock = match attest::lock_entries(root, &e.name) {
+                Ok(v) => v,
+                Err(err) => {
+                    fails += 1;
+                    could_not_run.get_or_insert(err.clone());
+                    let _ = writeln!(
+                        log,
+                        "  ✗ FAIL [OB-15] `{}` is patched AND held as a dev-dep oracle, but \
+                         Cargo.lock could not be read, so capture cannot be decided.\n    {err}",
+                        e.name
+                    );
+                    continue;
+                }
+            };
+            match oracle_verdict(&lock) {
+                OracleVerdict::Escapes(sibling) => {
+                    notes += 1;
+                    let holders: Vec<String> = oracles
+                        .iter()
+                        .map(|(m, r)| format!("{m} pins `{r}`"))
+                        .collect();
+                    let _ = writeln!(
+                        log,
+                        "    • NOTE [OB-15] `{}` is patched AND is a differential oracle, and \
+                         the oracle ESCAPES: the lock still carries registry {} {sibling}, so \
+                         the oracle compares against real upstream. Held by: {}. This is the \
+                         deliberate version-pin escape — it costs the oracle testing a \
+                         DIFFERENT upstream version than the one replaced, and it survives only \
+                         while the pin stays unsatisfiable by the shim.",
+                        e.name,
+                        e.name,
+                        holders.join("; ")
+                    );
+                }
+                OracleVerdict::Captured => {
+                    fails += 1;
+                    let holders: Vec<String> = oracles
+                        .iter()
+                        .map(|(m, r)| format!("{m} (`{r}`)"))
+                        .collect();
+                    let _ = writeln!(
+                        log,
+                        "  ✗ FAIL [OB-15] `{}` is patched to `{}` AND is kept as a \
+                         `[dev-dependencies]` differential ORACLE by {}. `[patch.crates-io]` \
+                         applies to dev-dependencies too, and Cargo.lock carries NO \
+                         registry-sourced `{}` — so the oracle now compares the implementation \
+                         against ITSELF. It will go on passing and stop meaning anything. Fix: \
+                         drop the patch, or pin the oracle at a version the shim cannot satisfy \
+                         (the escape `[OB-15]` reports as a NOTE) so a real registry copy stays \
+                         in the lock.",
+                        e.name,
+                        e.path,
+                        holders.join(", "),
+                        e.name
+                    );
+                }
+            }
+        }
+        if judged == 0 {
+            let _ = writeln!(
+                log,
+                "    OK — no patched package is held as a dev-dependency oracle ({} patch \
+                 entries examined).",
+                patches.len()
+            );
+        }
+    }
+
     // -- verdict --------------------------------------------------------------
     // Counted separately in the verdict because they are separate things: a
     // fork is third-party source under standing review, a first-party target
@@ -856,6 +939,135 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// What the lock says about a patched package that is ALSO a differential
+/// oracle. The lock is the ground truth: a registry-sourced entry beside the
+/// source-less patched one is the only thing that can keep an oracle pointed at
+/// real upstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OracleVerdict {
+    /// A registry sibling survives at this version — the oracle still compares
+    /// against upstream.
+    Escapes(String),
+    /// Every entry is the patch. The oracle compares the shim to itself.
+    Captured,
+}
+
+/// Decide capture from `Cargo.lock`'s entries for one name, as
+/// `(version, has_source)` from [`attest::lock_entries`].
+///
+/// This is deliberately NOT a semver computation. Whether a `[patch]` satisfies
+/// an oracle's requirement is exactly what cargo already decided when it wrote
+/// the lock, and re-deriving it here would give the repository two answers to
+/// one question — the failure this gate exists to prevent, in a new place.
+fn oracle_verdict(lock: &[(String, bool)]) -> OracleVerdict {
+    match lock.iter().find(|(_, has_source)| *has_source) {
+        Some((version, _)) => OracleVerdict::Escapes(version.clone()),
+        None => OracleVerdict::Captured,
+    }
+}
+
+/// Every workspace manifest that keeps `name` as a `[dev-dependencies]` entry
+/// stating a REGISTRY version requirement, as `(manifest, requirement)`.
+///
+/// A dev-dependency is how this repository holds a retired crate as a
+/// differential oracle — `aterm-grapheme` keeps `unicode-width`,
+/// `aterm-json` keeps `serde_json`, and eight more. Path, git and
+/// `workspace = true` entries are EXCLUDED and the exclusion is load-bearing:
+/// they state no registry requirement, so there is no upstream for a patch to
+/// capture. `aterm-gui`'s `winit = { workspace = true }` dev-dep is the live
+/// example — it inherits the patched fork on purpose and is not an oracle.
+fn dev_dependency_oracles(root: &Path, name: &str) -> Vec<(String, String)> {
+    use aterm_toml::edit::{DocumentMut, Item, TableLike};
+
+    let mut manifests = vec![root.join("Cargo.toml")];
+    if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
+        let mut members: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path().join("Cargo.toml"))
+            .filter(|p| p.is_file())
+            .collect();
+        members.sort();
+        manifests.extend(members);
+    }
+
+    let mut out = Vec::new();
+    for manifest in manifests {
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<DocumentMut>() else {
+            continue;
+        };
+
+        // `[dev-dependencies]`, plus every `[target.'cfg(..)'.dev-dependencies]`
+        // — a target-gated oracle is still an oracle on the cells it applies to.
+        let mut tables: Vec<&dyn TableLike> = Vec::new();
+        if let Some(t) = doc.get("dev-dependencies").and_then(Item::as_table_like) {
+            tables.push(t);
+        }
+        if let Some(targets) = doc.get("target").and_then(Item::as_table_like) {
+            for (_, gated) in targets.iter() {
+                if let Some(t) = gated
+                    .as_table_like()
+                    .and_then(|g| g.get("dev-dependencies"))
+                    .and_then(Item::as_table_like)
+                {
+                    tables.push(t);
+                }
+            }
+        }
+
+        for table in tables {
+            // Iterate the WHOLE table rather than looking `name` up directly.
+            // A dev-dependency key is not the package name when the entry
+            // renames it, and THE LIVE ORACLE IN THIS REPO IS RENAMED:
+            // `crates/aterm-alloc/Cargo.toml` declares
+            // `arrayvec_upstream = { package = "arrayvec", version = "=0.7.7" }`.
+            // A direct `table.get("arrayvec")` misses it and reports "no oracle,
+            // safe to patch" for the one case this obligation exists to judge —
+            // which is the same false-negative shape, in new clothes, as the
+            // shell recipe [OB-15] replaces.
+            for (key, entry) in table.iter() {
+                let declared = entry
+                    .as_table_like()
+                    .and_then(|t| t.get("package"))
+                    .and_then(Item::as_str)
+                    .unwrap_or(key);
+                if declared != name {
+                    continue;
+                }
+                if let Some(req) = entry.as_str() {
+                    out.push((rel(root, &manifest), req.to_string()));
+                    continue;
+                }
+                let Some(entry) = entry.as_table_like() else {
+                    continue;
+                };
+                if entry.get("path").is_some()
+                    || entry.get("git").is_some()
+                    || entry.get("workspace").is_some()
+                {
+                    continue;
+                }
+                if let Some(req) = entry.get("version").and_then(Item::as_str) {
+                    out.push((rel(root, &manifest), req.to_string()));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A manifest path relative to the repo root, for a message a reader can act on.
+fn rel(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +1127,7 @@ mod tests {
             [
                 ("arrayvec", "crates/aterm-arrayvec"),
                 ("cfg-if", "crates/aterm-cfg-if"),
+                ("libc", "crates/aterm-libc"),
                 ("log", "crates/aterm-log-shim"),
                 ("profiling", "crates/aterm-profiling"),
                 ("tracing", "crates/aterm-tracing"),
@@ -1189,6 +1402,106 @@ reason = \"no arch intrinsics reach the shipped build\"
             assert!(
                 log.contains(tag),
                 "every obligation must report; `{tag}` did not:\n{log}"
+            );
+        }
+    }
+
+    // -- [OB-15] the oracle trap ---------------------------------------------
+
+    /// The rule itself, over the only input that decides it. A registry sibling
+    /// in the lock is what keeps an oracle honest; its ABSENCE is capture.
+    #[test]
+    fn a_registry_sibling_is_what_separates_an_escaped_oracle_from_a_captured_one() {
+        // The live `arrayvec` shape: the fork is source-less, and a registry
+        // copy survives at the version the oracle pins.
+        let escaped = vec![("0.7.8".to_owned(), false), ("0.7.7".to_owned(), true)];
+        assert_eq!(
+            oracle_verdict(&escaped),
+            OracleVerdict::Escapes("0.7.7".to_owned())
+        );
+
+        // ARMED: delete the registry sibling — the same oracle is now comparing
+        // the shim against itself, and the verdict must flip.
+        let captured = vec![("0.7.8".to_owned(), false)];
+        assert_eq!(oracle_verdict(&captured), OracleVerdict::Captured);
+
+        // A package with no lock entries at all cannot be shown to escape.
+        assert_eq!(oracle_verdict(&[]), OracleVerdict::Captured);
+    }
+
+    /// The oracle SCANNER finds the real holders. If this ever returns empty,
+    /// `[OB-15]` has silently stopped judging anything — which is precisely the
+    /// failure mode that motivated it: a check whose "no hit" is
+    /// indistinguishable from "did not run".
+    ///
+    /// The protocol this replaces was a shell recipe,
+    /// `sed -n '/^\[dev-dependencies\]/,/^\[/p' crates/*/Cargo.toml | grep <name>`,
+    /// documented in `docs/THIRD_PARTY_SURFACE_PLAN.md`. Under `zsh` a glob that
+    /// matches nothing aborts the whole pipeline, so the recipe prints NOTHING
+    /// and a reader takes that for "no oracle, safe to patch". Measured: the
+    /// documented form extended with one non-matching glob reported 0 holders
+    /// for `unicode-width`; the same query run safely reports 3.
+    #[test]
+    fn the_oracle_scanner_finds_the_known_holders() {
+        let root = repo_root();
+        // THE RENAMED ORACLE, pinned by name because it is the only one in the
+        // repo that is BOTH patched and an oracle, and because a scanner that
+        // keys on the manifest KEY instead of the `package` field misses it
+        // silently. `crates/aterm-alloc` declares it as
+        // `arrayvec_upstream = { package = "arrayvec", version = "=0.7.7" }`.
+        let arrayvec = dev_dependency_oracles(&root, "arrayvec");
+        assert!(
+            arrayvec
+                .iter()
+                .any(|(m, r)| m.contains("aterm-alloc") && r == "=0.7.7"),
+            "the RENAMED arrayvec oracle must be found: {arrayvec:?}"
+        );
+
+        for name in ["unicode-width", "serde_json", "memchr"] {
+            assert!(
+                !dev_dependency_oracles(&root, name).is_empty(),
+                "`{name}` is a documented differential oracle but the scanner found no \
+                 [dev-dependencies] holder — the check has gone blind"
+            );
+        }
+    }
+
+    /// A `workspace = true` dev-dependency is NOT an oracle, and this exclusion
+    /// is load-bearing rather than cosmetic: `aterm-gui` keeps
+    /// `winit = { workspace = true, features = ["aterm-test-key-event"] }` under
+    /// `[dev-dependencies]`, and that inherits the PATCHED fork on purpose. If
+    /// the scanner counted it, `[OB-15]` would fail the gate on aterm's own
+    /// vendored winit forever.
+    #[test]
+    fn an_inherited_dev_dependency_is_not_an_oracle() {
+        let root = repo_root();
+        let holders = dev_dependency_oracles(&root, "winit");
+        assert!(
+            holders.is_empty(),
+            "winit's dev-dep is `workspace = true` (the patched fork), not a registry \
+             oracle, but the scanner claimed: {holders:?}"
+        );
+    }
+
+    /// Every patched package that IS an oracle must escape today. This is the
+    /// gate's own subject matter asserted as a unit test, so a capture is caught
+    /// by `cargo test` and not only by `cargo run -p xtask -- gate forge`.
+    #[test]
+    fn no_patch_in_this_repo_currently_captures_an_oracle() {
+        let root = repo_root();
+        let (forks, _) = read_manifest_patches(&root).expect("root manifest reads");
+        for e in &forks {
+            let holders = dev_dependency_oracles(&root, &e.name);
+            if holders.is_empty() {
+                continue;
+            }
+            let lock = attest::lock_entries(&root, &e.name).expect("Cargo.lock reads");
+            assert!(
+                matches!(oracle_verdict(&lock), OracleVerdict::Escapes(_)),
+                "`{}` is patched to `{}` and held as an oracle by {holders:?}, but no \
+                 registry-sourced entry survives in Cargo.lock — the oracle is CAPTURED",
+                e.name,
+                e.path
             );
         }
     }

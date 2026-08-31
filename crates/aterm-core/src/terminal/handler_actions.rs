@@ -23,6 +23,21 @@ use aterm_types::charset::{GlMapping, SingleShift};
 
 use super::{TerminalHandler, Vt52CursorState};
 
+impl TerminalHandler<'_> {
+    /// Stamp the ECHO ANCHOR: where this print action left the cursor, plus a
+    /// monotonic action count (see `TransientState::print_anchor`). Called at
+    /// the tail of every `ActionSink` print path — two stores and a cursor
+    /// read per print ACTION (bulk runs amortize it over the whole run), so
+    /// the hot blast path pays nothing measurable. Observability only: no
+    /// parser or grid decision ever reads it back.
+    #[inline]
+    fn stamp_print_anchor(&mut self) {
+        let cursor = self.grid.cursor();
+        self.transient.print_anchor = Some((cursor.row, cursor.col));
+        self.transient.print_anchor_seq = self.transient.print_anchor_seq.wrapping_add(1);
+    }
+}
+
 impl ActionSink for TerminalHandler<'_> {
     fn print(&mut self, c: char) {
         self.note_sync_open_action();
@@ -45,6 +60,7 @@ impl ActionSink for TerminalHandler<'_> {
         }
 
         self.write_char(c);
+        self.stamp_print_anchor();
     }
 
     /// FAST PATH: Print a run of ASCII bytes without per-character overhead.
@@ -74,6 +90,7 @@ impl ActionSink for TerminalHandler<'_> {
             for &byte in data {
                 self.write_char(byte as char);
             }
+            self.stamp_print_anchor();
             return;
         }
 
@@ -101,6 +118,7 @@ impl ActionSink for TerminalHandler<'_> {
             self.write_ascii_bulk_fast(data);
         }
         self.grid.damage_selection_output(origin);
+        self.stamp_print_anchor();
     }
 
     /// FAST PATH: Print a run of decoded non-ASCII characters.
@@ -125,6 +143,7 @@ impl ActionSink for TerminalHandler<'_> {
         let origin = self.grid.output_damage_origin();
         self.write_unicode_bulk(chars);
         self.grid.damage_selection_output(origin);
+        self.stamp_print_anchor();
     }
 
     /// Execute C0 and C1 control characters.

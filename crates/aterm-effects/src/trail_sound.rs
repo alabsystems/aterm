@@ -1241,7 +1241,7 @@ const SPACE_OCTAVE_LEVEL: f32 = 0.20;
 /// the keystroke's 700 Hz-2 kHz, so a 6 dB electrical cut would put the
 /// downbeat under the noise floor of the room. Pinned relatively by
 /// `the_ladder_holds_for_the_key_family`.
-const SPACE_VOICE_LEVEL: f32 = 0.268;
+const SPACE_VOICE_LEVEL: f32 = 0.32;
 /// The retrigger fade for the MONOPHONIC downbeat. Two spaces close enough to
 /// overlap would be two voices at the SAME fixed frequency with independently
 /// randomised oscillator phase — which is a comb filter, not a bass note: the
@@ -1256,6 +1256,15 @@ const SPACE_DAMP_S: f32 = 0.012;
 /// bass weight, below the tune. The level is deliberately under the octave's:
 /// warmth you FEEL in the chord, not a note you could hum back.
 const SPACE_FIFTH_LEVEL: f32 = 0.07;
+
+/// The space bell's FM strike-glint index — the same house ICE idiom as the
+/// melody bell (`fm_ratio` 3.01) at a shallower index: the downbeat is struck,
+/// not rung; its face flashes and is gone in ~22 ms.
+const SPACE_BELL_GLINT: f32 = 0.9;
+/// The space bell's 4f tink floor — the audible "ping" kinship with the
+/// melody bells, pinned well under their 0.30 so the downbeat never
+/// out-sparkles a letter.
+const SPACE_BELL_TINK: f32 = 0.12;
 /// THE DOWNBEAT BREATHES when the hand rests. A space that arrives after a
 /// PHRASE pause ([`PHRASE_PAUSE_S`] — the same threshold that resets the bar)
 /// is the first beat of a fresh thought, and it gets room: a slightly softer
@@ -3026,7 +3035,11 @@ impl TrailSynth {
             + col_off
             + i32::from(self.song_key)
             + shape.offset
-            + if ghosting { i32::from(self.song_ghost) } else { 0 };
+            + if ghosting {
+                i32::from(self.song_ghost)
+            } else {
+                0
+            };
 
         // CURSOR MOVEMENT (Glide/Sweep) is a style-agnostic, IN-KEY gesture
         // designed once here (like Kill/Bonk), before palette dispatch: it
@@ -3358,36 +3371,68 @@ impl TrailSynth {
                 SPACE_FIFTH_LEVEL,
             )
         };
-        let f = self.melody_hz(bass_octave(anchor), i32::from(self.song_key));
+        // THE LOW BELL (owner, 2026-08-30: "like the cute ping noise I just
+        // want it to be a bit lower when pressing space so that it sounds
+        // like a song"). The downbeat used to be a near-sine at
+        // `bass_octave(anchor)` — [110, 220) Hz — whose own comment admitted
+        // a laptop speaker "reproduces nothing at the fundamental" and hung
+        // identity on a 0.20-level octave partial. MEASURED on the
+        // `keyboard_song_ab` space scenario, the whole sub-250 Hz band held
+        // 12.5% of the mix's energy — the one gesture the owner named was
+        // built where his speakers cannot follow, and he reported "NO
+        // spacebar sound". The downbeat now STRIKES: the keystroke family's
+        // own struck-glass shape (grace-free sine body wearing the house
+        // 3.01 FM strike face that dies first, a quiet double-octave tink, a
+        // soft mallet) on the SAME song-keyed tonic, one octave up —
+        // `bass_octave × 2` lands in [220, 440), under every palette's
+        // melody, above every laptop's rolloff. Same pitch law, same
+        // monophonic damp, same coalesced-run breath; only the register and
+        // the timbre moved, and the register map's four bands stay disjoint
+        // (space 220-440, melody ≳ 520).
+        let f = self.melody_hz(bass_octave(anchor) * 2.0, i32::from(self.song_key));
         let v = Voice {
             bass: true,
             dur,
             attack,
             decay,
             p: [
+                // The body: the law partial, strictly loudest, on the note.
                 Partial {
                     lvl: 0.55,
                     f0: f,
                     f1: f,
+                    fm_ratio: 3.01,
+                    fm_i0: SPACE_BELL_GLINT,
+                    fm_tau: 0.022,
                     ..Partial::default()
                 },
-                // The octave above: roundness on a woofer, IDENTITY on a
-                // laptop speaker that reproduces nothing at the fundamental.
+                // The octave above: the bell's roundness (rested, it blooms —
+                // the breathing downbeat keeps its deeper exhale).
                 Partial {
                     lvl: oct_lvl,
                     f0: f * 2.0,
                     f1: f * 2.0,
                     ..Partial::default()
                 },
-                // The WARMTH — a barely-audible fifth over the root (see
-                // [`SPACE_FIFTH_LEVEL`]): felt in the chord, never hummable.
+                // The TINK — quadruple-octave glass at a whisper: the "ping"
+                // kinship with the melody bells, seated well under them (the
+                // melody bell's tink is 0.30; the downbeat must never
+                // out-sparkle the letters).
                 Partial {
-                    lvl: fifth_lvl,
-                    f0: f * 1.5,
-                    f1: f * 1.5,
+                    lvl: fifth_lvl.max(SPACE_BELL_TINK),
+                    f0: f * 4.0,
+                    f1: f * 4.0,
                     ..Partial::default()
                 },
             ],
+            // The mallet: a 5 ms felt tap out of 4.2 kHz, softer than the
+            // melody bell's — a thumb, not a mallet.
+            n_lvl: 0.5,
+            n_f0: 4200.0,
+            n_f1: 180.0,
+            n_glide: 0.005,
+            n_q: 0.7,
+            lp_cut: 3600.0,
             ..breath(0.05)
         };
         self.spawn(v, g * SPACE_VOICE_LEVEL, 0.0);
@@ -3548,7 +3593,13 @@ impl TrailSynth {
             lp_cut: POOF_LP_CUT_HZ,
             ..Voice::default()
         };
-        self.spawn_seeded(body, g * POOF_VOICE_GAIN * WORD_POOF_GAIN, ev.pan, 0.0, [0.0; 3]);
+        self.spawn_seeded(
+            body,
+            g * POOF_VOICE_GAIN * WORD_POOF_GAIN,
+            ev.pan,
+            0.0,
+            [0.0; 3],
+        );
         let air = Voice {
             delay: WORD_POOF_AIR_DELAY_S,
             dur: WORD_POOF_AIR_DUR_S,
@@ -10076,7 +10127,8 @@ mod tests {
             a.render(&mut buf);
         }
         assert_eq!(
-            a.walk, b.walk,
+            a.walk,
+            b.walk,
             "twelve corrections moved the song by {} degrees",
             b.walk - a.walk
         );
@@ -10106,15 +10158,24 @@ mod tests {
             "a downbeat arrives, it does not lean: {enter} -> {land}"
         );
         let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
-        let expect = s.melody_hz(bass_octave(anchor), 0);
+        // RECALIBRATED 2026-08-30 with the low-bell re-voice (owner: "like
+        // the cute ping … a bit lower"): the ONE register is now the folded
+        // tonic DOUBLED into [220, 440) — above a laptop speaker's rolloff
+        // (the old [110, 220) register measured 12.5% of the mix's energy
+        // under 250 Hz and the owner heard nothing), still an octave-plus
+        // under every melody. The pin's SUBJECT is unchanged: one fixed
+        // pitch, independent of the melody's walk. This assert was RED
+        // against the re-voice before this recalibration — the direction is
+        // recorded here in place of a mutation proof.
+        let expect = s.melody_hz(bass_octave(anchor) * 2.0, 0);
         assert!(
             (land - expect).abs() < 0.5,
-            "the downbeat lands on the palette's octave-folded tonic: got \
-             {land}, expected {expect}"
+            "the downbeat lands on the palette's octave-folded tonic, one \
+             octave up: got {land}, expected {expect}"
         );
         assert!(
-            (SPACE_BASS_LO_HZ..SPACE_BASS_LO_HZ * 2.0).contains(&land),
-            "…inside the ONE bass register ({land} Hz)"
+            (SPACE_BASS_LO_HZ * 2.0..SPACE_BASS_LO_HZ * 4.0).contains(&land),
+            "…inside the ONE audible bell register ({land} Hz)"
         );
         // INDEPENDENT OF THE MELODY. Walk the tune to a different degree and
         // the downbeat must not move a cent.
@@ -10229,7 +10290,8 @@ mod tests {
         let live: Vec<&Voice> = s.voices.iter().filter(|v| v.on && v.bass).collect();
         let undamped = live.iter().filter(|v| v.damp <= 0.0).count();
         assert_eq!(
-            undamped, 1,
+            undamped,
+            1,
             "exactly one bass root may be sounding at a time (of {} live)",
             live.len()
         );
@@ -10435,7 +10497,9 @@ mod tests {
             let n = 24_000usize; // 0.5 s
             let mut buf = vec![0.0f32; n * CHANNELS];
             s.render(&mut buf);
-            let mono: Vec<f32> = (0..n).map(|i| 0.5 * (buf[i * 2] + buf[i * 2 + 1])).collect();
+            let mono: Vec<f32> = (0..n)
+                .map(|i| 0.5 * (buf[i * 2] + buf[i * 2 + 1]))
+                .collect();
             let peak = mono.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let rms = (mono.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
             // Goertzel-free centroid: a coarse DFT over 64 log-ish bands is
@@ -10468,7 +10532,11 @@ mod tests {
                 peak,
                 rms,
                 if den < 1e-15 { 0.0 } else { (num / den) as f32 },
-                if den < 1e-15 { 0.0 } else { (over2k / den) as f32 },
+                if den < 1e-15 {
+                    0.0
+                } else {
+                    (over2k / den) as f32
+                },
                 (peak_bin / med) as f32,
             )
         }
@@ -10911,16 +10979,30 @@ mod tests {
         let v = at_speed[0];
         assert_eq!(v.dur, SPACE_DUR_S, "at speed, the working envelope");
         assert_eq!(v.p[1].lvl, SPACE_OCTAVE_LEVEL);
-        assert_eq!(v.p[2].lvl, SPACE_FIFTH_LEVEL, "the fifth is present…");
-        assert!(
-            v.p[2].lvl < v.p[1].lvl,
-            "…UNDER the octave: warmth, not a hummable note"
+        // RECALIBRATED 2026-08-30 with the low-bell re-voice: the warmth
+        // partial is now the TINK — quadruple-octave glass, the audible
+        // "ping" kinship with the melody bells — floored at
+        // [`SPACE_BELL_TINK`] and pinned under the melody bell's own 0.30
+        // crown so the downbeat never out-sparkles a letter. (This assert
+        // was RED against the re-voice before recalibration.)
+        assert_eq!(
+            v.p[2].lvl,
+            SPACE_FIFTH_LEVEL.max(SPACE_BELL_TINK),
+            "the tink is present…"
         );
         assert!(
-            (v.p[2].f0 - v.p[0].f0 * 1.5).abs() < 0.01,
-            "…and it is the perfect fifth of the root ({} vs {})",
+            v.p[2].lvl < 0.30,
+            "…UNDER the melody bell's crown: kinship, never competition"
+        );
+        assert!(
+            (v.p[2].f0 - v.p[0].f0 * 4.0).abs() < 0.01,
+            "…and it is the double octave of the root ({} vs {})",
             v.p[2].f0,
-            v.p[0].f0 * 1.5
+            v.p[0].f0 * 4.0
+        );
+        assert!(
+            v.p[0].fm_i0 > 0.0,
+            "the body wears the strike face — struck, not hummed"
         );
         // THE REST. A keystroke closes the whitespace run, then the hand
         // lifts for a beat over the phrase threshold.
@@ -10947,7 +11029,11 @@ mod tests {
         assert_eq!(b.attack, SPACE_BREATHE_ATTACK_S);
         assert_eq!(b.decay, SPACE_BREATHE_DECAY_S);
         assert_eq!(b.p[1].lvl, SPACE_BREATHE_OCTAVE_LEVEL);
-        assert_eq!(b.p[2].lvl, SPACE_BREATHE_FIFTH_LEVEL);
+        assert_eq!(
+            b.p[2].lvl,
+            SPACE_BREATHE_FIFTH_LEVEL.max(SPACE_BELL_TINK),
+            "the rested tink keeps its floor"
+        );
         assert_eq!(
             b.p[0].f0, v.p[0].f0,
             "breathing changes the ROOM, never the note: the root is fixed"
@@ -11473,7 +11559,13 @@ mod tests {
                         lp_cut: POOF_LP_CUT_HZ,
                         ..Voice::default()
                     };
-                    self.spawn_seeded(air, g * POOF_VOICE_GAIN * POOF_AIR_LEVEL, pan, 0.0, [0.0; 3]);
+                    self.spawn_seeded(
+                        air,
+                        g * POOF_VOICE_GAIN * POOF_AIR_LEVEL,
+                        pan,
+                        0.0,
+                        [0.0; 3],
+                    );
                     // (No held-run shimmer here: the pins replay isolated
                     // deletions and short scripts, never a held run — the
                     // run counter below its threshold spawns nothing, so the

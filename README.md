@@ -76,15 +76,15 @@ app from a DMG, but the toolchain comes from the network index — offline
 provisioning is not offered. Already-published releases keep the assets they
 shipped with: `aterm-<version>.dmg` is the ~1.07 GB seeded image in every
 release through **v0.63.0** (through v0.61.0 the lean image shipped beside it as
-`aterm-<version>-lite.dmg`), so the first lean `aterm-<version>.dmg` is the next
-cut from `main`.
+`aterm-<version>-lite.dmg`). **v0.65.0 published the first lean
+`aterm-<version>.dmg`**, and every app release since carries the lean pair.
 
 A release from the one-download lane also carries the
 `releases/latest/download/` names `aterm.dmg` and `aterm-mac.zip` — but those
 resolve only while an app release holds GitHub's `latest` pointer; when a
-source release holds it (as v0.64.0 does today) they return 404, so reach for
-the versioned assets on the newest app release, or `install.sh`, which elects
-that release itself. Every container has a `.sha256` sidecar whose digest also
+source release holds it they return 404, so if a download button ever 404s,
+reach for the versioned assets on the newest app release, or `install.sh`, which
+elects that release itself. Every container has a `.sha256` sidecar whose digest also
 appears in that release's `aterm-appcast.toml` (v0.63.0, cut by an older
 cutter, carries `aterm.dmg` but no `aterm-mac.zip`). With the sidecar beside
 the asset, and the app in place:
@@ -589,6 +589,15 @@ few certificate gates fail outright instead. Conformance tests project real
 subsystem state back onto the models so the specs stay tied to shipping code; a
 model with no such tie only proves something about itself, and the repository
 labels those.
+
+Shipped bugs get promoted into that discipline rather than just patched. The
+auto-update crash-loop — a quarantine memo the updater wrote and then ignored,
+so a build that had just failed was re-applied on the next check — was fixed,
+then hardened, and is now stated as one contract binding the writer to the
+reader, checked by the exhaustive interpreter and independently by `ty`, bound
+to the real constructors and the real reader by a conformance test, and guarded
+by replaying the original defect as a negative control that the model must
+catch.
 
 The development line — and the Apple-silicon slice of every release — is compiled
 by the Trust toolchain (`trustc`/`targo`), but in-compilation verification is not

@@ -149,9 +149,9 @@ pub(crate) struct Config {
     /// HEAD instead — the explicit opt-in for anyone who wants the rare flypast
     /// back; `flying kitty`/`kitty flying` and the historical
     /// `nyan rainbow`/`nyan`/`rainbow` also select it), `rainbow kitty
-    /// underline` (an explicit spelling of the DEFAULT highlighter-plus-strip
-    /// geometry), and `rainbow kitty tall` (the v0.43 full-height geometry the
-    /// letters stand inside),
+    /// underline` (the explicit highlighter-plus-under-baseline alternate),
+    /// and `rainbow kitty tall` (an explicit spelling of the DEFAULT v0.43
+    /// full-height geometry the letters stand inside),
     /// `phaser` (a full-spectrum additive hue sweep along the
     /// swept path), `comet` (the cadence-comet: a directional fading comet of
     /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
@@ -536,7 +536,10 @@ pub(crate) struct Config {
     /// can't silently submit commands at a bare prompt / REPL. A single trailing
     /// newline is not multi-line and is never flagged; bracketed paste (the modern
     /// shell default) bypasses it entirely. Set `false` to paste without confirmation.
-    /// See [`Config::confirm_multiline_paste_or_default`].
+    /// Whatever this decides, the bracketed-paste reading it decided BY is the one the
+    /// pasted bytes are framed with ([`crate::input::PasteFraming`]) — a program that
+    /// flips DEC 2004 while the paste is queued cannot make the question and the wire
+    /// disagree. See [`Config::confirm_multiline_paste_or_default`].
     pub(crate) confirm_multiline_paste: Option<bool>,
     /// RESTORE-1: reopen the previous graceful quit's windows/tabs/panes (with each
     /// pane's cwd) at the next launch, macOS-Terminal/iTerm style. Default ON — a v1
@@ -2440,9 +2443,12 @@ pub(crate) struct UpdateConfig {
     /// Apply a freshly-staged update IMMEDIATELY (default ON): the seamless
     /// handoff carries every window/tab/split — shells, screens, layout — across
     /// the re-exec, so there is no reason to sit on a staged build (the owner:
-    /// "no passive scheduler; I want immediate"). `false` restores the old
-    /// stage-and-wait behavior (apply on click / next launch).
-    /// `ATERM_NO_AUTO_APPLY` forces it off for one run.
+    /// "no passive scheduler; I want immediate"). `false` stages the build and
+    /// leaves applying it to a click (the Version menu's ⬆️ item, the palette's
+    /// Version row, the tab-strip ↻, Settings ▸ Software Update) — still in
+    /// place, still with the shells running; the next launch picks up a stage
+    /// only if no handoff ever ran. `ATERM_NO_AUTO_APPLY` forces it off for one
+    /// run.
     pub(crate) auto_apply: Option<bool>,
     /// OPT IN to Apple Developer-ID + notarization enforcement for self-updates.
     ///
@@ -2469,18 +2475,44 @@ pub(crate) struct UpdateConfig {
     pub(crate) require_team_id: Option<String>,
 }
 
-/// Whether a staged update applies immediately (config `update.auto_apply`,
-/// default TRUE; env `ATERM_NO_AUTO_APPLY` vetoes for a run — the same env-wins
-/// precedence as the other update settings).
-pub(crate) fn update_auto_apply(config: &Config) -> bool {
+/// The `update.auto_apply` answer with its REASON kept: the status bar tells the
+/// user which of the two "off" cases they are in, because the remedy differs
+/// (edit the config, or unset the variable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoApplySetting {
+    /// The default: the in-session lane applies a staged build by itself.
+    On,
+    /// `[update] auto_apply = false`.
+    OffByConfig,
+    /// `ATERM_NO_AUTO_APPLY` is set for this run (env wins, as for every other
+    /// update setting).
+    OffByEnv,
+}
+
+/// Whether — and if not, why not — a staged update applies by itself: env
+/// `ATERM_NO_AUTO_APPLY` vetoes for a run, else config `update.auto_apply`
+/// (default TRUE). A plain environment read every time, never memoised: a
+/// `OnceLock` whose initializer asks its own owner parks the caller forever, and
+/// that shape hung every apply on 2026-08-30.
+pub(crate) fn update_auto_apply_setting(config: &Config) -> AutoApplySetting {
     if std::env::var_os("ATERM_NO_AUTO_APPLY").is_some() {
-        return false;
+        return AutoApplySetting::OffByEnv;
     }
-    config
+    if config
         .update
         .as_ref()
         .and_then(|u| u.auto_apply)
         .unwrap_or(true)
+    {
+        AutoApplySetting::On
+    } else {
+        AutoApplySetting::OffByConfig
+    }
+}
+
+/// [`update_auto_apply_setting`] as the bool the lane's arm and poll read.
+pub(crate) fn update_auto_apply(config: &Config) -> bool {
+    matches!(update_auto_apply_setting(config), AutoApplySetting::On)
 }
 
 /// Default rows reserved for the in-grid tab strip, PER PLATFORM. On macOS this is
@@ -14894,6 +14926,23 @@ mod trail_style_resolution_tests {
             ..Config::default()
         }
         .cursor_trail_style_warning(&TrailPackCatalog::empty())
+    }
+
+    #[test]
+    fn native_ribbon_resolution_keeps_tall_default_and_explicit_underline() {
+        for (style, expected_tall) in [
+            ("rainbow kitty", true),
+            (crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE, true),
+            ("rainbow kitty flying", true),
+            ("rainbow kitty tall", true),
+            ("rainbow kitty underline", false),
+        ] {
+            assert_eq!(
+                glow(style, true).ribbon_tall,
+                expected_tall,
+                "native ribbon resolver returned the wrong geometry for {style:?}"
+            );
+        }
     }
 
     /// A MISTYPED STYLE FALLS BACK AND SAYS SO. It used to switch the whole

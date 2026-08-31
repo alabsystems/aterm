@@ -64,6 +64,97 @@ const MAX_INFLIGHT: usize = 64;
 /// kill-switch is observed promptly instead of only when the next peer connects.
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
 
+#[cfg(any(unix, windows))]
+fn poll_timeout_millis(timeout: Duration) -> i32 {
+    // poll/WSAPoll take whole milliseconds. Round UP so a sub-millisecond
+    // remainder cannot turn a positive shutdown budget into a busy zero-timeout
+    // poll; saturate because -1 has the special meaning "wait forever".
+    let millis = timeout.as_millis().saturating_add(u128::from(
+        !timeout.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    i32::try_from(millis).unwrap_or(i32::MAX)
+}
+
+/// Wait until a non-blocking listener may accept, or until `timeout` expires.
+/// `Ok(true)` means the OS reported an event (including an error/hangup, which
+/// the following `accept` surfaces); `Ok(false)` is an idle timeout.
+#[cfg(unix)]
+fn wait_listener_readable(listener: &TcpListener, timeout: Duration) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let started = Instant::now();
+    let mut remaining = timeout;
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is one initialized pollfd valid for the call;
+        // `listener` keeps its borrowed descriptor open for the whole wait.
+        let result = unsafe {
+            libc::poll(
+                std::ptr::from_mut(&mut descriptor),
+                1,
+                poll_timeout_millis(remaining),
+            )
+        };
+        if result >= 0 {
+            return Ok(result > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+        // Signals cannot restart the full shutdown interval: recompute from the
+        // original wait start, then give the caller its running-flag check.
+        remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_listener_readable(listener: &TcpListener, timeout: Duration) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLIN, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+
+    let mut descriptor = WSAPOLLFD {
+        // std's RawSocket is the pointer-width unsigned integer WinSock names
+        // SOCKET; windows-sys spells that same ABI type as `usize`.
+        fd: listener.as_raw_socket() as usize,
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: std initialized Winsock before it created `listener`;
+    // `descriptor` names that live borrowed socket for the duration of the call.
+    let result = unsafe {
+        WSAPoll(
+            std::ptr::from_mut(&mut descriptor),
+            1,
+            poll_timeout_millis(timeout),
+        )
+    };
+    if result == SOCKET_ERROR {
+        // `last_os_error` reads GetLastError, while Winsock APIs require their
+        // own thread-local error slot.
+        // SAFETY: WSAGetLastError takes no arguments and only reads that slot.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    Ok(result > 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wait_listener_readable(_listener: &TcpListener, timeout: Duration) -> io::Result<bool> {
+    // Native shipping targets use poll/WSAPoll above. Retain a compiling,
+    // bounded fallback for other std targets rather than claiming readiness.
+    std::thread::sleep(timeout);
+    Ok(false)
+}
+
 /// Decrements the in-flight counter when a connection's handler thread ends
 /// (including on panic), so a refused/finished connection always frees its slot.
 struct InFlightGuard(Arc<AtomicUsize>);
@@ -263,9 +354,10 @@ where
 /// holds one slot until it closes; the cap bounds the worst case — these are
 /// token-holders the operator already trusts.)
 ///
-/// **Shutdown.** The listener is set non-blocking and the accept loop polls
-/// `running` every [`ACCEPT_POLL`], so clearing it stops the loop promptly (a
-/// plain blocking `accept` would only notice on the next connection).
+/// **Shutdown.** The listener is set non-blocking and its readiness wait is
+/// bounded by [`ACCEPT_POLL`], so clearing `running` stops the loop promptly (a
+/// plain blocking `accept` would only notice on the next connection). A new
+/// connection wakes the wait immediately; setup is never paced by that bound.
 ///
 /// `lookup` and `connect_local` are cloned per connection, so wrap shared state in
 /// `Arc` on the caller side.
@@ -281,16 +373,30 @@ pub fn serve<F, G, E>(
     G: Fn() -> io::Result<CtlStream> + Send + Sync + Clone + 'static,
     E: Fn(NetEvent) + Send + Sync + Clone + 'static,
 {
-    // Non-blocking accept so the `running` kill-switch is observed on a timer, not
-    // only when the next peer connects.
-    let _ = listener.set_nonblocking(true);
+    // Non-blocking accept plus bounded readiness gives both immediate connection
+    // wakeups and a running-flag shutdown bound. If mode setup fails, a blocking
+    // accept would violate the latter, so fail closed rather than entering it.
+    if let Err(error) = listener.set_nonblocking(true) {
+        on_event(NetEvent::Rejected(format!(
+            "could not configure listener readiness: {error}"
+        )));
+        return;
+    }
     let inflight = Arc::new(AtomicUsize::new(0));
 
     while running.load(Ordering::Relaxed) {
         let tcp = match listener.accept() {
             Ok((s, _)) => s,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
+                // The common idle path blocks in the kernel with no polling CPU,
+                // but wakes at once when a connection reaches the accept queue.
+                // A readiness error gets the same persistent-error backoff as an
+                // accept error below; it must not become a new busy-spin path.
+                if wait_listener_readable(listener, ACCEPT_POLL).is_err()
+                    && running.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(ACCEPT_POLL);
+                }
                 continue;
             }
             // A single accept error is not fatal — but back off, so a persistent
@@ -619,6 +725,64 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn real_listener_readiness_wakes_before_the_shutdown_interval() {
+        // Deliberately much longer than production's 200 ms bound: a sleep-based
+        // implementation pays all five seconds and fails by a wide margin. The
+        // two-second wake ceiling still distinguishes that negative control but
+        // tolerates severe scheduler starvation in a parallel debug test run.
+        const TEST_WAIT: Duration = Duration::from_secs(5);
+        const MAX_READY_WAKE: Duration = Duration::from_secs(2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let waiting_listener = listener.try_clone().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let waiter = std::thread::spawn(move || {
+            // Rendezvous immediately before the readiness wait. If this path
+            // regresses to sleeping for the requested interval, the connection
+            // below arrives just after that sleep starts and waits out all of it.
+            entered_tx.send(()).unwrap();
+            wait_listener_readable(&waiting_listener, TEST_WAIT)
+        });
+        entered_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert!(waiter.join().unwrap().unwrap());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < MAX_READY_WAKE,
+            "a queued real connection must wake readiness instead of waiting out \
+             the {TEST_WAIT:?} test interval ({elapsed:?})"
+        );
+        let (accepted, _) = listener
+            .accept()
+            .expect("the readiness event corresponds to an accept-ready connection");
+        drop((accepted, client));
+    }
+
+    #[test]
+    fn idle_listener_readiness_wait_is_bounded_without_spinning() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        assert!(!wait_listener_readable(&listener, ACCEPT_POLL).unwrap());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= ACCEPT_POLL - Duration::from_millis(40),
+            "an idle readiness wait returned too early to replace sleep polling ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the readiness timeout must retain the {ACCEPT_POLL:?} shutdown bound ({elapsed:?})"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@
 //! prints `failing_applies=2 apply_failure="overlap handoff failed safely: handoff
 //! proof ended ChildDied"`, and the health ledger has carried both since the apply
 //! class was added. The WINDOW carried neither. Measured on the owner's own machine
-//! (2026-08-21): build 1787699398 sat staged for hours behind an "Update to v0.56.0
-//! — restart now" menu item while the engine had privately tried twice and watched
+//! (2026-08-21): build 1787699398 sat staged for hours behind a plain "Update to
+//! v0.56.0" menu item while the engine had privately tried twice and watched
 //! the successor die both times — the machine was 8x-oversubscribed at the time, so
 //! the child was STARVED, not broken (fork-to-execve p99 goes from 6 ms to 206 ms
 //! under that load; `aterm-pty/src/unix.rs`). When the load stopped the same builds
@@ -356,7 +356,7 @@ impl ApplyTrouble {
         let (_, short) = clauses(&self.reason);
         let next = match self.retry {
             ApplyRetry::Scheduled => "retrying on its own",
-            ApplyRetry::ManualOnly => "restart now to retry",
+            ApplyRetry::ManualOnly => "apply now to retry",
         };
         format!("tried {}, {short}; {next}", times(self.attempts))
     }
@@ -690,9 +690,15 @@ mod tests {
             manual.sentence()
         );
         assert!(
-            manual.row_tail().contains("restart now"),
+            manual.row_tail().contains("apply now"),
             "the manual-only row must name the action: {}",
             manual.row_tail()
+        );
+        assert!(
+            !manual.row_tail().contains("restart") && !auto.row_tail().contains("restart"),
+            "the action is an in-place apply, never a restart: {} / {}",
+            manual.row_tail(),
+            auto.row_tail()
         );
     }
 

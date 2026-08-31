@@ -1754,6 +1754,129 @@ impl App {
             w.request_redraw();
         }
     }
+
+    /// Run one [`FindAction`] against the front window's find bar and report the
+    /// state it left behind. `None` when there is no front window at all.
+    ///
+    /// EVERY arm is a call to the function the KEYSTROKE calls, and that is the
+    /// whole design: `Open` is `find_requested` (Edit ▸ Find… / ⌘F itself), `Type`
+    /// and `Edit` are `search_edit_in` (what `on_key_search_mode`'s field
+    /// classifier and the IME commit both reach), `Step` is `search_step_in`
+    /// (⌘S/⌘R), the toggles are `search_toggle_*_in` (⌥⌘C/⌥⌘R), `Accept`/`Cancel`
+    /// are `search_accept_in`/`search_cancel_in` (⏎/⎋). There is no second
+    /// implementation of find here to drift from the one on the glass.
+    ///
+    /// It also cannot become a way to type at the SHELL. Every editing arm bottoms
+    /// out in a `ws.search.as_mut()` that is `None` when no find bar is up, so a
+    /// `find type` against a closed bar changes nothing and says `open=0` — the
+    /// PTY is not on any path out of this function.
+    pub(crate) fn find_cmd(&mut self, action: FindAction) -> Option<FindStatus> {
+        let wid = self.frontmost_window?;
+        match action {
+            FindAction::Open => self.find_requested(),
+            FindAction::Type(text) => self.search_edit_in(wid, SearchEdit::Insert(text)),
+            FindAction::Edit(edit) => self.search_edit_in(wid, edit),
+            FindAction::Step { forward } => self.search_step_in(wid, forward),
+            FindAction::ToggleCase => self.search_toggle_case_in(wid),
+            FindAction::ToggleRegex => self.search_toggle_regex_in(wid),
+            FindAction::Accept => self.search_accept_in(wid),
+            FindAction::Cancel => self.search_cancel_in(wid),
+            FindAction::Status => {}
+        }
+        Some(self.find_status_in(wid))
+    }
+
+    /// Window `wid`'s find bar as the `find` verb reports it. Read from the ONE
+    /// [`SearchState`] the bar paints itself from, so the wire and the glass cannot
+    /// disagree about the match count or which match is current — `current`/`matches`
+    /// are the pair [`SearchState::window_title`] puts in the title bar.
+    fn find_status_in(&self, wid: crate::WindowId) -> FindStatus {
+        let Some(search) = self.windows.get(&wid).and_then(|ws| ws.search.as_ref()) else {
+            return FindStatus::CLOSED;
+        };
+        FindStatus {
+            open: true,
+            query: search.query.clone(),
+            case_sensitive: search.case_sensitive,
+            is_regex: search.is_regex,
+            regex_error: search.regex_error,
+            matches: search.matches.len(),
+            // `None` rather than a zeroth match: with an empty batch `current` is a
+            // resting index, not a position anything is standing on.
+            current: (!search.matches.is_empty()).then_some(search.current),
+            truncated: search.truncated,
+            current_match: search.current_match(),
+        }
+    }
+}
+
+/// One step the `find` verb drives the find bar through. Each variant names the
+/// keystroke it IS, and [`App::find_cmd`] resolves it to that keystroke's own
+/// function — the enum exists so the grammar (parsed on the control thread) and
+/// the effect (applied on the main thread) can travel through a `Wake`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FindAction {
+    /// Edit ▸ Find… (⌘F).
+    Open,
+    /// Insert text at the caret — a printable keypress, or an IME commit.
+    Type(String),
+    /// One field edit: caret motion or a kill.
+    Edit(SearchEdit),
+    /// ⌘S / ⌘R: step to the next/previous match, wrapping.
+    Step { forward: bool },
+    /// ⌥⌘C: match-case. A TOGGLE, because the keystroke is one.
+    ToggleCase,
+    /// ⌥⌘R: regex. A TOGGLE, because the keystroke is one.
+    ToggleRegex,
+    /// ⏎: leave find mode, staying on the current match.
+    Accept,
+    /// ⎋: leave find mode, restoring the pre-find viewport.
+    Cancel,
+    /// Report only — the one form that presses nothing.
+    Status,
+}
+
+/// What the `find` verb answers with: the find bar's state after the action ran.
+///
+/// Every field that can be absent is an `Option`, so the wire formatter has no way
+/// to spell a match position that does not exist — the reply's `-` for those comes
+/// from `None` and from nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FindStatus {
+    pub(crate) open: bool,
+    pub(crate) query: String,
+    pub(crate) case_sensitive: bool,
+    pub(crate) is_regex: bool,
+    pub(crate) regex_error: bool,
+    pub(crate) matches: usize,
+    /// 0-based index of the current match within `matches`; `None` when the batch
+    /// is empty and no match is current.
+    ///
+    /// This is the counter the find bar PAINTS (`SearchState::window_title`'s
+    /// `i/n`), which is why the wire and the glass always agree. When `truncated`
+    /// is set the batch is capped, so the pair counts within the cap and
+    /// `current_match` may be an exact point-relative hit from outside it — read
+    /// `truncated` before treating `current`/`matches` as a whole-history census.
+    pub(crate) current: Option<usize>,
+    pub(crate) truncated: bool,
+    /// `(row, col, len)` in `search` coordinates (negative row = scrollback).
+    pub(crate) current_match: Option<(i32, u16, u32)>,
+}
+
+impl FindStatus {
+    /// No find bar is up. The other fields are the type's zero values and the
+    /// formatter never reaches them: `open=0` is the whole reply.
+    pub(crate) const CLOSED: FindStatus = FindStatus {
+        open: false,
+        query: String::new(),
+        case_sensitive: false,
+        is_regex: false,
+        regex_error: false,
+        matches: 0,
+        current: None,
+        truncated: false,
+        current_match: None,
+    };
 }
 
 /// The empty-query snapshot of `search_recompute_from_anchor_in`: base row,
@@ -1772,8 +1895,142 @@ fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u6
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchDirection, SearchEdit, SearchMatch, SearchState, map_matches};
+    use super::{FindAction, SearchDirection, SearchEdit, SearchMatch, SearchState, map_matches};
     use crate::{App, WindowId, term_lock};
+
+    /// An App whose session capability writes to an observer pipe, so a test can
+    /// assert that a control verb put NOTHING on the PTY (the shape
+    /// `app_input`'s `app_observing_pty` uses, for the same reason).
+    #[cfg(unix)]
+    fn app_observing_pty() -> (App, [i32; 2]) {
+        use std::sync::Arc;
+
+        use aterm_session::sink::SinkWriter;
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        (
+            App::headless_for_test_with_sink(Arc::new(SinkWriter::new(pipe[1]))),
+            pipe,
+        )
+    }
+
+    #[cfg(unix)]
+    fn drained(pipe: [i32; 2]) -> Vec<u8> {
+        let mut bytes = [0u8; 256];
+        let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read <= 0 {
+            return Vec::new();
+        }
+        bytes[..read as usize].to_vec()
+    }
+
+    /// THE fence the `find` verb stands on, and the reason it can be `Read`: a find
+    /// query is typed into aterm's own overlay, and not one byte of it reaches the
+    /// driven program — whether the bar is open or not.
+    ///
+    /// Both halves matter. With the bar CLOSED every editing arm is a no-op (it
+    /// bottoms out in a `ws.search.as_mut()` that is `None`), so `find type` cannot
+    /// become a back door onto the shell for an edge holding only read authority.
+    /// With the bar OPEN the text lands in the QUERY and still not on the PTY.
+    #[cfg(unix)]
+    #[test]
+    fn typing_into_the_find_bar_never_reaches_the_pty() {
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+
+        // Closed bar: the type is swallowed, and the reply says so.
+        let status = app
+            .find_cmd(FindAction::Type("rm -rf /".to_string()))
+            .expect("a front window");
+        assert!(!status.open, "no find bar was opened by typing at one");
+        assert!(app.windows[&wid].search.is_none());
+        assert_eq!(
+            drained(pipe),
+            Vec::<u8>::new(),
+            "a find type against a CLOSED bar put bytes on the PTY"
+        );
+
+        // Open bar: the text lands in the query, still not on the PTY.
+        assert!(app.find_cmd(FindAction::Open).expect("front").open);
+        let status = app
+            .find_cmd(FindAction::Type("needle".to_string()))
+            .expect("front");
+        assert!(status.open);
+        assert_eq!(status.query, "needle");
+        assert_eq!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find active")
+                .query,
+            "needle"
+        );
+        assert_eq!(
+            drained(pipe),
+            Vec::<u8>::new(),
+            "a find type against an OPEN bar put bytes on the PTY"
+        );
+    }
+
+    /// The verb drives the SAME field editor the keystrokes do, so a caret motion
+    /// and a kill behave in the query exactly as ⌃A/⌃K do on the glass — and the
+    /// reported query is the one the bar holds.
+    #[test]
+    fn find_key_edits_run_the_field_editor_the_keystrokes_run() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.find_cmd(FindAction::Open).expect("front").open);
+        app.find_cmd(FindAction::Type("hello world".to_string()));
+        // ⌥⌫ (kill the word behind the caret).
+        let status = app
+            .find_cmd(FindAction::Edit(SearchEdit::DeleteWordBack))
+            .expect("front");
+        assert_eq!(status.query, "hello ");
+        // ⌃A then ⌃K: to the start, then kill to the end — an empty field.
+        app.find_cmd(FindAction::Edit(SearchEdit::MoveStart));
+        let status = app
+            .find_cmd(FindAction::Edit(SearchEdit::KillToEnd))
+            .expect("front");
+        assert_eq!(status.query, "");
+        assert_eq!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find active")
+                .query,
+            "",
+            "the wire and the bar report one query, not two"
+        );
+    }
+
+    /// `case`/`regex` are TOGGLES because the keystrokes they stand for are, and
+    /// the reply is how a driver learns which way the flag went. `accept` and
+    /// `cancel` both close the bar, so the reply falls back to `open=0`.
+    #[test]
+    fn the_find_toggles_report_the_flag_they_left_behind() {
+        let mut app = App::headless_for_test();
+        assert!(app.find_cmd(FindAction::Open).expect("front").open);
+        let before = app.find_cmd(FindAction::Status).expect("front");
+        let after = app.find_cmd(FindAction::ToggleCase).expect("front");
+        assert_eq!(after.case_sensitive, !before.case_sensitive);
+        let after_regex = app.find_cmd(FindAction::ToggleRegex).expect("front");
+        assert_eq!(after_regex.is_regex, !before.is_regex);
+
+        assert!(!app.find_cmd(FindAction::Cancel).expect("front").open);
+        // Every form still answers on a closed bar rather than erroring.
+        assert!(
+            !app.find_cmd(FindAction::Step { forward: true })
+                .expect("front")
+                .open
+        );
+    }
 
     /// A `SearchState` pre-seeded with three matches (scrollback row -1, live rows
     /// 0/1) so the find-state machine (`step`, `current_match`) can be driven

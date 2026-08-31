@@ -369,9 +369,9 @@ impl Terminal {
         let rel = usize::try_from(abs - oldest).ok()?;
         let scrollback = grid.scrollback_lines();
         if rel < scrollback {
-            return grid
-                .get_history_line(rel)
-                .map(|l| line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES));
+            return grid.get_history_line(rel).map(|l| {
+                line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
+            });
         }
         let visible_row = rel - scrollback;
         if visible_row >= usize::from(self.rows()) {

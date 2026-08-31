@@ -14,8 +14,9 @@
 //!   (cargo takes a file lock), they just queue — so "running them concurrently"
 //!   would buy nothing and cost the ability to reason about the run. Stages in a
 //!   lane run in declared order, one at a time. Tippy has its own target dir
-//!   (`target-tippy`) and the L0 gate has its own workspace, so both are real
-//!   lanes that genuinely overlap the main build.
+//!   (`target-tippy`), the L0 gate has its own workspace, and the libc oracle
+//!   owns its nested workspace's two target dirs, so all are real lanes that
+//!   genuinely overlap the main build.
 //!
 //! * An EXCLUSIVE stage runs with nothing else in flight. The two smokes MEASURE:
 //!   frames per second, input→present latency, sync timeout-releases. A gate that
@@ -148,6 +149,7 @@ pub fn lane_name(lane: Lane) -> &'static str {
         Lane::MainTarget => "target/",
         Lane::TippyTarget => "target-tippy/",
         Lane::FreezeGateTarget => "tools/freeze-safety-gate/target/",
+        Lane::LibcOracleTarget => "libc-oracle/{target,target-symgate}/",
     }
 }
 
@@ -174,6 +176,7 @@ mod tests {
             spec(StageId::Tippy, "tippy", Lane::TippyTarget, false),
             spec(StageId::GrepGuards, "grep", Lane::Pure, false),
             spec(StageId::LicenseHeaders, "license", Lane::Pure, false),
+            spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
             spec(StageId::FreezeGate, "l0", Lane::FreezeGateTarget, false),
             spec(StageId::ControlSocketSmoke, "smoke", Lane::MainTarget, true),
             spec(StageId::GuiSmoke, "gui", Lane::MainTarget, true),
@@ -294,6 +297,10 @@ mod tests {
         assert!(
             overlaps(at(idx("build")), at(idx("l0"))),
             "the L0 gate builds in its own workspace and must overlap the build"
+        );
+        assert!(
+            overlaps(at(idx("build")), at(idx("libc"))),
+            "the libc oracle builds in its own workspace and must overlap the build"
         );
         assert!(
             overlaps(at(idx("grep")), at(idx("license"))),

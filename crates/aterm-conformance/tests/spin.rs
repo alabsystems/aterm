@@ -80,9 +80,14 @@
 //! fingerprinted the same way, so a push that does not touch the event loop
 //! costs one content hash.
 //!
-//! The binary under test is `target/release/aterm` — the RELEASE profile, the
-//! bits a cut would ship. `ATERM_SPIN_BIN` (or `ATERM_PAINT_BIN`) overrides for
-//! callers that already hold the artifact to judge.
+//! The binary under test is RELEASE profile. Without an override, the shared
+//! conformance helper freshens `target/conformance-release/release/aterm`, a
+//! dedicated target reused by paint so nested builds do not feature-thrash the
+//! outer test target. `ATERM_SPIN_BIN` (or `ATERM_PAINT_BIN`) drives an existing
+//! artifact.
+
+#[cfg(unix)]
+mod support;
 
 /// The honest answer on Windows. NOT a pass in disguise: the probe drives a
 /// POSIX shell sandbox (`mktemp -d`, `/bin/sh`, a unix control socket path),
@@ -102,7 +107,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// The workspace root, from this crate's own manifest dir.
 #[cfg(unix)]
@@ -112,60 +117,6 @@ fn workspace_root() -> PathBuf {
         .nth(2)
         .expect("crates/aterm-conformance has a workspace root two levels up")
         .to_path_buf()
-}
-
-/// Resolve — and, once per test run, freshen — the RELEASE binary under test.
-/// Same contract and same env override precedence as the paint matrix, so the
-/// two gates always judge the same artifact when a caller supplies one.
-#[cfg(unix)]
-fn release_bin() -> PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        for var in ["ATERM_SPIN_BIN", "ATERM_PAINT_BIN"] {
-            if let Ok(p) = std::env::var(var) {
-                let p = PathBuf::from(p);
-                assert!(p.is_file(), "{var}={} does not exist", p.display());
-                return p;
-            }
-        }
-        let root = workspace_root();
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        // Under the branded driver a nested invocation must name its own lane
-        // (`targo --unverified`): the outer authorization does not propagate.
-        let mut cmd = Command::new(&cargo);
-        if Path::new(&cargo)
-            .file_stem()
-            .is_some_and(|n| n.to_string_lossy().starts_with("targo"))
-        {
-            cmd.arg("--unverified");
-        }
-        let status = cmd
-            .args(["build", "--release", "-p", "aterm"])
-            .current_dir(&root)
-            .status()
-            .unwrap_or_else(|e| panic!("could not spawn `{cargo} build --release -p aterm`: {e}"));
-        assert!(
-            status.success(),
-            "`{cargo} build --release -p aterm` failed ({status}) — the spin matrix judges the \
-             RELEASE binary and refuses to run without one (set ATERM_SPIN_BIN to drive a \
-             prebuilt artifact)"
-        );
-        let bin = match std::env::var("CARGO_TARGET_DIR") {
-            Ok(t) => {
-                let t = PathBuf::from(t);
-                let t = if t.is_absolute() { t } else { root.join(t) };
-                t.join("release/aterm")
-            }
-            Err(_) => root.join("target/release/aterm"),
-        };
-        assert!(
-            bin.is_file(),
-            "built the release profile but {} is missing",
-            bin.display()
-        );
-        bin
-    })
-    .clone()
 }
 
 /// Drive one shape through `tools/spin-conformance/spin_probe.sh` and assert
@@ -179,13 +130,15 @@ fn probe(shape: &str) {
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let bin = release_bin();
     let root = workspace_root();
+    let bin = support::release_bin(&root, &["ATERM_SPIN_BIN", "ATERM_PAINT_BIN"]);
     let script = root.join("tools/spin-conformance/spin_probe.sh");
     assert!(script.is_file(), "{} is missing", script.display());
 
-    let out = Command::new(&script)
+    let out = Command::new("/bin/bash")
+        .arg(&script)
         .arg(&bin)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .args(["--shape", shape, "--settle", "3", "--window", "6"])
         .args(["--max-arms", "100", "--budget", "120"])
         .output()

@@ -27,9 +27,17 @@ pub use format_plan::{
     HdrPlan, HdrReconfigurePlan, hdr_live_upgrade_wants_f16, hdr_present_plan,
     hdr_reconfigure_plan, hdr_swapchain_wants_f16,
 };
+// THE ROW (macOS): the first-party Metal backend that will retire `wgpu` and
+// `softbuffer` on this cell. FOUNDATION ONLY so far — the ObjC FFI plus the six
+// WGSL shaders ported to MSL, with the fire/rain integer parity proven against
+// the CPU. Nothing in `renderer` calls it yet, and every other cell is
+// untouched. See `metal/mod.rs` for exactly what is and is not done.
+#[cfg(target_os = "macos")]
+mod metal;
 mod renderer;
 pub use renderer::{
     DropOverlay, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad, WindowGpu,
+    WindowTarget,
 };
 /// THE DEMAND-DRIVEN EFFECT PIPELINES: the nine cell pipelines a launch with
 /// the shipped defaults never compiles (see `renderer::EffectPipelines`). The

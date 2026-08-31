@@ -190,7 +190,7 @@ pub struct Ready {
     /// a client as a NEW roster generation, which the check lane ratchets into
     /// [`Floor::roster_seq`] and enforces via `roster_authority_superseded` — but the
     /// apply lane re-read only `min_build`, so a bundle staged at 10:00 by a machine
-    /// revoked at 10:30 installed at the next launch anyway, and only a separate
+    /// revoked at 10:30 was applied anyway (in-session, or at the next launch), and only a separate
     /// `min_build` yank could have stopped a withdrawn machine's artifact. Recording
     /// the generation here is what lets the apply gate ask the question the stage gate
     /// already asks.
@@ -645,6 +645,28 @@ impl FailedMark {
     ///
     /// `now` is unix seconds. A marker with no `retry_after` and no quarantine flag
     /// (written before the retry budget existed) never suppresses.
+    ///
+    /// READER half of the `NativeUpdateFailedMarkSuppression` contract pair
+    /// (see [`Self::quarantine_mark`] / [`Self::stage_failure_mark`]): a
+    /// quarantine verdict suppresses at EVERY `now`, a backoff memo iff
+    /// `now < retry_after` — so neither side can silently re-interpret the
+    /// other's encoding again.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NativeUpdateFailedMarkSuppression",
+            action = "ProbeSuppresses",
+            project = "aterm_update::failed_mark_suppression_projection"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::spec_unmodeled(
+            machine = "NativeUpdateFailedMarkSuppression",
+            action = "PickSuppressionInputs",
+            reason = "Bounded nondeterministic environment selection, not a shipping updater transition; Tier-1 exhaustively enumerates every projected input class before driving the record/probe pair."
+        )
+    )]
     #[must_use]
     pub fn suppresses(&self, build_number: u64, sha256: &str, now: u64) -> bool {
         self.matches(build_number, sha256) && (self.quarantined || now < self.retry_after)
@@ -722,18 +744,47 @@ impl FailedMark {
     /// re-derive the verdict (trial, rollback, stage) is deleted moments later
     /// (2026-08-19 round-4 skeptics).
     pub fn record_quarantine(path: &Path, build_number: u64, sha256: &str) {
-        let m = FailedMark {
+        let m = Self::quarantine_mark(build_number, sha256);
+        let Ok(text) = aterm_toml::to_string(&m) else {
+            return;
+        };
+        let _ = write_durable(path, &text, "artifact quarantine");
+    }
+
+    /// The in-memory quarantine verdict [`Self::record_quarantine`] persists —
+    /// the WRITER half of the writer/reader suppression contract.
+    ///
+    /// CONTRACT (the 5ffcc15d crash-loop class, machine
+    /// `NativeUpdateFailedMarkSuppression`): for the value `V` this returns,
+    /// `V.suppresses(build_number, sha256, now)` holds for EVERY `now` — the
+    /// verdict must land in the `quarantined` field [`Self::suppresses`]
+    /// consults, never in a `retry_after` sentinel the reader is entitled to
+    /// read as "already elapsed". Split from the persisting wrapper precisely
+    /// so that round trip is expressible over in-memory values, with no
+    /// filesystem modeling; the PERSISTED half of the round trip (a torn or
+    /// zero-length marker must read as absent, a written one must read back
+    /// verbatim) is covered by the existing regression tests
+    /// `a_vacuous_marker_reads_as_absent_not_as_an_empty_memo` and
+    /// `a_quarantine_suppresses_forever_while_the_shape_it_used_to_take_does_not`
+    /// below.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NativeUpdateFailedMarkSuppression",
+            action = "RecordQuarantine",
+            project = "aterm_update::failed_mark_suppression_projection"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn quarantine_mark(build_number: u64, sha256: &str) -> Self {
+        FailedMark {
             build_number,
             sha256: sha256.to_ascii_lowercase(),
             attempts: 0,
             retry_after: 0,
             quarantined: true,
             install_root: None,
-        };
-        let Ok(text) = aterm_toml::to_string(&m) else {
-            return;
-        };
-        let _ = write_durable(path, &text, "artifact quarantine");
+        }
     }
 
     /// Record a download/stage failure of `(build_number, sha256)`, widening the
@@ -745,17 +796,7 @@ impl FailedMark {
     /// schedule is testable.
     pub fn record_stage_failure(path: &Path, build_number: u64, sha256: &str, now: u64) {
         let prior = Self::read(path).unwrap_or_default();
-        let attempts = prior.next_attempt(build_number, sha256);
-        let m = FailedMark {
-            build_number,
-            sha256: sha256.to_ascii_lowercase(),
-            attempts,
-            retry_after: now.saturating_add(Self::backoff_secs(attempts)),
-            // A timed backoff, never a quarantine: this failure is about fetching or
-            // staging the artifact, not about the artifact having proved itself bad.
-            quarantined: false,
-            install_root: None,
-        };
+        let m = prior.stage_failure_mark(build_number, sha256, now);
         let Ok(text) = aterm_toml::to_string(&m) else {
             return;
         };
@@ -769,6 +810,42 @@ impl FailedMark {
             let _ = std::fs::rename(&tmp, path);
         } else {
             let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The in-memory backoff memo [`Self::record_stage_failure`] persists,
+    /// given this memo as the prior state — the WRITER half of the timed
+    /// (non-quarantine) suppression contract.
+    ///
+    /// CONTRACT (machine `NativeUpdateFailedMarkSuppression`): for the value
+    /// `V` this returns, with deadline `D = V.retry_after`,
+    /// `V.suppresses(build_number, sha256, now)` holds IFF `now < D` — the
+    /// clause that binds [`Self::suppresses`]' comparison direction, which is
+    /// what the original 5ffcc15d divergence was: a writer meaning "forever"
+    /// in a field the reader compares FORWARD from `now`. Split from the
+    /// persisting wrapper so the round trip is expressible over in-memory
+    /// values; the persisted half rides the same regression tests as
+    /// [`Self::quarantine_mark`].
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NativeUpdateFailedMarkSuppression",
+            action = "RecordStageFailure",
+            project = "aterm_update::failed_mark_suppression_projection"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn stage_failure_mark(&self, build_number: u64, sha256: &str, now: u64) -> Self {
+        let attempts = self.next_attempt(build_number, sha256);
+        FailedMark {
+            build_number,
+            sha256: sha256.to_ascii_lowercase(),
+            attempts,
+            retry_after: now.saturating_add(Self::backoff_secs(attempts)),
+            // A timed backoff, never a quarantine: this failure is about fetching or
+            // staging the artifact, not about the artifact having proved itself bad.
+            quarantined: false,
+            install_root: None,
         }
     }
 
@@ -799,6 +876,53 @@ impl FailedMark {
     pub fn clear(path: &Path) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// One bounded machine state as both spec tiers exchange it — variable name to
+/// bounded value.
+#[cfg(any(test, feature = "spec-anchors"))]
+type SpecState = std::collections::BTreeMap<&'static str, i64>;
+
+/// Project one observed writer→reader round trip of [`FailedMark`] onto the
+/// bounded `NativeUpdateFailedMarkSuppression` machine: the picked-inputs state
+/// (phase 1), the state after the observed writer ran (phase 2), and the state
+/// after the observed [`FailedMark::suppresses`] probe (phase 3).
+///
+/// Compiled only for proof/test builds. Its inputs are OBSERVATIONS of the real
+/// value the writer produced (`recorded_quarantined`, the timeline class of its
+/// `retry_after`) and of the real probe verdict — not a second implementation
+/// of either decision rule. `probe_now_class`/`recorded_deadline_class` are the
+/// bounded timeline positions (0 smallest, 2 the interior deadline, 3 strictly
+/// past it; 0 doubles as the legacy no-deadline sentinel), computed by the
+/// caller from the real u64s.
+#[cfg(any(test, feature = "spec-anchors"))]
+#[doc(hidden)]
+#[must_use]
+pub fn failed_mark_suppression_projection(
+    quarantine_writer: bool,
+    probe_now_class: i64,
+    candidate_matches: bool,
+    recorded_quarantined: bool,
+    recorded_deadline_class: i64,
+    suppressed: bool,
+) -> (SpecState, SpecState, SpecState) {
+    let picked = std::collections::BTreeMap::from([
+        ("phase", 1),
+        ("writer_kind", if quarantine_writer { 1 } else { 2 }),
+        ("probe_now", probe_now_class),
+        ("candidate_matches", i64::from(candidate_matches)),
+        ("quarantined", 0),
+        ("deadline", 0),
+        ("suppressed", 0),
+    ]);
+    let mut recorded = picked.clone();
+    recorded.insert("phase", 2);
+    recorded.insert("quarantined", i64::from(recorded_quarantined));
+    recorded.insert("deadline", recorded_deadline_class);
+    let mut probed = recorded.clone();
+    probed.insert("phase", 3);
+    probed.insert("suppressed", i64::from(suppressed));
+    (picked, recorded, probed)
 }
 
 #[cfg(test)]
@@ -994,6 +1118,312 @@ mod tests {
         assert!(!timed.suppresses(42, &sha, 100 + RETRY_BACKOFF_SECS[3]));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The bounded timeline class of a real unix-seconds value relative to the
+    /// recorded deadline — the honest mapping between the u64 halfplane and the
+    /// `NativeUpdateFailedMarkSuppression` machine's `probe_now`/`deadline`
+    /// classes. With `deadline == 0` (the legacy no-deadline sentinel the
+    /// quarantine keeps) nothing is strictly before the deadline, so every
+    /// class compares the same way and absolute smallness keeps the four
+    /// classes distinguishable for the exhaustiveness sweep.
+    fn timeline_class(now: u64, deadline: u64) -> i64 {
+        if deadline == 0 {
+            i64::try_from(now.min(3)).expect("bounded class fits i64")
+        } else if now == 0 {
+            0
+        } else if now < deadline {
+            1
+        } else if now == deadline {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// Tier-1 for the WRITER/READER suppression contract pair (the 5ffcc15d
+    /// crash-loop class): drives the REAL in-memory round trip — the value each
+    /// writer produces, probed by the real [`FailedMark::suppresses`] — through
+    /// every bounded input class of `NativeUpdateFailedMarkSuppression`, and
+    /// validates both observed transitions against the machine.
+    ///
+    /// Contract 1: after [`FailedMark::quarantine_mark`] produces `V`,
+    /// `V.suppresses(build, sha, now)` holds for EVERY `now` (all four
+    /// timeline classes, including `u64::MAX`). Contract 2: after
+    /// [`FailedMark::stage_failure_mark`] produces `V` with deadline `D`,
+    /// `V.suppresses(build, sha, now)` holds IFF `now < D`. The persisted half
+    /// of the round trip is covered by the torn-write/read-back regression
+    /// tests above.
+    #[test]
+    fn failed_mark_suppression_exhaustively_refines_the_model() {
+        use std::collections::BTreeSet;
+
+        let model = aterm_spec::derive::native_update_failed_mark_suppression_model();
+        let reachable_inputs: BTreeSet<_> = model
+            .successors("PickSuppressionInputs", &model.init_state())
+            .into_iter()
+            .collect();
+        assert_eq!(
+            reachable_inputs.len(),
+            16,
+            "2 writers × 4 timeline classes × 2 identity classes"
+        );
+
+        const BUILD: u64 = 42;
+        let sha = "ab".repeat(32);
+        let wrong_sha = "cd".repeat(32);
+        // The matching candidate plus BOTH escape shapes (newer build,
+        // re-published digest) — the non-matching lanes must agree that a
+        // changed key ends suppression.
+        let candidates = [
+            (BUILD, sha.clone(), true),
+            (BUILD + 1, sha.clone(), false),
+            (BUILD, wrong_sha, false),
+        ];
+
+        // Writer 1: the quarantine verdict. In-memory, no filesystem.
+        let quarantine = FailedMark::quarantine_mark(BUILD, &sha);
+        assert!(quarantine.quarantined);
+        assert_eq!(
+            quarantine.retry_after, 0,
+            "the verdict must NOT ride the deadline field — that was the bug"
+        );
+
+        // Writer 2: a first stage failure at NOW0 — deadline NOW0 + rung 1.
+        const NOW0: u64 = 1_000;
+        let backoff = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0);
+        let deadline = NOW0 + RETRY_BACKOFF_SECS[0];
+        assert_eq!(backoff.retry_after, deadline);
+        assert_eq!(backoff.attempts, 1);
+        assert!(!backoff.quarantined);
+
+        let mut projected_inputs = BTreeSet::new();
+        let mut calls = 0usize;
+        for (mark, quarantine_writer) in [(&quarantine, true), (&backoff, false)] {
+            // One probe per timeline class; `timeline_class` is asserted below
+            // to hit all four so the sweep cannot silently narrow.
+            let probes = if quarantine_writer {
+                [0, 1, 2, u64::MAX]
+            } else {
+                [0, deadline - 1, deadline, u64::MAX]
+            };
+            for now in probes {
+                for (cand_build, cand_sha, matches) in &candidates {
+                    let suppressed = mark.suppresses(*cand_build, cand_sha, now);
+                    // The two contracts, asserted directly on the real verdict.
+                    if quarantine_writer {
+                        assert_eq!(
+                            suppressed, *matches,
+                            "quarantine must suppress its artifact at every now (now={now})"
+                        );
+                    } else {
+                        assert_eq!(
+                            suppressed,
+                            *matches && now < deadline,
+                            "backoff must suppress iff now < deadline (now={now})"
+                        );
+                    }
+
+                    let (picked, recorded, probed) = failed_mark_suppression_projection(
+                        quarantine_writer,
+                        timeline_class(now, mark.retry_after),
+                        *matches,
+                        mark.quarantined,
+                        if mark.retry_after == 0 { 0 } else { 2 },
+                        suppressed,
+                    );
+                    assert!(
+                        reachable_inputs.contains(&picked),
+                        "real input projection is unreachable: {picked:?}"
+                    );
+                    projected_inputs.insert(picked.clone());
+
+                    let label = format!(
+                        "failed-mark suppression quarantine={quarantine_writer} now={now} matches={matches}"
+                    );
+                    let writer_action = if quarantine_writer {
+                        "RecordQuarantine"
+                    } else {
+                        "RecordStageFailure"
+                    };
+                    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+                        &model,
+                        &[],
+                        &picked,
+                        &recorded,
+                        Some(writer_action),
+                        &label,
+                    );
+                    assert!(admitted, "real writer transition rejected: {why}");
+                    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+                        &model,
+                        &[],
+                        &recorded,
+                        &probed,
+                        Some("ProbeSuppresses"),
+                        &label,
+                    );
+                    assert!(admitted, "real reader transition rejected: {why}");
+                    for invariant in &model.invariants {
+                        assert!(
+                            model.check_invariant(invariant.name, &recorded),
+                            "real writer violated {}: {recorded:?}",
+                            invariant.name
+                        );
+                        assert!(
+                            model.check_invariant(invariant.name, &probed),
+                            "real round trip violated {}: {probed:?}",
+                            invariant.name
+                        );
+                    }
+                    calls += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            calls, 24,
+            "the concrete decision lattice must stay exhaustive"
+        );
+        assert_eq!(
+            projected_inputs, reachable_inputs,
+            "Tier-1 must cover every bounded PickSuppressionInputs class"
+        );
+    }
+
+    /// The healthy machine must REJECT both halves of the historical
+    /// divergence, and `Buggy=1` must reproduce them — otherwise the contract
+    /// is a claim about nothing.
+    #[test]
+    fn failed_mark_suppression_model_negative_controls_are_non_vacuous() {
+        let model = aterm_spec::derive::native_update_failed_mark_suppression_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+        // Historical defect, writer half: the crash-loop verdict recorded as a
+        // plain timed memo (`retry_after = 0`, no quarantine field) — the exact
+        // value the pre-5ffcc15d revert path persisted. The real reader then
+        // reads the poison as already elapsed: written, then ignored.
+        let legacy_poison = FailedMark {
+            build_number: 42,
+            sha256: "ab".repeat(32),
+            attempts: 0,
+            retry_after: 0,
+            quarantined: false,
+            install_root: None,
+        };
+        let suppressed = legacy_poison.suppresses(42, &"ab".repeat(32), 0);
+        assert!(
+            !suppressed,
+            "the regression shape: the poison does not hold"
+        );
+        let (picked, leaked, retried) = failed_mark_suppression_projection(
+            true,
+            0,
+            true,
+            legacy_poison.quarantined,
+            0,
+            suppressed,
+        );
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &picked,
+            &leaked,
+            Some("RecordQuarantine"),
+            "failed-mark suppression writer negative control",
+        );
+        assert!(
+            !admitted,
+            "healthy model admitted the quarantine-as-timed-memo writer: {why}"
+        );
+        assert!(
+            buggy
+                .successors("RecordQuarantine", &picked)
+                .contains(&leaked),
+            "Buggy=1 must reproduce the 5ffcc15d writer"
+        );
+        assert!(!buggy.check_invariant("QuarantineVerdictLandsInTheQuarantineField", &leaked));
+        assert!(
+            buggy
+                .successors("ProbeSuppresses", &leaked)
+                .contains(&retried),
+            "Buggy=1 must complete the written-then-ignored round trip"
+        );
+        assert!(!buggy.check_invariant("QuarantineSuppressesAtEveryProbe", &retried));
+
+        // Historical class, reader half: the deadline comparison direction
+        // flipped — a memo that suppresses FROM its deadline instead of until
+        // it. The healthy machine rejects the flipped verdict on a healthy
+        // recorded prefix; Buggy=1 admits it.
+        let (picked, recorded, flipped) =
+            failed_mark_suppression_projection(false, 3, true, false, 2, true);
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &picked,
+            &recorded,
+            Some("RecordStageFailure"),
+            "failed-mark suppression reader negative control (prefix)",
+        );
+        assert!(admitted, "the recorded prefix must be healthy: {why}");
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &recorded,
+            &flipped,
+            Some("ProbeSuppresses"),
+            "failed-mark suppression reader negative control",
+        );
+        assert!(
+            !admitted,
+            "healthy model admitted a memo suppressing past its deadline: {why}"
+        );
+        assert!(
+            buggy
+                .successors("ProbeSuppresses", &recorded)
+                .contains(&flipped),
+            "Buggy=1 must reproduce the flipped comparison"
+        );
+        assert!(!buggy.check_invariant("BackoffSuppressesIffBeforeDeadline", &flipped));
+    }
+
+    /// The contract pair is LINKED, not just stated: both writers and the
+    /// reader carry `#[refines]` anchors into the machine, the bounded input
+    /// pick is waived, and every anchor names the one projection.
+    #[test]
+    fn failed_mark_suppression_shipping_anchors_are_linked() {
+        let mut refinements: Vec<_> = aterm_spec::xref::refinements()
+            .filter(|anchor| anchor.machine == "NativeUpdateFailedMarkSuppression")
+            .map(|anchor| (anchor.action, anchor.rust_method, anchor.project))
+            .collect();
+        refinements.sort_unstable();
+        assert_eq!(
+            refinements,
+            [
+                (
+                    "ProbeSuppresses",
+                    "suppresses",
+                    "aterm_update::failed_mark_suppression_projection"
+                ),
+                (
+                    "RecordQuarantine",
+                    "quarantine_mark",
+                    "aterm_update::failed_mark_suppression_projection"
+                ),
+                (
+                    "RecordStageFailure",
+                    "stage_failure_mark",
+                    "aterm_update::failed_mark_suppression_projection"
+                ),
+            ]
+        );
+
+        let input_waivers: Vec<_> = aterm_spec::xref::waivers()
+            .filter(|waiver| waiver.machine == "NativeUpdateFailedMarkSuppression")
+            .collect();
+        assert_eq!(input_waivers.len(), 1);
+        assert_eq!(input_waivers[0].action, "PickSuppressionInputs");
+        assert_eq!(input_waivers[0].rust_method, "suppresses");
     }
 
     #[test]

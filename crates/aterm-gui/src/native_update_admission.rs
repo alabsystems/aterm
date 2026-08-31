@@ -45,7 +45,7 @@ impl AdmissionBlock {
         match self {
             Self::UnverifiedStage => "No newer verified update is staged".to_string(),
             Self::NativeStateUncertified => {
-                "Update relaunch is waiting for native document state to become safe".to_string()
+                "The update is waiting for native document state to become safe".to_string()
             }
             Self::LivePtysNeedSeamless => format!(
                 "Update kept {} live terminal session(s), including {} foreground job(s), running because a live-PTY and visible-screen handoff could not be prepared; retry manually when handoff is available",

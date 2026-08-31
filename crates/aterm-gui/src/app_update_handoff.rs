@@ -44,11 +44,16 @@ mod island;
 #[cfg(unix)]
 struct HandoffWorkerJob {
     attempt_id: u64,
-    /// When `park_all_readers` returned in the parent — the zero point of the
-    /// freeze the user actually feels. Carried so the worker can SPLIT the one
-    /// number the main thread later logs as park->proof into its two halves at
-    /// the moment the split becomes observable (the successor's dial). Data
-    /// only: nothing branches on it.
+    /// When the parent STARTED parking its readers — the zero point of the
+    /// freeze the user actually feels, and the same instant the 20 ms capture
+    /// deadline is measured from. (It is stamped immediately BEFORE
+    /// `park_all_readers`, not after, so `park->dial` includes the park itself;
+    /// the park is bounded by that same 20 ms, so the inclusion is negligible
+    /// against a multi-second dial — but the zero point is the park's start.)
+    ///
+    /// Carried so the worker can SPLIT the one number the main thread later logs
+    /// as park->proof into its two halves at the moment the split becomes
+    /// observable (the successor's dial). Data only: nothing branches on it.
     park_at: std::time::Instant,
     current_build: u64,
     target_build: u64,
@@ -2958,12 +2963,120 @@ fn optional_carry_fits(
         .is_some_and(|total| total <= ceiling)
 }
 
+/// `$ATERM_NO_SEAMLESS_UPDATE` is set: the ONE deliberate opt-out from the overlap
+/// handoff. A plain read every time, never memoised. Folded into
+/// [`App::seamless_handoff_unavailable`], the reading the apply gate and the
+/// status bar's posture share.
+#[must_use]
+pub(crate) fn seamless_handoff_opted_out() -> bool {
+    std::env::var_os("ATERM_NO_SEAMLESS_UPDATE").is_some()
+}
+
+/// Why the in-session overlap handoff cannot run in THIS process. ONE predicate
+/// ([`App::seamless_handoff_unavailable`]) answers it for both readers — the
+/// apply gate in `start_unix_update_handoff` (`seamless_capable`) and the status
+/// bar's posture (`App::apply_posture_for`) — so the bar can never promise a
+/// landing, or a manual affordance, that the gate refuses. With any of these the
+/// admission classifier (`native_update_admission::classify`) admits only the
+/// cold lane, which it grants at exactly zero live PTYs: the apply is REFUSED
+/// while any terminal is open, no shell dies, and the build lands at the next
+/// launch (or once every terminal is closed). Until 2026-08-30 the gate AND-ed
+/// four conjuncts while the posture folded only the first, so a `--control-sock`
+/// or `--headless` process painted "applies in place within ~2 min" over an apply
+/// the gate refused with any terminal open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandoffUnavailable {
+    /// `$ATERM_NO_SEAMLESS_UPDATE` — the one deliberate opt-out.
+    OptedOut,
+    /// `--control-sock <path>` / `$ATERM_CONTROL_SOCK`: an explicit control-socket
+    /// path. The successor inherits the variable and would come up on the same
+    /// path, which explicit paths keep under the strict never-hijack probe
+    /// (`control.rs`) while this process still holds it.
+    ExplicitControlSock,
+    /// `--headless` / `$ATERM_HEADLESS`: no window to hand across.
+    Headless,
+    /// No event-loop proxy to drive the handoff's wakes — only
+    /// `headless_for_test` builds such an App.
+    NoEventLoopProxy,
+}
+
+impl HandoffUnavailable {
+    /// Every reason, in the order the predicate asks: the deliberate opt-out
+    /// first (the one a person set on purpose), then the launch shape, then the
+    /// process shape.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::OptedOut,
+        Self::ExplicitControlSock,
+        Self::Headless,
+        Self::NoEventLoopProxy,
+    ];
+
+    /// What is set — the clause the reader can act on, which is why every
+    /// sentence built on it leads with it (the status bar truncates from the
+    /// right when the window is narrow).
+    #[must_use]
+    pub(crate) fn cause(self) -> &'static str {
+        match self {
+            Self::OptedOut => "$ATERM_NO_SEAMLESS_UPDATE is set",
+            Self::ExplicitControlSock => "$ATERM_CONTROL_SOCK is set (--control-sock)",
+            Self::Headless => "--headless (no window)",
+            Self::NoEventLoopProxy => "no event loop",
+        }
+    }
+
+    /// The log line's remedy, for the reasons that have one.
+    #[must_use]
+    pub(crate) fn remedy(self) -> &'static str {
+        match self {
+            Self::OptedOut => " Unset it to restore the default.",
+            Self::ExplicitControlSock => {
+                " Launch without --control-sock / $ATERM_CONTROL_SOCK to restore the default."
+            }
+            Self::Headless => " A windowed launch restores the default.",
+            Self::NoEventLoopProxy => "",
+        }
+    }
+
+    /// Whether this reason holds for `app` — a plain read each time.
+    fn holds_for(self, app: &App) -> bool {
+        match self {
+            Self::OptedOut => seamless_handoff_opted_out(),
+            Self::ExplicitControlSock => std::env::var_os("ATERM_CONTROL_SOCK").is_some(),
+            Self::Headless => app.headless,
+            Self::NoEventLoopProxy => app.proxy.is_none(),
+        }
+    }
+}
+
+impl App {
+    /// The ONE reading of whether the overlap handoff can run here — the first
+    /// true reason in [`HandoffUnavailable::ALL`]'s order, or `None` when the
+    /// seamless lane is available. Read by the apply gate
+    /// (`start_unix_update_handoff`) and by the status bar's posture
+    /// ([`App::apply_posture_for`]), and nowhere else, so the two cannot
+    /// disagree. Plain reads only — `var_os` and two fields — never a memo: a
+    /// memo whose initializer could call back into its owner parked the main
+    /// thread forever on 2026-08-30.
+    ///
+    /// NOT folded into `arm_native_auto_apply`'s `enabled` on purpose: the cold
+    /// lane is a real automatic path for a headless or `--control-sock` process
+    /// whose last terminal has closed (the classifier admits it at zero live
+    /// PTYs, and the cold spawn re-injects `ATERM_HEADLESS`), so a lane that
+    /// never arms would never take it.
+    #[must_use]
+    pub(crate) fn seamless_handoff_unavailable(&self) -> Option<HandoffUnavailable> {
+        HandoffUnavailable::ALL
+            .into_iter()
+            .find(|why| why.holds_for(self))
+    }
+}
+
 impl App {
     /// PROOF-CARRYING DSU (RFC Rung 1): APPLY a staged update now by re-execing — the
     /// staged build swaps in at the top of the new `main` (`apply_staged_if_ready`).
     /// Reached from `Wake::ApplyStagedUpdate` (the `aterm-ctl update apply` verb / the
-    /// GUI [Relaunch] nudge). No-op unless a STRICTLY-NEWER build is actually staged
-    /// (never a pointless restart). Rung 1b live wiring (DEFAULT-ON, opt out with
+    /// GUI's update-ready nudge). No-op unless a STRICTLY-NEWER build is actually staged
+    /// (never a pointless re-exec). Rung 1b live wiring (DEFAULT-ON, opt out with
     /// `ATERM_NO_SEAMLESS_UPDATE`): hands every live PTY master, its exact visible-screen
     /// checkpoint, and a `SessionHandoff` manifest to the new process so the running shell survives
     /// (the round-trip that makes that safe is
@@ -3209,25 +3322,37 @@ impl App {
         // opt-out, only one of which appeared in any document, neither of which
         // said anything when honoured. It is gone; this is the opt-out.
         //
-        // And it is LOUD. Suppressing the overlap sends the update down the
-        // legacy restart path — a different route from the one the release was
-        // tested on — so a binary that takes it says so, once, by name. A silent
-        // env var that reroutes an update is how a shipped binary comes to
-        // behave differently from the one that was proven.
-        let seamless_opt_out = std::env::var_os("ATERM_NO_SEAMLESS_UPDATE").is_some();
-        if seamless_opt_out {
+        // And it is LOUD. Suppressing the overlap leaves the update only the
+        // cold lane — which the classifier below admits for an exact zero-PTY
+        // state and nothing else, so with any terminal open the apply is REFUSED
+        // (`LivePtysNeedSeamless`), no shell dies, and the build waits for the
+        // next launch. A different route from the one the release was tested
+        // on, so a binary that takes it says so, once, by name. A silent env var
+        // that reroutes an update is how a shipped binary comes to behave
+        // differently from the one that was proven. (This line used to say live
+        // shells would NOT survive — a kill the classifier never permits; the
+        // status bar repeated it until 2026-08-30.)
+        //
+        // ONE PREDICATE FOR BOTH READERS. Four conjuncts were AND-ed right here —
+        // the opt-out, `$ATERM_CONTROL_SOCK`, `headless`, `proxy` — while the
+        // status bar's posture folded only the first, so a `--control-sock` or
+        // `--headless` process painted "applies in place within ~2 min" over an
+        // apply this gate refused (2026-08-30). `seamless_handoff_unavailable`
+        // is now the only place the four are read, and every reason is said in
+        // the log the way the opt-out always was.
+        let handoff_unavailable = self.seamless_handoff_unavailable();
+        if let Some(why) = handoff_unavailable {
             aterm_log::warn!(
-                "update apply: $ATERM_NO_SEAMLESS_UPDATE is set — the seamless \
-                 overlap handoff is DISABLED for this process. Live shells will NOT \
-                 survive the update; it falls back to the legacy restart path, which \
-                 is not the path this build's handoff proofs cover. Unset it to \
-                 restore the default."
+                "update apply: {} — the seamless overlap handoff is DISABLED for this \
+                 process. The update is refused while any terminal session is open; \
+                 with none open it re-execs cold (the staged build swaps in at the top \
+                 of the new main), which is not the path this build's handoff proofs \
+                 cover.{}",
+                why.cause(),
+                why.remedy()
             );
         }
-        let overlap_available = !self.headless
-            && !seamless_opt_out
-            && std::env::var_os("ATERM_CONTROL_SOCK").is_none()
-            && self.proxy.is_some();
+        let overlap_available = handoff_unavailable.is_none();
         let facts = crate::native_update_admission::AdmissionFacts {
             staged_verified: debug_seamless || apply_attempt.is_some(),
             seamless_capable: overlap_available && !live.is_empty(),
@@ -3433,8 +3558,9 @@ impl App {
         // that window — it is a function of `$HOME` and this process's pid — so
         // taking it here costs the attempt nothing and keeps a filesystem
         // round-trip out of the parked interval. (The rest of the lane decision
-        // is arithmetic plus one `fstat` per session, which is why only this
-        // fact moves.)
+        // — arithmetic plus one `fstat` per session — now sits below the worker
+        // spawn for the same reason; this fact moves further up only because it
+        // can touch the filesystem.)
         #[cfg(target_os = "macos")]
         let rendezvous_path_fits = crate::handoff_rendezvous::rendezvous_path_fits();
         // Same reasoning, same window: `app_bundle_root` ends in an `is_dir`.
@@ -3464,16 +3590,29 @@ impl App {
         // the attempt's identity, its successor `Command`, and the LANE DECISION
         // with its proof identities are all pure functions of facts settled
         // BEFORE the park — the pool snapshot, the dup'd masters, the apply
-        // ticket. Computing them inside the 20 ms budget bought nothing and
-        // spent the one resource the capture ladder is actually short of, so
-        // the degrade ladder below now has that budget back on every lane.
-        // What remains under the park is exactly what DEPENDS on the parked
-        // state: the two digests over the captured screens and layout.
+        // ticket. What remains under the park is exactly what DEPENDS on the
+        // parked state: the two digests over the captured screens and layout.
+        //
+        // WHAT THIS BUYS, precisely — an earlier version of this comment (and of
+        // the CHANGELOG and the RFC) claimed the capture ladder "gets that
+        // budget back", and that was FALSE: in the parent revision this block
+        // ran AFTER the ladder had already finished, so the ladder was never
+        // charged a microsecond of it and its `park_at + 20ms` window is
+        // byte-identical either way. What the move actually does is (a) take
+        // this work out of the frozen interval altogether, which is the freeze
+        // the user feels, and (b) stop attempts dying at the deadline check that
+        // follows the digests, which this block used to push past 20 ms.
+        //
+        // It also mints the attempt id before the park, so an attempt that dies
+        // after this point burns one `u64` id. Nothing keys on id contiguity.
         //
         // These early returns therefore do NOT roll back the overlap — no
-        // reader is parked, so there is nothing to re-attach. (It would be a
-        // no-op today, `attach_deferred_readers` over an empty selection, but
-        // writing it would be a lie about what happened here.) A return also
+        // reader is parked, so there is nothing to re-attach. (What it would do
+        // here is not nothing: `rollback_overlap` re-asserts a `set_cloexec` the
+        // mandatory loop above already established, and schedules a reader
+        // resume for readers that were never stopped. Both are harmless; neither
+        // describes what happened at this point, which is why the call is gone
+        // rather than kept "just in case".) A return also
         // drops `job_tx`, which is how the worker spawned just above learns to
         // exit: the same shape the activity re-check below already relies on.
 

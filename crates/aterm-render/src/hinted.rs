@@ -113,18 +113,29 @@ impl HintMode {
         }
     }
 
-    /// Whether `ATERM_RASTERIZER=fontdue` — the byte-stable portable path the
-    /// golden/parity tests export — is pinning the raster backend. It forces
+    /// Whether `ATERM_RASTERIZER` is pinning the raster backend to the
+    /// byte-stable PORTABLE path the golden/parity tests export. It forces
     /// `Off` at construction AND wins over the `font_hinting` config setter,
-    /// so those tests keep the exact fontdue bytes they were written against.
-    pub(crate) fn fontdue_forced() -> bool {
-        std::env::var("ATERM_RASTERIZER").ok().as_deref() == Some("fontdue")
+    /// so those tests keep the exact bytes they were written against.
+    ///
+    /// TWO SPELLINGS, deliberately. `portable` is the name of the thing —
+    /// `crate::font::Font` over `crate::raster`, the same code on every OS.
+    /// `fontdue` was that path's name while `fontdue` WAS that code, and it is
+    /// still accepted because it is exported by 20 test sites across 9 files,
+    /// by `aterm-gpu`'s parity harnesses, and by whatever shell scripts and
+    /// muscle memory outlive this comment. Breaking it would buy nothing but a
+    /// tidier string.
+    pub(crate) fn portable_forced() -> bool {
+        matches!(
+            std::env::var("ATERM_RASTERIZER").ok().as_deref(),
+            Some("portable" | "fontdue")
+        )
     }
 
     /// Parse `ATERM_FONT_HINTING`. Unset or unrecognized = the default
-    /// ([`HintMode::Full`]); [`Self::fontdue_forced`] forces `Off`.
+    /// ([`HintMode::Full`]); [`Self::portable_forced`] forces `Off`.
     pub(crate) fn from_env() -> Self {
-        if Self::fontdue_forced() {
+        if Self::portable_forced() {
             return Self::Off;
         }
         match std::env::var("ATERM_FONT_HINTING").ok().as_deref() {

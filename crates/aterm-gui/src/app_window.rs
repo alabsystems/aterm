@@ -20,6 +20,7 @@ use winit::window::Window;
 use crate::GpuBackend;
 use crate::app_config::resolve_force_scale;
 use crate::platform::AppRt;
+use crate::present::CpuPresenter as _;
 use crate::spawn::spawn_session;
 use crate::{
     App, Backend, BackendSlot, CloseOutcome, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget,
@@ -647,7 +648,8 @@ impl App {
         self.refresh_operator_status_item();
         debug_assert!(
             self.structural_invariants_ok(),
-            "window/session structural invariants violated after create_window_logical",
+            "window/session structural invariants violated after create_window_logical: {}",
+            self.structural_invariant_violation().unwrap_or_default(),
         );
     }
 
@@ -2024,22 +2026,16 @@ impl App {
                 }
             }
         }
-        // CPU (softbuffer) present path. Mirror the GPU arm's fail-soft rollback: a
-        // surface-creation failure drops the just-created window and returns false so
-        // the caller declines just this window, instead of `.expect()` unwinding the
-        // whole process and taking every other window/session down with it.
-        let context = match softbuffer::Context::new(window.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("aterm-gui: softbuffer context creation failed: {e}");
-                drop(window);
-                return false;
-            }
-        };
-        let surface = match softbuffer::Surface::new(&context, window.clone()) {
+        // CPU present path (first-party CoreGraphics on macOS, `softbuffer`
+        // elsewhere — see `crate::present`). Mirror the GPU arm's fail-soft
+        // rollback: a surface-creation failure drops the just-created window and
+        // returns false so the caller declines just this window, instead of
+        // `.expect()` unwinding the whole process and taking every other
+        // window/session down with it.
+        let surface = match crate::present::CpuSurface::new(window.clone()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("aterm-gui: softbuffer surface creation failed: {e}");
+                eprintln!("aterm-gui: CPU present surface creation failed: {e}");
                 drop(window);
                 return false;
             }
@@ -2055,10 +2051,7 @@ impl App {
             {
                 ws.a11y = a11y_adapter;
             }
-            ws.present = Some(PresentTarget::Cpu {
-                surface,
-                _context: context,
-            });
+            ws.present = Some(PresentTarget::Cpu { surface });
             true
         } else {
             false
@@ -2351,14 +2344,16 @@ impl App {
         if !self.windows.is_empty() {
             debug_assert!(
                 self.structural_invariants_ok(),
-                "window/session structural invariants violated after close_window_logical",
+                "window/session structural invariants violated after close_window_logical: {}",
+                self.structural_invariant_violation().unwrap_or_default(),
             );
             // A survivor became (or stayed) frontmost: re-mirror the control socket /
             // notify target onto its active tab, exactly like a tab/focus switch.
             self.sync_active_session();
             debug_assert!(
                 self.structural_invariants_ok(),
-                "window/session structural invariants violated after re-mirror",
+                "window/session structural invariants violated after re-mirror: {}",
+                self.structural_invariant_violation().unwrap_or_default(),
             );
         }
         // Glance refresh AFTER the store deregistration and the map removal,

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 // `CursorGlow::tick` — the per-presented-frame cost of the crate's largest
-// engine (35k lines, ~17 style-gated emitters, six output streams). Until this
+// engine (~17 style-gated emitters, six output streams). Until this
 // file the crate had NO bench target at all: the only instruments were
 // `#[ignore]`d perf gates in `tests/`, and the biggest one of those
 // (`tests/cursor_bench.rs::saturated*`) measures a state the shipping engine
@@ -50,7 +50,7 @@
 //
 //   * A FROZEN CLOCK. `tests/cursor_bench.rs::saturated` re-ticks ONE `Instant`,
 //     so `dt == 0`, the whole lazy-decay block is skipped, `rainbow.disp` stays
-//     0 and only the COLD 1-strip ribbon is measured. Every workload here
+//     0 and only the cheaper resting ribbon is measured. Every workload here
 //     advances the injected clock by a FIXED dt per frame (`Fixture::dt`), so
 //     the ~10 `exp` integrators, the momentum spine and the phase all run. The
 //     measurement clock (criterion's) stays entirely separate from the injected
@@ -97,11 +97,11 @@
 // WHAT A VOLUME BOUND CAN AND CANNOT CATCH. Every bound is two-sided: the min
 // proves the workload reached the emitter it claims (`>= 0` passes on a dead
 // engine), the max catches a count regression a timing number alone would hide.
-// TWO STREAMS ARE THE EXCEPTION, and they say so at their declaration:
+// THREE CAPPED MEASUREMENTS ARE THE EXCEPTION, and they say so at their declaration:
 //
 //   * `halos` is CAPPED at MAX_HALOS = 512 and the truncation happens inside
 //     `tick`, so a saturated halo stream reads 512 whatever was pushed. The seven
-//     workloads that saturate it (`rainbow_typing_{default_retina,retina,1x,light}`,
+//     workloads that saturate it (`rainbow_typing_{default_retina,underline_retina,1x,light}`,
 //     `rainbow_jump_bursts`, `beam_tube_jump`, `style_crossfade`) therefore
 //     assert `AT_HALO_CAP` — an explicit SATURATION guard, live only in the
 //     "fell off the cap" direction. The two-sided halo guards live on the
@@ -110,18 +110,22 @@
 //   * `out` is capped at MAX_QUADS = 16_384 the same way, and exactly one
 //     workload (`water_wake_saturated`) is deliberately pinned there — see its
 //     note. Every other workload's `out` is inside its budget.
+//   * the default 2× tall ribbon spends its dedicated half-budget and emits
+//     exactly 8_191 under-quads. Its exact-edge guard detects a lost emitter but
+//     cannot observe growth past the ribbon's deliberate core-first shedding.
 //
 // WHAT EACH WORKLOAD WAS CONFIRMED TO REACH. The guards below prove the STATE
 // from outside; the function names were confirmed once, out of band, by
 // sampling the bench binary built with `--profile profiling` (release codegen,
-// symbols kept) and mapping the inline call-site lines back to source. Share of
-// samples inside the timed loop, per workload:
+// symbols kept) and mapping the inline call-site lines back to source. These
+// HISTORICAL shares come from `d620df692`, before the current rainbow-ledger and
+// memoization rewrite; they establish reach, not present-day cost attribution:
 //
-//   rainbow_typing_retina   emit_rainbow 36 %, emit_particles 18 %,
+//   rainbow_typing_default_retina
+//                           emit_rainbow 36 %, emit_particles 18 %,
 //                           emit_rainbow_wake 3 %, rainbow_momentum_bands 2.6 %
-//                           (the six-HSV-round-trip site itself — DELETED at
-//                           migration step 1, so that share is now zero and the
-//                           profile below is a pre-step-1 reading), emit_rainbow_jumps
+//                           (the six-HSV-round-trip site, since deleted),
+//                           emit_rainbow_jumps
 //   rainbow_typing_light    emit_particles 33 %, push_rainbow_streak_over 14 %,
 //                           emit_rainbow 13 %, push_halo_over 8 %,
 //                           emit_fresh_ink 2 %, light_ink_bold 1.8 %
@@ -142,7 +146,7 @@
 // keyed on the inlined call-site line, which is why they name the emitter
 // rather than `tick`. `push_twinkle_over` and `stacked_ink_alpha` are inlined
 // further, inside the light rails / glitter frames above. `rainbow_typing_1x`
-// runs `rainbow_typing_retina`'s code at 1x and was not sampled separately;
+// runs `rainbow_typing_default_retina`'s code at 1x and was not sampled separately;
 // `water_wake_glide` POST-DATES that sampling run and carries no share of it —
 // its reach rests on its own bounds, see its note.)
 //
@@ -152,11 +156,9 @@
 // hint is the only thing that advances the canonical typing-momentum metric, so
 // without it the eased `rainbow.disp` spine never leaves 0, every momentum
 // channel (thickness, wave, glint, bloom) sits at its resting value, and the
-// ribbon renders COLD. Measured on the
-// identical script: momentum 1.00 vs 0.00, and 16_477 vs 4_156 emitted items per
-// frame — a 4x difference in emitted volume alone. The shipped
-// `bench_cursor_rainbow_hot_ribbon_worstcase` arms no typed hint, so despite its
-// name it does not measure the hot ribbon either.
+// ribbon renders COLD. The Criterion workload and the release integration gate
+// now both arm that hint; each retains an otherwise-identical unhinted control,
+// so a future benchmark cannot silently time the cheaper cold path.
 //
 // DETERMINISM IS FREE, AND THE BOUNDS SPEND IT. `frand` is a xorshift over
 // `self.rng`, which `tick` seeds to 0x9E37_79B9 on the first live tick; the
@@ -187,10 +189,9 @@ use criterion::{
 
 // ---------------------------------------------------------------- geometry --
 
-/// 2x retina metrics on a maximized window — the shape the hot ribbon costs
-/// most in: its per-cell work is DPI-dependent (`strips = cw.div_ceil(4)
-/// .clamp(1, 3)`, `row_px = 2`), so a 1x-only measurement understates the
-/// per-cell strip walk by ~3x.
+/// 2x retina metrics on a maximized window — the shape the tall ribbon costs
+/// most in. Its beam is resolved into device-row slabs across each full-height
+/// cell, so a 1x-only measurement understates both raster volume and ledger work.
 const RETINA: Geom = Geom {
     cw: 18,
     ch: 40,
@@ -203,8 +204,8 @@ const RETINA: Geom = Geom {
     head: 0,
 };
 
-/// The same window at 1x. Paired with `RETINA` so a change to the per-strip
-/// walk shows up as a CHANGED RATIO between the two, not just a slower number.
+/// The same window at 1x. Paired with `RETINA` so a DPI-dependent regression
+/// shows up as a CHANGED RATIO between the two, not just a slower number.
 const LODPI: Geom = Geom {
     cw: 9,
     ch: 20,
@@ -219,10 +220,9 @@ const LODPI: Geom = Geom {
 
 // ------------------------------------------------------------------ clocks --
 
-/// 8 ms per keystroke — the injected dt of the typing workloads. Fast human /
-/// key-repeat cadence: it keeps the ribbon's momentum spine pinned hot and the
-/// resident spark population at its steady-state worst case, which is the
-/// frame a user actually watches while typing.
+/// 8 ms per keystroke — a synthetic 125-key/s saturation cadence. It keeps the
+/// ribbon's momentum spine pinned hot and the resident spark population at its
+/// steady-state worst case; it is deliberately harsher than human typing.
 const TYPE_DT: Duration = Duration::from_millis(8);
 
 /// 60 fps — the dt of workloads whose script is paced in FRAMES rather than in
@@ -327,7 +327,9 @@ fn beam_for(style: GlowStyle) -> bool {
 /// A shipped-shaped config at full intensity.
 fn cfg_for(style: GlowStyle) -> GlowConfig {
     GlowConfig {
-        ribbon_tall: false,
+        // Mirrors the shipping resolver: tall is the default; only an explicit
+        // underline style opts into the quieter shoulder.
+        ribbon_tall: true,
         enabled: true,
         style,
         color: 0x00d0_d0d0,
@@ -359,7 +361,6 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
 /// per-run `layered_beam_quads` walk inside the budget.
 fn beam_family_cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
-        ribbon_tall: false,
         duration: Duration::from_millis(320),
         ..cfg_for(style)
     }
@@ -743,29 +744,32 @@ impl Volume {
 /// output, which is what a volume number cannot do:
 ///
 ///   * `typing_momentum` IS the value the eased `rainbow.disp` spine chases,
-///     and the ribbon's whole hot path — the 3-strip subdivision, the bloom,
-///     the wave and the glint — is gated on that spine leaving 0.005. A cold
-///     spine means the ribbon is the COLD 1-strip path no matter how many
-///     quads came out. Only a `note_typed`-paired forward move advances it.
+///     and the ribbon's bloom, wave and glint are gated on that spine leaving
+///     0.005. A cold spine means the cheaper resting path no matter how many
+///     quads came out. Only a `note_typed`-paired move advances it.
 ///   * `blaze` is the raw fire heat the flame field's height and the FirePatch
 ///     band walk ride.
 ///   * `erase_momentum` is advanced by exactly `note_backspace`/`note_kill`, so
 ///     it is the licence the erase poof needs, observed from outside.
+///   * `ribbon_tall` binds a workload to the presentation it claims; tall and
+///     underline intentionally share a quad budget, so counts alone cannot
+///     distinguish them.
 #[derive(Clone, Copy)]
-struct State([(f32, f32); 3]);
+struct State([(f32, f32); 4]);
 
-const SCALARS: [&str; 3] = ["momentum", "blaze", "erase_mom"];
+const SCALARS: [&str; 4] = ["momentum", "blaze", "erase_mom", "ribbon_tall"];
 
 impl State {
-    fn of(f: &Fixture) -> [f32; 3] {
+    fn of(f: &Fixture) -> [f32; 4] {
         [
             f.glow.typing_momentum(f.now),
             f.glow.blaze(),
             f.glow.erase_momentum(f.now),
+            if f.cfg.ribbon_tall { 1.0 } else { 0.0 },
         ]
     }
 
-    fn fold(&mut self, v: [f32; 3]) {
+    fn fold(&mut self, v: [f32; 4]) {
         for (a, b) in self.0.iter_mut().zip(v) {
             a.0 = a.0.min(b);
             a.1 = a.1.max(b);
@@ -775,7 +779,7 @@ impl State {
 
 impl Default for State {
     fn default() -> Self {
-        State([(f32::MAX, f32::MIN); 3])
+        State([(f32::MAX, f32::MIN); 4])
     }
 }
 
@@ -861,6 +865,10 @@ const QUAD_CAP: usize = 16_384;
 /// "This workload SATURATES the quad budget." Exactly one workload declares it.
 const AT_QUAD_CAP: Range = (QUAD_CAP, QUAD_CAP);
 
+/// The hot 2× tall body's exact half-budget edge. The emitter reserves
+/// `MAX_QUADS / 2`, then its half-open append limit yields 8_191 quads.
+const AT_RIBBON_BUDGET_EDGE: Range = (8_191, 8_191);
+
 /// The extra, decisive proof a workload carries beyond its volume bounds.
 enum Witness {
     /// Nothing beyond the bounds — the bounds themselves are decisive.
@@ -898,7 +906,7 @@ struct Workload {
     bounds: [Range; 6],
     /// `(min-over-window >= .0, max-over-window <= .1)` for each engine state
     /// scalar. `(0.0, 1.0)` makes no claim (every scalar is clamped to 0..=1).
-    state: [(f32, f32); 3],
+    state: [(f32, f32); 4],
     /// Bounds on the fraction of sampled frames that emitted anything, in
     /// percent. `(0, 0)` for the dark workloads; a positive lower bound for
     /// every workload that claims to draw.
@@ -1024,7 +1032,7 @@ fn report(name: &str, note: &str, s: &Sampled) {
     println!(
         "VOLUME {name:<22} | peak out/under/halos/patches/charred/halo_cells \
          {}/{}/{}/{}/{}/{} | per-frame avg {}/{}/{}/{}/{}/{} | momentum {:.2}-{:.2} \
-         blaze {:.2}-{:.2} erase {:.2}-{:.2} | lit {}/{} | {note}",
+         blaze {:.2}-{:.2} erase {:.2}-{:.2} ribbon_tall {:.0}-{:.0} | lit {}/{} | {note}",
         s.peak.0[0],
         s.peak.0[1],
         s.peak.0[2],
@@ -1043,6 +1051,8 @@ fn report(name: &str, note: &str, s: &Sampled) {
         s.state.0[1].1,
         s.state.0[2].0,
         s.state.0[2].1,
+        s.state.0[3].0,
+        s.state.0[3].1,
         s.lit,
         s.frames
     );
@@ -1054,20 +1064,16 @@ fn f_rainbow_retina() -> Fixture {
     Fixture::new(cfg_for(GlowStyle::RainbowKitty), RETINA, TYPE_DT)
 }
 
-/// The explicitly selected TALL presentation: the animated multi-strip body
-/// whose 2x/1x cost and emitted-volume ratio the hot-ribbon workloads guard.
-/// The shipping-default fixtures above stay on the restored underline so the
-/// off-path controls and host-seam measurements keep their default shape.
-fn f_rainbow_tall_retina() -> Fixture {
+/// The explicit UNDERLINE alternate retained alongside the shipping-default
+/// tall fixture above.
+fn f_rainbow_underline_retina() -> Fixture {
     let mut cfg = cfg_for(GlowStyle::RainbowKitty);
-    cfg.ribbon_tall = true;
+    cfg.ribbon_tall = false;
     Fixture::new(cfg, RETINA, TYPE_DT)
 }
 
-fn f_rainbow_tall_lodpi() -> Fixture {
-    let mut cfg = cfg_for(GlowStyle::RainbowKitty);
-    cfg.ribbon_tall = true;
-    Fixture::new(cfg, LODPI, TYPE_DT)
+fn f_rainbow_lodpi() -> Fixture {
+    Fixture::new(cfg_for(GlowStyle::RainbowKitty), LODPI, TYPE_DT)
 }
 
 /// The light-theme arm — a genuinely light palette, not the dark pair with the
@@ -1177,7 +1183,7 @@ fn workloads() -> Vec<Workload> {
             build: f_disabled,
             arm: arm_typing,
             bounds: DARK,
-            state: [ANY; 3],
+            state: [ANY; 4],
             lit_pct: (0, 0),
             witness: Witness::DarkUnless {
                 what: "the same typing script with enabled = true",
@@ -1191,7 +1197,7 @@ fn workloads() -> Vec<Workload> {
             build: f_unfocused,
             arm: arm_typing,
             bounds: DARK,
-            state: [ANY; 3],
+            state: [ANY; 4],
             lit_pct: (0, 0),
             witness: Witness::DarkUnless {
                 what: "the same typing script at intensity 1",
@@ -1207,7 +1213,7 @@ fn workloads() -> Vec<Workload> {
             bounds: DARK,
             // The spine must be stone cold: an idle engine that still carried
             // momentum would be running the warm integrators, not the idle path.
-            state: [(0.0, 0.0), (0.0, 0.0), ANY],
+            state: [(0.0, 0.0), (0.0, 0.0), ANY, (1.0, 1.0)],
             lit_pct: (0, 0),
             witness: Witness::DarkUnless {
                 what: "the same engine with the cursor moving",
@@ -1221,7 +1227,7 @@ fn workloads() -> Vec<Workload> {
             build: f_custom,
             arm: arm_idle,
             bounds: DARK,
-            state: [(0.0, 0.0), (0.0, 0.0), ANY],
+            state: [(0.0, 0.0), (0.0, 0.0), ANY, ANY],
             lit_pct: (0, 0),
             witness: Witness::DarkUnless {
                 what: "the same pack with the cursor moving",
@@ -1232,71 +1238,71 @@ fn workloads() -> Vec<Workload> {
         // ---- the ON costs --------------------------------------------------
         Workload {
             name: "rainbow_typing_default_retina",
-            note: "2x hot shipping-default underline + ink pops + wake, dark",
+            note: "2x hot shipping-default TALL ribbon + ink pops + wake, dark",
             build: f_rainbow_retina,
             arm: arm_typing,
             bounds: [
-                (5_350, 6_500),
-                // The actual user-path geometry witness: the full-width flat
-                // strip emits a deterministic 960 under-quads here. Its tight
-                // ceiling also proves this workload did NOT silently fall onto
-                // the tall row-by-row body guarded immediately below (10_764
-                // under-quads on the identical Retina typing script).
-                (850, 1_080),
+                // Measured after the 2026-08-29 sparkle/tall restoration; a
+                // modest two-sided envelope around the deterministic 2_085 peak.
+                (1_850, 2_350),
+                AT_RIBBON_BUDGET_EDGE,
                 AT_HALO_CAP,
                 (0, 0),
                 (0, 0),
                 (0, 0),
             ],
-            state: [(0.90, 1.0), ANY, (0.0, 0.0)],
+            state: [(0.90, 1.0), ANY, (0.0, 0.0), (1.0, 1.0)],
             lit_pct: (100, 100),
             witness: Witness::Dimmer {
-                what: "the same default-underline script without its typed license",
+                what: "the same default-tall script without its typed license",
                 control: f_rainbow_retina,
                 arm: arm_typing_unhinted,
                 ratio: 3,
             },
         },
         Workload {
-            name: "rainbow_typing_retina",
-            note: "2x hot TALL ribbon + ink pops + wake, dark",
-            build: f_rainbow_tall_retina,
+            name: "rainbow_typing_underline_retina",
+            note: "2x explicit underline + ink pops + wake, dark",
+            build: f_rainbow_underline_retina,
             arm: arm_typing,
             bounds: [
-                (5_350, 6_500),
-                (9_900, 12_000),
+                // Both presentations saturate the same dedicated budget, so
+                // count cannot distinguish them; `ribbon_tall=0` below is the
+                // non-vacuity guard for the explicit underline alternate.
+                (1_850, 2_350),
+                AT_RIBBON_BUDGET_EDGE,
                 AT_HALO_CAP,
                 (0, 0),
                 (0, 0),
                 (0, 0),
             ],
             // THE GATE, not the output: a spine this warm is what takes the
-            // ribbon past its `disp < 0.005` resting check and onto the 3-strip
+            // ribbon past its `disp < 0.005` resting check and onto the animated
             // hot path.
-            state: [(0.90, 1.0), ANY, (0.0, 0.0)],
+            state: [(0.90, 1.0), ANY, (0.0, 0.0), (0.0, 0.0)],
             lit_pct: (100, 100),
             witness: Witness::Dimmer {
-                what: "the same script with no note_typed: no ink pops, and a spine \
-                       that never leaves zero",
-                control: f_rainbow_tall_retina,
+                what: "the same underline script without its typed license",
+                control: f_rainbow_underline_retina,
                 arm: arm_typing_unhinted,
                 ratio: 3,
             },
         },
         Workload {
             name: "rainbow_typing_1x",
-            note: "1x hot TALL ribbon + ink pops + wake, dark",
-            build: f_rainbow_tall_lodpi,
+            note: "1x hot shipping-default TALL ribbon + ink pops + wake, dark",
+            build: f_rainbow_lodpi,
             arm: arm_typing,
             bounds: [
-                (3_280, 4_000),
-                (5_200, 6_350),
+                // Deterministic post-restoration peak: 1_199 over-ink quads.
+                (1_050, 1_350),
+                AT_RIBBON_BUDGET_EDGE,
                 AT_HALO_CAP,
                 (0, 0),
                 (0, 0),
                 (0, 0),
             ],
-            state: [(0.90, 1.0), ANY, (0.0, 0.0)],
+            state: [(0.90, 1.0), ANY, (0.0, 0.0), (1.0, 1.0)],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },
@@ -1326,11 +1332,11 @@ fn workloads() -> Vec<Workload> {
                 // gated — so a non-empty glyph-tint stream is a two-in-one
                 // witness: the light arm ran, and `note_typed` really did birth
                 // ink pops. Its ceiling is FRESH_INK_CAP = 32 (the pop ring),
-                // and the measured peak is 28: the bound is the structural cap.
-                (25, 32),
+                // and the post-restoration measured peak is 24.
+                (21, 32),
                 (0, 0),
             ],
-            state: [(0.90, 1.0), ANY, (0.0, 0.0)],
+            state: [(0.90, 1.0), ANY, (0.0, 0.0), (1.0, 1.0)],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },
@@ -1340,20 +1346,18 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_jumps,
             arm: arm_jump,
             bounds: [
-                (6_400, 7_800),
-                // The jump ZOOM owns this stream, with the ordinary ribbon
-                // body behind it. Since the shipping presentation returned to
-                // the flat underline, that background body no longer pays the
-                // tall path's row-by-row quad count; the ZOOM remains live at
-                // the deterministic 7_469 peak. Keep the default-path guard
-                // tight instead of opting this transient workload into tall.
-                (6_570, 8_370),
+                // Restored cold-jump bursts and spark density: deterministic
+                // post-restoration peak 5_902.
+                (5_200, 6_650),
+                // The jump ZOOM and restored tall body share this stream; their
+                // deterministic combined peak is 8_029.
+                (7_100, 8_300),
                 AT_HALO_CAP,
                 (0, 0),
                 (0, 0),
                 (0, 0),
             ],
-            state: [ANY, ANY, (0.0, 0.0)],
+            state: [ANY, ANY, (0.0, 0.0), (1.0, 1.0)],
             lit_pct: (98, 100),
             witness: Witness::Bounds,
         },
@@ -1372,7 +1376,7 @@ fn workloads() -> Vec<Workload> {
             // the truncate); `water_wake_glide` is the one that prices
             // `emit_water`'s per-segment walk to completion.
             bounds: [AT_QUAD_CAP, (0, 0), (3, 8), (0, 0), (0, 0), (0, 0)],
-            state: [(0.0, 0.0), ANY, (0.0, 0.0)],
+            state: [(0.0, 0.0), ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },
@@ -1385,7 +1389,7 @@ fn workloads() -> Vec<Workload> {
             // bound is a real two-sided count guard on the wake — the one thing
             // the saturated workload above structurally cannot give.
             bounds: [(8_580, 10_440), (0, 0), (3, 8), (0, 0), (0, 0), (0, 0)],
-            state: [(0.0, 0.0), ANY, (0.0, 0.0)],
+            state: [(0.0, 0.0), ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },
@@ -1408,7 +1412,7 @@ fn workloads() -> Vec<Workload> {
             ],
             // A blaze this hot is what the flame field's height, its coverage
             // ceiling and the FirePatch band walk all ride.
-            state: [ANY, (0.55, 1.0), (0.0, 0.0)],
+            state: [ANY, (0.55, 1.0), (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },
@@ -1425,7 +1429,7 @@ fn workloads() -> Vec<Workload> {
                 (0, 0),
                 (0, 0),
             ],
-            state: [ANY, ANY, (0.0, 0.0)],
+            state: [ANY, ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Dimmer {
                 what: "the same jumps with beam = false — what tests/cursor_bench.rs \
@@ -1445,7 +1449,7 @@ fn workloads() -> Vec<Workload> {
             build: f_laser,
             arm: arm_jump,
             bounds: [(9_230, 11_240), (0, 0), (132, 162), (0, 0), (0, 0), (0, 0)],
-            state: [ANY, ANY, (0.0, 0.0)],
+            state: [ANY, ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },
@@ -1457,12 +1461,12 @@ fn workloads() -> Vec<Workload> {
             // `under` is the rainbow ribbon's stream, and a caret that never
             // moves lays no ribbon — so an EMPTY under-stream is the proof that
             // what is being timed is the poof and only the poof.
-            bounds: [(44, 54), (0, 0), (92, 112), (0, 0), (0, 0), (0, 0)],
+            bounds: [(44, 54), (0, 0), (100, 130), (0, 0), (0, 0), (0, 0)],
             // The erase metric is advanced by exactly `note_backspace` and
             // `note_kill`, so a run this hard IS the poof's licence, observed
             // from outside; and a typing spine at zero proves the light being
             // measured is the erase path's, not a typing ribbon's.
-            state: [(0.0, 0.0), ANY, (0.60, 1.0)],
+            state: [(0.0, 0.0), ANY, (0.60, 1.0), ANY],
             lit_pct: (95, 100),
             witness: Witness::Bounds,
         },
@@ -1472,20 +1476,19 @@ fn workloads() -> Vec<Workload> {
             build: f_crossfade,
             arm: arm_crossfade,
             bounds: [
-                (1_890, 2_300),
-                // The rainbow half intentionally uses the shipping underline,
-                // so its under stream is one compact flat strip rather than a
-                // tall row-by-row body. A measured peak of 64 remains a strict
-                // positive witness that the rainbow ghost contributes while
-                // Fire is live; `Witness::Ghost` below independently proves the
-                // reverse (Fire's patch stream while rainbow is live).
-                (56, 72),
+                (2_100, 2_650),
+                // The rainbow half now follows the shipping tall default. Its
+                // measured 4_045-quad peak is a strict positive witness that
+                // the rainbow ghost contributes while Fire is live;
+                // `Witness::Ghost` below independently proves the reverse
+                // (Fire's patch stream while rainbow is live).
+                (3_550, 4_550),
                 AT_HALO_CAP,
                 (89, 109),
                 (0, 0),
                 (76, 93),
             ],
-            state: [ANY, ANY, (0.0, 0.0)],
+            state: [ANY, ANY, (0.0, 0.0), (1.0, 1.0)],
             lit_pct: (100, 100),
             witness: Witness::Ghost((272, 310)),
         },
@@ -1495,7 +1498,7 @@ fn workloads() -> Vec<Workload> {
             build: f_custom,
             arm: arm_jump,
             bounds: [(11_320, 13_790), (0, 0), (3, 8), (0, 0), (0, 0), (0, 0)],
-            state: [ANY, ANY, (0.0, 0.0)],
+            state: [ANY, ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
         },

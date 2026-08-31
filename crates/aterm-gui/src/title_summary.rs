@@ -2757,6 +2757,156 @@ mod tests {
         assert_eq!(error, "could not open the configured CA bundle");
     }
 
+    fn test_request_write_authority() -> RequestWriteAuthority {
+        RequestWriteAuthority {
+            global: Arc::new(AtomicU64::new(1)),
+            expected_global: 1,
+            session: Arc::new(AtomicU64::new(1)),
+            expected_session: 1,
+        }
+    }
+
+    fn certificate_pem(der: &[u8]) -> String {
+        let encoded = aterm_codec::base64::encode(der).unwrap();
+        format!("-----BEGIN CERTIFICATE-----\n{encoded}\n-----END CERTIFICATE-----\n")
+    }
+
+    #[test]
+    fn worker_client_cache_tracks_ca_bytes_proxy_and_timeout() {
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let ca_file = directory.path().join("provider-ca.pem");
+        std::fs::write(
+            &ca_file,
+            certificate_pem(include_bytes!("../../aterm-http/src/testdata/tls/root.der")),
+        )
+        .unwrap();
+        let endpoint = "https://models.example.test/v1/chat/completions";
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::OpenAiCompatible),
+            title_summary_endpoint: Some(endpoint.to_string()),
+            title_summary_allow_remote: Some(true),
+            title_summary_ca_file: Some(ca_file.to_string_lossy().into_owned()),
+            title_summary_proxy_mode: Some(TitleSummaryProxyMode::Direct),
+            title_summary_timeout_seconds: Some(20),
+            ..Config::default()
+        };
+        let mut settings = provider_settings(&config).unwrap();
+        let mut clients = WorkerClientCache::default();
+        let started = Instant::now();
+        let later = started + PLATFORM_TRUST_REFRESH_INTERVAL + Duration::from_secs(1);
+        let acquire =
+            |clients: &mut WorkerClientCache, settings: &ProviderSettings, now: Instant| {
+                let client = clients
+                    .for_request_at(
+                        settings,
+                        endpoint,
+                        None,
+                        test_request_write_authority(),
+                        now,
+                    )
+                    .unwrap();
+                assert!(matches!(client, WorkerClient::Shared(_)));
+            };
+
+        acquire(&mut clients, &settings, started);
+        acquire(&mut clients, &settings, later);
+        assert_eq!(clients.build_counts(), (1, 0));
+
+        // Replacing the SAME configured path with different certificate bytes
+        // must invalidate the client and its lazily snapshotted TLS config.
+        std::fs::write(
+            &ca_file,
+            certificate_pem(include_bytes!(
+                "../../aterm-http/src/testdata/tls/inter.der"
+            )),
+        )
+        .unwrap();
+        acquire(&mut clients, &settings, later);
+        acquire(&mut clients, &settings, later);
+        assert_eq!(clients.build_counts(), (2, 0));
+
+        settings.proxy_mode = TitleSummaryProxyMode::Environment;
+        acquire(&mut clients, &settings, later);
+        assert_eq!(clients.build_counts(), (3, 0));
+        settings.timeout += Duration::from_secs(1);
+        acquire(&mut clients, &settings, later);
+        assert_eq!(clients.build_counts(), (4, 0));
+        assert!(clients.has_unmanaged());
+    }
+
+    #[test]
+    fn worker_client_cache_refreshes_platform_trust_on_its_monotonic_deadline() {
+        let endpoint = "https://models.example.test/v1/chat/completions";
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::OpenAiCompatible),
+            title_summary_endpoint: Some(endpoint.to_string()),
+            title_summary_allow_remote: Some(true),
+            ..Config::default()
+        };
+        let settings = provider_settings(&config).unwrap();
+        let mut clients = WorkerClientCache::default();
+        let started = Instant::now();
+        let acquire = |clients: &mut WorkerClientCache, now| {
+            drop(
+                clients
+                    .for_request_at(
+                        &settings,
+                        endpoint,
+                        None,
+                        test_request_write_authority(),
+                        now,
+                    )
+                    .unwrap(),
+            );
+        };
+
+        acquire(&mut clients, started);
+        acquire(
+            &mut clients,
+            started + PLATFORM_TRUST_REFRESH_INTERVAL - Duration::from_nanos(1),
+        );
+        assert_eq!(clients.build_counts(), (1, 0));
+
+        acquire(&mut clients, started + PLATFORM_TRUST_REFRESH_INTERVAL);
+        acquire(&mut clients, started + PLATFORM_TRUST_REFRESH_INTERVAL);
+        assert_eq!(clients.build_counts(), (2, 0));
+    }
+
+    #[test]
+    fn managed_connectors_are_one_shot_and_clear_the_unmanaged_cache() {
+        let endpoint = "http://127.0.0.1:11434/api/chat";
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::Ollama),
+            title_summary_endpoint: Some(endpoint.to_string()),
+            title_summary_allow_remote: Some(true),
+            ..Config::default()
+        };
+        let settings = provider_settings(&config).unwrap();
+        let mut clients = WorkerClientCache::default();
+        let unmanaged = clients
+            .for_request(&settings, endpoint, None, test_request_write_authority())
+            .unwrap();
+        assert!(matches!(unmanaged, WorkerClient::Shared(_)));
+        drop(unmanaged);
+        assert!(clients.has_unmanaged());
+
+        let process = managed_process_identity(std::process::id()).unwrap();
+        for _ in 0..2 {
+            let client = clients.for_request(
+                &settings,
+                endpoint,
+                Some(process),
+                test_request_write_authority(),
+            );
+            #[cfg(target_os = "macos")]
+            assert!(matches!(client.unwrap(), WorkerClient::OneShot(_)));
+            #[cfg(not(target_os = "macos"))]
+            assert!(client.is_err());
+        }
+        assert_eq!(clients.build_counts(), (1, 2));
+        assert!(!clients.has_unmanaged());
+    }
+
     #[test]
     fn automatic_and_explicit_default_endpoints_are_distinct_authorities() {
         let automatic = Config {
@@ -4652,7 +4802,8 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             settings: provider_settings(&config).unwrap(),
             snapshot: snap("cargo test -p aterm-gui", ActivityState::Executing, None),
         };
-        let outcome = request_summary(&job, &authority, &mut ollama).unwrap();
+        let mut clients = WorkerClientCache::default();
+        let outcome = request_summary(&job, &authority, &mut ollama, &mut clients).unwrap();
         ollama.stop();
         assert_eq!(outcome.locality, TitleSummaryLocality::ManagedLocal);
         assert!(outcome.effective_endpoint.starts_with("http://127.0.0.1:"));
@@ -4697,7 +4848,8 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
                     snapshot: snap("cargo test", ActivityState::Executing, None),
                 };
                 let mut ollama = ManagedOllama::new(controller);
-                request_summary(&job, &authority, &mut ollama)
+                let mut clients = WorkerClientCache::default();
+                request_summary(&job, &authority, &mut ollama, &mut clients)
                     .unwrap()
                     .effective_endpoint
             })

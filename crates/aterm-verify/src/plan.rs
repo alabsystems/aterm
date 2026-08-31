@@ -26,6 +26,10 @@ pub enum Lane {
     TippyTarget,
     /// `tools/freeze-safety-gate/` is its own workspace with its own target dir.
     FreezeGateTarget,
+    /// `libc-oracle/{target,target-symgate}/` — the nested reference workspace
+    /// and its emitted-symbol gate. The oracle owns both directories and may
+    /// run beside the main workspace without contending for Cargo's lock.
+    LibcOracleTarget,
 }
 
 /// Every stage of the gate.
@@ -43,6 +47,7 @@ pub enum StageId {
     StartCompare,
     LicenseHeaders,
     FeatureGates,
+    LibcOracle,
     FreezeGate,
     ProofInventory,
     ControlSocketSmoke,
@@ -127,8 +132,13 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         Lane::MainTarget,
     ));
     v.push(spec(
+        StageId::LibcOracle,
+        "libc ABI oracle (4 ABI cells + 2 zero-surface targets; native runtime)",
+        Lane::LibcOracleTarget,
+    ));
+    v.push(spec(
         StageId::FreezeGate,
-        "L0 temporal-safety gate (freeze/data-loss/deadlock — 5 obligations)",
+        "L0 temporal-safety gate (freeze/data-loss/deadlock — 6 obligations)",
         Lane::FreezeGateTarget,
     ));
     v.push(spec(
@@ -228,6 +238,7 @@ mod tests {
                 StageId::StartCompare,
                 StageId::LicenseHeaders,
                 StageId::FeatureGates,
+                StageId::LibcOracle,
                 StageId::FreezeGate,
                 StageId::ProofInventory,
                 StageId::ControlSocketSmoke,
@@ -253,6 +264,27 @@ mod tests {
                 assert!(
                     ids(&ctx(mode, scope.clone())).contains(&StageId::RedrawConformance),
                     "{mode:?} / {} lost the redraw gate",
+                    scope.label()
+                );
+            }
+        }
+    }
+
+    /// This is the only route that resolves the pinned registry libc beside the
+    /// first-party replacement and executes the non-const checks. In
+    /// particular, a Linux gate host's native cell is what executes the Linux
+    /// pointer-constant and C-macro runtime oracle; cross `cargo check` cannot.
+    #[test]
+    fn the_libc_oracle_runs_in_every_tier_and_every_scope() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-grid"),
+                Scope::changed("main", vec![], true),
+            ] {
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::LibcOracle),
+                    "{mode:?} / {} lost the libc oracle",
                     scope.label()
                 );
             }
@@ -313,6 +345,7 @@ mod tests {
             let want = match s.id {
                 StageId::Tippy => Lane::TippyTarget,
                 StageId::FreezeGate => Lane::FreezeGateTarget,
+                StageId::LibcOracle => Lane::LibcOracleTarget,
                 StageId::GrepGuards
                 | StageId::InstallChannel
                 | StageId::TrustGateVerdict
@@ -332,6 +365,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 19);
+        assert_eq!(plan(&nothing_installed).len(), 20);
     }
 }

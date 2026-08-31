@@ -89,6 +89,33 @@ pub fn package_dir_hinted(root: &Path, id: &PkgId, printed: Option<&Path>) -> Op
     {
         return Some(member.clone());
     }
+    // OPEN FINDING (2026-08-30): THIS BRANCH MAKES A RATCHETED NUMBER DEPEND ON
+    // AN UNVERSIONED LOCAL CACHE, and it is why `loc`, `dominator`, `resolve`
+    // and `survey` are red on some machines and green on others with the same
+    // commit.
+    //
+    // A `[patch.crates-io]` FORK resolves here to a PRISTINE registry checkout
+    // of the same version whenever one happens to be unpacked in this machine's
+    // CARGO_HOME, and silently falls through to `vendor/<name>` when none is.
+    // The two measure different code. Proved by construction: a scratch
+    // CARGO_HOME mirroring the real one plus only the pristine `winit 0.30.13`
+    // and `smol_str 0.2.2` trees unpacked from their published `.crate`s puts
+    // all four survey cells EXACTLY on their recorded ceilings and turns `check`
+    // green; without them each cell reads +713 lines (winit +685, smol_str +28,
+    // and smol_str is in every cell via winit — hence the identical delta).
+    //
+    // Every ratchet commit in this ledger's history is authored on m21, so the
+    // committed ceilings are calibrated to m21's cache. Re-measuring them on a
+    // machine without those checkouts does not fix the skew, it moves it.
+    //
+    // The repair is a DECISION, not a patch, which is why this is a comment and
+    // not a change: either always measure the fork (drop this branch, so the
+    // number is what the repo carries), or always measure pristine (fail closed
+    // when the checkout is absent, so the number is the delta the fork adds) —
+    // but not "whichever this laptop happens to have". Note the separate, real
+    // movement underneath it: the graph itself has grown since the ceilings were
+    // set (third-party packages 91 -> 101 on mac-arm, +3 duplicate names), so a
+    // re-ratchet is owed too — and cannot be trusted until this is settled.
     for src in registry_srcs() {
         let candidate = src.join(format!("{}-{}", id.name, id.version));
         if candidate.is_dir() {
@@ -491,13 +518,31 @@ mod tests {
     #[test]
     fn package_dir_prefers_the_member_then_the_registry_then_vendor() {
         let root = repo_root();
-        let registry = package_dir(&root, &PkgId::new("libc", "0.2.186"))
-            .expect("libc 0.2.186 is unpacked in this checkout's registry");
-        assert!(registry.ends_with("libc-0.2.186"), "{}", registry.display());
+
+        // THE REGISTRY ARM. `syn` is the deliberate choice and the reason is a
+        // scar: this assertion used to name `libc 0.2.186`, and it went RED the
+        // day libc was retired to the first-party `crates/aterm-libc` — because
+        // the member then correctly won, which is the very precedence this test
+        // exists to prove. The example must therefore be a package the campaign
+        // has DOCUMENTED it cannot retire. `syn` is proc-macro-only: it is
+        // compiler-resident with zero machine code in the binary, and
+        // `docs/THIRD_PARTY_ROAD_TO_ZERO.md` records that neither lane —
+        // mirroring nor extraction — retires that class at all.
+        let registry = package_dir(&root, &PkgId::new("syn", "2.0.117"))
+            .expect("syn 2.0.117 is unpacked in this checkout's registry");
+        assert!(registry.ends_with("syn-2.0.117"), "{}", registry.display());
         assert!(
             !registry.starts_with(&root),
             "registry sources live outside the repo"
         );
+
+        // THE MEMBER ARM, asserted on the package that broke the registry arm,
+        // so the move is recorded rather than merely worked around: `libc` is
+        // patched to a workspace member and must resolve there, NOT to the
+        // registry copy of upstream libc that also exists on this box.
+        let retired = package_dir(&root, &PkgId::new("libc", "0.2.186"))
+            .expect("the patched `libc` resolves");
+        assert_eq!(retired, root.join("crates").join("aterm-libc"));
 
         // No registry copy of this version exists, so the fork answers.
         let vendored = package_dir(&root, &PkgId::new("winit", "0.0.0-not-published"))

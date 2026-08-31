@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — silent, signature-pinned in-app updater that pulls notarized releases from GitHub and swaps the .app on next launch."
+description = "aterm — silent, signature-pinned in-app updater that pulls notarized releases from GitHub, verifies and stages them, and hands the live session to the new build in place (the next-launch swap is only the fallback)."
 
 [features]
 default = []

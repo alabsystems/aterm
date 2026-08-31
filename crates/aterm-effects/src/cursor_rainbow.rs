@@ -11,8 +11,8 @@
 //!   [`crate::cursor_glow::CursorGlow::rainbow_phase`] so both marks stream on
 //!   one clock. Standalone, a slow baseline spin accelerates under sustained
 //!   typing and freezes at the final ember. Either path resolves through the
-//!   rainbow family's one reflected sweep and continuously interpolated six
-//!   anchors at the caret's own column, so the block and the ribbon leaving it
+//!   rainbow family's one reflected sweep and continuously interpolated seven
+//!   anchors at the caret's laid field position, so the block and the ribbon leaving it
 //!   are the same rainbow without hue steps;
 //! * **saturation + brightness** — the block starts from WHITE (dark theme) or
 //!   near-BLACK (light theme) and blooms toward a vivid rainbow as energy climbs;
@@ -56,8 +56,8 @@ use crate::cursor_glow::OVER_INK_COV_CAP;
 
 use crate::cursor_glow::Geom;
 use crate::cursor_glow::{
-    RAINBOW_CARET_LIGHT_FLOOR, rainbow_phase_from_unit_turn, rainbow_sweep_at,
-    rainbow_sweep_reflect, rainbow_thing_of,
+    RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_FIELD_LEVEL, RAINBOW_SPARKLE_LIGHT_SHARE,
+    rainbow_phase_from_unit_turn, rainbow_sweep_at, rainbow_sweep_reflect, rainbow_thing_of,
 };
 use crate::spectrum::{clear_light_of_cyan, clear_thing_of_cyan};
 
@@ -492,9 +492,9 @@ impl CursorRainbow {
         // it as a floor preserves the ATTACK that already worked while the
         // ribbon owns the RELEASE. With no host spine the two are one value and
         // the whole tick is byte-identical to the pre-`paint` engine.
-        let paint = cfg
-            .paint
-            .map_or(e, |p| (p.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).max(e));
+        let paint = cfg.paint.map_or(e, |p| {
+            (p.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).max(e)
+        });
         self.paint = paint;
 
         // Advance hue + breath only across a continuously CHARGED interval.
@@ -597,8 +597,7 @@ impl CursorRainbow {
         // column the ribbon's rail under this cell resolves. A hidden cursor
         // still reports a fill, so column 0 stands in when there is no cell.
         let col = cur.map_or(0, |(_, cc)| cc);
-        let sweep =
-            spectrum_field.unwrap_or_else(|| rainbow_sweep_at(col, spectrum_phase));
+        let sweep = spectrum_field.unwrap_or_else(|| rainbow_sweep_at(col, spectrum_phase));
         let band = spectrum_at(sweep, 0.0);
         let head_rgb = cfg.head_rgb.unwrap_or(band);
         let rainbow = shade(head_rgb, sat, val);
@@ -661,10 +660,9 @@ impl CursorRainbow {
         // with is the ribbon's sparkle field — alive for exactly as long as the
         // ribbon is. Floored on the cadence instead, the caret went dark the
         // moment the ignition heat did, with the sparkles still lit.
-        let fill = lift_to_light_floor(
-            fill,
-            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE),
-        );
+        let caret_floor =
+            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE);
+        let mut fill = lift_to_light_floor(fill, caret_floor);
 
         // The additive HALO: concentric rings around the block. Brightness = a small
         // breathing idle floor + the typing energy; radius grows with energy. Purely
@@ -714,11 +712,7 @@ impl CursorRainbow {
                     // family spectrum, preserving the authored rainbow halo.
                     shade(head_rgb, sat, val)
                 } else {
-                    shade(
-                        spectrum_at(sweep, t * HALO_HUE_SPREAD),
-                        sat,
-                        val,
-                    )
+                    shade(spectrum_at(sweep, t * HALO_HUE_SPREAD), sat, val)
                 };
                 push_ring(
                     out,
@@ -804,11 +798,7 @@ impl CursorRainbow {
                         2 => (-s - jit, ch + jit),
                         _ => (cw + jit, ch + jit),
                     };
-                    let hue = shade(
-                        spectrum_at(sweep, 0.13 + k as f32 * 0.29),
-                        0.85,
-                        1.0,
-                    );
+                    let hue = shade(spectrum_at(sweep, 0.13 + k as f32 * 0.29), 0.85, 1.0);
                     push_ring_rect(out, geom, cx + dx, cy + dy, s, s, premul_rgb(hue, dot_cov));
                 }
             }
@@ -816,7 +806,29 @@ impl CursorRainbow {
 
         // **AND §2.3 LAST OF ALL, ON THE PIXEL** — every ring, arm and dot this
         // tick emitted, asked of the composite it will actually write.
-        self.clear_caret_light_of_cyan(&mut out[emitted_from..], dark_theme, cfg);
+        let rim_peak = self.clear_caret_light_of_cyan(&mut out[emitted_from..], dark_theme, cfg);
+        // The rim is part of the cursor, but its pixels land OUTSIDE the opaque
+        // block and after the ribbon has spent the field's light budget.  The
+        // crossing roof made that ordering visible: a legal level-145 field plus
+        // the ordinary rim reached L78, and the flare arm reached L109, while a
+        // blue-end block sat at its L80 floor.  Paling the rim for §2.3 cannot
+        // repair a light ordering because it deliberately preserves luminance.
+        //
+        // `clear_caret_light_of_cyan` therefore measures the FINAL emitted pile
+        // over the field's certified destination.  Keep the ornament intact and
+        // lift its opaque centre above that measured peak by the SAME margin the
+        // family already promises.  Weight by the live floor so a settled OSC-12
+        // cursor remains exactly its configured colour instead of jumping bright
+        // merely because the idle ember exists.
+        if dark_theme {
+            let floor_weight = (caret_floor / RAINBOW_CARET_LIGHT_FLOOR).clamp(0.0, 1.0);
+            let promised_margin =
+                RAINBOW_CARET_LIGHT_FLOOR * (1.0 - RAINBOW_SPARKLE_LIGHT_SHARE) - 2.0;
+            fill = lift_to_light_floor(
+                fill,
+                ((rim_peak + promised_margin) * floor_weight).max(caret_floor),
+            );
+        }
 
         // Fingerprint: quantized phase + energy + fill so a settled cursor early-outs
         // the present but any visible step (spin, breath, tint, twinkle) forces a
@@ -956,14 +968,14 @@ impl CursorRainbow {
         quads: &mut [GlowQuad],
         dark_theme: bool,
         cfg: &RainbowConfig,
-    ) {
+    ) -> f32 {
         let ground = cfg.ground.unwrap_or(if dark_theme {
             GROUND_DARK_THEME
         } else {
             GROUND_LIGHT_THEME
         }) & 0x00FF_FFFF;
         if quads.is_empty() {
-            return;
+            return 0.0;
         }
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
         for q in quads.iter() {
@@ -987,14 +999,20 @@ impl CursorRainbow {
             n
         };
         let grounds = &grounds[..n_grounds];
-        let (w, h) = ((x1.saturating_sub(x0)) as usize, (y1.saturating_sub(y0)) as usize);
+        let (w, h) = (
+            (x1.saturating_sub(x0)) as usize,
+            (y1.saturating_sub(y0)) as usize,
+        );
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
             for q in quads.iter_mut() {
                 for &g in grounds {
                     q.color = clear_light_of_cyan(q.color, q.alpha, g);
                 }
             }
-            return;
+            // The pile proof is unavailable, so fail BRIGHT: the caller lifts
+            // the opaque centre to white instead of silently skipping §8(d).
+            // Empty input returned above and remains the only zero-cost case.
+            return 255.0;
         }
         // The colours as EMITTED. Every candidate below is derived from these, so
         // the answer cannot depend on how many times this ran.
@@ -1017,8 +1035,7 @@ impl CursorRainbow {
                     for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
                         for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
                             let i = (yy - y0) as usize * w + (xx - x0) as usize;
-                            scratch[i] =
-                                crate::spectrum::compose_on_glass(scratch[i], c, q.alpha);
+                            scratch[i] = crate::spectrum::compose_on_glass(scratch[i], c, q.alpha);
                         }
                     }
                 }
@@ -1050,7 +1067,44 @@ impl CursorRainbow {
                 q.color = crate::spectrum::pale_light_at_constant_light(c, keep);
             }
         }
+        // §8(d)'s additive-brightest ordering is the dark-page law.  A light
+        // page deliberately keeps the active block saturated and dark against
+        // white, so measuring it against a synthetic bright field would wash
+        // out the very contrast that makes it visible.
+        if !dark_theme {
+            self.rim_scratch = scratch;
+            return 0.0;
+        }
+
+        // Measure the pile over the exact grey level §4 derives for a fully
+        // spent field.  Use each emitted lay's peak channel in all three
+        // channels: the cyan projection is luminance-preserving and cannot
+        // exceed that pre-law channel envelope, so this white pile dominates
+        // every post-law authored hue.  Besides being conservative, the
+        // envelope depends only on geometry and earned coverage; outer-ring hue
+        // motion therefore cannot make the opaque block flicker or override the
+        // ribbon head's authority over its colour.
+        let level = RAINBOW_FIELD_LEVEL.round() as u32;
+        let field = (level << 16) | (level << 8) | level;
+        scratch.clear();
+        scratch.resize(w * h, field);
+        for (q, &emitted) in quads.iter().zip(self.rim_emitted.iter()) {
+            let level = ((emitted >> 16) & 0xff)
+                .max((emitted >> 8) & 0xff)
+                .max(emitted & 0xff);
+            let envelope = (level << 16) | (level << 8) | level;
+            for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
+                for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
+                    let i = (yy - y0) as usize * w + (xx - x0) as usize;
+                    scratch[i] = crate::spectrum::compose_on_glass(scratch[i], envelope, q.alpha);
+                }
+            }
+        }
+        let peak = scratch.iter().copied().fold(0.0f32, |peak, px| {
+            peak.max(crate::color_math::relative_luminance(px) * 255.0)
+        });
         self.rim_scratch = scratch;
+        peak
     }
 
     /// The largest rim, in pixels, the rasterized law above lays out.
@@ -1144,7 +1198,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 ///
 /// The block used to run its OWN colour wheel — a private `hsv2rgb_turns`
 /// sampled at a private unit-turn clock — while the ribbon leaving that same
-/// cell resolved the family's six anchors. Two spectrums, two clocks, meeting
+/// cell resolved the family's seven anchors. Two spectrums, two clocks, meeting
 /// at one cell: the caret could be teal while the underline directly beneath it
 /// was green, which is the most literally visible "different rainbows" this
 /// family had.
@@ -1158,30 +1212,11 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// rings walking outward, the glitter dots — folded by the family's own
 /// reflection so an offset can never wrap violet into red.
 ///
-/// **AND IT ANSWERS ON THE THING-ARC** ([`rainbow_thing_of`], §2.3). Every mark
-/// this resolves fills a cell or less and holds still — the block, the rim
-/// rings, the glitter dots — and §2.3 rules that a *thing* must never BE cyan.
-/// The band's arc cannot promise that: green is HSV `108°`, blue is `204°`, and
-/// a monotone hue between them has to cross `[165°, 200°]`, which is precisely
-/// how the shipped engine came to report `block_fill_rgb=40a5ab` (HSV `183°`,
-/// `S = 0.63`) and `45a4c5` (`195°`, `S = 0.65`). The thing-arc crosses the
-/// window at low chroma instead.
-///
-/// **THAT IS THE GUARANTEE ON THE POSITION, NOT ON THE PIXEL,** and this
-/// docstring used to claim otherwise: *"`shade` and `mix_rgb` below move
-/// saturation and value only, never hue, so nothing downstream can put the caret
-/// back in it."* True of [`shade`], which re-applies HSV's own S/V and is the
-/// identity at full energy. **FALSE of [`mix_rgb`]**, which is a straight
+/// The positional colour is the authored family spectrum. The no-solid-cyan
+/// guarantee belongs to the final emitted block fill, after [`mix_rgb`]: a straight
 /// per-channel line between two colours and therefore lands on every hue between
-/// them: from the shipped Default theme's `#50FA7B` cursor (hue `135°`) to the
-/// arc's blue (`204°`), 52 % of that line is inside `HSV [165°, 200°]`, and the
-/// engine emitted `#17A9E7` (`197.9°`, `S = 0.90`) for 19 of 500 measured
-/// keystrokes. The pin that was supposed to catch it swept only ACHROMATIC bases
-/// — white, near-black, and none — so the shipped configuration was outside the
-/// test's own domain and the test could not refute the defect.
-///
-/// What is structural now is [`crate::spectrum::clear_thing_of_cyan`], applied to
-/// the block's fill AFTER every mix: the guarantee is on the byte that leaves.
+/// them. [`crate::spectrum::clear_thing_of_cyan`] therefore runs after every base
+/// mix, so its guarantee applies to the byte that leaves.
 #[inline]
 fn spectrum_at(sweep: f32, off: f32) -> u32 {
     rainbow_thing_of(rainbow_sweep_reflect(sweep + off))
@@ -1229,6 +1264,10 @@ const CARET_LIGHT_KNEE: f32 = 0.25;
 /// byte, and this runs ONCE per frame.
 fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     let light = |c: u32| crate::color_math::relative_luminance(c) * 255.0;
+    // A conservative caller may ask above the displayable range (the raster
+    // backstop does exactly that after adding its margin).  White is the total
+    // answer, not an out-of-range bisection target.
+    let floor = floor.clamp(0.0, 255.0);
     if floor <= 0.0 || light(rgb) >= floor {
         return rgb;
     }
@@ -1307,45 +1346,18 @@ mod tests {
     /// regression instead of as the intended change. What a continuity oracle
     /// is for is catching a DISCONTINUITY, and the arc is C¹, so a real one
     /// lands far above this.
-    /// The honest bound for a walk of the CARET's colour: the steepest the arc
-    /// the caret actually draws can move, over the step being walked, plus a
-    /// level for the `f32 -> u8` rounding.
-    ///
-    /// **IT IS THE THING-ARC'S RATE, NOT THE BAND'S**, and that is a change on
-    /// the record. Until the caret was taken out of cyan the two were the same
-    /// function, so bounding the caret by `spectrum_max_byte_rate` was bounding
-    /// it by its own law. It is not the same function now
-    /// ([`crate::spectrum::spectrum_clear_of_cyan`]): the caret gives up chroma
-    /// across the cyan window, and that transit is steeper than anything on the
-    /// band. Measuring the caret against the band would fail these pins for
-    /// doing exactly what §2.3 requires.
-    ///
-    /// **AND IT IS NOT VACUOUS**, because the thing-arc's own rate is bounded in
-    /// turn: `spectrum_thing_max_byte_rate() <= SPECTRUM_THING_RATE_MAX x
-    /// spectrum_max_byte_rate()`, pinned in `crate::spectrum`. So these pins say
-    /// "the caret adds no step of its own on top of the law" — which is what
-    /// they were written to catch, a caret running its own wheel — and that pin
-    /// says "the law's own step is bounded".
+    /// The compatibility thing read is the authored band identity, so this is
+    /// the band's exact derived byte-rate plus one level for rounding.
     fn continuity_ceiling(dt: f32) -> u32 {
-        (crate::spectrum::spectrum_thing_max_byte_rate() * dt).ceil() as u32 + 1
+        (crate::spectrum::spectrum_max_byte_rate() * dt).ceil() as u32 + 1
     }
 
     /// The same bound for a walk of the BLOCK'S FILL, which is the thing-arc
     /// MIXED with a colour the arc did not choose.
     ///
-    /// **AND IT IS A THIRD LAW, NOT A SECOND**, on the same ladder the thing-arc
-    /// climbed: `mix_rgb` is a straight line between two colours and lands on
-    /// every hue between them, so §2.3's ruling has to be re-imposed on the
-    /// EMITTED byte ([`crate::spectrum::clear_thing_of_cyan`]) and that
-    /// re-imposition is steeper than the thing-arc, exactly as the thing-arc is
-    /// steeper than the band. Measuring the fill against the thing-arc's rate
-    /// would fail these pins for doing what §2.3 requires.
-    ///
-    /// **AND IT IS NOT VACUOUS**, because the caret's own rate is bounded in
-    /// turn: `spectrum_caret_max_byte_rate(base, mix) <= SPECTRUM_CARET_RATE_MAX
-    /// x spectrum_thing_max_byte_rate()`, pinned by
-    /// `the_caret_pays_a_bounded_price_for_its_base` over every shipped theme's
-    /// cursor colour and the block's whole mix ramp.
+    /// The exact bound is scanned from the composed base mix and final
+    /// [`crate::spectrum::clear_thing_of_cyan`] projection, so palette changes do
+    /// not leave a stale hand-written ceiling behind.
     fn caret_continuity_ceiling(base: u32, mix: f32, dt: f32) -> u32 {
         (crate::spectrum::spectrum_caret_max_byte_rate(base, mix) * dt).ceil() as u32 + 1
     }
@@ -1359,6 +1371,38 @@ mod tests {
             clear_thing_of_cyan(mix_rgb(base, rainbow, mix)),
             RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(e / CARET_LIGHT_KNEE),
         )
+    }
+
+    /// The rim-headroom law may only move the composed caret toward white. The
+    /// phase and ribbon-head tests care which chromatic ray owns the block, not
+    /// how far §8(d) must climb that ray for this frame's ornament.
+    fn assert_white_lift_of(actual: u32, source: u32, context: &str) {
+        let channels = |rgb: u32| {
+            [
+                ((rgb >> 16) & 0xff) as f32,
+                ((rgb >> 8) & 0xff) as f32,
+                (rgb & 0xff) as f32,
+            ]
+        };
+        let from = channels(source);
+        let to = channels(actual);
+        assert!(
+            to.into_iter().zip(from).all(|(to, from)| to >= from),
+            "{context}: {actual:#08x} is not a non-darkening lift of {source:#08x}"
+        );
+        let axis = (0..3)
+            .max_by(|&a, &b| (255.0 - from[a]).total_cmp(&(255.0 - from[b])))
+            .unwrap_or(0);
+        let t = if from[axis] < 255.0 {
+            (to[axis] - from[axis]) / (255.0 - from[axis])
+        } else {
+            0.0
+        };
+        let rebuilt = mix_rgb(source, 0x00FF_FFFF, t);
+        assert!(
+            rgb_max_delta(actual, rebuilt) <= 1,
+            "{context}: {actual:#08x} left the white-lift ray from {source:#08x} (rebuilt {rebuilt:#08x})"
+        );
     }
 
     fn rgb_max_delta(a: u32, b: u32) -> u32 {
@@ -1574,9 +1618,21 @@ mod tests {
         let (green_a, halo_a) = render(0x0033_FF00, 0.0);
         let (green_b, _) = render(0x0033_FF00, RAINBOW_PHASE_RING * 0.37);
         let (violet, _) = render(0x0066_33FF, 0.0);
-        assert_eq!(
-            green_a.fill, green_b.fill,
-            "the actual emitted head, not a different phase helper, owns the block hue"
+        let green_source = caret_law(0x0020_2020, 0x0033_FF00, MIX_MAX, 1.0);
+        assert_white_lift_of(
+            green_a.fill.expect("green caret fill"),
+            green_source,
+            "green head at phase A owns the block hue",
+        );
+        assert_white_lift_of(
+            green_b.fill.expect("green caret fill"),
+            green_source,
+            "green head at phase B owns the block hue",
+        );
+        assert_white_lift_of(
+            violet.fill.expect("violet caret fill"),
+            caret_law(0x0020_2020, 0x0066_33FF, MIX_MAX, 1.0),
+            "violet head owns the block hue",
         );
         assert_ne!(
             green_a.fill, violet.fill,
@@ -2376,10 +2432,10 @@ mod tests {
 
             let colour = spectrum_at(sweep, 0.0);
             colours.insert(colour);
-            assert_eq!(
-                emitted.fill,
-                Some(caret_law(BASE_DARK_THEME, colour, MIX_MAX, 1.0)),
-                "frame {frame}: emitted caret must use the lifted family phase"
+            assert_white_lift_of(
+                emitted.fill.expect("enabled caret fill"),
+                caret_law(BASE_DARK_THEME, colour, MIX_MAX, 1.0),
+                &format!("frame {frame}: emitted caret must use the lifted family phase"),
             );
             wrong_domain_disagreements +=
                 usize::from(spectrum_at(rainbow_sweep_at(col, cr.phase), 0.0) != colour);
@@ -2711,9 +2767,8 @@ mod tests {
                         // the quad carries.
                         for q in &out {
                             for ground in [0x0011_1318u32, 0x001A_1B26] {
-                                let px = crate::spectrum::compose_on_glass(
-                                    ground, q.color, q.alpha,
-                                );
+                                let px =
+                                    crate::spectrum::compose_on_glass(ground, q.color, q.alpha);
                                 if (px >> 16) & 0xff == (ground >> 16) & 0xff
                                     && (px >> 8) & 0xff == (ground >> 8) & 0xff
                                     && px & 0xff == ground & 0xff
@@ -2730,20 +2785,23 @@ mod tests {
                             }
                         }
                         // **THE EMITTED FILL IS THE LAW, APPLIED** — the block
-                        // composes exactly this and nothing else, so the pin
-                        // measures the shipped expression rather than a
-                        // plausible restatement of it.
+                        // composes this chromatic source, then on a dark page
+                        // may lift only toward white to clear its emitted rim.
                         let unruled = unruled_caret_fill(base, dark, field, e);
-                        assert_eq!(
-                            fill,
-                            lift_to_light_floor(
-                                clear_thing_of_cyan(unruled),
-                                RAINBOW_CARET_LIGHT_FLOOR
-                                    * aterm_render::smoothstep01(e / CARET_LIGHT_KNEE),
-                            ),
+                        let source = lift_to_light_floor(
+                            clear_thing_of_cyan(unruled),
+                            RAINBOW_CARET_LIGHT_FLOOR
+                                * aterm_render::smoothstep01(e / CARET_LIGHT_KNEE),
+                        );
+                        let context = format!(
                             "the emitted caret fill is not the composed law at \
                              field {field}, energy {e}, dark {dark}, base {name}"
                         );
+                        if dark {
+                            assert_white_lift_of(fill, source, &context);
+                        } else {
+                            assert_eq!(fill, source, "{context}");
+                        }
                         // …AND THE CONTROL: the same composition WITHOUT §2.3's
                         // law is what shipped, and it is cyan.
                         if cyan(unruled) {
@@ -2800,7 +2858,8 @@ mod tests {
         // about the block's EMITTED byte and `spectrum_clear_of_cyan` (the arc)
         // stays the identity.
         assert_eq!(
-            ruled_cyan, 0,
+            ruled_cyan,
+            0,
             "the caret wore cyan on {ruled_cyan} of {checked} samples \
              (worst #{ruled_worst:06X}, hue {:.1}°, S {:.2})",
             hsv(ruled_worst).0,
@@ -2835,7 +2894,8 @@ mod tests {
              grounds, so the zero above is the predicate's and not the mark's"
         );
         assert_eq!(
-            ruled_ring_cyan, 0,
+            ruled_ring_cyan,
+            0,
             "the caret's rings put {ruled_ring_cyan} of {ring_checked} composited \
              pixels in the window (worst #{ruled_ring_worst:06X}, hue {:.1}°, \
              S {:.2})",
@@ -3072,7 +3132,8 @@ mod tests {
              it exists for"
         );
         assert_eq!(
-            bad, 0,
+            bad,
+            0,
             "the caret's rim put {bad} of {lit} lit rasterized pixels in hue \
              [{LO}, {HI}] at S > {SAT} (worst #{worst:06X}, hue {:.1}°, S {:.2}) — \
              cyan is not a rainbow colour",
@@ -3224,12 +3285,11 @@ mod tests {
         // rounding at each end of a step.
         const STEP: Duration = Duration::from_millis(16);
         let step_s = STEP.as_secs_f32();
-        let ceiling = (((MIX_MAX - MIX_IDLE) + (SAT_MAX - SAT_IDLE) + (VAL_MAX - VAL_IDLE))
-            * 255.0
-            * step_s
-            / TYPING_MOMENTUM_TAU)
-            .ceil() as u32
-            + 2;
+        let ceiling =
+            (((MIX_MAX - MIX_IDLE) + (SAT_MAX - SAT_IDLE) + (VAL_MAX - VAL_IDLE)) * 255.0 * step_s
+                / TYPING_MOMENTUM_TAU)
+                .ceil() as u32
+                + 2;
         let mut previous: Option<(u32, u32)> = None;
         let mut worst_step = 0u32;
         let mut cooled = 0usize;
@@ -3419,7 +3479,7 @@ mod tests {
             head_dx: 0.5,
             pack: None,
             wake_persist_s: 2.4,
-            ribbon_tall: false,
+            ribbon_tall: true,
         };
         let body_cfg = cfg();
         let t0 = Instant::now();
@@ -3461,10 +3521,10 @@ mod tests {
             );
             let ribbon_colour = spectrum_at(family_field, 0.0);
             colours.insert(ribbon_colour);
-            assert_eq!(
-                body_frame.fill,
-                Some(caret_law(BASE_DARK_THEME, ribbon_colour, MIX_MAX, 1.0)),
-                "key {key}: caret and ribbon diverged at phase {family_phase}, col {col}"
+            assert_white_lift_of(
+                body_frame.fill.expect("enabled caret fill"),
+                caret_law(BASE_DARK_THEME, ribbon_colour, MIX_MAX, 1.0),
+                &format!("key {key}: caret and ribbon diverged at phase {family_phase}, col {col}"),
             );
         }
 
@@ -3477,8 +3537,11 @@ mod tests {
             "the real ribbon clock must advance non-vacuously: {phases:?}"
         );
         assert!(
-            colours.len() >= 12,
-            "the streaming run must traverse many interpolated colours: {colours:#x?}"
+            // CLASSIC (owner, 2026-08-30): the caret walks the arc while the
+            // mark unrolls (seven distinct stops) and then HOLDS the head — it
+            // no longer spins through interpolated colours forever.
+            colours.len() >= 5,
+            "the streaming run must traverse the unroll's colours: {colours:#x?}"
         );
     }
 
@@ -3527,7 +3590,7 @@ mod tests {
                 )
                 .fill
                 .unwrap();
-            assert_eq!(
+            assert_white_lift_of(
                 f,
                 caret_law(
                     BASE_DARK_THEME,
@@ -3542,7 +3605,7 @@ mod tests {
                     MIX_MAX,
                     1.0,
                 ),
-                "the caret at col {col} uses the family spectrum at col {col}"
+                &format!("the caret at col {col} uses the family spectrum at col {col}"),
             );
         }
     }
@@ -3629,7 +3692,10 @@ mod tests {
     fn the_rim_law_answers_for_every_dark_page_not_just_the_shipped_one() {
         use crate::spectrum::{clear_light_of_cyan, spectrum_hsv};
         let second = RIM_LAW_GROUNDS[1];
-        assert_ne!(RIM_LAW_GROUNDS[0], second, "two grounds or the law is one-page");
+        assert_ne!(
+            RIM_LAW_GROUNDS[0], second,
+            "two grounds or the law is one-page"
+        );
         // Sweep premultiplied candidates; keep those clean over ground 0 but
         // cyan over ground 1 BEFORE the law. The law must move every one of
         // them off the window over ground 1.
@@ -3651,10 +3717,7 @@ mod tests {
         // asking the law to rule sub-floor near-black pixels would make this
         // pin stricter than the law it pins.
         let in_window = |(h, s, v): (f64, f64, f64)| {
-            (165.0..=200.0).contains(&h)
-                && s > 0.3
-                && v * 255.0 > 24.0
-                && s * v * 255.0 >= 32.0
+            (165.0..=200.0).contains(&h) && s > 0.3 && v * 255.0 > 24.0 && s * v * 255.0 >= 32.0
         };
         let mut exercised = 0usize;
         for r in (0..64u32).step_by(4) {

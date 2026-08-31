@@ -55,6 +55,8 @@
 #![deny(missing_docs)]
 #![deny(clippy::all)]
 
+use std::borrow::Cow;
+
 mod bitmap;
 mod bloom;
 mod budgeted;
@@ -246,8 +248,25 @@ impl TerminalSearch {
             // (line numbers are bounded by scrollback limits), so this is
             // identical to `+` on every reachable path while carrying the
             // no-overflow proof for the Trust L0 gate.
-            self.index
-                .index_line(base_line.saturating_add(offset), line.as_ref());
+            self.index.index_line_cow(
+                base_line.saturating_add(offset),
+                Cow::Borrowed(line.as_ref()),
+            );
+        }
+        self.bump_generation();
+    }
+
+    /// Index owned lines at explicit absolute row numbers.
+    ///
+    /// Each `String` is moved into the retained index cache, avoiding the
+    /// second allocation required by a borrowed line. The generation advances
+    /// once for the whole batch, matching [`index_visible_content`](Self::index_visible_content).
+    pub fn index_numbered_content_owned(
+        &mut self,
+        lines: impl IntoIterator<Item = (usize, String)>,
+    ) {
+        for (absolute_row, line) in lines {
+            self.index.index_line_cow(absolute_row, Cow::Owned(line));
         }
         self.bump_generation();
     }

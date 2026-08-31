@@ -336,6 +336,23 @@ struct ScopeDetail {
     build_scripts: Vec<String>,
     proc_macros: Vec<String>,
     biggest: Vec<(String, u64)>,
+    /// Third-party packages this run measured from `vendor/<name>` because no
+    /// pristine checkout of that exact version was unpacked locally.
+    ///
+    /// THE ONE INPUT TO A CEILING THAT IS NOT IN THE TREE. Everything else the
+    /// ratchet compares — `Cargo.lock`, the manifests, `vendor/`, the ledger —
+    /// is committed, so two machines agree by construction. This is not:
+    /// [`crate::loc::package_dir`] prefers a pristine registry checkout and
+    /// falls back to the fork, so the same commit measures the fork's own
+    /// edits on a machine whose cargo cache never received the replaced crate.
+    /// MEASURED 2026-08-30: that is 685 lines for `winit 0.30.13` and 28 for
+    /// `smol_str 0.2.2`, i.e. 713 in every one of the four cells, which was
+    /// enough to turn four `third_party_loc` rows RED against ceilings taken
+    /// on a machine that had both. A RED row that cannot name that cause reads
+    /// as dependency drift and invites `--allow-regress`, which would record
+    /// aterm's own fork edits as third-party growth and keep the headroom
+    /// forever — so the row names it.
+    vendored_measured: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -380,7 +397,7 @@ fn measure(root: &Path) -> Result<Live, String> {
                 live.set(&scope, "build_scripts", u(s.build_scripts()));
                 live.set(&scope, "proc_macros", u(s.proc_macros()));
                 live.set(&scope, "duplicate_names", u(s.duplicate_names().len()));
-                live.detail.insert(scope.clone(), detail(&s));
+                live.detail.insert(scope.clone(), detail(root, &s));
             }
             // A cell that cannot resolve is NAMED, and every row scoped to it
             // reads UNMEASURED. It is never a pass.
@@ -478,7 +495,8 @@ fn measure(root: &Path) -> Result<Live, String> {
     Ok(live)
 }
 
-fn detail(s: &CellSurvey) -> ScopeDetail {
+fn detail(root: &Path, s: &CellSurvey) -> ScopeDetail {
+    let vendor = root.join("vendor");
     let mut biggest: Vec<(String, u64)> = s
         .third_party()
         .filter_map(|p| s.facts.get(p).map(|f| (p.spec(), f.loc)))
@@ -502,6 +520,16 @@ fn detail(s: &CellSurvey) -> ScopeDetail {
             .map(crate::model::PkgId::spec)
             .collect(),
         biggest,
+        vendored_measured: s
+            .third_party()
+            .filter_map(|p| s.facts.get(p).map(|f| (p, f)))
+            .filter(|(_, f)| {
+                f.root_dir
+                    .as_ref()
+                    .is_some_and(|dir| dir.starts_with(&vendor))
+            })
+            .map(|(p, _)| format!("{} (vendor/{})", p.spec(), p.name))
+            .collect(),
     }
 }
 
@@ -669,6 +697,26 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
          name what is NEW. `git diff -- Cargo.lock | grep '^+name'` does, and `cargo forge \
          survey --cell <name>` ranks what it costs by dominator.\n",
     );
+    // RULE OUT THE CACHE BEFORE BELIEVING THE DRIFT. Only `third_party_loc`
+    // can move this way: a fork and its pristine upstream are the SAME package
+    // to every other metric, so counts are unaffected and only the line total
+    // shifts, by exactly what the fork diverges by.
+    if row.metric == "third_party_loc"
+        && let Some(d) = live.detail.get(&row.scope)
+        && !d.vendored_measured.is_empty()
+    {
+        let _ = writeln!(
+            s,
+            "      MEASURED FROM THE FORK, NOT FROM UPSTREAM: {}. `loc::package_dir` prefers a \
+             pristine registry checkout of the same version and falls back to `vendor/<name>` \
+             when this machine has none, so those packages contribute aterm's OWN fork edits \
+             here and upstream's lines on a machine that has the pristine tree. Cargo cannot \
+             fetch one for a patched package (source-less lock entry), so the difference is a \
+             property of the CACHE, not of this tree. Rule it out before recording a \
+             regression: `cargo forge attest` names every fork it could not diff.",
+            d.vendored_measured.join(", ")
+        );
+    }
     let _ = write!(
         s,
         "      Either shrink it back, or record the regression:\n        cargo forge budget \

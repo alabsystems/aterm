@@ -1741,10 +1741,29 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Whether bracketed-paste mode (DECSET 2004) is active (mirrors the CPU binding).
+    /// Whether bracketed-paste mode (DECSET 2004) is active — a read-only view of
+    /// the mode for hosts that want to SHOW it, never a licence to assemble the
+    /// paste framing in JS; route pastes through
+    /// [`AtermGpuTerminal::format_paste`] (mirrors the CPU binding).
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn bracketed_paste_mode(&self) -> bool {
         self.term.modes().bracketed_paste()
+    }
+
+    /// The ONE paste encoder — the engine's own `Terminal::format_paste`, the same
+    /// call the native app's input seam makes (mirrors the CPU binding). Give it
+    /// the raw clipboard text; send the returned bytes to the PTY verbatim.
+    ///
+    /// It strips the control bytes a hostile clipboard smuggles in (ESC, the whole
+    /// C1 block, the C0 signal bytes), folds line breaks to CR, and only THEN adds
+    /// the `ESC[200~ … ESC[201~` guards when bracketed-paste mode is on. That order
+    /// is the security property: a pasted `ESC[201~` — or its 8-bit `0x9B 2 0 1 ~`
+    /// spelling, which terminates the region just as well once 8-bit controls are
+    /// honored — is already inert text by the time the closing guard is appended,
+    /// so it cannot close its own bracket and have the tail run as keystrokes. A
+    /// host that wraps the raw text itself has that hole, whichever order it picks.
+    pub fn format_paste(&self, text: &str) -> Vec<u8> {
+        self.term.format_paste(text)
     }
 
     /// True when DEC private mode 1007 (alternate scroll) is set: while the
@@ -3125,6 +3144,70 @@ impl AtermGpuTerminal {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// The bundled face, injected the way a JS host injects a fetched one. A
+    /// security property must not be skipped on a box with no system font, so
+    /// paste tests build from these bytes rather than `new_from_system`.
+    const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+
+    /// The web export IS the engine's paste formatter, so a JS host cannot get
+    /// the ordering wrong. Sanitize-then-wrap is the whole security property: a
+    /// planted `ESC[201~` (or its 8-bit `0x9B 2 0 1 ~` spelling, which closes the
+    /// region just as well) is inert text before the closing guard is appended,
+    /// so it can never terminate its own bracket and let the tail run as
+    /// keystrokes. A host that wraps raw clipboard text itself has that hole.
+    #[test]
+    fn paste_export_wraps_only_sanitized_text_so_a_planted_terminator_stays_inert() {
+        let mut t = AtermGpuTerminal::new(24, 80, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
+            .expect("the bundled face parses");
+
+        // Mode OFF: no guards to escape, yet ESC/C1 are still stripped and a bare
+        // LF is still folded to CR for the PTY.
+        assert!(!t.bracketed_paste_mode());
+        assert_eq!(
+            t.format_paste("a\x1b[31mb\u{009d}c\nd"),
+            b"a[31mbc\rd",
+            "unbracketed paste is sanitized too"
+        );
+
+        t.process(b"\x1b[?2004h");
+        assert!(t.bracketed_paste_mode());
+
+        let out = t.format_paste("safe\x1b[201~rm -rf ~");
+        assert_eq!(out, b"\x1b[200~safe[201~rm -rf ~\x1b[201~");
+        assert_eq!(
+            out.windows(6).filter(|w| *w == b"\x1b[201~").count(),
+            1,
+            "exactly one closing guard on the wire"
+        );
+        assert!(out.ends_with(b"\x1b[201~"), "and it is the last thing sent");
+
+        assert_eq!(
+            t.format_paste("a\u{009b}201~b"),
+            b"\x1b[200~a201~b\x1b[201~",
+            "the 8-bit CSI spelling of the terminator is stripped as well"
+        );
+
+        // The seam that keeps the two web facades and native from drifting: the
+        // export delegates, it does not reimplement.
+        let mut engine = Terminal::new(24, 80);
+        engine.process(b"\x1b[?2004h");
+        for probe in [
+            "",
+            "\t",
+            "x\r\ny\nz",
+            "safe\x1b[201~rm -rf ~",
+            "a\u{009b}201~b",
+            "a\u{0003}b\u{0004}c\u{001a}d\u{007f}e",
+            "中文🙂",
+        ] {
+            assert_eq!(
+                t.format_paste(probe),
+                engine.format_paste(probe),
+                "web export must equal Terminal::format_paste for {probe:?}"
+            );
+        }
+    }
 
     /// The WF-1 bumps mirrored into `effects_api` must be LIVE, not a stub.
     /// Parity with aterm-wasm is a text guard: it proves the call sites exist,

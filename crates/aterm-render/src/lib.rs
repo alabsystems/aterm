@@ -37,11 +37,17 @@ pub use aterm_core::render::DefaultBgSpan;
 // (which builds terminals + calls `Terminal::cell_frame` to feed the renderer).
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
-mod admission_cache;
 pub mod chrome_metrics;
 mod colr;
 pub mod deco;
 pub mod fire_field;
+/// THE FACE. The first-party `Font` that retired `fontdue` (and, with it, the
+/// duplicate `ttf-parser 0.21` under it): cmap, advances, `hhea` line metrics
+/// and legacy `kern` read once with the `ttf-parser` this crate already links,
+/// rasterized through the SAME first-party coverage fill `variation` and
+/// `hinted` use. See its docs for what is bit-identical to fontdue and what is
+/// deliberately not.
+pub mod font;
 pub mod font_catalog;
 /// The glyph-resolution CHAIN as one pure, exhaustively-verifiable policy —
 /// the module the U+276F tofu bug proved was missing (see its docs).
@@ -82,8 +88,12 @@ pub use aterm_types::text_shaping::{
 pub use ligature_shaping::{ColumnGlyph, ShapedRun};
 
 /// An interned parsed fallback face: its source bytes paired with the parsed
-/// `fontdue::Font`, so identical injected fonts share one ~370MB parse.
-type InternedFace = (std::sync::Arc<Vec<u8>>, std::sync::Arc<fontdue::Font>);
+/// [`crate::font::Font`], so identical injected fonts share ONE parse and one
+/// copy of the file (the face adopts the store's handle — see
+/// [`intern_parsed_font_keyed`]). Under `fontdue` the shared thing was a ~370 MB
+/// eager conversion of every outline; it is now ~1 MB of derived tables per
+/// broad face, and the file itself.
+type InternedFace = (std::sync::Arc<Vec<u8>>, std::sync::Arc<crate::font::Font>);
 
 /// Channel handle for a BACKGROUND lazy-fallback parse: the spawned thread sends
 /// the CHAIN of candidate faces that read + intern-parse OK (W8: the broad-fallback
@@ -232,12 +242,12 @@ fn discovered_font_bytes_contains(bytes: &[u8]) -> bool {
         .any(|held| held.as_slice() == bytes)
 }
 
-/// Parse a fallback `fontdue::Font` from `bytes`, sharing ONE parsed instance across
-/// all Renderers for identical bytes (a broad Unicode fallback is ~370MB parsed, so
-/// without this every pane paid it). Content-keyed by byte equality. Returns the
-/// interned SOURCE bytes alongside the parsed face (W8): the fallback pipeline
-/// needs both — fontdue for the portable raster, the raw bytes for ttf-parser
-/// cmap/metric duty and the macOS CoreText raster.
+/// Parse a fallback [`crate::font::Font`] from `bytes`, sharing ONE parsed
+/// instance across all Renderers for identical bytes. Content-keyed by byte
+/// equality. Returns the interned SOURCE bytes alongside the parsed face (W8):
+/// the fallback pipeline needs both — the face for the portable raster, the raw
+/// bytes for ttf-parser cmap/metric duty and the macOS CoreText raster — and
+/// they are now ONE allocation, since the face adopts the interned handle.
 ///
 /// This entry point has only a SLICE, so a genuinely new face costs a copy of it.
 /// A caller that already holds the store's own handle type wants
@@ -278,13 +288,22 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
 /// the bytes back would only invite a second name for one allocation.
 fn intern_parsed_font_owned(
     bytes: &std::sync::Arc<Vec<u8>>,
-) -> Result<std::sync::Arc<fontdue::Font>, String> {
+) -> Result<std::sync::Arc<crate::font::Font>, String> {
     intern_parsed_font_keyed(bytes, || bytes.clone()).map(|(_, font)| font)
 }
 
 /// The one parse + publish both entry points use. `key` supplies the store's byte
-/// handle ONLY when a genuinely new entry is being pushed — after the lookup AND
-/// after the under-lock re-check, so neither a hit nor a lost race pays for it.
+/// handle after the lookup misses, and the PARSE then adopts that handle rather
+/// than copying the file behind it.
+///
+/// The handle is therefore materialised BEFORE the under-lock re-check, not
+/// after — a deliberate reversal of the previous order. It used to be deferred
+/// so a lost race paid nothing, back when the parsed face kept no bytes and the
+/// handle was pure overhead; now the face MUST hold the file, so producing the
+/// handle first turns "one copy for the store plus one for the face" into one
+/// copy for both. A lost race discards it, which costs exactly what the old
+/// order cost on the winning path — and races here are two threads discovering
+/// the same font file at once, not a hot path.
 fn intern_parsed_font_keyed(
     bytes: &[u8],
     key: impl FnOnce() -> std::sync::Arc<Vec<u8>>,
@@ -292,11 +311,13 @@ fn intern_parsed_font_keyed(
     if let Some(face) = interned_parsed_font_lookup(bytes) {
         return Ok(face);
     }
-    // Parse OUTSIDE the lock: a broad-Unicode face costs hundreds of ms to parse,
+    // Parse OUTSIDE the lock: a broad-Unicode face costs tens of ms to parse,
     // and holding the lock across it would block a concurrent render-thread lookup
     // behind a warm thread's parse.
-    let parsed = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-        .map_err(|e| e.to_string())?;
+    let src = key();
+    let parsed =
+        crate::font::Font::from_shared_vec(src.clone(), crate::font::FontSettings::default())
+            .map_err(|e| e.to_string())?;
     let font = std::sync::Arc::new(parsed);
     let mut store = PARSED_FONT_INTERN
         .lock()
@@ -309,7 +330,6 @@ fn intern_parsed_font_keyed(
     {
         return Ok((src.clone(), existing.clone()));
     }
-    let src = key();
     store.push((src.clone(), font.clone()));
     Ok((src, font))
 }
@@ -340,14 +360,15 @@ fn interned_parsed_font_lookup(bytes: &[u8]) -> Option<InternedFace> {
 struct SharedFace {
     bytes: std::sync::Arc<[u8]>,
     index: u32,
-    font: std::sync::Weak<fontdue::Font>,
+    font: std::sync::Weak<crate::font::Font>,
 }
 
 /// PRIMARY/CHROME face parses, shared by source bytes.
 ///
-/// `fontdue::Font::from_bytes` materialises every glyph outline: MEASURED at
-/// 6.94 MB of live heap for the bundled DejaVu Sans Mono (2,044 geometry
-/// allocations). The same face was parsed THREE times in one idle process — the
+/// A parsed face is not free: MEASURED at 68 kB of live heap for the bundled
+/// DejaVu Sans Mono when it adopts the caller's bytes, and 6.94 MB when
+/// `fontdue` was doing the parsing (2,044 geometry allocations). The same face
+/// was parsed THREE times in one idle process — the
 /// renderer's own build (`Renderer::from_bytes`), the seal-time rebuild
 /// (`rebuild_from_admitted`, via `fork_semantic_surface`), and the GUI chrome's
 /// fallback face (`tray_raster::default_chrome_fonts` over
@@ -388,16 +409,22 @@ const SHARED_PARSED_FACE_SLOTS: usize = 12;
 pub fn shared_parsed_face(
     bytes: &[u8],
     index: u32,
-) -> Result<(std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>), String> {
+) -> Result<(std::sync::Arc<[u8]>, std::sync::Arc<crate::font::Font>), String> {
     if let Some(hit) = shared_parsed_face_lookup(bytes, index) {
         return Ok(hit);
     }
-    // Parse OUTSIDE the lock (a broad face costs hundreds of ms); a racer's
+    // Parse OUTSIDE the lock (a broad face costs tens of ms); a racer's
     // duplicate result is dropped by the re-check inside the publish.
-    let font = parse_face_at(bytes, index)?;
+    //
+    // The store's handle is made HERE, before the parse, so the parsed face can
+    // adopt it: the face holds the file (it reads outlines on demand), so
+    // handing it a slice would make this 23 MB `.ttc` resident twice. Same
+    // reversal, same reason, as `intern_parsed_font_keyed` — see there.
+    let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    let font = parse_face_at(&owned, index)?;
     Ok(shared_parsed_face_publish(
         bytes,
-        || std::sync::Arc::from(bytes),
+        || owned.clone(),
         index,
         font,
     ))
@@ -410,7 +437,7 @@ pub fn shared_parsed_face(
 fn shared_parsed_face_owned(
     bytes: &std::sync::Arc<[u8]>,
     index: u32,
-) -> Result<std::sync::Arc<fontdue::Font>, String> {
+) -> Result<std::sync::Arc<crate::font::Font>, String> {
     if let Some((_, font)) = shared_parsed_face_lookup(bytes, index) {
         return Ok(font);
     }
@@ -419,12 +446,20 @@ fn shared_parsed_face_owned(
 }
 
 /// The one parse both entry points use, at the requested COLLECTION index.
-fn parse_face_at(bytes: &[u8], index: u32) -> Result<std::sync::Arc<fontdue::Font>, String> {
-    fontdue::Font::from_bytes(
-        bytes,
-        fontdue::FontSettings {
+///
+/// Takes the store's own `Arc`, never a slice: the parsed face RETAINS the file
+/// (outlines are read on demand), so a slice here would make every shared face a
+/// second copy of its own bytes — 23 MB on `Arial Unicode.ttf`, 53 MB on
+/// `STHeiti Light.ttc`. Both entry points therefore materialise the handle
+/// before parsing.
+fn parse_face_at(
+    bytes: &std::sync::Arc<[u8]>,
+    index: u32,
+) -> Result<std::sync::Arc<crate::font::Font>, String> {
+    crate::font::Font::from_shared_slice(
+        bytes.clone(),
+        crate::font::FontSettings {
             collection_index: index,
-            ..fontdue::FontSettings::default()
         },
     )
     .map(std::sync::Arc::new)
@@ -495,7 +530,7 @@ fn shared_faces_prune(store: &mut Vec<SharedFace>) {
 fn shared_parsed_face_lookup(
     bytes: &[u8],
     index: u32,
-) -> Option<(std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>)> {
+) -> Option<(std::sync::Arc<[u8]>, std::sync::Arc<crate::font::Font>)> {
     let mut store = SHARED_PARSED_FACES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -522,8 +557,8 @@ fn shared_parsed_face_publish(
     bytes: &[u8],
     key: impl FnOnce() -> std::sync::Arc<[u8]>,
     index: u32,
-    font: std::sync::Arc<fontdue::Font>,
-) -> (std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>) {
+    font: std::sync::Arc<crate::font::Font>,
+) -> (std::sync::Arc<[u8]>, std::sync::Arc<crate::font::Font>) {
     let mut store = SHARED_PARSED_FACES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -583,8 +618,8 @@ impl Default for Theme {
 // the trait this CPU renderer implements (see `impl Rasterizer for Renderer`).
 pub use aterm_render_api::{
     CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowBlend, GlowQuad,
-    HaloMode, InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip, SpriteQuad,
-    TrailCell, WordDecoration,
+    HaloMode, InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip,
+    SpriteQuad, TrailCell, WordDecoration,
 };
 
 /// Which glyph source a [`GlyphKey`] rasterizes from.
@@ -1333,7 +1368,7 @@ pub struct Renderer {
     /// Shared, so a second `Renderer` over the SAME bytes — the seal-time
     /// rebuild, a semantic fork — reuses one parse instead of paying another
     /// whole-face outline materialisation (see [`shared_parsed_face`]).
-    font: std::sync::Arc<fontdue::Font>,
+    font: std::sync::Arc<crate::font::Font>,
     /// Raw PRIMARY-face bytes, retained so a `rustybuzz::Face` can be built for
     /// run shaping (ligatures). `None` when no bytes were available (e.g. a font
     /// loaded only by path that failed to re-read) — ligatures then cleanly
@@ -1394,7 +1429,7 @@ pub struct Renderer {
     /// cells the primary covers rasterize from THIS face (a true heavier weight) in
     /// preference to the file-sibling/synthetic path. `None` keeps the existing
     /// behaviour, so the default is byte-identical to before.
-    bold_font: Option<fontdue::Font>,
+    bold_font: Option<crate::font::Font>,
     /// Raw injected bold-face bytes, retained so the BOLD glyph id can be resolved
     /// through the Unicode cmap with ttf-parser (the same Mac-Roman-avoiding routing
     /// the primary uses — see [`Self::primary_unicode_gid`]), and so styled ligature
@@ -2686,7 +2721,7 @@ pub fn display_face_fit(bytes: &[u8]) -> Option<DisplayFaceFit> {
         embolden: entry.embolden,
         ..DisplayFaceFit::default()
     };
-    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
+    let font = crate::font::Font::from_bytes(bytes, crate::font::FontSettings::default()).ok()?;
     // Advance AND ink per glyph: the cell has to clear whichever is wider.
     let mut advances: Vec<f32> = Vec::new();
     let mut widest_extent = 0.0_f32;
@@ -2947,11 +2982,12 @@ enum RasterKind {
 }
 
 /// Pick the rasterizer: CoreText by default (batteries-included native quality),
-/// unless `ATERM_RASTERIZER=fontdue` forces the portable/deterministic path (tests
-/// use this for byte-stable, machine-independent output).
+/// unless `ATERM_RASTERIZER=portable` (or its legacy spelling `=fontdue`) forces
+/// the portable/deterministic path — tests use this for byte-stable,
+/// machine-independent output.
 ///
 /// THE OVERRIDE ANNOUNCES ITSELF, once per process. These reads are in the
-/// SHIPPING render crate, not behind `cfg(test)`, and `=fontdue` is not a small
+/// SHIPPING render crate, not behind `cfg(test)`, and it is not a small
 /// change: it drops CoreText hinting and system antialiasing, additionally forces
 /// subpixel mode `Off`, and disables the variable-font instancing path. A user
 /// with it exported — or inherited from a test shell — sees glyphs no shipped
@@ -2963,16 +2999,18 @@ enum RasterKind {
 #[cfg(target_os = "macos")]
 fn select_rasterizer() -> RasterKind {
     match std::env::var("ATERM_RASTERIZER").ok().as_deref() {
-        Some("fontdue") => {
+        // `fontdue` is the legacy spelling of `portable`, kept because 20 test
+        // sites export it — see `hinted::HintMode::portable_forced`.
+        Some("portable" | "fontdue") => {
             static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             ANNOUNCED.get_or_init(|| {
                 eprintln!(
-                    "aterm-render: $ATERM_RASTERIZER=fontdue — glyphs are rasterized \
-                     by the portable fontdue path, NOT CoreText. Hinting and system \
-                     antialiasing are off, subpixel rendering is forced Off, and \
-                     variable-font instancing is disabled. This is the byte-stable \
-                     test path; text will not look like any shipped build. Unset it \
-                     to restore CoreText."
+                    "aterm-render: $ATERM_RASTERIZER is set — glyphs are rasterized \
+                     by the portable first-party path, NOT CoreText. Hinting and \
+                     system antialiasing are off, subpixel rendering is forced Off, \
+                     and variable-font instancing is disabled. This is the \
+                     byte-stable test path; text will not look like any shipped \
+                     build. Unset it to restore CoreText."
                 );
             });
             RasterKind::Fontdue
@@ -3021,14 +3059,15 @@ fn next_styled_face_id() -> StyledFaceId {
 /// `gid_cache` memoizes the per-char Unicode-cmap lookup so the hot path pays
 /// it once.
 ///
-/// `font` is a [`LazyFontdue`] for the same reason the fallback chain's is:
-/// `fontdue::Font::from_bytes` materialises every glyph outline, MEASURED on
-/// this machine at 8.7 / 6.7 / 6.5 MB of live heap for DejaVu Sans Mono's
-/// Bold / Oblique / BoldOblique siblings — 21.9 MB an idle terminal paid at
-/// seal for three faces it may never draw. The DISK READ stays where it was
-/// (`ensure_styled_faces`, on the font worker), so the render thread still
-/// never does font I/O; only the parse moves to the first caller that
-/// genuinely needs a fontdue face.
+/// `font` is a [`LazyFontdue`] for the same reason the fallback chain's is,
+/// though the reason is a great deal smaller than it was: `fontdue` materialised
+/// every glyph outline, MEASURED on this machine at 8.7 / 6.7 / 6.5 MB of live
+/// heap for DejaVu Sans Mono's Bold / Oblique / BoldOblique siblings — 21.9 MB
+/// an idle terminal paid at seal for three faces it may never draw. The
+/// first-party face's tables are ~68 kB each on the same siblings. The DISK READ
+/// stays where it was (`ensure_styled_faces`, on the font worker), so the render
+/// thread still never does font I/O; only the parse moves to the first caller
+/// that genuinely needs a parsed face.
 #[derive(Clone)]
 struct StyledFace {
     font: LazyFontdue,
@@ -3044,13 +3083,17 @@ struct StyledFace {
 
 impl StyledFace {
     /// The parsed face, materialised from the resident bytes on first call.
-    /// `None` means fontdue REJECTED bytes [`fontdue_admissible`] admitted —
-    /// the permissive-error case [`Renderer::retire_unparsable_styled`] acts on.
+    /// `None` means the parse REFUSED bytes [`face_admissible`] admitted. That
+    /// is now unreachable by construction — admission asks exactly the two
+    /// conditions `crate::font::Font::from_bytes` can fail on — but
+    /// [`Renderer::retire_unparsable_styled`] still stands behind it, because
+    /// "unreachable" is a claim about today's code and the cost of being wrong
+    /// is a styled slot silently drawing the wrong letter.
     ///
     /// Call this only where a fontdue face is genuinely ABOUT TO DRAW. Coverage
     /// questions go to [`Self::covers`], which answers the same thing off the
     /// cmap without materialising anything.
-    fn parsed(&self) -> Option<&std::sync::Arc<fontdue::Font>> {
+    fn parsed(&self) -> Option<&std::sync::Arc<crate::font::Font>> {
         self.font.get_at(&self.bytes, self.index)
     }
 
@@ -3230,24 +3273,30 @@ fn x_height_em_of(face: &ttf_parser::Face<'_>, upem: f32) -> Option<f32> {
     (bb.y_max > 0).then(|| f32::from(bb.y_max) / upem)
 }
 
-/// A chain face's `fontdue::Font`, materialised from the resident bytes on FIRST
-/// ACTUAL USE rather than at admission.
+/// A chain face's [`crate::font::Font`], materialised from the resident bytes on
+/// FIRST ACTUAL USE rather than at admission.
 ///
-/// WHY. `fontdue::Font::from_bytes` eagerly converts every glyph outline: MEASURED
-/// on this machine at opt-level 0, 1799 ms for Hiragino Sans GB (29,352 glyphs) and
-/// 1438 ms for Arial Unicode (50,377 glyphs), against 0.043 ms / 0.018 ms for
-/// `ttf_parser::Face::parse` over the identical bytes. On the DEFAULT macOS path
-/// neither of those parses is read: `fallback_has` probes coverage through
-/// ttf-parser, and the rasterizer is CoreText, which draws from the bytes. So the
-/// eager parse was pure cold-start latency for the common case, and this defers it
-/// to the first caller that genuinely needs a fontdue face — the portable
-/// rasterizer, or the CoreText fail-safe.
+/// WHY, AND HOW MUCH SMALLER THE "WHY" GOT. This deferral was introduced against
+/// `fontdue`, whose `from_bytes` eagerly converted EVERY glyph outline: MEASURED
+/// on this machine at opt-level 0, 1799 ms for Hiragino Sans GB (29,352 glyphs)
+/// and 1438 ms for Arial Unicode (50,377 glyphs), against 0.043 ms / 0.018 ms for
+/// `ttf_parser::Face::parse` over the identical bytes. The first-party face
+/// touches no outline at parse time — it walks the cmap and reads `hmtx` — which
+/// takes the same two faces to roughly 1.8 ms and 0.3 ms in the shipped build.
+///
+/// So the deferral now buys milliseconds and about a megabyte per broad face
+/// rather than seconds and tens of megabytes, and it is kept for two reasons that
+/// survive the smaller number: on the DEFAULT macOS path the parse is never read
+/// at all (`fallback_has` probes coverage through ttf-parser and CoreText draws
+/// from the bytes), and a chain can hold several broad faces whose combined walk
+/// is still the largest thing between window attach and the first frame.
 ///
 /// SHAPE. The cell is `Arc`-shared, so CLONES of a `FallbackFace` (semantic forks,
 /// `rebuild_from_admitted`, publication) share one materialisation instead of
-/// racing to repeat it. `Some(None)` inside is the terminal "fontdue REJECTED these
-/// bytes" verdict, cached like any other, and is what
-/// [`Renderer::retire_unparsable_fallback`] acts on.
+/// racing to repeat it. `Some(None)` inside is the terminal "the parse REFUSED
+/// these bytes" verdict, cached like any other, and is what
+/// [`Renderer::retire_unparsable_fallback`] acts on — a state
+/// [`face_admissible`] now makes unreachable, see there.
 ///
 /// NO CONVERGENCE IS CLAIMED. The parse runs OUTSIDE the cell and a losing racer's
 /// result is discarded (the same discipline, and the same limitation, as
@@ -3256,7 +3305,7 @@ fn x_height_em_of(face: &ttf_parser::Face<'_>, upem: f32) -> Option<f32> {
 /// one of them BLOCK on the other's parse, which is exactly what a render thread
 /// must never do behind a warm thread.
 #[derive(Clone)]
-struct LazyFontdue(std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<fontdue::Font>>>>);
+struct LazyFontdue(std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<crate::font::Font>>>>);
 
 impl LazyFontdue {
     /// An UNPARSED cell (the discovery path): nothing is read until [`Self::get`].
@@ -3267,7 +3316,7 @@ impl LazyFontdue {
     /// A cell that is ALREADY parsed (the eager host-injection path), so the
     /// injected-bytes contract — "fails loudly at injection, never later" — is
     /// unchanged and no injected face can ever parse mid-frame.
-    fn ready(font: std::sync::Arc<fontdue::Font>) -> Self {
+    fn ready(font: std::sync::Arc<crate::font::Font>) -> Self {
         let cell = std::sync::OnceLock::new();
         let _ = cell.set(Some(font));
         LazyFontdue(std::sync::Arc::new(cell))
@@ -3287,7 +3336,7 @@ impl LazyFontdue {
     /// and never held one twice (only `ATERM_RASTERIZER=fontdue` or the CoreText
     /// fail-safe reached this at all, and neither is measured).
     /// [`Self::get_at`] strikes the same bargain against the other store.
-    fn get(&self, bytes: &std::sync::Arc<Vec<u8>>) -> Option<&std::sync::Arc<fontdue::Font>> {
+    fn get(&self, bytes: &std::sync::Arc<Vec<u8>>) -> Option<&std::sync::Arc<crate::font::Font>> {
         if self.0.get().is_none() {
             // Parse OUTSIDE the cell, then publish; a racer's duplicate result is
             // dropped by `set`. See the type docs on why this is not `get_or_init`.
@@ -3313,7 +3362,7 @@ impl LazyFontdue {
         &self,
         bytes: &std::sync::Arc<[u8]>,
         index: u32,
-    ) -> Option<&std::sync::Arc<fontdue::Font>> {
+    ) -> Option<&std::sync::Arc<crate::font::Font>> {
         if self.0.get().is_none() {
             // Parse OUTSIDE the cell, exactly as `get` does and for the same
             // reason (never block a render thread behind another's parse).
@@ -3337,10 +3386,10 @@ impl LazyFontdue {
         self.0.get().is_some()
     }
 
-    /// TEST ONLY: a cell already latched to "fontdue REJECTED these bytes".
-    /// `fontdue_admissible` is written precisely so this state is unreachable
-    /// from real bytes, so the retire path it guards can only be exercised by
-    /// manufacturing the verdict.
+    /// TEST ONLY: a cell already latched to "the parse REFUSED these bytes".
+    /// `face_admissible` asks exactly what the parse can refuse, so this state
+    /// is unreachable from real bytes and the retire path it guards can only be
+    /// exercised by manufacturing the verdict.
     #[cfg(test)]
     fn failed_parse() -> Self {
         let cell = std::sync::OnceLock::new();
@@ -3385,16 +3434,17 @@ impl FallbackFace {
     }
 
     /// Build LAZILY from bytes just read off disk: hold the bytes, validate the
-    /// face with ttf-parser, and defer the fontdue parse to first actual use.
+    /// face with ttf-parser, and defer the full parse to first actual use.
     ///
-    /// ADMISSION IS NOT WEAKENED. A bare `ttf_parser::Face::parse` would be a
-    /// strictly weaker test than the eager `fontdue::Font::from_bytes` it replaces,
-    /// and a face fontdue would have REJECTED could then enter the chain, shadow a
-    /// good entry, and (being non-tier) even end the candidate scan before the
-    /// broad backstop was reached. [`fontdue_admissible`] closes that: it replays
-    /// both of fontdue 0.9.3's failure modes over the parsed face without touching
-    /// an outline. [`Renderer::retire_unparsable_fallback`] is the second line of
-    /// defence if it is ever wrong.
+    /// ADMISSION IS NOT WEAKENED — and since `fontdue` was retired it is EXACT.
+    /// A face the renderer cannot parse must not enter the chain, where it would
+    /// shadow a good entry and (being non-tier) could even end the candidate
+    /// scan before the broad backstop was reached. [`face_admissible`] asks the
+    /// two conditions [`crate::font::Font::from_bytes`] itself can fail on, off
+    /// the same `ttf_parser::Face::parse` — so admitted implies parseable, and
+    /// `admission_agrees_with_the_first_party_face` measures that over the real
+    /// faces on the machine. [`Renderer::retire_unparsable_fallback`] stays as
+    /// the second line of defence if the two ever drift apart.
     ///
     /// The bytes arrive as the READ's OWN handle (`&Arc<Vec<u8>>`), not a slice,
     /// so a genuinely new face enters [`DISCOVERED_FONT_BYTES`] as the allocation
@@ -3426,12 +3476,8 @@ impl FallbackFace {
         // cold-start term (~203 ms on Hiragino alone, the table below). A pathless
         // face (injection) always walks: there is no identity to key on, and
         // injected bytes are one-offs by nature.
-        let admissible = match path.as_deref() {
-            Some(p) => admission_cache::admissible_cached(p, 0, || fontdue_admissible(bytes, 0)),
-            None => fontdue_admissible(bytes, 0),
-        };
-        if !admissible {
-            return Err("face is not admissible as a fontdue font".to_string());
+        if !face_admissible(bytes, 0) {
+            return Err("face is not admissible as a renderable font".to_string());
         }
         let bytes = intern_discovered_font_bytes(bytes);
         let norm = face_norm_facts(&bytes, 0);
@@ -3445,87 +3491,55 @@ impl FallbackFace {
     }
 }
 
-/// Whether `fontdue::Font::from_bytes(bytes, FontSettings { collection_index: index,
-/// .. })` would SUCCEED — decided with ttf-parser alone, i.e. without fontdue's
-/// eager per-glyph outline conversion (the ~1.7 s of cold start this whole change
-/// exists to defer).
+/// Whether [`crate::font::Font::from_bytes`] would SUCCEED for face `index` of
+/// `bytes`, AND the face has glyphs to draw with.
 ///
-/// READ OFF the pinned `fontdue 0.9.3` source (`src/font.rs::from_bytes`), which
-/// can only fail in two places:
+/// # This used to be a replication, and is now an equality
 ///
-///  1. `Face::parse(data, collection_index)` returns `Err` — replayed exactly;
-///  2. `generate_glyph(index)` returns `Err("Attempted to map a codepoint out of
-///     bounds.")` for some index in `indices_to_load`, i.e. `index >=
-///     number_of_glyphs()`. `indices_to_load` is `{0}` ∪ every NONZERO glyph id any
-///     cmap subtable maps a codepoint to (∪ GSUB-reachable ids when
-///     `load_substitutions`, which the default settings enable — the GSUB side is
-///     NOT replayed; see the caveat below).
+/// While `fontdue` was the face, this predicate was a hand-written REPLAY of
+/// another crate's two failure modes — `Face::parse` failing, and any cmap
+/// subtable mapping a code point to a glyph id past `number_of_glyphs()`, which
+/// fontdue turned into `Err("Attempted to map a codepoint out of bounds.")`
+/// while eagerly converting every glyph's outline. Replaying it meant walking
+/// the whole cmap (MEASURED at 203 ms on `Hiragino Sans GB.ttc` at opt-level 0,
+/// 1.8 ms in the shipped build), and it could only ever be too PERMISSIVE,
+/// which is why [`Renderer::retire_unparsable_fallback`] exists behind it.
 ///
-/// Everything else in that function — kerning, names, line metrics — is infallible
-/// or falls back to a default.
+/// [`crate::font::Font`] does not have that failure mode. An out-of-range cmap
+/// mapping is DROPPED when the map is built and an out-of-range glyph id is
+/// refused at the raster, so a face fontdue rejected outright now loads and
+/// draws every glyph it really has. What is left is exactly what
+/// `Font::from_bytes` itself can refuse:
 ///
-/// THIS IS NOT FREE, and the honest numbers matter: the cmap walk is the same
-/// enumeration fontdue does, minus the outline conversion. MEASURED on this
-/// machine at opt-level 0, against the eager `fontdue::Font::from_bytes` it
-/// replaces:
+///  1. `ttf_parser::Face::parse(bytes, index)` returns `Err`;
+///  2. the `head` table declares a zero `units_per_em`.
 ///
-/// ```text
-///   Hiragino Sans GB.ttc  23.5 MB   admissible  203.4 ms   fontdue  1817.2 ms
-///   Arial Unicode.ttf     23.3 MB   admissible   24.5 ms   fontdue  1486.6 ms
-///   STIXTwoMath.otf        0.8 MB   admissible   24.9 ms   fontdue   135.1 ms
-///   Apple Symbols.ttf      0.9 MB   admissible    6.9 ms   fontdue    76.5 ms
-/// ```
+/// Both are read straight off the parsed face, so this is no longer an
+/// approximation of somebody else's behaviour — it is the same two conditions,
+/// asked cheaply. `admission_agrees_with_the_first_party_face` holds that as an
+/// equality over every real font on the machine, and
+/// `a_face_fontdue_rejected_is_admitted_and_draws` supplies the input that used
+/// to separate them.
 ///
-/// So the two chain candidates cost ~228 ms of validation instead of ~3304 ms of
-/// parsing (and they run concurrently, so ~203 ms of wall clock instead of
-/// ~1817 ms). A bare `ttf_parser::Face::parse` would be ~50 µs — that difference
-/// is exactly what buys back the admission strength, and it is why this is not
-/// simply `Face::parse(..).is_ok()`.
+/// The old third condition — "the face has no glyphs at all" — is gone because
+/// ttf-parser cannot represent it: `maxp.numGlyphs` is a `NonZeroU16` there, so
+/// a face declaring zero fails `Face::parse` with `NoMaxpTable` and is already
+/// refused by (1). `a_refused_face_leaves_no_bytes_in_the_discovery_store`
+/// builds exactly that face and holds the refusal.
 ///
-/// CAVEATS, stated rather than glossed. This is a REPLICATION of another crate's
-/// internals, and two gaps are known: the workspace links ttf-parser 0.25 while
-/// fontdue links 0.21, so step 1 is judged by a different parser version; and the
-/// GSUB arm of `indices_to_load` is not walked. Both can only make this predicate
-/// too PERMISSIVE, never too strict, which is why
-/// [`Renderer::retire_unparsable_fallback`] exists.
+/// # What this deleted
 ///
-/// Two tests hold it: `fontdue_admissible_agrees_with_fontdue_on_this_machines_fonts`
-/// checks it against fontdue itself over every real face it can reach (and MEASURED
-/// no disagreement, in either direction, over 33 of them — so that test alone does
-/// not prove the extra check does anything), and
-/// `admission_rejects_a_face_ttf_parser_accepts_but_fontdue_does_not` supplies the
-/// separating input that does.
-fn fontdue_admissible(bytes: &[u8], index: u32) -> bool {
-    let Ok(face) = ttf_parser::Face::parse(bytes, index) else {
-        return false;
-    };
-    let glyph_count = face.number_of_glyphs();
-    // `indices_to_load` always contains 0, so a face with no glyphs at all trips
-    // the same bound check inside fontdue.
-    if glyph_count == 0 {
-        return false;
-    }
-    let Some(cmap) = face.tables().cmap else {
-        return true; // no cmap: `indices_to_load` stays {0}, which is in range
-    };
-    let mut ok = true;
-    for subtable in cmap.subtables {
-        subtable.codepoints(|cp| {
-            if let Some(gid) = subtable.glyph_index(cp)
-                && gid.0 != 0
-                && gid.0 >= glyph_count
-            {
-                ok = false;
-            }
-        });
-        if !ok {
-            break;
-        }
-    }
-    ok
+/// The persistent verdict cache (`admission_cache.rs`, 306 lines, an on-disk
+/// file under `cache_dir` with its own `REPLAY_VERSION`) existed solely because
+/// the cmap walk above was the largest remaining cold-launch term. With the walk
+/// gone the verdict costs a table-directory parse — microseconds — and a cache
+/// keyed on `(path, mtime, size)` would be slower than the thing it cached, so
+/// it went with the walk.
+fn face_admissible(bytes: &[u8], index: u32) -> bool {
+    ttf_parser::Face::parse(bytes, index).is_ok_and(|face| face.units_per_em() > 0)
 }
 
-/// Whether `fontdue::Font::lookup_glyph_index(ch)` would answer NON-ZERO for the
+/// Whether `crate::font::Font::lookup_glyph_index(ch)` would answer NON-ZERO for the
 /// face at `index` in `bytes` — read off the cmap with ttf-parser, WITHOUT
 /// fontdue's parse.
 ///
@@ -3557,7 +3571,7 @@ fn fontdue_admissible(bytes: &[u8], index: u32) -> bool {
 /// deferring a parse is allowed to do. The routing lattice is proven against
 /// fontdue's answer, so fontdue's answer is what this reproduces.
 ///
-/// CAVEATS, in the same spirit as [`fontdue_admissible`]'s. The workspace links
+/// CAVEATS, in the same spirit as [`face_admissible`]'s. The workspace links
 /// ttf-parser 0.25 and fontdue links 0.21, so the cmap is read by a different
 /// parser version. Outside the format-2 domain check above, enumeration and
 /// querying can still differ for a format-4 subtable at `U+FFFF` (the segment
@@ -3701,7 +3715,7 @@ struct RuntimeFallback {
 /// source path (reuse key), and the normalization facts.
 #[derive(Clone)]
 struct RuntimeFace {
-    font: Option<std::sync::Arc<fontdue::Font>>,
+    font: Option<std::sync::Arc<crate::font::Font>>,
     bytes: std::sync::Arc<Vec<u8>>,
     index: u32,
     path: String,
@@ -3792,19 +3806,22 @@ impl RuntimeFallback {
                 self.failed_paths.insert(path);
                 continue;
             };
-            let font = fontdue::Font::from_bytes(
-                bytes.as_slice(),
-                fontdue::FontSettings {
+            let norm = face_norm_facts(&bytes, index);
+            // Intern FIRST, then parse from the interned handle: the parsed face
+            // retains the file, so parsing from the slice would leave a
+            // discovered CJK face resident twice.
+            let bytes = intern_font_bytes(bytes);
+            let font = crate::font::Font::from_shared_vec(
+                bytes.clone(),
+                crate::font::FontSettings {
                     collection_index: index,
-                    ..Default::default()
                 },
             )
             .ok()
             .map(std::sync::Arc::new);
-            let norm = face_norm_facts(&bytes, index);
             let face = RuntimeFace {
                 font,
-                bytes: intern_font_bytes(bytes),
+                bytes,
                 index,
                 path,
                 norm,
@@ -3853,14 +3870,18 @@ impl RuntimeFallback {
             let key = Self::EMBEDDED_SYMBOLS_PATH;
             if !self.faces.iter().any(|f| f.path == key) {
                 let bytes = embedded_symbols_font().to_vec();
-                let font =
-                    fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
-                        .ok()
-                        .map(std::sync::Arc::new);
                 let norm = face_norm_facts(&bytes, 0);
+                // Interned before the parse, for the reason `discover` gives.
+                let bytes = intern_font_bytes(bytes);
+                let font = crate::font::Font::from_shared_vec(
+                    bytes.clone(),
+                    crate::font::FontSettings::default(),
+                )
+                .ok()
+                .map(std::sync::Arc::new);
                 self.faces.push(RuntimeFace {
                     font,
-                    bytes: intern_font_bytes(bytes),
+                    bytes,
                     index: 0,
                     path: key.to_string(),
                     norm,
@@ -3916,7 +3937,7 @@ impl RuntimeFallback {
         &self,
         ch: char,
     ) -> Option<(
-        Option<std::sync::Arc<fontdue::Font>>,
+        Option<std::sync::Arc<crate::font::Font>>,
         std::sync::Arc<Vec<u8>>,
         u32,
         FaceNorm,
@@ -4042,7 +4063,7 @@ const RUNTIME_FALLBACK_PROBE_PX: f32 = 16.0;
 /// those and move to the next candidate. (A space-like glyph would also be
 /// empty, but the resolver is only ever asked about non-space code points the
 /// configured faces missed.)
-fn face_can_render(face: &fontdue::Font, ch: char) -> bool {
+fn face_can_render(face: &crate::font::Font, ch: char) -> bool {
     if face.lookup_glyph_index(ch) == 0 {
         return false;
     }
@@ -4261,7 +4282,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     //
     // The chain is normally TWO faces on macOS — Hiragino Sans GB (23.5 MB) then
     // Arial Unicode (23.3 MB). This function USED to fontdue-parse both here, which
-    // eagerly converts every glyph outline (29,352 + 50,377 of them): measured on
+    // eagerly converted every glyph outline (29,352 + 50,377 of them): measured on
     // this machine 1799 ms + 1438 ms at opt-level 0, and that was the whole of
     // `seal_admitted_font_sources`, which is the whole of the backend-build thread,
     // which is what window attach blocks on before the first frame. Threading the
@@ -4269,12 +4290,14 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     // (`FallbackFace::from_path_bytes`) removes them from startup altogether.
     //
     // What is left per candidate is the file read (1.8 ms + 1.3 ms warm-cache when
-    // the predecessor change measured them) plus the `fontdue_admissible` cmap walk
-    // that keeps admission as strong as the parse it replaced — MEASURED here at
-    // 203.4 ms + 24.5 ms, opt-level 0. That is a real cost, and it is why the scope
-    // stays: those two are the dominant remaining term, they are independent, and
-    // they still overlap. Keeping the shape identical also keeps the scan-rule
-    // argument below unchanged.
+    // the predecessor change measured them) plus `face_admissible`, which is now
+    // a table-directory parse and two field reads — microseconds. It used to be a
+    // whole cmap walk (203.4 ms + 24.5 ms here, opt-level 0) replaying fontdue's
+    // out-of-range failure mode, and that walk is what the deleted
+    // `admission_cache` existed to amortize; retiring fontdue retired the failure
+    // mode, the walk and the cache together. The scope stays anyway: the two
+    // reads are independent and still overlap, and keeping the shape identical
+    // keeps the scan-rule argument below unchanged.
     //
     // THE SCAN RULE IS PRESERVED EXACTLY, because it decides which faces exist:
     // additive entries keep the scan going, the first NON-additive face that LOADS
@@ -4344,10 +4367,6 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
             break;
         }
     }
-    // The verdicts this scan just derived persist NOW, not at the next batch
-    // boundary: the chain build is the scan's natural completion, and a
-    // tail smaller than the flush batch would otherwise re-derive next launch.
-    admission_cache::flush_pending();
     chain
 }
 
@@ -4792,6 +4811,129 @@ pub fn clamp_to_row_band(top: i32, height: usize, band_h: usize) -> (usize, usiz
 #[must_use]
 pub fn clamp_to_col_band(left: i32, width: usize, band_w: usize) -> (usize, usize) {
     clamp_to_band(left, width, band_w)
+}
+
+/// The first and last-plus-one rows of a `height`-row raster that actually
+/// carry coverage, or `None` for a blank one. `row_has_ink` is asked at most
+/// once per row from each end.
+///
+/// THE INK IS NOT THE BOX. Two of this crate's three raster paths return a
+/// bitmap deliberately LARGER than the glyph: macOS CoreText pads the ink box
+/// by 1px per side (2 when `font_thicken` is on) plus a phase row
+/// ([`ct_padded_extent`]), and [`crate::subpixel`] widens by 1px per side for
+/// the FIR5 filter spread — while [`crate::variation`] crops its own
+/// [`crate::variation::RASTER_PAD`] back off before it reports. So the
+/// reported `(height, ymin)` box overhangs the real ink by a pixel or three on
+/// the padded paths and not at all on the cropped one. Any rule that reads
+/// glyph POSITION off the box therefore says different things about the same
+/// character on different paths — which is exactly the seam
+/// [`seat_ink_on_the_cell_floor`] exists to close, so it reads the ink.
+fn ink_row_extent(height: usize, row_has_ink: impl Fn(usize) -> bool) -> Option<(usize, usize)> {
+    let first = (0..height).find(|&y| row_has_ink(y))?;
+    let last = (first..height).rev().find(|&y| row_has_ink(y))?;
+    Some((first, last + 1))
+}
+
+/// Seat a glyph whose INK hangs past the CELL FLOOR back inside its own cell by
+/// raising it, instead of letting the blit's band clip eat the whole character.
+///
+/// `ink` is the `(first, last + 1)` row extent from [`ink_row_extent`]; the
+/// answer is the new `ymin`, or `None` to leave the raster where the font put
+/// it.
+///
+/// # What has to be rescued, and what must not be moved
+///
+/// A face may draw `_` with its ink sitting exactly ON the descent line (DejaVu
+/// Sans Mono does — the underscore's `yMin` equals hhea's `descender` to the
+/// font unit), and `cell_h` is a ROUNDED `ascent - descent + line_gap` while
+/// `baseline` rounds independently, so at roughly every other size the cell is
+/// a pixel short of holding both. The underscore then lands below its own floor
+/// and the terminal renders `foo_bar` as `foo bar` — measured on the shipped
+/// Linux build at the DEFAULT `font_px = 15`, and re-measured here on macOS with
+/// the embedded face, where `_` laid 90 units of ink against the hyphen's 1137
+/// (8%, nine pixels of antialiasing fringe) and read as blank, while 12, 16, 20
+/// and 24px drew it whole. A size the user never chose is not allowed to decide
+/// whether a character exists.
+///
+/// A DESCENDER is the opposite case and must NOT be moved. `row_scale` states
+/// that law already: "some faces let a descender raster overshoot `ch` by a
+/// pixel… clipping at the band edge in this SHARED helper makes both renderers
+/// drop the spill by construction". Trimming the last antialiased row off a
+/// `g`'s tail costs a pixel; lifting the `g` off the line the rest of the word
+/// stands on costs the typography — measured with the box rule in place, `g`,
+/// `y` and `p` were drawn one to two rows ABOVE `a`, `n` and `x` at 13, 14, 15
+/// and 18px, and the lift also carried the tail out of the descender ink-skip
+/// probe's band (`tests/deco_lines.rs::
+/// latin_descender_skip_survives_the_wide_glyph_exemption`).
+///
+/// # The predicate, and why it is exact rather than a threshold
+///
+/// The rows a character can be READ in are the ones above the baseline and
+/// inside the floor. Any ink there survives the floor clip untouched, so a
+/// glyph holding ink there CANNOT be erased by the clip — the clip can only
+/// trim its tail. The glyphs a floor clip can erase are therefore exactly the
+/// ones whose ink lies wholly below the baseline: `_`, the combining low line,
+/// the marks-below. Those have no body on the line to be misaligned against,
+/// which is why seating them is free. That is a proof, not a threshold, so
+/// nothing sits on rasterizer hinting noise. (`min(baseline, floor)` keeps the
+/// predicate total for a degenerate cell whose baseline lands past its own
+/// floor: there, "readable" runs out at the floor.)
+///
+/// Only ever moves ink UP, never past the cell ceiling (`ink_h <= cell_h` gives
+/// the seated top `floor - ink_h >= 0`), and never touches a glyph whose ink
+/// already sits inside its cell. Ink TALLER than the cell has no seat to be
+/// moved into and is left to the blit's band clip.
+///
+/// THE ARITHMETIC LIVES HERE, ONCE, because Linux rasterizes the same glyph
+/// through a second cache: the subpixel path keeps its own images, and a seat
+/// applied to only one of them leaves the underscore visible in grayscale and
+/// invisible under `ATERM_FONT_SUBPIXEL` — the same character, the same size,
+/// two answers. Both callers ask this — and both hand it INK, which is what
+/// makes the two answers equal: the subpixel raster carries a filter pad its
+/// grayscale twin crops off, so a box-measured seat gives the two caches
+/// different `ymin`s for one character and re-opens the very seam it closed.
+fn seated_ymin(
+    ink: (usize, usize),
+    height: usize,
+    ymin: i32,
+    baseline: i32,
+    cell_h: usize,
+) -> Option<i32> {
+    let floor = i32::try_from(cell_h).ok()?;
+    let (first, last) = ink;
+    if first >= last || last > height {
+        return None;
+    }
+    // Bitmap row 0 in cell coordinates — the blit's own anchor
+    // (`baseline - height - ymin`, see `Renderer::blit`).
+    let gy0 = baseline - i32::try_from(height).ok()? - ymin;
+    let ink_top = gy0 + i32::try_from(first).ok()?;
+    let ink_bottom = gy0 + i32::try_from(last).ok()?;
+    let readable = baseline.min(floor);
+    (ink_bottom > floor && ink_top >= readable && last - first <= cell_h)
+        .then_some(ymin + (ink_bottom - floor))
+}
+
+fn seat_ink_on_the_cell_floor(img: &mut GlyphImage, baseline: i32, cell_h: usize) {
+    let (w, h) = (img.width(), img.height());
+    let Some(ink) = (match img {
+        GlyphImage::Mono { bytes, .. } => ink_row_extent(h, |y| {
+            bytes
+                .get(y * w..(y + 1) * w)
+                .is_some_and(|r| r.iter().any(|&a| a > 0))
+        }),
+        GlyphImage::Rgba { bytes, .. } => ink_row_extent(h, |y| {
+            bytes
+                .get(y * w * 4..(y + 1) * w * 4)
+                .is_some_and(|r| r.as_chunks::<4>().0.iter().any(|px| px[3] > 0))
+        }),
+    }) else {
+        return;
+    };
+    let (GlyphImage::Mono { height, ymin, .. } | GlyphImage::Rgba { height, ymin, .. }) = img;
+    if let Some(seated) = seated_ymin(ink, *height, *ymin, baseline, cell_h) {
+        *ymin = seated;
+    }
 }
 
 /// Shared core of the two band clamps (W8 (f) rows, W8 (h) columns): given an
@@ -6328,7 +6470,8 @@ pub fn face_info(family: &str) -> Option<FaceInfo> {
     let path = resolve_font_family(family)?;
     let bytes = font_file::read_font_file(std::path::Path::new(&path)).ok()?;
     let font =
-        fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()).ok()?;
+        crate::font::Font::from_bytes(bytes.as_slice(), crate::font::FontSettings::default())
+            .ok()?;
     let lm = font.horizontal_line_metrics(FaceInfo::PROBE_PX)?;
     let adv = font.metrics('M', FaceInfo::PROBE_PX).advance_width;
     // Glyph count from the font's glyph table (ttf-parser is already a dependency,
@@ -6632,8 +6775,9 @@ impl Renderer {
     }
 
     pub fn set_fallback_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // Interned: a ~370MB parsed broad fallback is shared across panes injecting
-        // the same bytes (every terminal pane injects the same OS fallback).
+        // Interned: a parsed broad fallback (and its file) is shared across panes
+        // injecting the same bytes (every terminal pane injects the same OS
+        // fallback).
         let face = FallbackFace::from_bytes(bytes, None)?;
         self.fallback_chain.clear();
         self.fallback_chain.push(face);
@@ -6732,10 +6876,16 @@ impl Renderer {
     /// (synthetic or a previously-injected face) is left untouched. Drops the styled
     /// key cache so already-resolved bold cells re-route to the new face.
     pub fn set_bold_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-            .map_err(|e| e.to_string())?;
+        // One copy of the blob, shared by the parsed face and the retained
+        // handle: the face reads outlines on demand and so holds the file.
+        let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+        let font = crate::font::Font::from_shared_slice(
+            owned.clone(),
+            crate::font::FontSettings::default(),
+        )
+        .map_err(|e| e.to_string())?;
         self.bold_font = Some(font);
-        self.bold_font_bytes = Some(std::sync::Arc::from(bytes));
+        self.bold_font_bytes = Some(owned);
         // Bold cells resolved before this point chose the primary/sibling face; drop
         // those decisions + the per-char bold-gid memo so they re-route.
         self.bold_gid_cache.clear();
@@ -6774,11 +6924,15 @@ impl Renderer {
         // EAGER, like `FallbackFace::from_bytes`: injection is a host API whose
         // contract is "a bad blob fails loudly AT THE CALL, never later", so an
         // injected face must never be the one that parses mid-frame.
-        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-            .map_err(|e| e.to_string())?;
+        let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+        let font = crate::font::Font::from_shared_slice(
+            owned.clone(),
+            crate::font::FontSettings::default(),
+        )
+        .map_err(|e| e.to_string())?;
         self.styled_faces[slot] = Some(StyledFace {
             font: LazyFontdue::ready(std::sync::Arc::new(font)),
-            bytes: std::sync::Arc::from(bytes),
+            bytes: owned,
             index: 0,
             gid_cache: FxHashMap::default(),
             id: next_styled_face_id(),
@@ -7679,15 +7833,11 @@ impl Renderer {
                 // they are one COPY as well.
                 //
                 // ADMISSION IS NOT WEAKENED, exactly as on the fallback tier:
-                // `fontdue_admissible` replays fontdue's own failure modes over
-                // the bytes, so a face fontdue would REJECT cannot take a slot and
-                // silently turn a synthetic style into a wrong one.
+                // `face_admissible` asks what the parse itself can refuse, so a
+                // face the renderer cannot open never takes a slot and silently
+                // turns a synthetic style into a wrong one.
                 if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p))
-                    // Path-backed, so the verdict comes from the persistent
-                    // admission cache (mtime+size identity) before paying the
-                    // cmap walk — the same deal `FallbackFace::from_path_bytes`
-                    // makes, and the reason the walk is not a new startup cost.
-                    && admission_cache::admissible_cached(&p, 0, || fontdue_admissible(&bytes, 0))
+                    && face_admissible(&bytes, 0)
                 {
                     self.styled_faces[slot] = Some(StyledFace {
                         font: LazyFontdue::deferred(),
@@ -8086,12 +8236,16 @@ impl Renderer {
         self.rasterizer == RasterKind::CoreText
     }
 
-    /// TEST/DEBUG: force the deterministic fontdue rasterizer on this renderer
+    /// TEST/DEBUG: force the deterministic PORTABLE rasterizer on this renderer
     /// (no process-global env var, so it can't race other tests). On macOS it
     /// switches off the CoreText backend; on Linux and Windows it switches off
-    /// the grid-fitted [`hinted`] path — either way the portable fontdue
+    /// the grid-fitted [`hinted`] path — either way [`crate::font::Font`]'s
     /// bytes are what rasterize afterwards. No-op on the remaining targets
-    /// (wasm), where fontdue is already the only backend.
+    /// (wasm), where the portable path is already the only backend.
+    ///
+    /// The NAME is the legacy one, for the same reason `ATERM_RASTERIZER=fontdue`
+    /// still works: 13 call sites across the workspace's test suites use it, and
+    /// renaming them would be churn with no reader on the other end.
     #[doc(hidden)]
     pub fn debug_force_fontdue(&mut self) {
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
@@ -8439,6 +8593,19 @@ impl Renderer {
         // The aesthetic stem LUT applies per channel byte — identity by
         // default on Linux, but the operator knob must not silently die here.
         stem_darken(&mut b3, &self.stem_lut);
+        // Seat the ink the same way the grayscale cache does. This raster is a
+        // SECOND home for the same glyph, so a rule applied to only one of them
+        // makes the subpixel switch change what a character looks like — and
+        // the seat is measured on INK, never on the box, precisely because the
+        // two homes carry different padding: this raster keeps the 1px FIR5
+        // filter pad in its reported box, while `variation::crop_padded_coverage`
+        // takes the grayscale twin's pad back off. Equal ink, equal seat.
+        let ymin = ink_row_extent(height, |y| {
+            b3.get(y * width * 3..(y + 1) * width * 3)
+                .is_some_and(|row| row.iter().any(|&v| v > 0))
+        })
+        .and_then(|ink| seated_ymin(ink, height, ymin, self.baseline, self.cell_h))
+        .unwrap_or(ymin);
         Some(SubpxImage {
             width,
             height,
@@ -8474,7 +8641,7 @@ impl Renderer {
         ch: char,
     ) -> (usize, usize, i32, i32, f32, Vec<u8>) {
         // The fontdue face travels as an UNMATERIALISED handle (`LazyFontdue`, an
-        // `Arc` clone), not a parsed `Arc<fontdue::Font>`: on the default macOS
+        // `Arc` clone), not a parsed `Arc<crate::font::Font>`: on the default macOS
         // path CoreText below draws from the bytes and the handle is never opened,
         // so recovering the face here must not be what triggers a 1.4-second parse.
         #[allow(clippy::type_complexity)]
@@ -8559,10 +8726,9 @@ impl Renderer {
             //  * a CT-only runtime face (`font == None`) under the fontdue
             //    backend — honest `.notdef` rather than fake blank coverage,
             //    unchanged;
-            //  * a CHAIN face whose DEFERRED fontdue parse just FAILED. It was
-            //    admitted by `fontdue_admissible`, a replication of another
-            //    crate's internals that can only err PERMISSIVELY, so this is
-            //    the case that has to be caught rather than assumed away: left
+            //  * a CHAIN face whose DEFERRED parse just FAILED. Admission asks
+            //    exactly what that parse can refuse, so this is unreachable by
+            //    construction — and still caught rather than assumed away: left
             //    in place the face would keep shadowing the entries behind it
             //    (`fallback_pick` points at it, and it may have ended the
             //    candidate scan). Retire it, re-probe `ch` against the shortened
@@ -8588,10 +8754,13 @@ impl Renderer {
     /// Drop the chain entry backed by `bytes` because its DEFERRED fontdue parse
     /// failed, returning whether an entry was actually removed.
     ///
-    /// This is the second line of defence behind [`fontdue_admissible`]. Under the
-    /// eager parse this state was unreachable — a face fontdue rejected never
-    /// entered the chain — so the deferred parse must be able to reach the same
-    /// outcome, not merely render tofu from a face it cannot draw.
+    /// This is the second line of defence behind [`face_admissible`]. It was
+    /// load-bearing while admission REPLICATED fontdue's failure modes and could
+    /// only err permissively; now that admission asks exactly the conditions
+    /// `crate::font::Font::from_bytes` can fail on, it is unreachable by
+    /// construction. It stays because the alternative to a cheap unreachable
+    /// branch is a chain entry that shadows every face behind it while drawing
+    /// nothing, and because "unreachable" is a claim about today's code.
     ///
     /// The per-char memos are dropped exactly as [`Self::set_fallback_bytes`]
     /// drops them, and for the same reason: `fallback_pick` holds INDICES into the
@@ -8869,12 +9038,12 @@ impl Renderer {
             if self.styled_faces[slot].is_some() {
                 continue;
             }
-            // Deferred parse + `fontdue_admissible` admission, exactly as the
+            // Deferred parse + `face_admissible` admission, exactly as the
             // sibling-FILE scan above: these are the same discovery, and an Apple
             // `.ttc` costs three MORE full-face parses at seal for styles the
             // session may never draw. `ttf_parser::Face::parse` already succeeded
             // above, so this only adds fontdue's own bound check.
-            if fontdue_admissible(bytes, i) {
+            if face_admissible(bytes, i) {
                 self.styled_faces[slot] = Some(StyledFace {
                     font: LazyFontdue::deferred(),
                     bytes: bytes.clone(),
@@ -10626,7 +10795,7 @@ impl Renderer {
     pub fn set_font_hinting(&mut self, mode: &str) -> bool {
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
-            let mode = if hinted::HintMode::fontdue_forced() {
+            let mode = if hinted::HintMode::portable_forced() {
                 hinted::HintMode::Off
             } else {
                 hinted::HintMode::parse(mode)
@@ -10704,7 +10873,7 @@ impl Renderer {
     pub fn set_font_subpixel(&mut self, mode: &str) -> bool {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            let mode = if hinted::HintMode::fontdue_forced() {
+            let mode = if hinted::HintMode::portable_forced() {
                 subpixel::SubpixelMode::Off
             } else {
                 subpixel::SubpixelMode::parse(mode)
@@ -11100,7 +11269,8 @@ impl Renderer {
     /// can match pixel-for-pixel without duplicating the font logic/fallback.
     pub fn glyph_image(&mut self, key: GlyphKey) -> &GlyphImage {
         if !self.glyphs.contains_key(&key) {
-            let img = self.rasterize(key);
+            let mut img = self.rasterize(key);
+            seat_ink_on_the_cell_floor(&mut img, self.baseline, self.cell_h);
             self.glyphs.insert(key, img);
         }
         &self.glyphs[&key]
@@ -11663,10 +11833,10 @@ impl Renderer {
                     //
                     // `gid` was SHAPED ON THE PICKED STYLED FACE, so it means
                     // nothing anywhere else: the primary's glyph number `gid` is a
-                    // DIFFERENT letter. `fontdue_admissible` can err PERMISSIVELY,
-                    // so a slot whose deferred parse fails here has to be caught
-                    // rather than assumed away — and the only honest raster for a
-                    // glyph id whose face cannot be opened is NO INK.
+                    // DIFFERENT letter. A slot whose deferred parse fails here is
+                    // unreachable now that admission is exact, but it is still
+                    // caught rather than assumed away — and the only honest raster
+                    // for a glyph id whose face cannot be opened is NO INK.
                     //
                     // REFUSED, NOT RE-DRAWN. Retiring the slot and re-entering
                     // `rasterize(key)` would be the bug this guard exists to
@@ -20911,6 +21081,12 @@ pub fn ribbon_profile(d: f32, core: f32, reach: f32, shoulder: f32) -> f32 {
     // where the first argument is >= 1) and the outside (`d >= reach`, where it
     // is <= 0) need no branch of their own.
     let melt = smoothstep01((reach - d) / (reach - core));
+    // The tall highlighter holds the full shoulder. Its bump coefficient is
+    // exactly zero, so evaluating the second smoothstep cannot affect a byte
+    // and only spends a division on every emitted device row.
+    if shoulder == 1.0 {
+        return melt;
+    }
     let bump = smoothstep01((core - d) / core.max(f32::MIN_POSITIVE));
     melt * (shoulder + (1.0 - shoulder) * bump)
 }
@@ -21005,7 +21181,11 @@ pub fn ribbon_lift_profile(d: f32, core_up: f32, dn: f32) -> f32 {
     if d.is_nan() {
         return 0.0;
     }
-    let span = if d < 0.0 { core_up - 1.0 } else { dn * RIBBON_LIFT_DN_SHARE };
+    let span = if d < 0.0 {
+        core_up - 1.0
+    } else {
+        dn * RIBBON_LIFT_DN_SHARE
+    };
     if !span.is_finite() || span <= 0.0 {
         return 0.0;
     }
@@ -21093,11 +21273,25 @@ pub fn ribbon_beam(
                 let color = lerp_rgb_f(a.color, b.color, t);
                 let y0 = top.floor() as i32;
                 let y1 = bot.ceil() as i32;
+                let dither_x = p.div_euclid(step).rem_euclid(4) as usize;
+                // Every ribbon sample is exactly one integer device row, so it
+                // can never cross a grid-row boundary. Resolve the slab's X
+                // clip and the first row tag once here instead of sending each
+                // of ~6,600 hot rows through the generic rectangle splitter.
+                let rect_x0 = p.max(clip.x0);
+                let rect_x1 = (p + len).min(clip.x1);
+                let mut row_rel = (y0 - clip.origin_y).div_euclid(clip.cell_h);
+                let mut band_end = clip.origin_y + (row_rel + 1) * clip.cell_h;
                 for y in y0..y1 {
-                    // `push_glow_rect` may split at a geometry row edge, so keep
-                    // a conservative two-quad admission check.
+                    // Preserve the historical generic splitter's conservative
+                    // two-quad admission check even though this 1px row can
+                    // emit at most one.
                     if out.len() + 2 > max_quads {
                         return false;
+                    }
+                    if y >= band_end {
+                        row_rel += 1;
+                        band_end += clip.cell_h;
                     }
                     let lo = (y as f32).max(top);
                     let hi = ((y + 1) as f32).min(bot);
@@ -21115,7 +21309,11 @@ pub fn ribbon_beam(
                     // profile: it is zero wherever the base profile is behind
                     // letterforms, so the certified pair `(colour, cov)` is what
                     // lands there and only the leading is brighter.
-                    let level = cov * across + lift * ribbon_lift_profile(d, core_up, dn);
+                    let level = if lift == 0.0 {
+                        cov * across
+                    } else {
+                        cov * across + lift * ribbon_lift_profile(d, core_up, dn)
+                    };
                     // THE ORDERED DITHER, at the last truncation in the whole
                     // design (see [`BAYER4`]). The offset is under one level, so
                     // a request already clamped at its cap still truncates to
@@ -21133,21 +21331,23 @@ pub fn ribbon_beam(
                     // is pinned to cell boundaries — so the pattern cannot crawl
                     // as the mark moves, which is the artifact ordered dithering
                     // exists to avoid.
-                    let c = (level * cover + bayer4_at(p.div_euclid(step), y)) as u8;
+                    let c = (level * cover + BAYER4[y.rem_euclid(4) as usize][dither_x]) as u8;
                     if c > 0 {
-                        push_glow_rect(
-                            out,
-                            clip,
-                            p,
-                            y,
-                            len,
-                            1,
-                            premul_rgb(color, c),
-                            match blend {
-                                GlowBlend::Add => 0,
-                                GlowBlend::Over => c,
-                            },
-                        );
+                        let premul = premul_rgb(color, c);
+                        if premul != 0 && rect_x1 > rect_x0 && y >= clip.y0 && y < clip.y1 {
+                            out.push(GlowQuad {
+                                row: row_rel.max(0) as u16,
+                                x: rect_x0 as u16,
+                                y: y as u16,
+                                w: (rect_x1 - rect_x0) as u16,
+                                h: 1,
+                                color: premul,
+                                alpha: match blend {
+                                    GlowBlend::Add => 0,
+                                    GlowBlend::Over => c,
+                                },
+                            });
+                        }
                     }
                 }
             }
@@ -22201,7 +22401,7 @@ mod tests {
     /// [`DISCOVERED_FONT_BYTES`] has no eviction — it is a `Vec<Arc<Vec<u8>>>`
     /// that only ever grows, by design, because a discovered face is process-wide
     /// and permanent. `from_path_bytes` used to publish into it BEFORE asking
-    /// `fontdue_admissible`, so a refused candidate's whole file stayed resident
+    /// `face_admissible`, so a refused candidate's whole file stayed resident
     /// for the life of the process with no handle to it and no path back. Every
     /// built-in Windows candidate is admissible on this host, so the cost here is
     /// zero — which is exactly when the hole is cheap to close; the reachable case
@@ -22209,11 +22409,18 @@ mod tests {
     /// not, and it is a whole font file per reload.
     #[test]
     fn a_refused_face_leaves_no_bytes_in_the_discovery_store() {
-        // The one input class that separates `fontdue_admissible` from a bare
-        // `ttf_parser::Face::parse` — the same fixture the admission gate uses.
+        // A face admission REFUSES. `maxp.numGlyphs = 0` is unrepresentable in
+        // ttf-parser (the field is a `NonZeroU16`), so `Face::parse` fails with
+        // `NoMaxpTable` — which is condition (1) of `face_admissible`, and the
+        // cheapest honest way to build a file that reads as a font and is not
+        // one.
         let patched = std::sync::Arc::new(
-            patch_num_glyphs(embedded_symbols_font(), 1)
+            patch_num_glyphs(embedded_symbols_font(), 0)
                 .expect("the bundled symbols face has a maxp table"),
+        );
+        assert!(
+            !face_admissible(&patched, 0),
+            "fixture guard: admission must actually refuse this face"
         );
         assert!(
             !discovered_font_bytes_contains(patched.as_slice()),
@@ -22662,7 +22869,6 @@ mod tests {
         // Adding nothing is a no-op (idle aurora = byte-identical).
         assert_eq!(add_sat(0x00AB_CDEF, 0), 0x00AB_CDEF);
     }
-
 
     /// [`over_premul`] IS [`add_sat`] AT `alpha == 0` — the property the whole
     /// per-quad [`GlowQuad::alpha`] design rests on, proved EXHAUSTIVELY over
@@ -25557,7 +25763,7 @@ mod tests {
         );
     }
 
-    /// The second line of defence behind `fontdue_admissible`: a styled slot
+    /// The second line of defence behind `face_admissible`: a styled slot
     /// whose DEFERRED parse turns out to FAIL must be retired, not left to hand
     /// the by-ID raster path gids only that face owns. Retiring drops the slot
     /// and every memo taken against it, and bumps the font epoch.
@@ -25573,7 +25779,7 @@ mod tests {
             eprintln!("SKIP: no real -Bold sibling on this machine");
             return;
         };
-        // `fontdue_admissible` is written so this verdict is unreachable from
+        // `face_admissible` is written so this verdict is unreachable from
         // real bytes, so the retire path can only be exercised by manufacturing it.
         sf.font = LazyFontdue::failed_parse();
         let epoch = r.font_epoch;
@@ -25691,7 +25897,7 @@ mod tests {
             eprintln!("SKIP: the -Bold sibling has no 'A'");
             return;
         };
-        // Manufactured: `fontdue_admissible` is written so real bytes cannot
+        // Manufactured: `face_admissible` is written so real bytes cannot
         // produce this verdict.
         sf.font = LazyFontdue::failed_parse();
 
@@ -25810,7 +26016,7 @@ mod tests {
             eprintln!("SKIP: the -Bold sibling has no 'A'");
             return;
         };
-        // Manufactured: `fontdue_admissible` is written so real bytes cannot
+        // Manufactured: `face_admissible` is written so real bytes cannot
         // produce this verdict.
         sf.font = LazyFontdue::failed_parse();
         let doomed_id = sf.id;
@@ -26227,19 +26433,23 @@ mod tests {
         );
     }
 
-    /// DEFECT 3, PART ONE — ADMISSION IS NOT WEAKENED. `fontdue_admissible` is
-    /// what stops a face `fontdue::Font::from_bytes` would REJECT from entering
-    /// the chain now that admission no longer runs that constructor. It replays
-    /// fontdue 0.9.3's two failure modes from ttf-parser alone, which is a
-    /// replication of another crate's internals across a ttf-parser major
-    /// version — so it is checked EMPIRICALLY, against fontdue itself, over the
-    /// real faces on this machine.
+    /// ADMISSION IS NOT WEAKENED — and since `fontdue` was retired it is no
+    /// longer even an approximation. `face_admissible` is what stops a face the
+    /// renderer cannot parse from entering the chain now that admission does
+    /// not run the constructor itself; the property it must have is that it
+    /// answers EXACTLY what [`crate::font::Font::from_bytes`] would, so a chain
+    /// entry can never fail to materialise.
+    ///
+    /// Checked empirically over the real faces on this machine, because the two
+    /// are written separately (one reads two fields off a parsed face, the other
+    /// walks the cmap and builds tables) and only a measurement can say they
+    /// stayed in step.
     ///
     /// Bounded on purpose: every built-in fallback/symbol candidate that exists
-    /// (those are the faces that actually matter, and the ones that cost seconds
-    /// to parse), plus a sample of small system faces.
+    /// (those are the faces that actually matter, and the ones that cost the
+    /// most to parse), plus a sample of small system faces.
     #[test]
-    fn fontdue_admissible_agrees_with_fontdue_on_this_machines_fonts() {
+    fn admission_agrees_with_the_first_party_face() {
         let mut paths: Vec<String> = present_fallback_paths();
         paths.extend(
             symbol_discovery_paths()
@@ -26262,18 +26472,20 @@ mod tests {
             let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
                 continue;
             };
-            let predicted = fontdue_admissible(&bytes, 0);
-            let actual =
-                fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
-                    .is_ok();
+            let predicted = face_admissible(&bytes, 0);
+            let actual = crate::font::Font::from_bytes(
+                bytes.as_slice(),
+                crate::font::FontSettings::default(),
+            )
+            .is_ok();
             assert_eq!(
                 predicted, actual,
-                "fontdue_admissible disagreed with fontdue for {p}"
+                "face_admissible disagreed with the face it admits, for {p}"
             );
             checked += 1;
         }
         assert!(checked > 0, "no font file was readable to check against");
-        eprintln!("fontdue_admissible agreed with fontdue on {checked} face(s)");
+        eprintln!("admission agreed with the first-party face on {checked} face(s)");
     }
 
     /// The coverage index now walks every system font through TWO shared scratch
@@ -26332,8 +26544,10 @@ mod tests {
     }
 
     /// Rewrite `maxp.numGlyphs` in a copy of `bytes`. Used only to manufacture
-    /// the ONE input class that separates `fontdue_admissible` from a bare
-    /// `ttf_parser::Face::parse`.
+    /// corrupt faces: `0` is unrepresentable in ttf-parser and so fails
+    /// `Face::parse` (the admission-refusal fixture), while `1` is the face
+    /// whose cmap points past its own end that `fontdue` refused outright and
+    /// the first-party face loads (`a_face_fontdue_rejected_is_admitted_and_draws`).
     fn patch_num_glyphs(bytes: &[u8], n: u16) -> Option<Vec<u8>> {
         let num_tables = u16::from_be_bytes([*bytes.get(4)?, *bytes.get(5)?]) as usize;
         for i in 0..num_tables {
@@ -26349,40 +26563,72 @@ mod tests {
         None
     }
 
-    /// DEFECT 3, PART ONE, NON-VACUOUSLY. The agreement test above only proves
-    /// `fontdue_admissible` is not too STRICT — every real face on this machine
-    /// happens to satisfy both parsers, so a bare `ttf_parser::Face::parse`
-    /// would pass it too. This is the input class that actually separates them:
-    /// a face whose `cmap` maps code points to glyph ids past `maxp.numGlyphs`,
-    /// which ttf-parser ACCEPTS and `fontdue::Font::from_bytes` REJECTS
-    /// ("Attempted to map a codepoint out of bounds."). Admission must reject
-    /// it, or a face fontdue cannot rasterize enters the chain — where it can
-    /// shadow a good entry AND, being non-tier, end the candidate scan.
+    /// THE FACE FONTDUE REFUSED, NOW ADMITTED — and drawing.
+    ///
+    /// This fixture used to be the separating input for the admission gate: a
+    /// face whose `cmap` maps code points to glyph ids past `maxp.numGlyphs`,
+    /// which ttf-parser accepts and `fontdue::Font::from_bytes` REJECTS outright
+    /// ("Attempted to map a codepoint out of bounds."), taking the whole file
+    /// down with it. Admission existed to keep such a face out of the chain,
+    /// because fontdue could not rasterize a single glyph of it.
+    ///
+    /// [`crate::font::Font`] has no such cliff: an out-of-range mapping is
+    /// dropped as the cmap map is built and an out-of-range glyph id is refused
+    /// at the raster, so the face LOADS and every glyph it really has still
+    /// draws. The test therefore inverts — it is now a regression guard that a
+    /// truncated-`maxp` font (a real corruption class, and one a hostile font
+    /// could aim at a terminal) costs a few missing glyphs rather than a refused
+    /// face or a panic.
+    ///
+    /// fontdue is still consulted, as the statement of what changed.
     #[test]
-    fn admission_rejects_a_face_ttf_parser_accepts_but_fontdue_does_not() {
+    fn a_face_fontdue_rejected_is_admitted_and_draws() {
         let patched = patch_num_glyphs(embedded_symbols_font(), 1)
             .expect("the bundled symbols face has a maxp table");
         assert!(
-            ttf_parser::Face::parse(&patched, 0).is_ok(),
-            "the separating input must still be a face ttf-parser ACCEPTS \
-             (otherwise this proves nothing about the extra check)"
-        );
-        assert!(
             fontdue::Font::from_bytes(patched.as_slice(), fontdue::FontSettings::default())
                 .is_err(),
-            "the separating input must be one fontdue REJECTS"
+            "fixture guard: this input must still be one fontdue REJECTS, or the \
+             test is no longer about the change it documents"
         );
         assert!(
-            !fontdue_admissible(&patched, 0),
-            "admission must reject what the deferred fontdue parse would reject"
+            face_admissible(&patched, 0),
+            "admission must accept what the first-party face can parse"
         );
+        let font =
+            crate::font::Font::from_bytes(patched.as_slice(), crate::font::FontSettings::default())
+                .expect("the first-party face parses what fontdue refused");
+        // Every cmap entry pointed past the declared end, so the map is empty
+        // and each of these code points resolves to `.notdef` — the honest tofu
+        // a face that covers nothing should draw, reached without a panic.
+        let (notdef_m, notdef) = font.rasterize_indexed(0, 16.0);
+        assert!(
+            notdef_m.width > 0 && notdef.iter().any(|&c| c > 0),
+            "the symbols face's .notdef must be a real, inked glyph, or this \
+             proves nothing about reaching it"
+        );
+        for ch in ['\u{f005}', '\u{e0b0}', 'A'] {
+            assert_eq!(font.lookup_glyph_index(ch), 0, "{ch:?} must be unmapped");
+            let (m, cov) = font.rasterize(ch, 16.0);
+            assert_eq!(
+                (m.width, m.height, m.xmin, m.ymin),
+                (
+                    notdef_m.width,
+                    notdef_m.height,
+                    notdef_m.xmin,
+                    notdef_m.ymin
+                ),
+                "{ch:?} must draw .notdef"
+            );
+            assert_eq!(cov, notdef, "{ch:?} must draw .notdef's coverage");
+        }
         assert!(
             FallbackFace::from_path_bytes(
                 &std::sync::Arc::new(patched.clone()),
                 Some("patched".into())
             )
-            .is_err(),
-            "such a face must never enter the chain"
+            .is_ok(),
+            "and such a face now enters the chain rather than being refused"
         );
     }
 
@@ -26393,7 +26639,7 @@ mod tests {
     /// rather than by drawing tofu from a face it cannot rasterize.
     ///
     /// The failed verdict is manufactured (`LazyFontdue::failed_parse`) because
-    /// `fontdue_admissible` is written precisely so real bytes cannot produce it;
+    /// `face_admissible` is written precisely so real bytes cannot produce it;
     /// what is under test is the handling, not the trigger. The fontdue backend
     /// is forced so CoreText cannot quietly draw the bad entry on macOS.
     #[cfg(feature = "embedded-font")]
@@ -26683,24 +26929,38 @@ mod tests {
         );
     }
 
-    /// The glyph cache must serve the EXACT bytes/metrics a direct fontdue
-    /// rasterization at the renderer's `px` produces — no quantization
-    /// round-trip, no metric re-rounding. This is the byte-level contract the
-    /// GPU atlas (and the parity suite) stands on.
+    /// The glyph cache must serve the EXACT bytes/metrics a direct rasterization
+    /// through the portable face at the renderer's `px` produces — no
+    /// quantization round-trip, no metric re-rounding. This is the byte-level
+    /// contract the GPU atlas (and the parity suite) stands on.
+    ///
+    /// RE-BASELINED when `fontdue` was retired. The reference used to be
+    /// `fontdue::Font::rasterize_indexed`; it is now
+    /// [`crate::font::Font::rasterize_indexed`], the face the renderer actually
+    /// draws through. The PROPERTY is unchanged and still an equality — "the
+    /// cache hands back exactly what the rasterizer produced, transformed only
+    /// by the documented stem-darkening LUT". What moved is only which
+    /// rasterizer that is; the two agree on metrics and advance exactly and on
+    /// coverage to within a few LSBs (they flatten curves to different
+    /// tolerances), and THAT relationship is what
+    /// `tests/first_party_face_vs_fontdue.rs` measures against the retired
+    /// crate, kept as a dev-dependency oracle for exactly this purpose.
     #[test]
-    fn glyph_image_matches_direct_fontdue_rasterization() {
+    fn glyph_image_matches_direct_portable_rasterization() {
         let Some(bytes) = static_system_font_bytes() else {
             eprintln!("SKIP: no static system mono font found");
             return;
         };
         let px = 16.0;
         let mut r = Renderer::from_bytes(&bytes, px, Theme::default()).expect("renderer");
-        // This test pins the renderer's coverage to a DIRECT fontdue rasterization,
-        // so it must run on the deterministic fontdue backend (CoreText output is
-        // OS/version-dependent and is covered separately by the CoreText tests).
+        // This test pins the renderer's coverage to a DIRECT portable
+        // rasterization, so it must run on the deterministic portable backend
+        // (CoreText output is OS/version-dependent and is covered separately by
+        // the CoreText tests).
         r.debug_force_fontdue();
-        let font = fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
-            .expect("font");
+        let font =
+            crate::font::Font::from_bytes(bytes.as_slice(), crate::font::FontSettings::default())
+                .expect("font");
         for ch in ['M', 'a', '0', '%', ' '] {
             let key = r.glyph_key(ch);
             assert_eq!(key.source, FaceId::Primary);
@@ -26720,7 +26980,7 @@ mod tests {
                 "metrics differ for {ch:?}"
             );
             assert_eq!(img.advance(), m.advance_width, "advance differs for {ch:?}");
-            // Coverage is fontdue's bytes passed through the documented
+            // Coverage is the face's bytes passed through the documented
             // stem-darkening LUT (and nothing else): placement/advance stay
             // bit-identical above; only the per-texel coverage values are lifted
             // by `stem_darken`. Asserting against the LUT-transformed reference
@@ -27834,6 +28094,280 @@ mod tests {
                 (cw, ch, r.baseline()),
                 "cell_geometry({px}) must equal the activated live geometry"
             );
+        }
+    }
+
+    /// A cached glyph's INK extent in CELL rows: `(top, bottom)` with `bottom`
+    /// exclusive, or `None` for a blank raster. The blit anchors bitmap row 0 at
+    /// `baseline - height - ymin`, and the ink is found inside that bitmap rather
+    /// than assumed to fill it — see [`ink_row_extent`] for why the two are not
+    /// the same thing on two of the three raster paths.
+    fn ink_cell_rows(img: &GlyphImage, baseline: i32) -> Option<(i32, i32)> {
+        let (w, h) = (img.width(), img.height());
+        let ink = match img {
+            GlyphImage::Mono { bytes, .. } => {
+                ink_row_extent(h, |y| bytes[y * w..(y + 1) * w].iter().any(|&a| a > 0))
+            }
+            GlyphImage::Rgba { bytes, .. } => ink_row_extent(h, |y| {
+                bytes[y * w * 4..(y + 1) * w * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|px| px[3] > 0)
+            }),
+        }?;
+        let gy0 = baseline - h as i32 - img.ymin();
+        Some((gy0 + ink.0 as i32, gy0 + ink.1 as i32))
+    }
+
+    /// The underscore is a CHARACTER, and no font size the user did not choose may
+    /// decide whether it exists. DejaVu Sans Mono draws `_` with its ink sitting
+    /// exactly on the descent line, so wherever the rounded `cell_h` is a pixel
+    /// short of the rounded baseline plus that descent, the glyph lands below its
+    /// own cell and the blit's band clip eats it — which is `foo_bar` reading as
+    /// `foo bar` at the shipped default of 15 px while 16 px draws it. Rounding
+    /// decides that, so it happens at some sizes and not others, and a character
+    /// that exists at one size and not the next is the defect.
+    ///
+    /// # The property is about INK, and it has two clauses
+    ///
+    /// The first form of this test read the ink box off `(height, ymin)` and
+    /// demanded the BOX sit inside the cell. That is not a property this renderer
+    /// has or wants: macOS CoreText pads its raster by a px per side plus a phase
+    /// row, and `subpixel` pads by a px for the FIR5 spread, so on those paths the
+    /// reported box legitimately pokes out of the cell in every direction while
+    /// the ink sits comfortably inside — the backtick failed it at 13px on rows
+    /// `-1..5` of a 15-row cell, for one row of TRANSPARENT PAD above the cell
+    /// ceiling. What the renderer promises is about coverage:
+    ///
+    /// * **(a) nothing vanishes** — every glyph that rasterizes to ink keeps at
+    ///   least one ink row at or above the cell floor. This is the underscore
+    ///   clause: a character the clip erases entirely is the defect.
+    /// * **(b) a glyph with nothing on the line is seated whole** — a glyph whose
+    ///   ink lies wholly below the baseline has no body above the line to survive
+    ///   a clip, so all of its ink must be inside the cell.
+    ///
+    /// A descender is deliberately NOT covered by (b): `row_scale` documents that
+    /// a tail overshooting the floor is spill and is clipped, and lifting the `g`
+    /// off the line the rest of the word stands on would be the worse defect. See
+    /// [`seated_ymin`].
+    #[test]
+    fn no_glyph_that_fits_its_cell_is_left_hanging_below_the_cell_floor() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font");
+            return;
+        };
+        let mut seated_cases = 0usize;
+        for px in [
+            11.0_f32, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0, 30.0,
+        ] {
+            r.activate_px(px);
+            let (_, cell_h) = r.cell_size();
+            let baseline = r.baseline();
+            let floor = cell_h as i32;
+            for ch in '\u{20}'..='\u{7E}' {
+                let key = r.glyph_key(ch);
+                let img = r.glyph_image(key);
+                let Some((top, bottom)) = ink_cell_rows(img, baseline) else {
+                    continue; // no ink at all (space)
+                };
+                // (a) NOTHING VANISHES.
+                assert!(
+                    top < floor,
+                    "{ch:?} at {px}px is drawn entirely below its own cell floor \
+                     — ink rows {top}..{bottom} of 0..{cell_h} (baseline \
+                     {baseline}) — so the band clip erases the character"
+                );
+                // (b) A GLYPH WITH NOTHING ON THE LINE IS SEATED WHOLE.
+                if top < baseline.min(floor) || bottom - top > floor {
+                    continue; // has a body on the line, or no seat to move into
+                }
+                seated_cases += 1;
+                assert!(
+                    top >= 0 && bottom <= floor,
+                    "{ch:?} at {px}px lives wholly below the baseline, so the clip \
+                     costs it everything — but its ink is at rows {top}..{bottom} \
+                     of 0..{cell_h} (baseline {baseline})"
+                );
+            }
+        }
+        assert!(
+            seated_cases > 0,
+            "clause (b) never fired: no printable ASCII glyph on this face lives \
+             wholly below the baseline, so this test proved nothing"
+        );
+    }
+
+    /// The measurement above, made concrete on the one glyph and the one size the
+    /// audit caught: at 15 px the underscore must lay ink INSIDE its cell. Without
+    /// the seat it sits below the floor and only an antialias fringe survives the
+    /// clip — measured here on the embedded face at 15px, 90 units of ink against
+    /// the hyphen's 1137.
+    #[test]
+    fn the_underscore_lays_ink_inside_its_own_cell_at_every_size() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font");
+            return;
+        };
+        for px in [11.0_f32, 13.0, 15.0, 16.0, 18.0, 20.0, 24.0, 30.0] {
+            r.activate_px(px);
+            let (_, cell_h) = r.cell_size();
+            let baseline = r.baseline();
+            let key = r.glyph_key('_');
+            let img = r.glyph_image(key);
+            let (top, bottom) =
+                ink_cell_rows(img, baseline).expect("the underscore rasterizes to ink");
+            assert!(
+                bottom <= cell_h as i32 && top >= 0,
+                "the underscore at {px}px must sit inside its {cell_h}-row cell, \
+                 not at rows {top}..{bottom}"
+            );
+        }
+    }
+
+    /// THE USER-VISIBLE DEFECT, in the units the user sees: `foo_bar` must not
+    /// read as `foo bar`. The underscore lays as much ink on screen as the hyphen
+    /// — the control glyph, which sits nowhere near the floor and so is drawn
+    /// whole at every size.
+    ///
+    /// Measured on the embedded face before the seat existed, as a fraction of
+    /// the hyphen's ink: 15px `0.08` (nine pixels of 4%-coverage fringe — blank
+    /// to a reader), 14px `0.47`, 13px `0.90`, and `~1.0` at 12, 16, 20 and 24.
+    /// That the ratio depends on a size the user did not choose IS the defect,
+    /// so the pin is a floor under every size, not a number per size.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn an_underscore_is_as_solid_as_a_hyphen_at_every_size() {
+        for px in [12.0_f32, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0] {
+            let mut r = Renderer::from_bytes(embedded_font(), px, Theme::default()).unwrap();
+            let (cw, _) = r.cell_size();
+            let mut input = RenderInput::empty();
+            input.rows = 1;
+            input.cols = 2;
+            input.cells = vec![vec![RenderCell::default(); 2]];
+            for (i, ch) in "_-".chars().enumerate() {
+                input.cells[0][i].ch = ch;
+                input.cells[0][i].fg = [255, 255, 255];
+                input.cells[0][i].bg = [0, 0, 0];
+            }
+            let f = r.render_input(&input);
+            let bg = f.pixels[0];
+            let ink = |cell: usize| -> u32 {
+                let x0 = r.pad() + cell * cw;
+                let x1 = (x0 + cw).min(f.width);
+                (0..f.height)
+                    .flat_map(|y| (x0..x1).map(move |x| y * f.width + x))
+                    .map(|i| {
+                        let (p, b) = (f.pixels[i], bg);
+                        (((p >> 16) & 0xff) as i32 - ((b >> 16) & 0xff) as i32).unsigned_abs()
+                    })
+                    .sum()
+            };
+            let (underscore, hyphen) = (ink(0), ink(1));
+            assert!(hyphen > 0, "{px}px: the control glyph must have ink");
+            assert!(
+                underscore * 4 >= hyphen * 3,
+                "{px}px: the underscore is being eaten by the cell floor — {underscore} \
+                 units of ink against the hyphen's {hyphen}"
+            );
+        }
+    }
+
+    /// A DESCENDER IS NOT LIFTED OFF THE LINE IT SHARES. The seat's subject is a
+    /// glyph the floor clip would erase, never a glyph whose tail it merely
+    /// trims: `row_scale` documents the trim as deliberate ("the row-major CPU
+    /// painter erases that spill anyway"), and a `g` raised a row or two to save
+    /// its tail's last antialiased row would stand above the `a` beside it.
+    ///
+    /// Measured with the pre-fix rule, which read the position off the PADDED
+    /// raster box: on the embedded face at 13, 14, 15 and 18px, `g`/`y`/`p` were
+    /// drawn one to two rows above `a`/`n`/`x` — every descender in the font, at
+    /// most sizes, because the CoreText raster box hangs a px below its ink on
+    /// every glyph. The law is one-sided: a round-top `a` may legitimately
+    /// overshoot ABOVE a flat `g`, so only the descender rising is a defect.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn a_descender_is_not_lifted_off_the_line_it_shares() {
+        for px in [12.0_f32, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 24.0, 30.0] {
+            let mut r = Renderer::from_bytes(embedded_font(), px, Theme::default()).unwrap();
+            let baseline = r.baseline();
+            let top = |r: &mut Renderer, ch: char| {
+                let key = r.glyph_key(ch);
+                ink_cell_rows(r.glyph_image(key), baseline)
+                    .unwrap_or_else(|| panic!("{ch:?} rasterizes to ink at {px}px"))
+                    .0
+            };
+            let flat = top(&mut r, 'n');
+            // `j` is deliberately absent: its dot rides ABOVE the x-height, so
+            // its ink top is legitimately higher than `n`'s and it cannot
+            // witness this law. `g`/`y`/`p`/`q` all top out at the x-height.
+            for ch in ['g', 'y', 'p', 'q'] {
+                let d = top(&mut r, ch);
+                assert!(
+                    d >= flat,
+                    "{ch:?} at {px}px starts at cell row {d}, ABOVE the {flat} of \
+                     'n' — the descender has been lifted off the shared line"
+                );
+            }
+        }
+    }
+
+    /// The seat as a pure function, over the lattice of positions a raster can
+    /// take against a cell. Four laws, all of them the reason the box-measured
+    /// form was wrong:
+    ///
+    /// * ink that already sits inside the cell is untouched;
+    /// * ink with ANY row above the baseline is untouched however far its tail
+    ///   hangs — that ink survives the clip, so the glyph is readable and moving
+    ///   it would only break the line's shared baseline;
+    /// * ink wholly below the baseline that hangs past the floor is seated
+    ///   EXACTLY on the floor, and only ever upwards;
+    /// * ink taller than the cell has no seat and is left alone.
+    #[test]
+    fn the_seat_moves_only_ink_the_floor_clip_would_erase() {
+        let (cell_h, baseline) = (17usize, 14i32);
+        let floor = cell_h as i32;
+        // The `ymin` that places a raster of `h` rows whose ink ends at bitmap
+        // row `last` so that its ink bottom lands at cell row `want_bottom`:
+        // `bottom = (baseline - h - ymin) + last`.
+        let place = |h: usize, last: usize, want_bottom: i32| -> i32 {
+            baseline - h as i32 + last as i32 - want_bottom
+        };
+        for &(h, first, last) in &[(6usize, 1usize, 5usize), (20, 2, 19), (4, 0, 4)] {
+            let ink_h = (last - first) as i32;
+            for want_bottom in -2..=(floor + 4) {
+                let ymin = place(h, last, want_bottom);
+                let top = want_bottom - ink_h;
+                let seated = seated_ymin((first, last), h, ymin, baseline, cell_h);
+                let hangs = want_bottom > floor;
+                let on_the_line = top < baseline.min(floor);
+                let fits = ink_h <= floor;
+                if !hangs || on_the_line || !fits {
+                    assert_eq!(
+                        seated, None,
+                        "ink rows {top}..{want_bottom} (h={h}, {first}..{last}) must \
+                         keep its natural seat"
+                    );
+                    continue;
+                }
+                let seated = seated.expect("ink wholly below the baseline must be seated");
+                assert!(
+                    seated > ymin,
+                    "the seat only ever raises ink: {ymin} -> {seated}"
+                );
+                // Re-derive where the ink now lands: it must rest ON the floor,
+                // and its top must be inside the cell.
+                let gy0 = baseline - h as i32 - seated;
+                assert_eq!(
+                    gy0 + last as i32,
+                    floor,
+                    "seated ink rests exactly on the cell floor"
+                );
+                assert!(
+                    gy0 + first as i32 >= 0,
+                    "seated ink never leaves through the cell ceiling"
+                );
+            }
         }
     }
 
@@ -29801,7 +30335,9 @@ mod tests {
 
 #[cfg(test)]
 mod ribbon_beam_tests {
-    use super::{BeamClip, GlowQuad, RIBBON_CORE_SHARE, RibbonVertex, ribbon_beam, ribbon_profile};
+    use super::{
+        BeamClip, GlowBlend, GlowQuad, RIBBON_CORE_SHARE, RibbonVertex, ribbon_beam, ribbon_profile,
+    };
 
     const W: usize = 160;
     const H: usize = 120;
@@ -29900,7 +30436,15 @@ mod ribbon_beam_tests {
             vert(60.0, 60.0, up, dn, 0x00FF_0000, 200.0),
         ];
         let mut out = Vec::new();
-        assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+        assert!(ribbon_beam(
+            &mut out,
+            clip(),
+            &verts,
+            1.0,
+            4,
+            100_000,
+            crate::GlowBlend::Add
+        ));
         let px = paint(&out);
         let col: Vec<(i32, i32)> = px
             .iter()
@@ -29934,6 +30478,48 @@ mod ribbon_beam_tests {
         );
     }
 
+    #[test]
+    fn ribbon_rows_keep_clip_and_grid_band_tags() {
+        let clip = BeamClip {
+            x0: 5,
+            y0: 2,
+            x1: 27,
+            y1: 24,
+            cell_h: 7,
+            origin_y: 10,
+        };
+        let verts = [
+            vert(0.0, 10.0, 12.0, 12.0, 0x00ff_8040, 180.0),
+            vert(32.0, 10.0, 12.0, 12.0, 0x00ff_8040, 180.0),
+        ];
+        let mut out = Vec::new();
+        assert!(ribbon_beam(
+            &mut out,
+            clip,
+            &verts,
+            1.0,
+            4,
+            100_000,
+            GlowBlend::Add,
+        ));
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|q| {
+            q.h == 1
+                && i32::from(q.x) >= clip.x0
+                && i32::from(q.x + q.w) <= clip.x1
+                && i32::from(q.y) >= clip.y0
+                && i32::from(q.y + q.h) <= clip.y1
+                && q.row
+                    == (i32::from(q.y) - clip.origin_y)
+                        .div_euclid(clip.cell_h)
+                        .max(0) as u16
+        }));
+        assert!(
+            out.iter().any(|q| q.row == 0) && out.iter().any(|q| q.row == 1),
+            "the witness must cross the grid origin and a band boundary"
+        );
+    }
+
     /// **THE EDGES ARE SUB-PIXEL.** Sliding the spine by a tenth of a pixel must
     /// move the mark's outer coverage by about a tenth of a level — NOT snap it
     /// to the next row. This is the staircase the design names: a wave of
@@ -29947,7 +30533,15 @@ mod ribbon_beam_tests {
                 vert(60.0, spine, 12.0, 4.0, 0x00FF_FFFF, 200.0),
             ];
             let mut out = Vec::new();
-            assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+            assert!(ribbon_beam(
+                &mut out,
+                clip(),
+                &verts,
+                1.0,
+                4,
+                100_000,
+                crate::GlowBlend::Add
+            ));
             paint(&out)
                 .iter()
                 .filter(|((_, x), _)| *x == 40)
@@ -29983,7 +30577,15 @@ mod ribbon_beam_tests {
         ];
         let distinct = |step: usize| -> (usize, usize) {
             let mut out = Vec::new();
-            assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, step, 100_000, crate::GlowBlend::Add));
+            assert!(ribbon_beam(
+                &mut out,
+                clip(),
+                &verts,
+                1.0,
+                step,
+                100_000,
+                crate::GlowBlend::Add
+            ));
             let row: std::collections::BTreeSet<u32> = out
                 .iter()
                 .filter(|q| i32::from(q.y) == 60)
@@ -30060,7 +30662,15 @@ mod ribbon_beam_tests {
                 },
             ];
             let mut out = Vec::new();
-            assert!(ribbon_beam(&mut out, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+            assert!(ribbon_beam(
+                &mut out,
+                clip(),
+                &verts,
+                1.0,
+                4,
+                100_000,
+                crate::GlowBlend::Add
+            ));
             // The plateau only: rows within the core, where the profile is
             // exactly 1 and the emitted value is the request plus the dither.
             let vals: Vec<f64> = paint(&out)
@@ -30072,7 +30682,9 @@ mod ribbon_beam_tests {
             vals.iter().sum::<f64>() / vals.len() as f64
         };
         let base = 20.0f32;
-        let sweep: Vec<f64> = (0..=20).map(|i| mean_level(base + i as f32 / 20.0)).collect();
+        let sweep: Vec<f64> = (0..=20)
+            .map(|i| mean_level(base + i as f32 / 20.0))
+            .collect();
         // TRACKS THE REQUEST. Every step of a twentieth of a level moves the
         // emitted mean, and the mean never drifts from the request by more than
         // the plateau's own edge effects.
@@ -30127,7 +30739,15 @@ mod ribbon_beam_tests {
             vert(120.0, 60.0, 12.0, 4.0, 0x0000_00FF, 200.0),
         ];
         let mut full = Vec::new();
-        assert!(ribbon_beam(&mut full, clip(), &verts, 1.0, 4, 100_000, crate::GlowBlend::Add));
+        assert!(ribbon_beam(
+            &mut full,
+            clip(),
+            &verts,
+            1.0,
+            4,
+            100_000,
+            crate::GlowBlend::Add
+        ));
         let mut cut = Vec::new();
         assert!(
             !ribbon_beam(&mut cut, clip(), &verts, 1.0, 4, 200, crate::GlowBlend::Add),
@@ -30142,8 +30762,24 @@ mod ribbon_beam_tests {
         );
         // Degenerate inputs are no-ops, not panics.
         let mut none = Vec::new();
-        assert!(ribbon_beam(&mut none, clip(), &verts[..1], 1.0, 4, 100_000, crate::GlowBlend::Add));
-        assert!(ribbon_beam(&mut none, clip(), &[], 1.0, 4, 100_000, crate::GlowBlend::Add));
+        assert!(ribbon_beam(
+            &mut none,
+            clip(),
+            &verts[..1],
+            1.0,
+            4,
+            100_000,
+            crate::GlowBlend::Add
+        ));
+        assert!(ribbon_beam(
+            &mut none,
+            clip(),
+            &[],
+            1.0,
+            4,
+            100_000,
+            crate::GlowBlend::Add
+        ));
         assert!(none.is_empty());
     }
 }
@@ -30417,6 +31053,59 @@ mod comet_beam_tests {
         assert!(
             out.iter().any(|q| q.w == 1),
             "expected a 1px AA edge quad somewhere"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subpixel_seat_tests {
+    /// THE SUBPIXEL CACHE IS A SECOND HOME FOR THE SAME GLYPH, and a character
+    /// must not depend on which one served it.
+    ///
+    /// An underscore's ink sits at the very bottom of its cell, so a seat applied
+    /// to the grayscale raster alone leaves it drawn one row below its own floor
+    /// here — where the blit's band clip eats it and the terminal shows nothing.
+    /// The hyphen is the control: its ink is nowhere near the floor, so it is
+    /// visible either way and proves the probe is measuring ink at all.
+    #[test]
+    fn an_underscore_has_ink_under_subpixel_rendering_too() {
+        // THE SETTER, never the env var: `ATERM_FONT_SUBPIXEL` is process-global,
+        // so writing it here would change what every test sharing this binary
+        // rasterizes — which is the coupling, not a way to test around it.
+        let Some(mut renderer) = crate::Renderer::from_system(15.0, crate::Theme::default()) else {
+            return; // no system monospace face (headless CI)
+        };
+        if !renderer.set_font_subpixel("rgb") {
+            return; // this build has no LCD raster seam to exercise
+        }
+        let mut input = crate::RenderInput::empty();
+        input.rows = 1;
+        input.cols = 2;
+        input.cells = vec![vec![crate::RenderCell::default(); 2]];
+        for (i, ch) in "_-".chars().enumerate() {
+            input.cells[0][i].ch = ch;
+            input.cells[0][i].fg = [255, 255, 255];
+            input.cells[0][i].bg = [0, 0, 0];
+        }
+        let frame = renderer.render_input(&input);
+        let ground = frame.pixels[0];
+        let ink = |cell: usize| {
+            let w = frame.width / 2;
+            (0..frame.height)
+                .flat_map(|y| (cell * w..(cell + 1) * w).map(move |x| (x, y)))
+                .filter(|&(x, y)| frame.pixels[y * frame.width + x] != ground)
+                .count()
+        };
+        assert!(
+            ink(1) > 0,
+            "the control glyph must have ink, or this measures nothing"
+        );
+        assert!(
+            ink(0) > 0,
+            "an underscore is invisible under subpixel rendering: {} ink pixels \
+             against the hyphen's {}",
+            ink(0),
+            ink(1)
         );
     }
 }

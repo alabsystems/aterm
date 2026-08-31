@@ -87,11 +87,11 @@ pub fn baseline_in_row_q(row_top_q: i64, row_h_q: i64, cap_h_q: i64) -> i64 {
 /// Cap height of face `index` inside `bytes`, as a RATIO of the em size:
 /// OS/2 `sCapHeight` (via ttf-parser) over `units_per_em` when the table
 /// carries it, else the measured height of an actual `'H'` (rasterized at a
-/// reference size by the caller-supplied fontdue face). Falls back to `0.7`
+/// reference size by the caller-supplied face). Falls back to `0.7`
 /// (the Latin norm) only when both probes fail, so the centring rule is always
 /// defined.
 #[must_use]
-pub fn cap_height_ratio(bytes: &[u8], index: u32, font: &fontdue::Font) -> f32 {
+pub fn cap_height_ratio(bytes: &[u8], index: u32, font: &crate::font::Font) -> f32 {
     if let Ok(face) = ttf_parser::Face::parse(bytes, index)
         && let Some(cap) = face.capital_height()
         && cap > 0
@@ -238,7 +238,8 @@ mod tests {
     #[test]
     fn cap_ratio_from_os2_and_measured_h_agree() {
         let bytes = crate::embedded_font();
-        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).unwrap();
+        let font =
+            crate::font::Font::from_bytes(bytes, crate::font::FontSettings::default()).unwrap();
         let table = cap_height_ratio(bytes, 0, &font);
         assert!((0.4..1.0).contains(&table), "OS/2 cap ratio sane: {table}");
         // Force the measured fallback by handing it unparseable "table" bytes.

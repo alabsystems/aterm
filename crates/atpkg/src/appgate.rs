@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The two-anchor app apply gate (§16.2) — when a staged `aterm.app` DMG may be applied,
-//! once aterm is a named index member.
+//! once aterm is a named index member. atpkg's decision on the CLI path is refuse-and-defer:
+//! the in-session apply (the overlap handoff) is the GUI's, never atpkg's
+//! ([`crate::flow`]'s `app_apply_gate_refused` carries the rule).
 //!
 //! The gate is a strict **AND**, never an OR, and **notarization is always required**:
 //! Apple notarization (`codesign --verify` + `PINNED_TEAM_ID` + `spctl`, the existing

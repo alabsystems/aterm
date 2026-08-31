@@ -884,7 +884,6 @@ pub fn compress_into_with_dict(
 
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)] // idiomatic allocation panic (vec!); wrapped logic verified in the inner fn
-#[cfg_attr(trust_verify, trust::skip)] // idiomatic allocation panic (vec!); wrapped logic verified in the inner fn
 fn compress_into_vec_with_dict<const USE_DICT: bool>(
     input: &[u8],
     prepend_size: bool,

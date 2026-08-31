@@ -1,9 +1,10 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Core trigram search index with bloom filter acceleration.
+
+use std::borrow::Cow;
 
 use aterm_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
@@ -608,6 +609,14 @@ impl SearchIndex {
     ///
     /// This overwrites any existing content at that line number.
     pub fn index_line(&mut self, line_num: usize, text: &str) {
+        self.index_line_cow(line_num, Cow::Borrowed(text));
+    }
+
+    /// Shared borrowed/owned indexing primitive. Owned text moves directly
+    /// into the retained line cache instead of being copied a second time.
+    pub(crate) fn index_line_cow(&mut self, line_num: usize, text: Cow<'_, str>) {
+        let text_ref = text.as_ref();
+
         // Remove old trigrams if this line was previously indexed.
         // Use remove() to move the old String out (avoids clone).
         //
@@ -630,7 +639,7 @@ impl SearchIndex {
         // present in `lines` is still present in each of its posting lists.)
         let mut replaced_old: Option<String> = None;
         let unchanged = match self.lines.remove(&line_num) {
-            Some(old_text) if old_text == text => {
+            Some(old_text) if old_text == text_ref => {
                 // Put the owned String straight back: no reallocation here, and
                 // no `text.to_string()` below.
                 self.lines.insert(line_num, old_text);
@@ -650,7 +659,7 @@ impl SearchIndex {
             None => false,
         };
 
-        let bytes = text.as_bytes();
+        let bytes = text_ref.as_bytes();
         let line_u32 = line_as_u32(line_num);
 
         // A columns-only index (the budgeted engine) keeps no postings and no
@@ -661,7 +670,7 @@ impl SearchIndex {
         if self.maintain_trigrams
             && let Some(old_text) = replaced_old
         {
-            self.reindex_changed_row_postings(line_u32, &old_text, text);
+            self.reindex_changed_row_postings(line_u32, &old_text, text_ref);
         } else if self.maintain_trigrams {
             // Add all trigrams from this line (original case).
             for window in bytes.windows(3) {
@@ -699,7 +708,7 @@ impl SearchIndex {
             // per line — ~5 reallocations for an 80-column line — only to walk
             // it once and drop it, on the per-line primitive every index build
             // runs.
-            match lower_need(text) {
+            match lower_need(text_ref) {
                 LowerNeed::None => {}
                 LowerNeed::Ascii => {
                     for window in bytes.windows(3) {
@@ -717,7 +726,7 @@ impl SearchIndex {
                     }
                 }
                 LowerNeed::Unicode => {
-                    lower_fold_into(text, &mut self.lower_scratch);
+                    lower_fold_into(text_ref, &mut self.lower_scratch);
                     for window in self.lower_scratch.as_bytes().windows(3) {
                         let trigram: [u8; 3] = [window[0], window[1], window[2]];
                         // Bloom always, postings only when the row's text
@@ -736,8 +745,9 @@ impl SearchIndex {
         // above, and a `ColumnMap` is a pure function of the text, so the
         // cached one is already the map this call would rebuild.
         if !unchanged {
-            self.lines.insert(line_num, text.to_string());
-            self.column_maps.insert(line_num, ColumnMap::new(text));
+            let column_map = ColumnMap::new(text_ref);
+            self.lines.insert(line_num, text.into_owned());
+            self.column_maps.insert(line_num, column_map);
         }
         self.first_cached_line = self.first_cached_line.min(line_num);
         self.line_count = self.line_count.max(line_num.saturating_add(1));

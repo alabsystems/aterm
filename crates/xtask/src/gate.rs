@@ -53,15 +53,29 @@
 //!   a candidate L0 hazard every run (the survey's two — the synchronous wasm
 //!   `resize` reflow — were fixed 2026-07-14 by the cooperative offload; the
 //!   registry is empty today).
+//! - `lazyinit`: LAZY-INIT REENTRANCY CENSUS (L0-DEADLOCK, REENTRANCY sense;
+//!   OB-19..OB-21 in the same shared `crates/aterm-census` library, fused into
+//!   the same freeze-safety-gate build). `lockorder` asks whether two threads
+//!   can take two locks in opposite orders; this asks whether ONE thread can
+//!   arrive twice at the same lazy cell. `Once::call` marks a cell RUNNING
+//!   before it runs the initializer, so an initializer that reaches a blocking
+//!   touch of its own cell — `get_or_init`, `call_once`, a `LazyLock` deref —
+//!   waits for itself, forever, with no timeout and no log line. That shipped
+//!   in v0.65.0/v0.66.0 (`debug_seamless_reexec_armed`, fixed by 9811b83c) and
+//!   froze the terminal on the main thread at the first automatic update apply.
+//!   The lazy-init graph is required ACYCLIC, with NO waiver channel.
 //! - `fault`: INJECTED-BUT-UNEXERCISED. Every fault point injected into production
 //!   code (`fault::triggered("name")`, M7 FAULT-INJECT) must be armed by some test,
 //!   and every armed name must have a real injection site. Keeps the deterministic
 //!   fault-injection harness honest — an untested fail-closed path rots silently.
-//! - `forge`: THIRD-PARTY SURFACE POLICY. The shipped `aterm` binary resolves 153
-//!   third-party packages / 2,081,414 lines of Rust on aarch64-apple-darwin and
-//!   248 / 3,844,574 on Linux — code this repository neither owns nor verifies,
-//!   and the reason `.cargo/config.toml` still carries `-Ztrust-verify=off`. This
-//!   verb re-derives that surface from `cargo tree --locked --offline` (never
+//! - `forge`: THIRD-PARTY SURFACE POLICY. The shipped `aterm` binary resolves 91
+//!   third-party packages / 1,275,882 lines of Rust on aarch64-apple-darwin and
+//!   191 / 2,765,600 on Linux (re-measured 2026-08-30, against 153 / 2,081,414
+//!   and 248 / 3,844,574 when this verb was written on 2026-08-22 — the
+//!   retirement campaign is what moved them) — code this repository neither owns
+//!   nor verifies, and the reason `.cargo/config.toml` still carries
+//!   `-Ztrust-verify=off`. This verb re-derives that surface from
+//!   `cargo tree --locked --offline` (never
 //!   `cargo metadata --filter-platform`, whose feature-unified resolve over-counts
 //!   the macOS root by 28%) and fails on any of five obligation families: the
 //!   provenance/license/NOTICE attestation (`[OB-1]`..`[OB-10]`), a
@@ -71,13 +85,53 @@
 //!   deleted that EXISTS again (`[OB-13]`), and a measured surface over its
 //!   ratchet ceiling (`[OB-14]`).
 //!
-//!   IT IS RED TODAY, on purpose: `vendor/winit` ships without its provenance
-//!   files and its two `// LOCAL PATCH (aterm):` sites carry no Apache-2.0
-//!   §4(b) header notice. (The third finding — the Linux cell resolving an
-//!   unpatched `winnow 1.0.3` beside aterm's `winnow 0.7.15` fork — is gone as
-//!   of 2026-08-27: retiring `toml_edit` for `aterm-toml` retired the fork, so
-//!   there is nothing left for the registry copy to shadow.) Every `✗` line
-//!   names its fix.
+//!   THE PROVENANCE FINDINGS THIS HEADER USED TO NAME ARE CLOSED (2026-08-30).
+//!   It said the verb was red on purpose because `vendor/winit` shipped without
+//!   its provenance files and its `// LOCAL PATCH (aterm):` sites carried no
+//!   Apache-2.0 §4(b) notice; d8a78e6d repaired exactly that on 2026-08-23
+//!   (`.cargo_vcs_info.json`, `Cargo.toml.orig`, the empty `[workspace]` stub,
+//!   the notices, and a byte-diff instrument that no longer trusts our own
+//!   markers), and the winnow shadow went with the `toml_edit` fork on
+//!   2026-08-27. MEASURED on this tree: `[OB-1]`..`[OB-13]` all PASS — attest
+//!   reports 10 obligations green over 5 vendored forks, and every patch is
+//!   live in every cell.
+//!
+//!   WHAT IS RED IS `[OB-14]`, AND IT IS A MEASUREMENT, NOT A REGRESSION. All
+//!   four cells read exactly 713 lines over ceiling — mac-arm 1,276,595 vs
+//!   1,275,882, linux 2,766,313 vs 2,765,600, win 3,613,542 vs 3,612,829, wasm
+//!   1,173,295 vs 1,172,582 — while `Cargo.lock`, `vendor/`, `crates/aterm-forge`
+//!   and `tools/forge-budget.tsv` are all untouched since 1676527d wrote those
+//!   ceilings from the live values, and while every package, build-script,
+//!   proc-macro and duplicate-name row is still exactly AT its ceiling. No
+//!   third-party code entered the graph; the same 713 in four cells is the
+//!   signature of one shared package measured differently, not of drift.
+//!
+//!   The cause is [`aterm_forge::loc::package_dir`]: a `[patch.crates-io]` fork
+//!   is measured from a PRISTINE registry checkout of the same version when one
+//!   is unpacked locally, and from `vendor/<name>` when none is. That order is
+//!   deliberate (editing a fork must not move the ledger) but it makes a
+//!   COMMITTED number depend on an UNVERSIONED cache. MEASURED 2026-08-30 by
+//!   unpacking both published `.crate`s into a scratch `CARGO_HOME`: pristine
+//!   `winit 0.30.13` is 59,252 `*.rs` lines against the fork's 59,937 (+685),
+//!   pristine `smol_str 0.2.2` is 1,368 against 1,396 (+28) — 713 exactly, in
+//!   every cell that carries winit, which is all four. With those two
+//!   directories present the same tree measures 1,275,882 / 2,765,600 /
+//!   3,612,829 / 1,172,582 and `cargo forge check` exits 0.
+//!
+//!   So the ratchet is calibrated to ONE MACHINE'S CARGO CACHE: every ceiling
+//!   ever written to `tools/forge-budget.tsv` was written by m21, which must
+//!   hold both pristine trees since those are the numbers it recorded; m22
+//!   holds neither and cannot acquire them by using cargo, because a patched
+//!   package's lock entry is source-less and cargo never downloads the crate it
+//!   replaced (`cargo fetch` is a no-op for it, and the `.crate` is not in the
+//!   cache either). DO NOT clear this with `--update --allow-regress`: those
+//!   713 lines are aterm's OWN fork edits, and recording them as a third-party
+//!   regression would bake the headroom in forever. The choice — whether the
+//!   ledger means UPSTREAM's lines, in which case the pristine trees belong in
+//!   the tree at `vendor/.forge/<name>/pristine/` (the slot `[OB-7]` already
+//!   consults) and `package_dir` should read it, or the bytes aterm actually
+//!   ships, in which case `vendor/` wins and all four cells re-baseline once —
+//!   is the owner's, and it is open. Every `✗` line names its fix.
 //!
 //!   Implemented in `crates/aterm-forge` and shared VERBATIM with the
 //!   `cargo forge check` verb ([`aterm_forge::check::check_report`]) — the same
@@ -210,7 +264,7 @@
 //!   the zstd C-dep); else the pure-Rust engine. Skips gracefully if that rustup
 //!   target is absent. Matches M5's "uname-gated state probe".
 //! - `all`: the [`ALL_ROSTER`] gates — drift, dormant, mainloop, lockorder,
-//!   wasmloop, scope, fault, forge, counts, perf, lint — i.e. every check above
+//!   wasmloop, scope, lazyinit, fault, forge, counts, perf, lint — i.e. every check above
 //!   except `linux` (needs the Linux target), `miri` (needs a nightly miri
 //!   toolchain), `web` and `certified`.
 //!   MANUAL ONLY — nothing invokes `all` itself. This line used to read "what the
@@ -265,6 +319,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         Some("lockorder") => gate_lockorder(),
         Some("wasmloop") => gate_wasmloop(),
         Some("scope") => gate_scope(),
+        Some("lazyinit") => gate_lazyinit(),
         Some("fault") => gate_fault(),
         Some("forge") => gate_forge(),
         Some("linux") => gate_linux(),
@@ -309,7 +364,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         }
         other => {
             eprintln!(
-                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|fault|forge|linux|web|certified|lint|counts|miri|perf|nonvacuity>\n\
+                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|lazyinit|fault|forge|linux|web|certified|lint|counts|miri|perf|nonvacuity>\n\
                  (unknown check {other:?})"
             );
             false
@@ -340,6 +395,7 @@ const ALL_ROSTER: &[RosterEntry] = &[
     ("lockorder", gate_lockorder),
     ("wasmloop", gate_wasmloop),
     ("scope", gate_scope),
+    ("lazyinit", gate_lazyinit),
     ("fault", gate_fault),
     ("forge", gate_forge),
     ("counts", gate_counts),
@@ -476,6 +532,20 @@ const NON_VACUITY_REGISTRY: &[RedFixture] = &[
                      REAL flash-limiter claim over a copy of the real \
                      aterm-gui/src/lib.rs made per-pane (OB-13 RED)",
             calls: "run_one",
+            verb_level: true,
+        },
+    },
+    RedFixture {
+        gate: "lazyinit",
+        proof: RedProof::Fixture {
+            test: "the_v065_self_recursive_once_lock_is_red_with_its_path",
+            file: "crates/aterm-census/src/lazy_init.rs",
+            drives: "the VERB's implementation: run_lazy_init_census()'s derivation \
+                     and verdict, over the EXACT v0.65.0 `debug_seamless_reexec_armed` \
+                     source that shipped a permanent main-thread park (OB-19 RED \
+                     naming the cell and the accessor it calls back into); the \
+                     shipped repair of the same site is GREEN in the sibling test",
+            calls: "run_synth_sources",
             verb_level: true,
         },
     },
@@ -1333,6 +1403,30 @@ fn gate_scope() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// G-LAZYINIT: LAZY-INIT REENTRANCY CENSUS (L0-DEADLOCK, reentrancy sense)
+// ---------------------------------------------------------------------------
+//
+// The same ONE-IMPLEMENTATION-TWO-CONSUMERS shape as the four censuses above:
+// this verb and tools/freeze-safety-gate/build.rs both call
+// `aterm_census::run_lazy_init_census`.
+//
+// `lockorder` asks whether two threads can take two locks in opposite orders.
+// This asks the other reentrancy question: can ONE thread arrive twice at the
+// same lazy cell? `Once::call` marks a cell RUNNING before it runs the
+// initializer, so an initializer that reaches a blocking touch of its own cell
+// waits for itself — a permanent park with no timeout, no panic and no log
+// line. That shipped in v0.65.0 and v0.66.0 (`debug_seamless_reexec_armed`,
+// fixed by 9811b83c) and froze the terminal on the first automatic update
+// apply, on the winit main thread. Like the lock graph, this graph has NO
+// waiver channel: a cycle can only be fixed.
+
+fn gate_lazyinit() -> bool {
+    let outcome = aterm_census::run_lazy_init_census(&workspace_root());
+    eprint!("{}", outcome.log);
+    outcome.ok
+}
+
+// ---------------------------------------------------------------------------
 // G-FORGE: THIRD-PARTY SURFACE POLICY (provenance, patch liveness, the ratchet)
 // ---------------------------------------------------------------------------
 //
@@ -2078,12 +2172,12 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
         // anything consults a cache.
         ("proof_cache", "tools/proof_cache_selftest.sh"),
         // The paint-conformance tooth (2026-08-24 blackout audit,
-        // docs/RELEASE-PROOF-DISCIPLINE.md): when the paint-relevant trees
-        // (effects/render/gui + the gate's own machinery) differ from the last
-        // take it proved green, it re-runs the shape matrix against the
-        // RELEASE binary — headless launch, control-socket keystrokes, pixels
-        // asserted. Unchanged trees cost one content hash, so the ordinary
-        // push keeps the hook's affordability rule; the script itself owns the
+        // docs/RELEASE-PROOF-DISCIPLINE.md): when the derived local source
+        // closure of the RELEASE artifact (or the gate's own machinery)
+        // differs from the last take it proved green, it re-runs the shape
+        // matrix — headless launch, control-socket keystrokes, pixels asserted.
+        // An unchanged closure costs one content hash, so the ordinary push
+        // keeps the hook's affordability rule; the script itself owns the
         // macOS-only honesty and the loud ATERM_SKIP_PAINT_GUARD escape.
         // Its skip now prints INHERITED, never GREEN: GREEN out of that script
         // means the matrix ran in that process (see proof_cache above).
@@ -2097,9 +2191,9 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
         // made of), and asserts that `past_deadline_arms` stays ~0 across the
         // measured window. Proven able to go RED: 7929 arms with the fix
         // reverted, 0 with it in place. Same affordability shape as paint_guard:
-        // unchanged loop-relevant trees cost one content hash, and the script
-        // owns its own POSIX-only honesty and the loud ATERM_SKIP_SPIN_GUARD
-        // escape.
+        // an unchanged derived artifact closure costs one content hash, and
+        // the script owns its own POSIX-only honesty and the loud
+        // ATERM_SKIP_SPIN_GUARD escape.
         ("spin_guard", "tools/spin_guard.sh"),
         // The release-version tooth. The release version lives in THREE places
         // — `[workspace.package] version`, `VERSION_DEFAULT`, and the

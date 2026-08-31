@@ -84,6 +84,10 @@ pub trait ScrollbackAccess: sealed::Sealed {
     /// Get the current memory pressure watermark level.
     fn watermark_level(&self) -> WatermarkLevel;
 
+    /// History lines whose inline image was dropped at the image retention
+    /// horizon (both backends compress at the same boundary, so both count it).
+    fn image_rows_dropped_by_compression(&self) -> u64;
+
     // --- Write ---
 
     /// Push a new line to the scrollback.
@@ -210,6 +214,10 @@ impl ScrollbackAccess for Scrollback {
         self.watermark_level()
     }
 
+    fn image_rows_dropped_by_compression(&self) -> u64 {
+        self.image_rows_dropped_by_compression()
+    }
+
     fn push_line(&mut self, line: Line) -> std::io::Result<()> {
         // Inherent push_line returns (), wrap in Ok for trait compatibility.
         Scrollback::push_line(self, line);
@@ -298,6 +306,10 @@ impl ScrollbackAccess for DiskBackedScrollback {
 
     fn watermark_level(&self) -> WatermarkLevel {
         self.watermark_level()
+    }
+
+    fn image_rows_dropped_by_compression(&self) -> u64 {
+        self.image_rows_dropped_by_compression()
     }
 
     fn push_line(&mut self, line: Line) -> std::io::Result<()> {

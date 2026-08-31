@@ -2307,7 +2307,8 @@ pub(crate) fn encode_target_identity(build: u64, commit: &str) -> String {
 /// image refuses `take_target_identity`, closes the adopted fds and exits, and
 /// the parent books a `ChildDied` structural failure for a candidate that was
 /// perfectly healthy (found by the 2026-08-19 audit; the newer stage on disk is
-/// left for the next launch instead). Malformed values answer `false`: the
+/// left for the successor's own apply lane, or the next launch, instead). Malformed
+/// values answer `false`: the
 /// consuming reader is the one that diagnoses them.
 #[must_use]
 pub(crate) fn target_identity_names_this_build() -> bool {

@@ -147,6 +147,22 @@ enum Inner {
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoDirection {
+    Read,
+    Write,
+}
+
+fn timeout_directions(is_tls: bool, operation: IoDirection) -> (bool, bool) {
+    // A rustls read may need to write protocol records and a write may first
+    // need to read them, so TLS keeps both socket directions bounded. Plain TCP
+    // has no such cross-direction I/O and should pay only the relevant syscall.
+    (
+        is_tls || operation == IoDirection::Read,
+        is_tls || operation == IoDirection::Write,
+    )
+}
+
 impl Stream {
     /// Wrap an established plaintext connection.
     #[must_use]
@@ -245,30 +261,36 @@ impl Stream {
         }
     }
 
-    /// Push the remaining deadline down as the socket's read/write timeouts.
-    fn apply_timeouts(&mut self) -> io::Result<()> {
+    /// Push the remaining deadline down only to socket directions this
+    /// operation can use. TLS may perform cross-direction I/O, unlike plain TCP.
+    fn apply_timeouts(&mut self, operation: IoDirection) -> io::Result<()> {
         let budget = self.deadline.remaining_or_timeout()?;
-        let tcp = match &self.inner {
-            Inner::Plain(tcp) => tcp,
-            Inner::Tls(tls) => &tls.sock,
+        let (tcp, is_tls) = match &self.inner {
+            Inner::Plain(tcp) => (tcp, false),
+            Inner::Tls(tls) => (&tls.sock, true),
         };
-        tcp.set_read_timeout(Some(budget))?;
-        tcp.set_write_timeout(Some(budget))?;
+        let (set_read, set_write) = timeout_directions(is_tls, operation);
+        if set_read {
+            tcp.set_read_timeout(Some(budget))?;
+        }
+        if set_write {
+            tcp.set_write_timeout(Some(budget))?;
+        }
         Ok(())
     }
 
     /// Guard + deadline check performed before every read and write.
-    fn admit(&mut self) -> io::Result<()> {
+    fn admit(&mut self, operation: IoDirection) -> io::Result<()> {
         if !self.guard.is_authorized() {
             return Err(revoked_error());
         }
-        self.apply_timeouts()
+        self.apply_timeouts(operation)
     }
 }
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.admit()?;
+        self.admit(IoDirection::Read)?;
         match &mut self.inner {
             Inner::Plain(tcp) => tcp.read(buf),
             Inner::Tls(tls) => tls.read(buf),
@@ -280,7 +302,7 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // THE linearization point: terminal context does not leave this process
         // unless authority still holds right here.
-        self.admit()?;
+        self.admit(IoDirection::Write)?;
         match &mut self.inner {
             Inner::Plain(tcp) => tcp.write(buf),
             Inner::Tls(tls) => tls.write(buf),
@@ -288,7 +310,7 @@ impl Write for Stream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.admit()?;
+        self.admit(IoDirection::Write)?;
         match &mut self.inner {
             Inner::Plain(tcp) => tcp.flush(),
             Inner::Tls(tls) => tls.flush(),
@@ -308,6 +330,49 @@ mod tests {
         fn is_authorized(&self) -> bool {
             self.0.load(Ordering::Acquire)
         }
+    }
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = listener.accept().unwrap().0;
+        (client, server)
+    }
+
+    #[test]
+    fn timeout_direction_classification_keeps_tls_bidirectional() {
+        assert_eq!(timeout_directions(false, IoDirection::Read), (true, false));
+        assert_eq!(timeout_directions(false, IoDirection::Write), (false, true));
+        assert_eq!(timeout_directions(true, IoDirection::Read), (true, true));
+        assert_eq!(timeout_directions(true, IoDirection::Write), (true, true));
+    }
+
+    #[test]
+    fn plaintext_io_sets_only_its_socket_timeout_direction() {
+        let (read_client, mut read_server) = connected_pair();
+        read_server.write_all(b"r").unwrap();
+        let mut read_stream = Stream::plain(
+            read_client,
+            Arc::new(AlwaysAuthorized),
+            Deadline::after(Duration::from_secs(5)),
+        );
+        let mut byte = [0_u8; 1];
+        read_stream.read_exact(&mut byte).unwrap();
+        let read_client = read_stream.into_tcp().unwrap();
+        assert!(read_client.read_timeout().unwrap().is_some());
+        assert_eq!(read_client.write_timeout().unwrap(), None);
+
+        let (write_client, _write_server) = connected_pair();
+        let mut write_stream = Stream::plain(
+            write_client,
+            Arc::new(AlwaysAuthorized),
+            Deadline::after(Duration::from_secs(5)),
+        );
+        write_stream.write_all(b"w").unwrap();
+        write_stream.flush().unwrap();
+        let write_client = write_stream.into_tcp().unwrap();
+        assert_eq!(write_client.read_timeout().unwrap(), None);
+        assert!(write_client.write_timeout().unwrap().is_some());
     }
 
     #[test]

@@ -50,7 +50,31 @@ wgpu = { version = "29", default-features = false, features = ["webgl", "wgsl", 
 # refuse). aterm-wasm is aligned to the same 0.2.108 so both web crates share the
 # one workspace lock.
 wasm-bindgen = "=0.2.108"
-wasm-bindgen-futures = "0.4"
+# NOT optional and NOT removable, despite no `use` of it anywhere in this crate:
+# the two `#[wasm_bindgen] pub async fn` exports on GpuWeb (src/lib.rs:2793 `init`,
+# :2803 `init_offscreen`, under the `#[wasm_bindgen]` impl at :2774) expand to
+# `wasm_bindgen_futures::future_to_promise(async move { .. }).into()` —
+# wasm-bindgen-macro-support-0.2.108/src/codegen.rs:772, with the path defaulting
+# to a bare `wasm_bindgen_futures` at that crate's lib.rs:184. A source-level grep
+# finds only comments; the reference is MACRO-GENERATED. Deleting this line is a
+# hard compile error on wasm32, not a dead edge.
+# DEFAULT FEATURES OFF, though. The default set is just ["std"], and `std` =
+# ["wasm-bindgen/std", "js-sys/std", "web-sys/std", "futures-util"] — that last,
+# OPTIONAL `futures-util` is the omitted arm, and it is unreachable here.
+# COST: -5 packages / -36,126 lines from the SHIPPED BROWSER ARTIFACT (futures-util
+# 26,215 + futures-core 840 + futures-task 815 + slab 2,609 + pin-project-lite
+# 5,647). None of the four forge cells move — aterm-gpu-web is not in `-p aterm`.
+# WHY THE ARM IS DEAD: `futures_util` is named once in the crate
+# (wasm-bindgen-futures-0.4.58/src/lib.rs:50) under
+# `cfg(all(wasm32, feature = "std", panic = "unwind"))`, feeding ONLY the
+# catch_unwind variant of `future_to_promise` at :261. The macro call above still
+# resolves — the ungated variant at :223 is compiled instead, and its bound is
+# strictly LOOSER (no `UnwindSafe` on the future), so nothing that compiles today
+# stops compiling. The crate is no_std-clean: `#![cfg_attr(not(feature = "std"),
+# no_std)]` at src/lib.rs:33, and its only `std::` path is :263, inside that cfg.
+# `wasm-bindgen/std`, `js-sys/std` and `web-sys/std` are not lost — this crate
+# declares wasm-bindgen, web-sys and js-sys directly, with defaults on, right here.
+wasm-bindgen-futures = { version = "0.4", default-features = false }
 console_error_panic_hook = "0.1"
 # The browser DOM types the WebGL init path needs: the <canvas> handed in from JS,
 # and (TODO, present loop) the window/raf bindings. wgpu's `webgl` feature already

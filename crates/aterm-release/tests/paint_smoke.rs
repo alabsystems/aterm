@@ -7,7 +7,7 @@
 //! Born from the 2026-08-24 blackout audit (docs/RELEASE-PROOF-DISCIPLINE.md):
 //! v0.48.0 and v0.49.0 shipped the rainbow cursor trail dark while every gate
 //! and the self-check were green, because the self-check proves signatures and
-//! versions, never a pixel. The smoke closes that: ten keystrokes against the
+//! versions, never a pixel. The smoke closes that: a typed line against the
 //! JUST-BUILT bundle, headless, through its own control socket, pixels
 //! asserted — before any signing verdict is pronounced and before any
 //! publish-facing step runs.
@@ -377,7 +377,7 @@ fn unnotarized_and_rehearsal_cuts_skip_without_the_ack() {
 // --- pipeline placement ------------------------------------------------------
 
 /// The smoke lives in "selfcheck", and "selfcheck" precedes every
-/// publish-facing step — so the ten keystrokes are spent against the
+/// publish-facing step — so the typed line is spent against the
 /// just-built bundle BEFORE anything is drafted, uploaded, tagged or flipped.
 /// (Within the step, ordering against the signing gate is pinned by
 /// `the_paint_smoke_runs_before_the_signing_gate` above.)

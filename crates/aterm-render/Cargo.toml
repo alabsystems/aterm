@@ -47,21 +47,18 @@ aterm-types = { workspace = true }
 # (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the standard,
 # safe choice (matches the engine's grid/core caches, which already use it).
 aterm-hash = { workspace = true }
-# DEFAULT FEATURES OFF to drop the OPTIONAL `hashbrown` arm: fontdue's default
-# is ["simd", "hashbrown"], and its only use of it is `HashMap`/`HashSet` with
-# new/with_capacity/get/insert — src/lib.rs:25-28 falls back to std::collections
-# with no `std`-feature guard, so this compiles unchanged and rasterizes
-# identically. Costs hashbrown 0.15.5 + foldhash + allocator-api2: 3 packages,
-# 32,597 lines, mac-arm and wasm. `simd` is kept — it is the rasterizer.
-fontdue = { version = "0.9", default-features = false, features = ["simd"] }
 # First-party PNG (crates/aterm-png), which retired `png` and the flate2/
 # miniz_oxide/fdeflate/simd-adler32/crc32fast/adler2 compression stack behind
 # it — 7 packages / 33,439 lines. Decode is the inline-image and colour-emoji
 # path (`decode_png_rgba8`); encode is the `image` verb's framebuffer dump.
 aterm-png = { workspace = true }
 rustybuzz = "0.20.1"
-# Color-emoji (Apple Color Emoji `sbix` table) glyph extraction. fontdue is a
-# monochrome rasterizer; ttf-parser reads the embedded per-glyph PNG bitmaps.
+# THE font parser, now that `fontdue` is retired: `src/font.rs` reads the cmap,
+# `hmtx`, `hhea` and legacy `kern` through it and outlines every glyph through
+# it, and `src/colr.rs` reads the Apple Color Emoji `sbix` bitmaps. Retiring
+# fontdue also retired the DUPLICATE `ttf-parser 0.21` fontdue pinned under
+# itself — 2 packages / 31,645 lines off every cell, and one version of the
+# font parser in the tree instead of two.
 ttf-parser = "0.25"
 # Optional verifier registry used only when `spec-anchors` is enabled. The same
 # crate remains a dev-dependency below for this crate's Tier-1 tests.
@@ -75,9 +72,10 @@ libc = { workspace = true }
 
 [target.'cfg(any(all(unix, not(target_os = "macos")), windows))'.dependencies]
 # NATIVE CRISPNESS (see src/hinted.rs): grid-fitted glyph outlines for the two
-# native raster paths that are NOT CoreText — Linux (W13) and Windows. fontdue
-# has NO hinting, so at desktop sizes (~12px, scale 1.0) stems and crossbars land
-# at fractional pixel phases and read fuzzy; skrifa runs the font's TrueType
+# native raster paths that are NOT CoreText — Linux (W13) and Windows. Neither
+# the retired fontdue nor the first-party `src/font.rs` that replaced it hints,
+# so at desktop sizes (~12px, scale 1.0) stems and crossbars land at fractional
+# pixel phases and read fuzzy; skrifa runs the font's TrueType
 # bytecode / FreeType-ported autohinter and hands back a grid-fitted outline that
 # the SAME first-party coverage fill (`src/raster.rs`, as the FONT-2 variation path) turns
 # into crisp masks. Target-gated so the macOS (CoreText) build and the wasm
@@ -122,9 +120,16 @@ aterm-lexicon = { workspace = true }
 aterm-spec = { workspace = true }
 # Direct shaping access for the ligature gate (pre-check that "=>" ligates).
 rustybuzz = "0.20.1"
-# Coverage probing for the W6 styled-face/fallback-chain gates
-# (tests/styled_faces.rs): scan for a code point one fixture covers and the
-# other lacks, so the fallback routing test can never go vacuous.
+# ORACLE ONLY, never in the shipped graph — the same bargain `ab_glyph_rasterizer`
+# above strikes. `src/font.rs` RETIRED this crate from the product (2 packages /
+# 31,645 lines, all four cells, plus the duplicate `ttf-parser 0.21` under it);
+# it stays here as the independent second implementation the first-party face is
+# checked against — `tests/first_party_face_vs_fontdue.rs` proves the advance
+# widths bit-identical and the coverage within a derived bound over every glyph
+# of the embedded faces, which is the only evidence that can say the retirement
+# moved no pixels. It is also still the vacuity probe for the W6 styled-face /
+# fallback-chain gates (tests/styled_faces.rs) and the counter-example for the
+# Mac-Roman cmap tests. A dev-dep costs the product nothing.
 fontdue = "0.9"
 # Property test (tests/set_px_rerasterizes.rs): the renderer's DPR re-rasterization
 # guarantee — set_px(newPx) scales cell metrics proportionally AND clears the glyph

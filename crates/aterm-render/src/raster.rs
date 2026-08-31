@@ -26,24 +26,38 @@
 //! pad keeps outlines strictly inside the grid, so nothing here is ever asked
 //! to be clever about the boundary.
 //!
-//! # Why the arithmetic is spelled out the way it is
+//! # Two halves, guarded two different ways
 //!
-//! The numerics — the incremental `x += dxdy * dy` march down a segment's
-//! scanlines, the two-cell fast path when a scanline's x span lands inside one
-//! column, the `s = 1/(x1 - x0)` trapezoid split when it does not, the
-//! flatten-by-deviation quad subdivision and the recursive half-split for
-//! cubics — are fixed by an obligation stronger than taste: the glyph masks
-//! this produces are compared BYTE-FOR-BYTE against the crate it replaces
-//! (`tests/rasterizer_oracle.rs`) over real outlines pulled through the real
-//! font path. Antialiased coverage is exactly where an off-by-one is invisible
-//! to a "looks filled" test and obvious on screen, so the test is an equality,
-//! and reordering an expression here can break it.
+//! This module does two separable jobs, and they are held to two different
+//! standards on purpose (`docs/measured/fontdue-oracle-decision-2026-08-29.md`
+//! is the full argument).
+//!
+//! **The FILL — [`Rasterizer::draw_line`] and everything downstream of it — is
+//! held to f32 BIT EQUALITY against `ab_glyph_rasterizer`.** The incremental
+//! `x += dxdy * dy` march down a segment's scanlines, the two-cell fast path
+//! when a scanline's x span lands inside one column, the `s = 1/(x1 - x0)`
+//! trapezoid split when it does not, the accumulator's cross-row carry: every
+//! one of those computes EXACT analytic per-cell area, where two independent
+//! implementations agree to the bit because there is only one right answer.
+//! `tests/rasterizer_oracle.rs` feeds both rasterizers the same flattened
+//! polyline — `draw_line` calls only — and demands identical bits over tens of
+//! thousands of real glyph rasters. That equality is also the only expression
+//! of cross-machine determinism this crate has, and the GPU/CPU parity suites
+//! lean on it. Reordering an expression in the fill can break it.
+//!
+//! **The FLATTENING — [`Rasterizer::draw_quad`] and
+//! [`Rasterizer::draw_cubic`] — is NOT.** Its old constants (`devsq < 0.333`,
+//! `tol = 3.0`, `FLATNESS = 0.35`) were the retired crate's tuning, and pinning
+//! them pinned aterm to a rasterizer 3.2× less accurate than the `fontdue` it
+//! also retired. They are gone, replaced by [`FLATTEN_SAGITTA_PX`] — a budget
+//! derived from the 8-bit mask — and guarded by measured accuracy against an
+//! independent analytic reference (`tests/raster_accuracy_survey.rs`) instead.
 //!
 //! # Hardening — and the ONE place it is a deliberate difference
 //!
 //! The grid-escape paths — a cell index left of the buffer, a cell index right
 //! of it, a span whose interior loop would otherwise run for billions of
-//! iterations, and a quadratic whose deviation asks for millions of flattening
+//! iterations, and a curve whose deviation asks for millions of flattening
 //! segments — are CLAMPED or CAPPED rather than left to panic or hang, because
 //! the same fill also runs over font files aterm did not author, into a grid
 //! sized from the font's DECLARED `glyph_bounding_box`. A font whose outline
@@ -52,9 +66,9 @@
 //!
 //! For every outline that stays inside the grid — which is every outline this
 //! crate feeds it, because [`crate::variation::RASTER_PAD`] guarantees it —
-//! the clamps are unreachable and the output is bit-for-bit the retired
-//! crate's. `tests/rasterizer_oracle.rs` proves that over tens of thousands of
-//! real glyph rasters.
+//! the clamps are unreachable and the FILL is bit-for-bit the retired crate's.
+//! `tests/rasterizer_oracle.rs` proves that over tens of thousands of real
+//! glyph rasters, over the shared polyline described above.
 //!
 //! For an outline that ESCAPES the grid, the two rasterizers deliberately
 //! DIFFER, and it is worth being exact about how. The retired crate's write
@@ -89,12 +103,89 @@ fn lerp(t: f32, p0: Point, p1: Point) -> Point {
     point(p0.x + t * (p1.x - p0.x), p0.y + t * (p1.y - p0.y))
 }
 
-/// Straight-line distance between two points.
-#[inline]
-fn dist(p0: Point, p1: Point) -> f32 {
-    let (dx, dy) = (p1.x - p0.x, p1.y - p0.y);
-    (dx * dx + dy * dy).sqrt()
-}
+/// The greatest distance, in grid cells, that a flattened curve's polyline is
+/// permitted to depart from the true curve (its SAGITTA).
+///
+/// **Derived from the output format, not tuned.** The coverage mask this
+/// rasterizer feeds is 8 bits, so one output level is `1/255` of full coverage.
+/// A polyline whose sagitta is `t` px displaces the true edge by at most `t`,
+/// and an edge crossing a cell spans at most 1 px of it, so the coverage error
+/// flattening can contribute to any one cell is at most `t`. Holding that
+/// contribution under a single output level gives
+///
+/// ```text
+/// t ≤ 1/255 px = 0.0039 px
+/// ```
+///
+/// which is what this constant is. It moves only if the mask's depth moves —
+/// not when the font set, the corpus or the px sweep changes.
+///
+/// The retired `ab_glyph_rasterizer` targeted `1/(4√3) = 0.144 px` here (see
+/// [`Rasterizer::draw_quad`] for how its two constants both encode that one
+/// number), 37× looser, and it cost real accuracy. Measured against an
+/// independent analytic reference over **2,108 glyph rasters** from the two
+/// embedded faces across 8..32 px — 2,320 reached, 212 dropped as
+/// self-overlapping, a class every signed-area rasterizer gets wrong
+/// identically (`tests/raster_accuracy_survey.rs`, which holds both the
+/// measurement and the guard):
+///
+/// ```text
+///                       corpus mean /255   worst cell /255
+/// 0.144 px (retired)          0.862              42.8
+/// 1/255 px (this)             0.075               4.4
+/// fontdue 0.9.3               0.261              21.3
+/// ```
+///
+/// So the tightening is 11.5× on the mean, and — the point of the exercise —
+/// finally puts this module AHEAD of the `fontdue` it replaced (3.5× on the
+/// mean) instead of 3.2× behind it, on every one of the 16 (face, size) rows
+/// rather than only in aggregate.
+///
+/// **The worst-cell column is at the edge of what the instrument resolves, and
+/// is quoted as a bound, not a measurement.** Displacing the reference's
+/// sub-scanline phase by 1/303 px — which changes no geometry — moves a single
+/// reference cell by up to 7.97/255, more than the 4.4 the shipped path scores.
+/// So 4.4 is an UPPER bound on the true worst-cell error and the ~4.8× lead
+/// over fontdue is a LOWER bound on the true one. The mean is the figure to
+/// quote; `raster_accuracy_survey::reference_phase_sensitivity` prints the
+/// spread.
+///
+/// # What it costs, and where
+///
+/// Tightening the sagitta buys segments, and segments cost fill time. Measured
+/// on the REAL atlas path (`variation::varied_glyph_raster_with_face`, 94
+/// printable-ASCII glyphs of the embedded face, 20 reps, opt-level 2):
+///
+/// ```text
+///          12 px      16 px      24 px
+/// 0.144    0.507 µs   0.563 µs   0.732 µs
+/// 1/255    0.797 µs   0.901 µs   1.027 µs
+///          1.57×      1.60×      1.40×
+/// ```
+///
+/// That is a COLD-path cost. Every rasterized glyph is memoized by `GlyphKey`
+/// (which carries the quantised px) in the renderer's `glyphs` map and in the
+/// GPU atlas built from it, and that cache is cleared only at its 16,384-entry
+/// cap or on a font change — so the ~0.3 µs is paid once per distinct
+/// (glyph, size, style) in a session and never per frame. A pane's whole
+/// working set is a few hundred rasters; even a pathological run that fills the
+/// cap end to end pays ~5 ms more in total, spread across the session, for a
+/// per-frame cost of exactly zero.
+pub const FLATTEN_SAGITTA_PX: f32 = 1.0 / 255.0;
+
+/// `(4·t)²` — the squared second difference at which a quadratic's own chord
+/// already meets [`FLATTEN_SAGITTA_PX`], so it flattens to a single line.
+const ONE_LINE_DEVSQ: f32 = (4.0 * FLATTEN_SAGITTA_PX) * (4.0 * FLATTEN_SAGITTA_PX);
+
+/// `1/(4·t)` — the factor that turns a second difference into the square of the
+/// segment count that meets [`FLATTEN_SAGITTA_PX`]. Precomputed so the hot
+/// flattening loop pays no division.
+const INV_FOUR_SAGITTA: f32 = 1.0 / (4.0 * FLATTEN_SAGITTA_PX);
+
+/// Hard ceiling on the segments ONE curve may flatten to, so a hostile outline
+/// costs a wrong shape rather than a hung frame. See
+/// [`Rasterizer::draw_quad`] for why no in-grid curve can reach it.
+const MAX_FLATTEN_SEGMENTS: usize = 4096;
 
 /// A `width` × `height` signed-area accumulation grid.
 ///
@@ -241,33 +332,66 @@ impl Rasterizer {
 
     /// Accumulate a quadratic Bézier (`p1` is the control point).
     ///
-    /// Flattened to line segments by second-difference deviation: a nearly
-    /// straight curve becomes ONE line, and the segment count otherwise grows
-    /// with the fourth root of the squared deviation — cheap, and below the
-    /// quantisation floor of an 8-bit mask.
+    /// Flattened to a polyline whose SAGITTA — its greatest perpendicular
+    /// departure from the true curve — is at most [`FLATTEN_SAGITTA_PX`]. A
+    /// nearly straight curve becomes ONE line; otherwise the segment count
+    /// grows with the square root of the second difference.
+    ///
+    /// # The derivation
+    ///
+    /// `B(t) = (1-t)²p0 + 2t(1-t)p1 + t²p2`, so `B''(t) = 2·dev` with
+    /// `dev = p0 - 2·p1 + p2` — constant, which is what makes a quadratic's
+    /// error exactly computable rather than bounded. The curve's departure
+    /// from its own chord peaks at the midpoint:
+    ///
+    /// ```text
+    /// B(½) - ½(p0 + p2) = ¼(p0 + 2p1 + p2) - ½(p0 + p2) = -dev/4
+    /// ```
+    ///
+    /// so ONE line has sagitta `|dev|/4`, admissible when `|dev| ≤ 4t`, i.e.
+    /// `devsq ≤ (4t)²`. Splitting the parameter into `n` equal pieces gives
+    /// each sub-quad the second difference `dev/n²`, so the `n`-segment
+    /// sagitta is `|dev|/(4n²)` and `n ≥ √(|dev|/(4t))` meets the budget.
+    ///
+    /// The retired `ab_glyph_rasterizer` constants this replaced —
+    /// `devsq < 0.333` and `tol = 3.0` in `n = 1 + ⁴√(tol·devsq)` — are the
+    /// SAME number seen twice: `√0.333/4 = 0.144 px`, and
+    /// `⁴√3 = 1/(2·√0.144)`, so both encode a sagitta budget of
+    /// `1/(4√3) = 0.144 px`. That was its tuning, not a correctness property,
+    /// and [`FLATTEN_SAGITTA_PX`] replaces it with one derived from the output
+    /// format.
     pub fn draw_quad(&mut self, p0: Point, p1: Point, p2: Point) {
         let devx = p0.x - 2.0 * p1.x + p2.x;
         let devy = p0.y - 2.0 * p1.y + p2.y;
         let devsq = devx * devx + devy * devy;
-        if devsq < 0.333 {
+        // One line, when its own sagitta `|dev|/4` already fits the budget.
+        if devsq < ONE_LINE_DEVSQ {
             self.draw_line(p0, p2);
             return;
         }
-        let tol = 3.0;
-        // Segment count, CAPPED — the quad's counterpart to `draw_cubic`'s
-        // `MAX_DEPTH`, and it was missing while TrueType (the format aterm
-        // actually renders) is the quadratic path.
+        // Segment count, CAPPED — the quad's counterpart to the cubic's cap,
+        // and it was missing while TrueType (the format aterm actually
+        // renders) is the quadratic path.
         //
         // `devsq` is the squared second difference of three outline points, so
-        // wild control points make it enormous: `1e30` asks for ~130 million
-        // segments, each of which walks its own scanlines. The cap is chosen to
-        // be unreachable by any curve that could matter — the grid is at most
-        // 4096 cells on a side, whose worst in-grid `devsq` is under `3e8` and
-        // whose `n` is therefore under 200 — so no real glyph's flattening
-        // changes, while a hostile one costs a wrong shape instead of a hung
-        // frame.
-        const MAX_QUAD_SEGMENTS: usize = 4096;
-        let n = (1 + (tol * devsq).sqrt().sqrt().floor() as usize).min(MAX_QUAD_SEGMENTS);
+        // wild control points make it enormous. The cap is chosen to be
+        // unreachable by any curve that could matter: the grid is at most 4096
+        // cells on a side, so an in-grid `|dev| = |p0 - 2p1 + p2|` cannot exceed
+        // `8192·√2 ≈ 1.16e4` px, and `√(|dev|/(4t))` at `t = 1/255` is then at
+        // most 860 — a fifth of the cap. No real glyph's flattening changes,
+        // while a hostile one costs a wrong shape instead of a hung frame.
+        // (The cubic's worst in-grid `n` is `√3` times that, ~1489, also under
+        // the cap.) Taking the root of `devsq` FIRST also keeps the arithmetic
+        // finite for a `devsq` near f32's ceiling, which multiplying by a
+        // tolerance first would not.
+        // `saturating_add`, not `1 +`: a control point at f32 INFINITY makes the
+        // float→int cast saturate at `usize::MAX`, and `1 +` that is an
+        // overflow panic in a debug build. A font can encode a coordinate that
+        // scales to infinity, so this is reachable from a file, not only from a
+        // test.
+        let n = ((devsq.sqrt() * INV_FOUR_SAGITTA).sqrt().floor() as usize)
+            .saturating_add(1)
+            .min(MAX_FLATTEN_SEGMENTS);
         let nrecip = (n as f32).recip();
         let mut p = p0;
         let mut t = 0.0;
@@ -283,39 +407,61 @@ impl Rasterizer {
     /// Accumulate a cubic Bézier (`p1`, `p2` are the control points) — the CFF
     /// outline form.
     ///
-    /// Flattened by recursive half-splitting: the curve is straight enough when
-    /// its control polygon's length exceeds the chord's by less than the
-    /// flatness tolerance, and the recursion is depth-capped so a degenerate
-    /// curve terminates.
+    /// Flattened to the same [`FLATTEN_SAGITTA_PX`] budget as
+    /// [`draw_quad`](Self::draw_quad), by the same uniform split.
+    ///
+    /// # The derivation
+    ///
+    /// A cubic's second derivative is not constant, so the budget is met
+    /// through a bound rather than an equality:
+    ///
+    /// ```text
+    /// B''(t) = 6[(1-t)·d1 + t·d2]    d1 = p0 - 2p1 + p2,  d2 = p1 - 2p2 + p3
+    /// ```
+    ///
+    /// which is a linear interpolation, so `|B''| ≤ 6·D` with
+    /// `D = max(|d1|, |d2|)`. A curve departs from its chord over a parameter
+    /// span `Δt` by at most `⅛·max|B''|·Δt²`, so `n` equal pieces
+    /// (`Δt = 1/n`) have sagitta at most `3D/(4n²)`, met by
+    /// `n ≥ √(3D/(4t))`. One line is admissible when `3D/4 ≤ t`.
+    ///
+    /// This replaces the retired crate's recursive half-split on
+    /// `FLATNESS = 0.35` of control-polygon-vs-chord LENGTH excess — a
+    /// straightness proxy with no sagitta reading, so it could not be aimed at
+    /// a budget the output format derives. Uniform splitting also drops the
+    /// recursion (and its `MAX_DEPTH` of 16, worth 65,536 segments) for a flat
+    /// loop under the same cap the quad uses.
     pub fn draw_cubic(&mut self, p0: Point, p1: Point, p2: Point, p3: Point) {
-        self.tessellate_cubic(p0, p1, p2, p3, 0);
-    }
-
-    /// One half-split step of [`draw_cubic`]'s flattening.
-    fn tessellate_cubic(&mut self, p0: Point, p1: Point, p2: Point, p3: Point, n: u8) {
-        /// Straightness tolerance, in grid cells.
-        const FLATNESS: f32 = 0.35;
-        /// Depth cap: a curve that never flattens still terminates.
-        const MAX_DEPTH: u8 = 16;
-
-        let longlen = dist(p0, p1) + dist(p1, p2) + dist(p2, p3);
-        let shortlen = dist(p0, p3);
-        // Polygon-vs-chord excess. Comparing the SQUARED lengths' difference
-        // keeps the test to one subtraction once the three roots are paid for.
-        let flatness_squared = longlen * longlen - shortlen * shortlen;
-        if n < MAX_DEPTH && flatness_squared > FLATNESS * FLATNESS {
-            // de Casteljau at t = 0.5 — all halving, so exact in binary f32.
-            let p01 = lerp(0.5, p0, p1);
-            let p12 = lerp(0.5, p1, p2);
-            let p23 = lerp(0.5, p2, p3);
-            let p012 = lerp(0.5, p01, p12);
-            let p123 = lerp(0.5, p12, p23);
-            let mid = lerp(0.5, p012, p123);
-            self.tessellate_cubic(p0, p01, p012, mid, n + 1);
-            self.tessellate_cubic(mid, p123, p23, p3, n + 1);
-        } else {
+        let d1x = p0.x - 2.0 * p1.x + p2.x;
+        let d1y = p0.y - 2.0 * p1.y + p2.y;
+        let d2x = p1.x - 2.0 * p2.x + p3.x;
+        let d2y = p1.y - 2.0 * p2.y + p3.y;
+        // `D²`, so the single root below is the only one paid.
+        let dsq = (d1x * d1x + d1y * d1y).max(d2x * d2x + d2y * d2y);
+        // One line, when `3D/4` already fits: `D ≤ 4t/3`, i.e.
+        // `dsq ≤ (4t/3)² = (4t)²/9`.
+        if dsq < ONE_LINE_DEVSQ * (1.0 / 9.0) {
             self.draw_line(p0, p3);
+            return;
         }
+        // `saturating_add` for the same infinite-coordinate reason as the quad.
+        let n = ((3.0 * dsq.sqrt() * INV_FOUR_SAGITTA).sqrt().floor() as usize)
+            .saturating_add(1)
+            .min(MAX_FLATTEN_SEGMENTS);
+        let nrecip = (n as f32).recip();
+        let mut p = p0;
+        let mut t = 0.0;
+        for _ in 0..n - 1 {
+            t += nrecip;
+            let pn = lerp(
+                t,
+                lerp(t, lerp(t, p0, p1), lerp(t, p1, p2)),
+                lerp(t, lerp(t, p1, p2), lerp(t, p2, p3)),
+            );
+            self.draw_line(p, pn);
+            p = pn;
+        }
+        self.draw_line(p, p3);
     }
 
     /// Visit every cell in row-major order with `(flat index, coverage 0..=1)`.
@@ -378,10 +524,15 @@ mod tests {
     // `tests/rasterizer_oracle.rs` proves equality against the retired crate,
     // but only for as long as that dev-dependency is there. These four grids
     // are the evidence that outlives it, in the same shape `crates/aterm-hash`
-    // pins vectors for the hash it replaced — and they are not invented: the
-    // oracle's `in_module_golden_shapes_match_the_oracle` feeds these exact
-    // four outlines through `ab_glyph_rasterizer` and requires the same
-    // numbers, so the pin is the retired crate's own answer, recorded.
+    // pins vectors for the hash it replaced.
+    //
+    // The TWO LINE-ONLY grids are not invented: the oracle's
+    // `in_module_golden_shapes_match_the_oracle` feeds those exact outlines
+    // through `ab_glyph_rasterizer` and requires the same numbers, so the pin
+    // is the retired crate's own answer, recorded. The oracle feeds it the
+    // quad and the cubic too — but pre-flattened by the harness, so what it
+    // pins there is the FILL, and the two curve grids below additionally
+    // carry this module's own flattening. See each of them.
     // -----------------------------------------------------------------------
 
     /// An axis-aligned unit square on whole-pixel boundaries: the case where
@@ -431,6 +582,17 @@ mod tests {
 
     /// A quadratic — the TrueType outline form, and the one whose flattening
     /// segment count this module caps.
+    ///
+    /// UNLIKE the two grids above, this one is NOT the retired crate's answer:
+    /// it is the FILL's answer over the first-party flattening, so it moved
+    /// when [`FLATTEN_SAGITTA_PX`] replaced `ab_glyph_rasterizer`'s 0.144 px
+    /// budget. Every cell moved UP — a coarse polyline cuts the chord inside a
+    /// convex curve and loses the ink between them, and this figure's curve
+    /// bulges right — which is the same deficit the corpus-wide survey
+    /// measures. What pins these numbers is therefore not an oracle but a
+    /// bound: `tests/raster_accuracy_survey.rs` holds the shipped path to
+    /// mean ≤ 0.20/255 and per-glyph max ≤ 8/255 against an independent
+    /// analytic reference, and this grid is here to make a re-record LOUD.
     #[test]
     fn golden_quadratic() {
         let got = cov(6, 6, |r| {
@@ -439,17 +601,20 @@ mod tests {
         });
         #[rustfmt::skip]
         let want = [
-            0.196_875, 0.097_243, 0.0,       0.0, 0.0, 0.0,
-            0.5,       0.977_757, 0.404_315, 0.0, 0.0, 0.0,
-            0.5,       1.0,       0.899_810, 0.0, 0.0, 0.0,
-            0.5,       1.0,       0.568_828, 0.0, 0.0, 0.0,
-            0.5,       0.670_360, 0.033_297, 0.0, 0.0, 0.0,
-            0.146_875, 0.004_640, 0.0,       0.0, 0.0, 0.0,
+            0.209_617, 0.138_579, 0.0,       0.0, 0.0, 0.0,
+            0.5,       0.987_065, 0.469_326, 0.0, 0.0, 0.0,
+            0.5,       1.0,       0.963_990, 0.0, 0.0, 0.0,
+            0.5,       1.0,       0.629_342, 0.0, 0.0, 0.0,
+            0.5,       0.713_891, 0.037_827, 0.0, 0.0, 0.0,
+            0.159_617, 0.011_752, 0.0,       0.0, 0.0, 0.0,
         ];
         assert_grid(&got, &want, 6, "quadratic");
     }
 
-    /// A cubic — the CFF outline form, flattened by recursive half-splitting.
+    /// A cubic — the CFF outline form, flattened to the same sagitta budget by
+    /// the same uniform split. Pinned on the same terms as
+    /// [`golden_quadratic`]: first-party output, guarded by the accuracy bound
+    /// rather than by the retired crate.
     #[test]
     fn golden_cubic() {
         let got = cov(6, 6, |r| {
@@ -463,12 +628,12 @@ mod tests {
         });
         #[rustfmt::skip]
         let want = [
-            0.224_256, 0.294_048, 0.051_200, 0.0,       0.0,       0.0,
-            0.5,       1.0,       0.928_930, 0.362_075, 0.0,       0.0,
-            0.5,       1.0,       1.0,       0.988_955, 0.110_375, 0.0,
-            0.5,       1.0,       1.0,       0.988_955, 0.110_375, 0.0,
-            0.5,       1.0,       0.928_929, 0.362_075, 0.0,       0.0,
-            0.224_256, 0.294_048, 0.051_200, 0.0,       0.0,       0.0,
+            0.234_436, 0.332_630, 0.060_644, 0.0,       0.0,       0.0,
+            0.5,       1.0,       0.953_358, 0.400_362, 0.0,       0.0,
+            0.5,       1.0,       1.0,       0.992_968, 0.141_929, 0.0,
+            0.5,       1.0,       1.0,       0.992_968, 0.141_929, 0.0,
+            0.5,       1.0,       0.953_358, 0.400_362, 0.0,       0.0,
+            0.234_436, 0.332_630, 0.060_644, 0.0,       0.0,       0.0,
         ];
         assert_grid(&got, &want, 6, "cubic");
     }

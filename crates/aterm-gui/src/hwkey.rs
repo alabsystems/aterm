@@ -279,7 +279,9 @@ fn take_tokens(rest: &str) -> Result<(u64, u32, u64, String), String> {
                 .parse::<u64>()
                 .map_err(|_| format!("ERR hwkey: bad interval `{n}`\n"))?;
             if interval > MAX_INTERVAL_MS {
-                return Err(format!("ERR hwkey: interval must be 0..={MAX_INTERVAL_MS} ms\n"));
+                return Err(format!(
+                    "ERR hwkey: interval must be 0..={MAX_INTERVAL_MS} ms\n"
+                ));
             }
         } else {
             kept.push(tok);
@@ -391,7 +393,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
     // `NSApp` exists), so this returns the existing singleton and does not
     // construct AppKit's application object off-main. The returned object is
     // retained by the runtime for the process lifetime.
-    let app: Retained<AnyObject> = unsafe { msg_send_id![class!(NSApplication), sharedApplication] };
+    let app: Retained<AnyObject> =
+        unsafe { msg_send_id![class!(NSApplication), sharedApplication] };
 
     let mut posted = 0u32;
     for i in 0..spec.count {
@@ -471,9 +474,7 @@ pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FLAG_COMMAND, FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey,
-    };
+    use super::{FLAG_COMMAND, FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
 
     /// A bare letter is the unshifted US-QWERTY key for it, with no modifiers and
     /// both character strings equal — the shape AppKit reports for a plain press.
@@ -530,7 +531,11 @@ mod tests {
         let enter = parse_hwkey("enter").unwrap();
         assert_eq!(enter.keycode, 36);
         assert_eq!(enter.chars, "\r");
-        assert_eq!(enter.flags & FLAG_FUNCTION, 0, "Return is not a function key");
+        assert_eq!(
+            enter.flags & FLAG_FUNCTION,
+            0,
+            "Return is not a function key"
+        );
 
         let up = parse_hwkey("up").unwrap();
         assert_eq!(up.keycode, 126);
@@ -538,7 +543,10 @@ mod tests {
         assert_eq!(up.flags & FLAG_FUNCTION, FLAG_FUNCTION);
 
         assert_eq!(parse_hwkey("esc").unwrap(), parse_hwkey("escape").unwrap());
-        assert_eq!(parse_hwkey("enter").unwrap(), parse_hwkey("return").unwrap());
+        assert_eq!(
+            parse_hwkey("enter").unwrap(),
+            parse_hwkey("return").unwrap()
+        );
     }
 
     /// winit dereferences `charactersIgnoringModifiers` with `.expect(...)`, so an
@@ -547,9 +555,29 @@ mod tests {
     #[test]
     fn no_accepted_key_yields_empty_character_strings() {
         for spelling in [
-            "a", "Z", "0", "!", "space", "enter", "tab", "esc", "backspace", "delete", "up",
-            "down", "left", "right", "home", "end", "pageup", "pagedown", "f1", "f12", "ctrl+c",
-            "cmd+v", "shift+alt+q",
+            "a",
+            "Z",
+            "0",
+            "!",
+            "space",
+            "enter",
+            "tab",
+            "esc",
+            "backspace",
+            "delete",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "f1",
+            "f12",
+            "ctrl+c",
+            "cmd+v",
+            "shift+alt+q",
         ] {
             let s = parse_hwkey(spelling).unwrap_or_else(|e| panic!("{spelling}: {e}"));
             assert!(!s.chars.is_empty(), "{spelling} had empty characters");
@@ -570,7 +598,11 @@ mod tests {
         assert_eq!(s.interval_ms, 25);
         assert_eq!(s.keycode, parse_hwkey("x").unwrap().keycode);
 
-        assert_eq!(parse_hwkey("x").unwrap().interval_ms, 40, "human-ish default");
+        assert_eq!(
+            parse_hwkey("x").unwrap().interval_ms,
+            40,
+            "human-ish default"
+        );
         assert!(parse_hwkey("x count=0").is_err());
         assert!(parse_hwkey(&format!("x count={}", MAX_COUNT + 1)).is_err());
         assert!(parse_hwkey("x count=1oo").is_err());
@@ -597,8 +629,17 @@ mod tests {
             parse_hwkey("cmd+v").unwrap().flags & FLAG_COMMAND,
             FLAG_COMMAND
         );
-        assert_eq!(parse_hwkey("command+v").unwrap(), parse_hwkey("super+v").unwrap());
-        assert_eq!(parse_hwkey("control+c").unwrap(), parse_hwkey("ctrl+c").unwrap());
-        assert_eq!(parse_hwkey("option+x").unwrap(), parse_hwkey("alt+x").unwrap());
+        assert_eq!(
+            parse_hwkey("command+v").unwrap(),
+            parse_hwkey("super+v").unwrap()
+        );
+        assert_eq!(
+            parse_hwkey("control+c").unwrap(),
+            parse_hwkey("ctrl+c").unwrap()
+        );
+        assert_eq!(
+            parse_hwkey("option+x").unwrap(),
+            parse_hwkey("alt+x").unwrap()
+        );
     }
 }

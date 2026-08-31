@@ -224,6 +224,30 @@ impl ToneTracker {
 /// place so the WIRE FORMAT is a pure function of plain data (no `App`, no
 /// window, no audio device) and can be pinned by a headless test.
 ///
+/// The audio HOST as the status line reports it. `Live` = the worker is
+/// reachable AND responsive. `Wedged` = ingress is open but the worker has
+/// been stuck inside one platform call past its threshold, so cues are being
+/// dropped — a state a bare `live` bit cannot distinguish (the 2026-08 field
+/// incident printed `live` over a silent synth for hours, whichever state it
+/// was in). `Inert` = sealed headless/test form, non-macOS build, or
+/// permanent failure (including an exhausted wedge-revival budget).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AudioHost {
+    Live,
+    Wedged,
+    Inert,
+}
+
+impl AudioHost {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Wedged => "wedged",
+            Self::Inert => "inert",
+        }
+    }
+}
+
 /// The fields are chosen to answer the ONE question a driver actually asks —
 /// "is the mood steering my typing sounds, and if not, which gate stopped
 /// it?" — so every conjunct of `App::tone_infer_active` appears as its own
@@ -242,9 +266,9 @@ pub(crate) struct ToneStatus {
     pub(crate) sounds: bool,
     /// `trail_sound_volume`, already clamped to 0..1.
     pub(crate) volume: f32,
-    /// Whether the trail-audio worker can reach a device at all (false
-    /// headless, off macOS, or after a permanent ingress failure).
-    pub(crate) audio_live: bool,
+    /// The audio host's honest state — not merely whether a channel exists
+    /// (see [`AudioHost`]).
+    pub(crate) audio: AudioHost,
     /// The AND of the four above: whether inference may run at all.
     pub(crate) active: bool,
     /// Chars in the typed window (never the text — see
@@ -254,6 +278,10 @@ pub(crate) struct ToneStatus {
     /// `tone` is impossible; zero with `active=true` after typing means the
     /// feed is broken, not that your prose reads technical.
     pub(crate) inferences: u64,
+    /// Saturating count of sound cues dropped on a full ingress channel over
+    /// the host's lifetime. A handful is a burst; thousands alongside
+    /// `audio=wedged` is the wedge's cost, printed instead of private.
+    pub(crate) dropped: u64,
 }
 
 impl ToneStatus {
@@ -262,16 +290,17 @@ impl ToneStatus {
     pub(crate) fn line(&self) -> String {
         format!(
             "tone={} effective={} knob={} sounds={} volume={:.2} audio={} \
-             active={} window_chars={} inferences={}",
+             active={} window_chars={} inferences={} dropped={}",
             self.tone.label(),
             self.effective.label(),
             if self.knob { "on" } else { "off" },
             if self.sounds { "on" } else { "off" },
             self.volume,
-            if self.audio_live { "live" } else { "inert" },
+            self.audio.label(),
             self.active,
             self.window_chars,
             self.inferences,
+            self.dropped,
         )
     }
 }
@@ -450,15 +479,40 @@ mod tests {
             knob: false,
             sounds: true,
             volume: 0.4,
-            audio_live: true,
+            audio: AudioHost::Live,
             active: false,
             window_chars: 27,
             inferences: 5,
+            dropped: 0,
         };
         assert_eq!(
             status.line(),
             "tone=frustrated effective=technical knob=off sounds=on volume=0.40 \
-             audio=live active=false window_chars=27 inferences=5",
+             audio=live active=false window_chars=27 inferences=5 dropped=0",
+        );
+    }
+
+    /// The wedge is its own word on the wire: a stuck worker must never be
+    /// spelled `live` (the 2026-08 incident) nor collapsed into `inert`
+    /// (which names the sealed/failed forms a restart cannot revive).
+    #[test]
+    fn status_line_spells_a_wedged_host_wedged() {
+        let status = ToneStatus {
+            tone: Tone::Technical,
+            effective: Tone::Technical,
+            knob: true,
+            sounds: true,
+            volume: 0.4,
+            audio: AudioHost::Wedged,
+            active: false,
+            window_chars: 0,
+            inferences: 104,
+            dropped: 4_096,
+        };
+        assert_eq!(
+            status.line(),
+            "tone=technical effective=technical knob=on sounds=on volume=0.40 \
+             audio=wedged active=false window_chars=0 inferences=104 dropped=4096",
         );
     }
 

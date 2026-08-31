@@ -4,7 +4,9 @@
 //! Boot-health sentinel (§16.4) — the shared primitive that stops a launch-crash from
 //! bricking the fleet after a self-swap.
 //!
-//! An app self-swap applies *on next launch* and re-execs the new binary; the health
+//! An app self-swap is applied at the top of a launch — the handoff SUCCESSOR's boot
+//! apply on the ordinary in-session path, or a cold launch on the fallback path — and
+//! re-execs the new binary; the health
 //! probe "before any window" is necessarily shallow (it catches a pre-checkpoint panic,
 //! not a deep GUI-init crash). So the swap-back is gated by a **sentinel**: just before
 //! the swap is applied, [`Sentinel::arm`] records the build being trialed; the new build

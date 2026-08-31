@@ -69,6 +69,46 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
     })
 }
 
+/// The transient status pill for a build that is already installed on disk: the
+/// reducer imports it as an ACTIVATION stage and the seamless lane adopts every
+/// window and shell — there is nothing to relaunch.
+pub(crate) const UPDATE_INSTALLED_ACTIVATING: &str =
+    "\u{2191} Update installed — activating in place";
+
+/// The three answers about this process [`App::apply_posture_for`] folds in,
+/// read ONCE at the call site so the pure half ([`App::apply_posture_with`]) is
+/// testable without touching process environment (the tests in this crate
+/// assert those variables' ABSENCE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ApplyPostureEnv {
+    /// Why the in-session handoff cannot run in this process, if it cannot —
+    /// [`App::seamless_handoff_unavailable`], the SAME reading the apply gate
+    /// takes for `seamless_capable`. With a reason here the apply is REFUSED
+    /// while any terminal is open (`native_update_admission::classify` admits
+    /// the cold lane only with zero live PTYs), so no promise about WHEN it
+    /// applies is true.
+    pub(crate) handoff_unavailable: Option<crate::app_update_handoff::HandoffUnavailable>,
+    /// `[update] auto_apply` folded with `$ATERM_NO_AUTO_APPLY`.
+    pub(crate) auto_apply: crate::app_config::AutoApplySetting,
+    /// `$ATERM_DEBUG_RELAUNCH_NUDGE` is set: the screenshot seam vetoes the lane.
+    pub(crate) nudge_seam: bool,
+}
+
+impl ApplyPostureEnv {
+    /// The live answers. Plain reads — `var_os` and two fields of the App
+    /// (`seamless_handoff_unavailable`), and the fixed-shape memo in
+    /// `relaunch_nudge_seam_suppresses_auto_apply`, whose initializer reads the
+    /// ENVIRONMENT — never a memo whose initializer could call its own owner:
+    /// that exact shape parked the main thread forever on 2026-08-30.
+    pub(crate) fn observe(app: &App) -> Self {
+        Self {
+            handoff_unavailable: app.seamless_handoff_unavailable(),
+            auto_apply: crate::app_config::update_auto_apply_setting(&app.config),
+            nudge_seam: App::relaunch_nudge_seam_suppresses_auto_apply(),
+        }
+    }
+}
+
 impl App {
     /// Snapshot the current process-owned updater reducer into a fresh [`UpdateState`].
     /// This is memory-only: ledger and installed-bundle facts enter the reducer solely
@@ -131,6 +171,110 @@ impl App {
         match staged_build {
             Some(build) if self.automatic_apply_retry_scheduled(build) => ApplyRetry::Scheduled,
             _ => ApplyRetry::ManualOnly,
+        }
+    }
+
+    /// HOW the staged `build` will be applied — the status bar's finer law
+    /// ([`crate::status_bars::ApplyPosture`]), which must agree with
+    /// [`Self::apply_retry_for`]: a `ManualOnlyLatched { lapses: true }` bar and a
+    /// `Scheduled` row are the same fact. The bar says this instead of "restart
+    /// aterm to apply", which it said over the in-session handoff until
+    /// 2026-08-30.
+    pub(crate) fn apply_posture_for(&self, build: u64) -> crate::status_bars::ApplyPosture {
+        self.apply_posture_with(build, ApplyPostureEnv::observe(self))
+    }
+
+    /// The pure half of [`Self::apply_posture_for`]: the three answers about
+    /// this process supplied, the lane's own state read from `self`. Order: an
+    /// unavailable handoff first, whatever its reason (it changes WHETHER
+    /// anything applies while a terminal is open, so it outranks everything that
+    /// only changes WHEN), then policy — config, then the environment — then the
+    /// screenshot seam, then this build's own stand-down latch; what is left is
+    /// the automatic lane.
+    pub(crate) fn apply_posture_with(
+        &self,
+        build: u64,
+        env: ApplyPostureEnv,
+    ) -> crate::status_bars::ApplyPosture {
+        use crate::app_config::AutoApplySetting;
+        use crate::status_bars::{ApplyPosture as P, AutoApplyVeto};
+        if let Some(why) = env.handoff_unavailable {
+            // The warning outranks policy, but its fallback clause depends on
+            // it: a vetoed automatic lane never takes the cold apply at zero
+            // live PTYs, so the bar must not promise that landing. Same
+            // precedence as the standalone arms below.
+            let veto = match env.auto_apply {
+                AutoApplySetting::OffByEnv => Some(AutoApplyVeto::Env {
+                    var: "ATERM_NO_AUTO_APPLY",
+                }),
+                AutoApplySetting::OffByConfig => Some(AutoApplyVeto::Config),
+                AutoApplySetting::On if env.nudge_seam => Some(AutoApplyVeto::Env {
+                    var: "ATERM_DEBUG_RELAUNCH_NUDGE",
+                }),
+                AutoApplySetting::On => None,
+            };
+            return P::HandoffDisabled { why, veto };
+        }
+        match env.auto_apply {
+            AutoApplySetting::OffByEnv => {
+                return P::VetoedByEnv {
+                    var: "ATERM_NO_AUTO_APPLY",
+                };
+            }
+            AutoApplySetting::OffByConfig => return P::ManualByConfig,
+            AutoApplySetting::On => {}
+        }
+        if env.nudge_seam {
+            return P::VetoedByEnv {
+                var: "ATERM_DEBUG_RELAUNCH_NUDGE",
+            };
+        }
+        if let Some(manual) = self
+            .auto_apply_manual_only
+            .filter(|manual| manual.build == build)
+        {
+            return P::ManualOnlyLatched {
+                lapses: manual.retry_at.is_some(),
+            };
+        }
+        P::Automatic
+    }
+
+    /// One report from the updater's own check reached the event loop
+    /// (`Wake::UpdateProgress`): feed the update STATUS BAR — with the apply
+    /// posture computed for a `Staged` build, so the bar says how it applies —
+    /// then settle, re-grid and repaint. The `Staged` report is emitted from the
+    /// check thread BEFORE the `on_staged` callback posts `Wake::UpdateStaged`,
+    /// so it lands here before the stage is reconciled and armed: only the
+    /// POLICY posture is knowable now; the ARMED fact is re-stated onto the bar a
+    /// moment later by `arm_native_auto_apply`, typically well inside the hold.
+    pub(crate) fn note_update_progress(&mut self, progress: &aterm_update::Progress) {
+        let posture = if let aterm_update::Progress::Staged { build, .. } = progress {
+            Some(self.apply_posture_for(*build))
+        } else {
+            None
+        };
+        self.status_bars
+            .update_progress(progress, posture, std::time::Instant::now());
+        self.sync_status_bars();
+    }
+
+    /// Re-state HOW the staged `build` applies on the live update bar, if the
+    /// bar is still up for it, and repaint only when the words changed.
+    ///
+    /// EVERY site that changes the posture calls this — arming the lane, the
+    /// typing hold, and each of the stand-down paths that latch manual-only
+    /// (the refused physical attempt, the policy fallback, the reaped abort,
+    /// the returned-apply reconcile). Until 2026-08-30 only the first two did:
+    /// an admission refusal is synchronous and lands inside the `Staged` bar's
+    /// hold, so the bar kept promising "applies in place within ~2 min" while
+    /// the Version-menu row already said the attempt did not start — two
+    /// surfaces, two answers — and the folded sentence went into the ledger.
+    /// A no-op once the bar has folded.
+    pub(crate) fn restate_staged_bar_posture(&mut self, build: u64) {
+        let posture = self.apply_posture_for(build);
+        if self.status_bars.restate_apply_posture(build, posture) {
+            self.sync_status_bars();
         }
     }
 
@@ -287,7 +431,9 @@ impl App {
     /// With nothing actually staged
     /// (a stale nudge, the `ATERM_DEBUG_RELAUNCH_NUDGE` QA seam, a ledger cleared under
     /// us) it opens the Software Update route in the native Settings tab: honest
-    /// details, never a dead click, a legacy modal, or a blind restart.
+    /// details, never a dead click or a legacy modal — and nothing on this path
+    /// ever restarts the app: a staged build is applied IN PLACE by the seamless
+    /// overlap handoff, and the shells keep running.
     pub(crate) fn apply_update_or_details(&mut self) {
         let debug_seamless = crate::app_update_screen::debug_seamless_reexec_armed();
         let staged_ready = self.staged_update_ready();
@@ -352,7 +498,8 @@ impl App {
     ///
     /// But silent was the wrong other extreme, and it is what the owner actually
     /// hit: a staged build sat unapplied across two releases while `update
-    /// status` reported `failing=0 failing_applies=0` and advised a relaunch,
+    /// status` reported `failing=0 failing_applies=0` and said the build was
+    /// merely waiting to be applied,
     /// because the refusal reached this function and stopped here. "Nothing is
     /// wrong" and "we declined, here is why" are different answers and the file
     /// could only say the first. `record_apply_refusal` is the separate,
@@ -423,13 +570,14 @@ impl App {
             }
             crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { build, message } => {
                 aterm_log::warn!(
-                    "update apply ({source}): build {build} is installed; relaunch still needed: {message}"
+                    "update apply ({source}): build {build} is installed on disk; activating it \
+                     in place: {message}"
                 );
                 if open_details {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
                 } else {
-                    self.surface_nonmodal_update_status("↑ Update installed — relaunch once");
+                    self.surface_nonmodal_update_status(UPDATE_INSTALLED_ACTIVATING);
                 }
             }
             crate::native_app::UpdateOutcome::Deferred { reason } => {
@@ -555,7 +703,8 @@ impl App {
     }
 
     /// Re-sync the macOS VERSION menu (the rightmost menu-bar title) to the live update
-    /// state: `v<cur> ⬆️` + the one-click "Update to v<staged> — restart now" first item
+    /// state: `v<cur> ⬆️` + the one-click "Update to v<staged> — apply now, shells keep
+    /// running" first item
     /// while a strictly-newer build is staged; `v<cur> ⬆️` + the "Updated to v<cur> just
     /// now" celebration item while the post-update realized arrow is live; plain
     /// `v<cur>` otherwise. The PERSISTENT update affordance lives here now (the titlebar
@@ -570,7 +719,7 @@ impl App {
                     .upgrade_realized
                     .is_some_and(|t| t.elapsed() < crate::relaunch_notice::REALIZED_ARROW_TTL);
             // The always-visible offer carries the apply lane's verdict on ITSELF. A
-            // Version menu that says "restart now" while the engine has already tried
+            // Version menu that says "apply now" while the engine has already tried
             // and failed is the surface that made the 2026-08-21 field state
             // unreadable; the row now says how many attempts died, why, and whether
             // anything is still scheduled.
@@ -869,7 +1018,9 @@ fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyLedgerVerdict, apply_ledger_verdict, debug_seamless_reexec_armed};
+    use super::{
+        ApplyLedgerVerdict, ApplyPostureEnv, apply_ledger_verdict, debug_seamless_reexec_armed,
+    };
     use crate::App;
     use crate::WindowId;
     use crate::native_app::{AppViewState, UpdateOutcome};
@@ -1032,6 +1183,336 @@ mod tests {
         });
     }
 
+    /// THE STATUS BAR'S POSTURE, IN THE ORDER THE FACTS OUTRANK EACH OTHER: the
+    /// disabled handoff (nothing applies while a terminal is open), then policy
+    /// — config, then the
+    /// environment — then the screenshot seam, then THIS build's own stand-down
+    /// latch (a lapsing latch is the same fact as a `Scheduled` retry row; a
+    /// sticky one waits for a click); what is left is the automatic lane. The
+    /// three answers about the process go in as parameters: the tests in this
+    /// crate assert those variables' ABSENCE, and setting process env would
+    /// poison every one of them. The LIVE reader is pinned on what a headless
+    /// App really is — a process with no seamless lane — because it reads the
+    /// same predicate the apply gate reads.
+    #[test]
+    fn apply_posture_names_config_env_latch_and_disabled_handoff_in_that_order() {
+        use crate::app_config::AutoApplySetting;
+        use crate::app_update_handoff::HandoffUnavailable;
+        use crate::status_bars::ApplyPosture as P;
+        use crate::update_apply_trouble::ApplyRetry;
+        let mut app = App::headless_for_test();
+        assert!(
+            crate::app_config::update_auto_apply(&app.config)
+                && !App::relaunch_nudge_seam_suppresses_auto_apply()
+                && !crate::app_update_handoff::seamless_handoff_opted_out()
+                && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
+            "PRECONDITION: no update veto may be set in the test environment"
+        );
+        let build = 4_242;
+        let latch = |build: u64, retry_at: Option<std::time::Instant>| crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at,
+        };
+        let later = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+        let clean = ApplyPostureEnv {
+            handoff_unavailable: None,
+            auto_apply: AutoApplySetting::On,
+            nudge_seam: false,
+        };
+        // THE LIVE READER, on a headless App: no window and no event loop, so no
+        // seamless lane — and the posture says so, because it reads the ONE
+        // predicate the apply gate reads. (Until 2026-08-30 it folded only the
+        // opt-out and answered `Automatic` here, over a lane the gate refused.)
+        assert_eq!(
+            app.seamless_handoff_unavailable(),
+            Some(HandoffUnavailable::Headless)
+        );
+        assert_eq!(
+            ApplyPostureEnv::observe(&app).handoff_unavailable,
+            app.seamless_handoff_unavailable()
+        );
+        assert_eq!(
+            app.apply_posture_for(build),
+            P::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: None
+            },
+            "a headless App has no seamless lane, and the bar says so"
+        );
+        assert_eq!(
+            app.apply_posture_with(build, clean),
+            P::Automatic,
+            "the default policy, with the lane available"
+        );
+
+        // THE LANE'S OWN STATE: a lapsing latch, a sticky latch, another build's.
+        app.auto_apply_manual_only = Some(latch(build, later));
+        assert_eq!(
+            app.apply_posture_with(build, clean),
+            P::ManualOnlyLatched { lapses: true }
+        );
+        assert_eq!(
+            app.apply_retry_for(Some(build)),
+            ApplyRetry::Scheduled,
+            "…which is the Scheduled row: the same fact, on the row"
+        );
+        app.auto_apply_manual_only = Some(latch(build, None));
+        assert_eq!(
+            app.apply_posture_with(build, clean),
+            P::ManualOnlyLatched { lapses: false }
+        );
+        assert_eq!(app.apply_retry_for(Some(build)), ApplyRetry::ManualOnly);
+        app.auto_apply_manual_only = Some(latch(build + 1, None));
+        assert_eq!(
+            app.apply_posture_with(build, clean),
+            P::Automatic,
+            "another build's latch is not this build's"
+        );
+
+        // POLICY OUTRANKS THE LATCH: config first…
+        app.auto_apply_manual_only = Some(latch(build, later));
+        assert_eq!(
+            app.apply_posture_with(
+                build,
+                ApplyPostureEnv {
+                    auto_apply: AutoApplySetting::OffByConfig,
+                    ..clean
+                }
+            ),
+            P::ManualByConfig
+        );
+        // …the environment veto names its variable…
+        assert_eq!(
+            app.apply_posture_with(
+                build,
+                ApplyPostureEnv {
+                    auto_apply: AutoApplySetting::OffByEnv,
+                    ..clean
+                }
+            ),
+            P::VetoedByEnv {
+                var: "ATERM_NO_AUTO_APPLY"
+            }
+        );
+        // …so does the screenshot seam…
+        assert_eq!(
+            app.apply_posture_with(
+                build,
+                ApplyPostureEnv {
+                    nudge_seam: true,
+                    ..clean
+                }
+            ),
+            P::VetoedByEnv {
+                var: "ATERM_DEBUG_RELAUNCH_NUDGE"
+            }
+        );
+        // …and an unavailable handoff outranks all of it, whatever its reason:
+        // nothing applies while a terminal is open, so neither the automatic
+        // promise nor the manual affordance would be true — but the warning
+        // CARRIES the veto (config here: it outranks the seam, like the arms
+        // above), so the bar's fallback clause cannot promise the
+        // closed-terminals landing a vetoed lane never attempts.
+        for why in HandoffUnavailable::ALL {
+            assert_eq!(
+                app.apply_posture_with(
+                    build,
+                    ApplyPostureEnv {
+                        handoff_unavailable: Some(why),
+                        auto_apply: AutoApplySetting::OffByConfig,
+                        nudge_seam: true,
+                    }
+                ),
+                P::HandoffDisabled {
+                    why,
+                    veto: Some(crate::status_bars::AutoApplyVeto::Config)
+                }
+            );
+        }
+        // The screenshot seam is a veto of its own when policy is otherwise On…
+        assert_eq!(
+            app.apply_posture_with(
+                build,
+                ApplyPostureEnv {
+                    handoff_unavailable: Some(HandoffUnavailable::Headless),
+                    auto_apply: AutoApplySetting::On,
+                    nudge_seam: true,
+                }
+            ),
+            P::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: Some(crate::status_bars::AutoApplyVeto::Env {
+                    var: "ATERM_DEBUG_RELAUNCH_NUDGE"
+                })
+            }
+        );
+        // …and an armed lane carries none.
+        assert_eq!(
+            app.apply_posture_with(
+                build,
+                ApplyPostureEnv {
+                    handoff_unavailable: Some(HandoffUnavailable::Headless),
+                    ..clean
+                }
+            ),
+            P::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: None
+            }
+        );
+
+        // THE LIVE READER folds the real config through the same seam…
+        app.auto_apply_manual_only = None;
+        app.config.update = Some(crate::app_config::UpdateConfig {
+            auto_apply: Some(false),
+            ..app.config.update.clone().unwrap_or_default()
+        });
+        assert_eq!(
+            crate::app_config::update_auto_apply_setting(&app.config),
+            AutoApplySetting::OffByConfig
+        );
+        let observed = ApplyPostureEnv::observe(&app);
+        assert_eq!(observed.auto_apply, AutoApplySetting::OffByConfig);
+        assert_eq!(
+            app.apply_posture_with(
+                build,
+                ApplyPostureEnv {
+                    handoff_unavailable: None,
+                    ..observed
+                }
+            ),
+            P::ManualByConfig
+        );
+        // …and, headless, still answers with the lane that is not there — now
+        // carrying the config veto the live reader observed.
+        assert_eq!(
+            app.apply_posture_for(build),
+            P::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: Some(crate::status_bars::AutoApplyVeto::Config)
+            }
+        );
+    }
+
+    /// THE BAR CARRIES THE POSTURE THE APP COMPUTED. `Wake::UpdateProgress` lands
+    /// in `note_update_progress`; a `Staged` report paints `apply_posture_for`,
+    /// which for a headless App — no window, no event loop, so no seamless lane
+    /// — is the handoff-off warning: the same fact the apply gate acts on
+    /// (`a_stand_down_restates_the_staged_bar_while_it_is_still_up` drives that
+    /// gate). Never "applies in place within ~2 min" over a lane that is not
+    /// there, never "apply it from the Version menu" for a click the gate
+    /// refuses, never "restart aterm to apply". With the lane AVAILABLE (the pure
+    /// seam) the automatic promise is painted, and a later stand-down for that
+    /// build is re-stated onto the same bar.
+    #[test]
+    fn a_staged_report_paints_the_bar_with_the_posture_the_app_computed() {
+        use crate::app_config::AutoApplySetting;
+        use crate::app_update_handoff::HandoffUnavailable;
+        use crate::status_bars::{ApplyPosture, Lane, staged_detail};
+        let mut app = App::headless_for_test();
+        assert!(
+            crate::app_config::update_auto_apply(&app.config)
+                && !App::relaunch_nudge_seam_suppresses_auto_apply()
+                && !crate::app_update_handoff::seamless_handoff_opted_out()
+                && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
+            "PRECONDITION: no update veto may be set in the test environment"
+        );
+        let build = 4_243;
+        let staged = aterm_update::Progress::Staged {
+            version: "9.9.9".to_string(),
+            build,
+        };
+        let bar_detail = |app: &App| {
+            app.status_bars
+                .bars()
+                .next()
+                .expect("the update bar is up")
+                .1
+                .text
+                .detail
+                .clone()
+        };
+        app.note_update_progress(&staged);
+        let (lane, bar) = app
+            .status_bars
+            .bars()
+            .next()
+            .expect("the staged report raised the update bar");
+        assert_eq!(lane, Lane::Update);
+        assert_eq!(bar.text.title, "aterm v9.9.9 is ready");
+        let headless = ApplyPosture::HandoffDisabled {
+            why: HandoffUnavailable::Headless,
+            veto: None,
+        };
+        assert_eq!(bar.text.detail, staged_detail(build, headless));
+        assert!(
+            bar.text.detail.contains("--headless")
+                && bar
+                    .text
+                    .detail
+                    .contains("will NOT apply while any terminal is open")
+                && !bar.text.detail.contains("~2 min")
+                && !bar.text.detail.contains("Version menu")
+                && !bar.text.detail.to_lowercase().contains("restart"),
+            "{}",
+            bar.text.detail
+        );
+        assert_eq!(
+            app.status_bar_rows, 1,
+            "…and the row is reserved on the grid"
+        );
+
+        // A stand-down latch for this build changes nothing here: the lane that
+        // cannot run outranks the latch, and the bar keeps its warning.
+        let latch = |retry_at| crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at,
+        };
+        app.auto_apply_manual_only = Some(latch(None));
+        assert_eq!(app.apply_posture_for(build), headless);
+        assert!(
+            !app.status_bars.restate_apply_posture(build, headless),
+            "the words did not change"
+        );
+
+        // With the lane AVAILABLE — the pure seam, since a headless test process
+        // cannot build an event loop — the automatic promise, then the stand-down
+        // re-stated onto the same bar.
+        let available = ApplyPostureEnv {
+            handoff_unavailable: None,
+            auto_apply: AutoApplySetting::On,
+            nudge_seam: false,
+        };
+        app.auto_apply_manual_only = None;
+        assert_eq!(
+            app.apply_posture_with(build, available),
+            ApplyPosture::Automatic
+        );
+        app.status_bars.update_progress(
+            &staged,
+            Some(ApplyPosture::Automatic),
+            std::time::Instant::now(),
+        );
+        let detail = bar_detail(&app);
+        assert!(
+            detail.contains("applies in place within ~2 min")
+                && detail.contains("your shells keep running")
+                && !detail.to_lowercase().contains("restart"),
+            "{detail}"
+        );
+        app.auto_apply_manual_only = Some(latch(None));
+        let posture = app.apply_posture_with(build, available);
+        assert_eq!(posture, ApplyPosture::ManualOnlyLatched { lapses: false });
+        assert!(app.status_bars.restate_apply_posture(build, posture));
+        let detail = bar_detail(&app);
+        assert!(
+            detail.contains("until you apply it") && !detail.to_lowercase().contains("restart"),
+            "{detail}"
+        );
+    }
+
     /// THE WHOLE SHIPPING ASSEMBLY, FROM ONE REAL FAILED APPLY.
     ///
     /// Everything else about this work can be asserted through seams — `ApplyTrouble`
@@ -1074,7 +1555,7 @@ mod tests {
                 "9.9.9",
                 app.apply_trouble_for(build).as_ref()
             ),
-            "\u{2191} Update to v9.9.9 \u{2014} restart now"
+            "\u{2191} Update to v9.9.9 \u{2014} apply now, shells keep running"
         );
 
         // ONE REAL FAILURE, through the door the handoff completion uses. Nothing
@@ -1182,7 +1663,7 @@ mod tests {
         assert_eq!(
             crate::menu::staged_apply_label("\u{2191}", build, "9.9.9", Some(&latched)),
             "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t start; \
-             restart now to retry"
+             apply now to retry"
         );
         assert!(
             app.update_snapshot(false)
@@ -1234,7 +1715,7 @@ mod tests {
         assert_eq!(
             crate::menu::staged_apply_label("\u{2191}", staged, "9.9.9", Some(&trouble)),
             "\u{2191} Update to v9.9.9 \u{2014} tried once, didn\u{2019}t take over; \
-             restart now to retry",
+             apply now to retry",
             "the CAUSE came off the disk, and so did the fact that nothing is scheduled"
         );
         assert!(
@@ -1306,7 +1787,7 @@ mod tests {
                 "9.9.9",
                 app.apply_trouble_for(fresh).as_ref()
             ),
-            "\u{2191} Update to v9.9.9 \u{2014} restart now"
+            "\u{2191} Update to v9.9.9 \u{2014} apply now, shells keep running"
         );
         assert!(
             app.update_snapshot(false)
@@ -1509,6 +1990,7 @@ mod tests {
             app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
                 build,
                 dmg_sha256: [0xab; 32],
+                activation: false,
                 cycles,
                 last_attempt: std::time::Instant::now(),
             });
@@ -1528,6 +2010,7 @@ mod tests {
         app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
             build: build + 7,
             dmg_sha256: [0xab; 32],
+            activation: false,
             cycles: 8,
             last_attempt: std::time::Instant::now(),
         });
@@ -1563,6 +2046,7 @@ mod tests {
         app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256: [0xab; 32],
+            activation: false,
             cycles: 5,
             last_attempt: std::time::Instant::now() - std::time::Duration::from_secs(600),
         });
@@ -1679,7 +2163,7 @@ mod tests {
         assert_eq!(
             apply_ledger_verdict(&UpdateOutcome::InstalledNeedsRelaunch {
                 build: 7,
-                message: "relaunch once".to_string(),
+                message: "activating in place".to_string(),
             }),
             ApplyLedgerVerdict::Silent
         );

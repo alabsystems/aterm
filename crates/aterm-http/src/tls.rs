@@ -56,7 +56,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 
 /// How server certificates are verified.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Trust {
     /// Verify against the operating system's trust store.
     PlatformVerifier,

@@ -7,36 +7,24 @@
 //! v0.48.0 and v0.49.0 shipped the rainbow cursor trail dark past green gates
 //! because every proof measured a different machine, screen or profile than the
 //! owner runs, and nothing in CI or the cut ever pixel-checked a shipped
-//! artifact. This suite closes the CI half: it launches the RELEASE-profile
-//! `target/release/aterm` HEADLESS, drives real keystrokes through the control
+//! artifact. This suite closes the CI half: it launches a RELEASE-profile
+//! `aterm` HEADLESS, drives real keystrokes through the control
 //! socket, records the take with `ctl video … full pace`, and asserts on the
 //! pixels — through `tools/paint-conformance/paint_probe.sh`, the same driver
 //! and scanner the release cut's paint smoke uses, so the two gates cannot
 //! drift apart.
 //!
-//! THE MATRIX (each row a test):
-//!   1. main-screen /bin/sh prompt typing            → effect ink PRESENT
-//!   2. alt-screen fake-Claude shape (DEC-2026 bracketed repaints + DECTCEM
-//!      hide + 150ms spinner + per-key echo), typing → effect ink PRESENT
-//!   3. alt-screen cold spinner, NOTHING typed       → ZERO ink in EVERY frame
-//!   4. alt-screen ESC7/ESC8 token streamer, typing  → effect ink PRESENT
-//!      (the "unowned batch" cadence that tripped the ownership fence; kept
-//!      as a matrix row so that regression class stays dead)
-//!   5. UNFOCUSED alt-screen fake-Claude, typed over the control socket,
-//!      captured WITHOUT a recording                 → RAINBOW ink PRESENT
-//!   6. UNFOCUSED alt-screen cold spinner, nothing typed, same unpinned
-//!      capture                                      → NOT ink (row 5's control)
-//!   7. shipped-default style, first still + typing   → resident PET in every
-//!      frame, including frame zero, AND rainbow ink with no interior blackout
-//!   8. classic flying-kitty style, sustained typing → kitty is EARNED and its
-//!      whole-head bitmap survives into three isolated final stills
-//!   9. alt-screen COLD TOKEN STREAMER whose RESTING CARET ADVANCES every batch
-//!      (append-shaped, DECTCEM SHOWN, NOTHING typed) → ZERO ink in EVERY frame
+//! THE MATRIX has 21 live-artifact rows plus the scanner's own semantic
+//! negative controls. It covers prompt, fake-Claude, ESC7/ESC8 streamer and
+//! cold-output shapes; pinned video and unpinned focused/unfocused images;
+//! shipped-default resident pet, earned flying cat and owner-spelling overlap;
+//! and four matched typed `off` twins. Those off twins preserve cursor/text
+//! deltas while requiring zero ribbon geometry and a quiet effect ledger, so a
+//! cursor, glyph or resident animal cannot satisfy the positive classifier.
 //!
-//! Rows 7 and 8 close a different false-green class. The first six rows pin
-//! `rainbow kitty` and accept generic dynamic rainbow pixels; they neither run
-//! the shipped default (`rainbow kitty pet`) nor type long enough to earn the
-//! classic flying cat. The companion rows pair every `ctl image` with the
+//! The companion rows close a different false-green class. Trail-only rows pin
+//! the companion-free `flying` style; companion rows pin their explicit style
+//! and pair every `ctl image` with the
 //! engine's exact `trail status`, then demand BOTH the semantic claim and a
 //! tall foreground connected component in that captured frame. A live pet/cat
 //! state with an omitted sprite fails; rainbow ink with no animal also fails.
@@ -95,15 +83,34 @@
 //!   row 3,    the dark control     31 frames  total_ink 0
 //!   row 6,    the quiet control    25 frames  total_ink 0-196      hues 0-1
 //!
-//! The busiest SINGLE frame runs 98-136 px on every ink arm, which is why the
-//! ≥150 floor gates the TAKE and not a frame — a per-frame floor of 150 would
-//! be vacuously red on healthy builds.
+//! The busiest SINGLE frame ran 98-136 px on every ink arm under the retired
+//! traverse, which is why the ≥150 floor gates the TAKE and not a frame.
+//!
+//! RE-MEASURED 2026-08-30, after the per-mark traverse shipped and the typed
+//! rows moved to [`MATURE_RUN`]'s 29 keys (shipped dist binary, same headless
+//! 584x350) — those 2026-08-24 lines above describe the fixed-40-cell
+//! traverse at 10-11 keys and are kept as history, not calibration:
+//!
+//!   rows 1/2/4, capture=video  246-250 frames  total_ink 35,162-46,827
+//!                              union_hues 11   driven_dark_us=0
+//!                              mature_lead_us 120-159k (the pre-glass lead;
+//!                              the 158,126 outlier is the merged tree's 3x
+//!                              sweep — still 3x under the probe's 500 ms
+//!                              MATURE_LEAD_MAX_US ceiling)
+//!   rows 5/6a/6b, image        67 frames       total_ink 9,698-9,765
+//!                              union_hues 11   ribbon_window_hues 11
+//!                              ribbon_bound 43 ribbon_dark 0
+//!
+//! best_ink (the busiest single frame) now runs 220-482 on the ink arms — the
+//! longer run stacks more concurrent sparks — so the 150 take-floor sits far
+//! under every healthy arm on both axes, and the controls still measure 0-766
+//! total with 0-3 hue buckets (the pet's coat, when one is minted saturated).
 //!
 //! WIRING: the pre-push gate covers this matrix through the `guards` lane of
 //! `xtask gate lint` (which `.githooks/pre-push` runs on every push) —
-//! `tools/paint_guard.sh` re-runs `cargo test -p aterm-conformance --test
-//! paint` whenever the paint-relevant trees (aterm-effects / aterm-render /
-//! aterm-gui / this gate itself) differ from the last take it proved green.
+//! `tools/paint_guard.sh` nonce-relinks this test and the release app, then runs
+//! a private copy directly whenever Cargo's derived artifact/test source closure
+//! or this gate's own machinery differs from the last take it proved green.
 //!
 //! RUNTIME, and why it moved: the probe's whole-run watchdog used to sleep out
 //! the full `--budget` and be killed on exit, which orphaned its `sleep` — and
@@ -121,11 +128,23 @@
 //! `sips`, so elsewhere the suite compiles to one loud not-run notice instead
 //! of a silent green (see `paint_matrix_is_a_macos_only_lane` below).
 //!
-//! The binary under test is `target/release/aterm` — the RELEASE profile, the
-//! bits a cut would ship (audit rule 1: parts of the old proof ran debug
-//! binaries). If it is stale this test rebuilds it (`cargo build --release -p
-//! aterm`, once per run); `ATERM_PAINT_BIN=<path>` overrides for driving a
-//! specific artifact.
+//! QUIET-MACHINE LANE, too: the video rows audit a real-time pipeline, and
+//! one sweep run beside a full workspace compile charged row 1 with a
+//! 35,264 us rendered gap (normal sampling hole — the band, not the capture,
+//! went dark) that ten deliberate CPU/memory-load re-creations could not
+//! reproduce. Run verdict-bearing sweeps with no parallel builds, and re-run
+//! any charged video row on a quiet machine with `ATERM_PAINT_KEEP=1` before
+//! believing or dismissing it — the probe header's LOAD SENSITIVITY note
+//! carries the measurements.
+//!
+//! The binary under test is RELEASE profile (audit rule 1: parts of the old
+//! proof ran debug binaries). Without `ATERM_PAINT_BIN`, the shared conformance
+//! helper freshens `target/conformance-release/release/aterm`; its dedicated
+//! target avoids feature-thrashing the outer integration-test build and is
+//! reused by the spin matrix. The override drives a specific artifact.
+
+#[cfg(target_os = "macos")]
+mod support;
 
 /// The honest answer everywhere the lane cannot run. NOT a pass in disguise:
 /// it prints exactly what was not proven, so a green run on Linux/Windows can
@@ -147,7 +166,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "macos")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// The workspace root, from this crate's own manifest dir — the probe script
 /// and the release binary are both addressed from it.
@@ -160,69 +179,6 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Resolve — and, once per test run, freshen — the RELEASE binary under test.
-///
-/// `cargo build --release -p aterm` is the staleness check: warm and unchanged
-/// it is a no-op costing well under a second, and it is exactly what the
-/// blackout audit demands (rule 1 — a release-claiming proof runs the RELEASE
-/// profile, not whatever binary happens to be lying around). `ATERM_PAINT_BIN`
-/// bypasses the build for callers that already hold the artifact to judge
-/// (the release smoke drives the just-built bundle through the same probe).
-#[cfg(target_os = "macos")]
-fn release_bin() -> PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        if let Ok(p) = std::env::var("ATERM_PAINT_BIN") {
-            let p = PathBuf::from(p);
-            assert!(
-                p.is_file(),
-                "ATERM_PAINT_BIN={} does not exist",
-                p.display()
-            );
-            return p;
-        }
-        let root = workspace_root();
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        // Under the branded driver a nested invocation must name its own lane
-        // (`targo --unverified`): the outer authorization does not propagate,
-        // and a bare `targo build` here would refuse and fail the whole matrix
-        // for a reason that has nothing to do with paint.
-        let mut cmd = Command::new(&cargo);
-        if Path::new(&cargo)
-            .file_stem()
-            .is_some_and(|n| n.to_string_lossy().starts_with("targo"))
-        {
-            cmd.arg("--unverified");
-        }
-        let status = cmd
-            .args(["build", "--release", "-p", "aterm"])
-            .current_dir(&root)
-            .status()
-            .unwrap_or_else(|e| panic!("could not spawn `{cargo} build --release -p aterm`: {e}"));
-        assert!(
-            status.success(),
-            "`{cargo} build --release -p aterm` failed ({status}) — the paint matrix judges the \
-             RELEASE binary and refuses to run without one (set ATERM_PAINT_BIN to drive a \
-             prebuilt artifact)"
-        );
-        let bin = match std::env::var("CARGO_TARGET_DIR") {
-            Ok(t) => {
-                let t = PathBuf::from(t);
-                let t = if t.is_absolute() { t } else { root.join(t) };
-                t.join("release/aterm")
-            }
-            Err(_) => root.join("target/release/aterm"),
-        };
-        assert!(
-            bin.is_file(),
-            "built the release profile but {} is missing",
-            bin.display()
-        );
-        bin
-    })
-    .clone()
-}
-
 /// The bitmap morphology and continuity classifiers have their own negative
 /// controls. Keep this beside the artifact rows so a future threshold edit
 /// cannot silently let a one-cell cursor impersonate a whole kitty, or erase
@@ -231,8 +187,9 @@ fn release_bin() -> PathBuf {
 #[test]
 fn paint_scanner_semantic_classifiers_keep_their_negative_controls() {
     let dir = workspace_root().join("tools/paint-conformance");
-    let out = Command::new("python3")
+    let out = Command::new("/usr/bin/python3")
         .args(["-m", "unittest", "-v", "scan_test.py"])
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir(&dir)
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", dir.join("scan_test.py").display()));
@@ -244,26 +201,46 @@ fn paint_scanner_semantic_classifiers_keep_their_negative_controls() {
     );
 }
 
+/// THE MATURE RUN — the release smoke's own 29 keys, shared by every typed
+/// trail row since the 2026-08-30 key-length recalibration.
+///
+/// The shipped traverse is PER-MARK (`RAINBOW_TRAVERSE_MIN_CELLS = 26` in
+/// crates/aterm-effects/src/cursor_glow.rs): the arc spreads over the mark
+/// being typed, so a 10-key mark spans ~2-3 of 12 hue buckets BY DESIGN and
+/// the historical 10-11-key rows sat exactly on the `union_hues >= 4` /
+/// `ribbon_window_hues >= 4` cliff — the same cliff the release smoke was
+/// moved off on 2026-08-30 (crates/aterm-release/src/publish.rs: "a 10-key
+/// take hovers exactly at the claim's `ribbon_hue_bands >= 4` boundary").
+/// MEASURED on the shipped binary, 2026-08-30, before the move: row 5 read
+/// union_hues=3 two runs in three (a per-launch hue-phase coin flip, total_ink
+/// 2642 in the 3-bucket mode vs 7104 in the 5-bucket one), rows 1/2/4 read
+/// union_hues=2-3 deterministically, row 6b ribbon_window_hues=3 two in
+/// three. The SAME shapes at these 29 keys read union_hues=10-11 with
+/// ribbon_window_hues=10 and ribbon_bound=42 — past the clamp floor the arc
+/// actually completes, and the floors sit under it with real margin instead
+/// of straddling a launch phase. No spaces: a space ends the mark, and the
+/// row audits the design at the length its arc completes.
+#[cfg(target_os = "macos")]
+const MATURE_RUN: &str = "t,h,e,r,a,i,n,b,o,w,k,i,t,t,y,p,a,i,n,t,s,t,h,e,a,r,c,o,k";
+
 /// What one matrix row expects of its take.
 #[cfg(target_os = "macos")]
 enum Expect {
     /// Effect ink present: ≥150 dynamic saturated px across the take, ≥4 of
-    /// 12 hue buckets, a visible clump in some single frame, no interior
-    /// multi-frame rainbow blackout, and — on a paired take — NOT ONE frame
-    /// where the engine claims a ribbon IT IS STILL DRIVING over an unbanded
-    /// raster, on a claim that itself covered at least two frames.
+    /// 12 hue buckets, a visible clump in some single frame, repeated
+    /// ribbon-shaped geometry with no interior multi-frame blackout, and — on
+    /// a paired take — NOT ONE frame where the engine claims a ribbon IT IS
+    /// STILL DRIVING over a raster without that geometry. The claim itself must
+    /// cover at least two frames.
     ///
     /// Two things make that a bind rather than a coin flip, and both were
     /// measured on row 6b (2026-08-29):
     ///
-    /// * WHAT COUNTS AS A BAND. The hue-separation witness must be two samples
-    ///   of ONE 4-connected painted object (`object_row_hue_separation` in
-    ///   scan.py). Read across the whole raster row it paired the caret's own
-    ///   one-hue block with a walking pet's coat and answered about the pet's
-    ///   pose. It is a strictly stricter oracle — in-object separation is a max
-    ///   over a subset of the whole-row pairs — so no blackout it used to catch
-    ///   can escape through it. It still asks only "does SOME one object carry
-    ///   ≥15° within a row", the pet included; see the note on `probe`.
+    /// * WHAT COUNTS AS A RIBBON. Saturated changed pixels must form either a
+    ///   thin detached component or a dense horizontal run attached to the
+    ///   cursor in X. A mature paired claim may retain a pale attached run, but
+    ///   cannot turn a detached gray glyph/rule into a ribbon. Hue separation is
+    ///   diagnostic only and cannot grant presence.
     /// * WHEN THE CLAIM IS HELD. `ribbon_hue_bands` counts DISTINCT HUE BANDS
     ///   among the live typing sparks, quantized to twentieths of a turn — not
     ///   the number of sparks, which is the separate `ribbon_segments`. A spark
@@ -308,8 +285,8 @@ enum Expect {
     /// The control for a path that carries an unavoidable cursor-cell
     /// artifact: the take FAILS the exact ink predicate, read the other way.
     /// See the probe's `--expect quiet` note for the
-    /// measurements; on the unpinned path the deciding term is hue spread
-    /// (1 bucket vs the trail's 9), not pixel count.
+    /// measurements; on the unpinned path the deciding terms are take-level
+    /// colour identity and ribbon geometry, not raw cursor/text pixel count.
     ///
     /// What is negated is the PAINT predicate only. [`Expect::Ink`]'s
     /// `ribbon_bound >= 2` floor is not part of it, and must not be: this row's
@@ -317,6 +294,10 @@ enum Expect {
     /// of 3 live runs), so folding the floor in would let the control go green
     /// for want of a ledger entry on a take that painted.
     Quiet,
+    /// Matched typed negative control: cursor/text deltas must be present, but
+    /// the canonical off style must produce no ribbon witness and keep every
+    /// effect ledger quiet.
+    EffectOff,
 }
 
 /// Drive one shape through the probe on the ORIGINAL (recorded) capture path —
@@ -326,22 +307,10 @@ enum Expect {
 fn probe(shape: &str, keys: &str, expect: Expect) {
     // TRAIL rows run on the COMPANION-FREE head, not on `classic`.
     //
-    // `classic` spells `rainbow kitty`, which was a companion-free ribbon until
-    // 2026-08-26 and has been a RESIDENT ANIMAL since. `scan.py`'s rainbow predicate
-    // (>=15 deg of hue separation among changed saturated pixels sharing one raster
-    // row OF ONE 4-CONNECTED PAINTED OBJECT) cannot tell live fur from ribbon — a
-    // coat is one object and carries its own hue spread, so scoping the oracle to an
-    // object narrows nothing here — and the resident fades in AFTER the frame-0
-    // baseline, so its body is "changed" in every later frame. Roughly seven of
-    // `COAT_RAMP`'s sixteen coats clear the saturation floor and `mint_launch_seed`
-    // draws a fresh one per launch — so these rows became a COIN FLIP on the cat,
-    // measured red 3 of 5 and 3 of 4 on an unmodified tree. A 15/15 green here was
-    // luck, not evidence.
-    //
-    // `flying` is the same trail with no resident on glass, which is what these rows
-    // were written to measure. Rows that JUDGE the resident pin their own style, are
-    // untouched, and use the instrument that can separate a cat from a ribbon (paired
-    // `ctl trail status` morphology) rather than pixels alone.
+    // `classic` now carries a resident animal. `flying` exercises the same trail
+    // without that independent bitmap, so these rows isolate ribbon continuity.
+    // Rows that judge a resident pin their own style and bind its status to
+    // companion morphology separately.
     probe_styled(shape, keys, expect, Capture::PinnedVideo, "flying");
 }
 
@@ -399,7 +368,7 @@ enum Companion {
 /// gate must never fail because of its own harness load.
 #[cfg(target_os = "macos")]
 fn probe_with(shape: &str, keys: &str, expect: Expect, capture: Capture) {
-    probe_with_companion_style(shape, keys, expect, capture, None, None);
+    probe_with_companion_style(shape, keys, expect, capture, None, Some("flying"));
 }
 
 /// A row that pins an explicit `--style` with NO companion obligation — the
@@ -433,12 +402,12 @@ fn probe_with_companion_style(
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let bin = release_bin();
     let root = workspace_root();
+    let bin = support::release_bin(&root, &["ATERM_PAINT_BIN"]);
     let script = root.join("tools/paint-conformance/paint_probe.sh");
     assert!(script.is_file(), "{} is missing", script.display());
 
-    let (expect_arg, what) = match expect {
+    let (expect_arg, what) = match &expect {
         Expect::Ink => ("ink", "effect ink present"),
         Expect::Dark => ("dark", "zero effect ink in every frame"),
         Expect::TrailDark => (
@@ -449,11 +418,28 @@ fn probe_with_companion_style(
             "quiet",
             "a take that the ink gate itself would NOT score as effect ink",
         ),
+        Expect::EffectOff => (
+            "effect-off",
+            "typed cursor/text pixels but no ribbon from the canonical off style",
+        ),
     };
-    let mut cmd = Command::new(&script);
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg(&script)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     cmd.arg(&bin)
         .args(["--shape", shape, "--record", "5", "--expect", expect_arg])
-        .args(["--min-ink", "150", "--min-hues", "4", "--budget", "180"]);
+        .args(["--min-ink", "150", "--min-hues", "4", "--budget", "180"])
+        // THE BACKEND FENCE, stated here rather than inherited from the probe's
+        // default. This matrix exists to pixel-check the SHIPPED artifact, and
+        // the shipped artifact renders on the GPU: `App::ensure_pixel_backend`
+        // used to fall back to the CPU renderer silently (into `gui.log`, which
+        // the probe dumps only when the socket never appears), so a GPU backend
+        // that failed to initialize AT ALL produced a fully green matrix drawn
+        // entirely on the CPU. Every row was insured against the failure of the
+        // thing it exists to judge. The probe now turns that into a
+        // COULD-NOT-RUN, which this file already treats as "the probe decided
+        // nothing, which is not a pass".
+        .args(["--backend", "gpu"]);
     match capture {
         Capture::PinnedVideo => {}
         Capture::UnpinnedFocused => {
@@ -499,14 +485,17 @@ fn probe_with_companion_style(
     // What a RED on this row actually means. Rows 1-4 and rows 5-6 fail for
     // different reasons and send a reader to different code, so they say so
     // rather than sharing one message that fits neither.
-    let meaning = match capture {
-        Capture::PinnedVideo => {
+    let meaning = match (&expect, capture) {
+        (Expect::EffectOff, _) => {
+            "the canonical `off` style leaked trail geometry, or the scanner attributed unrelated pixels to a ribbon — inspect the reported geometry and the `off` style resolution"
+        }
+        (_, Capture::PinnedVideo) => {
             "the shipped binary does not paint its flagship effect at all — this row's window              was FOCUSED and RECORDED, i.e. every excuse was already granted"
         }
-        Capture::UnpinnedFocused => {
+        (_, Capture::UnpinnedFocused) => {
             "the engine and captured pixels disagree about the cursor companion, or the              rainbow contains an interior blackout — this row pairs every status read with its              exact unpinned frame and generic rainbow pixels cannot satisfy the animal obligation"
         }
-        Capture::UnpinnedUnfocused => {
+        (_, Capture::UnpinnedUnfocused) => {
             "an UNFOCUSED window being typed into does not paint its trail — the v0.48-v0.50              blackout class, back. Look at `App::cursor_fx_focus`'s typed-wake term and the              W11b demotion it exists to override; note that `ctl video` would have HIDDEN this              (its recording pin un-suppresses the same gate), which is why this row does not              use one"
         }
     };
@@ -532,7 +521,23 @@ fn probe_with_companion_style(
 #[cfg(target_os = "macos")]
 #[test]
 fn main_screen_prompt_typing_paints_trail_ink() {
-    probe("prompt", "e,c,h,o,space,h,e,l,l,o", Expect::Ink);
+    probe("prompt", MATURE_RUN, Expect::Ink);
+}
+
+/// Row 1's matched negative control: identical prompt, keys, focus and video
+/// path, with only the effect style changed. It must retain real dynamic cursor
+/// pixels while producing no ribbon witness, so the scanner cannot pass row 1
+/// merely by counting cursor motion or echoed text.
+#[cfg(target_os = "macos")]
+#[test]
+fn main_screen_prompt_with_effect_off_has_no_ribbon() {
+    probe_with_style(
+        "prompt",
+        "e,c,h,o,space,h,e,l,l,o",
+        Expect::EffectOff,
+        Capture::PinnedVideo,
+        "off",
+    );
 }
 
 /// Matrix row 2: typing into the fake-Claude alt-screen shape (DEC-2026
@@ -541,7 +546,7 @@ fn main_screen_prompt_typing_paints_trail_ink() {
 #[cfg(target_os = "macos")]
 #[test]
 fn alt_screen_fake_claude_typing_paints_trail_ink() {
-    probe("fake-claude", "r,a,i,n,b,o,w,space,o,n", Expect::Ink);
+    probe("fake-claude", MATURE_RUN, Expect::Ink);
 }
 
 /// Matrix row 3, the dark control: an alt-screen spinner repainting on its own
@@ -615,10 +620,67 @@ fn alt_screen_cold_spinner_paints_zero_ink() {
 /// Image-burst rows carry no recording and no `inputs[]`, so they report
 /// `driven_dark_us=-1` and keep the old whole-take frame gap, which is all
 /// such a take can support.
+///
+/// THE CONTINUITY FLAG MOVED TO LITNESS (2026-08-30, the litness
+/// recalibration's video half — see [`MATURE_RUN`] for the key-length side,
+/// and the notes in scan.py's `driven_window_darkness` for the machinery).
+/// The per-frame HUE witness that used to feed `driven_dark_us` reads the
+/// authored young band (~1.2 s of one or two hues after the first keystroke
+/// — real, lit, driven ink) as darkness, and flickers sub-bar mid-take on
+/// healthy glass under the per-mark traverse. MEASURED on the shipped
+/// binary: a structurally healthy 29-key take (union_hues=11, one 113-frame
+/// lit run) charged driven_dark_us=1,250,924 against the 26.5k bound — red
+/// at ANY key length — and three consecutive healthy takes charged 53-70 ms
+/// interior "blackouts" on lit glass. The term now reads band POPULATION
+/// (flat saturated ink, the paired bind's own litness: >= 22 flat px from
+/// the first keystroke's glass arrival to the take's end on the preserved
+/// healthy take, while a blanked layer counts 0, a grey trail is not
+/// saturated, and the caret block stands in tall columns), opens the charge
+/// window at the pixels' first sustained lit frame (the pre-glass lead is
+/// excused and reported as `mature_lead_us`; a take with no sustained
+/// litness exempts nothing), and hands the close's first 0.4 s to the
+/// authored exhale (`EXHALE_CLOSE_ALLOWANCE_US` — the video mirror of the
+/// paired takes' close guard). The excused lead is itself BOUNDED at the
+/// probe's verdict (`MATURE_LEAD_MAX_US`, 500 ms — healthy takes measure
+/// 120-141 ms), so a dead start can never hide inside the excusal. The
+/// ARC promise stays at take level, on `union_hues`, exactly where the
+/// paired rows hold it.
+///
+/// REPLAYED both ways on a preserved healthy 29-key fake-claude take
+/// (2026-08-30, shipped binary): untouched, driven_dark_us=0; the SAME
+/// pixels with three interior driven frames blanked to the baseline charge
+/// 52,089 us — 3 x the take's 17,672 us nominal, double the bound — so the
+/// fence-defect class this term exists for still fires through the rescope.
+///
+/// THE PEER WAVE FIXED THE SAME BLINDNESS FROM THE GEOMETRY SIDE the same
+/// day (its measured account follows, kept as history), and the merge fused
+/// the two: the continuity flag is `scan.driven_lit` — the band-population
+/// litness above, now counted over `band_ink_metrics`' object domain at the
+/// RIBBON_LIT_MIN_PX=7 floor, ORed with the ribbon-geometry arm so no frame
+/// either wave read as lit can go dark. The reconciliation measurements live
+/// at `driven_lit` in scan.py.
+///
+/// WHAT COUNTS AS LIT IN THAT WINDOW MOVED, 2026-08-30 (`scan.driven_lit`).
+/// The witness used to be ribbon-shaped GEOMETRY, whose thin arm caps a
+/// component at four pixels tall because it was calibrated on the explicit
+/// underline highlighter. These rows pin `--style flying`, i.e.
+/// `ribbon_look=tall` — the banded body the letters sit inside — and under the
+/// per-mark classic-rainbow traverse a fresh mark lights that whole body: one
+/// connected object 7-10 px wide and 6-8 px TALL, 32-55 saturated changed
+/// pixels, its arc visibly unrolling frame to frame. Nothing was dark; the
+/// instrument could not see it, and all three video ink rows charged the young
+/// mark as a 245-420 ms interior blackout (`driven_dark_us` 262_648 / 263_482 /
+/// 420_155 against a 26_5xx bound, deterministic across runs). Continuity now
+/// reads the band's own flat-column population — `flat_ink >= 12`, the identical
+/// term the claim-bound path has charged since the same day — ORed with the
+/// geometry arm, so a frame can only move dark to lit. MEASURED on one take,
+/// style the only variable: live `flying` holds flat_ink 31-59 across every
+/// frame of the driven window and drops to 0 at the exhale; `off` holds
+/// flat_ink 0 on all 11 frames while its caret block paints 98 px each time.
 #[cfg(target_os = "macos")]
 #[test]
 fn alt_screen_esc7_esc8_streamer_typing_paints_trail_ink() {
-    probe("streamer", "h,e,l,l,o,space,w,o,r,l,d", Expect::Ink);
+    probe("streamer", MATURE_RUN, Expect::Ink);
 }
 
 /// Matrix row 5 — THE ONE ROW THAT CAN GO RED. An UNFOCUSED window
@@ -634,22 +696,44 @@ fn alt_screen_esc7_esc8_streamer_typing_paints_trail_ink() {
 /// The pixel COUNT barely moves (an unfocused typed window still drags a
 /// saturated block cursor and echoes glyphs); the HUE SPREAD is the witness,
 /// and `--min-hues 4` sits between 1 and 9 with margin on both sides.
+///
+/// Those numbers are the 10-key fixed-traverse era's. At [`MATURE_RUN`]'s 29
+/// keys on the shipped per-mark binary (2026-08-30) the healthy arm reads
+/// frames=67 total_ink=9,736 union_hues=11 ribbon_window_hues=11 — the same
+/// shape at 10 keys had become a per-launch hue-phase coin flip (union_hues
+/// 3 two runs in three, the exact cliff the const documents), while the
+/// broken arm's signature is unchanged: an unfocused window whose typed-wake
+/// term is gone still collapses to ONE hue bucket however many keys land, so
+/// the floor's separation only widened.
 #[cfg(target_os = "macos")]
 #[test]
 fn unfocused_typed_window_paints_its_trail_under_an_unpinned_capture() {
     probe_with(
         "fake-claude",
-        "r,a,i,n,b,o,w,space,o,n",
+        MATURE_RUN,
         Expect::Ink,
         Capture::UnpinnedUnfocused,
+    );
+}
+
+/// Row 5's same-shape effect-off twin on the unpinned, unfocused capture path.
+#[cfg(target_os = "macos")]
+#[test]
+fn unfocused_typed_window_with_effect_off_has_no_ribbon() {
+    probe_with_style(
+        "fake-claude",
+        "r,a,i,n,b,o,w,space,o,n",
+        Expect::EffectOff,
+        Capture::UnpinnedUnfocused,
+        "off",
     );
 }
 
 /// Matrix row 6, row 5's control: the SAME unfocused window under the SAME
 /// unpinned capture, with NOTHING typed, is a take the ink gate would not
 /// score as ink. Without it row 5 could be satisfied by a scanner that counts
-/// the client's own repaints; with it, row 5's 9 hue buckets are provably the
-/// typed trail and nothing else. It also pins the other half of the contract
+/// the client's own repaints; with it, row 5's 9 hue buckets (11 at
+/// [`MATURE_RUN`]'s 29 keys) are provably the typed trail and nothing else. It also pins the other half of the contract
 /// the typed wake must not break — an IDLE unfocused window still demotes
 /// (W11b), so the fix bought the trail back without turning background
 /// decoration on.
@@ -710,9 +794,22 @@ fn unfocused_idle_window_paints_nothing_under_an_unpinned_capture() {
 fn focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin() {
     probe_with(
         "fake-claude",
-        "r,a,i,n,b,o,w,space,o,n",
+        MATURE_RUN,
         Expect::Ink,
         Capture::UnpinnedFocused,
+    );
+}
+
+/// Row 6a's matched effect-off twin on the unpinned focused capture path.
+#[cfg(target_os = "macos")]
+#[test]
+fn focused_typed_window_with_effect_off_has_no_ribbon() {
+    probe_with_style(
+        "fake-claude",
+        "r,a,i,n,b,o,w,space,o,n",
+        Expect::EffectOff,
+        Capture::UnpinnedFocused,
+        "off",
     );
 }
 
@@ -720,44 +817,20 @@ fn focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin() {
 /// landing away from the caret several times a second, which is precisely the
 /// concurrent-decoration traffic that makes the batch counter a bad proxy.
 ///
-/// THIS ROW IS WHERE THE RIBBON BIND WAS REPAIRED (2026-08-29). It went red
-/// intermittently, always in the tail: typing stops, the authored exhale runs,
-/// and `ribbon_hue_bands` — a count of DISTINCT HUE BANDS among the live
-/// sparks, not of the sparks themselves (that is `ribbon_segments`) — falls
-/// only 11 → 8 over the nine frames after the last admitted move, never near
-/// the claim's 4, while the ribbon's own ink leaves the raster entirely: the
-/// merged ribbon+caret object shrinks 157 → 139 → 123 → 119 → 109 → 98 px over
-/// frames 21-26, i.e. down to exactly the caret's own 7x14 block. From there
-/// the only other saturated ink is 1-4 detached single pixels of the resident
-/// pet's coat ~150° away, and the whole-row oracle paired those two objects:
-/// frames 26-30 of the preserved failing take read 151.7, 0.7, 0.1, 149.2,
-/// 151.4 deg while the raster's aggregates barely moved — `dynamic_saturated`
-/// 102/99/99/100/101, companion 315/306/306/319/315, hue buckets [4, 11] on all
-/// five. Three pixels of ink and thirteen of companion, against a 151° swing in
-/// the verdict: it was the pet's walk cycle deciding the row.
-///
-/// BOTH HALVES WERE NEEDED, and the second one is why. The contaminated flag
-/// feeds `rainbow_gap` as well as `ribbon_dark`, and on this `--capture image`
-/// path `continuity_holds` falls back to `rainbow_gap <= 1` (no keystroke
-/// ledger, so `driven_dark_us` is -1). Bounding the CLAIM to the driven window
-/// alone left the preserved failing take red: `ribbon_dark=0 ribbon_bound=17`
-/// but `rainbow_gap=2`. Scoping the ORACLE to one painted object
-/// (`object_row_hue_separation`) takes nine preserved takes from
-/// `rainbow_gap` 0,1,0,0,0,1,0,0,2 and `ribbon_dark` 0,1,0,0,0,1,0,0,2 to zero
-/// on both, everywhere.
-///
-/// MEASURED with the verdict predicate lifted verbatim from each version and
-/// run over the same nine preserved takes: HEAD scores 3 FAIL of 9, the
-/// repaired gate 0 of 9. Live, 18 consecutive runs of this row: 18 PASS,
-/// `ribbon_dark=0` and `rainbow_gap=0` on every one, `ribbon_bound` 17-19.
-/// Blanking two interior DRIVEN frames of a healthy take still scores
-/// `ribbon_dark=2` and red; blanking one still scores 1.
+/// THIS ROW CARRIES THE RIBBON BIND. A mature engine claim is charged only
+/// through the last frame the engine reports as driven; the authored exhale is
+/// outside that domain. Inside it, presence comes from changed-pixel ribbon
+/// geometry (thin detached component or cursor-attached X-span), not hue spread.
+/// The contradiction tally is deliberately unsliced: raster-derived sustained
+/// bounds once let a ribbon that died from frame 12 onward end its own audit
+/// window and pass with `ribbon_dark=0`; the full driven window charges 13.
+/// `ribbon_bound >= 2` keeps a zero contradiction count non-vacuous.
 #[cfg(target_os = "macos")]
 #[test]
 fn focused_streamer_typing_paints_trail_ink_without_a_recording_pin() {
     probe_with(
         "streamer",
-        "h,e,l,l,o,space,w,o,r,l,d",
+        MATURE_RUN,
         Expect::Ink,
         Capture::UnpinnedFocused,
     );
@@ -793,6 +866,62 @@ fn shipped_default_first_still_and_typing_carry_the_resident_pet() {
         Expect::Ink,
         Capture::UnpinnedFocused,
         Some(Companion::Pet),
+    );
+}
+
+/// The explicit underline spelling must travel through the shipped config
+/// loader, resolve to the rainbow engine, report underline geometry, and paint
+/// a real ribbon. Default and owner-shorthand rows now use the tall body, so
+/// neither proves that this independently selectable alternate still works.
+///
+/// AT [`MATURE_RUN`]'s 29 KEYS, like every other typed ink row (2026-08-30,
+/// the merge's recalibration of this upstream-new row). The row landed typing
+/// 7 keys, and under the shipped per-mark traverse a 7-key mark's live sparks
+/// span at most 3 hue bands BY DESIGN — MEASURED on a kept take: 23 paired
+/// rows, `ribbon_hue_bands` 0/1/2/3 and never 4, so the mature-claim
+/// threshold (`bands >= 4`) could not fire, `ribbon_bound=0`, and the
+/// non-vacuity floor refused a take whose underline was painting perfectly
+/// well (total_ink=1648, union_hues=9). That is the same stale-calibration
+/// class that moved rows 1-6 to [`MATURE_RUN`]; at 29 keys the underline
+/// matures its claim like the other image rows (measured 3x on the merged
+/// tree: ribbon_claimed=50, ribbon_bound=43, ribbon_window_hues 5-7,
+/// total_ink 8,393-20,387, union_hues 10, verdict PASS on every take).
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_underline_spelling_paints_an_underline_ribbon() {
+    probe_with_style(
+        "prompt",
+        MATURE_RUN,
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        "underline",
+    );
+}
+
+/// Pet-free reproduction of the short explicit-tall hue defect. Unlike the
+/// default/literal rows, no companion can supply its four scanner buckets.
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_tall_short_word_paints_four_hues_without_a_pet() {
+    probe_with_style(
+        "prompt",
+        "r,a,i,n,b,o,w,k,i,t,t,y",
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        "tall",
+    );
+}
+
+/// Exact off twin: same prompt, keys, focus and unpinned capture.
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_tall_short_word_control_has_no_ribbon_when_effect_is_off() {
+    probe_with_style(
+        "prompt",
+        "r,a,i,n,b,o,w,k,i,t,t,y",
+        Expect::EffectOff,
+        Capture::UnpinnedFocused,
+        "off",
     );
 }
 
@@ -834,6 +963,23 @@ fn cold_output_paints_literally_nothing_for_a_companion_free_style() {
 /// that widening the pet predicate REROUTED the head rather than deleting it:
 /// the row's `pet_claimed == 0` term would go red the moment the escape hatch
 /// stopped selecting the flypast, and row 10 holds the other side.
+///
+/// THE FINAL-STILL FLOOR IS THE RESTING HEAD'S (2026-08-30). The earned head
+/// SETTLES as momentum drains: by the witness stills (typing over, plane
+/// cleared, 1.05+ s quiet) it stands at its momentum-zero resting size, and
+/// the strict 12x18 morphology floor read that plainly drawn head as MISSING
+/// about one take in three — `cat_final_run=0 cat_missing=27` on takes whose
+/// preserved stills visibly carry the whole head beside the caret. MEASURED
+/// on six healthy takes of this row against the shipped binary (18 stills):
+/// the head is present in EVERY still at 22-28 x 16-23 px, and the three
+/// failing takes' stills all read exactly 16 px tall — a stable resting
+/// size, sampled 16,17,17 across each take's stills, not a fade passing
+/// through. scan.py's `CAT_STILL_MIN_H` (15) now admits the resting head on
+/// the isolating stills alone, and only while the engine claims the cat;
+/// mid-take frames keep the strict floor, a one-cell text/ribbon row is
+/// structurally <= 14 px, and the caret's 7 px width fails the width floor —
+/// the impostor pins in scan_test.py hold every one of those edges, and the
+/// resting-head pin is red-proven against the pre-recalibration scanner.
 #[cfg(target_os = "macos")]
 #[test]
 fn flying_style_sustained_typing_earns_and_paints_the_flying_kitty() {

@@ -38,6 +38,7 @@ impl FakeRepo {
         }
         fs::create_dir_all(root.join("tools/perf-arena")).expect("mkdir");
         fs::create_dir_all(root.join("scripts")).expect("mkdir");
+        fs::create_dir_all(root.join("libc-oracle")).expect("mkdir");
         fs::write(root.join("Cargo.toml"), b"[workspace]\n").expect("write");
         let me = Self {
             root,
@@ -51,6 +52,7 @@ impl FakeRepo {
         me.script("tools/test-trust-gate-verdict.sh", "exit 0");
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
+        me.script("libc-oracle/run.sh", "exit 0");
         // The redraw harness the gate builds and then DRIVES. Present and passing
         // by default so an unrelated test never reads a missing binary as a
         // finding; `redraw_harness` re-writes it for the tests that are about
@@ -130,6 +132,26 @@ exit 0"#,
         // that does not.
         env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
         env.ay_bin_dir = Some(self.root.join("no-ay"));
+        // …and unset the operator's target-dir redirect, for the same reason.
+        // Two stages here do not just SPAWN a child, they DRIVE a binary the
+        // build was supposed to leave behind — the control-socket smoke and the
+        // redraw gate — and both resolve it with `smoke::debug_bin`, which
+        // honours `CARGO_TARGET_DIR` exactly as cargo does. `capture()` reads
+        // the ambient one, so a shell that exports a redirect (this repo is
+        // worked in by several sessions at once and each keeps its own target
+        // dir to stay off the shared cargo lock) sent both stages hunting
+        // outside the sandbox for binaries the fixture had written INSIDE it:
+        // `redraw conformance: just-built harness missing (<redirect>/debug/…)`
+        // — a COULD-NOT-RUN, so `the_redraw_gate_…` read `could_not_run: 1`
+        // where a passing harness must leave the tally clean — and
+        // `smoke: just-built binaries missing`, which cost the scoped run its
+        // exit::PASS. Nothing about the stages was wrong: they were reading the
+        // right variable and the fixture was the one lying about the repo.
+        // `None` is the pin because the synthetic repo has cargo's DEFAULT
+        // layout — `redraw_harness` and `with_answering_smoke` write to
+        // `<root>/target/debug`, which is precisely where `debug_bin` looks
+        // when the variable is unset.
+        env.cargo_target_dir = None;
         Ctx::new(
             self.root.clone(),
             mode,
@@ -202,8 +224,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        19,
-        "17 gate stages plus the two --full tiers"
+        20,
+        "18 gate stages plus the two --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -281,6 +303,78 @@ fn a_failing_guard_is_a_finding_and_exits_one() {
 }
 
 #[test]
+fn the_libc_oracle_driver_is_required_and_fails_closed() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    ctx.env.cargo_target_dir = Some("caller-relative-target".into());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::LibcOracle)
+        .expect("the libc oracle is planned");
+
+    let owned_target = repo.root.join("libc-oracle/target");
+    repo.script(
+        "libc-oracle/run.sh",
+        &format!(
+            "test \"$CARGO_TARGET_DIR\" = \"{}\" || exit 1; \
+             test \"$PYTHONDONTWRITEBYTECODE\" = 1 || exit 1; exit 0",
+            owned_target.display()
+        ),
+    );
+    let passed = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&passed));
+    assert!(!t.failed(), "the driver received its owned environment");
+    assert_eq!(t.gate_failures, 0);
+    assert_eq!(t.could_not_run, 0);
+
+    fs::remove_file(repo.root.join("libc-oracle/run.sh")).expect("remove driver");
+    let missing = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&missing));
+    assert_eq!(t.could_not_run, 1, "a missing oracle decides nothing");
+    assert_eq!(t.gate_failures, 0);
+    assert!(
+        missing
+            .render()
+            .contains("libc-oracle/run.sh missing or not executable"),
+        "{}",
+        missing.render()
+    );
+
+    repo.script(
+        "libc-oracle/run.sh",
+        "echo 'libc ABI mismatch in native runtime oracle'; exit 1",
+    );
+    let failed = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&failed));
+    assert_eq!(t.gate_failures, 1, "a red oracle is a finding");
+    assert_eq!(t.could_not_run, 0);
+    assert!(failed.render().contains("libc ABI mismatch"));
+    assert!(
+        failed
+            .render()
+            .contains("FAIL  libc-oracle/run.sh (cross-cell ABI + native runtime)")
+    );
+
+    repo.script(
+        "libc-oracle/run.sh",
+        "echo 'required target/toolchain unavailable'; exit 3",
+    );
+    let unavailable = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&unavailable));
+    assert_eq!(
+        t.gate_failures, 0,
+        "an environment failure is not a finding"
+    );
+    assert_eq!(t.could_not_run, 1, "exit 3 means nothing was decided");
+    assert!(
+        unavailable
+            .render()
+            .contains("required target/toolchain unavailable")
+    );
+}
+
+#[test]
 fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     let repo = FakeRepo::new();
     repo.with_stage2("echo 'error: unknown unstable option: `trust-verify`' >&2; exit 1");
@@ -295,7 +389,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
         "gate dormant",
         "gate mainloop",
         "gate counts",
-        "freeze-safety-gate (5 obligations)",
+        "freeze-safety-gate (6 obligations)",
     ] {
         assert!(
             labels_with(&ladder, "FAIL").iter().any(|l| l == driven),
@@ -614,7 +708,11 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ("skip", "gate mainloop (selftest: not executed)"),
             (
                 "skip",
-                "freeze-safety-gate (5 obligations) (selftest: not executed)"
+                "libc-oracle/run.sh (cross-cell ABI + native runtime) (selftest: not executed)"
+            ),
+            (
+                "skip",
+                "freeze-safety-gate (6 obligations) (selftest: not executed)"
             ),
             ("skip", "gate counts (selftest: not executed)"),
             (

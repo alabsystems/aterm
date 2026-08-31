@@ -263,6 +263,27 @@ struct PointerGeometry {
     head: usize,
 }
 
+/// Pane-local result of one pointer-to-cell mapping. The pane rectangle is
+/// carried with the cell so selection autoscroll can reuse the same split plan.
+#[derive(Clone, Copy)]
+struct MouseCellMapping {
+    pane_cell: (u16, u16),
+    pane_rect: (u16, u16, u16, u16),
+}
+
+/// What the `pointer` verb asks of the front window's pointer. Each variant is the
+/// winit event it stands in for, so [`App::pointer_cmd`] has one call to make per
+/// arm and no pointer behaviour of its own to keep in step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerAction {
+    /// `WindowEvent::CursorMoved` onto the centre of terminal cell `(row, col)`.
+    Move { row: u16, col: u16 },
+    /// `WindowEvent::CursorLeft`: the pointer withdraws from the window.
+    Leave,
+    /// Report only — moves nothing.
+    Status,
+}
+
 impl App {
     /// Modal palette pointer boundary. It clears any hover/press retained by the native
     /// app underneath, synchronizes the cursor to the palette row hover, and reports
@@ -414,28 +435,6 @@ impl App {
         self.repaint_palette_pointer(wid, changed);
     }
 
-    /// The FOCUSED pane's top-left `(row_off, col_off)` cell offset in window
-    /// `wid`'s grid. `(0, 0)` when the focused pane fills the window (no splits) — so
-    /// subtracting it from a window mouse cell is a no-op on the single-pane path,
-    /// keeping mouse handling byte-identical. Used to translate window mouse coords
-    /// into the focused pane's local grid (its engine expects pane-local cells).
-    pub(crate) fn focused_pane_origin(&self, wid: WindowId) -> (u16, u16) {
-        if self.active_tab_is_single_focused_pane(wid) {
-            return (0, 0);
-        }
-        self.active_visible_leaf_plan(wid)
-            // `LogicalRect` is `Copy`, so lift the four scalars out instead of
-            // cloning the whole `VisibleLeaf` (and with it another `SplitPath`
-            // `Vec`) just to read them.
-            .and_then(|plan| plan.leaf(plan.focused).map(|leaf| leaf.rect))
-            .map_or((0, 0), |rect| {
-                (
-                    rect.origin.y.round().max(0.0) as u16,
-                    rect.origin.x.round().max(0.0) as u16,
-                )
-            })
-    }
-
     /// `true` when window `wid`'s active tab is one single, focused pane — i.e.
     /// when [`Self::active_visible_leaf_plan`] would allocate a plan whose answer
     /// is already known.
@@ -522,22 +521,38 @@ impl App {
     /// in the already-focused pane, on a divider, or in a single-pane tab returns
     /// `false` (the press proceeds to the normal selection/tracking path).
     pub(crate) fn focus_pane_under_pointer(&mut self, wid: WindowId) -> bool {
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return false;
+        };
+        self.focus_pane_under_pointer_from_plan(wid, &plan)
+    }
+
+    fn focus_pane_under_pointer_from_plan(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
         let (wr, wc) = ws.last_mouse_window_cell;
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return false;
-        };
         if plan.leaves.len() == 1 {
             return false;
         }
-        let Some(hit) = self.visible_view_at_cell(wid, wr, wc) else {
+        let Some(hit_leaf) = plan.leaf_at(crate::tab_model::LogicalPoint {
+            x: f32::from(wc),
+            y: f32::from(wr),
+        }) else {
             return false; // divider / outside grid: nothing to focus
         };
+        let hit = hit_leaf.view;
         if hit == plan.focused {
             return false; // already focused: proceed with the normal press
         }
+        let hit_origin = (
+            hit_leaf.rect.origin.y.round().max(0.0) as u16,
+            hit_leaf.rect.origin.x.round().max(0.0) as u16,
+        );
         let terminal_projection = self.active_tree(wid).is_some();
         let moved = if terminal_projection {
             let Some(session) = self
@@ -566,7 +581,7 @@ impl App {
         }
         // Re-derive the pane-local mouse cell for the newly-focused pane so any
         // follow-up gesture uses its grid; re-mirror term/master/socket onto it.
-        let (ro, co) = self.focused_pane_origin(wid);
+        let (ro, co) = hit_origin;
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_mouse_cell = (wr.saturating_sub(ro), wc.saturating_sub(co));
         }
@@ -581,21 +596,42 @@ impl App {
     /// press path proceeds. The armed [`pane::DividerHit`] is held in
     /// `ws.divider_drag` until release; `drag_divider` consumes it on each move.
     pub(crate) fn begin_divider_drag(&mut self, wid: WindowId) -> bool {
+        self.begin_divider_drag_with_plan(wid, None)
+    }
+
+    fn begin_divider_drag_with_plan(
+        &mut self,
+        wid: WindowId,
+        canonical_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
-        let (wr, wc) = ws.last_mouse_window_cell;
+        let (wr, wc, rows, cols) = (
+            ws.last_mouse_window_cell.0,
+            ws.last_mouse_window_cell.1,
+            ws.rows,
+            ws.cols,
+        );
         let hit = if let Some(tree) = self.active_tree(wid) {
             if tree.len() == 1 {
                 return false;
             }
-            let Some(hit) = tree.divider_at(wr, wc, ws.rows, ws.cols) else {
+            let Some(hit) = tree.divider_at(wr, wc, rows, cols) else {
                 return false;
             };
             crate::DividerDrag::Terminal(hit)
         } else {
-            let Some(plan) = self.active_visible_leaf_plan(wid) else {
-                return false;
+            let owned_plan;
+            let plan = match canonical_plan {
+                Some(plan) => plan,
+                None => {
+                    let Some(plan) = self.active_visible_leaf_plan(wid) else {
+                        return false;
+                    };
+                    owned_plan = plan;
+                    &owned_plan
+                }
             };
             let Some(divider) = plan.divider_at(crate::tab_model::LogicalPoint {
                 x: f32::from(wc),
@@ -969,26 +1005,104 @@ impl App {
     /// Refresh the remembered cells under the pointer — the raw WINDOW cell
     /// (click-to-focus hit-testing) and the FOCUSED-PANE-LOCAL cell (PTY mouse
     /// reports), the latter CLAMPED to the pane's own grid so a drag crossing a
-    /// divider stays inside the focused pane's sub-rect. Returns
-    /// `((window_row, window_col), (pane_row, pane_col))`. Shared by the normal
-    /// motion path and the About-modal gate: the modal swallows motion, but must
-    /// not leave a STALE cell for the first click after a keyboard close.
+    /// divider stays inside the focused pane's sub-rect. Returns the pane-local
+    /// cell and pane rect; the motion hot path reuses the rect for
+    /// selection-autoscroll rather than planning the split twice. Shared by the
+    /// normal motion path and the About-modal gate: the modal swallows motion, but
+    /// must not leave a STALE cell for the first click after a keyboard close.
     fn refresh_mouse_cell(
         &mut self,
         wid: WindowId,
         geom: PointerGeometry,
         x: f64,
         y: f64,
-    ) -> ((u16, u16), (u16, u16)) {
+    ) -> MouseCellMapping {
         let (row, col) = self.pixel_to_cell_with(wid, geom, x, y);
-        let (ro, co, prows, pcols) = self.focused_pane_rect(wid);
+        let pane_rect @ (ro, co, prows, pcols) = self.focused_pane_rect(wid);
         let lr = row.saturating_sub(ro).min(prows.saturating_sub(1));
         let lc = col.saturating_sub(co).min(pcols.saturating_sub(1));
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_mouse_window_cell = (row, col);
             ws.last_mouse_cell = (lr, lc);
         }
-        ((row, col), (lr, lc))
+        MouseCellMapping {
+            pane_cell: (lr, lc),
+            pane_rect,
+        }
+    }
+
+    /// The window pixel at the CENTRE of terminal cell `(row, col)` — the exact
+    /// inverse of [`pixel_to_term_cell`] plus the frame origin
+    /// [`Self::window_to_frame_with`] removes, so feeding the result back through
+    /// [`Self::pixel_to_cell`] lands on the cell it names.
+    ///
+    /// The centre and not the origin: the cell origin is one rounding away from the
+    /// neighbouring cell, and the half-cell also puts the pointer on the correct
+    /// SIDE of a cell for the selection seam's `SelectionSide`.
+    ///
+    /// `None` when the geometry cannot answer — a zero-sized grid or cell (before
+    /// the first layout), or a cell outside the grid. Refusing is the point: the
+    /// caller replies `ERR` rather than moving the pointer somewhere else and
+    /// reporting it as though the request had been honoured.
+    fn cell_centre_px(&self, wid: WindowId, row: u16, col: u16) -> Option<(f64, f64)> {
+        let (rows, cols) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols))?;
+        if row >= rows || col >= cols {
+            return None;
+        }
+        let geom = self.pointer_geometry(wid);
+        let (cw, ch) = geom.cell;
+        if cw == 0 || ch == 0 {
+            return None;
+        }
+        let (ox, oy) = self.frame_origin_with(wid, geom);
+        // The same three insets `pixel_to_term_cell` strips, put back in its order.
+        let strip_px = usize::from(self.chrome_rows()) * ch;
+        let fx = usize::from(col) * cw + cw / 2 + geom.pad;
+        let fy = usize::from(row) * ch + ch / 2 + strip_px + geom.pad_top + geom.head;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "window pixel coordinates; the f64 mantissa covers every representable window size"
+        )]
+        Some((ox as f64 + fx as f64, oy as f64 + fy as f64))
+    }
+
+    /// Drive the front window's POINTER, and report where it actually ended up.
+    ///
+    /// The point of the verb is that it takes the pointer's own path:
+    /// [`Self::on_cursor_moved`] is the function `WindowEvent::CursorMoved` calls
+    /// and [`Self::on_cursor_left`] the one `WindowEvent::CursorLeft` calls, so
+    /// hover resolution, the link caption bracket, strip hover, divider cursors and
+    /// pane hit-testing all run exactly as they do for a hand on a mouse. The
+    /// `mouse` verb cannot do this: it posts an engine `InputEvent` into the input
+    /// seam, which never touches `last_cursor_px` and so never resolves a hover.
+    ///
+    /// The reply is READ BACK from the window after the real path ran, never
+    /// predicted from the request — so it states where the pointer IS, even if the
+    /// motion path resolved somewhere other than the cell asked for. `Ok(None)`
+    /// means the window holds no pointer position at all — after a `leave`, and
+    /// before any motion — and is the only thing said then.
+    pub(crate) fn pointer_cmd(
+        &mut self,
+        action: PointerAction,
+    ) -> Result<Option<(u16, u16)>, &'static str> {
+        let Some(wid) = self.frontmost_window else {
+            return Err("no window");
+        };
+        match action {
+            PointerAction::Move { row, col } => {
+                let (x, y) = self
+                    .cell_centre_px(wid, row, col)
+                    .ok_or("cell is outside the grid")?;
+                self.on_cursor_moved(wid, x, y);
+            }
+            PointerAction::Leave => self.on_cursor_left(wid),
+            PointerAction::Status => {}
+        }
+        Ok(self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.pointer_position_known)
+            .map(|ws| ws.last_mouse_window_cell))
     }
 
     /// W1 (kill the compositor stretch): where the (padded) FRAME's top-left sits
@@ -1057,6 +1171,22 @@ impl App {
     ) -> (f64, f64) {
         let (ox, oy) = self.frame_origin_with(wid, geom);
         ((x - ox as f64).max(0.0), (y - oy as f64).max(0.0))
+    }
+
+    /// Window→FRAME on the Y axis WITHOUT [`Self::window_to_frame`]'s at-zero
+    /// clamp, so the result stays NEGATIVE above the frame's first pixel row.
+    ///
+    /// HIT-TESTING wants the clamp: a press inside a leading band belongs to the
+    /// frame's edge cell, and there is no cell above row 0 to name. EDGE-OVERSHOOT
+    /// math is the one consumer that must not have it — its whole input is the
+    /// SIGNED distance the pointer is held PAST an edge, and the clamp floors that
+    /// distance at the frame origin. On a window whose top inset is zero (no top
+    /// pad, no chrome rows) the clamped y equals the grid's own top edge, which
+    /// the edge math must read as "inside the grid": the gesture reports a pointer
+    /// dragged anywhere above the window as resting on terminal row 0.
+    fn window_to_frame_y_signed(&self, wid: WindowId, geom: PointerGeometry, y: f64) -> f64 {
+        let (_, oy) = self.frame_origin_with(wid, geom);
+        y - oy as f64
     }
 
     /// If pixel position `(x, y)` lands in window `wid`'s tab-strip region (the top
@@ -1459,6 +1589,12 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        // The pointer memos are deliberately KEPT (a press that races the departure
+        // still hit-tests against the last place the pointer was); what withdraws is
+        // the claim that they describe a pointer this window currently holds. Cleared
+        // BEFORE the strip-hover early return, or a window with no chip under the
+        // pointer would keep vouching for a position the pointer has left.
+        ws.pointer_position_known = false;
         if ws.strip_hover.is_none() && !ws.strip_hover_new_tab {
             return;
         }
@@ -2361,6 +2497,9 @@ impl App {
         // whether it landed in the tab strip (intercepted before cell mapping).
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_cursor_px = (x, y);
+            // Written HERE, beside the coordinate it qualifies, so the flag and the
+            // position it vouches for cannot be set by two different events.
+            ws.pointer_position_known = true;
             // POINTER PURSUIT (wave 3): the brain is its own motion sensor,
             // but it only senses on a TICK — and with the frame lane
             // released, mouse motion alone never produced one, so the pet
@@ -2576,18 +2715,21 @@ impl App {
                     w.set_cursor(CursorIcon::Default);
                 }
             }
-            // A selection drag held up INTO the tab strip is still past the TOP grid edge
-            // — the strip occupies exactly the pixel band (`y < pad + strip_px`) that
-            // triggers top-edge autoscroll, so without this the gesture would be dead
-            // whenever the strip is shown (the Linux/Windows default). No-op unless a
-            // selection drag is active; arms `next_autoscroll`, and the repeat tick grows
-            // the selection from the last in-grid cell. (macOS strip default is 0 → never
-            // reached.)
-            self.selection_autoscroll_with(wid, geom, y);
-            return;
+            // A selection drag held up INTO the tab strip is still past the TOP grid
+            // edge. It is the one strip motion that continues through the grid seam:
+            // `refresh_mouse_cell` clamps it to the focused pane's top row at the
+            // CURRENT strip column, then autoscroll runs before the MouseMove arm grows
+            // the endpoint through the newly revealed row on this SAME event. The
+            // selecting arm consumes that MouseMove locally before PTY egress, so chrome
+            // still never reports motion to the app. A plain strip hover returns here as
+            // before. (macOS strip default is 0 → this branch is never reached.)
+            if !self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
+                return;
+            }
         }
         // The window cell is cached by the helper; the seam below consumes pane-local.
-        let (_, (lr, lc)) = self.refresh_mouse_cell(wid, geom, x, y);
+        let mapped_cell = self.refresh_mouse_cell(wid, geom, x, y);
+        let (lr, lc) = mapped_cell.pane_cell;
         // SPLIT-PANE DIVIDER DRAG: while a divider is held, motion resizes the split
         // (relayout + repaint) and short-circuits the selection / mouse-report path —
         // the drag is GUI chrome, not terminal input. A no-op when none is held.
@@ -2663,7 +2805,7 @@ impl App {
         // freshly-revealed edge row. A no-op when no selection drag is active or the
         // pointer is inside the grid. `row`/`col` are already clamped to the grid by
         // `pixel_to_cell`, so the edge row is 0 (top) or rows-1 (bottom).
-        self.selection_autoscroll_with(wid, geom, y);
+        self.selection_autoscroll_with(wid, geom, y, mapped_cell.pane_rect);
         self.input(
             wid,
             InputEvent::MouseMove {
@@ -2817,13 +2959,21 @@ impl App {
     /// the oldest/newest line is harmless.
     pub(crate) fn selection_autoscroll(&mut self, wid: WindowId, y: f64) -> bool {
         let geom = self.pointer_geometry(wid);
-        self.selection_autoscroll_with(wid, geom, y)
+        let pane_rect = self.focused_pane_rect(wid);
+        self.selection_autoscroll_with(wid, geom, y, pane_rect)
     }
 
-    /// [`Self::selection_autoscroll`] against geometry the caller already derived.
-    fn selection_autoscroll_with(&mut self, wid: WindowId, geom: PointerGeometry, y: f64) -> bool {
-        let (selecting, rows) = match self.windows.get(&wid) {
-            Some(ws) => (ws.selecting, ws.rows),
+    /// [`Self::selection_autoscroll`] against geometry and, on the motion hot path,
+    /// the focused pane rect the cell-mapping step already derived.
+    fn selection_autoscroll_with(
+        &mut self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        y: f64,
+        pane_rect: (u16, u16, u16, u16),
+    ) -> bool {
+        let selecting = match self.windows.get(&wid) {
+            Some(ws) => ws.selecting,
             None => return false,
         };
         // Not dragging a selection → disarm the repeat timer and bail.
@@ -2834,15 +2984,25 @@ impl App {
             return false;
         }
         let ch = geom.cell.1.max(1);
-        // The chrome headroom stacks above the pad on the y-axis, so the grid's
-        // top edge is `head + pad_top + strip_px` — fold it into the pad inset the
-        // pure edge math subtracts (head == 0 && pad_top == pad is byte-identical).
-        let pad = geom.pad_top + geom.head;
+        let (pane_row, _, pane_rows, _) = pane_rect;
+        // The chrome headroom stacks above the pad on the y-axis, followed by the
+        // focused pane's row offset inside the terminal grid. Autoscroll belongs to
+        // THAT pane's viewport: in a vertical split, crossing the top pane's bottom
+        // or the bottom pane's top is already past an edge even though the pointer is
+        // still inside the window. Single-pane `pane_row == 0` is byte-identical.
+        let pane_top = geom
+            .pad_top
+            .saturating_add(geom.head)
+            .saturating_add(usize::from(pane_row).saturating_mul(ch));
         let strip_px = usize::from(self.chrome_rows()) * ch;
         // W1: window→frame first, so the grid's top/bottom edges account for the
-        // leading remainder band like every other pointer consumer.
-        let (_, y) = self.window_to_frame_with(wid, geom, 0.0, y);
-        let lines = crate::app_render::selection_autoscroll_lines(y, pad, strip_px, ch, rows);
+        // leading remainder band like every other pointer consumer — but on the
+        // SIGNED seam. A drag past the TOP edge lives entirely in the negative
+        // half of frame space (`selection_autoscroll_lines(-1.0, ..) == 1` is the
+        // pure math's own contract), which the hit-testing clamp cannot express.
+        let y = self.window_to_frame_y_signed(wid, geom, y);
+        let lines =
+            crate::app_render::selection_autoscroll_lines(y, pane_top, strip_px, ch, pane_rows);
         if lines == 0 {
             // Pointer is back inside the grid → stop auto-scrolling.
             if let Some(ws) = self.windows.get_mut(&wid) {
@@ -2852,7 +3012,15 @@ impl App {
         }
         let term = match self.front_terminal(wid) {
             Some(terminal) => terminal.term.clone(),
-            None => return false,
+            None => {
+                // A tab close/switch can retire the front terminal between
+                // repeat ticks. Drop the old level-triggered deadline here or
+                // the event loop keeps re-observing a time in the past.
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.next_autoscroll = None;
+                }
+                return false;
+            }
         };
         let moved = {
             let mut term = term_lock(&term);
@@ -3454,17 +3622,20 @@ impl App {
         // boundary. A divider consumes the press; otherwise a press in a sibling
         // focuses that stable view first, so the matching keyboard/pointer router
         // can never target the formerly focused leaf.
+        let mut canonical_press_routed = false;
         if pressed
             && button == WinitMouseButton::Left
-            && self.active_visible_content_route(wid)
-                == Some(crate::VisibleContentRoute::Heterogeneous)
+            && let Some((plan, crate::VisibleContentRoute::Heterogeneous)) =
+                self.active_visible_frame_layout(wid)
         {
+            canonical_press_routed = true;
             let (px, py) = self
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
             if self.strip_col_at(wid, px, py).is_none()
-                && (self.begin_divider_drag(wid) || self.focus_pane_under_pointer(wid))
+                && (self.begin_divider_drag_with_plan(wid, Some(&plan))
+                    || self.focus_pane_under_pointer_from_plan(wid, &plan))
             {
                 return;
             }
@@ -3687,7 +3858,7 @@ impl App {
             return;
         }
         // SOFTWARE UPDATE MODAL: the own-rendered update dialog. A left press on the close
-        // dot / Close closes it, on Check runs a fresh check, on Install & Relaunch applies
+        // dot / Close closes it, on Check runs a fresh check, on Apply Now applies
         // the staged build. Every gesture is swallowed while open (truly modal), and a
         // swallowed left RELEASE still settles any in-flight drag (as with About above).
         if self
@@ -4069,7 +4240,7 @@ impl App {
         // rather than mis-focusing. A no-op on the single-pane path.
         if button == WinitMouseButton::Left {
             if pressed {
-                if self.begin_divider_drag(wid) {
+                if !canonical_press_routed && self.begin_divider_drag(wid) {
                     return;
                 }
             } else if self.finish_divider_drag(wid) {
@@ -4082,7 +4253,11 @@ impl App {
         // SPLIT PANES: a left press in a DIFFERENT pane focuses it (and stops there
         // — it does not also start a selection in the old pane). A no-op on the
         // single-pane path (the hit-test always returns the only/focused pane).
-        if pressed && button == WinitMouseButton::Left && self.focus_pane_under_pointer(wid) {
+        if pressed
+            && button == WinitMouseButton::Left
+            && !canonical_press_routed
+            && self.focus_pane_under_pointer(wid)
+        {
             return;
         }
         let mut click_count: u8 = 1;
@@ -4653,8 +4828,97 @@ fn bank_scroll_lines(residual: &mut f64, delta: f64) -> Option<(bool, i32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WheelDir, bank_scroll_lines, press_selection_kind, press_starts_selection};
+    use super::{
+        PointerAction, WheelDir, bank_scroll_lines, press_selection_kind, press_starts_selection,
+    };
     use aterm_core::selection::SelectionType;
+
+    /// The `pointer` verb's honesty pin, in both directions.
+    ///
+    /// A window that has never seen pointer motion, and one the pointer has LEFT,
+    /// hold no pointer position — and the verb says exactly that rather than
+    /// reporting the coordinate memos, which are `(0, 0)` before the first motion
+    /// and deliberately KEEP the departed position afterwards (a press racing the
+    /// departure still has to hit-test somewhere). A previous attempt reported
+    /// `inside=true row=5 col=3` for exactly this state.
+    #[test]
+    fn the_pointer_reports_no_position_before_any_motion_and_after_it_leaves() {
+        let mut app = crate::App::headless_for_test();
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Status),
+            Ok(None),
+            "a window that has never seen the pointer claims no position"
+        );
+
+        // A real move: the reply is the cell the window actually resolved.
+        let at = app
+            .pointer_cmd(PointerAction::Move { row: 3, col: 5 })
+            .expect("the move is addressable");
+        assert_eq!(at, Some((3, 5)));
+        assert_eq!(app.pointer_cmd(PointerAction::Status), Ok(Some((3, 5))));
+
+        // …and after leaving, the position is withdrawn rather than remembered.
+        assert_eq!(app.pointer_cmd(PointerAction::Leave), Ok(None));
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Status),
+            Ok(None),
+            "the departed pointer's last cell must not be reported as where it is"
+        );
+        // NON-VACUITY for the clause above: the memo really does still hold (3, 5),
+        // so `Ok(None)` is the flag doing work and not an emptied coordinate.
+        let wid = crate::WindowId(0);
+        assert_eq!(app.windows[&wid].last_mouse_window_cell, (3, 5));
+    }
+
+    /// A cell outside the grid is REFUSED, not clamped: answering `OK` for a
+    /// pointer that landed elsewhere is the class of lie this surface exists to
+    /// avoid. The refusal also leaves the previous position untouched.
+    #[test]
+    fn a_pointer_move_outside_the_grid_is_refused_and_changes_nothing() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        assert!(rows > 0 && cols > 0, "the headless window has a grid");
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Move { row: 1, col: 1 }),
+            Ok(Some((1, 1)))
+        );
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Move { row: rows, col: 0 }),
+            Err("cell is outside the grid")
+        );
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Move { row: 0, col: cols }),
+            Err("cell is outside the grid")
+        );
+        assert_eq!(
+            app.pointer_cmd(PointerAction::Status),
+            Ok(Some((1, 1))),
+            "a refused move left the pointer where it was"
+        );
+    }
+
+    /// The cell→pixel inverse is exactly that: every cell of the grid maps to a
+    /// pixel that maps back to the same cell. Without this the verb would drive the
+    /// pointer to a neighbouring cell and truthfully report the wrong one.
+    #[test]
+    fn every_cell_maps_to_a_pixel_that_maps_back_to_that_cell() {
+        let app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                let (x, y) = app
+                    .cell_centre_px(wid, row, col)
+                    .expect("an in-grid cell has a centre");
+                assert_eq!(
+                    app.pixel_to_cell(wid, x, y),
+                    (row, col),
+                    "cell ({row}, {col}) round-trips through pixel ({x}, {y})"
+                );
+            }
+        }
+    }
 
     fn native_palette_row_center(
         app: &crate::App,
@@ -8158,5 +8422,320 @@ mod tests {
             term_lock(&term).selection_to_string().as_deref(),
             Some("hello")
         );
+    }
+
+    /// Two terminal panes stacked TOP/BOTTOM through the canonical
+    /// `SplitAxis::Vertical` layout. Both receive enough history for either edge
+    /// direction to move the viewport; the new bottom pane remains focused.
+    fn stacked_autoscroll_fixture() -> (crate::App, crate::WindowId, u64, u64) {
+        use crate::{App, WindowId, pane, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let top = app.focused_session_id(wid).expect("top terminal");
+        let bottom = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        let plan = app
+            .active_visible_leaf_plan(wid)
+            .expect("stacked visible plan");
+        assert_eq!(plan.dividers.len(), 1);
+        assert_eq!(
+            plan.dividers[0].axis,
+            crate::tab_model::SplitAxis::Vertical,
+            "fixture must stack panes rather than place them side by side"
+        );
+        assert_eq!(app.focused_session_id(wid), Some(bottom));
+
+        for session in [top, bottom] {
+            let term = app.pool.get(session).expect("pooled terminal").term.clone();
+            let mut terminal = term_lock(&term);
+            for line in 0..100 {
+                terminal.process(format!("pane {session} history {line}\r\n").as_bytes());
+            }
+            assert!(terminal.grid().scrollback_lines() > 8);
+            assert_eq!(terminal.grid().display_offset(), 0);
+        }
+        (app, wid, top, bottom)
+    }
+
+    /// Selection-autoscroll consumes the pane rect the normal cell-mapping step
+    /// already planned. Enabling selection must not add another owned visible plan
+    /// to the split-pane pointer hot path.
+    #[test]
+    fn split_selection_motion_reuses_the_mapped_pane_rect() {
+        use crate::{reset_visible_leaf_plan_builds, visible_leaf_plan_builds};
+
+        let (mut app, wid, _, _) = stacked_autoscroll_fixture();
+        let (row, col, rows, cols) = app.focused_pane_rect(wid);
+        assert!(rows > 2 && cols > 2, "fixture needs an interior pane cell");
+        let (x, y) = app
+            .cell_centre_px(wid, row + 1, col + 1)
+            .expect("interior bottom-pane pixel");
+
+        reset_visible_leaf_plan_builds();
+        app.on_cursor_moved(wid, x, y);
+        let plain_motion_builds = visible_leaf_plan_builds();
+        assert!(
+            plain_motion_builds > 0,
+            "split fixture must exercise planning"
+        );
+
+        app.begin_selection(wid, SelectionType::Simple);
+        reset_visible_leaf_plan_builds();
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            plain_motion_builds,
+            "autoscroll must reuse refresh_mouse_cell's pane rect"
+        );
+    }
+
+    /// The TOP pane's lower edge is an autoscroll edge even though it lies near
+    /// the middle of the window. The old window-height calculation read this
+    /// divider pixel as inside and left the pane parked in history.
+    #[test]
+    fn top_stacked_pane_autoscrolls_at_its_own_bottom_edge() {
+        use crate::term_lock;
+
+        let (mut app, wid, top, _) = stacked_autoscroll_fixture();
+        assert!(
+            app.active_tree_mut(wid)
+                .expect("terminal pane tree")
+                .set_focus(top)
+        );
+        let active = app.windows[&wid].tabs.active;
+        assert!(app.sync_tab_model_from_layout(wid, active));
+        app.sync_window(wid);
+        assert_eq!(app.focused_session_id(wid), Some(top));
+
+        let term = app.pool.get(top).expect("top terminal").term.clone();
+        term_lock(&term).scroll_display(5);
+        app.windows.get_mut(&wid).expect("window").selecting = true;
+
+        let (pane_row, _, pane_rows, _) = app.focused_pane_rect(wid);
+        assert_eq!(pane_row, 0, "the original terminal is the top pane");
+        assert!(pane_rows < app.windows[&wid].rows);
+        let ch = app.win_cell_size(wid).1.max(1);
+        let strip_px = usize::from(app.chrome_rows()) * ch;
+        let pane_bottom = app.win_pad_top(wid)
+            + app.win_head(wid)
+            + strip_px
+            + usize::from(pane_row.saturating_add(pane_rows)) * ch;
+        assert_eq!(
+            crate::app_render::selection_autoscroll_lines(
+                pane_bottom as f64,
+                app.win_pad_top(wid) + app.win_head(wid),
+                strip_px,
+                ch,
+                app.windows[&wid].rows,
+            ),
+            0,
+            "negative control: the same point is inside the whole-window grid"
+        );
+        let (_, frame_y) = app.frame_origin(wid);
+        assert!(app.selection_autoscroll(wid, frame_y as f64 + pane_bottom as f64));
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            4,
+            "crossing the top pane's bottom edge scrolls it toward live"
+        );
+    }
+
+    /// The BOTTOM pane's upper edge is independent of the window's top edge.
+    /// One pixel into the divider must scroll the focused bottom pane into
+    /// history, rather than waiting until the pointer leaves the whole window.
+    #[test]
+    fn bottom_stacked_pane_autoscrolls_at_its_own_top_edge() {
+        use crate::term_lock;
+
+        let (mut app, wid, _, bottom) = stacked_autoscroll_fixture();
+        let term = app.pool.get(bottom).expect("bottom terminal").term.clone();
+        app.windows.get_mut(&wid).expect("window").selecting = true;
+
+        let (pane_row, _, pane_rows, _) = app.focused_pane_rect(wid);
+        assert!(pane_row > 0, "the new terminal is the bottom pane");
+        assert!(pane_rows < app.windows[&wid].rows);
+        let ch = app.win_cell_size(wid).1.max(1);
+        let strip_px = usize::from(app.chrome_rows()) * ch;
+        let pane_top =
+            app.win_pad_top(wid) + app.win_head(wid) + strip_px + usize::from(pane_row) * ch;
+        let pointer = pane_top as f64 - 1.0;
+        assert_eq!(
+            crate::app_render::selection_autoscroll_lines(
+                pointer,
+                app.win_pad_top(wid) + app.win_head(wid),
+                strip_px,
+                ch,
+                app.windows[&wid].rows,
+            ),
+            0,
+            "negative control: the same point is inside the whole-window grid"
+        );
+        let (_, frame_y) = app.frame_origin(wid);
+        assert!(app.selection_autoscroll(wid, frame_y as f64 + pointer));
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            1,
+            "crossing the bottom pane's top edge scrolls it into history"
+        );
+    }
+
+    /// A strip is chrome for hover/reporting, but not a dead zone for an active
+    /// text drag. One coalesced motion must refresh its CURRENT x, clamp to row 0,
+    /// and extend before returning — both through a newly revealed history row and
+    /// when the viewport is already clamped.
+    #[test]
+    fn tab_strip_selection_motion_refreshes_and_extends_the_endpoint_immediately() {
+        use crate::{App, WindowId, term_lock};
+
+        fn run(with_history: bool) -> (usize, i32, u16, (u16, u16), bool) {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.tab_strip_rows = 1;
+            app.splice_tab_strip(wid);
+            let term = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            if with_history {
+                term_lock(&term).process(&numbered_screen("L"));
+                term_lock(&term).process(b"\r\nL24");
+                assert_eq!(term_lock(&term).grid().scrollback_lines(), 1);
+            }
+            // Intentionally stale: the coalesced strip event lands at column 7.
+            app.windows.get_mut(&wid).expect("window").last_mouse_cell = (8, 3);
+            app.begin_selection(wid, SelectionType::Simple);
+
+            let (cw, ch) = app.win_cell_size(wid);
+            let (frame_x, frame_y) = app.frame_origin(wid);
+            let strip_col = 7u16;
+            let x =
+                frame_x as f64 + (app.win_pad(wid) + usize::from(strip_col) * cw + cw / 2) as f64;
+            let y = frame_y as f64 + (app.win_pad_top(wid) + app.win_head(wid) + ch / 2) as f64;
+            assert_eq!(app.strip_col_at(wid, x, y), Some(strip_col));
+
+            app.on_cursor_moved(wid, x, y);
+
+            let terminal = term_lock(&term);
+            (
+                terminal.grid().display_offset(),
+                terminal.text_selection().end().row,
+                terminal.text_selection().end().col,
+                app.windows[&wid].last_mouse_cell,
+                app.windows[&wid].next_autoscroll.is_some(),
+            )
+        }
+
+        assert_eq!(run(true), (1, -1, 7, (0, 7), true));
+        assert_eq!(
+            run(false),
+            (0, 0, 7, (0, 7), true),
+            "endpoint motion does not depend on viewport motion"
+        );
+    }
+
+    #[test]
+    fn selection_autoscroll_disarms_when_the_front_terminal_is_gone() {
+        use std::time::Instant;
+
+        use crate::{App, WindowId};
+
+        let wid = WindowId(0);
+        let mut native = App::headless_for_test();
+        assert!(native.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        {
+            let window = native.windows.get_mut(&wid).expect("headless window");
+            window.selecting = true;
+            window.next_autoscroll = Some(Instant::now());
+        }
+        // PAST THE BOTTOM EDGE, because that is the edge whose no-motion half is
+        // unconditional: at `display_offset == 0` a negative `scroll_display`
+        // delta clamps to nothing, so `assert!(!…)` holds however much scrollback
+        // this fixture ever gains, where the top-edge spelling holds only while it
+        // stays empty. (`a_selection_drag_above_the_window_top_scrolls_into_history`
+        // owns the top edge, whose own hazard is the frame clamp.)
+        let past_bottom = 10_000.0;
+        // Derived from the app's OWN geometry, so a future padding or chrome
+        // default cannot quietly make the fixture vacuous again.
+        let guard_ch = native.win_cell_size(wid).1;
+        assert_ne!(
+            crate::app_render::selection_autoscroll_lines(
+                past_bottom,
+                native.win_pad_top(wid) + native.win_head(wid),
+                usize::from(native.chrome_rows()) * guard_ch,
+                guard_ch,
+                native.windows[&wid].rows,
+            ),
+            0,
+            "fixture must place the pointer past a grid edge"
+        );
+        assert!(!native.selection_autoscroll(wid, past_bottom));
+        assert!(
+            native.windows[&wid].next_autoscroll.is_none(),
+            "a retired front terminal must not leave an already-due wake armed"
+        );
+
+        // Negative control: with a live terminal, the same held edge drag owns
+        // the next repeat deadline even when history clamping prevents motion.
+        let mut terminal = App::headless_for_test();
+        terminal
+            .windows
+            .get_mut(&wid)
+            .expect("headless window")
+            .selecting = true;
+        assert!(!terminal.selection_autoscroll(wid, past_bottom));
+        assert!(
+            terminal.windows[&wid].next_autoscroll.is_some(),
+            "a live edge drag must still rearm"
+        );
+    }
+
+    /// The gesture's own coordinate space: a drag past the TOP edge is reported
+    /// at a pointer y ABOVE the frame's first row, i.e. in the negative half of
+    /// frame space — the half the pure edge math is specified on
+    /// (`selection_autoscroll_lines(-1.0, ..) == 1`). Hit-testing's at-zero clamp
+    /// belongs to consumers that must name a cell; this one must name a DISTANCE,
+    /// and a window with no top inset puts row 0 at frame y == 0, where a clamped
+    /// pointer reads as "inside the grid" and the gesture scrolls nothing at all.
+    #[test]
+    fn a_selection_drag_above_the_window_top_scrolls_into_history() {
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let mut terminal = crate::term_lock(&term);
+            for line in 0..100 {
+                terminal.process(format!("history {line}\r\n").as_bytes());
+            }
+            assert!(terminal.grid().scrollback_lines() > 8);
+            assert_eq!(
+                terminal.grid().display_offset(),
+                0,
+                "the drag starts at the live bottom"
+            );
+        }
+        app.windows
+            .get_mut(&wid)
+            .expect("headless window")
+            .selecting = true;
+
+        assert!(
+            app.selection_autoscroll(wid, -1.0),
+            "one pixel above the top edge scrolls one line into history"
+        );
+        assert_eq!(crate::term_lock(&term).grid().display_offset(), 1);
+        assert!(app.windows[&wid].next_autoscroll.is_some());
+
+        // The magnitude is the overshoot itself: four cell-heights further out
+        // moves five lines on the tick, not one.
+        let ch = app.win_cell_size(wid).1 as f64;
+        assert!(app.selection_autoscroll(wid, -4.0 * ch));
+        assert_eq!(crate::term_lock(&term).grid().display_offset(), 6);
     }
 }

@@ -1902,7 +1902,7 @@ impl App {
         }
     }
 
-    fn native_ui_full_viewport(
+    pub(crate) fn native_ui_full_viewport(
         &self,
         wid: WindowId,
     ) -> Result<crate::native_ui::LogicalRect, String> {
@@ -2231,17 +2231,28 @@ impl App {
     /// accessibility and inspection consume this same semantic tree and device
     /// destination. Any lifecycle, geometry, service, theme, or document drift
     /// changes the compile stamp and therefore fails closed.
+    #[cfg(test)]
     pub(crate) fn retained_native_leaf_artifact(
         &self,
         wid: WindowId,
         view: crate::tab_model::ViewId,
         require_presented: bool,
     ) -> Option<RetainedNativeLeafArtifact<'_>> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        self.retained_native_leaf_artifact_from_plan(wid, view, require_presented, &plan)
+    }
+
+    pub(crate) fn retained_native_leaf_artifact_from_plan(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        require_presented: bool,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<RetainedNativeLeafArtifact<'_>> {
         let window = self.windows.get(&wid)?;
         if window.overlay.is_some() {
             return None;
         }
-        let plan = self.active_visible_leaf_plan(wid)?;
         let leaf = plan.leaf(view)?;
         let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
             return None;
@@ -2250,7 +2261,7 @@ impl App {
         let (cw, ch) = self.win_cell_size(wid);
         let scale = window.scale.max(f64::EPSILON);
         let viewport = if plan.leaves.len() == 1 {
-            self.native_ui_viewport(wid).ok()?
+            self.native_ui_full_viewport(wid).ok()?
         } else {
             crate::native_ui::LogicalRect::new(
                 0.0,
@@ -2328,7 +2339,9 @@ impl App {
         }
         let plan = self.active_visible_leaf_plan(wid)?;
         for leaf in &plan.leaves {
-            let Some(artifact) = self.retained_native_leaf_artifact(wid, leaf.view, true) else {
+            let Some(artifact) =
+                self.retained_native_leaf_artifact_from_plan(wid, leaf.view, true, &plan)
+            else {
                 continue;
             };
             let local_x = x - artifact.device_x as f64;
@@ -2857,7 +2870,7 @@ impl App {
                 return true;
             }
             // Nothing holds keyboard focus: Return falls back to the page's
-            // DEFAULT button (the highlighted Primary — "Install & Relaunch",
+            // DEFAULT button (the highlighted Primary — "Update to Latest Now",
             // "Copy Build Information"), the native default-button convention.
             // Space never does; on macOS it only activates the focused control.
             // NumpadEnter only ever arrives from a controller (`key kpenter`);
@@ -2877,7 +2890,7 @@ impl App {
             InputEvent::Resize { .. }
             | InputEvent::ResizeWindowPx { .. }
             | InputEvent::Focus(_) => return false,
-            InputEvent::Text(text) | InputEvent::Paste(text) => {
+            InputEvent::Text(text) | InputEvent::Paste(text, _) => {
                 Some(AppEvent::TextInput(TextInputEvent::Commit(text.clone())))
             }
             InputEvent::Key {
@@ -5300,11 +5313,26 @@ impl App {
         self.arm_native_auto_apply(build, &digest);
     }
 
+    /// The close-preflight blocker for unsaved native-app (editor / Settings)
+    /// work. Says what the update is waiting for — never "before relaunching":
+    /// the apply is in place and the shells keep running.
+    pub(crate) const UNSAVED_NATIVE_WORK_BLOCKS_APPLY: &'static str =
+        "Review or discard unsaved native-app work before the update can apply";
+    /// The close-preflight blocker while session restore / adoption is in flight.
+    pub(crate) const RESTORE_IN_FLIGHT_BLOCKS_APPLY: &'static str =
+        "Wait for session restore to finish before the update applies";
+    /// The `InstalledNeedsRelaunch` outcome's sentence: the bundle on disk is
+    /// already the newer build, and the reducer activates it in place — an
+    /// ACTIVATION stage the seamless lane adopts every window and shell through.
+    /// Nothing to relaunch.
+    pub(crate) const INSTALLED_ACTIVATES_IN_PLACE: &'static str = "The update is already on disk; aterm activates it in place at the next quiet \
+         moment — your shells keep running";
+
     /// `true` while the `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam is
     /// suppressing the automatic update lane — and it SAYS SO, once per process,
     /// the first time either the arm or the poll asks.
     ///
-    /// The seam seeds a fake `Wake::UpdateStaged` so the relaunch banner can be
+    /// The seam seeds a fake `Wake::UpdateStaged` so the update-ready nudge can be
     /// captured with `ctl image` without waiting for a real background stage, and
     /// a fake nudge must not be able to install anything. That is the right
     /// intent. The wrong part was the silence: both `arm_native_auto_apply` and
@@ -5321,7 +5349,7 @@ impl App {
             if on {
                 aterm_log::warn!(
                     "$ATERM_DEBUG_RELAUNCH_NUDGE is set: this is the QA/screenshot \
-                     seam for the relaunch banner, and it DISABLES automatic update \
+                     seam for the update-ready nudge, and it DISABLES automatic update \
                      application for the whole process — no staged build will be \
                      armed or applied, whatever `[update] auto_apply` says. Unset it \
                      to restore the default."
@@ -5362,6 +5390,9 @@ impl App {
             }
             ArmDecision::SuppressManualOnly => {
                 self.auto_apply_intent = None;
+                // The status bar's Staged line was painted from policy alone; this
+                // build's own latch is the finer fact — say so while the bar is up.
+                self.restate_staged_bar_posture(build);
                 false
             }
             ArmDecision::Keep => false,
@@ -5398,6 +5429,11 @@ impl App {
                     // would push the deadline out forever.
                     apply_by: now + crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE,
                 });
+                // The status bar's "applies in place within ~2 min" was a POLICY line
+                // when the Staged report painted it; now it is an armed fact (or,
+                // under `ATERM_NO_SEAMLESS_UPDATE`, the line that says nothing applies
+                // while a terminal is open) — re-state it while the bar is still up.
+                self.restate_staged_bar_posture(build);
                 true
             }
         }
@@ -5530,10 +5566,10 @@ impl App {
             // …AND IT MAY NOT HOLD FOREVER. A refusal that can repeat without
             // bound is a feature that silently stops working, so a lane held by
             // typing for this long past its grace stands down to manual-only:
-            // the ordinary latch, which lapses and re-arms on its own, and the
-            // staged build still applies for free at the next launch — where
-            // there is no live session to freeze at all. Better than proving a
-            // point by freezing the terminal of someone who is plainly using it.
+            // the ordinary latch, which lapses and re-arms on its own — and a
+            // click from the Version menu applies the build in place at any
+            // time. Better than proving a point by freezing the terminal of
+            // someone who is plainly using it.
             if typing_gap
                 && past_grace
                 && now.saturating_duration_since(intent.apply_by)
@@ -5541,8 +5577,9 @@ impl App {
             {
                 aterm_log::info!(
                     "update auto-apply for build {} stood down to manual-only: the keyboard \
-                     has not been idle for {:?} since its grace expired; the staged build \
-                     applies at the next launch",
+                     has not been idle for {:?} since its grace expired; it re-arms by \
+                     itself later, or apply it now from the Version menu — in place, your \
+                     shells keep running",
                     intent.build,
                     crate::AUTOMATIC_UPDATE_TYPING_HOLD
                 );
@@ -5554,6 +5591,8 @@ impl App {
                     retry_at: Some(now + crate::ACTIVITY_RETRY_BUDGET_REPLENISH),
                 });
                 self.auto_apply_intent = None;
+                // The status bar, if it is still up for this build, says so too.
+                self.restate_staged_bar_posture(intent.build);
                 return;
             }
             self.auto_apply_intent = Some(intent);
@@ -5779,9 +5818,22 @@ impl App {
                 // typed classification beside this replaced. The generous schedule
                 // is also the right default for the set: every producer here is a
                 // fact about this process's current state, which is what changes.
+                // WHICH SIDE OF THE SWAP, derived from the live stage rather
+                // than a ticket: this lane fails before any candidate exists, so
+                // there is none. `poll` admitted this intent only against the
+                // stage that exactly matches it, so the stage is this artifact.
+                let activation = self
+                    .native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .is_some_and(|staged| {
+                        staged.build == intent.build && staged.is_installed_activation()
+                    });
                 let schedule = self.spend_physical_failure_budget(
                     intent.build,
                     intent.dmg_sha256,
+                    activation,
                     PhysicalFailureShape::Transient,
                 );
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
@@ -5789,6 +5841,12 @@ impl App {
                     dmg_sha256: intent.dmg_sha256,
                     retry_at: schedule.retry_at(),
                 });
+                // THE BAR MAY NOT OUTLIVE THE PROMISE. An admission refusal is
+                // synchronous, so this arm runs inside the Staged bar's hold with
+                // "applies in place within ~2 min" still on screen — while the
+                // Version-menu row already says the attempt did not start. Same
+                // fact, both surfaces, now.
+                self.restate_staged_bar_posture(intent.build);
                 let wait_secs = |at: std::time::Instant| {
                     at.saturating_duration_since(std::time::Instant::now())
                         .as_secs()
@@ -5847,6 +5905,7 @@ impl App {
                     dmg_sha256: intent.dmg_sha256,
                     retry_at: None,
                 });
+                self.restate_staged_bar_posture(intent.build);
                 aterm_log::warn!(
                     "automatic update policy mismatch; clearing timer and requiring manual retry"
                 );
@@ -6070,7 +6129,7 @@ impl App {
                         // to a process this reducer cannot identify.
                         let message = format!(
                             "Build {build} is already installed on disk; activating it in place \
-                             (a relaunch also picks it up)"
+                             — your shells keep running"
                         );
                         aterm_log::warn!("update sync: {message}");
                     }
@@ -6192,7 +6251,7 @@ impl App {
         // window is long, it is that it lands MID-WORD. So both automatic lanes —
         // including `AutomaticPastGrace`, which by design ignores the quiet epoch
         // below — wait for a plain gap between keystrokes. An explicit
-        // "Install & Relaunch" is the user asking for the pause and is never held.
+        // "Update to Latest Now" is the user asking for the pause and is never held.
         //
         // This refuses; it never admits. It returns above `begin_apply_preflight`,
         // so it mints no ticket, spends no retry budget, and cannot make an apply
@@ -6278,9 +6337,7 @@ impl App {
         {
             Ok(true) => self.native_update_close_preflight(),
             Ok(false) => (
-                ClosePreflight::Blocked(vec![
-                    "Review or discard unsaved native-app work before relaunching".to_string(),
-                ]),
+                ClosePreflight::Blocked(vec![Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()]),
                 None,
             ),
             Err(message) => {
@@ -6423,20 +6480,21 @@ impl App {
         &mut self,
         build: u64,
         dmg_sha256: [u8; 32],
+        activation: bool,
         shape: PhysicalFailureShape,
     ) -> PhysicalFailureSchedule {
         let now = std::time::Instant::now();
         let spent = self
             .auto_apply_physical_retry
             .filter(|retry| {
-                retry.build == build
-                    && retry.dmg_sha256 == dmg_sha256
+                retry.covers(build, dmg_sha256, activation)
                     && now.duration_since(retry.last_attempt) < PHYSICAL_RETRY_BUDGET_REPLENISH
             })
             .map_or(0, |retry| retry.cycles);
         self.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256,
+            activation,
             cycles: spent.saturating_add(1),
             last_attempt: now,
         });
@@ -6551,6 +6609,10 @@ impl App {
     ) -> Option<std::time::Duration> {
         let dmg_sha256 = decode_dmg_sha256(attempt.target_dmg_sha256())?;
         let build = attempt.target_build();
+        // WHICH SIDE OF THE SWAP this attempt is on. A failed candidate leaves
+        // the bundle installed, so the retry for the SAME logical update arrives
+        // as an activation; `covers` folds the two sides into one ladder.
+        let activation = attempt.is_installed_activation();
         let now = std::time::Instant::now();
         let cycles = self
             .auto_overlap_retry
@@ -6558,8 +6620,7 @@ impl App {
                 // REPLENISHING BUDGET: a busy stretch must not permanently
                 // retire an artifact. Once the terminal has gone long enough
                 // without a revoked attempt, start the schedule over.
-                retry.build == build
-                    && retry.dmg_sha256 == dmg_sha256
+                retry.covers(build, dmg_sha256, activation)
                     && now.duration_since(retry.last_attempt)
                         < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
             })
@@ -6568,6 +6629,7 @@ impl App {
         self.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256,
+            activation,
             cycles: cycles.saturating_add(1),
             last_attempt: now,
         });
@@ -6652,11 +6714,15 @@ impl App {
                     retry_at: self.physical_completion_retry_at(
                         attempt.target_build(),
                         dmg_sha256,
+                        attempt.is_installed_activation(),
                         lane,
                     ),
                 });
             }
             self.auto_apply_intent = None;
+            // The Staged bar, if it is still up for this build, stands down with
+            // the lane — not after the next unrelated reconcile.
+            self.restate_staged_bar_posture(attempt.target_build());
             self.publish_native_update_state();
         }
         UpdateOutcome::Failed { message }
@@ -6693,6 +6759,7 @@ impl App {
         &mut self,
         build: u64,
         dmg_sha256: [u8; 32],
+        activation: bool,
         lane: HandoffFailureLane,
     ) -> Option<std::time::Instant> {
         debug_assert!(
@@ -6704,7 +6771,7 @@ impl App {
                 Some(std::time::Instant::now() + crate::ACTIVITY_MANUAL_ONLY_LAPSE)
             }
             HandoffFailureLane::Physical(shape) => self
-                .spend_physical_failure_budget(build, dmg_sha256, shape)
+                .spend_physical_failure_budget(build, dmg_sha256, activation, shape)
                 .retry_at(),
             // UNREACHABLE — both callers return before the latch is stamped for a
             // person's failure, and the debug assert above says so. If a future
@@ -6786,11 +6853,13 @@ impl App {
                         retry_at: self.physical_completion_retry_at(
                             attempt.target_build(),
                             dmg_sha256,
+                            attempt.is_installed_activation(),
                             lane,
                         ),
                     });
                 }
                 self.auto_apply_intent = None;
+                self.restate_staged_bar_posture(attempt.target_build());
                 self.publish_native_update_state();
                 self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::Failed { message })
@@ -6804,9 +6873,7 @@ impl App {
                 self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::InstalledNeedsRelaunch {
                     build,
-                    message: "The update is already on disk; aterm activates it at the next \
-                              quiet moment (a relaunch also picks it up)"
-                        .to_string(),
+                    message: Self::INSTALLED_ACTIVATES_IN_PLACE.to_string(),
                 })
             }
             ReturnedApplyDisposition::Retired => {
@@ -6908,7 +6975,7 @@ impl App {
             ));
         }
         if self.pending_restore.is_some() || !self.seamless_adopt.is_empty() {
-            blockers.push("Wait for session restore to finish before relaunching".to_string());
+            blockers.push(Self::RESTORE_IN_FLIGHT_BLOCKS_APPLY.to_string());
         }
         if blockers.is_empty() {
             (
@@ -6948,9 +7015,7 @@ impl App {
             Ok(true) => {}
             Ok(false) => {
                 return UpdateOutcome::Blocked {
-                    reasons: vec![
-                        "Review or discard unsaved native-app work before relaunching".to_string(),
-                    ],
+                    reasons: vec![Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()],
                 };
             }
             Err(message) => return UpdateOutcome::Failed { message },
@@ -9817,8 +9882,12 @@ mod tests {
         // counter either.
         let mut verdicts = Vec::new();
         for _ in 0..64 {
-            let verdict =
-                app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient);
+            let verdict = app.spend_physical_failure_budget(
+                build,
+                dmg,
+                false,
+                PhysicalFailureShape::Transient,
+            );
             verdicts.push(verdict);
             if verdict == PhysicalFailureSchedule::Converged {
                 break;
@@ -9867,7 +9936,12 @@ mod tests {
         // mint a fourth epoch out of the saturating counter.
         for extra in 0..4 {
             assert_eq!(
-                app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient),
+                app.spend_physical_failure_budget(
+                    build,
+                    dmg,
+                    false,
+                    PhysicalFailureShape::Transient
+                ),
                 PhysicalFailureSchedule::Converged,
                 "late completion {extra} must not resurrect the lane"
             );
@@ -9877,6 +9951,7 @@ mod tests {
             app.spend_physical_failure_budget(
                 build,
                 [0xcd_u8; 32],
+                false,
                 PhysicalFailureShape::Transient
             ),
             PhysicalFailureSchedule::Retry(_)
@@ -10034,15 +10109,15 @@ mod tests {
         let dmg = [0xab_u8; 32];
 
         assert!(matches!(
-            app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient),
+            app.spend_physical_failure_budget(build, dmg, false, PhysicalFailureShape::Transient),
             PhysicalFailureSchedule::Retry(_)
         ));
         assert!(matches!(
-            app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient),
+            app.spend_physical_failure_budget(build, dmg, false, PhysicalFailureShape::Transient),
             PhysicalFailureSchedule::Retry(_)
         ));
         assert_eq!(
-            app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Structural),
+            app.spend_physical_failure_budget(build, dmg, false, PhysicalFailureShape::Structural),
             PhysicalFailureSchedule::Converged,
             "two round trips are already spent on these bytes and the structural \
              budget is {STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS}; a `Retry` here would \
@@ -10065,6 +10140,7 @@ mod tests {
         app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256: [0xab; 32],
+            activation: false,
             cycles: MAX_PHYSICAL_FAILURE_CYCLES,
             last_attempt: std::time::Instant::now(),
         });
@@ -10206,6 +10282,121 @@ mod tests {
     /// latch) and consumes exactly one cycle; the fourth revocation returns
     /// `None` so the completion path falls back to the sticky manual latch.
     /// A different artifact owns a fresh budget by construction.
+    /// THE FLIP THE LADDER USED TO FORGET. A candidate that fails after booting
+    /// has already swapped the installed bundle — the boot apply swaps and
+    /// re-execs BEFORE it can prove readiness — so the retry for the SAME
+    /// logical update arrives as an installed-bundle ACTIVATION, whose digest is
+    /// a different 32 bytes. Keyed on the bytes, the ladder read `cycles == 0`
+    /// and started over: the reported "retry in 2s", twice.
+    ///
+    /// The budget must count attempts at the LOGICAL update, so the schedule
+    /// continues across the flip and still converges in
+    /// `MAX_ACTIVITY_REVOKED_CYCLES` attempts total.
+    #[test]
+    fn the_activation_of_a_failed_download_continues_its_ladder_instead_of_refilling_it() {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        let mut app = App::headless_for_test();
+        let download = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            77,
+            COMMIT,
+            &"ab".repeat(32),
+        );
+        let activation = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            77,
+            COMMIT,
+            &crate::native_updater_service::installed_activation_digest(77, COMMIT),
+        );
+        assert!(
+            activation.is_installed_activation() && !download.is_installed_activation(),
+            "the fixture must actually straddle the swap"
+        );
+
+        assert_eq!(
+            app.arm_activity_revoked_overlap_retry(&download),
+            Some(std::time::Duration::from_secs(2)),
+            "rung 1, as a download"
+        );
+        assert_eq!(
+            app.arm_activity_revoked_overlap_retry(&download),
+            Some(std::time::Duration::from_secs(8)),
+            "rung 2, still a download"
+        );
+
+        // The candidate swapped the bundle before it failed. Same update, new
+        // artifact identity — the ladder CONTINUES.
+        assert_eq!(
+            app.arm_activity_revoked_overlap_retry(&activation),
+            Some(std::time::Duration::from_secs(30)),
+            "rung 3 across the flip — not a refilled `2s`"
+        );
+
+        for (cycle, want) in [
+            Some(std::time::Duration::from_secs(60)),
+            Some(std::time::Duration::from_secs(120)),
+            Some(std::time::Duration::from_secs(300)),
+            Some(std::time::Duration::from_secs(600)),
+            Some(std::time::Duration::from_secs(900)),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                app.arm_activity_revoked_overlap_retry(&activation),
+                want,
+                "post-flip cycle {cycle}"
+            );
+        }
+        // The latch itself is the CALLER's move once this returns `None` (see
+        // this function's doc); what is pinned here is that the budget is spent
+        // in `MAX_ACTIVITY_REVOKED_CYCLES` attempts counted ACROSS the flip.
+        assert_eq!(
+            app.auto_overlap_retry.map(|retry| retry.cycles),
+            Some(MAX_ACTIVITY_REVOKED_CYCLES),
+            "eight attempts total, not eight per artifact identity"
+        );
+        assert!(
+            app.auto_overlap_retry.is_some_and(|retry| retry.activation),
+            "and the record now names the side of the swap it was last spent on"
+        );
+    }
+
+    /// The physical ladder carries the same key and the same flip.
+    #[test]
+    fn a_physical_failure_ladder_survives_the_download_to_activation_flip() {
+        let mut app = App::headless_for_test();
+        let build = 77;
+        let dmg = [0xab_u8; 32];
+        let activation_dmg = [0xcd_u8; 32];
+
+        for cycle in 0..PHYSICAL_FAILURES_PER_EPOCH {
+            let _ = app.spend_physical_failure_budget(
+                build,
+                dmg,
+                false,
+                PhysicalFailureShape::Transient,
+            );
+            assert_eq!(
+                app.auto_apply_physical_retry.map(|r| r.cycles),
+                Some(cycle + 1),
+                "download cycle {cycle}"
+            );
+        }
+
+        // Same logical update, now an activation: the count CONTINUES.
+        let _ = app.spend_physical_failure_budget(
+            build,
+            activation_dmg,
+            true,
+            PhysicalFailureShape::Transient,
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|r| r.cycles),
+            Some(PHYSICAL_FAILURES_PER_EPOCH + 1),
+            "the flip must not refill the lifetime counter"
+        );
+    }
+
     #[test]
     fn overlap_retry_budget_rearms_intent_per_artifact_and_exhausts_to_manual_only() {
         let mut app = App::headless_for_test();
@@ -10294,6 +10485,7 @@ mod tests {
         app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256: [0xab; 32],
+            activation: false,
             cycles: MAX_ACTIVITY_REVOKED_CYCLES,
             last_attempt: std::time::Instant::now(),
         });
@@ -10507,7 +10699,7 @@ mod tests {
     /// works in the terminal tab. Returns the settings instance/view.
     ///
     /// THIS BLOCKER IS CHOSEN OVER `pending_restore` ON PURPOSE, and the choice is
-    /// the whole point of the test that uses it. Both stop an update relaunch, but
+    /// the whole point of the test that uses it. Both stop an update apply, but
     /// they are discovered in different places:
     ///   * `pending_restore` is found by `native_update_close_preflight`, a pure
     ///     counting function with NO user interface whatsoever;
@@ -10883,11 +11075,11 @@ mod tests {
         let UpdateOutcome::Blocked { reasons } =
             app.apply_native_update(ApplyMode::AutomaticPastGrace)
         else {
-            panic!("an unsaved Settings draft blocks an update relaunch");
+            panic!("an unsaved Settings draft blocks an update apply");
         };
         assert_eq!(
             reasons,
-            vec!["Review or discard unsaved native-app work before relaunching".to_string()],
+            vec![App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()],
             "the block came from the native close barrier — the one that surfaces \
              recovery — and not from a later, UI-less blocker"
         );
@@ -11310,6 +11502,10 @@ mod tests {
             "…and says what happens next — activation, not a manual relaunch, got {outcome:?}"
         );
         assert!(
+            !outcome.to_lowercase().contains("relaunch"),
+            "…and never asks for one: {outcome:?}"
+        );
+        assert!(
             app.auto_apply_intent
                 .is_some_and(|intent| intent.build == build
                     && intent.dmg_sha256 == decode_dmg_sha256(&staged.dmg_sha256).unwrap()),
@@ -11561,6 +11757,209 @@ mod tests {
     /// flattening would put a genuine invariant failure into an endless retry
     /// loop, so the distinction is kept TYPED all the way to the outcome.
     ///
+    /// THE BAR MAY NOT OUTLIVE THE PROMISE.
+    ///
+    /// The `Staged` report paints the posture from policy, BEFORE the stage is
+    /// reconciled and armed; an admission refusal on the first automatic attempt
+    /// is synchronous and lands well inside that bar's 8 s hold. Until
+    /// 2026-08-30 the `Failed` arm latched manual-only and restated nothing, so a
+    /// bar that promised "applies in place within ~2 min" kept promising it while
+    /// the Version-menu row already said "tried once, didn't start" — two
+    /// surfaces, two answers — and when the bar folded, the ledger kept the false
+    /// sentence. Driven through the real lane: a headless `App` has no seamless
+    /// lane, so the physical gate refuses ("Update kept N … session(s)
+    /// running…") and the poll takes exactly the arm that was silent.
+    ///
+    /// AND THE BAR AGREES WITH THE GATE BEFORE THE ATTEMPT. The gate's
+    /// `seamless_capable` and the bar's posture read ONE predicate
+    /// (`App::seamless_handoff_unavailable`), so the line the `Staged` report
+    /// paints here is already the handoff-off warning — until 2026-08-30 the
+    /// posture folded only the `$ATERM_NO_SEAMLESS_UPDATE` opt-out, and a
+    /// `--control-sock` or `--headless` process painted the automatic promise
+    /// over an apply the gate refused with any terminal open. The promise a
+    /// WINDOWED app paints is modelled onto the bar by hand so the restatement is
+    /// observable as a change of words.
+    #[test]
+    fn a_stand_down_restates_the_staged_bar_while_it_is_still_up() {
+        use crate::app_update_handoff::HandoffUnavailable;
+        use crate::status_bars::{ApplyPosture, staged_detail};
+        use crate::update_apply_trouble::ApplyRetry;
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        assert!(
+            app.pool.iter().count() > 0,
+            "PRECONDITION AND A SAFETY RAIL: with an empty session pool the \
+             admission classifier admits the destructive COLD lane and the \
+             authorized apply below would `exec()` the test binary"
+        );
+        assert!(
+            !crate::app_update_handoff::seamless_handoff_opted_out()
+                && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
+            "PRECONDITION: the reason the lane is unavailable must be the App's own shape"
+        );
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let staged = aterm_update::Progress::Staged {
+            version: format!("1.0.{build}"),
+            build,
+        };
+        let bar_detail = |app: &App| {
+            app.status_bars
+                .bars()
+                .next()
+                .expect("the Staged bar is still up")
+                .1
+                .text
+                .detail
+                .clone()
+        };
+        // The gate and the bar read one predicate: headless, so no seamless lane.
+        let why = app
+            .seamless_handoff_unavailable()
+            .expect("a headless App has no seamless lane");
+        assert_eq!(why, HandoffUnavailable::Headless);
+        let unavailable = ApplyPosture::HandoffDisabled { why, veto: None };
+        // The report lands first, from the check thread, and paints the posture —
+        // already the warning, because the lane is not there…
+        app.note_update_progress(&staged);
+        assert_eq!(bar_detail(&app), staged_detail(build, unavailable));
+        assert!(
+            !bar_detail(&app).contains("~2 min") && !bar_detail(&app).contains("Version menu"),
+            "{}",
+            bar_detail(&app)
+        );
+        // …then the stage is reconciled and armed (the arm reads policy, not the
+        // lane: the cold lane is a real automatic path once every PTY is gone).
+        stage_one_build_for_test(&mut app, build);
+        assert_eq!(bar_detail(&app), staged_detail(build, unavailable));
+        // Model the bar a WINDOWED app paints — the automatic promise.
+        app.status_bars.update_progress(
+            &staged,
+            Some(ApplyPosture::Automatic),
+            std::time::Instant::now(),
+        );
+        assert!(bar_detail(&app).contains("~2 min"));
+
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "the refused attempt retires the intent"
+        );
+        let latched = app
+            .auto_apply_manual_only
+            .expect("a refused physical handoff latches manual-only");
+        assert_eq!(latched.build, build);
+        let refusal = app
+            .native_updater_service
+            .snapshot()
+            .error
+            .clone()
+            .expect("a returned physical failure records why it stopped");
+        assert!(
+            refusal.starts_with("Update kept"),
+            "the attempt must reach the physical admission gate, got {refusal:?}"
+        );
+        // The refusal is the gate acting on the predicate the bar already named;
+        // this build's latch does not outrank a lane that cannot run.
+        let posture = app.apply_posture_for(build);
+        assert_eq!(posture, unavailable);
+        let detail = bar_detail(&app);
+        assert_eq!(
+            detail,
+            staged_detail(build, posture),
+            "the live bar carries the posture the App computes now"
+        );
+        assert!(
+            detail.contains("will NOT apply while any terminal is open")
+                && !detail.contains("~2 min")
+                && !detail.contains("Version menu"),
+            "{detail}"
+        );
+        // …and the Version-menu row states the lane's own fact.
+        assert_eq!(
+            app.apply_retry_for(Some(build)),
+            if latched.retry_at.is_some() {
+                ApplyRetry::Scheduled
+            } else {
+                ApplyRetry::ManualOnly
+            }
+        );
+    }
+
+    /// The same law at the reaped-abort completion: a handoff worker that killed
+    /// and reaped its child latches manual-only on the physical budget, and the
+    /// Staged bar — if it is still up for that build — says so at once rather
+    /// than after the next unrelated reconcile.
+    #[test]
+    fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
+        use crate::status_bars::{ApplyPosture, staged_detail};
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let staged = aterm_update::Progress::Staged {
+            version: format!("1.0.{build}"),
+            build,
+        };
+        app.note_update_progress(&staged);
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"ab".repeat(32),
+        );
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        let bar_detail = |app: &App| {
+            app.status_bars
+                .bars()
+                .next()
+                .expect("the Staged bar is still up")
+                .1
+                .text
+                .detail
+                .clone()
+        };
+        // A headless App has no seamless lane, and the report painted that fact
+        // (the posture reads the gate's own predicate). Model the promise a
+        // WINDOWED app paints so the restatement below is a change of words.
+        let unavailable = ApplyPosture::HandoffDisabled {
+            why: app
+                .seamless_handoff_unavailable()
+                .expect("a headless App has no seamless lane"),
+            veto: None,
+        };
+        assert_eq!(bar_detail(&app), staged_detail(build, unavailable));
+        app.status_bars.update_progress(
+            &staged,
+            Some(ApplyPosture::Automatic),
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            bar_detail(&app),
+            staged_detail(build, ApplyPosture::Automatic)
+        );
+
+        app.abort_reaped_native_apply_before_reconcile(
+            &ticket,
+            "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        );
+
+        let latched = app
+            .auto_apply_manual_only
+            .expect("a returned physical failure latches manual-only");
+        assert_eq!(latched.build, build);
+        let posture = app.apply_posture_for(build);
+        assert_eq!(
+            posture, unavailable,
+            "this build's latch does not outrank a lane that cannot run"
+        );
+        let detail = bar_detail(&app);
+        assert_eq!(detail, staged_detail(build, posture));
+        assert!(
+            !detail.contains("~2 min") && !detail.contains("Version menu"),
+            "{detail}"
+        );
+    }
+
     /// Driven through the real lane with a real broken reducer: a Settings view
     /// whose instance has been removed from the runtime under it, which is exactly
     /// the `RuntimeError::UnknownInstance` shape `prepare_close` reports.
@@ -11639,6 +12038,7 @@ mod tests {
         app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build: 77,
             dmg_sha256: [0xab; 32],
+            activation: false,
             cycles: MAX_ACTIVITY_REVOKED_CYCLES,
             last_attempt: std::time::Instant::now(),
         });
@@ -11650,6 +12050,7 @@ mod tests {
         app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build: 77,
             dmg_sha256: [0xab; 32],
+            activation: false,
             cycles: MAX_ACTIVITY_REVOKED_CYCLES,
             last_attempt: std::time::Instant::now()
                 - crate::ACTIVITY_RETRY_BUDGET_REPLENISH

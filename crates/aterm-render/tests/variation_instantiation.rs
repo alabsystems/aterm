@@ -462,8 +462,8 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
 #[cfg(target_os = "macos")]
 #[test]
 fn sf_mono_ct_raster_ink_tracks_the_instance() {
-    if std::env::var_os("ATERM_RASTERIZER").is_some_and(|v| v == "fontdue") {
-        eprintln!("SKIP: fontdue rasterizer forced (no variation support there by design)");
+    if std::env::var_os("ATERM_RASTERIZER").is_some_and(|v| v == "portable" || v == "fontdue") {
+        eprintln!("SKIP: portable rasterizer forced (no variation instancing there by design)");
         return;
     }
     let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") else {

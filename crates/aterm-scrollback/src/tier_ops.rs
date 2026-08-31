@@ -322,6 +322,14 @@ impl Scrollback {
             return;
         }
 
+        // THE IMAGE RETENTION HORIZON. Compression is where a line's inline
+        // picture stops existing (the wire format has no image section — see
+        // `Line::serialize`), so this is the one place in the crate that can
+        // report the loss, and it reports it BEFORE the lines are consumed.
+        self.image_rows_dropped_by_compression = self
+            .image_rows_dropped_by_compression
+            .saturating_add(crate::count_image_rows(&lines));
+
         // Compress and add to warm tier
         self.warm.push_block(&lines);
 

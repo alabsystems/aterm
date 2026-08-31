@@ -23,11 +23,13 @@ use crate::app_config::{TitleSummaryProvider, TitleSummaryProxyMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 
 const TOKEN_FILE_MAX: u64 = 16 * 1024;
 const WORKER_REAP_INTERVAL: Duration = Duration::from_millis(250);
+/// Maximum age of a cached operating-system trust snapshot.
+pub(super) const PLATFORM_TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub(super) fn endpoint_is_loopback(endpoint: &str) -> bool {
     endpoint_authority(endpoint).is_some_and(|(_, host, _)| host_is_loopback(host))
@@ -71,6 +73,176 @@ fn effective_settings_transport(
         settings.proxy_mode,
         settings.ca_file.as_deref(),
     )
+}
+
+/// Everything that affects an unmanaged HTTP client's reusable transport
+/// configuration. Endpoint, bearer token, request guard, and proxy environment
+/// are deliberately absent: there is no connection pool, tokens/guards belong
+/// to one request, and `aterm-http` resolves environment proxies on every send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnmanagedClientIdentity {
+    trust: Arc<aterm_http::Trust>,
+    proxy_mode: aterm_http::ProxyMode,
+    timeout: Duration,
+}
+
+impl UnmanagedClientIdentity {
+    fn client(&self) -> aterm_http::Client {
+        aterm_http::Client::with_shared_trust(
+            Arc::clone(&self.trust),
+            self.proxy_mode,
+            self.timeout,
+        )
+    }
+
+    fn uses_platform_trust(&self) -> bool {
+        matches!(self.trust.as_ref(), aterm_http::Trust::PlatformVerifier)
+    }
+}
+
+fn unmanaged_client_identity(
+    settings: &ProviderSettings,
+    effective_endpoint: &str,
+) -> Result<UnmanagedClientIdentity, String> {
+    let transport = effective_settings_transport(settings, effective_endpoint);
+    // Re-read configured CA bytes through the hardened loader for EVERY job.
+    // Equality is therefore over the actual DER, never just a path whose
+    // contents may have changed since the previous summary.
+    let trust = if let Some(path) = transport.ca_file.as_deref() {
+        Arc::new(aterm_http::Trust::Roots(load_ca_bundle(path)?))
+    } else {
+        Arc::new(aterm_http::Trust::PlatformVerifier)
+    };
+    let proxy_mode = match transport.proxy_mode {
+        TitleSummaryProxyMode::Direct => aterm_http::ProxyMode::Direct,
+        TitleSummaryProxyMode::Environment => aterm_http::ProxyMode::Environment,
+    };
+    Ok(UnmanagedClientIdentity {
+        trust,
+        proxy_mode,
+        timeout: settings.timeout,
+    })
+}
+
+struct CachedUnmanagedClient {
+    identity: UnmanagedClientIdentity,
+    client: aterm_http::Client,
+    built_at: Instant,
+}
+
+/// The single worker's one reusable default-connector client. Managed-process
+/// connectors carry a live attested identity and are always built and dropped
+/// per request; entering that arm clears this cache so an A→managed→A sequence
+/// cannot retain an older platform-trust snapshot across the authority change.
+/// Platform trust is also refreshed on a monotonic deadline so a long-lived
+/// worker adopts system-root changes; explicit DER roots remain identity-cached.
+#[derive(Default)]
+pub(super) struct WorkerClientCache {
+    unmanaged: Option<CachedUnmanagedClient>,
+    #[cfg(test)]
+    unmanaged_builds: usize,
+    #[cfg(test)]
+    managed_builds: usize,
+}
+
+pub(super) enum WorkerClient<'a> {
+    Shared(&'a aterm_http::Client),
+    OneShot(aterm_http::Client),
+}
+
+impl std::ops::Deref for WorkerClient<'_> {
+    type Target = aterm_http::Client;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(client) => client,
+            Self::OneShot(client) => client,
+        }
+    }
+}
+
+impl WorkerClientCache {
+    pub(super) fn for_request(
+        &mut self,
+        settings: &ProviderSettings,
+        effective_endpoint: &str,
+        managed_process: Option<ManagedProcessIdentity>,
+        write_authority: RequestWriteAuthority,
+    ) -> Result<WorkerClient<'_>, String> {
+        self.for_request_at(
+            settings,
+            effective_endpoint,
+            managed_process,
+            write_authority,
+            Instant::now(),
+        )
+    }
+
+    pub(super) fn for_request_at(
+        &mut self,
+        settings: &ProviderSettings,
+        effective_endpoint: &str,
+        managed_process: Option<ManagedProcessIdentity>,
+        write_authority: RequestWriteAuthority,
+        now: Instant,
+    ) -> Result<WorkerClient<'_>, String> {
+        if managed_process.is_some() {
+            self.unmanaged = None;
+            #[cfg(test)]
+            {
+                self.managed_builds += 1;
+            }
+            return build_client(
+                settings,
+                effective_endpoint,
+                managed_process,
+                write_authority,
+            )
+            .map(WorkerClient::OneShot);
+        }
+
+        let identity = match unmanaged_client_identity(settings, effective_endpoint) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.unmanaged = None;
+                return Err(error);
+            }
+        };
+        if self.unmanaged.as_ref().is_none_or(|cached| {
+            cached.identity != identity
+                || (cached.identity.uses_platform_trust()
+                    && now.saturating_duration_since(cached.built_at)
+                        >= PLATFORM_TRUST_REFRESH_INTERVAL)
+        }) {
+            let client = identity.client();
+            self.unmanaged = Some(CachedUnmanagedClient {
+                identity,
+                client,
+                built_at: now,
+            });
+            #[cfg(test)]
+            {
+                self.unmanaged_builds += 1;
+            }
+        }
+        Ok(WorkerClient::Shared(
+            &self
+                .unmanaged
+                .as_ref()
+                .expect("unmanaged client inserted above")
+                .client,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_counts(&self) -> (usize, usize) {
+        (self.unmanaged_builds, self.managed_builds)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_unmanaged(&self) -> bool {
+        self.unmanaged.is_some()
+    }
 }
 
 pub(super) fn request_body(
@@ -135,21 +307,7 @@ pub(super) fn build_client(
     managed_process: Option<ManagedProcessIdentity>,
     write_authority: RequestWriteAuthority,
 ) -> Result<aterm_http::Client, String> {
-    let transport = effective_settings_transport(settings, effective_endpoint);
-    // A configured bundle is an explicit trust override for this ONE provider,
-    // never process-global state and never inline certificate contents. Absent
-    // one, the OPERATING SYSTEM's trust store verifies the peer — the same
-    // model the retired client's `platform-verifier` feature selected.
-    let trust = if let Some(path) = transport.ca_file.as_deref() {
-        aterm_http::Trust::Roots(load_ca_bundle(path)?)
-    } else {
-        aterm_http::Trust::PlatformVerifier
-    };
-    let proxy_mode = match transport.proxy_mode {
-        TitleSummaryProxyMode::Direct => aterm_http::ProxyMode::Direct,
-        TitleSummaryProxyMode::Environment => aterm_http::ProxyMode::Environment,
-    };
-    let client = aterm_http::Client::new(trust, proxy_mode, settings.timeout);
+    let client = unmanaged_client_identity(settings, effective_endpoint)?.client();
     let _ = write_authority;
     if let Some(process) = managed_process {
         #[cfg(target_os = "macos")]
@@ -318,6 +476,7 @@ pub(super) fn worker_loop(
     ollama_controller: ManagedOllamaController,
 ) {
     let mut ollama = ManagedOllama::new(ollama_controller);
+    let mut clients = WorkerClientCache::default();
     loop {
         let job = match requests.recv_timeout(WORKER_REAP_INTERVAL) {
             Ok(job) => job,
@@ -344,7 +503,7 @@ pub(super) fn worker_loop(
         // Consent and session lifetime are checked before every file/process/network
         // boundary and once more before the completion enters the publication lane.
         let mut result = if job_is_authorized(&job, &authority_epoch) {
-            request_summary(&job, &authority_epoch, &mut ollama).map(|outcome| {
+            request_summary(&job, &authority_epoch, &mut ollama, &mut clients).map(|outcome| {
                 locality = outcome.locality;
                 effective_endpoint = Some(outcome.effective_endpoint);
                 managed_install_present = outcome.managed_install_present;
@@ -412,6 +571,7 @@ pub(super) fn request_summary(
     job: &Job,
     authority_epoch: &Arc<AtomicU64>,
     ollama: &mut ManagedOllama,
+    clients: &mut WorkerClientCache,
 ) -> Result<RequestOutcome, String> {
     let settings = &job.settings;
     let snapshot = &job.snapshot;
@@ -449,7 +609,7 @@ pub(super) fn request_summary(
     let _runtime_attestation = runtime_attestation;
     let owned_managed = managed_process.is_some();
     let authority = RequestWriteAuthority::for_job(job, authority_epoch.clone());
-    let client = match build_client(
+    let client = match clients.for_request(
         settings,
         &effective_endpoint,
         managed_process,

@@ -1573,6 +1573,181 @@ fn resolve_path(
 /// sweep; 2 s is generous for a main-thread `sessions` answer.
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// One monotonic wall-clock budget for every socket phase of a discovery probe.
+/// Socket timeouts are refreshed from the REMAINING budget before each actual
+/// read/write, so a peer that makes partial progress cannot restart the clock.
+#[derive(Clone, Copy)]
+struct ProbeDeadline {
+    started: std::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl ProbeDeadline {
+    fn after(budget: std::time::Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            budget,
+        }
+    }
+
+    fn remaining(self) -> io::Result<std::time::Duration> {
+        self.budget
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(probe_timeout_error)
+    }
+}
+
+fn probe_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "control-socket discovery exceeded its socket-I/O deadline",
+    )
+}
+
+/// A read/write view that re-arms the underlying socket from ONE absolute
+/// deadline before every syscall. `BufReader::read_until` may perform many reads
+/// for a trickling line; each one therefore sees less time than the previous one.
+struct ProbeIo<'a> {
+    stream: &'a CtlStream,
+    deadline: ProbeDeadline,
+}
+
+impl Read for ProbeIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream
+            .set_read_timeout(Some(self.deadline.remaining()?))?;
+        Read::read(&mut self.stream, buf)
+    }
+}
+
+impl Write for ProbeIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream
+            .set_write_timeout(Some(self.deadline.remaining()?))?;
+        Write::write(&mut self.stream, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream
+            .set_write_timeout(Some(self.deadline.remaining()?))?;
+        Write::flush(&mut self.stream)
+    }
+}
+
+struct ProbeConnectJob {
+    path: String,
+    reply: std::sync::mpsc::SyncSender<io::Result<CtlStream>>,
+}
+
+/// The blocking `CtlStream::connect` surface has no portable timeout. Run it on
+/// ONE lazy worker and wait on its reply only for the caller's remaining budget.
+/// `busy` is claimed with a non-blocking CAS before submission, so a kernel-stuck
+/// connect strands at most this one bounded worker: later probes fail closed as
+/// timeouts instead of blocking behind it or spawning another thread. A result
+/// arriving after its caller timed out is sent to a dropped channel and the
+/// returned stream is closed normally.
+struct ProbeConnector {
+    sender: Option<std::sync::mpsc::SyncSender<ProbeConnectJob>>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProbeConnector {
+    fn spawn<F>(connect: F) -> io::Result<Self>
+    where
+        F: Fn(&str) -> io::Result<CtlStream> + Send + 'static,
+    {
+        // `busy` admits at most one request, and the channel encodes that same
+        // bound instead of relying on an unbounded type for a one-job protocol.
+        let (sender, requests) = std::sync::mpsc::sync_channel::<ProbeConnectJob>(1);
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_busy = std::sync::Arc::clone(&busy);
+        let worker = std::thread::Builder::new()
+            .name("aterm-ctl-probe-connect".to_owned())
+            .spawn(move || {
+                while let Ok(job) = requests.recv() {
+                    let result = connect(&job.path);
+                    worker_busy.store(false, std::sync::atomic::Ordering::Release);
+                    let _ = job.reply.send(result);
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            busy,
+            worker: Some(worker),
+        })
+    }
+
+    fn connect(&self, path: &str, deadline: ProbeDeadline) -> io::Result<CtlStream> {
+        let _ = deadline.remaining()?;
+        if self
+            .busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(probe_timeout_error());
+        }
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let Some(sender) = self.sender.as_ref() else {
+            self.busy.store(false, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "control-socket connector is unavailable",
+            ));
+        };
+        if sender
+            .send(ProbeConnectJob {
+                path: path.to_owned(),
+                reply,
+            })
+            .is_err()
+        {
+            self.busy.store(false, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "control-socket connector stopped",
+            ));
+        }
+        match result.recv_timeout(deadline.remaining()?) {
+            Ok(result) => {
+                let _ = deadline.remaining()?;
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(probe_timeout_error()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "control-socket connector stopped",
+            )),
+        }
+    }
+}
+
+impl Drop for ProbeConnector {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn shared_probe_connector() -> io::Result<&'static ProbeConnector> {
+    static CONNECTOR: std::sync::OnceLock<Result<ProbeConnector, String>> =
+        std::sync::OnceLock::new();
+    match CONNECTOR.get_or_init(|| {
+        ProbeConnector::spawn(|path| CtlStream::connect(path)).map_err(|error| error.to_string())
+    }) {
+        Ok(connector) => Ok(connector),
+        Err(error) => Err(io::Error::other(error.clone())),
+    }
+}
+
 /// One socket's answer to the discovery probe, with every failure class KEPT
 /// DISTINCT. `ls`/`instances` used to fold all of them into `None` and then,
 /// with zero survivors, print the fleet-wide claim "no live aterm instances
@@ -1600,7 +1775,9 @@ enum Probe {
     /// A token WAS sent and the server still answered `ERR auth`: the file on
     /// disk is not the token the server holds (a restarted instance rewrote it).
     AuthRejected,
-    /// The [`PROBE_DEADLINE`] fired on a read or a write.
+    /// The shared [`PROBE_DEADLINE`] fired during connect, AUTH/request write,
+    /// or response read. The small regular token file is byte-bounded but, like
+    /// ordinary local filesystem I/O, is not claimed interruptible by `std`.
     Timeout,
     /// Anything else, with the raw cause: a socket file that vanished between
     /// readdir and dial, a non-auth `ERR`, a malformed header, a connection
@@ -1613,41 +1790,73 @@ enum Probe {
 /// return them as [`Probe::Answered`] — or the CLASSIFIED failure, never a
 /// bare `None`. `pid` is the instance pid the socket names (`0` = unknown),
 /// consulted only to label a refused connect as stale-or-booting. Lines are
-/// read through [`read_bounded_line`]: the deadline alone cannot stop a peer
-/// that STREAMS newline-less bytes (each read succeeds, so the clock keeps
-/// resetting), so the accumulation cap is what bounds memory.
+/// read through [`read_bounded_line`] over [`ProbeIo`]: the line-size cap bounds
+/// memory, while `ProbeIo`'s shrinking per-read timeout makes
+/// [`PROBE_DEADLINE`] a total SOCKET wall-clock bound even for a byte-trickling
+/// peer. The separately hardened token-file read does not consume that budget.
 fn probe_lines(path: &str, verb: &str, pid: u32) -> Probe {
-    let stream = match CtlStream::connect(path) {
+    probe_lines_with_deadline(path, verb, pid, PROBE_DEADLINE)
+}
+
+fn probe_read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    deadline: ProbeDeadline,
+) -> io::Result<usize> {
+    let _ = deadline.remaining()?;
+    let read = read_bounded_line(reader, line)?;
+    let _ = deadline.remaining()?;
+    Ok(read)
+}
+
+fn probe_lines_with_deadline(
+    path: &str,
+    verb: &str,
+    pid: u32,
+    budget: std::time::Duration,
+) -> Probe {
+    let connect_deadline = ProbeDeadline::after(budget);
+    let connector = match shared_probe_connector() {
+        Ok(connector) => connector,
+        Err(error) => return classify_connect_error(error, pid),
+    };
+    let stream = match connector.connect(path, connect_deadline) {
         Ok(stream) => stream,
         Err(e) => return classify_connect_error(e, pid),
     };
-    if let Err(e) = stream
-        .set_read_timeout(Some(PROBE_DEADLINE))
-        .and_then(|()| stream.set_write_timeout(Some(PROBE_DEADLINE)))
-    {
-        return Probe::Other(e);
-    }
+    let remaining_socket_budget = match connect_deadline.remaining() {
+        Ok(remaining) => remaining,
+        Err(error) => return io_probe(error),
+    };
     // An unreadable token is not fatal YET: the request still goes out without
     // an `AUTH` line, and only the server's `ERR auth` proves the miss mattered
     // (an instance that answers anyway is simply answered).
-    let token_miss = match read_token_at(path) {
-        Ok(token) => {
-            if let Err(e) = (&stream).write_all(format!("AUTH {token}\n").as_bytes()) {
-                return io_probe(e);
-            }
-            None
-        }
-        Err((token_path, e)) => Some(Probe::NoToken(token_path, e)),
+    let (token, token_miss) = match read_token_at(path) {
+        Ok(token) => (Some(token), None),
+        Err((token_path, error)) => (None, Some(Probe::NoToken(token_path, error))),
     };
-    if let Err(e) = (&stream)
-        .write_all(format!("{verb}\n").as_bytes())
-        .and_then(|()| (&stream).flush())
+    let deadline = ProbeDeadline::after(remaining_socket_budget);
+    let mut io = ProbeIo {
+        stream: &stream,
+        deadline,
+    };
+    if let Some(token) = token
+        && let Err(e) = io.write_all(format!("AUTH {token}\n").as_bytes())
     {
         return io_probe(e);
     }
-    let mut reader = BufReader::new(&stream);
+    if let Err(error) = deadline.remaining() {
+        return io_probe(error);
+    }
+    if let Err(e) = io
+        .write_all(format!("{verb}\n").as_bytes())
+        .and_then(|()| io.flush())
+    {
+        return io_probe(e);
+    }
+    let mut reader = BufReader::new(io);
     let mut status = String::new();
-    match read_bounded_line(&mut reader, &mut status) {
+    match probe_read_bounded_line(&mut reader, &mut status, deadline) {
         Err(e) => return io_probe(e),
         Ok(0) => {
             return Probe::Other(io::Error::new(
@@ -1673,9 +1882,14 @@ fn probe_lines(path: &str, verb: &str, pid: u32) -> Probe {
     let mut lines = Vec::with_capacity(count);
     for _ in 0..count {
         let mut line = String::new();
-        match read_bounded_line(&mut reader, &mut line) {
+        match probe_read_bounded_line(&mut reader, &mut line, deadline) {
             Err(e) => return io_probe(e),
-            Ok(0) => break,
+            Ok(0) => {
+                return Probe::Other(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the server closed before the complete discovery response",
+                ));
+            }
             Ok(_) => lines.push(line.trim_end_matches(['\r', '\n']).to_string()),
         }
     }
@@ -2563,6 +2777,127 @@ fn read_token_for(path: &str) -> Option<String> {
     read_token_at(path).ok()
 }
 
+/// A launch token is 64 hex bytes plus optional surrounding whitespace. Keep a
+/// little compatibility room while placing a hard ceiling on authentication
+/// file memory, even if a same-user process replaces it concurrently.
+const MAX_CONTROL_TOKEN_FILE_BYTES: u64 = 256;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0002_0000 | 0x0000_0800; // O_NOFOLLOW | O_NONBLOCK
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_0100 | 0x0000_0004; // O_NOFOLLOW | O_NONBLOCK
+
+/// Open only the regular file itself on the shipped Unix targets. `O_NONBLOCK`
+/// makes a planted FIFO/device immediately inspectable, and `O_NOFOLLOW`
+/// rejects a planted symlink at the final component; descriptor metadata then
+/// rejects every non-regular kind before a read.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(TOKEN_FILE_OPEN_FLAGS)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Conservative fallback for platforms without the audited open-flag values.
+/// The pre-open kind check prevents ordinary special-file mistakes; the
+/// descriptor check detects replacement before any bytes are accepted.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token path is not a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token path changed away from a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Read a control capability token without following a final symlink or ever
+/// allocating beyond the token-file bound.
+///
+/// # Errors
+///
+/// Returns an error for missing, non-regular, symlinked, oversized, or non-UTF-8
+/// files. On the shipped Unix targets the open is also nonblocking, so a planted
+/// FIFO/device is rejected before it can park the caller.
+pub fn read_control_token_file(path: &Path) -> io::Result<String> {
+    let file = open_regular_token_file(path)?;
+    if file.metadata()?.len() > MAX_CONTROL_TOKEN_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file exceeds the 256-byte bound",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(MAX_CONTROL_TOKEN_FILE_BYTES as usize);
+    file.take(MAX_CONTROL_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONTROL_TOKEN_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file exceeds the 256-byte bound",
+        ));
+    }
+    let raw = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "token file is not UTF-8"))?;
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file is empty",
+        ));
+    }
+    if token.contains(['\r', '\n']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file contains an embedded line terminator",
+        ));
+    }
+    Ok(token.to_string())
+}
+
 /// [`read_token_for`] with the miss KEPT: which file was looked for, and why
 /// it could not be read (absent, another user's 0600, empty). Discovery
 /// reports that per socket instead of letting the server's bare `ERR auth`
@@ -2592,26 +2927,22 @@ fn read_token_at(path: &str) -> Result<String, (PathBuf, io::Error)> {
     let mut miss: Option<(PathBuf, io::Error)> = None;
     for name in names {
         let token_path = dir.join(name);
-        let raw = match std::fs::read_to_string(&token_path) {
-            Ok(raw) => raw,
+        match read_control_token_file(&token_path) {
+            Ok(token) => return Ok(token),
             Err(e) => {
+                // A malformed/non-regular file EXISTS for this socket. Do not
+                // reach past it for a directory-shared legacy credential.
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+                ) {
+                    return Err((token_path, e));
+                }
                 // Keep the FIRST (per-socket) miss: it is the file this build
                 // wants, and the one whose absence a report should name.
                 miss.get_or_insert((token_path, e));
-                continue;
             }
-        };
-        let t = raw.trim().to_string();
-        return if t.is_empty() {
-            Err(miss.unwrap_or_else(|| {
-                (
-                    token_path,
-                    io::Error::new(io::ErrorKind::InvalidData, "token file is empty"),
-                )
-            }))
-        } else {
-            Ok(t)
-        };
+        }
     }
     Err(miss.unwrap_or_else(|| {
         (
@@ -4055,6 +4386,9 @@ fn subscribe_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    static PROBE_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn operator_proposal_limit_matches_the_server_protocol_bound() {
@@ -5876,6 +6210,67 @@ mod tests {
         ));
     }
 
+    /// A connect attempt that never returns consumes ONE worker only. The first
+    /// caller leaves at its own deadline; later callers cannot enqueue behind the
+    /// stuck syscall and fail closed without spawning another attempt. Once
+    /// released, the successful late stream is sent to a dropped reply channel,
+    /// closed normally, and the one worker joins cleanly.
+    #[test]
+    fn connector_deadline_bounds_one_stuck_worker_and_late_success() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = std::sync::Arc::clone(&calls);
+        let (entered, worker_entered) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release, blocked) = std::sync::mpsc::sync_channel::<()>(0);
+        let connector = ProbeConnector::spawn(move |_path| {
+            worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            entered.send(()).expect("announce stalled connector");
+            blocked.recv().expect("release stalled connector");
+            let (result, peer) = CtlStream::pair()?;
+            drop(peer);
+            Ok(result)
+        })
+        .expect("spawn injected connector");
+
+        let started = std::time::Instant::now();
+        let first = connector
+            .connect(
+                "forever-stalled",
+                ProbeDeadline::after(std::time::Duration::from_millis(40)),
+            )
+            .expect_err("the first caller must observe its deadline");
+        assert_eq!(first.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the blocking connect escaped its caller's budget"
+        );
+        worker_entered
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("the sole worker must enter the injected connect");
+
+        for budget_ms in [10, 20, 40] {
+            let later_started = std::time::Instant::now();
+            let later = connector
+                .connect(
+                    "must-not-queue",
+                    ProbeDeadline::after(std::time::Duration::from_millis(budget_ms)),
+                )
+                .expect_err("a later connect must fail behind the bounded worker");
+            assert_eq!(later.kind(), io::ErrorKind::TimedOut);
+            assert!(
+                later_started.elapsed() < std::time::Duration::from_millis(200),
+                "submission blocked behind the stuck connect"
+            );
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "later callers must not start or queue another connect"
+        );
+
+        release.send(()).expect("release worker");
+        drop(connector); // closes its request channel and joins the sole worker
+    }
+
     /// A token miss names the FILE it looked for (the per-instance mirror,
     /// resolved in the socket's own directory), so the report can print it;
     /// the `Option` wrapper other callers use is unchanged.
@@ -5886,6 +6281,61 @@ mod tests {
         assert_eq!(path, Path::new("/nonexistent-aterm-dir/aterm-77.token"));
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(read_token_for("/nonexistent-aterm-dir/aterm-77.sock").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_reader_rejects_oversized_symlink_and_fifo_without_parking() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-ctl-token-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("token fixture directory");
+        let socket = dir.join("mock.sock");
+        let token = dir.join("aterm.token");
+        let socket_text = socket.to_str().expect("utf8 socket path");
+
+        std::fs::write(
+            &token,
+            vec![b'x'; MAX_CONTROL_TOKEN_FILE_BYTES as usize + 1],
+        )
+        .expect("oversized token");
+        let (_, error) = read_token_at(socket_text).expect_err("oversized token must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::remove_file(&token).expect("remove oversized token");
+        std::fs::write(&token, "deadbeef\nsend injected\n").expect("multiline token");
+        let (_, error) = read_token_at(socket_text).expect_err("multiline token must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::remove_file(&token).expect("remove multiline token");
+        let target = dir.join("real.token");
+        std::fs::write(&target, "deadbeef\n").expect("real token");
+        std::os::unix::fs::symlink(&target, &token).expect("token symlink");
+        assert!(
+            read_token_at(socket_text).is_err(),
+            "the final token component must not be followed"
+        );
+
+        std::fs::remove_file(&token).expect("remove token symlink");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&token)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "create token FIFO");
+        let started = std::time::Instant::now();
+        let (_, error) = read_token_at(socket_text).expect_err("FIFO token must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the token FIFO parked discovery"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A mock instance at `dir/<name>` that accepts ONE connection, reads
@@ -5919,6 +6369,8 @@ mod tests {
             let mut w = conn;
             w.write_all(reply).expect("write reply");
             w.flush().expect("flush");
+            w.shutdown(std::net::Shutdown::Write)
+                .expect("finish mock reply");
             let mut sink = Vec::new();
             let _ = r.read_to_end(&mut sink);
             line
@@ -5929,12 +6381,15 @@ mod tests {
     /// The probe against REAL sockets: a bound-then-abandoned socket file is
     /// Refused (labelled by the pid's liveness), a missing file is Other,
     /// `ERR auth` is NoToken when nothing was on disk and AuthRejected when a
-    /// token WAS sent, `OK n` is Answered, a non-auth `ERR` keeps the server's
-    /// words, and a hang-up is Other(UnexpectedEof). UNIX ONLY: the mock is a
-    /// std `UnixListener`.
+    /// token WAS sent, exactly-complete `OK n` is Answered, truncated `OK n` and
+    /// a headerless hang-up are Other(UnexpectedEof), and a non-auth `ERR` keeps
+    /// the server's words. UNIX ONLY: the mock is a std `UnixListener`.
     #[cfg(unix)]
     #[test]
     fn probe_lines_classifies_real_sockets() {
+        let _serial = PROBE_SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = std::env::temp_dir().join(format!("aterm-ctl-f8-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("private dir");
@@ -5999,6 +6454,15 @@ mod tests {
         }
         srv.join().expect("mock");
 
+        // Other: the header promised two rows but the peer supplied only one.
+        // The complete two-row arm immediately above is the negative control.
+        let (sock, srv) = mock_instance(&dir, "mock.sock", b"OK 2\nalpha\n");
+        match probe_lines(&sock, "sessions", 0) {
+            Probe::Other(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("a truncated OK body is UnexpectedEof, got {other:?}"),
+        }
+        srv.join().expect("mock");
+
         // Other: a non-auth ERR keeps the server's words.
         let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR usage: sessions\n");
         match probe_lines(&sock, "sessions", 0) {
@@ -6015,6 +6479,56 @@ mod tests {
         }
         srv.join().expect("mock");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every delivered byte arrives sooner than the configured socket timeout,
+    /// so the old per-read deadline would accept this response after many budget
+    /// windows. The one monotonic probe deadline must cut it off mid-line.
+    #[cfg(unix)]
+    #[test]
+    fn probe_deadline_is_total_against_a_trickling_peer() {
+        use std::io::{BufRead, Write};
+
+        let _serial = PROBE_SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-trickle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("private trickle dir");
+        let sock = dir.join("mock.sock");
+        let listener = aterm_uds::CtlListener::bind(&sock).expect("bind trickle mock");
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept trickle client");
+            let mut reader = std::io::BufReader::new(conn.try_clone().expect("clone client"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("read probe request");
+            for byte in b"OK 1\nalpha\n" {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                if conn
+                    .write_all(&[*byte])
+                    .and_then(|()| conn.flush())
+                    .is_err()
+                {
+                    break; // the total-deadline client closed as intended
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let probe = probe_lines_with_deadline(
+            sock.to_str().expect("utf8 socket"),
+            "sessions",
+            0,
+            std::time::Duration::from_millis(140),
+        );
+        assert!(matches!(probe, Probe::Timeout), "got {probe:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the peer restarted the per-read timeout instead of sharing one budget"
+        );
+
+        server.join().expect("trickle server");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

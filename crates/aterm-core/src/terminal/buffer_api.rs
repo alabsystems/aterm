@@ -242,6 +242,29 @@ impl Terminal {
         total
     }
 
+    /// Monotonic count of history rows that crossed the IMAGE RETENTION
+    /// HORIZON across the main and alternate grids: rows that kept their text
+    /// and lost their inline picture when the tiered store compressed them.
+    /// Counted separately from
+    /// [`scrollback_truncated_lines`](Self::scrollback_truncated_lines)
+    /// because no LINE was lost — the same out-of-band discipline (audit E10a),
+    /// a different quantity.
+    ///
+    /// An inline image is retained for exactly as long as its line is held
+    /// uncompressed. Past that boundary the row is the empty row it always was
+    /// underneath the picture, so a footprint ages out of history one row at a
+    /// time from its top — the same direction as the history above it. Hosts
+    /// poll this to say so in their own chrome; nothing is ever written into
+    /// the user's content to mark it.
+    #[must_use]
+    pub fn scrollback_image_rows_dropped(&self) -> u64 {
+        let mut total = self.grid.image_rows_dropped_by_compression();
+        if let Some(ref alt) = self.alt_grid {
+            total += alt.image_rows_dropped_by_compression();
+        }
+        total
+    }
+
     /// Clear all scrollback history (main and alt grids).
     ///
     /// Resets both the ring buffer scrollback (`total_lines`, `ring_head`)
@@ -425,10 +448,42 @@ impl Terminal {
     /// ```
     #[must_use]
     pub fn format_paste(&self, text: &str) -> Vec<u8> {
+        self.format_paste_framed(text, self.modes.bracketed_paste)
+    }
+
+    /// [`Self::format_paste`] with the bracketed-paste decision supplied rather
+    /// than read from the live mode.
+    ///
+    /// The sanitize + LF→CR body is IDENTICAL either way; only whether the guards
+    /// wrap it is chosen by the caller. This exists because a paste is framed when
+    /// its bytes are produced, which for a queued paste is strictly LATER than the
+    /// moment a person was asked about it — and a program on the other end of the
+    /// PTY may flip DEC 2004 in between. A host that showed someone a question
+    /// about a paste (aterm's multi-line paste confirmation) must be able to frame
+    /// the answer by the mode the QUESTION was asked under, or the guard and the
+    /// wire can disagree about the same paste in either direction.
+    ///
+    /// Passing `self.modes().bracketed_paste` reproduces [`Self::format_paste`]
+    /// exactly, which is how the no-promise callers (the control `paste` verbs)
+    /// keep their "framed by the mode at write time" contract.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// // The mode says nothing here: the caller's decision is what frames it.
+    /// assert_eq!(term.format_paste_framed("hello", true), b"\x1b[200~hello\x1b[201~");
+    /// term.process(b"\x1b[?2004h");
+    /// assert_eq!(term.format_paste_framed("hello", false), b"hello");
+    /// ```
+    #[must_use]
+    pub fn format_paste_framed(&self, text: &str, bracketed: bool) -> Vec<u8> {
         // Truncate at char boundary to prevent unbounded allocation (#7379).
         let text = bounded_paste_text(text);
 
-        if self.modes.bracketed_paste {
+        if bracketed {
             // Strip every non-printable control char except TAB and the line breaks
             // (\n/\r, normalized to CR just below). This covers ESC (which could inject
             // \x1b[201~ to end the bracket region early), the C1 controls 0x80-0x9F
@@ -602,6 +657,33 @@ mod tests {
     fn unbracketed_paste_strips_escape_and_c1() {
         let term = Terminal::new(24, 80);
         assert_eq!(term.format_paste("a\x1b[31mb\u{009D}c"), b"a[31mbc");
+    }
+
+    /// A supplied framing OVERRIDES the live mode in both directions, and only
+    /// the guards move: the sanitize + LF→CR body is the same text either way.
+    /// This is what lets a host frame a queued paste by the mode its user was
+    /// asked about rather than by whatever the program has set by the time the
+    /// bytes are written.
+    #[test]
+    fn a_supplied_framing_decides_the_guards_and_nothing_else() {
+        let mut term = Terminal::new(24, 80);
+        // 2004 OFF, framed bracketed anyway.
+        assert_eq!(
+            term.format_paste_framed("a\x1b[31mb\nc", true),
+            b"\x1b[200~a[31mb\rc\x1b[201~"
+        );
+        term.process(b"\x1b[?2004h");
+        // 2004 ON, framed unbracketed anyway — same body, no guards.
+        assert_eq!(
+            term.format_paste_framed("a\x1b[31mb\nc", false),
+            b"a[31mb\rc"
+        );
+        // Passing the live mode IS `format_paste`, which is how a caller with no
+        // captured answer keeps the write-time contract.
+        assert_eq!(
+            term.format_paste_framed("a\x1b[31mb\nc", term.modes().bracketed_paste),
+            term.format_paste("a\x1b[31mb\nc")
+        );
     }
 
     #[test]

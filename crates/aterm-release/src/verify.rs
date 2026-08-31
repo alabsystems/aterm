@@ -20,6 +20,7 @@ use std::process::Command;
 
 use aterm_update_core::Manifest;
 
+use crate::gates;
 use crate::ledger::{self, Error, Result};
 use crate::manifest_out;
 use crate::publish::{self, TagKind, gh_retry, step};
@@ -1528,6 +1529,11 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     let slug = slug_of(repo)?;
     println!("aterm-release · yank build {build} ({slug})");
     let git = ledger::GitCli::new(repo);
+    // Cleanup-only yank resumes can mutate tags/releases without calling the
+    // fresh-cut ladder. They still require the checkout's own cutter.
+    gates::clean_tree(&git)?;
+    gates::on_main(&git)?;
+    gates::current_cutter_identity_gate(&git)?;
     publish::assert_origin_repo_binding(&git, &slug)?;
     // Keep the release object + manifest discoverable after tag-first cleanup;
     // a resumed yank may legitimately find the bad tag already absent.

@@ -28,6 +28,23 @@
 
 use std::path::{Path, PathBuf};
 
+/// WHY a running copy is inert, not merely THAT it is. [`Running::InertApp`]
+/// deliberately collapses three situations the updater treats identically — a
+/// dev-marked build, a launch from a mounted disk image, and an App-Translocated
+/// launch — because the updater's answer to all three is the same: do not touch
+/// it. A person's is not. Two of the three are a mistake they can undo in one
+/// drag, and the third is not a fault at all.
+///
+/// Re-exported here rather than reimplemented: the classification is the pure
+/// path logic that sits beside [`crate::bundle::resolve_from`], so the reason
+/// shown to a human and the refusal acted on by the updater are the same
+/// judgement and cannot drift apart.
+/// macOS-only, like the module it comes from: `bundle` is `#[cfg(target_os =
+/// "macos")]` because the whole notion of an `.app` that can be translocated is,
+/// and every other `crate::bundle` use in this file is gated the same way.
+#[cfg(target_os = "macos")]
+pub use crate::bundle::{InstallPosture, posture_from};
+
 /// What the running copy IS — decides whether the updater's promise ("the updater
 /// updates only this one") may be made at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

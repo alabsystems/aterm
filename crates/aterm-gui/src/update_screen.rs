@@ -4,7 +4,7 @@
 //! The own-rendered, cross-platform SOFTWARE UPDATE overlay: a floating [`DrawPrim`] card
 //! (same simple native-window style as [`crate::about`]) that shows the running build, the
 //! staged update (if any) with its "what's new" notes rendered from Markdown
-//! ([`crate::markdown`]), and the actions — Check for Updates, Install & Relaunch (only
+//! ([`crate::markdown`]), and the actions — Check for Updates, Apply Now (only
 //! when a strictly-newer build is staged), and Close. It is the DETAILED update screen the
 //! tab-strip ↻ icon, the App-menu "Software Update…" item, the macOS toolbar ↻ button, and
 //! the fading "update ready" nudge all open. Shipping update details now render in the
@@ -677,7 +677,7 @@ pub(crate) fn update_a11y(state: &UpdateState) -> accesskit::TreeUpdate {
         button(UpdateHit::Check, "Check for Updates");
     }
     if state.has_update() {
-        button(UpdateHit::Install, "Install & Relaunch");
+        button(UpdateHit::Install, "Apply Now");
     }
 
     let mut root = Node::new(Role::Window);
@@ -757,7 +757,7 @@ pub(crate) fn update_layout(state: &UpdateState, g: &SettingsGeom) -> UpdateLayo
         .map(|l| text_w(l, px * 0.82))
         .fold(0.0, f32::max);
     let btn_row_w = ui_text_width("Check for Updates", px * 0.85)
-        + ui_text_width("Install & Relaunch", px * 0.85)
+        + ui_text_width("Apply Now", px * 0.85)
         + ui_text_width("Close", px * 0.85)
         + 12.0 * cw;
     let cur = current_line(state);
@@ -817,7 +817,7 @@ pub(crate) fn update_layout(state: &UpdateState, g: &SettingsGeom) -> UpdateLayo
     let right = cx0 + card_w - 1.4 * cw;
     let (close_btn, next) = mk(right, "Close");
     let (install_btn, next) = if staged {
-        mk(next, "Install & Relaunch")
+        mk(next, "Apply Now")
     } else {
         ((next, by, 0.0, 0.0), next)
     };
@@ -1126,7 +1126,7 @@ pub(crate) fn update_tray(state: &UpdateState, g: &SettingsGeom, theme: Theme) -
         "Check for Updates",
         !state.has_update() && state.enabled,
     );
-    button(&mut prims, l.install_btn, "Install & Relaunch", true);
+    button(&mut prims, l.install_btn, "Apply Now", true);
     button(&mut prims, l.close_btn, "Close", false);
 
     prims.push(DrawPrim::ClipPop);
@@ -1559,7 +1559,7 @@ mod tests {
                 .any(|p| matches!(p, DrawPrim::Text { s, .. } if s == needle))
         };
         assert!(has("Software Update"), "title");
-        assert!(has("Install & Relaunch"), "install button");
+        assert!(has("Apply Now"), "install button");
         assert!(has("Close"), "close button");
         let pushes = t
             .prims

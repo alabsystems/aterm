@@ -245,6 +245,10 @@ pub struct Scrollback {
     /// FIFO under the byte budget) — real retention loss, exposed out-of-band
     /// (audit E10a). User-requested `set_line_limit` truncation is NOT counted.
     pressure_evicted_lines: u64,
+    /// Monotonic count of history lines that crossed the IMAGE RETENTION
+    /// HORIZON — see
+    /// [`image_rows_dropped_by_compression`](Self::image_rows_dropped_by_compression).
+    image_rows_dropped_by_compression: u64,
     /// Current memory pressure watermark level.
     watermark_level: WatermarkLevel,
     /// Absolute byte threshold for Yellow level (entry).
@@ -296,6 +300,7 @@ impl Scrollback {
             line_count: 0,
             line_limit: Some(DEFAULT_LINE_LIMIT),
             pressure_evicted_lines: 0,
+            image_rows_dropped_by_compression: 0,
             watermark_level: WatermarkLevel::Green,
             yellow_threshold: threshold_bytes(DEFAULT_YELLOW_PERCENT, memory_budget),
             yellow_exit_threshold: threshold_bytes(YELLOW_EXIT_PERCENT, memory_budget),
@@ -352,6 +357,7 @@ impl Scrollback {
             line_count: 0,
             line_limit: Some(DEFAULT_LINE_LIMIT),
             pressure_evicted_lines: 0,
+            image_rows_dropped_by_compression: 0,
             watermark_level: WatermarkLevel::Green,
             yellow_threshold: threshold_bytes(DEFAULT_YELLOW_PERCENT, memory_budget),
             yellow_exit_threshold: threshold_bytes(YELLOW_EXIT_PERCENT, memory_budget),
@@ -498,6 +504,33 @@ impl Default for Scrollback {
     fn default() -> Self {
         Self::with_defaults()
     }
+}
+
+/// How many of `lines` carry an inline-image span — i.e. how many FOOTPRINT
+/// ROWS lose their picture when this batch is compressed.
+///
+/// The ONE seam both tiered stores count the image retention horizon through
+/// ([`Scrollback`] and `DiskBackedScrollback` each compress hot lines in their
+/// own `promote_hot_to_warm`), so the two counters cannot come to mean
+/// different things. Counts LINES, not spans: a row covered by two placements
+/// side by side is still one row of history that lost its pictures, and the
+/// sibling loss counters ([`Scrollback::pressure_evicted_lines`]) are line
+/// counts too.
+///
+/// Costs one `Option` discriminant test per promoted line — `Line::images` is
+/// `None` for every line of every session that never drew a picture.
+pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
+    let mut rows = 0u64;
+    for line in lines {
+        if line.has_images() {
+            // Saturating: `lines` is one warm block (thousands at most), so the
+            // count cannot approach u64::MAX on any real path — the saturation
+            // only discharges the strict L0 gate's unconstrained-input overflow
+            // obligation.
+            rows = rows.saturating_add(1);
+        }
+    }
+    rows
 }
 
 // Tests for the top-level Scrollback type and integration tests.

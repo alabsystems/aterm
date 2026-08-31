@@ -48,7 +48,8 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::control_auth::{self, AuthOutcome};
 use crate::input::{
-    Delivery, Egress, EgressMode, InputEvent, InputOutcome, ScrollIntent, Source, seam_egress,
+    Delivery, Egress, EgressMode, InputEvent, InputOutcome, PasteFraming, ScrollIntent, Source,
+    seam_egress,
 };
 use crate::session_store::Store;
 use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested, Subscribers};
@@ -406,11 +407,61 @@ fn sessionless_front_paste_event(
     }
     Some(
         match native_control_decision(false, true, principal, NativeControlTarget::App) {
-            NativeControlDecision::WithoutSession => Ok(InputEvent::Paste(text())),
+            NativeControlDecision::WithoutSession => {
+                Ok(InputEvent::Paste(text(), PasteFraming::AtDrain))
+            }
             NativeControlDecision::Denied => Err("ERR denied\n"),
             NativeControlDecision::ResolveSession
             | NativeControlDecision::NoActiveTerminal
             | NativeControlDecision::NoSuchSession => Err("ERR invalid control target\n"),
+        },
+    )
+}
+
+/// Resolve `resize px <w> <h>` when a NATIVE tab app owns the front and there is
+/// therefore deliberately no `ActiveSession` to resolve.
+///
+/// A window is the same window whatever its front tab draws: a hand on its edge
+/// resizes it with Settings up, so the control twin of that drag has to reach it
+/// too. Gating the px form on an active terminal made the compact/phone Settings
+/// layouts unreachable from the socket — the only way to see one was to resize
+/// while a TERMINAL tab was front and open Settings afterwards. The event carries
+/// no engine state (`App::input`'s native lane forwards it precisely because it
+/// is a window fact, not text input), so nothing downstream needs the session.
+///
+/// `None` retains the established session resolver: the CELL form (`resize <r>
+/// <c>`) really is session-class — it resizes the engine and the PTY — and an
+/// explicit `@<sid>` continues to name an exact terminal. Like the bare `paste`
+/// and `image` lanes beside it, only an Owner's bare/self request may take the
+/// app-authority route, and the verdict is [`native_control_decision`]'s existing
+/// App case rather than a parallel control-only allowlist.
+fn sessionless_front_window_resize(
+    verb: &str,
+    rest: &str,
+    selector: Option<&Selector>,
+    front_has_terminal: bool,
+    principal: NativeControlPrincipal,
+) -> Option<Result<InputEvent, String>> {
+    if verb != "resize" || front_has_terminal || !matches!(selector, None | Some(Selector::SelfTok))
+    {
+        return None;
+    }
+    let parsed = control_input::parse_resize_px(rest)?;
+    Some(
+        match native_control_decision(false, true, principal, NativeControlTarget::App) {
+            // A malformed px request keeps THE PARSER'S OWN answer, not a
+            // rewritten one. `parse_resize_px` distinguishes a missing argument
+            // from an unspellable one, and which tab happens to be in front is not
+            // a reason for the same request to be told two different things —
+            // collapsing both to the usage string is exactly how that drift
+            // starts.
+            NativeControlDecision::WithoutSession => parsed,
+            NativeControlDecision::Denied => Err("ERR denied\n".to_string()),
+            NativeControlDecision::ResolveSession
+            | NativeControlDecision::NoActiveTerminal
+            | NativeControlDecision::NoSuchSession => {
+                Err("ERR invalid control target\n".to_string())
+            }
         },
     )
 }
@@ -1154,8 +1205,10 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         .unwrap_or_else(|| "-".to_string());
     let staged_version = st.staged_version.as_deref().unwrap_or("-");
     let staged_commit = st.staged_commit.as_deref().unwrap_or("-");
-    // relaunch_ready: a strictly-newer build is staged and will apply on the next
-    // launch (or immediately via `update apply`). The one-glance SEE for a controller.
+    // relaunch_ready: a strictly-newer build is staged and can be applied in place
+    // now (automatically by the in-session lane, or via `update apply`). The
+    // one-glance SEE for a controller. The key NAME is historical and kept for wire
+    // compatibility — agents and docs/RFC-proof-carrying-dsu.md parse it.
     let relaunch_ready = st.staged_build.is_some_and(|b| b > st.current_build);
     // Self-healing ledger fields: failing=<consecutive>:<kind> (0 when healthy) and
     // the lifetime rescue-path count — so a driver can see a broken pipeline (or a
@@ -2792,6 +2845,12 @@ fn dispatch_app_verb(
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
         "tab" => control_input::cmd_tab(proxy, rest),
         "hover" => control_input::cmd_hover(proxy, rest),
+        // The three window-surface drives. Each is answered here as well as in the
+        // session router because each targets the FRONT WINDOW and needs no PTY
+        // mirror to do it — the same reason `hover` and `tab` are on this path.
+        "find" => control_input::cmd_find(proxy, rest),
+        "pane" => control_input::cmd_pane(proxy, rest),
+        "pointer" => control_input::cmd_pointer(proxy, rest),
         "metrics" => control_query::cmd_metrics(active_term, rest),
         _ => return None,
     };
@@ -2895,6 +2954,29 @@ fn dispatch_before_session(
             principal,
         )
     {
+        return Some(
+            match route {
+                Ok(event) => control_input::input_reply_to_str(post_input_reply(
+                    proxy,
+                    Op::WriteInput,
+                    vec![event],
+                )),
+                Err(error) => error.to_string(),
+            }
+            .into(),
+        );
+    }
+
+    // `resize px` names the WINDOW, and a native front tab does not stop an edge
+    // drag from resizing it. Same shape as the paste lane above: bare/self owner
+    // only, App authority, the cell form untouched.
+    if let Some(route) = sessionless_front_window_resize(
+        verb,
+        rest,
+        selector.as_ref(),
+        resolve_active(active).is_some(),
+        principal,
+    ) {
         return Some(
             match route {
                 Ok(event) => control_input::input_reply_to_str(post_input_reply(
@@ -4366,7 +4448,9 @@ fn run_operator_proposal(
 /// particular a trailing two-byte `\n` remains two literal bytes; only the
 /// interactive text `paste` verb applies its convenience expansion.
 fn operator_paste_event(text: &str) -> InputEvent {
-    InputEvent::Paste(text.to_string())
+    // No gesture, so no promise to keep: DEC 2004 as it stands when the frame is
+    // written is what an operator proposal is framed by (`PasteFraming::AtDrain`).
+    InputEvent::Paste(text.to_string(), PasteFraming::AtDrain)
 }
 
 /// Execute one proposed side effect behind its durable intent transaction.
@@ -4830,7 +4914,10 @@ where
     // than pasting into whichever tab became front.
     if front_terminal_session == Some(target_session) {
         let event = if paste {
-            InputEvent::Paste(String::from_utf8_lossy(&payload).into_owned())
+            InputEvent::Paste(
+                String::from_utf8_lossy(&payload).into_owned(),
+                PasteFraming::AtDrain,
+            )
         } else {
             // Raw front-session input is not the user's fingers. It still
             // enters App::input so that seam closes any older licence before
@@ -4854,9 +4941,13 @@ where
     if paste {
         // PASTE semantics: run the payload through `format_paste` under the target's
         // lock (bracketed-paste guards when DECSET 2004 is on + control-byte sanitize
-        // + LF->CR), exactly as the `paste` verb / human Cmd-V do — then write the
-        // transformed bytes. The payload is interpreted as UTF-8 (lossy): a paste is
-        // text, and the sanitizer would strip raw control bytes anyway.
+        // + LF->CR), exactly as the `paste` verb does — then write the transformed
+        // bytes. Reading the mode HERE, as the bytes are made, IS the verb's framing
+        // contract (`PasteFraming::AtDrain`): a driver was shown no confirmation, so
+        // there is no earlier answer to keep faith with. A human Cmd-V differs on
+        // purpose — it carries the mode its confirmation was judged under. The payload
+        // is interpreted as UTF-8 (lossy): a paste is text, and the sanitizer would
+        // strip raw control bytes anyway.
         let text = String::from_utf8_lossy(&payload);
         let out = term_lock(&term).format_paste(&text);
         control_input::write_pty(&ctx.sink, &out);
@@ -5648,7 +5739,9 @@ fn operator_input_if_epoch(
         return Delivery::ConflictZero;
     }
     let bytes = match ev {
-        InputEvent::Paste(text) => terminal.format_paste(&text),
+        InputEvent::Paste(text, framing) => {
+            terminal.format_paste_framed(&text, framing.bracketed(terminal.modes().bracketed_paste))
+        }
         InputEvent::Key {
             key,
             mods,
@@ -5793,20 +5886,11 @@ fn control_attempt_closes_cursor_license(verb: &str) -> bool {
 }
 
 fn front_routed_resize(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
-    if let Some(px) = rest.trim().strip_prefix("px") {
-        let mut it = px.split_whitespace();
-        let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
-            return "ERR usage: resize px <w> <h>\n".to_string();
+    if let Some(event) = control_input::parse_resize_px(rest) {
+        return match event {
+            Err(usage) => usage,
+            Ok(event) => front_routed_input(proxy, session, Some(event), "ERR\n"),
         };
-        let (Ok(width), Ok(height)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
-            return "ERR bad args\n".to_string();
-        };
-        return front_routed_input(
-            proxy,
-            session,
-            Some(InputEvent::ResizeWindowPx { width, height }),
-            "ERR\n",
-        );
     }
     let (rows, cols) = match control_input::parse_resize(rest) {
         Ok(size) => size,
@@ -6376,15 +6460,19 @@ fn handle(
     // an ignored attempt and be borrowed by subsequent PTY output.
     // Authorization has already completed above; denied callers cannot mutate
     // visible-window effect state through this side channel.
-    // …EXCEPT a well-formed plain typed glyph `key` — the control twin of the
-    // input seams' mash exception. That press dispatches through the same
-    // `Wake::Input` seam a physical key uses and stamps its own typed licence,
-    // so pre-clearing here wiped the banked stamps of earlier keys whose
-    // echoes were still in flight and manufactured no-fresh-hint declines —
-    // permanently unlit ribbon cells — under any control-driven typing burst.
-    // Malformed bodies, modified chords, and named keys still fence.
+    // …EXCEPT a well-formed `key` that ARMS ITS OWN LICENSE — the control
+    // twin of the input seams' mash exception. Plain typed glyphs, plain
+    // Enter, Tab and Backspace all dispatch through the same `Wake::Input`
+    // seam a physical key uses and stamp their own licence class there
+    // (typed / return / gesture / quench), so pre-clearing here wiped the
+    // banked stamps of earlier keys whose echoes were still in flight AND
+    // destroyed the class the dispatched key was about to arm —
+    // manufacturing no-fresh-hint declines (permanently unlit ribbon cells)
+    // under any control-driven typing burst, deterministically for every
+    // `key enter`. Malformed bodies, modified chords, and the remaining
+    // named keys still fence.
     if control_attempt_closes_cursor_license(verb)
-        && !(verb == "key" && control_input::key_is_plain_typed_glyph(rest))
+        && !(verb == "key" && control_input::key_arms_own_license(rest))
     {
         let cleared = front_routed_license_clear(proxy, session);
         if !cleared.starts_with("OK") {
@@ -6507,7 +6595,10 @@ fn handle(
                     front_routed_input(
                         proxy,
                         session,
-                        Some(InputEvent::Paste(control_input::paste_text(text))),
+                        Some(InputEvent::Paste(
+                            control_input::paste_text(text),
+                            PasteFraming::AtDrain,
+                        )),
                         "ERR\n",
                     )
                     .starts_with("OK")
@@ -6532,7 +6623,10 @@ fn handle(
                     cross_input(
                         term,
                         ctx,
-                        Some(InputEvent::Paste(control_input::paste_text(text))),
+                        Some(InputEvent::Paste(
+                            control_input::paste_text(text),
+                            PasteFraming::AtDrain,
+                        )),
                         "ERR\n",
                     )
                     .starts_with("OK")
@@ -6650,13 +6744,19 @@ fn handle(
         "paste" if is_cross && targets_front => front_routed_input(
             proxy,
             session,
-            Some(InputEvent::Paste(control_input::paste_text(rest))),
+            Some(InputEvent::Paste(
+                control_input::paste_text(rest),
+                PasteFraming::AtDrain,
+            )),
             "ERR\n",
         ),
         "paste" if is_cross => cross_input(
             term,
             ctx,
-            Some(InputEvent::Paste(control_input::paste_text(rest))),
+            Some(InputEvent::Paste(
+                control_input::paste_text(rest),
+                PasteFraming::AtDrain,
+            )),
             "ERR\n",
         ),
         "paste" => control_input::cmd_paste(proxy, rest),
@@ -6742,7 +6842,7 @@ fn handle(
         // `trail [status|<n>]`: the FOCUSED window's cursor-trail diagnostics.
         // The `<n>` form prints the last n spawn-seam verdicts from the
         // engine's diagnostic ring — licensed/declined + reason
-        // (no-fresh-hint / no-credits / off-shape) + origin/target; `status`
+        // (no-fresh-hint / no-credits / off-shape / program-row) + origin/target; `status`
         // prints ONE line of standing engine state (style, every gate to the
         // glass, the cumulative licensed/declined tally, live ribbon).
         // Read-only and App-level like `tone` (`@peer trail` reads the peer's
@@ -6800,6 +6900,51 @@ fn handle(
         // of the drag-and-drop affordance; a real drag drives the same flag). Always
         // targets the frontmost window, so a `@<sel>` is meaningless here.
         "hover" => control_input::cmd_hover(proxy, rest),
+        // `find`: drive the FIND BAR — type a query, step matches, toggle
+        // case/regex, accept/cancel. Read-class: find mode DIVERTS keystrokes away
+        // from the PTY, so nothing typed here can reach the driven program, and what
+        // it moves (viewport + highlight) is what `scroll`/`select` move.
+        // `search` answers the same question without a bar; this drives the bar.
+        //
+        // FRONT window, like `hover` — `App::find_cmd` resolves `frontmost_window`,
+        // so an `@<sel>` routes to the INSTANCE and lands on that instance's front
+        // window. It does not aim at the window hosting the selected session, and
+        // nothing here claims it does.
+        // `find` REPORTS at Read and MUTATES at Write, and the two are demanded
+        // TOGETHER for the mutating forms — the `turn` conjunction, not an escalation.
+        // Escalating would REPLACE the base op, and the base op is the read gate: the
+        // mutating forms still answer with the match position, so replacing it would
+        // hand a keystroke-only edge a screen read it has no authority for. The bare and
+        // `status` forms only report, so they stay reachable by a watcher that must never
+        // be able to touch the session; every other form routes each later physical
+        // keystroke into the bar and moves the selection and the viewport, which is a
+        // write whatever the reply looks like.
+        "find"
+            if !matches!(rest.split_whitespace().next().unwrap_or(""), "" | "status")
+                && !matches!(scope, Scope::Owner)
+                && !cross_session_authorized(scope, "key", ctx) =>
+        {
+            log_denial(
+                AUDIT_SUBSYSTEM,
+                &format!("find -> {}", ctx.self_id.as_str()),
+                aterm_containment::mode_or_containment(),
+                "find's mutating forms need read+write; edge lacks write",
+            );
+            "ERR denied\n".to_string()
+        }
+        "find" => control_input::cmd_find(proxy, rest),
+        // `pane <dir>`: move keyboard focus between the active tab's split panes —
+        // `spawn split=v|h` makes them, this walks them, and the active-pane mark
+        // follows because it is the key binding's own `focus_pane_in`. Write-class
+        // for `tab`'s reason: choosing which pane the keyboard drives is an
+        // input-routing authority. FRONT window, like `hover` (NOT `tab`'s aimed
+        // `@<sid>` routing — see the verb table row).
+        "pane" => control_input::cmd_pane(proxy, rest),
+        // `pointer`: put the window's POINTER on a cell through `on_cursor_moved`,
+        // the function winit's `CursorMoved` calls, so link hover / divider cursors
+        // / strip highlight resolve for real. Write-class: under DEC 1000/1002/1003
+        // that motion is reported to the driven program. FRONT window, like `hover`.
+        "pointer" => control_input::cmd_pointer(proxy, rest),
         // Cross-session `resize` does NOT go through the seam: `seam_egress` emits no
         // bytes for `Resize`, and `App::input`'s Resize arm resizes the WINDOW (every
         // tab + the GPU swapchain). A background target has no window to echo to, so we
@@ -7578,7 +7723,7 @@ mod tests {
         assert_eq!(decoded.text, r"Continue literally: \n");
         assert_eq!(
             operator_paste_event(&decoded.text),
-            InputEvent::Paste(r"Continue literally: \n".to_string())
+            InputEvent::Paste(r"Continue literally: \n".to_string(), PasteFraming::AtDrain)
         );
         assert_ne!(
             control_input::paste_text(&decoded.text),
@@ -7795,7 +7940,7 @@ mod tests {
             let delivered = operator_input_if_epoch(
                 &target.term,
                 &target.ctx,
-                Some(InputEvent::Paste(text.to_string())),
+                Some(InputEvent::Paste(text.to_string(), PasteFraming::AtDrain)),
                 epoch.get(),
                 OperatorTerminalFence::Exact(initial_terminal_generation),
             );
@@ -8057,7 +8202,7 @@ mod tests {
             let delivery = operator_input_if_epoch(
                 &target.term,
                 &target.ctx,
-                Some(InputEvent::Paste(text.to_string())),
+                Some(InputEvent::Paste(text.to_string(), PasteFraming::AtDrain)),
                 epoch.get(),
                 OperatorTerminalFence::Exact(proposal.generation),
             );
@@ -9892,7 +10037,10 @@ mod tests {
         )
         .expect("native-front paste is classified before session resolution")
         .expect("owner may drive its front app");
-        assert_eq!(route, InputEvent::Paste("Paragraph".to_string()));
+        assert_eq!(
+            route,
+            InputEvent::Paste("Paragraph".to_string(), PasteFraming::AtDrain)
+        );
 
         assert!(
             sessionless_front_paste_event(
@@ -9936,6 +10084,133 @@ mod tests {
                 NativeControlPrincipal::Edge,
             ),
             Some(Err("ERR denied\n")),
+        );
+    }
+
+    /// The px form of `resize` names the WINDOW, so a native front tab — which
+    /// deliberately has no `ActiveSession` — must not be able to make the window
+    /// unresizable from the socket. Measured before this lane existed: with the
+    /// Settings tab front, `resize px 420 820` answered `ERR no active terminal`
+    /// and the compact/phone Settings layouts could not be reached at all.
+    #[test]
+    fn the_window_form_of_resize_survives_a_native_front_and_the_cell_form_does_not_move() {
+        let route = sessionless_front_window_resize(
+            "resize",
+            "px 420 820",
+            None,
+            false,
+            NativeControlPrincipal::Owner,
+        )
+        .expect("a native front classifies the window form before session resolution")
+        .expect("owner may resize its own window");
+        assert_eq!(
+            route,
+            InputEvent::ResizeWindowPx {
+                width: 420,
+                height: 820
+            }
+        );
+
+        assert!(
+            sessionless_front_window_resize(
+                "resize",
+                "px 420 820",
+                None,
+                true,
+                NativeControlPrincipal::Owner,
+            )
+            .is_none(),
+            "a terminal front retains the established session resize path",
+        );
+        assert!(
+            sessionless_front_window_resize(
+                "resize",
+                "24 80",
+                None,
+                false,
+                NativeControlPrincipal::Owner
+            )
+            .is_none(),
+            "the CELL form resizes the engine and the PTY, so it stays session-class",
+        );
+        assert!(
+            sessionless_front_window_resize(
+                "resize",
+                "px 420 820",
+                Some(&Selector::Local(7)),
+                false,
+                NativeControlPrincipal::Owner,
+            )
+            .is_none(),
+            "an explicit selector remains an exact terminal-session target",
+        );
+        assert_eq!(
+            sessionless_front_window_resize(
+                "resize",
+                "px 420 820",
+                None,
+                false,
+                NativeControlPrincipal::Edge,
+            ),
+            Some(Err("ERR denied\n".to_string())),
+        );
+        assert_eq!(
+            sessionless_front_window_resize(
+                "resize",
+                "px 420",
+                None,
+                false,
+                NativeControlPrincipal::Owner,
+            ),
+            Some(Err("ERR usage: resize px <w> <h>\n".to_string())),
+            "a malformed window request is told how to spell itself, not handed to a resolver",
+        );
+        // …and an UNSPELLABLE one keeps the parser's other answer. Which tab is in
+        // front is not a reason for one request to be told two different things.
+        assert_eq!(
+            sessionless_front_window_resize(
+                "resize",
+                "px wide tall",
+                None,
+                false,
+                NativeControlPrincipal::Owner,
+            ),
+            Some(Err("ERR bad args\n".to_string())),
+            "a native front must answer the same as a terminal front does",
+        );
+    }
+
+    /// The px form has THREE routers now — the plain verb, the front-routed
+    /// cross-session twin, and the native-front window lane — and a caller cannot
+    /// be made to care which one answered. One parser is what keeps them equal.
+    #[test]
+    fn every_router_reads_the_window_resize_form_the_same_way() {
+        assert_eq!(
+            control_input::parse_resize_px("px 1400 900"),
+            Some(Ok(InputEvent::ResizeWindowPx {
+                width: 1400,
+                height: 900
+            })),
+        );
+        assert_eq!(
+            control_input::parse_resize_px("  px  1400   900  "),
+            Some(Ok(InputEvent::ResizeWindowPx {
+                width: 1400,
+                height: 900
+            })),
+            "the argument is whitespace-tolerant, as every other verb's is",
+        );
+        assert!(
+            control_input::parse_resize_px("24 80").is_none(),
+            "the cell form is not the window form",
+        );
+        assert_eq!(
+            control_input::parse_resize_px("px 1400"),
+            Some(Err("ERR usage: resize px <w> <h>\n".to_string())),
+        );
+        assert_eq!(
+            control_input::parse_resize_px("px wide tall"),
+            Some(Err("ERR bad args\n".to_string())),
         );
     }
 
@@ -10205,7 +10480,10 @@ mod tests {
             operator_input(
                 &handle.term,
                 &handle.ctx,
-                Some(InputEvent::Paste(control_input::paste_text(text))),
+                Some(InputEvent::Paste(
+                    control_input::paste_text(text),
+                    PasteFraming::AtDrain,
+                )),
             ) == Delivery::Full
         };
         let press = |_: &str| panic!("BusyZero paste must stop before Enter");
@@ -10984,6 +11262,14 @@ mod tests {
                 "cwd",
                 "colors",
                 "search",
+                // `find` DRIVES the bar `search` answers without. Read for the same
+                // reason `scroll`/`select` are: find mode DIVERTS keystrokes away
+                // from the PTY, so nothing typed into it reaches the driven program,
+                // and what it moves is the viewport and the highlight. Its reply is
+                // the match position `search` already answers — so it hands a read
+                // edge nothing new, and would have handed a WRITE-only edge a screen
+                // read it does not hold.
+                "find",
                 "selection",
                 "blocks",
                 "blocktext",
@@ -11049,10 +11335,18 @@ mod tests {
                 "feed-bin",
                 "paste-bin",
                 "mouse",
+                // `pointer` moves the WINDOW's pointer, which a DEC 1000/1002/1003
+                // app receives as motion reports — `mouse`'s own class, reached
+                // through the winit entry point `mouse` never touches.
+                "pointer",
                 "paste",
                 "resize",
                 "focus",
                 "tab",
+                // `pane` is `tab` one level down: it chooses which pane the keyboard
+                // drives, and re-aiming the human's next keystroke is an authority a
+                // read-only edge must not hold.
+                "pane",
                 "open",
                 "invoke",
                 "rain",
@@ -11149,6 +11443,61 @@ mod tests {
         assert!(!update_is_owner_only_subcmd("bogus"));
     }
 
+    /// NEITHER single-op edge can drive the find bar, and both halves are needed to
+    /// say so.
+    ///
+    /// The dispatch arm demands the base read AND `key`'s write for the mutating forms.
+    /// This holds the two halves that compose it: a read-only edge clears the base gate
+    /// and fails the write half, and a write-only edge fails the base gate outright —
+    /// which is the property a keystroke-only edge must not be able to talk its way
+    /// past, because every `find` reply carries a match position.
+    #[test]
+    fn no_single_op_edge_can_drive_the_find_bars_mutating_forms() {
+        let ctx = test_ctx();
+        let read = edge_granted(Op::ReadScreen, &ctx);
+        let write = edge_granted(Op::WriteInput, &ctx);
+
+        // The base gate is the READ, so a keystroke-only edge never reaches `find`.
+        assert!(!gate_allows(write, "find", &ctx));
+        // …and the write half is `key`'s own op, which a read-only edge lacks.
+        assert!(!cross_session_authorized(read, "key", &ctx));
+        // The reporting form needs only the base gate, so a watcher keeps it.
+        assert!(gate_allows(read, "find", &ctx));
+    }
+
+    /// `find`'s mutating forms are gated by a CONJUNCTION, never an escalation.
+    ///
+    /// `escalated_op` REPLACES the base op, and `find`'s base op is the read gate its
+    /// replies need — every form, the mutating ones included, answers with the match
+    /// position. Escalating to `WriteInput` would drop the read requirement for exactly
+    /// the forms that still report, handing a keystroke-only edge a screen read it has
+    /// no authority for. So `find` escalates for nothing, and the dispatch arm demands
+    /// write ON TOP of the base read, the way `turn` does.
+    #[test]
+    fn find_is_gated_by_conjunction_and_never_by_escalation() {
+        for rest in [
+            "",
+            "status",
+            "open",
+            "next",
+            "type secret",
+            "accept",
+            "cancel",
+        ] {
+            assert_eq!(
+                escalated_op("find", rest),
+                None,
+                "find {rest:?} must not escalate — escalation would drop its read gate"
+            );
+        }
+    }
+
+    /// The `invoke` / `open` seams escalate to the fine op their target needs,
+    /// and the owner-only twins (`OpenPalette`, `SoftwareUpdate`, `ApplyUpdate`,
+    /// the connected-spawn presets) to `OwnerOnly`.
+    ///
+    /// Written without `#[test]` and never run until 2026-08-30 — tippy reported
+    /// it as dead code, which is the only reason it was found.
     #[test]
     fn escalated_op_fences_invoke_and_open_indirect_seams() {
         use Escalation::{Op as EOp, OwnerOnly};
@@ -15163,7 +15512,7 @@ mod tests {
             &mut reply,
         ));
         assert_eq!(String::from_utf8_lossy(&reply), "OK 7 bytes\n");
-        let Some((InputEvent::Paste(text), target)) = routed else {
+        let Some((InputEvent::Paste(text, _), target)) = routed else {
             panic!("visible explicit paste-bin bypassed the App input seam");
         };
         assert_eq!(text, "中🙂");
@@ -16218,6 +16567,73 @@ mod tests {
         }
     }
 
+    /// The three window-surface drives are classified by WHOSE VOCABULARY they
+    /// speak, not by whether they mutate — and this pins each answer against the
+    /// edge that must not be able to run it.
+    ///
+    /// `find` is `ReadScreen`. Find mode exists to DIVERT keystrokes away from the
+    /// PTY, so a typed query reaches no program; what it moves is the viewport and
+    /// the highlight, exactly what `scroll` and `select` (both read) move, and what
+    /// it reports is the match position `search` (read) already answers. The
+    /// alternative was the real escalation: `WriteInput` and `ReadScreen` are
+    /// INDEPENDENT here — a `push` connection carries write with no read — so a
+    /// `Write` classification would have let a keystroke-only edge type a query and
+    /// read match positions back off a screen it has no authority to read.
+    ///
+    /// `pointer` and `pane` are `WriteInput`. `pointer` drives real pointer motion,
+    /// which a DEC 1000/1002/1003 app RECEIVES; `pane` chooses which pane the
+    /// keyboard drives, which is `tab`'s own authority one level down. Neither
+    /// reply carries anything screen-derived, so neither needs read beside it — the
+    /// `turn` pattern (write verb, read reply, both authorities demanded in the
+    /// dispatch arm) is deliberately NOT needed here, and that is a property of the
+    /// replies, which the two assertions below hold to.
+    #[test]
+    fn the_window_surface_drives_are_classified_by_whose_vocabulary_they_speak() {
+        let ctx = test_ctx();
+        let read = edge_granted(Op::ReadScreen, &ctx);
+        let write = edge_granted(Op::WriteInput, &ctx);
+
+        assert_eq!(required_op("find"), Some(Op::ReadScreen));
+        assert!(gate_allows(read, "find", &ctx), "read edge may find");
+        assert!(
+            !gate_allows(write, "find", &ctx),
+            "a keystroke-only edge must NOT read match positions out of the find bar"
+        );
+
+        for v in ["pointer", "pane"] {
+            assert_eq!(required_op(v), Some(Op::WriteInput), "{v} is write-side");
+            assert!(gate_allows(write, v, &ctx), "write edge may {v}");
+            assert!(!gate_allows(read, v, &ctx), "read edge may NOT {v}");
+        }
+
+        // `rest` EXCLUDES the verb (`line.split_once(' ')` in the dispatch), so these
+        // fixtures carry only the tail — a fixture that repeated the verb would test a
+        // shape the dispatch never produces.
+        //
+        // `pointer` and `pane` are write-side at the verb level and have no argument
+        // that reaches further, so their gate is the whole gate. `find` is the one that
+        // splits: it REPORTS at Read and MUTATES at Write, and the tail decides which.
+        for (verb, rest) in [("pointer", "move 1 1"), ("pane", "left")] {
+            assert_eq!(escalated_op(verb, rest), None, "{verb} {rest}");
+        }
+        // `find` escalates for NOTHING, deliberately: escalation REPLACES the base op,
+        // and the base op is the read gate every form's reply needs. Its mutating forms
+        // are fenced by a CONJUNCTION in the dispatch arm — the base read PLUS write,
+        // the way `turn` demands read beside its write — which is a property of the
+        // dispatch and not of this function.
+        for rest in ["type secret", "accept", "open", "next", ""] {
+            assert_eq!(escalated_op("find", rest), None, "find {rest:?}");
+        }
+
+        // The replies carry nothing screen-derived, which is what excuses `pointer`
+        // and `pane` from `turn`'s read+write conjunction. Held to the FORMATTERS,
+        // so a later reply field that leaks the grid trips this.
+        assert_eq!(
+            control_input::find_status_line(&crate::app_search::FindStatus::CLOSED),
+            "OK open=0\n"
+        );
+    }
+
     /// REGRESSION (integration audit): the SELF-path op-scope gate must re-verify an
     /// Edge against the session that is active RIGHT NOW — not op-match alone. The one
     /// global ActiveHandle is retargeted to the new frontmost active tab on every tab
@@ -16312,6 +16728,8 @@ mod tests {
             momentum: 0.5,
             momentum_display: 0.44,
             speed: 12.0,
+            resume_grant: 0.0,
+            woken: 0,
             glow_active: true,
             pet_active: true,
             cat_active: false,

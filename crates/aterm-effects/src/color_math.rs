@@ -42,24 +42,45 @@ pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
     (h, s, max)
 }
 
-/// WCAG channel linearization, precomputed. The input to the transfer function
-/// is always a BYTE (`(c & 0xff) as f32 / 255.0`), so 256 entries cover every
-/// argument that can ever occur and the table is EXACT, not an approximation:
-/// each entry is produced by the very same expression, in the same order, with
-/// the same ops the closure used to evaluate inline, so every caller still sees
-/// the identical `f32` — no ink `strength` step can flip and no fingerprint can
-/// move. (Built at runtime on purpose: `powf` is not `const`, and transcribing
-/// decimal literals is how the last ULP gets silently lost.)
-static SRGB_LIN: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
-    std::array::from_fn(|i| {
-        let n = i as f32 / 255.0;
-        if n <= 0.03928 {
-            n / 12.92
-        } else {
-            ((n + 0.055) / 1.055).powf(2.4)
+/// WCAG channel linearization and weights, precomputed. The input to the
+/// transfer function is always a BYTE, so 256 entries cover every argument.
+/// Each stored weight is produced by the same rounded `f32` multiply that the
+/// scalar expression used, and evaluation retains its left-associative adds;
+/// this is an exact cache, not an approximation. Built at runtime because
+/// `powf` is not `const` and decimal transcription can lose the last ULP.
+pub(crate) struct RelativeLuminanceTable {
+    red: [f32; 256],
+    green: [f32; 256],
+    blue: [f32; 256],
+}
+
+static RELATIVE_LUMINANCE: std::sync::LazyLock<RelativeLuminanceTable> =
+    std::sync::LazyLock::new(|| {
+        let linear: [f32; 256] = std::array::from_fn(|i| {
+            let n = i as f32 / 255.0;
+            if n <= 0.03928 {
+                n / 12.92
+            } else {
+                ((n + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        RelativeLuminanceTable {
+            red: std::array::from_fn(|i| 0.2126 * linear[i]),
+            green: std::array::from_fn(|i| 0.7152 * linear[i]),
+            blue: std::array::from_fn(|i| 0.0722 * linear[i]),
         }
-    })
-});
+    });
+
+#[inline]
+pub(crate) fn relative_luminance_table() -> &'static RelativeLuminanceTable {
+    &RELATIVE_LUMINANCE
+}
+
+#[inline]
+pub(crate) fn relative_luminance_with(table: &RelativeLuminanceTable, rgb: u32) -> f32 {
+    (table.red[((rgb >> 16) & 0xff) as usize] + table.green[((rgb >> 8) & 0xff) as usize])
+        + table.blue[(rgb & 0xff) as usize]
+}
 
 /// sRGB relative luminance (WCAG) of a `0x00RRGGBB` colour. Host-side copy of the
 /// renderer's private helper: the §4.3 guard runs BEFORE the bytes cross the
@@ -67,10 +88,7 @@ static SRGB_LIN: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
 /// definition the renderer floors with — bounded to ≤ 9 evaluations per ink word
 /// per frame (the guard loop), never per pixel.
 pub fn relative_luminance(rgb: u32) -> f32 {
-    let t = &*SRGB_LIN;
-    0.2126 * t[((rgb >> 16) & 0xff) as usize]
-        + 0.7152 * t[((rgb >> 8) & 0xff) as usize]
-        + 0.0722 * t[(rgb & 0xff) as usize]
+    relative_luminance_with(relative_luminance_table(), rgb)
 }
 
 /// HSV (`h` degrees, `s`/`v` in `0..=1`) → `0x00RRGGBB`.

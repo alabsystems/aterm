@@ -4,14 +4,15 @@
 //! `aterm-drive` — the AI-friendly "sugar" CLI over the core `await`/`send`/`key`/
 //! `text` primitives. It teaches itself through `--help` and emits actionable
 //! errors, so an AI agent builds correct intuition for the kernel without docs.
-//! All real work flows through `aterm-ctl` (the std-only core client), so this is
-//! a thin, honest wrapper — no protocol re-implementation.
+//! All real work uses the core control verbs: a configured prompt reuses one
+//! [`RelayClient`] connection, while discovery and the other commands retain the
+//! std-only `aterm-ctl` client.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::{CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn};
+use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn};
 
 /// Resolve the `aterm-ctl` binary: `$ATERM_CTL`, then a sibling of this binary
 /// (the cargo/install layout), then bare `aterm-ctl` on `PATH`.
@@ -113,24 +114,24 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
     })
 }
 
-/// Resolve the LOCAL host's control socket + capability token for a `--dial` drive.
-/// The socket comes from `--socket`/`$ATERM_CONTROL_SOCK`; the token from
-/// `$ATERM_CONTROL_TOKEN`, else the sibling token file located by the SHARED
-/// convention (`aterm_uds::latest::token_path_for_sock`) — `aterm-<pid>.token`
-/// for an instance socket, and for an explicitly-named one a token named after
-/// that socket (`x.sock` -> `x.sock.token`), so two private instances sharing a
-/// directory cannot overwrite each other's credential (F9).
-fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
-    let sock = opts
-        .socket
-        .clone()
-        .or_else(|| std::env::var("ATERM_CONTROL_SOCK").ok())
+/// Resolve an explicitly configured LOCAL control endpoint. `Ok(None)` means
+/// neither `--socket` nor `$ATERM_CONTROL_SOCK` selected one, so a local prompt
+/// must retain the existing `aterm-ctl` discovery path. Once a socket IS selected,
+/// a missing token is an error rather than permission to silently drive some
+/// other discovered instance.
+fn resolve_configured_local_endpoint_with(
+    flag_socket: Option<String>,
+    env_socket: Option<String>,
+    env_token: Option<String>,
+    read_token: impl FnOnce(&std::path::Path) -> Option<String>,
+) -> Result<Option<(String, String)>, String> {
+    let Some(sock) = flag_socket
+        .or(env_socket)
         .filter(|s| !s.is_empty() && s != "0" && s != "off")
-        .ok_or(
-            "--dial needs the LOCAL host socket: pass --socket <PATH> or set ATERM_CONTROL_SOCK",
-        )?;
-    let token = std::env::var("ATERM_CONTROL_TOKEN")
-        .ok()
+    else {
+        return Ok(None);
+    };
+    let token = env_token
         .filter(|s| !s.is_empty())
         .or_else(|| {
             // The SHARED convention, not a hand-rolled one: an instance socket
@@ -141,9 +142,7 @@ fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
             // wrote, so `--dial` silently failed to authenticate where `aterm ctl`
             // worked; deriving it here AGAIN is how that came back.
             let tok_path = aterm_uds::latest::token_path_for_sock(&sock)?;
-            std::fs::read_to_string(&tok_path)
-                .ok()
-                .map(|s| s.trim().to_string())
+            read_token(&tok_path).map(|s| s.trim().to_string())
         })
         .filter(|s| !s.is_empty())
         .ok_or(
@@ -151,7 +150,104 @@ fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
              token file beside the socket is readable (`aterm-<pid>.token` for an instance \
              socket, else the token named after the socket itself)",
         )?;
-    Ok((sock, token))
+    Ok(Some((sock, token)))
+}
+
+/// Resolve the LOCAL host's control socket + capability token when a socket was
+/// explicitly selected by `--socket` or `$ATERM_CONTROL_SOCK`. The token comes
+/// from `$ATERM_CONTROL_TOKEN`, else the sibling token file located by the SHARED
+/// convention (`aterm_uds::latest::token_path_for_sock`) — `aterm-<pid>.token`
+/// for an instance socket, and a token named after any explicit socket. The
+/// legacy shared `aterm.token` is accepted only when the per-socket file is absent.
+fn resolve_configured_local_endpoint(opts: &Opts) -> Result<Option<(String, String)>, String> {
+    resolve_configured_local_endpoint_with(
+        opts.socket.clone(),
+        std::env::var("ATERM_CONTROL_SOCK").ok(),
+        std::env::var("ATERM_CONTROL_TOKEN").ok(),
+        |path| aterm_ctl::read_control_token_file(path).ok(),
+    )
+}
+
+/// `--dial` always needs an explicit/env LOCAL endpoint; it has no discovery
+/// fallback because the local host is the authority that resolves the saved name.
+fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
+    resolve_configured_local_endpoint(opts)?.ok_or_else(|| {
+        "--dial needs the LOCAL host socket: pass --socket <PATH> or set ATERM_CONTROL_SOCK"
+            .to_string()
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LocalPromptRoute {
+    Persistent { socket: String, token: String },
+    ShellDiscovery,
+}
+
+/// A missing/unreadable token keeps the pre-existing shell client in charge: it
+/// has its own discovery and classified authentication diagnostics. Only a fully
+/// resolved endpoint opts into the persistent protocol path.
+fn local_prompt_route(endpoint: Result<Option<(String, String)>, String>) -> LocalPromptRoute {
+    match endpoint {
+        Ok(Some((socket, token))) => LocalPromptRoute::Persistent { socket, token },
+        Ok(None) | Err(_) => LocalPromptRoute::ShellDiscovery,
+    }
+}
+
+fn run_prompt_turn<C: ControlClient>(
+    opts: &Opts,
+    client: &mut C,
+    text: &str,
+) -> Result<String, String>
+where
+    C::Error: std::fmt::Display,
+{
+    let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
+    gov.enable_self_write();
+    let turn = Turn {
+        idle: Duration::from_millis(opts.idle_ms),
+        timeout: Duration::from_millis(opts.timeout_ms),
+        ready_pattern: resolve_ready(opts.ready.clone()),
+    };
+    turn.run(client, &mut gov, text.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+/// Run the configured-endpoint prompt fast path when `route` selected it.
+/// Keeping route resolution outside this seam makes the protocol test
+/// independent of ambient process environment while production still uses the
+/// exact same connection/Turn body.
+fn run_persistent_local_prompt(
+    opts: &Opts,
+    route: LocalPromptRoute,
+) -> Option<Result<String, String>> {
+    if opts.cmd.first().map(String::as_str) != Some("prompt") {
+        return None;
+    }
+    let LocalPromptRoute::Persistent {
+        socket: sock,
+        token,
+    } = route
+    else {
+        return None;
+    };
+    let text = opts.cmd[1..].join(" ");
+    if text.is_empty() {
+        return Some(Err(
+            "prompt needs text, e.g. `aterm-drive prompt 'say hi'`".to_string()
+        ));
+    }
+    Some(
+        RelayClient::connect_local(&sock, &token)
+            .map_err(|e| {
+                format!(
+                    "cannot reach the configured target aterm at control socket '{sock}' ({e}).\n  \
+                     • Is that aterm still running?\n  \
+                     • Is the socket/token pair current? (--socket / ATERM_CONTROL_SOCK / \
+                     ATERM_CONTROL_TOKEN)"
+                )
+            })
+            .and_then(|mut client| run_prompt_turn(opts, &mut client, &text)),
+    )
 }
 
 /// The whole drive CLI as a callable: `argv[1..]` in, exit code out. Served
@@ -208,16 +304,19 @@ fn run(opts: &Opts) -> Result<String, String> {
                  • Is the LOCAL socket/token right? (--socket / ATERM_CONTROL_SOCK / ATERM_CONTROL_TOKEN)"
             )
         })?;
-        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-        gov.enable_self_write();
-        let turn = Turn {
-            idle: Duration::from_millis(opts.idle_ms),
-            timeout: Duration::from_millis(opts.timeout_ms),
-            ready_pattern: resolve_ready(opts.ready.clone()),
-        };
-        return turn
-            .run(&mut client, &mut gov, text.as_bytes())
-            .map_err(|e| e.to_string());
+        return run_prompt_turn(opts, &mut client, &text);
+    }
+
+    // A configured local endpoint already gives us everything the control CLI
+    // would rediscover on every verb. Keep one authenticated connection for the
+    // entire prompt turn (send/key/await/text), and let the connect itself replace
+    // the subprocess `cursor` preflight. Other commands deliberately retain the
+    // shell client because this fast path is scoped to the Turn flow.
+    if let Some(result) = run_persistent_local_prompt(
+        opts,
+        local_prompt_route(resolve_configured_local_endpoint(opts)),
+    ) {
+        return result;
     }
 
     let ctl = resolve_ctl();
@@ -243,18 +342,7 @@ fn run(opts: &Opts) -> Result<String, String> {
             if text.is_empty() {
                 return Err("prompt needs text, e.g. `aterm-drive prompt 'say hi'`".to_string());
             }
-            // A permissive governor: this drives ANOTHER session (cross-session),
-            // so self-write is enabled with ample headroom. (Self-driving a single
-            // terminal is the case where the floor matters — see the lib docs.)
-            let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
-            gov.enable_self_write();
-            let turn = Turn {
-                idle: Duration::from_millis(opts.idle_ms),
-                timeout: Duration::from_millis(opts.timeout_ms),
-                ready_pattern: resolve_ready(opts.ready.clone()),
-            };
-            turn.run(&mut client, &mut gov, text.as_bytes())
-                .map_err(|e| e.to_string())
+            run_prompt_turn(opts, &mut client, &text)
         }
         "read" => client.run(&["text"]),
         "shot" => {
@@ -294,6 +382,30 @@ fn run(opts: &Opts) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt_opts(socket: String) -> Opts {
+        Opts {
+            socket: Some(socket),
+            dial: None,
+            idle_ms: 7,
+            timeout_ms: 1_000,
+            ready: Some(String::new()),
+            cmd: vec!["prompt".to_string(), "hello".to_string()],
+        }
+    }
+
+    fn unique_endpoint() -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-agent-fast-path-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create unique endpoint directory");
+        (dir.join("control.sock"), dir)
+    }
 
     /// The prompt-ready pattern must be a KNOB, not a constant: the default only
     /// matches a Claude input caret, so driving any other REPL — or a plain
@@ -374,5 +486,175 @@ mod tests {
             !p.to_string_lossy().ends_with("/c.token"),
             "the old hand-rolled <stem>.token derivation is gone, got {p:?}"
         );
+    }
+
+    #[test]
+    fn configured_endpoint_uses_one_persistent_route_and_flag_precedence() {
+        let endpoint = resolve_configured_local_endpoint_with(
+            Some("/run/flag.sock".to_string()),
+            Some("/run/env.sock".to_string()),
+            Some("capability".to_string()),
+            |_| panic!("an env token must avoid a token-file read"),
+        )
+        .expect("configured endpoint resolves");
+
+        assert_eq!(
+            local_prompt_route(Ok(endpoint)),
+            LocalPromptRoute::Persistent {
+                socket: "/run/flag.sock".to_string(),
+                token: "capability".to_string(),
+            },
+            "the prompt fast path receives the exact explicit endpoint and token"
+        );
+    }
+
+    #[test]
+    fn configured_prompt_uses_one_connection_and_no_cursor_preflight() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (socket, dir) = unique_endpoint();
+        let socket_text = socket.to_string_lossy().into_owned();
+        let token_path = aterm_uds::latest::token_path_for_sock(&socket_text).expect("token path");
+        std::fs::write(&token_path, "capability\n").expect("write token");
+        let listener = aterm_uds::CtlListener::bind(&socket).expect("bind endpoint");
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("one persistent connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut writer = stream;
+            let mut requests = Vec::new();
+
+            for reply in [b"".as_slice(), b"OK\n", b"OK\n", b"OK idle 1\n"] {
+                let mut request = String::new();
+                reader.read_line(&mut request).expect("request line");
+                requests.push(request.trim_end().to_string());
+                writer.write_all(reply).expect("reply");
+            }
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("text request");
+            requests.push(request.trim_end().to_string());
+            writer
+                .write_all(b"OK 2\nsettled\n> \n")
+                .expect("text reply");
+            requests
+        });
+
+        let out = run_persistent_local_prompt(
+            &prompt_opts(socket_text.clone()),
+            LocalPromptRoute::Persistent {
+                socket: socket_text,
+                token: "capability".to_string(),
+            },
+        )
+        .expect("persistent route selected")
+        .expect("persistent prompt turn");
+        let requests = server.join().expect("server completes");
+
+        assert_eq!(out, "settled\n> \n");
+        assert_eq!(
+            requests,
+            [
+                "AUTH capability",
+                "send hello",
+                "key enter",
+                "await idle 7 timeout 1000",
+                "text",
+            ],
+            "one connection carries the whole Turn and never sends a cursor preflight"
+        );
+
+        std::fs::remove_file(&socket).expect("remove socket");
+        std::fs::remove_file(&token_path).expect("remove token");
+        std::fs::remove_dir(dir).expect("remove endpoint directory");
+    }
+
+    #[test]
+    fn absent_or_disabled_endpoint_preserves_shell_discovery_fallback() {
+        for flag in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("off".to_string()),
+        ] {
+            let endpoint = resolve_configured_local_endpoint_with(flag, None, None, |_| {
+                panic!("fallback must not probe a token file")
+            })
+            .expect("no configured endpoint is not an error");
+            assert_eq!(
+                local_prompt_route(Ok(endpoint)),
+                LocalPromptRoute::ShellDiscovery,
+                "None selects the existing shell discovery path"
+            );
+        }
+    }
+
+    #[test]
+    fn env_endpoint_resolves_the_per_socket_token_file() {
+        let endpoint = resolve_configured_local_endpoint_with(
+            None,
+            Some("/tmp/run/custom.sock".to_string()),
+            None,
+            |path| {
+                assert!(
+                    path.ends_with("custom.sock.token"),
+                    "per-socket token path: {path:?}"
+                );
+                Some("  file-capability\n".to_string())
+            },
+        )
+        .expect("env endpoint resolves");
+
+        assert_eq!(
+            endpoint,
+            Some((
+                "/tmp/run/custom.sock".to_string(),
+                "file-capability".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn unresolved_token_preserves_shell_diagnostics_while_dial_still_gets_the_error() {
+        let err = resolve_configured_local_endpoint_with(
+            None,
+            Some("/tmp/run/custom.sock".to_string()),
+            None,
+            |_| None,
+        )
+        .expect_err("the endpoint itself cannot resolve without its token");
+
+        assert!(
+            err.contains("could not resolve the LOCAL control token"),
+            "{err}"
+        );
+        assert_eq!(
+            local_prompt_route(Err(err)),
+            LocalPromptRoute::ShellDiscovery,
+            "local prompt retains aterm-ctl's existing classified error path"
+        );
+    }
+
+    #[test]
+    fn resolved_but_unreachable_endpoint_surfaces_connect_error_without_retargeting() {
+        let (socket, dir) = unique_endpoint();
+        let socket_text = socket.to_string_lossy().into_owned();
+        let token_path = aterm_uds::latest::token_path_for_sock(&socket_text).expect("token path");
+        std::fs::write(&token_path, "capability\n").expect("write token");
+
+        let err = run(&prompt_opts(socket_text))
+            .expect_err("a resolved endpoint must not silently retarget");
+        assert!(
+            err.contains("cannot reach the configured target aterm"),
+            "actionable endpoint error: {err}"
+        );
+
+        std::fs::remove_file(token_path).expect("remove token");
+        std::fs::remove_dir(dir).expect("remove endpoint directory");
     }
 }

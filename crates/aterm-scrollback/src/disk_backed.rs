@@ -155,6 +155,10 @@ pub struct DiskBackedScrollback {
     /// Maximum total lines allowed (None = no limit).
     /// When set, older lines are discarded when this limit is exceeded.
     line_limit: Option<usize>,
+    /// Monotonic count of history lines that crossed the IMAGE RETENTION
+    /// HORIZON — see
+    /// [`image_rows_dropped_by_compression`](Self::image_rows_dropped_by_compression).
+    image_rows_dropped_by_compression: u64,
     /// Current memory pressure watermark level.
     watermark_level: WatermarkLevel,
     /// Absolute byte threshold for Yellow level (entry).
@@ -196,6 +200,7 @@ impl DiskBackedScrollback {
             block_size,
             line_count: cold_lines,
             line_limit: None,
+            image_rows_dropped_by_compression: 0,
             watermark_level: WatermarkLevel::Green,
             yellow_threshold: threshold_bytes(DEFAULT_YELLOW_PERCENT, config.memory_budget),
             yellow_exit_threshold: threshold_bytes(YELLOW_EXIT_PERCENT, config.memory_budget),
@@ -245,6 +250,19 @@ impl DiskBackedScrollback {
     #[inline]
     pub(crate) fn line_limit(&self) -> Option<usize> {
         self.line_limit
+    }
+
+    /// Monotonic count of history lines whose INLINE IMAGE was discarded
+    /// because the line was compressed — the disk-backed twin of
+    /// [`Scrollback::image_rows_dropped_by_compression`], with the identical
+    /// meaning and the identical horizon: a picture ends where compression
+    /// begins, so it never reaches the `.dtrm` cold file at all.
+    ///
+    /// [`Scrollback::image_rows_dropped_by_compression`]: crate::Scrollback::image_rows_dropped_by_compression
+    #[must_use]
+    #[inline]
+    pub fn image_rows_dropped_by_compression(&self) -> u64 {
+        self.image_rows_dropped_by_compression
     }
 
     /// Set the line limit (maximum total lines allowed).

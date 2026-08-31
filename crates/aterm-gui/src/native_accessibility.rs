@@ -274,6 +274,46 @@ pub(crate) enum AccessibilityProjectionError {
 pub(crate) struct StagedNativeAccessibility {
     pub(crate) owners: Vec<AccessibilityOwner>,
     pub(crate) projection: NativeAccessibilityProjection,
+    window_root_index: usize,
+}
+
+impl StagedNativeAccessibility {
+    pub(crate) fn new(
+        owners: Vec<AccessibilityOwner>,
+        projection: NativeAccessibilityProjection,
+    ) -> Self {
+        // `compose_native_accessibility` appends its host Window root last.
+        // Retain that O(1) slot and revalidate both id and label at publish;
+        // malformed or differently-built projections fail closed.
+        let window_root_index = projection.update.nodes.len().saturating_sub(1);
+        Self {
+            owners,
+            projection,
+            window_root_index,
+        }
+    }
+
+    /// A staged composite is reusable only while every piece of its published
+    /// identity is still current. The view generations protect action routes;
+    /// the root label protects the window name, which `apply_title` may advance
+    /// after native paint stages this projection but before the frame publishes.
+    pub(crate) fn matches(&self, owners: &[AccessibilityOwner], window_title: &str) -> bool {
+        let root = self.projection.update.tree.as_ref().map(|tree| tree.root);
+        self.owners.as_slice() == owners
+            && self
+                .projection
+                .update
+                .nodes
+                .get(self.window_root_index)
+                .is_some_and(|(node, value)| {
+                    Some(*node) == root
+                        && value.label() == Some(normalized_window_title(window_title))
+                })
+    }
+}
+
+fn normalized_window_title(title: &str) -> &str {
+    if title.is_empty() { "aterm" } else { title }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -913,11 +953,7 @@ pub(crate) fn compose_native_accessibility(
     // window: the root's name is what every assistive client calls the WINDOW, so a user
     // moving between windows must not hear "aterm" for all of them — and it must not
     // change meaning merely because the front tab is a native app rather than a shell.
-    window.set_label(if window_title.is_empty() {
-        "aterm"
-    } else {
-        window_title
-    });
+    window.set_label(normalized_window_title(window_title));
     window.set_bounds(window_bounds);
     window.set_children(child_roots);
     nodes.push((root, window));

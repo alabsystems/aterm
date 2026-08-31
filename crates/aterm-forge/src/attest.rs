@@ -513,7 +513,7 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
 /// Every `[[package]]` entry in `Cargo.lock` for `name`, as
 /// `(version, has_source)`. A path-patched package carries NO `source` key,
 /// which is exactly how a live patch is distinguished from a dead one.
-fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)>, String> {
+pub(crate) fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)>, String> {
     let path = root.join("Cargo.lock");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -1254,10 +1254,15 @@ fn ob7_apache_modification_notices(root: &Path, forks: &[VendoredFork], log: &mu
             let _ = writeln!(
                 log,
                 "  • NOTE [OB-7] fork `{}` cannot be diffed: no pristine copy of `{} {}` under \
-                 the local registry src. This obligation is therefore UNVERIFIED for it, not \
-                 satisfied. FIX: `cargo fetch` (or unpack the .crate from the registry cache) so \
-                 the pristine tree is present, then re-run.",
-                fork.name, fork.name, fork.version
+                 `vendor/.forge/{}/pristine/` or the local registry src. This obligation is \
+                 therefore UNVERIFIED for it, not satisfied. FIX: unpack the published \
+                 `{}-{}.crate` into `vendor/.forge/{}/pristine/`, then re-run. NOT `cargo \
+                 fetch`: this package is patched out, so its lock entry is source-less and cargo \
+                 never downloads the crate the fork replaced — on a machine that has not held \
+                 the pristine tree since before the patch landed, neither the registry src nor \
+                 the registry cache will ever acquire it (measured on m22, 2026-08-30, for both \
+                 `winit 0.30.13` and `smol_str 0.2.2`).",
+                fork.name, fork.name, fork.version, fork.name, fork.name, fork.version, fork.name
             );
             continue;
         };
@@ -1334,9 +1339,22 @@ struct Divergence {
     added: Vec<String>,
 }
 
-/// The unpacked pristine source for `name@version`, if the local registry has
-/// it. Offline by construction — this is the same tree `diff -rq` was used
-/// against by hand, and it is present for all six current forks.
+/// The unpacked pristine source for `name@version`, if this checkout or the
+/// local registry has it. Offline by construction — this is the same tree
+/// `diff -rq` was used against by hand.
+///
+/// WHETHER IT IS THERE IS A PROPERTY OF THE MACHINE, NOT OF THE TREE, and an
+/// earlier version of this comment claimed the opposite ("present for all six
+/// current forks"). It is not: `[patch.crates-io]` makes the replaced
+/// package's lock entry source-less, so cargo never downloads it, and a
+/// machine that did not already hold the pristine copy from before the fork
+/// landed never will. MEASURED on m22, 2026-08-30: `winit 0.30.13` and
+/// `smol_str 0.2.2` are absent from BOTH `registry/src` and `registry/cache`,
+/// while `indexmap 2.14.0`, `libm 0.2.16` and `pkg-config` are present — so
+/// [OB-7] is UNVERIFIED here for winit and green on the machine that recorded
+/// the ledger. `crate::loc::package_dir` has the same dependency on the same
+/// missing artifact and does NOT fail loudly: it silently measures the fork
+/// instead, which is worth 713 lines of `third_party_loc` in every cell.
 fn pristine_dir(root: &Path, name: &str, version: &str) -> Option<PathBuf> {
     // A repo-local pristine tree wins over the registry. This is the
     // `vendor/.forge/<name>/pristine/` slot of the fork ledger layout: a fork
@@ -1712,7 +1730,7 @@ mod tests {
     /// The arm is SORTED (measured, not assumed — the first draft of this
     /// assertion listed them in manifest order and went red).
     #[test]
-    fn the_real_patch_table_is_five_vendored_forks_and_five_first_party_targets() {
+    fn the_real_patch_table_is_five_vendored_forks_and_six_first_party_targets() {
         let root = repo_root();
         let (vendored, first_party) = partition_patches(&patch_paths(&root).unwrap(), &root);
         let mut names: Vec<String> = vendored.into_iter().map(|(n, _)| n).collect();
@@ -1726,6 +1744,7 @@ mod tests {
             vec![
                 ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
                 ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
+                ("libc".to_string(), "crates/aterm-libc".to_string()),
                 ("log".to_string(), "crates/aterm-log-shim".to_string()),
                 (
                     "profiling".to_string(),

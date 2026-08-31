@@ -19,6 +19,16 @@ impl DiskBackedScrollback {
             return Ok(());
         }
 
+        // THE IMAGE RETENTION HORIZON, counted through the same seam as the
+        // in-memory store's promotion so the two can never come to mean
+        // different things (see `crate::count_image_rows`). The disk store's
+        // horizon is the SAME boundary: compression, not the trip to disk —
+        // a picture is already gone by the time a warm block reaches the cold
+        // `.dtrm` file.
+        self.image_rows_dropped_by_compression = self
+            .image_rows_dropped_by_compression
+            .saturating_add(crate::count_image_rows(&lines));
+
         // Compress and add to warm tier.
         self.warm.push_block(&lines);
 

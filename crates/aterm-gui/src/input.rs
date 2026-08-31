@@ -179,8 +179,9 @@ pub enum InputEvent {
     /// Never emits wheel reports; it only moves the local viewport. A controller
     /// that wants to drive a tracking app's wheel uses `Wheel`/`mouse` instead.
     ScrollView(ScrollIntent),
-    /// Paste text as if typed (bracketed when the app enabled DECSET 2004).
-    Paste(String),
+    /// Paste text as if typed, framed per [`PasteFraming`] (bracketed when the
+    /// app enabled DECSET 2004, unless the gesture already captured that answer).
+    Paste(String, PasteFraming),
     /// A geometry change. Re-clamped against `MAX_GRID_*` in the seam.
     ///
     /// `echo_to_window` is a TRANSPORT flag (NOT a `Source` branch): the control
@@ -244,6 +245,51 @@ impl PixelOffset {
     /// The cell's top-left corner — the offset a Controller (no real pointer)
     /// uses, so a 1016 report it drives is exactly the cell origin in pixels.
     pub const CELL_ORIGIN: Self = Self { x: 0, y: 0 };
+}
+
+/// WHEN the bracketed-paste (DEC 2004) question is answered for one
+/// [`InputEvent::Paste`] — carried ON the event, because the gesture that starts
+/// a paste and the write that lands it are separated by a queue.
+///
+/// A paste does not egress where it is made: `App::input_paste` enqueues it on the
+/// per-session ordered writer and `seam_egress` produces the bytes later, on that
+/// writer's thread. A program on the other end of the PTY can flip DEC 2004 inside
+/// that window, so "read the mode when the bytes are produced" and "read the mode
+/// when the person made the gesture" are genuinely different answers — and the
+/// multi-line paste confirmation asks its question using the SECOND one. Framing by
+/// the first let the guard and the wire disagree about the same paste in both
+/// directions: a body confirmed as unbracketed arriving bracketed, and (the
+/// dangerous way round) a body judged inert BECAUSE bracketed paste was on arriving
+/// unbracketed at a bare prompt, submitting every line without ever being asked
+/// about.
+///
+/// This is DATA on the event, never a [`Source`] branch: `seam_egress` reads the
+/// same field for a human paste and a controller one, so identical events still
+/// produce identical bytes and the `bytes_human_eq_controller` invariant is
+/// untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteFraming {
+    /// Read DEC 2004 when the bytes are produced. Nothing was promised about this
+    /// paste: the `paste`/`paste-bin` control verbs (no gesture, no confirmation —
+    /// their documented contract is the terminal's mode at write time) and the
+    /// file drop, which never consults the mode at all.
+    AtDrain,
+    /// Frame by `bracketed` no matter what the mode says at drain time: the answer
+    /// observed when a person's paste gesture was JUDGED — the same read the
+    /// pastejacking guard decided by, so what they were told is what is sent.
+    Gesture { bracketed: bool },
+}
+
+impl PasteFraming {
+    /// The framing decision for a paste being written now, given the terminal's
+    /// LIVE DEC 2004 state. The one place the two answers are reconciled.
+    #[must_use]
+    pub fn bracketed(self, live: bool) -> bool {
+        match self {
+            Self::AtDrain => live,
+            Self::Gesture { bracketed } => bracketed,
+        }
+    }
 }
 
 /// Tracking-agnostic scrollback navigation for [`InputEvent::ScrollView`].
@@ -660,7 +706,7 @@ fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8]) -> Delivery {
 /// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
 /// SOLE reader of `keyboard_mode()`/`mouse_tracking_enabled()` and the SOLE caller
 /// of `encode_key_with_layout` / the `encode_mouse_*` family / `encode_committed_
-/// text` / `format_paste` / the focus-report egress, reading the relevant mode
+/// text` / `format_paste_framed` / the focus-report egress, reading the relevant mode
 /// ONCE per event under a single `term_lock`, ending at the `mode`-selected
 /// [`emit`] (`Interactive` = non-parking on the UI thread; `Backpressured` =
 /// blocking + `SPILL_CAP` on an expendable thread; `TryImmediate` = guarded,
@@ -949,8 +995,17 @@ pub fn seam_egress(
                 },
             }
         }
-        InputEvent::Paste(text) => {
-            let out = term_lock(term).format_paste(text);
+        InputEvent::Paste(text, framing) => {
+            // The framing question is answered by the EVENT (see [`PasteFraming`]):
+            // a paste reaches here on the ordered-writer thread, arbitrarily later
+            // than the gesture that made it, so the live mode is the right answer
+            // only for a paste nobody was promised anything about. Both reads
+            // happen under this one lock, so the fallback still sees the mode the
+            // bytes are being written against.
+            let out = {
+                let t = term_lock(term);
+                t.format_paste_framed(text, framing.bracketed(t.modes().bracketed_paste))
+            };
             let d = if out.is_empty() {
                 Delivery::Full
             } else {
@@ -1487,7 +1542,7 @@ mod tests {
             | InputEvent::MouseMove { .. }
             | InputEvent::Wheel { .. }
             | InputEvent::ScrollView(_)
-            | InputEvent::Paste(_)
+            | InputEvent::Paste(..)
             | InputEvent::Resize { .. }
             | InputEvent::ResizeWindowPx { .. }
             | InputEvent::Focus(_) => {}
@@ -2092,7 +2147,15 @@ mod tests {
                 suppress_copy_on_select: false,
                 px_off: PixelOffset::CELL_ORIGIN,
             },
-            InputEvent::Paste("rm -rf safe".to_string()),
+            InputEvent::Paste("rm -rf safe".to_string(), PasteFraming::AtDrain),
+            // A CAPTURED framing is data on the event, not a source flag: the
+            // matrix runs with DEC 2004 ON below, so a `Gesture` that disagrees
+            // with the live mode is exactly the case where a source branch would
+            // show up — both sides must still produce the SAME unbracketed bytes.
+            InputEvent::Paste(
+                "rm -rf safe".to_string(),
+                PasteFraming::Gesture { bracketed: false },
+            ),
             InputEvent::Focus(true),
             InputEvent::Focus(false),
             // [key_sequences] override: written to the PTY verbatim, no Source and no
@@ -2584,6 +2647,44 @@ mod tests {
         }
     }
 
+    /// THE FRAMING FIELD IS THE SEAM'S ONLY ANSWER for a paste: `AtDrain` reads
+    /// DEC 2004 as it stands right now (the write-time contract the control verbs
+    /// keep), and `Gesture` overrides it in BOTH directions — which is the whole
+    /// point, since the writer thread runs arbitrarily later than the gesture and
+    /// the program can move the mode in between.
+    ///
+    /// Sanitize and LF→CR are unaffected either way: only the guards move.
+    #[test]
+    fn the_seam_frames_a_paste_by_the_event_not_by_the_moment() {
+        let live_off = term_with(&[]);
+        let live_on = term_with(&[b"\x1b[?2004h"]);
+        let paste = |framing| InputEvent::Paste("ls\nrm -rf ~".to_string(), framing);
+
+        // AtDrain: the live mode — unchanged behaviour for a paste nobody was
+        // promised anything about.
+        assert_eq!(
+            egress_bytes(&live_off, &paste(PasteFraming::AtDrain)),
+            b"ls\rrm -rf ~".to_vec()
+        );
+        assert_eq!(
+            egress_bytes(&live_on, &paste(PasteFraming::AtDrain)),
+            b"\x1b[200~ls\rrm -rf ~\x1b[201~".to_vec()
+        );
+
+        // Gesture: the captured answer wins over whatever the mode says NOW, so a
+        // program flipping 2004 under a queued paste changes nothing about it.
+        assert_eq!(
+            egress_bytes(&live_on, &paste(PasteFraming::Gesture { bracketed: false })),
+            b"ls\rrm -rf ~".to_vec(),
+            "2004 turned ON after the gesture cannot bracket an unbracketed promise"
+        );
+        assert_eq!(
+            egress_bytes(&live_off, &paste(PasteFraming::Gesture { bracketed: true })),
+            b"\x1b[200~ls\rrm -rf ~\x1b[201~".to_vec(),
+            "2004 turned OFF after the gesture cannot unframe a paste judged inert"
+        );
+    }
+
     /// END-TO-END through the paste seam: the drop site appends one space and
     /// routes the escaped path through `format_paste`. With bracketed paste OFF
     /// the bytes are the escaped path + trailing space verbatim (ESC/C1 are still
@@ -2606,13 +2707,19 @@ mod tests {
         // Bracketed paste OFF: literal escaped path + trailing space.
         let term = term_with(&[]);
         assert_eq!(
-            egress_bytes(&term, &InputEvent::Paste(drop_text("/p/My File"))),
+            egress_bytes(
+                &term,
+                &InputEvent::Paste(drop_text("/p/My File"), PasteFraming::AtDrain)
+            ),
             b"/p/My\\ File ".to_vec()
         );
         // Bracketed paste ON (DEC 2004): same body inside the bracket guards.
         let term = term_with(&[b"\x1b[?2004h"]);
         assert_eq!(
-            egress_bytes(&term, &InputEvent::Paste(drop_text("/p/My File"))),
+            egress_bytes(
+                &term,
+                &InputEvent::Paste(drop_text("/p/My File"), PasteFraming::AtDrain)
+            ),
             b"\x1b[200~/p/My\\ File \x1b[201~".to_vec()
         );
     }

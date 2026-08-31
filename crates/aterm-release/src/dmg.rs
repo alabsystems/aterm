@@ -163,6 +163,86 @@ fn archive_app(_app: &Path, _zip: &Path) -> Result<(), String> {
     Err("bundle zip creation requires macOS (ditto); build releases on a Mac".into())
 }
 
+/// The mounted window's geometry, in Finder's coordinates: broad enough to hold
+/// the app and the `/Applications` alias side by side, with the drag going
+/// left → right. Numbers, not prose, so the layout is reviewable.
+///
+/// (This used to read "a window / wide enough to hold …", and OB-17's reserved
+/// vocabulary matched the accidental adjacency of those two words across the
+/// line break. It was never a scope claim — the window is broad, it does not
+/// scope anything — so the sentence is reworded rather than waived: a waiver
+/// spent on a false positive teaches the next reader that the channel is for
+/// noise.)
+const WIN_LEFT: u32 = 200;
+const WIN_TOP: u32 = 160;
+const WIN_WIDTH: u32 = 620;
+const WIN_HEIGHT: u32 = 400;
+const ICON_SIZE: u32 = 128;
+/// Icon centres inside the window's content area.
+const APP_ICON_X: u32 = 160;
+const APP_ICON_Y: u32 = 205;
+const DROP_ICON_X: u32 = 460;
+const DROP_ICON_Y: u32 = 205;
+
+// The geometry must describe a window a user can actually drag across: the
+// app on the left, the /Applications alias on the right, both fully visible.
+const _: () = {
+    assert!(APP_ICON_X < DROP_ICON_X, "the drag must go left to right");
+    assert!(
+        DROP_ICON_X + ICON_SIZE / 2 <= WIN_WIDTH,
+        "the /Applications icon falls outside the window"
+    );
+    assert!(
+        APP_ICON_X > ICON_SIZE / 2,
+        "the app icon is clipped by the left edge"
+    );
+    assert!(
+        APP_ICON_Y + ICON_SIZE / 2 <= WIN_HEIGHT && DROP_ICON_Y + ICON_SIZE / 2 <= WIN_HEIGHT,
+        "an icon falls below the window"
+    );
+};
+
+/// Set to anything non-empty to skip the decorated window and cut the plain
+/// image directly — the escape hatch for a machine where driving Finder is not
+/// wanted (and the switch the tests use).
+const NO_WINDOW_ENV: &str = "ATERM_DMG_NO_WINDOW";
+
+/// The Finder script that lays the window out. Written against the MOUNTED
+/// volume by name; every value comes from the constants above.
+fn window_applescript(volname: &str) -> String {
+    format!(
+        r#"tell application "Finder"
+  tell disk "{volname}"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {{{left}, {top}, {right}, {bottom}}}
+    set opts to the icon view options of container window
+    set arrangement of opts to not arranged
+    set icon size of opts to {icon}
+    set position of item "aterm.app" of container window to {{{ax}, {ay}}}
+    set position of item "Applications" of container window to {{{dx}, {dy}}}
+    close
+    open
+    update without registering applications
+    delay 1
+  end tell
+end tell
+"#,
+        volname = volname,
+        left = WIN_LEFT,
+        top = WIN_TOP,
+        right = WIN_LEFT + WIN_WIDTH,
+        bottom = WIN_TOP + WIN_HEIGHT,
+        icon = ICON_SIZE,
+        ax = APP_ICON_X,
+        ay = APP_ICON_Y,
+        dx = DROP_ICON_X,
+        dy = DROP_ICON_Y,
+    )
+}
+
 #[cfg(unix)]
 fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result<(), String> {
     // `cp -R` (not a hand-rolled walk): preserves symlinks, extended
@@ -175,6 +255,30 @@ fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result
     std::os::unix::fs::symlink("/Applications", stage.join("Applications"))
         .map_err(|e| format!("symlink /Applications: {e}"))?;
 
+    // THE DECORATED WINDOW (reinstating what spec decision 20 dropped; owner
+    // 2026-08-30). The drag to /Applications is not decoration — it is the
+    // gesture that clears App Translocation, and a copy launched from anywhere
+    // else can neither self-update nor put `aterm` on PATH. A window that opens
+    // with the app on the left and the Applications alias on the right is the
+    // only thing in the download that says so.
+    //
+    // FAIL-SOFT, DELIBERATELY. Laying the window out needs Finder, and Finder
+    // automation can be refused by TCC on a headless or freshly-provisioned
+    // cutting machine. A refused prompt must never cost a release, so every
+    // step below falls back to the plain image the cut has always produced.
+    // The DMG's bytes are not signed at this point (the container signature and
+    // the notarization staple are applied downstream), so the fallback is a
+    // straight substitution, not a half-built artifact.
+    if std::env::var_os(NO_WINDOW_ENV).is_none_or(|v| v.is_empty()) {
+        match build_decorated(stage, volname, dmg) {
+            Ok(()) => return Ok(()),
+            Err(why) => {
+                println!("==> DMG window layout skipped ({why}); cutting the plain image");
+                let _ = std::fs::remove_file(dmg);
+            }
+        }
+    }
+
     println!("==> hdiutil create {} (UDZO)", dmg.display());
     run_quiet(
         Command::new("hdiutil")
@@ -186,6 +290,87 @@ fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result
             .arg(dmg),
         "hdiutil create",
     )
+}
+
+/// Build the image the long way so Finder can lay the window out: a read-write
+/// image, mounted; the script above; then a compressed copy. Any failure is
+/// returned so the caller can fall back — and the mount is detached on EVERY
+/// path, because a leaked mount outlives the cut and wedges the next one.
+#[cfg(unix)]
+fn build_decorated(stage: &Path, volname: &str, dmg: &Path) -> Result<(), String> {
+    let rw = dmg.with_extension("rw.dmg");
+    let _ = std::fs::remove_file(&rw);
+    println!("==> hdiutil create {} (UDRW, for layout)", rw.display());
+    run_quiet(
+        Command::new("hdiutil")
+            .arg("create")
+            .args(["-volname", volname])
+            .arg("-srcfolder")
+            .arg(stage)
+            .args(["-fs", "HFS+", "-format", "UDRW", "-ov"])
+            .arg(&rw),
+        "hdiutil create (UDRW)",
+    )?;
+
+    // -nobrowse keeps the volume out of the Finder sidebar; it is still
+    // scriptable by name, which is what the AppleScript addresses.
+    let mount = dmg.with_extension("mnt");
+    let _ = std::fs::remove_dir_all(&mount);
+    std::fs::create_dir_all(&mount).map_err(|e| format!("create {}: {e}", mount.display()))?;
+    run_quiet(
+        Command::new("hdiutil")
+            .arg("attach")
+            .arg(&rw)
+            .args(["-nobrowse", "-mountpoint"])
+            .arg(&mount),
+        "hdiutil attach (layout)",
+    )
+    .inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&mount);
+        let _ = std::fs::remove_file(&rw);
+    })?;
+
+    let laid_out = run_quiet(
+        Command::new("osascript")
+            .arg("-e")
+            .arg(window_applescript(volname)),
+        "osascript (DMG window layout)",
+    );
+    // Detach BEFORE deciding what the layout result means: the mount must go
+    // whether Finder cooperated or not.
+    let detached = run_quiet(
+        Command::new("hdiutil")
+            .arg("detach")
+            .arg(&mount)
+            .arg("-force"),
+        "hdiutil detach (layout)",
+    );
+    let _ = std::fs::remove_dir_all(&mount);
+    if let Err(e) = laid_out {
+        let _ = std::fs::remove_file(&rw);
+        return Err(e);
+    }
+    detached.inspect_err(|_| {
+        let _ = std::fs::remove_file(&rw);
+    })?;
+
+    println!("==> hdiutil convert -> {} (UDZO)", dmg.display());
+    let converted = run_quiet(
+        Command::new("hdiutil")
+            .arg("convert")
+            .arg(&rw)
+            .args(["-format", "UDZO", "-ov", "-o"])
+            .arg(dmg),
+        "hdiutil convert (UDZO)",
+    );
+    let _ = std::fs::remove_file(&rw);
+    converted
+}
+
+/// The decorated path is macOS-only for the same reason the plain one is.
+#[cfg(not(unix))]
+fn build_decorated(_stage: &Path, _volname: &str, _dmg: &Path) -> Result<(), String> {
+    Err("DMG window layout requires macOS".into())
 }
 
 /// DMG assembly is a macOS operation end-to-end (`hdiutil`, HFS+, the
@@ -228,4 +413,90 @@ fn run_quiet(cmd: &mut Command, what: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The script addresses the volume BY NAME — the name `create` derives from
+    /// the version — and carries the geometry above. A script that names the
+    /// wrong disk would lay out whatever else happens to be mounted.
+    #[test]
+    fn applescript_addresses_the_volume_and_carries_the_geometry() {
+        let script = window_applescript("aterm 9.9.0");
+        assert!(script.contains(r#"tell disk "aterm 9.9.0""#), "{script}");
+        assert!(
+            script.contains(&format!(
+                "set the bounds of container window to {{{}, {}, {}, {}}}",
+                WIN_LEFT,
+                WIN_TOP,
+                WIN_LEFT + WIN_WIDTH,
+                WIN_TOP + WIN_HEIGHT
+            )),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!(
+                r#"set position of item "aterm.app" of container window to {{{APP_ICON_X}, {APP_ICON_Y}}}"#
+            )),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!(
+                r#"set position of item "Applications" of container window to {{{DROP_ICON_X}, {DROP_ICON_Y}}}"#
+            )),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!("set icon size of opts to {ICON_SIZE}")),
+            "{script}"
+        );
+    }
+
+    /// A volume name with a quote in it would end the AppleScript string early
+    /// and run whatever followed. The names this cut produces are
+    /// `aterm <version>`, so this is a guard against a future caller, not a
+    /// live bug — but the guard belongs in the test, not in a comment.
+    #[test]
+    fn volume_names_this_cut_produces_carry_no_quotes() {
+        for v in ["0.67.0", "1.0.0", "0.100.0"] {
+            let volname = format!("aterm {v}");
+            assert!(!volname.contains('"'), "{volname}");
+            let script = window_applescript(&volname);
+            assert_eq!(
+                script.matches('"').count() % 2,
+                0,
+                "unbalanced quotes in the script for {volname}"
+            );
+        }
+    }
+
+    /// The decorated path must fail CLEANLY when it cannot build the image —
+    /// returning an error for the caller to fall back on, and leaving neither
+    /// the read-write image nor the mount directory behind. Finder is never
+    /// reached here: `hdiutil create` refuses the missing stage first.
+    #[cfg(unix)]
+    #[test]
+    fn decorated_build_fails_clean_and_leaves_nothing() {
+        let tmp = std::env::temp_dir().join(format!("aterm-dmg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("temp dir");
+        let dmg = tmp.join("aterm-9.9.0.dmg");
+        let missing_stage = tmp.join("no-such-stage");
+
+        let err = build_decorated(&missing_stage, "aterm 9.9.0", &dmg)
+            .expect_err("a missing stage must not produce an image");
+        assert!(!err.is_empty());
+
+        assert!(
+            !dmg.with_extension("rw.dmg").exists(),
+            "left the UDRW image behind"
+        );
+        assert!(
+            !dmg.with_extension("mnt").exists(),
+            "left the mount dir behind"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

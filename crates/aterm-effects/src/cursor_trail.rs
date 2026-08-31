@@ -430,27 +430,33 @@ impl CursorTrail {
     /// the following move (a key was pressed) and classifies it as scrubbing,
     /// which the comet deliberately does not paint.
     pub fn note_navigation(&mut self, now: Instant) {
-        self.type_hint.clear();
-        self.move_hint = None;
+        self.clear_typed();
         self.nav_hint = Some(now);
     }
 
     /// Arm one generic movement LICENSE, superseding any swallowed
     /// typed/navigation classifier.
     fn note_move(&mut self, now: Instant) {
-        self.type_hint.clear();
-        self.nav_hint = None;
+        self.clear_typed();
         self.move_hint = Some(now);
     }
 
-    /// Classify a Tab completion or non-empty paste.
+    /// Classify a Tab completion or non-empty paste. The SUPERSEDE shape, in
+    /// lockstep with `CursorGlow::note_user_gesture` (2026-08-30): the banked
+    /// typed stamps are real keys whose echoes are still in flight, so a Tab
+    /// mid-burst closes the nav/generic classes but keeps the bank — wiping
+    /// it here orphaned those echoes on the trail engine's side of the pair.
     pub fn note_user_gesture(&mut self, now: Instant) {
-        self.note_move(now);
+        self.supersede_typed_press();
+        self.move_hint = Some(now);
     }
 
-    /// Classify a plain Return.
+    /// Classify a plain Return — bank-preserving exactly like
+    /// [`Self::note_user_gesture`], in lockstep with `CursorGlow::note_return`
+    /// (which never wiped the bank).
     pub fn note_return(&mut self, now: Instant) {
-        self.note_move(now);
+        self.supersede_typed_press();
+        self.move_hint = Some(now);
     }
 
     /// Classify a settled user resize/re-grid.
@@ -521,9 +527,7 @@ impl CursorTrail {
         self.sparks.clear();
         self.last = None;
         self.last_visible = None;
-        self.type_hint.clear();
-        self.nav_hint = None;
-        self.move_hint = None;
+        self.clear_typed();
         self.blink_hint = None;
         self.ctx_alt = false;
         self.pane_columns = None;
@@ -550,9 +554,7 @@ impl CursorTrail {
             self.sparks.clear();
             self.last = cur;
             self.last_visible = cur.map(|c| (c, now));
-            self.type_hint.clear();
-            self.nav_hint = None;
-            self.move_hint = None;
+            self.clear_typed();
             self.blink_hint = None;
             return 0;
         }
@@ -595,25 +597,19 @@ impl CursorTrail {
             // borrow the typed/nav/gesture stamp and mint a detached comet.
             // The RESIDENT bed is untouched: a hidden relocation is someone
             // else's output, and earned light is never destroyed by that.
-            self.type_hint.clear();
-            self.nav_hint = None;
-            self.move_hint = None;
+            self.clear_typed();
         } else if completed_hidden_reappearance {
             // A visible→hidden→visible cycle that returns to the SAME cell is
             // still the completion boundary for one-shot input state.
             // No move reached `spawn`, so consume the hints dark; otherwise the
             // next unrelated PTY/CUP delta could borrow them.
-            self.type_hint.clear();
-            self.nav_hint = None;
-            self.move_hint = None;
+            self.clear_typed();
         } else if unseeded_visible {
             // A fresh/reset engine has no honest source cell from which to
             // render this landing. Seed the visible anchor, but spend every
             // one-shot license now: retaining it would let the following
             // unrelated CUP borrow it.
-            self.type_hint.clear();
-            self.nav_hint = None;
-            self.move_hint = None;
+            self.clear_typed();
         }
         self.last = cur;
         if let Some(c) = cur {

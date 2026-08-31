@@ -442,7 +442,7 @@ pub(crate) mod paste_order {
         // against a metric that means "keystroke to PTY", and `MAX_KEY_WRITE_NS`
         // is a `fetch_max` that never resets, so that reading poisons the maximum
         // for the life of the process.
-        let key_ns = if matches!(ev, InputEvent::Paste(_)) {
+        let key_ns = if matches!(ev, InputEvent::Paste(..)) {
             0
         } else {
             crate::metrics::take_key_arrival()
@@ -1720,15 +1720,19 @@ impl App {
 
     /// Whether tone-of-typing inference may run AT ALL: the `tone_melody`
     /// knob, the trail-sound config gates (master toggle + nonzero volume —
-    /// a muted synth needs no mood), and a LIVE trail-audio worker. The last
-    /// conjunct is the "never runs headless-muted" policy: a headless app,
-    /// a non-macOS build (inert audio stub), or a permanently failed audio
-    /// worker never spends a cycle on the classifier, never loads its
-    /// weights, never even buffers chars. Focus and reduced-motion need no
-    /// check HERE — the tone only rides sound events those policies already
-    /// gate at the drain seams.
+    /// a muted synth needs no mood), and a LIVE, RESPONSIVE trail-audio
+    /// worker. The liveness conjunct is the "never runs headless-muted"
+    /// policy: a headless app, a non-macOS build (inert audio stub), or a
+    /// permanently failed audio worker never spends a cycle on the
+    /// classifier, never loads its weights, never even buffers chars. The
+    /// responsiveness conjunct extends it to the WEDGED worker (stuck inside
+    /// one platform call, every cue dropped): its sound can only be silence,
+    /// so inference stops with it. Focus and reduced-motion need no check
+    /// HERE — the tone only rides sound events those policies already gate
+    /// at the drain seams.
     fn tone_infer_active(&self) -> bool {
         self.trail_audio.is_live()
+            && self.trail_audio.wedged_for().is_none()
             && self.config.tone_melody_or_default()
             && self.config.trail_sounds_or_default()
             && self.config.trail_sound_volume() > 0.0
@@ -1761,16 +1765,24 @@ impl App {
             return Err("no focused window".to_string());
         };
         let knob = self.config.tone_melody_or_default();
+        let audio = if !self.trail_audio.is_live() {
+            crate::tone_infer::AudioHost::Inert
+        } else if self.trail_audio.wedged_for().is_some() {
+            crate::tone_infer::AudioHost::Wedged
+        } else {
+            crate::tone_infer::AudioHost::Live
+        };
         Ok(crate::tone_infer::ToneStatus {
             tone: ws.tone_tracker.current(),
             effective: ws.tone_tracker.effective(knob),
             knob,
             sounds: self.config.trail_sounds_or_default(),
             volume: self.config.trail_sound_volume(),
-            audio_live: self.trail_audio.is_live(),
+            audio,
             active: self.tone_infer_active(),
             window_chars: ws.tone_tracker.window_chars(),
             inferences: ws.tone_tracker.inferences,
+            dropped: self.trail_audio.dropped_cues(),
         }
         .line())
     }
@@ -2277,7 +2289,16 @@ impl App {
         if !release_only {
             let class = classify_press(&ev);
             let plain_typed_glyph = class.typed_forward == Some(true) && !class.enter_like;
-            if !plain_typed_glyph {
+            // Presses that ARM THEIR OWN LICENSE CLASS downstream join the
+            // mash exception (2026-08-30): a plain Enter arms `note_return`
+            // and a Tab arms `note_user_gesture` at the dispatch boundary
+            // below, and both supersede the contradicted classes there while
+            // KEEPING the banked typed stamps. Wiping here instead orphaned
+            // every in-flight glyph echo at a submit/complete boundary — the
+            // deterministic no-fresh-hint decline per Enter and the mid-band
+            // Tab notch. Every other class still closes the cohort at entry.
+            let arms_own_license = plain_typed_glyph || is_plain_enter(&ev) || class.tab_key;
+            if !arms_own_license {
                 self.clear_move_license(wid);
             }
         }
@@ -2298,7 +2319,7 @@ impl App {
                     | InputEvent::MouseButton { .. }
                     | InputEvent::MouseMove { .. }
                     | InputEvent::Wheel { .. }
-                    | InputEvent::Paste(_)
+                    | InputEvent::Paste(..)
                     | InputEvent::ScrollView(_)
             )
         {
@@ -2471,7 +2492,7 @@ impl App {
             InputEvent::Key { .. }
             | InputEvent::Text(_)
             | InputEvent::KeySequence(_)
-            | InputEvent::Paste(_) => Some(std::time::Instant::now()),
+            | InputEvent::Paste(..) => Some(std::time::Instant::now()),
             _ => None,
         };
         match ev {
@@ -2788,11 +2809,20 @@ impl App {
                         // K sweeps — program output still finds no license.
                         let typed_press_supersede = typed_forward == Some(true)
                             && (!enter_like || (enter_like && !typed_enter && is_alt));
-                        if typed_press_supersede {
+                        // Plain Enter and Tab are BANK-PRESERVING too
+                        // (2026-08-30): each arms its own license class below
+                        // (`note_return` / `note_user_gesture`), and the
+                        // banked typed stamps are earlier keys whose echoes
+                        // are still in flight — wiping them here was the
+                        // deterministic +1 no-fresh-hint decline per Enter and
+                        // the 8-cell black notch behind every mid-burst Tab.
+                        // The supersede still closes every contradicted class;
+                        // modified chords, kills and raw input keep the wipe.
+                        if typed_press_supersede || typed_enter || tab_key {
                             ws.cursor_glow.supersede_typed_press(input_now);
                             ws.cursor_trail.supersede_typed_press();
                         } else {
-                                            ws.cursor_glow.clear_typed(input_now);
+                            ws.cursor_glow.clear_typed(input_now);
                             ws.cursor_trail.clear_typed();
                         }
                         // ECHO-CORRELATION DEADLINE. Clearing the bypass on the FIRST
@@ -3013,17 +3043,38 @@ impl App {
                             }
                         }
                         // Unsupported movement classes close the license and
-                        // do not re-stamp it here. Return, Tab and kill chords
-                        // are not typing, so a swallowed key cannot license the
-                        // relocation that follows one (navigation re-stamps its
-                        // own class immediately below).
-                        if (typed_enter && !shift_enter_insert)
-                            || navigation_key
-                            || kill_key
-                            || tab_key
-                        {
+                        // do not re-stamp it here. Kill chords are not typing,
+                        // so a swallowed key cannot license the relocation
+                        // that follows one (navigation re-stamps its own class
+                        // immediately below).
+                        if navigation_key || kill_key {
                             ws.cursor_glow.clear_typed(input_now);
                             ws.cursor_trail.clear_typed();
+                        }
+                        // Plain Enter LICENSES its response (2026-08-30): the
+                        // shell echo-back / prompt repaint after a submit is
+                        // the user's own keypress landing, and leaving it
+                        // licenseless was one deterministic no-fresh-hint
+                        // decline — one permanent unlit notch — per Enter
+                        // (measured 15/15). `note_return` is depth-1 and
+                        // consumed ONCE at the spawn seam, so exactly one
+                        // coalesced response move is licensed and a program
+                        // flood after it still declines. The bank was already
+                        // preserved by the supersede arm above.
+                        if typed_enter && !shift_enter_insert {
+                            ws.cursor_glow.note_return(input_now);
+                            ws.cursor_trail.note_return(input_now);
+                        }
+                        // Tab is a USER GESTURE (2026-08-30): a completion
+                        // sweep is the keyboard's own echo, and an unlicensed
+                        // one printed as the mid-band 8-cell hole. The gesture
+                        // hint is depth-1/consume-once too, and
+                        // `note_user_gesture` keeps the banked typed stamps
+                        // (the supersede shape) so mid-burst in-flight glyph
+                        // echoes stay licensed under their own class.
+                        if tab_key {
+                            ws.cursor_glow.note_user_gesture(input_now);
+                            ws.cursor_trail.note_user_gesture(input_now);
                         }
                         // ...except NAVIGATION, which re-stamps its own class:
                         // a press whose whole purpose is to move the cursor is
@@ -3539,7 +3590,7 @@ impl App {
             ev @ InputEvent::Wheel { .. } => self.input_wheel(wid, &ev, &term, &sink),
             // --- Explicit, tracking-agnostic scrollback nav (A.6) --------------
             InputEvent::ScrollView(intent) => self.input_scroll_view(wid, intent, &term),
-            ev @ InputEvent::Paste(_) => {
+            ev @ InputEvent::Paste(..) => {
                 // A PASTE IS TYPING, for the cursor-effect wake's purposes: the
                 // text lands at the caret and the cursor walks it, which is
                 // exactly the movement the trail exists to draw. The wake stamp
@@ -4179,23 +4230,37 @@ impl App {
     /// atomicity is the sink's own guarantee (direct writes serialize under its
     /// lock; a wedged-tty spill stays frame-contiguous). On session teardown the
     /// slave closes and the parked write returns an error, so the thread always
-    /// ends — no leak. `ev` must be `InputEvent::Paste(_)`.
+    /// ends — no leak. `ev` must be `InputEvent::Paste(..)`.
+    ///
+    /// THE DELAY IS WHY A PASTE CARRIES ITS FRAMING. Everything above says the
+    /// bytes are produced later, on another thread, after an unbounded queue —
+    /// which means the DEC 2004 state `seam_egress` would read is not necessarily
+    /// the one the gesture was judged under. The answer travels on the event
+    /// ([`crate::input::PasteFraming`]); this path only moves it, and must never
+    /// re-derive it.
     fn input_paste(
         &mut self,
         wid: WindowId,
         ev: InputEvent,
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
-        _input_now: std::time::Instant,
+        input_now: std::time::Instant,
     ) -> InputOutcome {
-        debug_assert!(matches!(&ev, InputEvent::Paste(_)));
+        debug_assert!(matches!(&ev, InputEvent::Paste(..)));
         self.snap_to_bottom(wid);
-        // A paste is not the user's fingers moving the caret: it is one
-        // gesture whose landing is asynchronous and arbitrarily large. Close
-        // the older license and stay dark.
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.clear_typed(std::time::Instant::now());
-            ws.cursor_trail.clear_typed();
+        // A movement-capable paste IS a user gesture (2026-08-30): one
+        // keyboard/menu action, classified through `note_user_gesture` at the
+        // real input boundary — the SUPERSEDE shape, so the banked typed
+        // stamps of keys already in flight ahead of this paste survive (the
+        // pre-fix `clear_typed` here wiped them and orphaned their echoes
+        // into no-fresh-hint declines). An empty / sanitizer-empty paste can
+        // move no cursor and arms nothing (tier-1: no licence without a real
+        // movement-capable press behind it).
+        let movement_capable = matches!(&ev, InputEvent::Paste(text, _)
+            if aterm_core::terminal::Terminal::paste_has_payload(text));
+        if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_glow.note_user_gesture(input_now);
+            ws.cursor_trail.note_user_gesture(input_now);
         }
         // Enqueue the paste on the session's ordered FIFO: it writes OFF the UI
         // thread (a 16 MiB paste into a stalled child must never block the event
@@ -4205,9 +4270,6 @@ impl App {
         match paste_order::enqueue(term, sink, ev) {
             Ok(_queued_behind_existing) => {}
             Err(ev) => {
-                // Detached fallback has no delivery-completion edge back to
-                // the event loop. Fail closed: its asynchronous/unproven bytes
-                // cannot leave a movement licence live for concurrent output.
                 let term = term.clone();
                 let sink = sink.clone();
                 std::thread::spawn(move || {
@@ -4215,6 +4277,18 @@ impl App {
                     input::seam_egress(&term, &sink, &ev, input::EgressMode::Backpressured);
                 });
             }
+        }
+        // NEITHER path above is delivery: the FIFO queues the bytes for a
+        // writer thread and the detached fallback has no completion edge, so
+        // — exactly like a queued key at the `Wake::Input` seam — the
+        // arrival-time licence must not be spendable by concurrent program
+        // output before the bytes provably land. Revoke the gesture stamped
+        // above, timestamp-matched so a newer key's licence (and every banked
+        // typed stamp) is untouched. The safe cost is only missing cosmetics
+        // for the eventual queued echo.
+        if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_glow.revoke_input_hints_at(input_now);
+            ws.cursor_trail.revoke_input_hints_at(input_now);
         }
         InputOutcome::Ok
     }
@@ -5423,6 +5497,14 @@ impl App {
         // sweeps were declined at no-fresh-hint and printed as permanently
         // unlit ribbon cells). The non-typed license classes are still closed;
         // App::input's own typed-press supersede runs downstream.
+        // Plain Enter and Tab join the exception (2026-08-30): each arms its
+        // OWN license class at the dispatch boundary (`note_return` /
+        // `note_user_gesture`, both bank-preserving supersedes), so the
+        // pre-dispatch wipe here destroyed the in-flight stamps AND the very
+        // class the press was about to arm — the deterministic no-fresh-hint
+        // decline per Enter, and the Tab notch. A key one of the local gates
+        // consumes (keybinding, native view) never reaches the seam and its
+        // transient arm is revoked there, exactly like a failed write.
         let plain_typed_glyph = self
             .windows
             .get(&wid)
@@ -5430,7 +5512,7 @@ impl App {
             .is_some_and(|m| !m.control_key() && !m.alt_key() && !m.super_key())
             && matches!(
                 base_logical_key(&ev),
-                Key::Character(_) | Key::Named(NamedKey::Space)
+                Key::Character(_) | Key::Named(NamedKey::Space | NamedKey::Enter | NamedKey::Tab)
             );
         if plain_typed_glyph {
             let at = std::time::Instant::now();
@@ -6492,7 +6574,7 @@ impl App {
                 }
                 true
             }
-            InputEvent::Text(text) | InputEvent::Paste(text) => {
+            InputEvent::Text(text) | InputEvent::Paste(text, _) => {
                 self.rename_field_edit(wid, SearchEdit::Insert(text.clone()));
                 true
             }
@@ -7032,7 +7114,7 @@ impl App {
                 // Committed text, a `[key_sequences]` payload and a paste are all
                 // "an unhandled keystroke" by the card's rule: dismiss and
                 // swallow rather than let raw bytes out from under a menu.
-                InputEvent::Text(_) | InputEvent::KeySequence(_) | InputEvent::Paste(_) => {
+                InputEvent::Text(_) | InputEvent::KeySequence(_) | InputEvent::Paste(..) => {
                     self.close_tab_menu(wid);
                     true
                 }
@@ -7513,7 +7595,7 @@ impl App {
             // activates in nav (or commits the open menu; a letter jumps its highlight),
             // a lone `/` opens search. With the colour wheel up, text feeds its hex
             // readout (no-ops off the hex field).
-            InputEvent::Text(t) | InputEvent::Paste(t) => {
+            InputEvent::Text(t) | InputEvent::Paste(t, _) => {
                 if wheel_open {
                     for ch in t.chars().filter(|c| !c.is_control()) {
                         self.settings_wheel_hex_push(ch);
@@ -12332,6 +12414,311 @@ mod press_path_lock_elision_tests {
         bytes[..read as usize].to_vec()
     }
 
+    /// GATE (lane-license, deliverable 1 — Enter): a plain Enter at the real
+    /// input boundary arms `note_return` (its coalesced response move is
+    /// licensed, consume-once) WITHOUT wiping the banked typed stamps of keys
+    /// whose echoes are still in flight.
+    ///
+    /// RED-PROOF (2026-08-30): with the input-boundary arm reverted (the
+    /// pre-fix `clear_typed` on the Enter arm, no `note_return` call — the
+    /// shipped 0.67.0 shape), this fails at the first assert with
+    /// `spawns == 0`: the Enter both destroyed the bank and arrived
+    /// licenseless, the measured deterministic +1 no-fresh-hint per Enter.
+    #[cfg(unix)]
+    #[test]
+    fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
+        use std::time::{Duration, Instant};
+
+        use aterm_types::keyboard::NamedKey;
+
+        use crate::cursor_glow::Geom;
+
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        // PHASE A — BARE Enter on an empty bank: the response move can only
+        // be funded by `note_return` itself, so this half is the direct red
+        // for the arm (a leftover glyph stamp cannot mask a missing arm).
+        {
+            let (mut bare, bare_pipe) = app_observing_pty();
+            bare.config.cursor_trail = Some(true);
+            bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            let bare_cfg = bare.glow_config();
+            let b0 = Instant::now();
+            bare.windows
+                .get_mut(&wid)
+                .unwrap()
+                .cursor_glow
+                .tick(Some((0, 0)), b0, &bare_cfg, geom, &mut out);
+            assert_eq!(
+                bare.input(
+                    wid,
+                    InputEvent::Key {
+                        key: Key::Named(NamedKey::Enter),
+                        mods: Modifiers::empty(),
+                        base_layout: None,
+                        event_type: KeyEventType::Press,
+                    },
+                    Source::Human
+                ),
+                crate::input::InputOutcome::Ok
+            );
+            let _ = drain(bare_pipe);
+            let ws = bare.windows.get_mut(&wid).unwrap();
+            let b1 = Instant::now();
+            ws.cursor_glow
+                .tick(Some((2, 0)), b1, &bare_cfg, geom, &mut out);
+            assert_eq!(
+                ws.cursor_glow.spawns(),
+                1,
+                "a bare Enter's response move is licensed by note_return alone"
+            );
+            // …and consumed ONCE: the program flood after it stays dark.
+            ws.cursor_glow.tick(
+                Some((3, 0)),
+                b1 + Duration::from_millis(16),
+                &bare_cfg,
+                geom,
+                &mut out,
+            );
+            assert_eq!(
+                ws.cursor_glow.spawns(),
+                1,
+                "the return license is depth-1/consume-once — floods still decline"
+            );
+        }
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .cursor_glow
+            .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
+        // Two real glyphs bank stamps; their echoes are in flight when Enter lands.
+        for ch in ['g', 'i'] {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Key {
+                        key: Key::Character(ch),
+                        mods: Modifiers::empty(),
+                        base_layout: None,
+                        event_type: KeyEventType::Press,
+                    },
+                    Source::Human
+                ),
+                crate::input::InputOutcome::Ok,
+                "glyph key must land on the observing PTY"
+            );
+        }
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Named(NamedKey::Enter),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        let _ = drain(pipe);
+        let ws = app.windows.get_mut(&wid).unwrap();
+        // The Enter's coalesced response move is licensed (`note_return` armed;
+        // spawn also pops the oldest banked stamp, class-blind)…
+        let e1 = Instant::now();
+        ws.cursor_glow
+            .tick(Some((0, 1)), e1, &glow_cfg, geom, &mut out);
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            1,
+            "Enter's own response move must be licensed (was: deterministic no-fresh-hint +1 per Enter)"
+        );
+        // …and the surviving banked stamp still licenses the in-flight echo.
+        ws.cursor_glow.tick(
+            Some((2, 0)),
+            e1 + Duration::from_millis(16),
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            2,
+            "banked typed stamps must survive a plain Enter"
+        );
+        // Depth-1/consume-once: everything is spent — a program flood declines.
+        ws.cursor_glow.tick(
+            Some((3, 0)),
+            e1 + Duration::from_millis(32),
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            2,
+            "the return license is consume-once — a program flood after it stays dark"
+        );
+    }
+
+    /// GATE (lane-license, deliverable 1 — Tab): a plain Tab arms the user
+    /// gesture license (its completion sweep is licensed) and KEEPS the
+    /// banked typed stamps (the supersede shape inside `note_user_gesture`).
+    ///
+    /// RED-PROOF (2026-08-30): with the input-boundary arm reverted (Tab on
+    /// the pre-fix `clear_typed` arm, nothing armed), this fails at the first
+    /// assert with `spawns == 0` — the measured 8-cell mid-band black notch.
+    #[cfg(unix)]
+    #[test]
+    fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
+        use std::time::{Duration, Instant};
+
+        use aterm_types::keyboard::NamedKey;
+
+        use crate::cursor_glow::Geom;
+
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .cursor_glow
+            .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
+        for ch in ['l', 's'] {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Key {
+                        key: Key::Character(ch),
+                        mods: Modifiers::empty(),
+                        base_layout: None,
+                        event_type: KeyEventType::Press,
+                    },
+                    Source::Human
+                ),
+                crate::input::InputOutcome::Ok
+            );
+        }
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        let _ = drain(pipe);
+        let ws = app.windows.get_mut(&wid).unwrap();
+        // The tab sweep is licensed by the gesture hint…
+        let e1 = Instant::now();
+        ws.cursor_glow
+            .tick(Some((0, 8)), e1, &glow_cfg, geom, &mut out);
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            1,
+            "the Tab completion sweep must be licensed (was: the 8-cell black notch)"
+        );
+        // …and the surviving banked stamp still licenses the in-flight echo.
+        ws.cursor_glow.tick(
+            Some((0, 9)),
+            e1 + Duration::from_millis(16),
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            2,
+            "banked typed stamps must survive a mid-burst Tab"
+        );
+
+        // BARE Tab on an empty bank: the sweep can only be funded by
+        // `note_user_gesture` itself — the direct red for the arm.
+        let (mut bare, bare_pipe) = app_observing_pty();
+        bare.config.cursor_trail = Some(true);
+        bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let bare_cfg = bare.glow_config();
+        let b0 = Instant::now();
+        bare.windows
+            .get_mut(&wid)
+            .unwrap()
+            .cursor_glow
+            .tick(Some((0, 0)), b0, &bare_cfg, geom, &mut out);
+        assert_eq!(
+            bare.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        let _ = drain(bare_pipe);
+        let ws = bare.windows.get_mut(&wid).unwrap();
+        let b1 = Instant::now();
+        ws.cursor_glow
+            .tick(Some((0, 8)), b1, &bare_cfg, geom, &mut out);
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            1,
+            "a bare Tab's sweep is licensed by note_user_gesture alone"
+        );
+        // …and consumed ONCE: the program move after it stays dark.
+        ws.cursor_glow.tick(
+            Some((3, 0)),
+            b1 + Duration::from_millis(16),
+            &bare_cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            1,
+            "the gesture license is consume-once — floods still decline"
+        );
+    }
+
     use std::sync::{Arc, Mutex};
 
     use aterm_core::selection::SelectionType;
@@ -13370,7 +13757,11 @@ mod paste_cursor_gesture_tests {
             0
         );
         assert_eq!(
-            app.input(wid, InputEvent::Paste(text.to_string()), Source::Human),
+            app.input(
+                wid,
+                InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
+                Source::Human
+            ),
             crate::input::InputOutcome::Ok
         );
 

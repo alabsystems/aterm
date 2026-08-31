@@ -22,7 +22,8 @@ use aterm_core::terminal::CursorStyle;
 // site is unchanged; this crate now consumes the value, never `&Terminal`.
 pub use aterm_core::render::{
     CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, GlowBlend, GlowQuad, HaloMode,
-    InkCell, RainHalo, RenderInput, SceneAtlas, SelectionClip, SpriteQuad, TrailCell, WordDecoration,
+    InkCell, RainHalo, RenderInput, SceneAtlas, SelectionClip, SpriteQuad, TrailCell,
+    WordDecoration,
 };
 
 /// A row-major RGBA framebuffer packed as `0xTTRRGGBB`.

@@ -37,6 +37,8 @@
 //! each instance to a content generation and DISCARDS it when the underlying
 //! buffer changes, so a resumed cursor can never surface stale coordinates.
 
+use std::borrow::Cow;
+
 use crate::grapheme::ColumnMap;
 use crate::index::{
     CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError,
@@ -180,12 +182,24 @@ impl BudgetedSearch {
     /// is a no-op (the caller's completion check races nothing, so tolerate it
     /// rather than panic).
     pub fn feed_row(&mut self, text: &str) {
+        self.feed_row_cow(Cow::Borrowed(text));
+    }
+
+    /// Index and verify one owned row without copying its text into the cache.
+    ///
+    /// This has the same ordering and completion contract as
+    /// [`feed_row`](Self::feed_row), but moves `text` into the index.
+    pub fn feed_row_owned(&mut self, text: String) {
+        self.feed_row_cow(Cow::Owned(text));
+    }
+
+    fn feed_row_cow(&mut self, text: Cow<'_, str>) {
         if self.rows_fed >= self.total_rows {
             return;
         }
         let row_offset = self.rows_fed;
         let abs_row = self.base_row.saturating_add(row_offset);
-        self.index.index_line(abs_row, text);
+        self.index.index_line_cow(abs_row, text);
         self.rows_fed += 1;
         if row_offset < self.verify_from {
             return;
@@ -195,7 +209,7 @@ impl BudgetedSearch {
         // begins at the final retained suffix, later eviction can never remove
         // capped matches and expose an unverified hole.
         if self.matches.len() < MAX_SEARCH_MATCHES {
-            self.verify_row(abs_row, text);
+            self.verify_row(abs_row);
         }
     }
 
@@ -277,7 +291,15 @@ impl BudgetedSearch {
 
     /// Verify matches on the just-indexed row `abs_row`, appending to
     /// `self.matches` (ascending order preserved; capped).
-    fn verify_row(&mut self, abs_row: usize, text: &str) {
+    fn verify_row(&mut self, abs_row: usize) {
+        let retained = self.index.lines.get(&abs_row);
+        debug_assert!(
+            retained.is_some(),
+            "the just-indexed row must survive newest-first eviction"
+        );
+        let Some(text) = retained.map(String::as_str) else {
+            return;
+        };
         match &mut self.matcher {
             RowMatcher::Literal => {
                 // Sweep THIS row with the batch path's own scan
@@ -429,6 +451,26 @@ mod tests {
             "unrelated filler line",
             "last NEEDLE",
         ]
+    }
+
+    #[test]
+    fn owned_feed_retains_the_callers_allocation() {
+        let mut row = String::with_capacity(128);
+        row.push_str("prefix needle suffix");
+        let allocation = row.as_ptr();
+        let capacity = row.capacity();
+
+        let mut search =
+            BudgetedSearch::new("needle", true, false, 7, 1).expect("budgeted construction");
+        search.feed_row_owned(row);
+
+        let retained = search.index.lines.get(&7).expect("owned row is retained");
+        assert_eq!(retained.as_ptr(), allocation);
+        assert_eq!(retained.capacity(), capacity);
+        assert_eq!(
+            search.results(),
+            one_shot(&["prefix needle suffix"], 7, "needle", true, false)
+        );
     }
 
     /// The closed-form doomed-prefix calculation must stay identical to the

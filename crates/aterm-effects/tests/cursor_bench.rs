@@ -4,7 +4,7 @@
 //! LUMEN WAKE release performance gates.
 //!
 //! ```sh
-//! cargo test -p aterm-effects --release --test cursor_bench -- --ignored --nocapture
+//! cargo test -p aterm-effects --release --test cursor_bench -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::time::{Duration, Instant};
@@ -15,7 +15,9 @@ const ITERATIONS: usize = 300;
 
 fn config(style: GlowStyle) -> GlowConfig {
     GlowConfig {
-        ribbon_tall: false,
+        // Shipping default: the tall body; explicit underline is exercised by
+        // the workload matrix benchmark.
+        ribbon_tall: true,
         enabled: true,
         dark_theme: true,
         // The documented default dark palette — a COHERENT pair, never 0/0
@@ -110,14 +112,14 @@ fn saturated_sweep(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
 }
 
 fn benchmark(style: GlowStyle, label: &str) {
-    benchmark_with(style, label, saturated);
+    benchmark_with(style, label, saturated, 100);
 }
 
 /// A bench fixture: build a `CursorGlow` in the given style plus its start instant
 /// and cursor cell.
 type GlowFixture = fn(GlowStyle) -> (CursorGlow, Instant, (u16, u16));
 
-fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture) {
+fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total_quads: usize) {
     let config = config(style);
     let geometry = geometry();
     let (mut glow, now, cursor) = fixture(style);
@@ -140,47 +142,50 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture) {
     let median = samples[ITERATIONS / 2];
     let p90 = samples[ITERATIONS * 9 / 10];
     println!(
-        "bench_cursor_{label}_worstcase: median {median:?} (p90 {p90:?}), \
+        "{label}: median {median:?} (p90 {p90:?}), \
          max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over)"
     );
     assert!(
-        max_total_quads > 100,
-        "fixture must exercise substantial geometry"
+        max_total_quads > min_total_quads,
+        "fixture must exercise substantial geometry ({max_total_quads} quads)"
     );
     assert!(
         p90.as_micros() < 500,
-        "worst-case {label} cursor frame p90 {p90:?} >= 500 us (median {median:?})"
+        "{label} cursor frame p90 {p90:?} >= 500 us (median {median:?})"
     );
 }
 
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
 fn bench_cursor_water_worstcase() {
-    benchmark(GlowStyle::Water, "water");
+    benchmark(GlowStyle::Water, "bench_cursor_water_worstcase");
 }
 
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-fn bench_cursor_rainbow_worstcase() {
-    benchmark_with(GlowStyle::RainbowKitty, "nyan", saturated_sweep);
+fn bench_cursor_rainbow_frozen_sweep_baseline() {
+    benchmark_with(
+        GlowStyle::RainbowKitty,
+        "bench_cursor_rainbow_frozen_sweep_baseline",
+        saturated_sweep,
+        5_000,
+    );
 }
 
 /// The HOT ribbon gate the frozen-clock fixture above cannot reach: `saturated`
 /// re-ticks one Instant, so `dt == 0` never runs the momentum integrator,
-/// `rainbow.disp` stays 0, and only the cold 1-strip path is measured — while the
-/// real worst case is the per-strip wave at RETINA cell metrics under sustained
-/// typing (the audited ~6× cost / quad-budget saturation). This fixture warms
-/// the clock 8 ms per keystroke and keeps typing THROUGH the measured window,
-/// pinning both the frame cost and the no-truncation budget headroom.
+/// `rainbow.disp` stays 0, and only the cheaper resting path is measured. This
+/// 125-key/s saturation stress warms the clock 8 ms per event and keeps typing
+/// through the measured window, pinning the capped tall-ribbon worst-case cost;
+/// it cannot observe geometry growth after the deliberate budget edge. It is
+/// deliberately harsher than a claim about ordinary human cadence.
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
 fn bench_cursor_rainbow_hot_ribbon_worstcase() {
-    // The default RainbowKitty presentation is the restored v0.43 underline
-    // and is covered by `bench_cursor_rainbow_worstcase`. This gate is for the
-    // explicitly selected TALL presentation whose animated per-strip body is
-    // the renderer's real high-geometry rainbow path.
-    let mut config = config(GlowStyle::RainbowKitty);
-    config.ribbon_tall = true;
+    // The shipping-default tall presentation is the renderer's real
+    // high-geometry rainbow path. The cold frozen-clock gate above cannot
+    // reach its animated body, so this fixture warms it explicitly.
+    let config = config(GlowStyle::RainbowKitty);
     // 2× retina cell metrics — the hot path's cost scales with device pixels.
     let geometry = Geom {
         cw: 18,
@@ -237,14 +242,28 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
     );
     assert!(
         max_under_quads > 6_000,
-        "fixture must exercise the hot under-ink per-strip path ({max_under_quads} quads)"
+        "fixture must exercise the hot tall under-ink path ({max_under_quads} quads)"
     );
-    // Each stream's MAX_QUADS is 16_384; at the under-ink cap the ribbon tail
-    // visibly pops off every frame, so the ribbon stream must keep real headroom.
+    // The no-jump body has a dedicated 8,191-quad edge. Crossing it means a
+    // supposedly ordinary typing frame borrowed jump/overflow capacity.
     assert!(
-        max_under_quads <= 14_384,
-        "hot retina ribbon saturates its quad budget ({max_under_quads} quads)"
+        max_under_quads <= 8_191,
+        "hot retina ribbon exceeded its dedicated edge ({max_under_quads} quads)"
     );
+    // WHERE THE FRAME STANDS (m3, 2026-08-30, settle head-to-head resolved by
+    // benchmark — the resident-scratch settle beat the sweep-rects/Fibonacci-
+    // plane rewrite ~2.3x and is the one merged): median ~323 µs, p90
+    // ~545 µs — the gate below is still RED by ~9 % at the tail. Where the
+    // time lives now (6 s `sample` of this fixture, self time): 60 %
+    // spend_rainbow_budget, 10 % emit_particles, 8 % RainbowLedger
+    // plan_exact_tiles+coverage_for, 5 % ribbon_beam, 5 % settle_flying_pile.
+    // The settle is no longer the hotspot; the next honest cut is the §4
+    // budget pass, and that one is certified arithmetic — not a quick win.
+    // RE-MEASURED (m3, 2026-08-30) after the classic-spectrum merge: median
+    // ~320-356 µs, p90 ~560-574 µs on the merged meteor+party tree — and
+    // ~326 µs / ~570-575 µs on pristine origin/main (identical max quads,
+    // 8489), so the meteor lane adds nothing to the worst case and the ~14 %
+    // tail miss is main's own, in the same budget pass named above.
     assert!(
         p90.as_micros() < 500,
         "worst-case hot nyan cursor frame p90 {p90:?} >= 500 us (median {median:?})"

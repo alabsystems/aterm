@@ -56,16 +56,17 @@ pub struct InputEpoch(u64);
 ///
 /// ## Backpressure scope (honest)
 ///
-/// NO writer parks while holding the fd lock. [`SinkWriter::write_frame`] (the
-/// ordered BULK path) writes the whole frame under the lock in `DRAIN_CHUNK`-bounded
-/// `write(2)`s and, when the foreground wedges, spills the tail and releases the
-/// lock rather than parking inside it: a paste that parked under the lock pinned the
-/// sink for as long as the child took to drain, and the reply writer — carrying the
-/// DA/DSR/CPR answer a TUI is BLOCKED reading — queued behind it, so neither side
-/// could make progress. A bulk caller still feels `SPILL_CAP` backpressure, just on
-/// its NEXT frame (the entry check) instead of inside the mutex. The first §6.2
-/// milestone layers on top as [`SinkWriter::write_frame_nonparking`] (the UI
-/// keystroke egress): bytes are written only after a `poll(2)` `POLLOUT` check
+/// The UI path is non-parking only while its bounded spill has room.
+/// [`SinkWriter::write_frame`] (the ordered BULK path) can deliberately park an
+/// expendable writer while holding the fd lock; frames larger than `NONPARK_MAX`
+/// and the spill-unavailable fallback reach it. This preserves whole-frame order
+/// and bounded memory, but a multi-MiB paste into a child that synchronously waits
+/// for a DA/DSR/CPR reply can deadlock with the reply writer queued behind the
+/// paste. [`SinkWriter::write_frame_body_locked`] records the unresolved protocol
+/// boundary; callers must not infer a global “no writer parks” guarantee.
+///
+/// [`SinkWriter::write_frame_nonparking`] (the UI keystroke egress) writes bytes
+/// only after a `poll(2)` `POLLOUT` check
 /// (writable guarantees only SOME room, so the write unit must be one the kernel can
 /// refuse without parking — the whole frame on an `O_NONBLOCK` master, one byte
 /// otherwise; see [`SinkWriter::note_master_nonblocking`]), spilling the
@@ -575,13 +576,11 @@ impl SinkWriter {
     /// the first hard error rather than silently dropping the tail (the bug the
     /// legacy `write_all` had before `write_some`).
     ///
-    /// Returns early only on a hard error or a `0` write (peer closed). It never
-    /// PARKS under the lock: the direct-read gather keeps the master `O_NONBLOCK`, so
-    /// a wedged foreground surfaces as `EAGAIN`, and the tail is spilled to the
-    /// drainer instead of the caller waiting inside the mutex (see
-    /// [`Self::write_frame_body_locked`] for why that wait was a livelock). The
-    /// caller still feels `SPILL_CAP` backpressure — on its next frame, at the entry
-    /// check above, where waiting blocks nobody else.
+    /// Returns early only on a hard error or a `0` write (peer closed). On Unix
+    /// the body uses blocking writes while holding the serialization lock; this
+    /// is safe for ordinary bounded frames but carries the large-paste/query-reply
+    /// deadlock documented on [`Self::write_frame_body_locked`]. Callers place this
+    /// path only on expendable egress threads, never the UI event loop.
     ///
     /// SPEC (A7): writing through the raw master fd is the model's `UseFd` action.
     /// The OwnedFd-last-drop discipline guarantees the fd is open for the whole
@@ -600,6 +599,14 @@ impl SinkWriter {
         if !bytes.is_empty() {
             let _ = self.reserve_input_attempt();
         }
+        self.write_frame_after_reserve(bytes)
+    }
+
+    /// Blocking frame body after the public entry point has reserved this
+    /// non-empty input attempt. The non-parking API delegates here when it must
+    /// apply blocking backpressure, so that one public attempt advances the epoch
+    /// exactly once rather than reserving again through [`Self::write_frame`].
+    fn write_frame_after_reserve(&self, bytes: &[u8]) -> io::Result<usize> {
         // FIFO with any SPILLED bytes: while the wedged-tty spill buffer is
         // non-empty this frame must queue BEHIND it (a direct write would overtake
         // spilled keystrokes), under the SPILL_CAP wait so a paste into a wedged
@@ -629,10 +636,12 @@ impl SinkWriter {
         self.write_frame_body_locked(guard, bytes)
     }
 
-    /// Write a whole frame while HOLDING the fd lock. The caller is always an
-    /// EXPENDABLE thread (the per-session ordered egress writer, the reply writer, the
-    /// cross-session control thread) — never the UI event loop, which uses
-    /// [`Self::write_frame_nonparking`].
+    /// Write a whole frame while HOLDING the fd lock. Ordinary callers are
+    /// expendable threads (the per-session ordered egress writer, reply writer,
+    /// and cross-session control thread). [`Self::write_frame_nonparking`] also
+    /// delegates here for an oversized frame or a spill already at capacity, so
+    /// its UI callers must obey that method's explicitly conditional liveness
+    /// contract.
     ///
     /// DELIBERATELY STILL PARKING. There is a real defect here — a multi-MiB paste is
     /// ONE frame, so a wedged foreground pins this lock for as long as the child takes
@@ -648,10 +657,14 @@ impl SinkWriter {
     /// `O_NONBLOCK` pipe left the next keystroke parked >3 s, where parking here
     /// returns it in ~13 µs.
     ///
-    /// The correct repair is upstream — chunk large pastes into `SPILL_CAP`-sized
-    /// frames at the `seam_egress` Paste arm, where ordering is already preserved by
-    /// the per-session FIFO writer and each frame can feel backpressure honestly.
-    /// Until that lands, parking an expendable thread beats parking the event loop.
+    /// A correct repair needs a reply-aware ordered serializer. Blindly slicing the
+    /// encoded frame is not sound: DA/DSR/CPR bytes inserted between slices would
+    /// become pasted content while one bracketed-paste envelope is open. Repeating
+    /// complete bracketed envelopes changes paste transaction/undo semantics and
+    /// still needs explicit reply priority between chunks. Until that protocol is
+    /// designed and integration-tested against a real blocking TUI, parking an
+    /// expendable thread is preferable to moving the same unbounded wait onto the
+    /// event loop.
     #[cfg(unix)]
     fn write_frame_body_locked(
         &self,
@@ -746,13 +759,17 @@ impl SinkWriter {
     #[cfg_attr(not(unix), allow(dead_code))]
     const TRY_LOCK_SPINS: u32 = 256;
 
-    /// [`Self::write_frame`] that NEVER parks the calling thread — the UI-thread
-    /// keystroke egress (design §6.2's first backpressure milestone). The common
-    /// case is byte-identical to `write_frame`: one uncontended lock, a handful
-    /// of poll-guarded `write(2)`s. Only when the tty input buffer is FULL (a
-    /// wedged foreground program that stopped reading — previously this parked
-    /// the WHOLE event loop on one keypress) or another writer holds the fd lock
-    /// does the frame spill to the buffer a detached drainer feeds out in order.
+    /// Opportunistically non-parking [`Self::write_frame`] for UI-sized frames.
+    /// A frame at most [`Self::NONPARK_MAX`] returns without waiting for tty
+    /// capacity while the spill remains below [`Shared::SPILL_CAP`]: the common
+    /// case is byte-identical to `write_frame`, and a full tty or contended fd
+    /// lock diverts the frame to the ordered spill drainer.
+    ///
+    /// Two bounded-memory fallbacks MAY park the caller: frames larger than
+    /// `NONPARK_MAX` take the ordinary blocking path immediately, and any frame
+    /// does so once the spill is already at `SPILL_CAP`. Callers that can produce
+    /// either condition must use an expendable thread; this method is not an
+    /// unconditional event-loop liveness guarantee.
     ///
     /// Same whole-frame atomicity and per-producer FIFO as `write_frame`: while
     /// anything is spilled, EVERY writer (this one and the blocking ones) appends
@@ -784,7 +801,7 @@ impl SinkWriter {
         // otherwise repeated pastes into a wedged foreground would accumulate
         // unbounded memory in the spill.
         if bytes.len() > Self::NONPARK_MAX {
-            return self.write_frame(bytes);
+            return self.write_frame_after_reserve(bytes);
         }
         // Bound the spill on the non-parking path too. This path normally SKIPS the
         // `SPILL_CAP` backpressure to keep the UI event loop unparked, but a spill
@@ -808,7 +825,7 @@ impl SinkWriter {
         // fix: route automated/cross-session input egress through `write_frame` on the
         // expendable control thread so this guard never fires on the UI thread.
         if self.shared.spill_len() >= Shared::SPILL_CAP {
-            return self.write_frame(bytes);
+            return self.write_frame_after_reserve(bytes);
         }
         // Undelivered spill exists → queue behind it (order), never touch the fd.
         if !self.shared.spill_is_empty() && self.shared.spill_append(self.master, bytes, false) {
@@ -951,7 +968,7 @@ impl SinkWriter {
         if !bytes.is_empty() {
             let _ = self.reserve_input_attempt();
         }
-        self.write_frame(bytes)
+        self.write_frame_after_reserve(bytes)
     }
 
     /// Spill `bytes[off..]` while HOLDING the fd lock — the only state in which a
@@ -1075,8 +1092,10 @@ impl Shared {
     }
 
     /// Append one frame to the spill, arranging the drainer, returning whether the
-    /// frame was accepted. `wait_for_room` applies the `SPILL_CAP` backpressure
-    /// (blocking callers only — their thread is expendable; the UI's is not).
+    /// frame was accepted. `wait_for_room` applies the `SPILL_CAP` backpressure.
+    /// It normally belongs to expendable blocking callers; the conditional
+    /// non-parking API can also select it after its spill-cap guard, which is why
+    /// that public method explicitly warns its caller may park at the cap.
     /// Returns `false` only when a drainer could not be arranged (no `dup`/spawn),
     /// in which case NOTHING was appended and the caller must fall back to a
     /// blocking write — spilling without a drainer would strand the bytes.
@@ -1329,6 +1348,57 @@ mod tests {
         drop(writer);
     }
 
+    /// Each public non-empty write call is one input attempt, even when the
+    /// non-parking entry point delegates a bulk frame to its blocking body.
+    /// Empty probes reserve nothing. The large frame is the regression case:
+    /// routing it back through `write_frame` used to advance the epoch twice.
+    #[test]
+    fn public_writes_reserve_one_epoch_per_nonempty_attempt() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        let large = vec![b'L'; SinkWriter::NONPARK_MAX + 1];
+        let expected_len = 2 + large.len();
+        let reader_handle = thread::spawn(move || {
+            let mut bytes = vec![0_u8; expected_len];
+            reader.read_exact(&mut bytes).expect("read all attempts");
+            bytes
+        });
+
+        let initial = sink.input_epoch().0;
+        assert_eq!(sink.write_frame(b"").expect("empty blocking write"), 0);
+        assert_eq!(
+            sink.input_epoch().0,
+            initial,
+            "empty write is not an attempt"
+        );
+
+        assert_eq!(sink.write_frame(b"B").expect("blocking write"), 1);
+        assert_eq!(sink.input_epoch().0, initial + 1);
+
+        assert_eq!(
+            sink.write_frame_nonparking(b"N")
+                .expect("small non-parking write"),
+            1
+        );
+        assert_eq!(sink.input_epoch().0, initial + 2);
+
+        assert_eq!(
+            sink.write_frame_nonparking(&large)
+                .expect("large delegated write"),
+            large.len()
+        );
+        assert_eq!(
+            sink.input_epoch().0,
+            initial + 3,
+            "delegation must not reserve a second epoch"
+        );
+
+        let bytes = reader_handle.join().expect("reader thread");
+        assert_eq!(&bytes[..2], b"BN");
+        assert!(bytes[2..].iter().all(|byte| *byte == b'L'));
+        drop(writer);
+    }
+
     /// A contended fd lock is a zero-byte refusal, not an invitation to spill a
     /// guarded actuator frame behind the holder.  Once the holder leaves, the
     /// next distinct frame lands in full; reading exactly that frame proves the
@@ -1464,7 +1534,7 @@ mod tests {
     /// prove `write_frame_nonparking` returns promptly instead of parking, and
     /// that every spilled byte is delivered IN ORDER once the peer drains.
     #[test]
-    fn nonparking_write_never_parks_and_preserves_order() {
+    fn small_write_below_spill_cap_returns_promptly_and_preserves_order() {
         let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
 
@@ -1499,7 +1569,7 @@ mod tests {
             // finite deadline catches it. A tight one only lets scheduler preemption
             // on a loaded box fake a failure.
             t0.elapsed() < std::time::Duration::from_secs(5),
-            "non-parking writes must not wait for the wedge to clear"
+            "small writes below a fresh spill cap must not wait for the wedge to clear"
         );
 
         // Unwedge: drain everything; the spill drainer must deliver A,B,C after

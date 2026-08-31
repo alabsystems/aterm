@@ -131,8 +131,12 @@ impl Line {
     /// scope line for how far a picture follows its text: an inline image is
     /// retained for as long as its line lives in the IN-MEMORY hot tier (where
     /// `Line` structs are held as-is and the payload `Arc` is shared by every
-    /// row of the footprint), and is dropped when the line is serialized for
-    /// the LZ4 warm tier, the zstd cold tier, or the disk-backed `.dtrm` store.
+    /// row of the footprint), and is dropped at the ONE boundary where a line is
+    /// serialized while surviving: `promote_hot_to_warm`. The warm-to-cold and
+    /// cold-to-disk moves carry already-serialized bytes, so the picture has
+    /// been gone since compression and the `.dtrm` file never had it to lose —
+    /// naming three tiers would send a reader looking for the loss in two places
+    /// it cannot happen.
     ///
     /// The reason is per-line duplication: the wire format has no cross-line
     /// dictionary, so a shared payload would be written once per COVERED ROW —
@@ -140,11 +144,28 @@ impl Line {
     /// blocks and then compresses that redundancy again on every tier
     /// migration. Giving history the payload once needs a page-level payload
     /// table in the block codec, which is a wire-format change with its own
-    /// compatibility and bounding story; until then the honest behaviour is
-    /// that a picture survives the scrollback boundary and the hot window, and
-    /// falls back to today's blank rows once its line is compressed. Nothing
-    /// about the existing bytes changes: a line with no image serializes
-    /// byte-identically to before the field existed.
+    /// compatibility and bounding story. Nothing about the existing bytes
+    /// changes: a line with no image serializes byte-identically to before the
+    /// field existed.
+    ///
+    /// ## What the person scrolling there sees, and how they are told
+    ///
+    /// The boundary is a decided limit, not an accident, so it is REPORTED
+    /// rather than silent: every line that crosses it is counted by
+    /// [`Scrollback::image_rows_dropped_by_compression`], which reaches hosts
+    /// as `Terminal::scrollback_image_rows_dropped` alongside the other
+    /// out-of-band retention signals (audit E10a — content never carries a
+    /// sentinel).
+    ///
+    /// Past the boundary the line keeps its text, attributes, hyperlinks and
+    /// underline colours and loses only the picture, so the row renders as the
+    /// empty row it always was underneath one. A footprint therefore ages out
+    /// of history one row at a time from its TOP, in the same direction and at
+    /// the same boundary as the history above it — a picture straddling the
+    /// boundary shows its newer rows and not its older ones, which is the same
+    /// rule the surrounding text obeys.
+    ///
+    /// [`Scrollback::image_rows_dropped_by_compression`]: crate::Scrollback::image_rows_dropped_by_compression
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         // The estimate is only a capacity hint (never affects the serialized

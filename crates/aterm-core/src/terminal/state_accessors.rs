@@ -818,6 +818,20 @@ impl Terminal {
         self.modes.cursor_visible
     }
 
+    /// The ECHO ANCHOR: where the most recent PTY print run ended —
+    /// `(row, col)` in ACTIVE-grid coordinates (the same space as
+    /// [`Self::cursor`]) plus a monotonic per-print-action sequence, so a
+    /// host can tell "output landed" apart from a stale sample even when the
+    /// end position did not move. `None` before the first print (or after a
+    /// reset). Observability for the cursor-effect host's hidden/parked-caret
+    /// lane; never read by the terminal itself.
+    #[must_use]
+    pub fn print_anchor(&self) -> Option<(u16, u16, u64)> {
+        self.transient
+            .print_anchor
+            .map(|(row, col)| (row, col, self.transient.print_anchor_seq))
+    }
+
     /// The VIEWPORT row the cursor projects onto, on screen or not.
     ///
     /// The DEC cursor is anchored in the ACTIVE grid; the viewport row it

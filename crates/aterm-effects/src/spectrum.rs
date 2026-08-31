@@ -12,99 +12,27 @@
 //! jump path, landing ring, glyph tint, point-marks — reads its colour here, so
 //! *"which rainbow is this?"* stops being a question anyone can ask.
 //!
-//! # The six names, and why they are the control points
+//! # The seven control points
 //!
-//! [`SPECTRUM_ANCHORS`] is the family's own vocabulary, unchanged since v0.43:
-//! `#FF0000 #FF9900 #FFFF00 #33FF00 #0099FF #6633FF` — HSV `0 / 36 / 60 / 108 /
-//! 204 / 255`°. Red is pure red and yellow is **pure yellow**, which is the
-//! whole of the reversal recorded below.
+//! [`crate::spectrum::SPECTRUM_ANCHORS`] is canonical ROYGBIV:
+//! `#FF0000 #FF7F00 #FFFF00 #00FF00 #0000FF #4B0082 #9400D3`.
+//! [`crate::spectrum::generate_spectrum_lut`] joins adjacent anchors with a smooth per-channel
+//! interpolation. The anchors themselves are stored verbatim.
 //!
-//! ## What this file used to be, and why it is not that any more
+//! # Cyan policy
 //!
-//! Migration step 6 shipped a **constant-luminance** arc: seven stops solved so
-//! that every hue carried `#FF0000`'s relative luminance (`0.2126`) at
-//! gamut-max chroma. It bought one real thing — a single legibility ceiling,
-//! because there was no bright hue to charge a dim one for — and it was reversed
-//! on glass, for two measured reasons:
+//! The continuous green-to-blue leg necessarily crosses cyan. The dense-walk
+//! test `spectrum_never_rests_on_cyan` bounds that crossing, while point marks
+//! use [`crate::spectrum::spectrum_snap`] and the caret's emitted fill is
+//! projected by [`crate::spectrum::clear_thing_of_cyan`]. No named stop is cyan.
 //!
-//! 1. **It was not vivid.** Yellow at red's luminance is `#838400`: a muddy
-//!    olive. Green is `#00942D`, a bottle green. On the default dark palette the
-//!    whole trail read pale and washed out, which is the opposite of what the
-//!    mark is for.
-//! 2. **It rested on cyan.** Its table contained `#008E8E` — HSV hue **exactly
-//!    180.00°** at `S = 1.00`, dead-centre cyan — and **15.59 %** of its arc sat
-//!    inside the design's cyan window (`HSV [165°, 200°]` at `S > 0.3`), against
-//!    §2.3.4's `<= 4 %` bound. It passed its own test only because that test
-//!    measured a DIFFERENT window: OkLCh `194.77° ± 10°`, a different space at
-//!    half the width. The law had been moved, not met.
+//! # Table and cost
 //!
-//! Both are properties of *holding the luminance flat*, not of the machinery, so
-//! the machinery is kept and the target changed.
-//!
-//! # The three functions of `t`
-//!
-//! - **`H(t)` — hue**, in sRGB HSV degrees. Monotone, and paced by
-//!   [`spectrum_cyan_weight`]: the arc spends [`SPECTRUM_CYAN_RUSH`] of its
-//!   parameter per degree inside the cyan window and a full unit outside it, so
-//!   the window is **crossed fast** rather than avoided (it cannot be avoided —
-//!   see below) or rested in.
-//! - **`L(t)` — OkLab lightness.** The two bracketing anchors' own lightness,
-//!   mixed on the segment's eased coordinate. Not flat, and not claimed to be:
-//!   the six anchors span **7.5x** in relative luminance by construction. The
-//!   claim is that the arc holds the line BETWEEN the two anchors it is running
-//!   between — worst deviation **0.18 %** of OkLab `L`, **5.6 %** of relative
-//!   luminance — where the sRGB byte-lerp it replaces sagged as much as
-//!   **19.2 %** below that line and printed a dark band inside every interval.
-//! - **`C(t)` — chroma. Spent, never budgeted.** Every entry is the MOST
-//!   saturated sRGB colour with that hue and that lightness
-//!   ([`spectrum_max_chroma`]) — a solve, not a mix, which is what lets hue and
-//!   lightness both land exactly while the only free variable pays for it.
-//!   Measured on the committed table: mean HSV saturation **0.89**, minimum
-//!   **0.65**.
-//!
-//! ## Why OkLab lightness rather than relative luminance
-//!
-//! Rec. 709 `Y` answers *"how much light"*, which is the right question for the
-//! contrast ceiling (`RAINBOW_BAND_COV_CAPS` is solved against it) and the wrong
-//! one for a ramp: an arc interpolated linearly in `Y` has to spend saturation
-//! buying brightness in the warm half, because no hue near red carries as much
-//! light as the straight line from red to orange demands. `L` is the perceptual
-//! answer, and an arc linear in it holds the anchors' own brightness
-//! relationship with chroma nearly intact.
-//!
-//! # The cyan ruling (§2.3)
-//!
-//! Owner: *"Cyan isn't a rainbow color."* That is a ruling about **things being
-//! cyan**, not about the gradient — every physical rainbow contains cyan, and a
-//! continuous path from green (108°) to blue (204°) must cross `[165°, 200°]`.
-//! So, precisely:
-//!
-//! - **No stop is cyan.** The nearest anchor to the window is blue at HSV
-//!   `204°`, four degrees clear of its top edge.
-//! - **Cyan is crossed, never rested on.** The arc spends **3.52 %** of `t`
-//!   inside `HSV [165°, 200°]` at `S > 0.3`, against §2.3.4's `4 %` bound —
-//!   measured in the design's own window, in the design's own space, by
-//!   [`tests::spectrum_never_rests_on_cyan`]. Nine of the 256 table entries lie
-//!   inside it and none of them is a place the arc slows down.
-//! - **Point-marks never sample the open gradient** — they snap to a named stop
-//!   via [`spectrum_snap`]. A star, a mote, a fresh-ink veil, a glyph tint **or
-//!   the caret's own block** is a *thing*, and a thing must be nameable.
-//!
-//! # The table
-//!
-//! 256 entries, `0x00RRGGBB`, generated by [`generate_spectrum_lut`] and
-//! committed as a `const` so it costs nothing at run time. The six anchors land
-//! on the EXACT indices `51 · i` ([`SPECTRUM_STRIDE`]) and are stored verbatim —
-//! the arc cannot round its own control points, and
-//! [`tests::spectrum_reproduces_its_anchors_exactly`] reads them straight back
-//! out. `spectrum_lut_is_byte_reproducible_from_its_generator` is what keeps the
-//! transcription honest.
-//!
-//! # Cost
-//!
-//! The six-anchor HSV walk this replaced cost six `hsv2rgb` round trips per
-//! swept cell per frame — **1,440 `hsv2rgb` calls/frame** at the 240-cell cap.
-//! [`spectrum`] is one 1 KB table read plus one lerp.
+//! [`crate::spectrum::SPECTRUM_LUT`] contains
+//! [`crate::spectrum::SPECTRUM_LUT_LEN`] (`511`) `0x00RRGGBB` entries,
+//! or just under 2 KiB. The seven anchors land exactly at `85 * i`
+//! ([`crate::spectrum::SPECTRUM_STRIDE`]). A spectrum read is two adjacent table lookups plus one
+//! lerp.
 
 use crate::effect_util::lerp_rgb;
 
@@ -112,21 +40,9 @@ use crate::effect_util::lerp_rgb;
 // THE ARC'S CONSTANTS — every one of them derived or named, none transcribed.
 // ---------------------------------------------------------------------------
 
-/// **THE SIX NAMES**, `0x00RRGGBB`, red → violet — the family's own anchors and
-/// the arc's control points.
-///
-/// These are the constants v0.43 shipped and the ones every doc, test fixture
-/// and settings preview in this crate is written against. They are stated as
-/// COLOURS; their hues and lightnesses are read back out of them by the
-/// generator rather than transcribed beside them, so the arc cannot disagree
-/// with the constants it is built from.
-/// **THE ANCHORS ARE CANONICAL ROYGBIV AS OF 2026-08-28, AND THAT IS AN OWNER
-/// RULING, NOT A SOLVE** (*"a rainbow. like in the sky"*, *"do you know how to
-/// make a regular ROYGBIV rainbow color pallet? do that"*). Seven authored
-/// names, in spectral order: red, orange, yellow, green, blue, **indigo**,
-/// violet. They are stated as COLOURS; their hues and lightnesses are read back
-/// out of them by the generator rather than transcribed beside them, so the arc
-/// cannot disagree with the constants it is built from.
+/// **THE SEVEN NAMES**, `0x00RRGGBB`, red → violet — canonical ROYGBIV and the
+/// arc's control points. The generator reads these authored colours directly,
+/// so its curve cannot disagree with its anchors.
 ///
 /// **WHAT THE SEVENTH ANCHOR BOUGHT, and why the six-anchor arc could not buy
 /// it.** The retired six anchors carried a hand-built neutralized handoff across
@@ -149,11 +65,10 @@ use crate::effect_util::lerp_rgb;
 /// cyan window's pre-image to raw hues `107.5° .. 199°`. Two things retire that
 /// tuning rather than refute it: the palette is no longer six anchors bridging
 /// green to blue across the whole wedge, and the rainbow bed no longer composites
-/// additively — it is source-over ([`GlowQuad::alpha`]), so the ground's own
+/// additively — it is source-over ([`aterm_render::GlowQuad::alpha`]), so the ground's own
 /// colour is displaced rather than summed and the pre-image argument no longer
-/// applies to the bed at all. What survives is the LAW, not the anchor edit:
-/// cyan is a CROSSING, bounded and paced by [`spectrum_cyan_weight`], never a
-/// stripe and never a resting place.
+/// applies to the bed at all. What survives is the law, not the anchor edit:
+/// cyan is a bounded crossing, never an authored stripe or resting place.
 pub const SPECTRUM_ANCHORS: [u32; SPECTRUM_STOPS] = [
     0x00FF_0000, // red
     0x00FF_7F00, // orange
@@ -169,7 +84,7 @@ pub const SPECTRUM_ANCHORS: [u32; SPECTRUM_STOPS] = [
 /// control points.
 pub const SPECTRUM_STOPS: usize = 7;
 
-/// **THE CROSSING ROOF** — eight full-chroma through-samples the green→blue
+/// **THE CROSSING ROOF** — eight authored through-samples the green→blue
 /// interval is drawn through, pinned at consecutive table slots
 /// [`SPECTRUM_ROOF_AT`]`..+8` of that interval. NOT named stops: nothing snaps
 /// here ([`spectrum_snap`] still resolves to the seven ROYGBIV anchors), and
@@ -283,19 +198,12 @@ const SPECTRUM_ROOF_PACE: [(usize, u32); 4] = [
     (60, 0x0026_8BFF), // hue 212°, S 0.85 — the exit
 ];
 
-/// The LUT's length. **511 entries, 2 KB** — doubled from the 256 the six-anchor
-/// arc shipped with, and the reason is [`SPECTRUM_SAT_ENV`]: the chroma law adds
-/// a second thing that moves along the arc, and where it ramps (`hue 198..206`,
-/// `S 0.26 -> 1.00`) a 256-entry table put **22 levels** between neighbours —
-/// over the `16` `spectrum_lut_tracks_the_curve_it_transcribes` allows, and a
-/// genuine staircase rather than a bookkeeping failure. At 511 the same ramp
-/// steps **13**. The table is still a `const`, still one read plus one lerp.
+/// The LUT's length: **511 entries, just under 2 KiB**. This gives each of the
+/// six anchor intervals exactly 85 steps while keeping the table compact.
 pub const SPECTRUM_LUT_LEN: usize = 511;
 
 /// Entries per anchor interval. `85 x 6 == 510`, so the seven anchors land on
-/// the EXACT indices `85 · i` and are stored verbatim. The 511-entry length was
-/// chosen for the six-anchor arc (`102 x 5`) and divides the seven-anchor one
-/// exactly as well, so the table length did not have to move with the palette.
+/// the exact indices `85 * i` and are stored verbatim.
 pub const SPECTRUM_STRIDE: usize = (SPECTRUM_LUT_LEN - 1) / (SPECTRUM_STOPS - 1);
 const _: () = assert!(
     SPECTRUM_STRIDE * (SPECTRUM_STOPS - 1) == SPECTRUM_LUT_LEN - 1,
@@ -330,104 +238,6 @@ pub const SPECTRUM_CYAN_SAT_MIN: f64 = 0.3;
 /// §2.3.4's bound on how much of `t` may lie inside the window.
 #[cfg(test)]
 pub(crate) const SPECTRUM_CYAN_DWELL_MAX: f64 = 0.04;
-
-/// **THE CHROMA CEILING PER HUE** — `121` samples at one degree, hue
-/// [`SPECTRUM_SAT_ENV_LO`] `..` [`SPECTRUM_SAT_ENV_HI`], linearly interpolated;
-/// `1.0` (no cap at all) outside.
-///
-/// **`@generated` — do not edit by hand.** `certify_spectrum_sat_env` re-derives
-/// the bound from scratch and proves every committed sample, and every point of
-/// the interpolation between them, sits at or under it.
-///
-/// # What it is a bound ON
-///
-/// For a hue `h` and a saturation `s`, the emitter can put `hsv(h, s, v)` on the
-/// glass at ANY coverage — the ribbon's transverse profile scales a vertex's
-/// coverage smoothly to zero, so a colour approved at the vertex's coverage is
-/// still painted at every coverage below it. The bound is therefore
-/// coverage-blind by necessity:
-///
-/// ```text
-/// SAT_ENV(h) = sup { s* : for all s <= s*, for all cov, for both shipped
-///                    grounds, add_sat(bg, premul(hsv(h, s, 1), cov)) is NOT
-///                    lit-and-inside HSV [165, 200] at S > 0.3 }
-/// ```
-///
-/// **DOWNWARD-CLOSED, and that is not pedantry.** The safe set is NOT an
-/// interval at every hue: at `123°` full chroma is safe (the composite reads
-/// `150°`) while `S = 0.55` is NOT (it reads `167°` at coverage 16) — DESATURATING
-/// a green over a blue-black ground is what walks it through cyan. A bound
-/// defined as "the largest safe `s`" would have licensed exactly the colour that
-/// fails, which is the defect the first pass of this table shipped.
-///
-/// # Why a ceiling and not a fade
-///
-/// [`clear_thing_of_cyan`]'s argument, applied to the band: a cap has nothing to
-/// say about a colour already under it, so red, orange, yellow and violet are
-/// bit-identical to the arc that shipped and only the green→blue crossing pays.
-/// Measured: the law touches `hue 96..216`, `23 %` of the arc's `255°` span, and
-/// the composite's mean saturation over the whole `(t x coverage)` grid moves
-/// `0.487 -> 0.450` while its cyan share moves `5.47 % -> 0.00 %`.
-///
-/// # The cost, stated
-///
-/// The crossing is PALE. `SAT_ENV` floors at `0.26` around hue `180°`, so the
-/// arc's green→blue transit is a desaturated mint→slate ramp rather than a
-/// turquoise one. That is the whole trade: there is no monotone hue from green
-/// to blue over this ground that is both saturated and outside the window, and
-/// §2.3's three ways out are still the only three there are.
-#[rustfmt::skip]
-pub const SPECTRUM_SAT_ENV: [f32; SPECTRUM_SAT_ENV_N] = [
-    1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 0.9990, 0.9932, 0.9795,
-    0.9565, 0.9248, 0.8860, 0.8438, 0.8017, 0.7628, 0.7275, 0.6944,
-    0.6615, 0.6292, 0.5988, 0.5716, 0.5480, 0.5290, 0.5151, 0.5051,
-    0.4973, 0.4899, 0.4821, 0.4735, 0.4642, 0.4543, 0.4443, 0.4348,
-    0.4259, 0.4180, 0.4111, 0.4051, 0.3996, 0.3941, 0.3884, 0.3823,
-    0.3762, 0.3702, 0.3649, 0.3602, 0.3561, 0.3523, 0.3485, 0.3445,
-    0.3404, 0.3364, 0.3323, 0.3281, 0.3237, 0.3194, 0.3152, 0.3111,
-    0.3072, 0.3032, 0.2996, 0.2962, 0.2934, 0.2912, 0.2897, 0.2888,
-    0.2884, 0.2883, 0.2883, 0.2883, 0.2883, 0.2882, 0.2878, 0.2870,
-    0.2857, 0.2838, 0.2815, 0.2790, 0.2764, 0.2739, 0.2715, 0.2691,
-    0.2668, 0.2647, 0.2630, 0.2617, 0.2609, 0.2605, 0.2604, 0.2604,
-    0.2604, 0.2604, 0.2604, 0.2606, 0.2613, 0.2623, 0.2638, 0.2655,
-    0.2671, 0.2684, 0.2692, 0.2696, 0.2718, 0.2867, 0.2911, 0.3692,
-    0.5173, 0.6452, 0.7715, 0.8764, 0.9488, 0.9871, 0.9991, 1.0000,
-    1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000,
-    1.0000,
-];
-
-/// The hue the first sample of [`SPECTRUM_SAT_ENV`] stands for, in degrees.
-pub const SPECTRUM_SAT_ENV_LO: f64 = 96.0;
-/// The hue the last sample of [`SPECTRUM_SAT_ENV`] stands for.
-pub const SPECTRUM_SAT_ENV_HI: f64 = 216.0;
-/// How many samples [`SPECTRUM_SAT_ENV`] carries — one per degree of
-/// `SPECTRUM_SAT_ENV_LO ..= SPECTRUM_SAT_ENV_HI`, which is the resolution at
-/// which a LINEAR read between neighbours still sits under the solved bound.
-pub const SPECTRUM_SAT_ENV_N: usize = 121;
-const _: () = assert!(
-    SPECTRUM_SAT_ENV_N == (SPECTRUM_SAT_ENV_HI - SPECTRUM_SAT_ENV_LO) as usize + 1,
-    "the envelope table must carry exactly one sample per degree"
-);
-
-/// The chroma ceiling at HSV hue `hue_deg` — [`SPECTRUM_SAT_ENV`], read.
-///
-/// Linear between samples and `1.0` outside the table's span: the table is
-/// derived so that the LINE between two samples is under the solved bound too,
-/// so the read is as safe as the samples are.
-#[must_use]
-pub fn spectrum_sat_envelope(hue_deg: f64) -> f64 {
-    if !(SPECTRUM_SAT_ENV_LO..SPECTRUM_SAT_ENV_HI).contains(&hue_deg) {
-        return 1.0;
-    }
-    let x = hue_deg - SPECTRUM_SAT_ENV_LO;
-    let i = (x as usize).min(SPECTRUM_SAT_ENV_N - 2);
-    let f = x - i as f64;
-    let (a, b) = (
-        f64::from(SPECTRUM_SAT_ENV[i]),
-        f64::from(SPECTRUM_SAT_ENV[i + 1]),
-    );
-    a + (b - a) * f
-}
 
 /// **THE CHROMA FLOOR**, in levels of channel spread (`max − min`): below it a
 /// colour is a GREY, not a cyan, and §2.3.4's ruling is about colours.
@@ -505,7 +315,6 @@ pub const SPECTRUM_GLASS_SOFT_HI: f32 = 4.0;
 /// `V * 255 > 24` qualifier, which is also the shipped ground's own `V`.
 pub const SPECTRUM_GLASS_LIT_MIN: f32 = 24.0;
 
-
 /// **HOW MUCH STEEPER THAN THE THING-ARC A BASE-MIXED CARET MAY BE.**
 ///
 /// [`SPECTRUM_THING_RATE_MAX`]'s twin, one level down. That constant bounds the
@@ -555,7 +364,7 @@ pub const SPECTRUM_GLASS_LIT_MIN: f32 = 24.0;
 pub const SPECTRUM_CARET_RATE_MAX: f32 = 17.0;
 
 // ---------------------------------------------------------------------------
-// THE SPACES — sRGB HSV for hue and chroma, OkLab for lightness.
+// THE COLOUR SPACE — sRGB HSV for hue/chroma and linear sRGB for test luminance.
 // ---------------------------------------------------------------------------
 
 /// Cubic smoothstep `0..1`, CLAMPING — the segment's eased coordinate.
@@ -571,7 +380,7 @@ fn smoothstep01(x: f64) -> f64 {
 
 /// sRGB `0..1` → linear, the IEC 61966-2-1 transfer. The piecewise form, not the
 /// `2.2` approximation — the linear toe near black is where the two disagree
-/// most and is exactly where this arc's darkest anchor (`#6633FF`) lives.
+/// most.
 #[inline]
 #[cfg(test)]
 fn srgb_decode(c: f64) -> f64 {
@@ -582,28 +391,9 @@ fn srgb_decode(c: f64) -> f64 {
     }
 }
 
-/// OkLab **lightness** (`L`, 0..1) of a LINEAR-light sRGB triple — Björn
-/// Ottosson's matrices, cube-root compressed.
-///
-/// Only the lightness is taken. The `a`/`b` opponent axes would be a second
-/// vocabulary rather than a second measurement: the six named anchors, the cyan
-/// window and `light_ink_bold`'s hue normalization are all already written in
-/// sRGB HSV, so hue and chroma stay there and OkLab is asked only the one
-/// question sRGB cannot answer — how bright does this LOOK.
-#[inline]
-#[cfg(test)]
-fn oklab_lightness(lin: [f64; 3]) -> f64 {
-    let l = 0.412_221_470_8 * lin[0] + 0.536_332_536_3 * lin[1] + 0.051_445_992_9 * lin[2];
-    let m = 0.211_903_498_2 * lin[0] + 0.680_699_545_1 * lin[1] + 0.107_396_956_6 * lin[2];
-    let s = 0.088_302_461_9 * lin[0] + 0.281_718_837_6 * lin[1] + 0.629_978_700_5 * lin[2];
-    0.210_454_255_3 * l.cbrt() + 0.793_617_785_0 * m.cbrt() - 0.004_072_046_8 * s.cbrt()
-}
-
 /// HSV of a `0x00RRGGBB` — hue in DEGREES, saturation and value in `0..1`.
 ///
-/// The generator's input side (the anchors' hues are read out of the anchors)
-/// and the cyan bound's measurement side, so the law and its proof cannot end up
-/// in two different colour spaces.
+/// Used by the cyan-bound and colour-continuity measurements.
 #[must_use]
 pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
     let chan = |sh: u32| ((rgb >> sh) & 0xff) as f64 / 255.0;
@@ -622,15 +412,8 @@ pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
     (hue, if hi <= 0.0 { 0.0 } else { d / hi }, hi)
 }
 
-/// HSV → UNQUANTIZED sRGB `0..1`, hue in degrees — `hsv2rgb`'s float twin, for
-/// the generator's inner solve alone.
-///
-/// **SOLVING ON BYTES IS SOLVING ON A STAIRCASE.** `hsv2rgb` rounds to `u8`, so
-/// a bisection that measured its output would be bisecting a step function: it
-/// converges onto whichever plateau it lands in rather than onto the answer, and
-/// two neighbouring table entries whose targets are a hair apart can come back
-/// from opposite ends of the same plateau. The solve runs in `f64` and the
-/// result is rounded exactly once, at the end.
+/// HSV → unquantized sRGB `0..1`, hue in degrees. The crossing-roof generator
+/// stays in `f64` and rounds exactly once when it commits an entry to the LUT.
 fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
     let h = hue_deg.rem_euclid(360.0) / 60.0;
     let c = v * s;
@@ -647,31 +430,13 @@ fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
     [r + m, g + m, b + m]
 }
 
-/// OkLab lightness of a committed `0x00RRGGBB`, through the sRGB transfer — the
-/// generator's one perceptual measurement, taken on the BYTES so what is solved
-/// for is what the emitter will push.
-#[cfg(test)]
-fn spectrum_lightness(rgb: u32) -> f64 {
-    let chan = |sh: u32| srgb_decode(((rgb >> sh) & 0xff) as f64 / 255.0);
-    oklab_lightness([chan(16), chan(8), chan(0)])
-}
-
-/// **THE GENERATOR.** Builds [`SPECTRUM_LUT`] from the six anchors.
+/// **THE GENERATOR.** Builds [`SPECTRUM_LUT`] from the seven anchors.
 ///
-/// Per interval the arc is parameterized by [`smoothstep01`] of the slot — zero
-/// slope at each anchor, which is what makes the family's reflected sweep C¹ at
-/// both turnarounds. Two things ride that one coordinate:
-///
-/// * **hue**, through the cyan warp: the eased coordinate names a fraction of
-///   the interval's WARPED hue budget, and the hue that spends it is found by
-///   inverting the cumulative density. Outside the window that is a plain
-///   interpolation; inside it the arc moves `1 / 0.30` times faster, so the
-///   window is crossed rather than rested in;
-/// * **lightness**, straight: the two anchors' own OkLab lightness mixed at the
-///   same coordinate. That is "the anchors' line" — not a claim that the arc is
-///   level, but that it does not sag BELOW the two it is running between, which
-///   is what a byte-lerp cannot help doing and what put a `19.2 %` dark band
-///   inside every interval of the ramp this replaces.
+/// Five intervals use [`smoothstep01`] followed by per-channel sRGB
+/// interpolation. The green→blue interval instead follows the authored
+/// [`SPECTRUM_CROSSING_ROOF`] with a monotone cubic in HSV. Both paths have zero
+/// slope at the seven named anchors, so the reflected sweep turns around without
+/// a colour crease while reproducing every anchor exactly.
 ///
 /// The repo's discipline for a derived table (see `RAINBOW_BAND_COV_CAPS` and
 /// `certify_rainbow_band_cov_caps`): the table ships as a `const` so it costs
@@ -701,19 +466,15 @@ pub fn generate_spectrum_lut() -> [u32; SPECTRUM_LUT_LEN] {
             // what makes the arc C¹ across every control point and at both
             // turnarounds of the reflected sweep.
             let k = smoothstep01(slot as f64 / SPECTRUM_STRIDE as f64);
-            lut[idx] = lerp_rgb(
-                SPECTRUM_ANCHORS[seg],
-                SPECTRUM_ANCHORS[seg + 1],
-                k as f32,
-            );
+            lut[idx] = lerp_rgb(SPECTRUM_ANCHORS[seg], SPECTRUM_ANCHORS[seg + 1], k as f32);
         }
     }
     lut
 }
 
 /// One interior entry of the green→blue interval: a monotone cubic (Fritsch–
-/// Carlson PCHIP) in HSV hue and value through the anchors and the eight
-/// [`SPECTRUM_CROSSING_ROOF`] samples, at saturation exactly `1`.
+/// Carlson PCHIP) in HSV hue, saturation, and value through the anchors, pacing
+/// knots, and eight [`SPECTRUM_CROSSING_ROOF`] samples.
 ///
 /// # Why PCHIP and not another stack of smoothsteps
 ///
@@ -763,7 +524,11 @@ fn spectrum_roof_entry(slot: usize) -> u32 {
     }
     put(KNOTS - 3, SPECTRUM_ROOF_PACE[2].0, SPECTRUM_ROOF_PACE[2].1);
     put(KNOTS - 2, SPECTRUM_ROOF_PACE[3].0, SPECTRUM_ROOF_PACE[3].1);
-    put(KNOTS - 1, SPECTRUM_STRIDE, SPECTRUM_ANCHORS[SPECTRUM_ROOF_SEG + 1]);
+    put(
+        KNOTS - 1,
+        SPECTRUM_STRIDE,
+        SPECTRUM_ANCHORS[SPECTRUM_ROOF_SEG + 1],
+    );
     let x = slot as f64;
     let h = pchip_eval(&xs, &hue, x);
     let s = pchip_eval(&xs, &sat, x);
@@ -816,14 +581,11 @@ fn pchip_eval<const N: usize>(xs: &[f64; N], ys: &[f64; N], x: f64) -> f64 {
 
 /// THE ONE SPECTRUM, at spectrum position `t` — `0` is red, `1` is violet.
 ///
-/// One table read and one lerp, against the six `hsv2rgb` round trips (~25 flops
-/// with three divides each) the anchor walk it replaces cost per swept cell per
-/// frame.
-///
-/// INTERPOLATED, NOT ROUNDED: a nearest-entry lookup would put a 256-step
+/// Two adjacent table lookups and one lerp. INTERPOLATED, NOT ROUNDED: a nearest-entry
+/// lookup would put a 511-entry
 /// staircase back on top of a curve built to remove one. Adjacent entries are at
-/// most 14 levels apart, so the straight mix between them is indistinguishable
-/// from the generated curve.
+/// most 5 levels apart on the five ordinary intervals and at most 16 through the
+/// authored crossing roof, so the straight mix between them remains continuous.
 ///
 /// `t` outside `0..=1` clamps rather than wraps, on purpose: the arc is
 /// **acyclic**. Wrapping violet back into red is the magenta seam this family
@@ -849,118 +611,22 @@ pub fn spectrum(t: f32) -> u32 {
     lerp_rgb(SPECTRUM_LUT[i], SPECTRUM_LUT[j], x - i as f32)
 }
 
-/// **THE ARC A *THING* WEARS** — [`spectrum`] with its cyan transit taken at low
-/// chroma instead of at full.
-///
-/// §2.3 rules that cyan may be CROSSED but that a *thing* must never BE cyan,
-/// and §2.3.4 states the window as **HSV hue `[165°, 200°]` at `S > 0.3`**. A
-/// band satisfies that by crossing fast: the ribbon's cyan pixels are a few
-/// pixels of a moving mark, and the dwell bound is what keeps them from being
-/// anything more. A CARET cannot. It fills a whole cell and holds still, so for
-/// as long as the field sits in the window the caret simply *is* cyan — which is
-/// what the shipped engine reported as `block_fill_rgb=40a5ab` (HSV `183°`,
-/// `S = 0.63`) and `45a4c5` (`195°`, `S = 0.65`).
-///
-/// **THE THREE WAYS OUT, AND WHY THIS IS THE ONE.** Green is HSV `108°` and blue
-/// is `204°`, so a continuous path between them can (a) cross the window at full
-/// chroma, (b) go the long way round the wheel through magenta, or (c) cross it
-/// at LOW chroma. There is no fourth. (a) is what a band does and a thing may
-/// not; (b) is the magenta seam this family bans outright; so a thing takes (c).
-/// The alternative to continuity — snapping to a named stop, §2.3.3's rule for
-/// stars and motes — is right for a mark that blinks into existence and wrong
-/// for one that persists: it steps the caret's colour by up to 209 levels
-/// between two frames, which the family's own continuity pins measure and reject.
-///
-/// **THE LAW.** Hue and value are untouched; SATURATION is eased down to
-/// [`SPECTRUM_CYAN_SAT_CEIL`] across [`SPECTRUM_CYAN_FADE`] degrees of shoulder
-/// either side, so it is already at the floor by the time the window is entered
-/// and stays there across all of it. Continuity is preserved because the ease is
-/// a `smoothstep` on a hue that is itself monotone and continuous in `t`.
-///
-/// On glass: the caret PALES for the fraction of a turn the rainbow spends
-/// crossing cyan, and is never teal.
+/// Compatibility name for the spectrum read used by persistent point marks.
+/// Older versions desaturated the cyan crossing here; canonical ROYGBIV keeps
+/// the authored arc intact. The emitted caret fill is constrained separately by
+/// [`clear_thing_of_cyan`].
 #[must_use]
 pub fn spectrum_clear_of_cyan(t: f32) -> u32 {
-    // **RETIRED WITH THE REST OF THE CYAN-AVOIDANCE FAMILY (ROYGBIV merge), AND
-    // THIS WAS THE ONE THAT ACTUALLY BIT.**
-    //
-    // It warped the arc by a span keyed on `t` rather than on the colour, so it
-    // survived the retirement of its rgb-keyed twin [`clear_thing_of_cyan`] and
-    // went on greying the thing arc by itself. Measured against canonical
-    // ROYGBIV: **8.9 %** of the arc moved, worst sample `#00817E -> #658180`,
-    // chroma `130 -> 28`. A 4.6x chroma collapse over a ninth of the arc is the
-    // grey hole, in the marks that wear this arc — glitter, point-marks and the
-    // caret's own base — and it is the exact defect the seven anchors were
-    // adopted to remove from the ribbon.
-    //
-    // Five mechanisms in this family are now retired together and for one
-    // reason: the neutralized green→blue handoff, `SPECTRUM_SAT_ENV`,
-    // `RAINBOW_STREAK_SAT_PAIR`, `clear_thing_of_cyan` and this. Every one of
-    // them bought a zero cyan count by spending chroma, and the owner's ruling is
-    // that cyan is a bounded CROSSING rather than a colour to destroy. The law
-    // now lives in the censuses that COUNT the crossing.
     spectrum(t)
 }
 
-/// **THE THING-LAW, ON A COLOUR** — [`spectrum_clear_of_cyan`]'s twin, keyed on
-/// the colour's OWN hue instead of on a position along the arc.
+/// Project a solid emitted colour below the saturated-cyan ceiling.
 ///
-/// # Why the position-keyed one is not enough
-///
-/// `spectrum_clear_of_cyan` guarantees the colour the caret RESOLVES. It says
-/// nothing about the colour the caret EMITS, because the caret does not emit what
-/// it resolves: the block IS the cursor, so the fill is the theme's
-/// `cursor_color` (or OSC 12) TINTED toward the arc — `mix_rgb(base, rainbow, …)`,
-/// a straight per-channel line in sRGB.
-///
-/// **A LINE BETWEEN TWO LEGAL COLOURS IS NOT A LEGAL LINE.** With the shipped
-/// Default theme the base is `#50FA7B`, HSV hue `135°`; the arc's blue anchor is
-/// `204°`; and **52 % of the straight RGB line between them lies inside
-/// `HSV [165°, 200°]`**. At full energy the mix runs at `MIX_MAX`, which lands on
-/// `#17A9E7` — hue `197.9°`, `S = 0.90`, a solid turquoise block filling the
-/// cell. Measured on glass: 19 of 500 keystrokes.
-///
-/// This is not fixable by choosing a better space to interpolate in. Cyan is
-/// genuinely BETWEEN green and blue: an OkLab-rectangular blend of the same two
-/// endpoints was measured at **9.8 %** of the `(field x energy)` grid inside the
-/// window against the sRGB blend's `7.0 %` — worse, not better, and for a
-/// structural reason. §2.3's three ways out are the only three there are, and
-/// (c) — cross at LOW CHROMA — is the one a *thing* takes. So the mix takes it too.
-///
-/// # The law
-///
-/// Hue and value are untouched; SATURATION is held under a hue-keyed ENVELOPE
-/// that closes to [`SPECTRUM_CYAN_SAT_CEIL`] across the window and opens to `1` —
-/// no cap at all — by the outer edge of [`SPECTRUM_THING_SOFT_LO`] /
-/// [`SPECTRUM_THING_SOFT_HI`]. Colours under [`SPECTRUM_THING_CHROMA_FLOOR`]
-/// levels of channel spread are greys and are ramped out of the law entirely.
-/// [`settle_on_the_byte`] then re-asks the ruling's own question of the emitted
-/// triple, because that is what the ruling is about.
-///
-/// **AN ENVELOPE RATHER THAN A PULL, AND THAT IS THE WHOLE OF WHY THE ARC IS
-/// SAFE.** The obvious spelling — ease saturation toward the ceiling by the same
-/// `inside` factor — is a law about every colour NEAR the window, and it pales the
-/// arc's own blue approach for no reason: those colours were never illegal, they
-/// were merely nearby. Capping instead means the law has nothing to say about a
-/// colour already under its envelope, so the thing-arc — which has spent its own
-/// chroma by the time it reaches the shoulder — passes through nearly untouched:
-/// **53 of 4,097 walked positions move at all, by at most 26 levels**, pinned by
-/// `the_colour_law_leaves_the_thing_arc_where_it_found_it`. The arc was certified
-/// on glass; a law about the MIX has no business moving it.
-///
-/// **AND A PROJECTION RATHER THAN AN EASE.** `sat + (envelope - sat) * inside`
-/// reads gentler and is not: it leaves saturation ABOVE the envelope wherever
-/// `inside < 1`, which is precisely the excess the `f32 -> u8` rotation can carry
-/// into the window, and it is not a fixed point — repeated application creeps
-/// instead of landing. The projection is idempotent up to that rotation.
-///
-/// **THE COST, STATED.** On a theme whose cursor colour is chromatic and on the
-/// far side of the window from part of the arc, the caret gives up chroma where
-/// the mix would otherwise have been turquoise — `3.1 %` of the swept
-/// `(field x energy x theme)` grid across the shipped roster — and its steepest
-/// transit is up to [`SPECTRUM_CARET_RATE_MAX`] times the thing-arc's own.
-/// Themes whose cursor colour is achromatic (Dracula, Nord, Catppuccin Mocha,
-/// One Dark, Gruvbox Light, and the theme-polar fallbacks) pay nothing at all.
+/// The cursor block mixes the theme cursor colour with [`spectrum`], and that
+/// mix can enter the cyan window even when both endpoints are allowed. This
+/// hue-keyed envelope preserves hue and value, caps saturation through the
+/// window, and leaves low-chroma greys alone. `settle_on_the_byte` checks the
+/// quantized result so the guarantee applies to the emitted RGB value.
 #[must_use]
 pub fn clear_thing_of_cyan(rgb: u32) -> u32 {
     // **UN-RETIRED 2026-08-29, AND ONLY FOR THE MARK IT WAS ALWAYS ABOUT.**
@@ -1101,46 +767,38 @@ pub fn compose_on_glass(ground: u32, premul: u32, alpha: u8) -> u32 {
 /// touched at all.
 #[inline]
 fn over_the_glass_ceiling(px: u32) -> bool {
-    // **THE INTEGER TURNSTILE** — a reject-only pre-gate on the bytes, with the
-    // f64 HSV law below it untouched and still the only thing that can answer
-    // `true`. This predicate is asked of every composite of every rainbow quad
-    // and of 255 weights of every halo, every frame; profiled on the hot-ribbon
-    // release gate it was the single largest line in the frame, and for almost
-    // every pixel the answer is "no" for a reason three integer compares can
-    // establish. Each gate rejects only what the exact law below provably
-    // rejects, with degrees of margin over the window's own shoulders, so the
-    // answers are bit-identical to the un-gated form:
-    //   - `val * 255.0` IS the max byte for byte channels, so the first test is
-    //     the `SPECTRUM_GLASS_LIT_MIN` test itself, not an approximation;
-    //   - `sat <= 0.2` sits under `SPECTRUM_GLASS_SAT_CEIL = 0.22`, the LOWEST
-    //     ceiling the shoulder blend can produce;
-    //   - the hue gates bound hue outside `(150, 210)`, seven degrees clear of
-    //     the softened window `(157, 204)`: an r-max pixel reads in
-    //     `[0, 60] ∪ [300, 360)`; a g-max pixel reads over `150` only when
-    //     `2(b - r) > d`; a b-max pixel reads under `210` only when
-    //     `2(g - r) > d` — the sector formulas solved at the margin.
-    {
-        let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
-        let mx = r.max(g).max(b);
-        if mx <= SPECTRUM_GLASS_LIT_MIN as u32 {
-            return false;
-        }
-        let d = mx - r.min(g).min(b);
-        if d * 5 <= mx {
-            return false;
-        }
-        // Mirrors `spectrum_hsv`'s own tie-breaking: `hi == r` first, then
-        // `hi == g`, then blue.
-        if r >= mx {
-            return false;
-        }
-        if g >= mx {
-            if 2 * b.saturating_sub(r) <= d {
-                return false;
-            }
-        } else if 2 * g.saturating_sub(r) <= d {
-            return false;
-        }
+    // **THE INTEGER TURNSTILE** — reject only byte triples that the exact f64
+    // HSV law below must reject. This predicate is asked of every composite of
+    // every rainbow quad and every halo weight; cheap misses matter even with
+    // the resident exact memos.
+    let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+    let mx = r.max(g).max(b);
+    // `val * 255` is exactly the maximum byte. A saturation at or below 0.20
+    // is safely below the lowest possible ceiling, 0.22.
+    if mx <= SPECTRUM_GLASS_LIT_MIN as u32 {
+        return false;
+    }
+    let d = mx - r.min(g).min(b);
+    if d * 5 <= mx {
+        return false;
+    }
+
+    // The softened window is 157°..204°; throughout it red is strictly the
+    // smallest channel. Reject every other sector before the general converter.
+    if r >= g || r >= b {
+        return false;
+    }
+    // Resolve its two halves without division. When green is
+    // largest, H = 120 + 60(B-R)/(G-R), so the lower shoulder is open only
+    // above 157°.  When blue is largest, H = 240 - 60(G-R)/(B-R), so the upper
+    // shoulder is open only below 204°.  Equality is safe to reject because
+    // smoothstep is exactly zero at the shoulder endpoint.
+    if if g >= b {
+        60 * (b - r) <= 37 * (g - r)
+    } else {
+        60 * (g - r) <= 36 * (b - r)
+    } {
+        return false;
     }
     let (hue, sat, val) = spectrum_hsv(px);
     if val * 255.0 <= f64::from(SPECTRUM_GLASS_LIT_MIN) {
@@ -1195,8 +853,8 @@ fn pale_at_constant_light(rgb: u32, keep: f32) -> u32 {
 
 /// **THE PIXEL A RADIAL HALO WRITES**, at one point of its falloff.
 ///
-/// [`HaloMode::Add`] carries PREMULTIPLIED peak light that the falloff scales
-/// before a saturating add; [`HaloMode::Over`] carries a STRAIGHT veil colour
+/// [`aterm_render::HaloMode::Add`] carries PREMULTIPLIED peak light that the falloff scales
+/// before a saturating add; [`aterm_render::HaloMode::Over`] carries a STRAIGHT veil colour
 /// whose OPACITY the falloff scales. Two different meanings for `weight`, so the
 /// two spellings are kept apart rather than folded.
 #[inline]
@@ -1215,15 +873,16 @@ pub fn compose_halo_on_glass(ground: u32, colour: u32, weight: u8, over: bool) -
 /// # Why this one has to be coverage-blind, and why that is affordable here
 ///
 /// A `GlowQuad` is one `(colour, alpha)` pair, so its law can ask about exactly
-/// the pixel that pair will write. A halo is an ELLIPTICAL FALLOFF: every weight
-/// from `1` to `255` lands somewhere inside it, so the only guarantee worth
-/// having is one that holds at all of them. That is the shape of law this file
-/// spent sixteen percent of the arc on once — but the cost is not the same,
-/// because the SUBJECT is not the same. `SPECTRUM_SAT_ENV` was coverage-blind
-/// about EVERY COLOUR ON THE ARC, so it paled the arc; this is coverage-blind
-/// about ONE HALO'S OWN COLOUR, so it pales only the halos whose light actually
-/// crosses the window, and leaves `SPECTRUM_LUT` untouched exactly as its twin
-/// does.
+/// the pixel that pair will write. A halo is an ELLIPTICAL FALLOFF: additive
+/// halos reach every weight from `1` to `255`, while source-over halos reach
+/// `1..=halo_over_cap(colour)` because the renderer clamps their centre. The
+/// only useful guarantee is one that holds across that whole reachable domain.
+/// That is the shape of law this file spent sixteen percent of the arc on once
+/// — but the cost is not the same, because the SUBJECT is not the same.
+/// `SPECTRUM_SAT_ENV` was coverage-blind about EVERY COLOUR ON THE ARC, so it
+/// paled the arc; this is coverage-blind about ONE HALO'S OWN COLOUR, so it
+/// pales only the halos whose light actually crosses the window, and leaves
+/// `SPECTRUM_LUT` untouched exactly as its twin does.
 ///
 /// # What it is for, measured
 ///
@@ -1234,8 +893,21 @@ pub fn compose_halo_on_glass(ground: u32, colour: u32, weight: u8, over: bool) -
 /// `halos` and which no quad law can reach.
 #[must_use]
 pub fn clear_halo_of_cyan(colour: u32, over: bool, ground: u32) -> u32 {
+    // `HaloMode::Over` stores its centre-alpha ceiling in the colour's high
+    // byte.  It is live renderer metadata, not a colour channel: zero means an
+    // uncapped 255, while every other value limits the radial weights that can
+    // reach glass.  Preserve it through the RGB projection and ask the law only
+    // about that renderer-reachable weight domain.  Dropping it would turn a
+    // corrected, legibility-capped veil into an uncapped opaque centre.
+    let over_bits = if over { colour & 0xff00_0000 } else { 0 };
+    let max_weight = if over {
+        aterm_render::halo_over_cap(colour)
+    } else {
+        255
+    };
+    let pale = |keep: f32| pale_at_constant_light(colour, keep) | over_bits;
     let bad = |c: u32| {
-        (1..=255u32)
+        (1..=u32::from(max_weight))
             .any(|w| over_the_glass_ceiling(compose_halo_on_glass(ground, c, w as u8, over)))
     };
     // An ACHROMATIC halo cannot make a saturated composite in the window: it
@@ -1253,18 +925,14 @@ pub fn clear_halo_of_cyan(colour: u32, over: bool, ground: u32) -> u32 {
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..10 {
         let mid = 0.5 * (lo + hi);
-        if bad(pale_at_constant_light(colour, mid)) {
+        if bad(pale(mid)) {
             hi = mid;
         } else {
             lo = mid;
         }
     }
-    let kept = pale_at_constant_light(colour, lo);
-    if bad(kept) {
-        pale_at_constant_light(colour, 0.0)
-    } else {
-        kept
-    }
+    let kept = pale(lo);
+    if bad(kept) { pale(0.0) } else { kept }
 }
 
 /// **THE LIGHT-LAW** — §2.3's ruling, asked of the PIXEL and answered at emit
@@ -1278,7 +946,7 @@ pub fn clear_halo_of_cyan(colour: u32, over: bool, ground: u32) -> u32 {
 /// ROYGBIV runs a straight per-channel line from `#00FF00` to `#0000FF`, so
 /// forbidding the colour means spending the arc's chroma across a ninth of its
 /// length, which is the grey hole. Measured here: the retired
-/// [`SPECTRUM_SAT_ENV`] applied to this arc moves **82 of 511** table entries and
+/// the retired `SPECTRUM_SAT_ENV` applied to this arc moves **82 of 511** table entries and
 /// drives `#00827D` to `#608281`, chroma `130 -> 34`.
 ///
 /// **BUT NOTHING ON GLASS IS A COLOUR.** It is a colour AT A COVERAGE over a
@@ -1414,26 +1082,23 @@ fn the_stack_is_over_the_ceiling(premul: u32, alpha: u8, ground: u32) -> bool {
     false
 }
 
-/// **THE CARET'S STEEPEST BYTE RATE FROM A GIVEN BASE** —
-/// [`spectrum_thing_max_byte_rate`]'s twin for the colour the block actually
-/// emits, `clear_thing_of_cyan(mix_rgb(base, thing_arc(t), mix))`.
+/// **THE CARET'S STEEPEST BYTE RATE FROM A GIVEN BASE** — the composed counterpart
+/// to [`spectrum_max_byte_rate`] for the colour the block actually emits,
+/// `clear_thing_of_cyan(mix_rgb(base, thing_arc(t), mix))`.
 ///
-/// **WALKED FOUR TIMES FINER THAN ITS TWO SIBLINGS**, and that is the honest
-/// direction rather than an inconsistency. Both of those measure a law whose
-/// steepest place is a table chord, so the table's own resolution bounds them.
-/// This one measures a law keyed on the EMITTED COLOUR'S HUE, which crosses
-/// [`SPECTRUM_THING_SOFT_HI`]'s six degrees in as little as `0.006` of `t` — a
-/// step and a half of the table. A 255-step walk would report a rate the caret exceeds
-/// between two of its own samples, which is the shape of a false green.
-///
-/// The number it is compared against ([`spectrum_thing_max_byte_rate`]) is still
-/// the coarse one, so the ratio can only OVERSTATE what the base costs.
+/// **WALKED FOUR TIMES FINER THAN THE BAND SCAN**, and that is the honest
+/// direction rather than an inconsistency. The band scan measures a law whose
+/// steepest place is a table chord, so the table's own resolution bounds it.
+/// This one measures a law keyed on the emitted colour's hue, whose shoulder can
+/// be narrower than the authored spectrum's table chords. Walking four times
+/// finer prevents the scan from missing the composed law's steepest transition.
 ///
 /// The mix is passed in rather than assumed: the block's ramp runs
 /// `MIX_IDLE .. MIX_MAX` with energy and differs between themes, and a rate
 /// measured at one point on that ramp says nothing about the others.
 #[must_use]
-pub fn spectrum_caret_max_byte_rate(base: u32, mix: f32) -> f32 {
+#[cfg(test)]
+pub(crate) fn spectrum_caret_max_byte_rate(base: u32, mix: f32) -> f32 {
     let last = SPECTRUM_LUT_LEN * 4 - 1;
     let caret = |t: f32| clear_thing_of_cyan(lerp_rgb(base, spectrum_clear_of_cyan(t), mix));
     let mut worst = 0u32;
@@ -1452,16 +1117,17 @@ pub fn spectrum_caret_max_byte_rate(base: u32, mix: f32) -> f32 {
 /// violet. Out-of-range indices clamp to the ends.
 ///
 /// EVENLY SPACED, and that is load-bearing rather than a simplification: even
-/// spacing is what puts the anchors on the exact table indices `51 · i`, which
-/// is what lets them be stored verbatim instead of resolved through a solve that
-/// could round them.
+/// spacing puts the anchors on the exact table indices `85 * i`, so they can be
+/// stored verbatim.
 #[inline]
 #[must_use]
-pub fn spectrum_stop_position(i: usize) -> f32 {
+#[cfg(test)]
+pub(crate) fn spectrum_stop_position(i: usize) -> f32 {
     i.min(SPECTRUM_STOPS - 1) as f32 / (SPECTRUM_STOPS - 1) as f32
 }
 
-/// The colour of named stop `i` — red, orange, yellow, green, blue, violet.
+/// The colour of named stop `i` — red, orange, yellow, green, blue, indigo,
+/// violet.
 ///
 /// Read straight out of the table at its exact index, so it is the anchor
 /// constant itself and not a resolve that happens to agree.
@@ -1474,7 +1140,7 @@ pub fn spectrum_stop(i: usize) -> u32 {
 /// WHICH NAME IS THIS? The nearest named stop's INDEX to spectrum position `t`.
 ///
 /// Carried as an index rather than a colour so a caller that needs the darkened
-/// light-theme ink for a snapped mark can read it out of a pre-solved table
+/// light-theme ink for a snapped mark can read it out of a precomputed table
 /// instead of re-running the recipe (see `InkRole::band_ink`), and so the two
 /// can never disagree about which name a position has.
 #[inline]
@@ -1506,7 +1172,8 @@ pub fn spectrum_snap(t: f32) -> u32 {
 /// the colour law happened to do the day it was written, and then a law change
 /// looks like a regression when it is only a re-pacing.
 #[must_use]
-pub fn spectrum_max_byte_rate() -> f32 {
+#[cfg(test)]
+pub(crate) fn spectrum_max_byte_rate() -> f32 {
     let mut worst = 0u32;
     for pair in SPECTRUM_LUT.windows(2) {
         for shift in [16u32, 8, 0] {
@@ -1516,54 +1183,14 @@ pub fn spectrum_max_byte_rate() -> f32 {
     worst as f32 * (SPECTRUM_LUT_LEN - 1) as f32
 }
 
-/// **THE THING-ARC'S STEEPEST BYTE RATE** — [`spectrum_max_byte_rate`]'s twin
-/// for [`spectrum_clear_of_cyan`], measured over the same `255` steps so the two
-/// numbers are comparable.
-///
-/// It is the honest bound for a continuity oracle walking the CARET, and it is
-/// LARGER than the band's: the cyan transit is a deliberate departure and it has
-/// to be paid for somewhere. What keeps that from being a licence is
-/// [`SPECTRUM_THING_RATE_MAX`] — the multiple is itself bounded, and
-/// `the_thing_arc_pays_a_bounded_price_for_leaving_cyan` holds it there.
-#[must_use]
-pub fn spectrum_thing_max_byte_rate() -> f32 {
-    let last = SPECTRUM_LUT_LEN - 1;
-    let mut worst = 0u32;
-    let mut prev = spectrum_clear_of_cyan(0.0);
-    for i in 1..=last {
-        let cur = spectrum_clear_of_cyan(i as f32 / last as f32);
-        for shift in [16u32, 8, 0] {
-            worst = worst.max(((prev >> shift) & 0xff).abs_diff((cur >> shift) & 0xff));
-        }
-        prev = cur;
-    }
-    worst as f32 * last as f32
-}
-
-/// How much steeper than the band the thing-arc is allowed to be.
-///
-/// **THE NUMBER THAT KEEPS "NO POP" MEANING SOMETHING.** The caret's continuity
-/// pins used to bound its step by the BAND's steepest rate, which was right
-/// while the caret drew the band's own colours. It does not any more — it takes
-/// the cyan transit at low chroma, and that transit is steeper than anything on
-/// the band. Bounding the caret by its own law would be vacuous (any law is
-/// Lipschitz in its own constant), so the caret is bounded by its own law AND
-/// that law is bounded by this multiple of the band's.
-///
-/// `3.0` against a measured `2.36`. It is not slack for its own sake: narrowing
-/// [`SPECTRUM_CYAN_FADE`] to protect the blue anchor is what buys the steepness,
-/// and this is the ceiling on that trade.
-pub const SPECTRUM_THING_RATE_MAX: f32 = 2.75;
-
 /// THE ONE SPECTRUM, resolved — 511 entries, 2 KB, `0x00RRGGBB`, red at index
 /// `0` and violet at index `510`.
 ///
-/// **`@generated` by [`generate_spectrum_lut`] — do not edit by hand.** The six
-/// anchors sit verbatim at indices `0 / 102 / 204 / 306 / 408 / 510`; every entry
-/// between them is the most saturated sRGB colour on the arc's hue at the
-/// anchors' own lightness line, held under [`SPECTRUM_SAT_ENV`].
+/// **`@generated` by [`generate_spectrum_lut`] — do not edit by hand.** The seven
+/// anchors sit verbatim at indices `0 / 85 / 170 / 255 / 340 / 425 / 510`;
+/// entries between them are smooth per-channel interpolations.
 ///
-/// Regenerate after any change to the anchors or the cyan warp:
+/// Regenerate after any change to the anchors or interpolation law:
 ///
 /// ```text
 /// targo --unverified test -p aterm-effects --lib emit_spectrum_lut \
@@ -1664,8 +1291,8 @@ mod tests {
     use super::*;
 
     /// How finely the arc is walked when a property has to hold *everywhere*.
-    /// 4096 is 16 samples between neighbouring LUT entries: fine enough that a
-    /// reversal or a cyan detour narrower than a table step still gets caught.
+    /// 4096 gives about eight samples per LUT interval, exercising interpolated
+    /// reads between every adjacent pair.
     const WALK: usize = 4096;
 
     /// WCAG relative luminance of a committed table entry — read back through
@@ -1697,16 +1324,16 @@ mod tests {
     }
 
     /// **THE COMMITTED TABLE IS THE LAW'S OWN OUTPUT.** Byte-for-byte, no
-    /// tolerance: the moment an anchor or the cyan warp moves, this fails and
+    /// tolerance: the moment an anchor or interpolation rule moves, this fails and
     /// the table has to be regenerated rather than nudged.
     #[test]
     fn spectrum_lut_is_byte_reproducible_from_its_generator() {
         let fresh = generate_spectrum_lut();
         assert_eq!(fresh.len(), SPECTRUM_LUT.len());
-        for (i, (&committed, &solved)) in SPECTRUM_LUT.iter().zip(fresh.iter()).enumerate() {
+        for (i, (&committed, &generated)) in SPECTRUM_LUT.iter().zip(fresh.iter()).enumerate() {
             assert_eq!(
-                committed, solved,
-                "entry {i} drifted: committed #{committed:06X}, generator says #{solved:06X}"
+                committed, generated,
+                "entry {i} drifted: committed #{committed:06X}, generator says #{generated:06X}"
             );
         }
     }
@@ -1717,7 +1344,7 @@ mod tests {
     /// constant-luminance arc's "red" was `#FF0000` but its yellow was `#838400`
     /// and its green `#00942D` — an olive and a bottle green, because holding
     /// every hue at red's luminance is what a rainbow's bright half has to give
-    /// up. These six are the family's own names, and the table stores them
+    /// up. These seven are the family's own names, and the table stores them
     /// rather than solving anything that could round them.
     #[test]
     fn spectrum_reproduces_its_anchors_exactly() {
@@ -1756,7 +1383,7 @@ mod tests {
     /// than that can come back in either order. At `SPECTRUM_LUT_LEN = 256` the
     /// mean step was `1.0°`, four times the rotation, and the exact assertion
     /// held by luck; at `511` the mean step is `0.5°` and it does not.
-    /// Measured worst drop on the committed table: `0.093°`.
+    /// Measured worst drop on the committed table: `0.264°`.
     ///
     /// So the bound is the ROTATION ITSELF, computed from each pair's own
     /// spread rather than transcribed. **It still refutes what it exists to
@@ -1839,10 +1466,8 @@ mod tests {
     /// the stated `[165, 200]`, at the stated saturation floor, on the
     /// INTERPOLATED colours [`spectrum`] actually returns.
     ///
-    /// The bound is on DWELL, not on presence: green is `108°` and blue is
-    /// `204°`, so a monotone hue between them cannot skip the window (§2.3).
-    /// Crossing it fast is the only thing a curve can do, and
-    /// [`SPECTRUM_CYAN_RUSH`] is what makes it fast.
+    /// The bound is on dwell, not presence: the continuous green-to-blue leg
+    /// cannot skip the window (§2.3), and this test measures the actual arc.
     #[test]
     fn spectrum_never_rests_on_cyan() {
         let mut inside = 0usize;
@@ -1866,18 +1491,8 @@ mod tests {
             dwell * 100.0,
             SPECTRUM_CYAN_DWELL_MAX * 100.0
         );
-        // NON-VACUOUS: the window IS crossed. A curve that never entered it at
-        // ALL would have a hue reversal or a gap in it, which is a worse defect
-        // than the one this bounds.
-        //
-        // **MEASURED WITHOUT THE SATURATION FLOOR, and that is the change
-        // [`SPECTRUM_SAT_ENV`] forced.** The clause read `inside > 0` on the
-        // FULL predicate — hue in the window AND `S > 0.3` — which was a way of
-        // asking "does the arc reach these hues" that only worked while the arc
-        // reached them at chroma. It does not any more, by design, and the two
-        // questions have to be asked separately or the non-vacuity clause
-        // becomes a demand for the defect. Hue is asked here; chroma is what the
-        // dwell above bounds.
+        // The crossing assertion keeps the dwell bound non-vacuous: a curve
+        // that skipped the window entirely would have a reversal or gap.
         let crosses = (0..=WALK).any(|i| {
             let hue = spectrum_hsv(spectrum(i as f32 / WALK as f32)).0;
             (SPECTRUM_CYAN_LO..=SPECTRUM_CYAN_HI).contains(&hue)
@@ -1897,55 +1512,11 @@ mod tests {
         }
     }
 
-    /// **THE ARC HOLDS THE ANCHORS' OWN LIGHT** — it does not sag below the line
-    /// between the two anchors it is running between.
-    ///
-    /// **WHAT IS NOT CLAIMED.** Not that the arc is level: the six anchors span
-    /// `7.5x` in relative luminance by construction, and holding them flat is
-    /// exactly the decision this file reverses. What is claimed is the property a
-    /// byte-lerp cannot hold — sRGB's transfer curve is convex, so a straight
-    /// line in ENCODED bytes always carries less light than the two lights it
-    /// stands for, and the sag reached **19.2 %** on red→orange, **18.9 %** on
-    /// blue→violet and **13.1 %** on green→blue. Three dark bands, one per
-    /// interval, in a mark whose whole complaint was that it does not look
-    /// smooth.
+    /// The arc may follow the seven anchors' deliberately broad luminance span,
+    /// but it must not introduce a deep interior dip between adjacent stops.
     #[test]
-    fn spectrum_holds_the_anchors_own_light() {
-        let light: Vec<f64> = SPECTRUM_ANCHORS.iter().map(|&c| spectrum_lightness(c)).collect();
+    fn spectrum_has_no_deep_interior_luminance_dip() {
         let lum: Vec<f64> = SPECTRUM_ANCHORS.iter().map(|&c| luminance(c)).collect();
-        let mut worst_l = 0.0f64;
-        let mut worst_y = 0.0f64;
-        for (i, &entry) in SPECTRUM_LUT.iter().enumerate() {
-            let seg = (i / SPECTRUM_STRIDE).min(SPECTRUM_STOPS - 2);
-            let eased = smoothstep01((i - seg * SPECTRUM_STRIDE) as f64 / SPECTRUM_STRIDE as f64);
-            let want_l = light[seg] + (light[seg + 1] - light[seg]) * eased;
-            let want_y = lum[seg] + (lum[seg + 1] - lum[seg]) * eased;
-            worst_l = worst_l.max(((spectrum_lightness(entry) - want_l) / want_l).abs());
-            worst_y = worst_y.max(((luminance(entry) - want_y) / want_y).abs());
-        }
-        // **THE LINE-HOLDING CLAUSES ARE RETIRED WITH THE SOLVE THAT HELD THE
-        // LINE.** They read `worst_l <= 0.01` / `worst_y <= 0.08`, and they were
-        // true of `spectrum_max_chroma`: that generator asked for a lightness at
-        // each step and solved the most saturated colour that carried it, so the
-        // arc rode the anchors' interpolated lightness by construction. Canonical
-        // ROYGBIV is an AUTHORED palette mixed per channel, which is the arc the
-        // owner ruled for and the one upstream shipped; it does not hold that
-        // line and cannot be made to without reintroducing a chroma solve, which
-        // is what put the grey hole in the green→blue crossing. Measured on the
-        // shipped table: OkLab `L` leaves the line by 22.8 % and relative
-        // luminance by 32.3 %, both inside the green→blue leg, whose endpoints
-        // themselves differ by 10x in luminance.
-        //
-        // WHAT REPLACES THEM IS THE DEFECT THEY WERE PROXIES FOR — a DARK BAND
-        // INSIDE AN INTERVAL. Leaving the line is only visible when the arc
-        // dips below BOTH of the anchors it is running between, because that is
-        // the shape the eye reads as a hole rather than as a ramp. The sRGB
-        // byte-lerp this arc uses does dip, and the dip is bounded and small:
-        // 11.89 % below the lower endpoint, once, in the green→blue leg, where
-        // the floor is indigo-dark already (`0.0722 -> 0.0636` of relative
-        // luminance, an absolute difference of 0.0086). The bound is stated just
-        // above the measurement so a retune that deepened the dip — or a new
-        // interval that grew one — fails here with the leg named.
         let mut worst_dip = 0.0f64;
         let mut dip_seg = 0usize;
         for seg in 0..SPECTRUM_STOPS - 1 {
@@ -2091,23 +1662,39 @@ mod tests {
         );
     }
 
-    /// **THE TABLE TRACKS THE CURVE IT TRANSCRIBES.** [`spectrum`] lerps between
-    /// entries; the curve is solved. They agree to a handful of levels
-    /// everywhere, so reading the table is reading the law.
+    /// Adjacent generated entries stay close enough that the LUT cannot print a
+    /// visible staircase, and [`spectrum`] remains continuous between them. The
+    /// 16-level ceiling is exact: the authored crossing's consecutive
+    /// `#74E9D5 → #6CD9D2` samples move green `233 → 217`.
     #[test]
-    fn spectrum_lut_tracks_the_curve_it_transcribes() {
+    fn spectrum_lut_has_bounded_adjacent_steps() {
         let fresh = generate_spectrum_lut();
         let mut worst = 0i32;
         for i in 0..SPECTRUM_LUT_LEN - 1 {
-            for shift in [16u32, 8, 0] {
-                let a = ((fresh[i] >> shift) & 0xff) as i32;
-                let b = ((fresh[i + 1] >> shift) & 0xff) as i32;
-                worst = worst.max((a - b).abs());
-            }
+            let step = [16u32, 8, 0]
+                .into_iter()
+                .map(|shift| {
+                    let a = ((fresh[i] >> shift) & 0xff) as i32;
+                    let b = ((fresh[i + 1] >> shift) & 0xff) as i32;
+                    (a - b).abs()
+                })
+                .max()
+                .unwrap_or(0);
+            let ceiling = if i / SPECTRUM_STRIDE == SPECTRUM_ROOF_SEG {
+                16
+            } else {
+                5
+            };
+            assert!(
+                step <= ceiling,
+                "table entries {i}..{} jump {step} levels (bound {ceiling})",
+                i + 1
+            );
+            worst = worst.max(step);
         }
-        assert!(
-            worst <= 16,
-            "adjacent table entries jump {worst} levels — the table is a staircase"
+        assert_eq!(
+            worst, 16,
+            "the authored roof's exact continuity ceiling changed"
         );
         assert!(worst > 0, "a table with no structure would pass vacuously");
         // The read is CONTINUOUS in `t`: half a table step in either direction
@@ -2115,7 +1702,7 @@ mod tests {
         for i in 0..=WALK {
             let t = i as f32 / WALK as f32;
             let a = spectrum(t);
-            let b = spectrum((t + 0.5 / SPECTRUM_LUT_LEN as f32).min(1.0));
+            let b = spectrum((t + 0.5 / (SPECTRUM_LUT_LEN - 1) as f32).min(1.0));
             for shift in [16u32, 8, 0] {
                 let d = ((a >> shift) & 0xff).abs_diff((b >> shift) & 0xff) as i32;
                 assert!(d <= worst, "the read steps {d} across half a table entry");
@@ -2124,11 +1711,11 @@ mod tests {
     }
 
     /// **POINT-MARKS SNAP TO A NAME** (§2.3.3). [`spectrum_snap`] resolves to one
-    /// of exactly six colours, whatever it is handed — which is what keeps
+    /// of exactly seven colours, whatever it is handed — which is what keeps
     /// `is_fresh_ink_veil`'s finite-set assertion true once the band itself goes
     /// continuous, and what keeps a solid teal dot off the page.
     #[test]
-    fn spectrum_snap_resolves_to_one_of_the_six_names() {
+    fn spectrum_snap_resolves_to_one_of_the_seven_names() {
         let named: Vec<u32> = (0..SPECTRUM_STOPS).map(spectrum_stop).collect();
         assert_eq!(named, SPECTRUM_ANCHORS.to_vec());
         for i in 0..=WALK {
@@ -2145,7 +1732,7 @@ mod tests {
                 "a stop does not snap to itself"
             );
             // Every name is reachable: a snap vocabulary with a dead entry is a
-            // five-colour rainbow wearing a six-colour label.
+            // six-colour rainbow wearing a seven-colour label.
             assert!(
                 (0..=WALK).any(|k| spectrum_snap(k as f32 / WALK as f32) == stop),
                 "stop {i} is unreachable by snapping"
@@ -2214,6 +1801,61 @@ mod tests {
     /// A pixel dark enough to be the ground is not a pixel of the mark. `24` is
     /// the shipped ground's own V, so this is exactly "brighter than the page".
     const GLASS_LIT_MIN: u32 = 24;
+
+    #[test]
+    fn over_halo_cyan_correction_preserves_the_renderer_alpha_cap() {
+        let ground = 0x00FD_F6E3;
+        for colour in [0x8000_8080u32, 0xBE00_8080] {
+            let cap = aterm_render::halo_over_cap(colour);
+            let bad_at = |c: u32, weight: u8| {
+                over_the_glass_ceiling(compose_halo_on_glass(ground, c, weight, true))
+            };
+            assert!(
+                (1..=cap).any(|weight| bad_at(colour, weight)),
+                "#{colour:08X} must exercise the cyan correction"
+            );
+
+            let ruled = clear_halo_of_cyan(colour, true, ground);
+            assert_ne!(
+                ruled & 0x00ff_ffff,
+                colour & 0x00ff_ffff,
+                "the witness did not reach the projection"
+            );
+            assert_eq!(
+                ruled & 0xff00_0000,
+                colour & 0xff00_0000,
+                "the RGB projection changed the live Over-halo alpha cap"
+            );
+            assert_eq!(aterm_render::halo_over_cap(ruled), cap);
+            assert!(
+                (1..=cap).all(|weight| !bad_at(ruled, weight)),
+                "#{ruled:08X} remains cyan at a renderer-reachable weight"
+            );
+        }
+    }
+
+    #[test]
+    fn over_halo_cyan_correction_ignores_unreachable_weights() {
+        let ground = 0x00FD_F6E3;
+        let colour = 0x1000_080Cu32;
+        let cap = aterm_render::halo_over_cap(colour);
+        let bad_at = |weight: u8| {
+            over_the_glass_ceiling(compose_halo_on_glass(ground, colour, weight, true))
+        };
+        assert!(
+            (1..=cap).all(|weight| !bad_at(weight)),
+            "the capped halo must be clean throughout its reachable falloff"
+        );
+        assert!(
+            (u16::from(cap) + 1..=255).any(|weight| bad_at(weight as u8)),
+            "the witness needs a cyan value above its renderer cap"
+        );
+        assert_eq!(
+            clear_halo_of_cyan(colour, true, ground),
+            colour,
+            "an unreachable falloff weight changed the emitted halo"
+        );
+    }
 
     /// **THE GATE THAT WAS GREEN WHILE THE GLASS WAS NOT — TWICE.**
     ///
@@ -2396,89 +2038,5 @@ mod tests {
             "the light-law paled the whole crossing rather than the pixels that \
              needed it: mean chroma of the leg's bright composites is {leg_mean:.0}"
         );
-    }
-
-    /// **THE SAFETY CERTIFICATE BEHIND [`SPECTRUM_SAT_ENV`]** — it re-derives
-    /// the bound from scratch and proves every committed sample, and every point
-    /// of the LINE between two samples, sits at or under it.
-    ///
-    /// The derivation is the one the table's own doc states, and it is a search
-    /// rather than a formula: for each hue, walk `s` UPWARD from zero and stop at
-    /// the first `s` whose composite is lit-and-cyan at any coverage over any
-    /// shipped ground. Downward-closed on purpose — the safe set is not an
-    /// interval at every hue (at `123°` full chroma is safe and `S = 0.55` is
-    /// not), and a bound defined as "the largest safe `s`" would license exactly
-    /// the colour that fails.
-    ///
-    /// ```text
-    /// targo --unverified test -p aterm-effects --lib certify_spectrum_sat_env \
-    ///     -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "exhaustive envelope certifier; run explicitly"]
-    fn certify_spectrum_sat_env() {
-        let hard = |hue: f64| -> f64 {
-            let mut safe = 1.0f64;
-            for step in 0..=200u32 {
-                let s = f64::from(step) / 200.0;
-                let srgb = hsv_srgb(hue, s, 1.0);
-                let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
-                let colour = (byte(srgb[0]) << 16) | (byte(srgb[1]) << 8) | byte(srgb[2]);
-                let bad = GLASS_GROUNDS.iter().any(|&ground| {
-                    (1..=171u32).any(|cov| {
-                        let lit = aterm_render::add_sat(
-                            ground,
-                            aterm_render::premul_rgb(colour, cov as u8),
-                        );
-                        let (h, sa, v) = spectrum_hsv(lit);
-                        (v * 255.0) as u32 > GLASS_LIT_MIN
-                            && (SPECTRUM_CYAN_LO..=SPECTRUM_CYAN_HI).contains(&h)
-                            && sa > SPECTRUM_CYAN_SAT_MIN
-                    })
-                });
-                if bad {
-                    safe = (f64::from(step) - 1.0).max(0.0) / 200.0;
-                    break;
-                }
-            }
-            safe
-        };
-        // 1. THE COMMITTED SAMPLES.
-        let mut worst = f64::MIN;
-        for (i, &v) in SPECTRUM_SAT_ENV.iter().enumerate() {
-            let hue = SPECTRUM_SAT_ENV_LO + i as f64;
-            let bound = hard(hue);
-            worst = worst.max(f64::from(v) - bound);
-            assert!(
-                f64::from(v) <= bound + 1e-9,
-                "sample {i} (hue {hue}) commits {v} over a solved bound of {bound}"
-            );
-        }
-        // 2. THE LINE BETWEEN THEM — the read is a lerp, so the lerp is the law.
-        for k in 0..=4000u32 {
-            let hue = SPECTRUM_SAT_ENV_LO
-                + (SPECTRUM_SAT_ENV_HI - SPECTRUM_SAT_ENV_LO) * f64::from(k) / 4000.0;
-            let bound = hard(hue);
-            let read = spectrum_sat_envelope(hue);
-            assert!(
-                read <= bound + 1e-9,
-                "the interpolated envelope reads {read} at hue {hue}, over its \
-                 solved bound of {bound}"
-            );
-        }
-        // 3. NOT VACUOUS, AND NOT WIDER THAN IT NEEDS TO BE. The law must
-        //    actually bite somewhere, and it must leave the arc alone outside
-        //    the corridor it was solved for.
-        assert!(
-            SPECTRUM_SAT_ENV.iter().any(|&v| v < 0.35),
-            "the envelope never bites — the corridor solved to nothing"
-        );
-        assert_eq!(SPECTRUM_SAT_ENV[0], 1.0, "the table opens un-capped");
-        assert_eq!(
-            SPECTRUM_SAT_ENV[SPECTRUM_SAT_ENV_N - 1],
-            1.0,
-            "the table closes un-capped"
-        );
-        println!("worst slack under the solved bound: {worst:+.5}");
     }
 }

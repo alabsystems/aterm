@@ -2744,7 +2744,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides one session. Serious Mode and Reduce Motion disable it."
         }
         "Toolchain Packages" => {
-            "Maintenance controls the background service. It and auto-update apply next launch. Auto-install runs next package operation and may fetch multiple GB. First launch installs the ALab toolset: from bytes sealed inside a full install, or as a multi-GB download on lean installs; [packages] seed_install = false in aterm.toml turns that into an offer."
+            "Maintenance controls the background service. It and the toolset's auto-update apply next launch. Auto-install runs next package operation and may fetch multiple GB. First launch installs the ALab toolset: from bytes sealed inside a full install, or as a multi-GB download on lean installs; [packages] seed_install = false in aterm.toml turns that into an offer."
         }
         "Smart Titles" => {
             "Activity is a generated fallback when a session has no authored Description. Built-in stays on-device. On macOS, aterm auto-starts Ollama only after every file in its bounded runtime code closure passes pinned structural-signature, Apple Developer-ID Team, code-identifier, ownership, permission, and stable-identity checks; it repeats the closure check before terminal context is sent, clears inherited environment, disables cloud integration, and uses direct loopback. A pre-existing localhost service and every custom service remain untrusted network providers and require explicit consent. Other platforms never auto-execute a managed runtime without a platform attestation anchor. Environment proxy honors HTTP(S)_PROXY and NO_PROXY; Direct bypasses them. For HTTPS OpenAI-compatible endpoints, an explicit CA bundle replaces platform roots. Recent terminal text may be sent. Credential filtering is conservative but heuristic and cannot identify every secret; use Built-in or managed local Ollama when terminal context must stay on-device. Credentials and certificates are path-only—never stored here."
@@ -5157,9 +5157,7 @@ mod trail_style_tests {
                 // one appended geometry word swapped the animal on glass
                 // (`pet_active=true cat_active=false` tall vs
                 // `pet_active=false cat_active=true` underline, same input).
-                s == "rainbow kitty pet"
-                    || s == "rainbow kitty"
-                    || s == "rainbow kitty underline",
+                s == "rainbow kitty pet" || s == "rainbow kitty" || s == "rainbow kitty underline",
                 "style {s:?}"
             );
         }
@@ -5361,12 +5359,12 @@ mod trail_style_tests {
             );
             // …AND THE SAME SPELLING on the underline axis, which is a separate
             // constraint from the body above. `style_names_underline_ribbon`
-            // reports what the string SAYS, explicitly not "is this the hybrid?"
-            // (the hybrid is the default, so a bare `rainbow kitty` draws it and
-            // answers `false`), and its one non-test caller is the Settings
-            // paint label. A disagreeing pair would label one spelling of a
-            // style with the shortened "Rainbow underline" and the other with
-            // its full name.
+            // reports what the string SAYS, explicitly not "is this the
+            // alternate geometry?" (a bare `rainbow kitty` draws the tall
+            // default and answers `false`), and its one non-test caller is the
+            // Settings paint label. A disagreeing pair would label one spelling
+            // of a style with the shortened "Rainbow underline" and the other
+            // with its full name.
             assert_eq!(
                 GlowStyle::style_names_underline_ribbon(alias),
                 GlowStyle::style_names_underline_ribbon(canonical),
@@ -5399,8 +5397,8 @@ mod trail_style_tests {
     /// `TrailStyleIssue::Unknown`, and `resolve_trail_style` answers that by
     /// substituting the DEFAULT style. So every spelling the ENGINE advertises
     /// has to be a spelling THIS module resolves, or the two halves disagree in
-    /// the one direction the user cannot see: asking for the tall body gets the
-    /// default's highlighter, and the only word about it is a warning on the
+    /// the one direction the user cannot see: an explicit style silently falls
+    /// back to the default, and the only word about it is a warning on the
     /// startup banner. (Before 2026-08-29 the same gap switched the whole
     /// cursor effect OFF — `effective=false intensity=0.00` under a
     /// `ribbon_look=tall` diagnostic.)
@@ -5409,14 +5407,14 @@ mod trail_style_tests {
     /// spelling resolves to a canonical picker option that is itself still tall
     /// (an alias that canonicalised to an underline spelling would re-enable the
     /// trail while silently dropping the requested geometry). Backward: every
-    /// canonical rainbow-kitty spelling draws the highlighter-plus-under-baseline
-    /// hybrid — the default since the owner reversed it on 2026-08-28 — except
-    /// the one explicitly named `tall`; companion selection must not
+    /// every ordinary canonical rainbow-kitty spelling draws the tall default;
+    /// only the one explicitly named `underline` selects the
+    /// highlighter-plus-under-baseline alternate. Companion selection must not
     /// accidentally change the ribbon geometry.
     ///
     /// The four spellings are written out rather than imported because the
     /// engine exports the predicate, not the list; `cursor_glow`'s own
-    /// `rainbow_standard_spellings_use_the_hybrid_and_tall_aliases_keep_the_v043_body`
+    /// `rainbow_spellings_share_one_mark_and_differ_only_in_the_shoulder`
     /// holds the other copy.
     #[test]
     fn every_tall_ribbon_spelling_stays_selectable() {
@@ -5451,8 +5449,8 @@ mod trail_style_tests {
                 "the tall body is a presentation of the rainbow ribbon, not a style of its own"
             );
         }
-        // The highlighter-plus-under-baseline hybrid is the rainbow family's
-        // default; only the explicitly named `tall` entry forks the geometry.
+        // The predicate records an explicit `tall` token, not resolved
+        // geometry: ordinary rainbow rows also draw tall without matching it.
         for &s in CURSOR_TRAIL_STYLES {
             let expected = matches!(s, "rainbow kitty tall");
             assert_eq!(

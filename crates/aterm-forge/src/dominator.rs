@@ -318,14 +318,27 @@ mod tests {
     }
 
     #[test]
-    fn naga_falls_with_wgpu_and_libc_falls_alone() {
+    fn naga_falls_with_wgpu_and_libc_has_left_the_surface() {
         let s = survey(0);
         let wgpu = dom(&s, &find(&s, "wgpu"));
         assert!(
             wgpu.also.contains(&find(&s, "naga")),
             "naga is wgpu's alone"
         );
-        assert!(dom(&s, &find(&s, "libc")).also.is_empty(), "libc is a leaf");
+
+        // `libc` used to be asserted here as "a leaf" — `dom(libc).also` empty.
+        // That assertion still PASSED after libc was retired to the first-party
+        // `crates/aterm-libc`, because a package that is not in the third-party
+        // surface has an empty dominator too. A test that passes both when a
+        // fact holds and when its subject has ceased to exist is not testing the
+        // fact. So the claim is now ABSENCE, stated directly — the same shape
+        // `linux_dominator_costs_match_the_baseline` uses for AccessKit, and for
+        // the same reason: a cost of zero would also be reported for a package
+        // forge simply failed to see.
+        assert!(
+            !s.third_party().any(|id| id.name == "libc"),
+            "libc is patched to crates/aterm-libc and must not be third-party"
+        );
     }
 
     /// The linux anchors. `accesskit_unix` and `accesskit_winit` used to be

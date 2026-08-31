@@ -145,6 +145,13 @@ pub struct EnvSnapshot {
     pub skip_gui_smoke: Option<String>,
     /// `ATERM_VERIFY_BASE` — the default `--base` for `--changed`.
     pub verify_base: Option<String>,
+    /// `ATERM_VERIFY_STAGE_TIMEOUT` — the wall-clock ceiling on one stage child,
+    /// in seconds, or `0`/`off` to remove it (see [`exec::DEFAULT_CHILD_CEILING`]
+    /// for why there is one at all). Kept RAW here and parsed in
+    /// [`exec::ceiling_from_env`]: the snapshot's job is to read the environment
+    /// exactly once, on the main thread, and the policy that interprets it is a
+    /// pure function with its own tests.
+    pub stage_timeout: Option<OsString>,
     /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC` — a caller-supplied doc-driver
     /// binding. Cargo prefers either over the config's `[build] rustdoc`, so
     /// the children inherit it and the doc-driver rule must account for it:
@@ -171,6 +178,7 @@ impl EnvSnapshot {
             verify_base: std::env::var("ATERM_VERIFY_BASE")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            stage_timeout: std::env::var_os(exec::CEILING_ENV),
             // NO empty-filter, deliberately: cargo has no treat-empty-as-unset
             // rule for these (only RUSTC_WRAPPER gets one), so a set-but-empty
             // RUSTDOC still masks CARGO_BUILD_RUSTDOC and still reaches the
@@ -247,13 +255,17 @@ impl Ctx {
     }
 
     /// The command environment: cwd is the repo root (the script `cd`s there and
-    /// several stages pass root-relative paths), PATH is the computed one.
+    /// several stages pass root-relative paths), PATH is the computed one, and
+    /// every child gets the wall-clock ceiling — a hung stage has to be able to
+    /// end the run RED, because a gate that hangs has decided nothing and says
+    /// nothing.
     #[must_use]
     pub fn exec_env(&self) -> exec::ExecEnv<'_> {
         exec::ExecEnv {
             cwd: &self.root,
             path: &self.path_env,
             scratch: &self.scratch,
+            child_ceiling: exec::ceiling_from_env(self.env.stage_timeout.as_deref()),
         }
     }
 
@@ -495,6 +507,45 @@ mod tests {
             "a directory is not an executable file"
         );
         assert!(!is_executable_file(&tmp.join("absent")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn every_child_inherits_the_wall_clock_ceiling_from_the_snapshot() {
+        // The wiring, end to end: the one environment read (`EnvSnapshot`), the
+        // pure policy (`exec::ceiling_from_env`), and the value every stage
+        // child is actually launched with (`Ctx::exec_env`). A gate whose stages
+        // silently ran with `child_ceiling: None` would hang exactly as it did
+        // before, and nothing else in the tree would notice.
+        let tmp = mktemp_dir("atv-ceiling").expect("mktemp");
+        let ctx = |raw: Option<&str>| {
+            let env = EnvSnapshot {
+                stage_timeout: raw.map(OsString::from),
+                ..EnvSnapshot::default()
+            };
+            Ctx::new(
+                tmp.clone(),
+                Mode::Fast,
+                Scope::Workspace,
+                true,
+                env,
+                tmp.clone(),
+            )
+        };
+        assert_eq!(
+            ctx(None).exec_env().child_ceiling,
+            Some(exec::DEFAULT_CHILD_CEILING),
+            "an unset override still leaves the backstop in place"
+        );
+        assert_eq!(
+            ctx(Some("120")).exec_env().child_ceiling,
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            ctx(Some("off")).exec_env().child_ceiling,
+            None,
+            "and an operator who types `off` gets the old unbounded wait"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
