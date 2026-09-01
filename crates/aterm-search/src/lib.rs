@@ -271,11 +271,16 @@ impl TerminalSearch {
         self.bump_generation();
     }
 
-    /// Mark an older history prefix as intentionally omitted by a bounded
-    /// bulk snapshot. Search results then report `incomplete` with the exact
-    /// oldest retained absolute row, without indexing rows only to evict them.
-    pub fn mark_history_prefix_evicted(&mut self, lowest_retained_line: usize) {
-        self.index.mark_history_prefix_evicted(lowest_retained_line);
+    /// State whether the bounded bulk snapshot that just finished omitted an
+    /// older history prefix — `Some(oldest_indexed_row)` when it did (results
+    /// report `incomplete` from exactly that row, without indexing rows only to
+    /// evict them), `None` when the whole retained window is indexed and
+    /// results are exhaustive again.
+    ///
+    /// See [`SearchIndex::set_history_prefix_eviction`] for why a bulk builder
+    /// gets to clear the flag that the incremental append path latches.
+    pub fn set_history_prefix_eviction(&mut self, lowest_retained_line: Option<usize>) {
+        self.index.set_history_prefix_eviction(lowest_retained_line);
         self.bump_generation();
     }
 

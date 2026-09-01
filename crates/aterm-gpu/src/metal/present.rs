@@ -81,6 +81,16 @@ impl MetalWindowSurface {
         &self.config
     }
 
+    /// The live `contentsScale` of the presented layer, read back off the
+    /// `CAMetalLayer` itself. The points-per-pixel term CoreAnimation uses to
+    /// lay the drawable down: it MUST equal the parent view's backing scale,
+    /// or the device-pixel drawable composites as points (v0.69.0's 2x
+    /// oversize + resample). Never echoed from a cached field — the gate asks
+    /// the layer.
+    pub(crate) fn contents_scale(&self) -> f64 {
+        self.swapchain.contents_scale()
+    }
+
     /// W6 flip-drill diagnostic — the LIVE layer's pacing-relevant state,
     /// read back off the actual `CAMetalLayer` (never echoed from config):
     /// `(display_sync_enabled, framebuffer_only, maximum_drawable_count,
@@ -122,6 +132,15 @@ impl MetalWindowSurface {
         device: &ffi::Device,
         want: &SwapchainConfig,
     ) -> Result<bool, String> {
+        // The layer's `contentsScale` is NOT one of the drift axes above and
+        // cannot be: it is not in `SwapchainConfig` at all, it is owned by the
+        // parent layer, and it changes with NO resize and no reconfigure when
+        // a window is dragged between a Retina and a non-Retina display. So it
+        // is polled here, ahead of the early-out — this is the poll that
+        // replaces `raw-window-metal`'s KVO observer, and skipping it on a
+        // steady present is what would let a display change go unnoticed.
+        // Change-gated inside, so the steady cost is one property read.
+        self.swapchain.sync_layer_geometry();
         let drift = self.config.format != want.format
             || self.config.width != want.width
             || self.config.height != want.height
@@ -532,6 +551,80 @@ mod tests {
             eprintln!("SKIP: no Metal device on this machine");
         }
         d
+    }
+
+    /// A bare `CALayer` at a caller-chosen `contentsScale` — the headless
+    /// stand-in for the winit view's backing layer on a Retina display.
+    fn parent_at_scale(scale: f64) -> Obj {
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: alloc/init (+1, exactly as `Swapchain::new_layer`) then a
+        // scalar `CGFloat` setter on the live layer.
+        unsafe {
+            let alloc: unsafe extern "C" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id = ffi::msg();
+            let raw = alloc(ffi::class(c"CALayer"), ffi::sel(c"alloc"));
+            let init: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            let layer = Obj::from_owned(init(raw, ffi::sel(c"init"))).expect("CALayer init");
+            let set: unsafe extern "C" fn(ffi::Id, ffi::Sel, f64) = ffi::msg();
+            set(layer.id(), ffi::sel(c"setContentsScale:"), scale);
+            layer
+        }
+    }
+
+    /// W7 — THE RETINA GATE AT THE PRESENT SEAM. `contentsScale` is owned by
+    /// the parent layer and is NOT a `SwapchainConfig` axis, so it can never
+    /// appear in `reconcile`'s drift set; the sync therefore has to run AHEAD
+    /// of the no-drift early-out. This test is the one that fails if someone
+    /// "tidies" the poll inside the `if drift` block: the config here never
+    /// moves, so `reconcile` returns `false` every time, and the scale must
+    /// still track the parent.
+    ///
+    /// It is reachable headlessly for the same reason S5 is — a layer tree
+    /// needs no window, and `contentsScale` propagation is a property read,
+    /// not a composite.
+    #[test]
+    fn the_no_drift_reconcile_still_tracks_the_parents_contents_scale() {
+        let Some(dev) = device() else { return };
+        let _test_pool = ffi::AutoreleasePool::new();
+        let parent = parent_at_scale(2.0);
+        let config = SwapchainConfig {
+            format: PixelFormat::Bgra8Unorm,
+            width: 16,
+            height: 16,
+            framebuffer_only: false,
+            display_sync: false,
+            maximum_drawables: 2,
+            opaque: true,
+        };
+        let mut surface =
+            MetalWindowSurface::attached(&dev, &parent, config, Arc::new(LossLatch::new()))
+                .expect("attached surface");
+        assert!(
+            (surface.contents_scale() - 2.0).abs() < f64::EPSILON,
+            "attach adopts the Retina parent's scale — got {}",
+            surface.contents_scale()
+        );
+
+        // The display drag, with the config held EXACTLY where it was.
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: scalar `CGFloat` setter on the live parent layer.
+        unsafe {
+            let set: unsafe extern "C" fn(ffi::Id, ffi::Sel, f64) = ffi::msg();
+            set(parent.id(), ffi::sel(c"setContentsScale:"), 1.0);
+        }
+        let reconfigured = surface
+            .reconcile(&dev, &config)
+            .expect("a no-drift reconcile succeeds");
+        assert!(
+            !reconfigured,
+            "nothing in the drift set moved — this is the steady-present path"
+        );
+        assert!(
+            (surface.contents_scale() - 1.0).abs() < f64::EPSILON,
+            "the steady present must still adopt the parent's new scale: \
+             contentsScale is not a drift axis and cannot be one, so the poll \
+             has to run ahead of the early-out — got {}",
+            surface.contents_scale()
+        );
     }
 
     /// # Safety

@@ -56,6 +56,7 @@ pub enum StageId {
     RedrawConformance,
     DifferentialOracle,
     KaniFloor,
+    CrossCells,
 }
 
 /// A stage's identity, its ladder header, and its scheduling constraints.
@@ -197,6 +198,48 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             "trust-mc / Kani BMC floor (config-free parser harnesses)",
             Lane::MainTarget,
         ));
+        // THE OTHER FOUR CELLS, COMPILED. `--fast` type-checks exactly one of
+        // the five targets aterm ships for; forge measures all five and
+        // compiles none. `xtask gate cells` closes that with a real compiler
+        // per triple, and it is `--full`-only for one measured reason: the
+        // five-cell matrix costs ~19 s warm and ~106 s cold, against a `--fast`
+        // budget that exists to be paid on every commit.
+        //
+        // WHAT `--fast` DOES NOT SEE, corrected 2026-09-01 because the previous
+        // version of this sentence was FALSE IN BOTH DIRECTIONS. It listed
+        // "every `#[cfg(unix)]`" among the blind spots: macOS IS a unix, so the
+        // mac-arm cell `--fast` runs compiles every `#[cfg(unix)]` block in
+        // every crate it builds, and always did. And it implied `--full` covered
+        // the rest, which was not true either — `ring` and `zstd-sys` bundle C,
+        // their build scripts could not run for the Linux and Windows triples on
+        // this box, and until the `cshim` rows landed in
+        // `tools/cross-cell-gate.tsv` those two cells reached NONE of aterm's
+        // own eighteen compiled crates. A bare `E0308` under
+        // `#[cfg(target_os = "linux")]` in `crates/aterm-gui/src/control.rs`
+        // left `gate cells` GREEN.
+        //
+        // What `--fast` really does not see: `#[cfg(windows)]`,
+        // `#[cfg(target_os = "linux")]`, the `unix` arms that exclude Apple,
+        // `#[cfg(target_arch = "wasm32")]`, and every third-party crate that
+        // only appears on a non-native cell. `--full` sees all four of those
+        // now: measured over the 3,245 platform `cfg` attribute sites under
+        // `crates/`, some cell reaches 2,894 of them, against 2,143 before the
+        // shim rows. Of the 351 left, 232 are in crates no cell's graph carries
+        // at all (`aterm-release`, `atpkg-keys`, `aterm-conformance`,
+        // `aterm-nest`, `aterm-effects-web`, …) and 119 are predicates no cell's
+        // triple can satisfy. Neither `--fast` nor `--full` LINKS or RUNS a
+        // cross artifact.
+        //
+        // `MainTarget`, even though every cell compiles into a target directory
+        // OUTSIDE this repo: the stage reaches the verb through
+        // `targo run -p xtask`, and THAT holds the workspace lock like any other
+        // gate. The lane describes what the stage contends for, not where the
+        // work it launches ends up.
+        v.push(spec(
+            StageId::CrossCells,
+            "cross-cell type-check (forge's five cells, each for its own triple)",
+            Lane::MainTarget,
+        ));
     }
     v
 }
@@ -319,7 +362,11 @@ mod tests {
         assert_eq!(full[..fast.len()], fast[..]);
         assert_eq!(
             full[fast.len()..],
-            [StageId::DifferentialOracle, StageId::KaniFloor]
+            [
+                StageId::DifferentialOracle,
+                StageId::KaniFloor,
+                StageId::CrossCells
+            ]
         );
     }
 
@@ -386,6 +433,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 21);
+        assert_eq!(plan(&nothing_installed).len(), 22);
     }
 }

@@ -98,6 +98,11 @@ pub(crate) const PINNED_DIR_OPERATION_DESCRIPTOR_UNITS: usize = 8;
 const REMOVE_LIVE_FIXED_UNITS: usize = 4;
 const REMOVE_MAX_DEPTH: usize = PINNED_DIR_OPERATION_DESCRIPTOR_UNITS - REMOVE_LIVE_FIXED_UNITS - 1;
 
+pub(crate) struct ClearContentsOutcome {
+    pub(crate) result: io::Result<()>,
+    pub(crate) removed: usize,
+}
+
 /// Maximum absolute-path depth an initial pin may retain. Artifact admission
 /// reserves additional units for children, files, validation, and bounded
 /// cleanup handles; together they fit the artifact handoff descriptor budget.
@@ -587,6 +592,31 @@ mod imp {
             Ok(std::fs::File::from(open_directory_at(self.leaf(), ".")?))
         }
 
+        /// Open an existing direct-child advisory lease through this retained
+        /// directory authority. No lexical ancestor is re-resolved between the
+        /// lock decision and a later handle-rooted mutation.
+        pub(crate) fn open_existing_namespace_lock_at_retained(
+            &self,
+            name: &OsStr,
+        ) -> io::Result<std::fs::File> {
+            validate_component(name)?;
+            let fd = openat(
+                self.leaf(),
+                name,
+                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            let stat = fstat(&fd).map_err(io::Error::from)?;
+            if !FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_nlink != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "namespace lock is not a singly-linked regular file",
+                ));
+            }
+            Ok(std::fs::File::from(fd))
+        }
+
         pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
             let mut current = open_directory_at(CWD, Path::new("/"))?;
             if !same_identity(&current, self.pinned.root.as_ref()) {
@@ -1041,7 +1071,12 @@ mod imp {
             Ok(names)
         }
 
-        fn remove_contents(&self, budget: &mut usize, depth: usize) -> io::Result<()> {
+        fn remove_contents(
+            &self,
+            budget: &mut usize,
+            depth: usize,
+            removed: &mut usize,
+        ) -> io::Result<()> {
             if depth > super::REMOVE_MAX_DEPTH {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1059,20 +1094,23 @@ mod imp {
                 }
                 *budget -= 1;
                 let result = match self.child(&name) {
-                    Ok(child) => child.remove_contents(budget, depth + 1).and_then(|()| {
-                        if !self.current_child_matches(&name, &child) {
-                            return Err(identity_changed());
-                        }
-                        unlinkat(self.leaf(), &name, AtFlags::REMOVEDIR)
-                            .map_err(io::Error::from)?;
-                        if !directory_was_unlinked(child.leaf()) {
-                            return Err(identity_changed());
-                        }
-                        Ok(())
-                    }),
-                    Err(_) => {
-                        unlinkat(self.leaf(), &name, AtFlags::empty()).map_err(io::Error::from)
-                    }
+                    Ok(child) => child
+                        .remove_contents(budget, depth + 1, removed)
+                        .and_then(|()| {
+                            if !self.current_child_matches(&name, &child) {
+                                return Err(identity_changed());
+                            }
+                            unlinkat(self.leaf(), &name, AtFlags::REMOVEDIR)
+                                .map_err(io::Error::from)?;
+                            *removed = removed.saturating_add(1);
+                            if !directory_was_unlinked(child.leaf()) {
+                                return Err(identity_changed());
+                            }
+                            Ok(())
+                        }),
+                    Err(_) => unlinkat(self.leaf(), &name, AtFlags::empty())
+                        .map_err(io::Error::from)
+                        .map(|()| *removed = removed.saturating_add(1)),
                 };
                 if let Err(error) = result
                     && first_error.is_none()
@@ -1083,8 +1121,13 @@ mod imp {
             first_error.map_or(Ok(()), Err)
         }
 
-        pub(crate) fn clear_contents_with_budget(&self, budget: &mut usize) -> io::Result<()> {
-            self.remove_contents(budget, 0)
+        pub(crate) fn clear_contents_with_budget(
+            &self,
+            budget: &mut usize,
+        ) -> super::ClearContentsOutcome {
+            let mut removed = 0;
+            let result = self.remove_contents(budget, 0, &mut removed);
+            super::ClearContentsOutcome { result, removed }
         }
 
         /// Remove a child tree named only BY NAME, resolving it through the
@@ -1103,7 +1146,8 @@ mod imp {
                 Err(error) => return Err(error),
             };
             let mut budget = super::REMOVE_MAX_ENTRIES;
-            child.remove_contents(&mut budget, 0)?;
+            let mut removed = 0;
+            child.remove_contents(&mut budget, 0, &mut removed)?;
             if !self.current_child_matches(name, &child) {
                 return Err(identity_changed());
             }
@@ -1117,7 +1161,8 @@ mod imp {
         pub(crate) fn remove_child_tree_exact(&self, name: &OsStr, child: &Self) -> io::Result<()> {
             validate_component(name)?;
             let mut budget = super::REMOVE_MAX_ENTRIES;
-            child.remove_contents(&mut budget, 0)?;
+            let mut removed = 0;
+            child.remove_contents(&mut budget, 0, &mut removed)?;
             if !self.current_child_matches(name, child) {
                 return Err(identity_changed());
             }
@@ -1690,7 +1735,11 @@ mod imp {
             }
         }
 
-        pub(crate) fn open_namespace_lock(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        fn open_namespace_lock_with_create(
+            &self,
+            name: &OsStr,
+            create: bool,
+        ) -> io::Result<std::fs::File> {
             validate_component(name)?;
             self.validate_path_identity()?;
             let path = self.path.join(name);
@@ -1698,7 +1747,7 @@ mod imp {
             options
                 .read(true)
                 .write(true)
-                .create(true)
+                .create(create)
                 .truncate(false)
                 // Keep the exact lock entry pinned for the advisory-lock lifetime.
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -1719,6 +1768,19 @@ mod imp {
                 return Err(identity_changed());
             }
             Ok(file)
+        }
+
+        pub(crate) fn open_namespace_lock(&self, name: &OsStr) -> io::Result<std::fs::File> {
+            self.open_namespace_lock_with_create(name, true)
+        }
+
+        pub(crate) fn open_existing_namespace_lock_at_retained(
+            &self,
+            name: &OsStr,
+        ) -> io::Result<std::fs::File> {
+            // Retained Windows directory handles deny ancestor replacement, so
+            // the existing path-validated open is already capability-stable.
+            self.open_namespace_lock_with_create(name, false)
         }
 
         pub(crate) fn create_child(&self, name: &OsStr) -> io::Result<Self> {
@@ -2136,7 +2198,12 @@ mod imp {
             Ok(names)
         }
 
-        fn remove_contents(&self, budget: &mut usize, depth: usize) -> io::Result<()> {
+        fn remove_contents(
+            &self,
+            budget: &mut usize,
+            depth: usize,
+            removed: &mut usize,
+        ) -> io::Result<()> {
             if depth > super::REMOVE_MAX_DEPTH {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2159,19 +2226,29 @@ mod imp {
                             && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 =>
                     {
                         self.child(&name).and_then(|child| {
-                            child.remove_contents(budget, depth + 1)?;
+                            child.remove_contents(budget, depth + 1, removed)?;
                             if !self.current_child_matches(&name, &child) {
                                 return Err(identity_changed());
                             }
-                            dispose_file_handle(child.leaf())
+                            dispose_file_handle(child.leaf())?;
+                            *removed = removed.saturating_add(1);
+                            Ok(())
                         })
                     }
                     Ok(metadata)
                         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
                     {
-                        open_disposable(&path).and_then(|file| dispose_file_handle(&file))
+                        open_disposable(&path).and_then(|file| {
+                            dispose_file_handle(&file)?;
+                            *removed = removed.saturating_add(1);
+                            Ok(())
+                        })
                     }
-                    Ok(_) => open_disposable(&path).and_then(|file| dispose_file_handle(&file)),
+                    Ok(_) => open_disposable(&path).and_then(|file| {
+                        dispose_file_handle(&file)?;
+                        *removed = removed.saturating_add(1);
+                        Ok(())
+                    }),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                     Err(error) => Err(error),
                 };
@@ -2184,8 +2261,13 @@ mod imp {
             first_error.map_or(Ok(()), Err)
         }
 
-        pub(crate) fn clear_contents_with_budget(&self, budget: &mut usize) -> io::Result<()> {
-            self.remove_contents(budget, 0)
+        pub(crate) fn clear_contents_with_budget(
+            &self,
+            budget: &mut usize,
+        ) -> super::ClearContentsOutcome {
+            let mut removed = 0;
+            let result = self.remove_contents(budget, 0, &mut removed);
+            super::ClearContentsOutcome { result, removed }
         }
 
         #[cfg(test)]
@@ -2197,7 +2279,8 @@ mod imp {
                 Err(error) => return Err(error),
             };
             let mut budget = super::REMOVE_MAX_ENTRIES;
-            child.remove_contents(&mut budget, 0)?;
+            let mut removed = 0;
+            child.remove_contents(&mut budget, 0, &mut removed)?;
             if !self.current_child_matches(name, &child) {
                 return Err(identity_changed());
             }
@@ -2207,7 +2290,8 @@ mod imp {
         pub(crate) fn remove_child_tree_exact(&self, name: &OsStr, child: &Self) -> io::Result<()> {
             validate_component(name)?;
             let mut budget = super::REMOVE_MAX_ENTRIES;
-            child.remove_contents(&mut budget, 0)?;
+            let mut removed = 0;
+            child.remove_contents(&mut budget, 0, &mut removed)?;
             if !self.current_child_matches(name, child) {
                 return Err(identity_changed());
             }
@@ -2912,6 +2996,39 @@ mod tests {
         );
 
         drop(instance);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_contents_reports_only_successful_mutations() {
+        let root = unique_dir("clear-mutation-count");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+
+        let mut budget = 8;
+        let empty = pinned.clear_contents_with_budget(&mut budget);
+        empty.result.unwrap();
+        assert_eq!(empty.removed, 1, "the empty nested directory was removed");
+
+        std::fs::write(root.join("first"), b"one").unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/second"), b"two").unwrap();
+        let mut budget = 8;
+        let cleared = pinned.clear_contents_with_budget(&mut budget);
+        cleared.result.unwrap();
+        assert_eq!(
+            cleared.removed, 3,
+            "two files plus their containing directory are real mutations"
+        );
+        assert_eq!(budget, 5, "the scan budget tracks the same three entries");
+
+        let mut budget = 8;
+        let no_op = pinned.clear_contents_with_budget(&mut budget);
+        no_op.result.unwrap();
+        assert_eq!(no_op.removed, 0, "an empty sweep must not request fsync");
+        assert_eq!(budget, 8);
+
+        drop(pinned);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -2334,6 +2334,7 @@ mod tests {
         let nonce = LaunchNonce::generate();
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -2540,6 +2541,7 @@ mod tests {
     fn temporal_ctx() -> crate::SessionCtx {
         crate::SessionCtx {
             sink: Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),

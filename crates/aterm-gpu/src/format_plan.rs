@@ -15,6 +15,7 @@
 // `gpu_format_invariant` test (GPU-free) and the `gpu_pipeline_format` ay proof
 // both check the equality holds for BOTH `srgb_offscreen` states.
 
+#[cfg(wgpu_arm)]
 use wgpu::TextureFormat;
 
 /// The stored offscreen colour-target format == the format of the offscreen's
@@ -28,6 +29,7 @@ use wgpu::TextureFormat;
 /// the bloom composite + extract, the tray overlay, and the test/readback blit —
 /// MUST build its `ColorTargetState` with this.
 #[must_use]
+#[cfg(wgpu_arm)]
 pub(crate) fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
     if srgb_offscreen {
         TextureFormat::Rgba8Unorm
@@ -42,6 +44,7 @@ pub(crate) fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
 /// on downlevel the offscreen is itself sRGB, so `add_srgb_suffix` is the identity.
 /// Pipelines whose pass attaches `off.view_srgb` build with this.
 #[must_use]
+#[cfg(wgpu_arm)]
 pub(crate) fn offscreen_srgb_view_format(srgb_offscreen: bool) -> TextureFormat {
     offscreen_format(srgb_offscreen).add_srgb_suffix()
 }
@@ -51,6 +54,7 @@ pub(crate) fn offscreen_srgb_view_format(srgb_offscreen: bool) -> TextureFormat 
 /// `create_view`. Only needed on native (where the texture is Unorm but a sRGB
 /// view is aliased); on downlevel the texture is already sRGB, so no alias.
 #[must_use]
+#[cfg(wgpu_arm)]
 pub(crate) fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureFormat] {
     if srgb_offscreen {
         &[TextureFormat::Rgba8UnormSrgb]
@@ -68,6 +72,7 @@ pub(crate) fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureF
 /// `Rgba8Unorm` and stores the clear verbatim, so the raw byte passes through (readback
 /// stays byte-exact, the in-process path unchanged).
 #[must_use]
+#[cfg(wgpu_arm)]
 pub(crate) fn offscreen_clear_color(rgb: u32, srgb_offscreen: bool) -> wgpu::Color {
     let chan = |b: u32| -> f64 {
         let c = b as f64 / 255.0;

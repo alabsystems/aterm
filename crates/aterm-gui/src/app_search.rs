@@ -438,24 +438,35 @@ impl SearchState {
     /// Temporary native-title projection while find owns the chrome. Kept on
     /// the search state so warning expiry can restore the exact latest status
     /// without duplicating its formatting policy.
+    /// The `+` (history deeper than the index) and `…` (the terminal changed
+    /// since this was counted) qualifiers the title and the find bar both carry,
+    /// in that order. Empty when the count is an exact census of the present
+    /// screen — which is the only state that gets to state a bare number.
+    pub(crate) fn count_qualifier(&self) -> &'static str {
+        match (self.truncated, self.results_dirty) {
+            (true, true) => "+…",
+            (true, false) => "+",
+            (false, true) => "…",
+            (false, false) => "",
+        }
+    }
+
     pub(crate) fn window_title(&self) -> String {
         if self.query.is_empty() {
             "aterm — find:".to_string()
         } else if self.matches.is_empty() {
-            format!("aterm — find: {} (no matches)", self.query)
-        } else if self.truncated {
             format!(
-                "aterm — find: {} ({}/{}+)",
+                "aterm — find: {} (no matches{})",
                 self.query,
-                self.current + 1,
-                self.matches.len()
+                self.count_qualifier()
             )
         } else {
             format!(
-                "aterm — find: {} ({}/{})",
+                "aterm — find: {} ({}/{}{})",
                 self.query,
                 self.current + 1,
-                self.matches.len()
+                self.matches.len(),
+                self.count_qualifier()
             )
         }
     }
@@ -1805,6 +1816,7 @@ impl App {
             // resting index, not a position anything is standing on.
             current: (!search.matches.is_empty()).then_some(search.current),
             truncated: search.truncated,
+            stale: search.results_dirty,
             current_match: search.current_match(),
         }
     }
@@ -1859,6 +1871,17 @@ pub(crate) struct FindStatus {
     /// `truncated` before treating `current`/`matches` as a whole-history census.
     pub(crate) current: Option<usize>,
     pub(crate) truncated: bool,
+    /// The terminal changed since `matches` was counted, so the pair above is a
+    /// PAST census, not the present one ([`SearchState::results_dirty`]).
+    ///
+    /// Output does not re-run the search — that would be one full scan per PTY
+    /// batch on the UI thread — so between the output and the next edit or step
+    /// the count is simply older than the screen. It can be wrong in either
+    /// direction (new output adds hits; a repaint or a `clear` removes them), so
+    /// it is NOT the `truncated` "at least this many" floor and gets its own
+    /// field. The find bar paints the same qualifier, which is what keeps the
+    /// wire and the glass agreeing.
+    pub(crate) stale: bool,
     /// `(row, col, len)` in `search` coordinates (negative row = scrollback).
     pub(crate) current_match: Option<(i32, u16, u32)>,
 }
@@ -1875,6 +1898,7 @@ impl FindStatus {
         matches: 0,
         current: None,
         truncated: false,
+        stale: false,
         current_match: None,
     };
 }
@@ -2153,6 +2177,253 @@ mod tests {
             .and_then(|window| window.search.as_mut())
             .expect("active search")
             .set_query(query.into());
+    }
+
+    /// Occurrences of `needle` in the rows the reader can actually SEE — the
+    /// ground truth every find count is measured against below. Read straight off
+    /// the visible grid, so it is independent of every index, cache and snapshot
+    /// the search path builds.
+    #[cfg(test)]
+    fn visible_occurrences(
+        term: &std::sync::Arc<std::sync::Mutex<super::Terminal>>,
+        needle: &str,
+    ) -> usize {
+        let t = term_lock(term);
+        (0..t.rows())
+            .map(|row| {
+                t.get_line_text(i32::from(row), None)
+                    .unwrap_or_default()
+                    .matches(needle)
+                    .count()
+            })
+            .sum()
+    }
+
+    fn hits(app: &App, wid: WindowId) -> usize {
+        app.windows[&wid]
+            .search
+            .as_ref()
+            .expect("active search")
+            .matches
+            .len()
+    }
+
+    /// A count the terminal has already moved past is never stated as a census.
+    ///
+    /// Output does not re-run the search (one full scan per PTY batch on the UI
+    /// thread is what the deferral exists to avoid), so between an output burst
+    /// and the next edit/step the batch is simply older than the screen. It used
+    /// to go on painting `1/3` at a window holding five hits, with no marker of
+    /// any kind on the glass or the wire. Now both carry it, and the next
+    /// recompute — which does have the real number — drops it again.
+    #[test]
+    fn output_since_the_count_is_marked_on_the_glass_and_on_the_wire() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        term_lock(&term).process(b"needle one\r\nneedle two\r\nneedle three\r\n");
+
+        app.search_enter();
+        set_query(&mut app, wid, "needle");
+        app.search_recompute();
+        let counted = hits(&app, wid);
+        assert_eq!(counted, 3);
+        let fresh = app.find_status_in(wid);
+        assert!(!fresh.stale, "a just-run count is the present census");
+        assert_eq!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find")
+                .count_qualifier(),
+            "",
+            "and is painted bare"
+        );
+
+        // Two more hits arrive. The batch is not re-run — that is the design —
+        // so the number on screen is now three of five.
+        term_lock(&term).process(b"needle four\r\nneedle five\r\n");
+        app.search_refresh_for_output(0);
+        assert_eq!(
+            visible_occurrences(&term, "needle"),
+            5,
+            "five hits are on the glass"
+        );
+
+        let stale = app.find_status_in(wid);
+        assert_eq!(
+            stale.matches, counted,
+            "the batch is deliberately not re-run"
+        );
+        assert!(
+            stale.stale,
+            "so the reply says the count is older than the screen"
+        );
+        assert_eq!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find")
+                .count_qualifier(),
+            "…",
+            "and the bar marks it rather than asserting 3/3"
+        );
+        assert!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find")
+                .window_title()
+                .contains("(1/3…)"),
+            "the title carries the same qualifier as the bar"
+        );
+        // (`find_status_line`'s own rendering of this flag is pinned beside the
+        // formatter, in control_input.rs.)
+
+        // The next recompute has the real number, so the qualifier goes away.
+        app.search_recompute();
+        assert_eq!(hits(&app, wid), 5);
+        let refreshed = app.find_status_in(wid);
+        assert!(!refreshed.stale);
+        assert_eq!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find")
+                .count_qualifier(),
+            "",
+            "an exact count is stated plainly — the marker is not a permanent scar"
+        );
+    }
+
+    /// THE DEFECT: after a `clear`, growing the window taller silently erased
+    /// on-screen lines from the search corpus.
+    ///
+    /// `clear` is `ED 2` + `ED 3`: the screen is blanked and the scrollback is
+    /// DROPPED. With no history left, a rows-grow cannot reveal anything, so it
+    /// appends blank rows at the BOTTOM — which grows the retained-line total while
+    /// `absolute_row_counter` stays put, and `oldest_absolute_row()` is
+    /// `counter − visible − scrollback`. Every retained row's absolute key
+    /// therefore shifted DOWN by the number of appended rows. The GUI's index-reuse
+    /// path carried the pre-shift keys forward, re-fed only the rows at/after the
+    /// OLD visible base, and left the top band of the screen — where everything
+    /// printed since the clear lives — absent from the corpus entirely.
+    #[test]
+    fn growing_the_window_after_a_clear_keeps_the_visible_screen_searchable() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        {
+            let mut t = term_lock(&term);
+            for line in 0..40 {
+                t.process(format!("old {line:02}\r\n").as_bytes());
+            }
+            // What /usr/bin/clear emits with the E3 capability: home, erase the
+            // display, erase the scrollback.
+            t.process(b"\x1b[H\x1b[2J\x1b[3J");
+            t.process(b"needle alpha\r\nneedle beta\r\nneedle gamma\r\n");
+        }
+        let before = visible_occurrences(&term, "needle");
+        assert_eq!(before, 3, "fixture: three hits on the glass");
+
+        app.search_enter();
+        set_query(&mut app, wid, "needle");
+        app.search_recompute();
+        assert_eq!(hits(&app, wid), before, "the pre-resize count is exact");
+
+        let (rows, cols) = {
+            let t = term_lock(&term);
+            (t.rows(), t.cols())
+        };
+        term_lock(&term).resize(rows.saturating_add(8), cols);
+        let after = visible_occurrences(&term, "needle");
+        assert_eq!(after, before, "the grow keeps every hit on the glass");
+
+        app.search_recompute();
+        assert_eq!(
+            hits(&app, wid),
+            after,
+            "find must see every hit the reader can see after the window grew"
+        );
+    }
+
+    /// The same slide, the other way — and the one the retained-floor guard
+    /// CANNOT see.
+    ///
+    /// A shrink that trims the trailing blanks a screen-clear left behind also
+    /// changes the retained-line total, so the absolute space slides — but
+    /// UPWARD, which looks exactly like the ordinary retention advance the reuse
+    /// guard exists to allow. Nothing but the grid's own renumber report
+    /// separates them. Here the clear KEEPS its history (`ED 2` alone, no
+    /// `ED 3`), so there are rows below the refreshed band: a reused index files
+    /// them at pre-slide keys and answers about the wrong lines — or drops them
+    /// as evicted while the terminal still holds them.
+    #[test]
+    fn shrinking_the_window_after_a_screen_clear_keeps_history_correctly_keyed() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        {
+            let mut t = term_lock(&term);
+            for line in 0..40 {
+                t.process(format!("needle {line:02}\r\n").as_bytes());
+            }
+            // `ED 2` + home: the screen is blank — every row below the cursor is
+            // a trailing blank, which is what makes the shrink TRIM — and the
+            // history stays where it is.
+            t.process(b"\x1b[H\x1b[2J");
+        }
+        let deep = "needle 03";
+        let absolute_of = |app: &mut App, query: &str| -> Option<i64> {
+            set_query(app, wid, query);
+            app.search_recompute();
+            let search = app.windows[&wid].search.as_ref().expect("find");
+            search
+                .current_match()
+                .map(|(row, _, _)| search.match_base_y + i64::from(row))
+        };
+
+        app.search_enter();
+        let before = absolute_of(&mut app, deep).expect("the deep needle is in history");
+
+        let (rows, cols) = {
+            let t = term_lock(&term);
+            (t.rows(), t.cols())
+        };
+        let oldest_before = term_lock(&term).grid().oldest_absolute_row();
+        term_lock(&term).resize(rows.saturating_sub(6).max(6), cols);
+        let oldest_after = term_lock(&term).grid().oldest_absolute_row();
+        let slide =
+            i64::try_from(oldest_after).unwrap_or(0) - i64::try_from(oldest_before).unwrap_or(0);
+        assert!(
+            slide > 0,
+            "fixture: the trailing-blank trim really did slide the absolute space"
+        );
+
+        let after = absolute_of(&mut app, deep).expect("the deep needle is still in history");
+        assert_eq!(
+            after,
+            before + slide,
+            "the needle's absolute row must be the one the SLID grid now gives it, \
+             not the key a reused index filed it under"
+        );
+        // And the row that name points at really is the one holding the text.
+        let text = {
+            let t = term_lock(&term);
+            let oldest = i64::try_from(t.grid().oldest_absolute_row()).unwrap_or(0);
+            let index = usize::try_from(after - oldest).expect("a retained history row");
+            t.grid()
+                .get_history_line(index)
+                .map(|line| line.to_string())
+                .unwrap_or_default()
+        };
+        assert!(
+            text.contains(deep),
+            "the reported absolute row holds the match: {text:?}"
+        );
     }
 
     /// A find state holding `query` with the caret at its end — the state typing

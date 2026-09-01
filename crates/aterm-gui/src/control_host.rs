@@ -32,13 +32,14 @@ use aterm_control::{
 };
 use aterm_core::terminal::Terminal;
 use aterm_session::SessionId;
+#[cfg(test)]
 use aterm_session::sink::SinkWriter;
 use winit::event_loop::EventLoopProxy;
 
 use super::control_session;
 use crate::session_store::Store;
 use crate::subscribe::{SubscriberSet, Subscribers, Subscription};
-use crate::{Wake, term_lock};
+use crate::{SessionCtx, Wake, term_lock};
 
 pub(crate) struct GuiHost<'a> {
     /// The ONE session this host serves — the target the dispatcher resolved
@@ -57,10 +58,23 @@ pub(crate) struct GuiHost<'a> {
     /// session. `None` only on the session-scoped [`GuiHost::new`], which then
     /// reports `roster: false`.
     store: Option<&'a Store>,
-    /// The RESOLVED target's PTY sink — the same `ctx.sink` `send`/`feed` write
-    /// through, so trait-served input keeps whole-frame atomicity with the
-    /// keyboard path. `None` only on [`GuiHost::new`] (`input_sink: false`).
-    sink: Option<&'a SinkWriter>,
+    /// The RESOLVED target capability: sink plus its canonical echo tracker, so
+    /// trait-served input cannot bypass either whole-frame ordering or per-session
+    /// receipt attribution. `None` only on [`GuiHost::new`] (`input_sink: false`).
+    ctx: Option<&'a SessionCtx>,
+}
+
+fn classify_raw_editor_write(
+    result: std::io::Result<usize>,
+    intended: usize,
+) -> (bool, crate::input::Delivery) {
+    let ok = result.is_ok();
+    let delivery = match result {
+        Ok(written) if written == intended => crate::input::Delivery::Full,
+        Ok(accepted) if accepted > 0 => crate::input::Delivery::PartialInDoubt { accepted },
+        _ => crate::input::Delivery::Failed,
+    };
+    (ok, delivery)
 }
 
 impl<'a> GuiHost<'a> {
@@ -84,7 +98,7 @@ impl<'a> GuiHost<'a> {
             proxy,
             subscribers,
             store: None,
-            sink: None,
+            ctx: None,
         }
     }
 
@@ -99,7 +113,7 @@ impl<'a> GuiHost<'a> {
         proxy: Option<&'a EventLoopProxy<Wake>>,
         subscribers: &'a Subscribers,
         store: &'a Store,
-        sink: &'a SinkWriter,
+        ctx: &'a SessionCtx,
     ) -> Self {
         Self {
             sid,
@@ -107,7 +121,7 @@ impl<'a> GuiHost<'a> {
             proxy,
             subscribers,
             store: Some(store),
-            sink: Some(sink),
+            ctx: Some(ctx),
         }
     }
 
@@ -135,7 +149,7 @@ impl SessionHost for GuiHost<'_> {
             event_loop: self.proxy.is_some(),
             clipboard: true,
             roster: self.store.is_some(),
-            input_sink: self.sink.is_some(),
+            input_sink: self.ctx.is_some(),
         }
     }
 
@@ -226,7 +240,7 @@ impl SessionHost for GuiHost<'_> {
         if !self.serves(sid) {
             return None;
         }
-        let Some(sink) = self.sink else {
+        let Some(ctx) = self.ctx else {
             return Some(false);
         };
         // An empty frame moves nothing, so it must not stamp an input time the
@@ -235,7 +249,20 @@ impl SessionHost for GuiHost<'_> {
             return Some(true);
         }
         crate::metrics::note_input();
-        Some(sink.write_frame(bytes).is_ok())
+        let write = ctx.output_echo.begin_raw_editor(bytes);
+        let receipt = ctx.sink.write_frame_with_receipt(bytes);
+        let accepted_order = match receipt.as_ref() {
+            Ok(receipt) => receipt.order(),
+            Err(error) => error.order(),
+        };
+        let (ok, delivery) = classify_raw_editor_write(
+            receipt
+                .map(|receipt| receipt.accepted())
+                .map_err(|error| error.into_error()),
+            bytes.len(),
+        );
+        write.finish_delivery(delivery, accepted_order, &ctx.sink);
+        Some(ok)
     }
 
     fn request_redraw(&self, sid: u64) {
@@ -306,6 +333,27 @@ mod tests {
         input_sink: true,
     };
 
+    #[test]
+    fn raw_editor_write_classification_preserves_partial_acceptance_and_reply_shape() {
+        assert_eq!(
+            classify_raw_editor_write(Ok(4), 4),
+            (true, crate::input::Delivery::Full)
+        );
+        assert_eq!(
+            classify_raw_editor_write(Ok(2), 4),
+            (true, crate::input::Delivery::PartialInDoubt { accepted: 2 }),
+            "the host still replies from Result::is_ok while echo tracking retains the prefix"
+        );
+        assert_eq!(
+            classify_raw_editor_write(Ok(0), 4),
+            (true, crate::input::Delivery::Failed)
+        );
+        assert_eq!(
+            classify_raw_editor_write(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)), 4,),
+            (false, crate::input::Delivery::Failed)
+        );
+    }
+
     /// A session registered in a fresh registry, exactly as the GUI registers a
     /// tab: shared engine `Arc`, fabric identity, and a sink over `master` (a pipe
     /// write-end where a test reads the bytes back, else the `-1` stub). The host
@@ -315,6 +363,7 @@ mod tests {
         let nonce = LaunchNonce::generate();
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(master)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -368,7 +417,7 @@ mod tests {
         let store = session_store::new_store();
         let handle = registered(0, &term, -1);
         store.write().unwrap().register(handle.clone());
-        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx.sink);
+        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx);
         // EQUALITY, where the declared run enforces only a floor: this host's shape
         // is fully known here, so a capability gained or lost has to be RESTATED in
         // the profile rather than quietly widening what the matrix is held to.
@@ -461,7 +510,7 @@ mod tests {
         let store = session_store::new_store();
         let handle = registered(0, &term, -1);
         store.write().unwrap().register(handle.clone());
-        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx.sink);
+        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx);
         assert_eq!(cmd_select(&host, 0, "0 0 0 4"), "OK\n");
         let before = cmd_selection(&host, 0);
 
@@ -492,7 +541,7 @@ mod tests {
         let sibling = registered(1, &sibling_term, -1);
         store.write().unwrap().register(handle.clone());
         store.write().unwrap().register(sibling.clone());
-        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx.sink);
+        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx);
 
         // The sibling IS resolvable — this host just does not serve it.
         assert_eq!(host.resolve(Selector::Local(1)), Some(1));
@@ -527,7 +576,7 @@ mod tests {
         // doing, not the insertion order's.
         store.write().unwrap().register(sibling.clone());
         store.write().unwrap().register(handle.clone());
-        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx.sink);
+        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx);
 
         let roster = host.sessions();
         assert_eq!(roster.iter().map(|e| e.sid).collect::<Vec<_>>(), vec![0, 1]);
@@ -568,12 +617,35 @@ mod tests {
         let store = session_store::new_store();
         let handle = registered(0, &term, fds[1]);
         store.write().unwrap().register(handle.clone());
-        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx.sink);
+        let host = GuiHost::with_fleet(0, &term, None, &reg, &store, &handle.ctx);
 
         assert_eq!(host.write_input(0, b"echo hi\r"), Some(true));
         let mut buf = [0u8; b"echo hi\r".len()];
         rx.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"echo hi\r");
+        let sample = handle
+            .ctx
+            .output_echo
+            .sample(&handle.ctx.sink, std::time::Instant::now());
+        assert!(sample.last_accepted_at.is_none());
+        assert!(
+            sample.last_boundary_at.is_some(),
+            "a raw command ending in CR opens the submitted turn"
+        );
+        assert!(!sample.input_hot);
+
+        assert_eq!(host.write_input(0, b"x"), Some(true));
+        let mut byte = [0];
+        rx.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        let echo = handle
+            .ctx
+            .output_echo
+            .sample(&handle.ctx.sink, std::time::Instant::now());
+        assert!(
+            echo.last_accepted_at.is_some(),
+            "a raw editor frame without CR/LF keeps its echo shadow"
+        );
 
         // A host with no sink reports the write did not happen, rather than `OK`
         // for bytes that went nowhere.

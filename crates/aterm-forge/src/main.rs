@@ -46,6 +46,18 @@ fn main() -> ExitCode {
         } => aterm_forge::budget::run(&root, update, allow_regress.as_deref()),
         cli::Cmd::Attest => aterm_forge::attest::run(&root),
         cli::Cmd::Check { cells } => aterm_forge::check::run(&root, &cells),
+        cli::Cmd::MirrorEmit { out } => aterm_forge::mirror::run_emit(&root, &out),
+        cli::Cmd::MirrorVerify { dir } => aterm_forge::mirror::run_verify(&root, &dir),
+        cli::Cmd::MirrorBundle { dir, out } => {
+            aterm_forge::mirror_bundle::run_bundle(&root, &dir, &out)
+        }
+        cli::Cmd::MirrorUnbundle { file, out, force } => {
+            aterm_forge::mirror_bundle::run_unbundle(&root, &file, &out, force)
+        }
+        cli::Cmd::MirrorCheckBundle { file } => {
+            aterm_forge::mirror_bundle::run_check_bundle(&root, &file)
+        }
+        cli::Cmd::MirrorConfig { write } => aterm_forge::mirror_config::run_config(&root, write),
     };
 
     match out {

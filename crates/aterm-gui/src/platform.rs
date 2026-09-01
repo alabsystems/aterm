@@ -1578,7 +1578,7 @@ pub(crate) fn platform_apprt() -> PlatformAppRt {
 /// returns: the objc target on macOS, `()` elsewhere (so the `App` field type is
 /// the same name on every platform, like `menu::MenuHandle`).
 #[cfg(target_os = "macos")]
-pub(crate) type ReduceMotionObserver = objc2::rc::Retained<reduce_motion::ReduceMotionTarget>;
+pub(crate) type ReduceMotionObserver = aterm_objc::Retained<reduce_motion::ReduceMotionTarget>;
 
 /// See the macOS variant above — nothing to retain off macOS.
 #[cfg(not(target_os = "macos"))]
@@ -1586,53 +1586,155 @@ pub(crate) type ReduceMotionObserver = ();
 
 /// macOS "Reduce Motion" integration (W11): the one query + the one observer.
 /// Follows the [`crate::menu`] `MenuTarget` pattern — a declared `NSObject`
-/// subclass owning the `EventLoopProxy<Wake>`, registered on the WORKSPACE
-/// notification center for `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`
-/// and relaying each post into the existing `Wake` channel (no policy logic here;
-/// the main thread re-queries and resolves).
+/// subclass owning the relay, registered on the WORKSPACE notification center for
+/// `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` and relaying each
+/// post into the existing `Wake` channel (no policy logic here; the main thread
+/// re-queries and resolves).
+///
+/// # THE W2 SEAM
+///
+/// This module is HALF ported. What is off `objc2` and onto
+/// [`aterm_objc`](aterm_objc) — the first-party runtime layer — is the part W1
+/// exists to prove: the declared class, its ivars, its `dealloc`, its
+/// registration with the notification centre, and the `Retained` handle `App`
+/// holds ([`ReduceMotionObserver`]).
+///
+/// What is deliberately NOT ported, and is W2's to take:
+///
+/// * [`query`] / [`increase_contrast`] / [`reduce_transparency`] — three plain
+///   `msg_send!` BOOL getters. They are the cheapest possible port (one typed
+///   cast each) and are left as a matched pair with the ported half so a reader
+///   can see both forms side by side.
+/// * `MainThreadMarker` — `objc2`'s proof-of-main-thread token, which
+///   `aterm-objc` deliberately does not model. Replacing it means deciding what
+///   aterm's own main-thread proof is; that is a design question, not a
+///   translation, and it is shared with all six remaining `declare_class!`
+///   sites.
 #[cfg(target_os = "macos")]
 mod reduce_motion {
-    use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    use objc2::{
-        ClassType, DeclaredClass, class, declare_class, msg_send, msg_send_id, mutability, sel,
-    };
-    use objc2_foundation::{MainThreadMarker, NSString};
+    use objc2::{class, msg_send};
+    use objc2_foundation::MainThreadMarker;
     use winit::event_loop::EventLoopProxy;
 
     use crate::Wake;
 
-    declare_class!(
-        /// The notification-observer target. Owns the `EventLoopProxy<Wake>` and
-        /// exposes one `reduceMotionDidChange:` selector that posts
+    /// The workspace notification this module observes. Its value equals
+    /// AppKit's exported `NSWorkspaceAccessibilityDisplayOptionsDidChange
+    /// Notification` constant; it is posted on the WORKSPACE centre, not the
+    /// default one.
+    pub(crate) const DISPLAY_OPTIONS_NOTIFICATION: &str =
+        "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification";
+
+    /// The observer target's ivars.
+    ///
+    /// A boxed relay rather than the `EventLoopProxy<Wake>` itself: a proxy can
+    /// only be minted from a live `winit::EventLoop`, which on macOS must be
+    /// built on the main thread and only once per process, so a class whose
+    /// ivar IS the proxy cannot be driven from a test at all. Production still
+    /// posts exactly `Wake::ReduceMotionChanged` and nothing else — see
+    /// [`observe`] — and the seam is what lets the runtime test below fire the
+    /// REAL class from a REAL AppKit notification.
+    pub(crate) struct ReduceMotionIvars {
+        relay: Box<dyn Fn()>,
+    }
+
+    aterm_objc::declare_class! {
+        /// The notification-observer target. Owns the relay and exposes one
+        /// `reduceMotionDidChange:` selector that posts
         /// [`Wake::ReduceMotionChanged`] — a pure relay from AppKit into the
         /// event loop (the main thread re-queries the flag there, so a burst of
         /// notifications coalesces to the latest value).
-        pub(crate) struct ReduceMotionTarget;
+        ///
+        /// Declared with [`aterm_objc::declare_class!`] rather than objc2's:
+        /// this is the FIRST site ported off the objc2 cluster. The class name,
+        /// the superclass, the selector and the behaviour are unchanged; a
+        /// registered-class + real-notification test below proves it.
+        pub(crate) struct ReduceMotionTarget: NSObject {
+            const NAME: &str = "ATermReduceMotionTarget";
+            type Ivars = ReduceMotionIvars;
 
-        // SAFETY:
-        // - NSObject imposes no subclassing requirements.
-        // - InteriorMutable is the safe default; we never mutate the proxy.
-        // - ReduceMotionTarget has no Drop impl beyond the auto-generated ivar drop.
-        unsafe impl ClassType for ReduceMotionTarget {
-            type Super = objc2::runtime::NSObject;
-            type Mutability = mutability::InteriorMutable;
-            const NAME: &'static str = "ATermReduceMotionTarget";
-        }
-
-        impl DeclaredClass for ReduceMotionTarget {
-            type Ivars = EventLoopProxy<Wake>;
-        }
-
-        unsafe impl ReduceMotionTarget {
             /// The observer selector. Fire-and-forget: a closed loop (app
             /// shutting down) just drops the event, like every other relay.
-            #[method(reduceMotionDidChange:)]
-            fn reduce_motion_did_change(&self, _note: Option<&AnyObject>) {
-                let _ = self.ivars().send_event(Wake::ReduceMotionChanged);
+            @sel(reduceMotionDidChange:)
+            fn reduce_motion_did_change(&self, _note: aterm_objc::Id) {
+                (self.ivars().relay)();
             }
         }
-    );
+    }
+
+    /// Build a target around an arbitrary relay. `observe` is the production
+    /// caller; the test below is the other one.
+    fn new_target(relay: Box<dyn Fn()>) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
+        ReduceMotionTarget::alloc_init(ReduceMotionIvars { relay })
+    }
+
+    /// `[[NSWorkspace sharedWorkspace] notificationCenter]`, or null.
+    fn workspace_center() -> aterm_objc::Id {
+        // SAFETY: `+sharedWorkspace` is a standard singleton accessor and
+        // `-notificationCenter` a plain accessor on it; both return autoreleased
+        // or immortal objects that are only borrowed here. Both prototypes are
+        // `-(id)`, exactly as cast.
+        unsafe {
+            let f: unsafe extern "C" fn(aterm_objc::ClassPtr, aterm_objc::Sel) -> aterm_objc::Id =
+                aterm_objc::msg();
+            let ws = f(
+                aterm_objc::class(c"NSWorkspace"),
+                aterm_objc::sel!(sharedWorkspace),
+            );
+            if ws.is_null() {
+                return std::ptr::null_mut();
+            }
+            let g: unsafe extern "C" fn(aterm_objc::Id, aterm_objc::Sel) -> aterm_objc::Id =
+                aterm_objc::msg();
+            g(ws, aterm_objc::sel!(notificationCenter))
+        }
+    }
+
+    /// Register `target` on the workspace centre for the display-options
+    /// notification. `false` if the workspace or its centre is unavailable.
+    ///
+    /// The centre holds the observer WEAKLY and this module never removes it,
+    /// exactly as before: `App` keeps the returned handle in a field for the
+    /// process lifetime.
+    fn register(target: &aterm_objc::Retained<ReduceMotionTarget>) -> bool {
+        // A SCOPE, not an RAII token: `AutoreleasePool::new` is `unsafe` since
+        // W2 closed D2, because a token can be dropped out of order and that is
+        // a use-after-free plus a fatal runtime error.
+        aterm_objc::autoreleasepool(|_| {
+            let center = workspace_center();
+            if center.is_null() {
+                return false;
+            }
+            let Some(name) = aterm_objc::ns_string(DISPLAY_OPTIONS_NOTIFICATION) else {
+                return false;
+            };
+            // SAFETY: `-addObserver:selector:name:object:` is
+            // `-(void)(id, SEL, id, id)`, exactly the prototype cast below. The
+            // observer is `target`, which the caller keeps alive; the selector
+            // is one this class declares; `name` is a live +1 NSString the pool
+            // outlives; nil `object` means "from any sender".
+            unsafe {
+                let add: unsafe extern "C" fn(
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    aterm_objc::Id,
+                    aterm_objc::Id,
+                ) = aterm_objc::msg();
+                add(
+                    center,
+                    aterm_objc::sel!(addObserver:selector:name:object:),
+                    target.as_id(),
+                    aterm_objc::sel!(reduceMotionDidChange:),
+                    name.id(),
+                    std::ptr::null_mut(),
+                );
+            }
+            true
+        })
+    }
 
     /// Query `NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion`
     /// — the live OS "Reduce Motion" accessibility preference.
@@ -1676,38 +1778,157 @@ mod reduce_motion {
     /// it alive for the process life — the notification center references it
     /// weakly, and it is never removed, exactly like the menu target). `None`
     /// off the main thread (AppKit requirement; the winit loop guarantees it).
-    pub(crate) fn observe(proxy: &EventLoopProxy<Wake>) -> Option<Retained<ReduceMotionTarget>> {
-        let mtm = MainThreadMarker::new()?;
-        let target: Retained<ReduceMotionTarget> = {
-            let this = mtm.alloc().set_ivars(proxy.clone());
-            // SAFETY: plain `[super init]` on a freshly allocated instance.
-            unsafe { msg_send_id![super(this), init] }
-        };
-        // The accessibility display-options notification is posted on the
-        // WORKSPACE notification center (not the default center). The name
-        // string equals AppKit's exported constant value.
-        let name =
-            NSString::from_str("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
-        // SAFETY: standard main-thread AppKit calls; `addObserver:` retains
-        // nothing (weak observer), the target outlives the run loop in `App`.
-        unsafe {
-            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-            if ws.is_null() {
-                return None;
-            }
-            let center: *mut AnyObject = msg_send![ws, notificationCenter];
-            if center.is_null() {
-                return None;
-            }
-            let _: () = msg_send![
-                center,
-                addObserver: &*target,
-                selector: sel!(reduceMotionDidChange:),
-                name: &*name,
-                object: std::ptr::null::<AnyObject>()
-            ];
+    pub(crate) fn observe(
+        proxy: &EventLoopProxy<Wake>,
+    ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
+        let _mtm = MainThreadMarker::new()?;
+        let proxy = proxy.clone();
+        let target = new_target(Box::new(move || {
+            // Fire-and-forget: a closed loop (app shutting down) just drops the
+            // event, exactly as the objc2 version did.
+            let _ = proxy.send_event(Wake::ReduceMotionChanged);
+        }))?;
+        if register(&target) {
+            Some(target)
+        } else {
+            None
         }
-        Some(target)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{DISPLAY_OPTIONS_NOTIFICATION, ReduceMotionTarget, new_target, register};
+
+        /// Remove `target` from the workspace centre — production never does
+        /// this (the observer lives for the process), but a test must, or the
+        /// centre keeps a weak reference to freed memory.
+        fn unregister(target: &aterm_objc::Retained<ReduceMotionTarget>) {
+            let center = super::workspace_center();
+            if center.is_null() {
+                return;
+            }
+            // SAFETY: `-removeObserver:` is `-(void)(id)`; `center` is the live
+            // workspace centre and `target` a live observer registered on it.
+            unsafe {
+                let f: unsafe extern "C" fn(aterm_objc::Id, aterm_objc::Sel, aterm_objc::Id) =
+                    aterm_objc::msg();
+                f(center, aterm_objc::sel!(removeObserver:), target.as_id());
+            }
+        }
+
+        /// Post the REAL notification on the REAL workspace centre.
+        fn post() {
+            aterm_objc::autoreleasepool(|_| {
+                let center = super::workspace_center();
+                assert!(!center.is_null(), "no workspace notification centre");
+                let name = aterm_objc::ns_string(DISPLAY_OPTIONS_NOTIFICATION).expect("NSString");
+                // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`;
+                // `center` is live, `name` a live +1 NSString, nil sender is
+                // legal.
+                unsafe {
+                    let f: unsafe extern "C" fn(
+                        aterm_objc::Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Id,
+                    ) = aterm_objc::msg();
+                    f(
+                        center,
+                        aterm_objc::sel!(postNotificationName:object:),
+                        name.id(),
+                        std::ptr::null_mut(),
+                    );
+                }
+            });
+        }
+
+        /// THE PROOF. Not "the macro expands": the class is looked up by name in
+        /// the Objective-C runtime's own table, an instance is registered with
+        /// the real `NSWorkspace` notification centre, the real notification is
+        /// posted, and AppKit's dispatch machinery is what calls the Rust body.
+        #[test]
+        fn a_real_workspace_notification_reaches_the_declared_class() {
+            use aterm_objc::{ClassType, class, class_name, superclass_of};
+
+            let hits = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&hits);
+            let target = new_target(Box::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("+alloc/-init produced a ReduceMotionTarget");
+
+            // The runtime's own view of what got registered.
+            let cls = ReduceMotionTarget::class();
+            assert!(!cls.is_null());
+            assert_eq!(
+                class(c"ATermReduceMotionTarget"),
+                cls,
+                "objc_getClass disagrees with the registered pair"
+            );
+            // SAFETY: `cls` is the class this module just registered, so it
+            // and its superclass are live, immortal class objects.
+            unsafe {
+                assert_eq!(class_name(cls), c"ATermReduceMotionTarget");
+                assert_eq!(class_name(superclass_of(cls)), c"NSObject");
+            }
+            // SAFETY: `target` is a live instance; `-respondsToSelector:` is a
+            // side-effect-free query.
+            unsafe {
+                let responds: unsafe extern "C" fn(
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    aterm_objc::Sel,
+                ) -> bool = aterm_objc::msg();
+                assert!(responds(
+                    target.as_id(),
+                    aterm_objc::sel!(respondsToSelector:),
+                    aterm_objc::sel!(reduceMotionDidChange:)
+                ));
+            }
+
+            assert!(register(&target), "workspace centre registration failed");
+            post();
+            post();
+            unregister(&target);
+            // Removed: a further post must NOT reach it.
+            post();
+
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                2,
+                "AppKit did not deliver the notification to the declared class \
+                 exactly as many times as it was posted"
+            );
+        }
+
+        /// The ivars are dropped when the last reference goes — the generated
+        /// `dealloc`, on the real site's real ivar type (a boxed closure that
+        /// owns an `Arc`).
+        #[test]
+        fn dropping_the_target_drops_its_relay() {
+            struct Spy(Arc<AtomicUsize>);
+            impl Drop for Spy {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let drops = Arc::new(AtomicUsize::new(0));
+            let spy = Spy(Arc::clone(&drops));
+            let target = new_target(Box::new(move || {
+                let _ = &spy;
+            }))
+            .expect("target");
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(target);
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "the generated -dealloc did not drop the relay"
+            );
+        }
     }
 }
 

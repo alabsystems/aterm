@@ -1979,9 +1979,10 @@ pub fn spawn_shell_with_pid_cell_px(
             // program is not the shell at all.
             format!(
                 "child could not exec `{}` (_exit(127)) — usually a nonexistent or \
-                 non-executable path. If this is the shell, check `shell` in \
-                 aterm.toml / --shell / $ATERM_SHELL; `aterm --validate-config` \
-                 checks it without launching",
+                 non-executable path. If this is the shell, it came from `shell` in \
+                 aterm.toml, `--shell`, or $ATERM_SHELL (in that precedence). \
+                 `aterm doctor` reports whether $SHELL is executable; for the other \
+                 two sources, test the path above directly",
                 exec_target.to_string_lossy()
             ),
         )),

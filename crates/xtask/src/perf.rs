@@ -1127,7 +1127,7 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
     }
     let script = workspace_root().join("tools/wasm-bench/run.sh");
     // The PUBLIC snapshot ships crates/xtask but NOT tools/wasm-bench
-    // (publish/manifest.txt exports exactly one path from tools/, install.sh), so
+    // (publish/manifest.txt exports two named paths from tools/ and this is not one), so
     // there `bash <missing>` exits 127 and this lane fails with a message that names
     // no cause. Absent harness is a box fact, not a regression.
     if !script.exists() {

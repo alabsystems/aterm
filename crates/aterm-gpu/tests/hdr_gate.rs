@@ -474,6 +474,11 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
 fn gpu(px: f32) -> Option<GpuRenderer> {
     match GpuRenderer::new(px, aterm_render::Theme::default()) {
         Ok(mut g) => {
+            // THE FLIP: the EDR gates drive the wgpu present stand-ins (the
+            // wgpu offscreen + test-hdr destinations) — the WGPU ORACLE arm,
+            // asked for by name post-flip.
+            #[cfg(target_os = "macos")]
+            g.disarm_metal_for_oracle();
             // Deterministic expectations: the bloom halo is a separate additive
             // layer over the offscreen, orthogonal to the laws under test.
             g.set_bloom(false);

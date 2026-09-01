@@ -1,0 +1,66 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
+# crates/aterm-cfg-if, crates/aterm-arrayvec, crates/aterm-log-shim and
+# crates/aterm-libc.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the two
+# third-party consumers' `core_maths = "0.1.0"` lines at this code the package
+# must be called `core_maths` — nothing else works. The DIRECTORY keeps the
+# `aterm-` prefix so a `ls crates/` or a stack trace still reads as ours and
+# nobody mistakes this for a vendored upstream (those live under `vendor/`,
+# which is where genuinely-upstream source belongs).
+name = "core_maths"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number: rustybuzz 0.20.1 and ttf-parser 0.25.1
+# each ask for `^0.1.0`, and 0.1.1 is what the lock held before the swap, so the
+# lockfile's version line does not move.
+#
+# It must ALSO be >= every other `0.1.x` this workspace forces into the graph —
+# the rule crates/aterm-arrayvec learned the expensive way, when a shim at 0.7.6
+# left the registry copy satisfying all six consumers and the patch row silently
+# did nothing. Nothing pins `core_maths` here (no dev-dep oracle holds it; see
+# the ORACLE note in src/lib.rs for why there cannot be one), and 0.1.1 is
+# upstream's own latest, so the shim is the highest candidate in the graph.
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `core_maths` replacement for aterm (forwards CoreFloat to std; replaces the crates.io core_maths package and, with it, libm)"
+
+# `core_maths` is both the PACKAGE and the crate root every consumer writes
+# (`use core_maths::CoreFloat;`). Cargo would derive it from the package name on
+# its own; it is declared so the two can never drift.
+[lib]
+name = "core_maths"
+path = "src/lib.rs"
+
+[dependencies]
+# NONE, AND THAT IS THE ENTIRE POINT. Upstream's one dependency is `libm`, and
+# `libm` is a VENDORED FORK in this repository (vendor/libm, 19,867 lines and a
+# build script). `core_maths` is libm's SOLE parent on mac-arm and on wasm-cpu,
+# so this empty table is what takes both packages off those two cells.
+
+# NO `[dev-dependencies]` ORACLE, and the omission is judged rather than
+# forgotten — `cargo forge check` [OB-15] would FAIL the build if it were here.
+#
+# The natural oracle is `libm`: compare this shim's answers to the very
+# implementation upstream forwards to. But `libm` is itself a `[patch.crates-io]`
+# entry (-> vendor/libm), and `[patch]` rewrites dev edges too, so a
+# `libm = "0.2"` dev-dependency declared anywhere in this workspace resolves to
+# the fork — which is the reference — while Cargo.lock carries no
+# registry-sourced `libm` at all. That is precisely the shape [OB-15] calls
+# ORACLE CAPTURE, and it is a FAIL, not a note. The escape hatch other crates
+# use (pin the oracle to a version the shim cannot satisfy) would put a second
+# `libm` back into Cargo.lock to test code that no cell executes.
+#
+# What replaces it is stronger than a value-for-value differential, because the
+# claim to defend is not "these agree" but "nothing calls either": every
+# `use core_maths::CoreFloat;` in the graph is `#[cfg(not(feature = "std"))]`
+# and `std` is ON for both consumers in all five cells. tests/consumers.rs
+# checks exactly that, per cell, from the live resolve.
+
+[lints]
+workspace = true

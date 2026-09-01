@@ -128,7 +128,8 @@ const HELP_HEAD: &str = concat!(
     "\n",
     "SUBCOMMANDS (print info and exit; no shell is spawned):\n",
     "    show-config               Print aterm's effective runtime configuration.\n",
-    "    validate-config           Validate the config; exit non-zero on error.\n",
+    "    validate-config           Validate $ATERM_CONTAINMENT_MODE (NOT aterm.toml);\n",
+    "                              exit non-zero if it is malformed.\n",
     "    explain-config            Explain how aterm resolves its configuration.\n",
     "    doctor                    Pre-flight health check; exit non-zero on a problem.\n",
     "    list-fonts                List available font families.\n",
@@ -539,8 +540,40 @@ fn show_config_report() -> String {
 /// the env, then delegates to the pure [`validate_containment_value`]. Scriptable:
 /// `aterm validate-config && aterm`.
 fn validate_config_report() -> (String, i32) {
-    validate_containment_value(std::env::var("ATERM_CONTAINMENT_MODE").ok().as_deref())
+    let (report, code) =
+        validate_containment_value(std::env::var("ATERM_CONTAINMENT_MODE").ok().as_deref());
+    // The scope note rides on the VERB, not on the shared core: `doctor` calls
+    // `validate_containment_value` too and renders its string as ONE `key: …`
+    // detail line, which a multi-line note would break.
+    //
+    // Only on success. A reader looking at `ERR:` needs the error, not a caveat
+    // about what else was not examined.
+    if code == 0 {
+        (format!("{report}{VALIDATE_SCOPE_NOTE}"), code)
+    } else {
+        (report, code)
+    }
 }
+
+/// What `validate-config` does NOT check, printed on every SUCCESS.
+///
+/// An `OK` from a verb named `validate-config` reads as "your configuration is
+/// valid". It is not what this checks. It validates one environment variable;
+/// it never opens `aterm.toml`, and it never looks at the shell. That gap sent
+/// a real reader the wrong way: the exec-127 error in `aterm-pty` used to name
+/// `aterm --validate-config` as the way to check a broken `shell` setting
+/// "without launching", so a user whose shell was the broken thing got `OK` and
+/// exit 0 from the command they were told to run. The error message is fixed;
+/// this note is the other half, so the same conclusion cannot be reached from
+/// this command's own output.
+///
+/// On the FAILURE path it is deliberately absent — a reader looking at `ERR:`
+/// needs the error, not a caveat about what else was not examined. It also rides
+/// on the VERB rather than on the shared `validate_containment_value`, because
+/// `doctor` renders that function's string as one `key: …` detail line.
+const VALIDATE_SCOPE_NOTE: &str = "note: this checks ATERM_CONTAINMENT_MODE only. \
+It does not open aterm.toml and does not validate\n      the shell — for the shell, \
+run `aterm doctor`.\n";
 
 /// Pure core of `validate-config` (env-free, so it is deterministically testable):
 /// validate a containment-mode selection. `None` = unset (the default `user`
@@ -948,12 +981,32 @@ fn doctor_checks(
         Some(p) => (false, format!("shell: {p} (not executable or missing)")),
     };
 
-    let (tty_ok, tty_detail) = if is_tty {
-        (true, "tty: stdout is a terminal".to_string())
+    // A NOTE, never a FAIL, and this is the row that made `doctor` unusable as
+    // the thing its own help calls it: "Pre-flight health check; exit non-zero
+    // on a problem."
+    //
+    // The check is SELF-REFERENTIAL — it measures `doctor`'s own stdout, not
+    // aterm's ability to run. aterm is a windowed terminal that allocates its
+    // own pty; whether the process that asked for a health report had its
+    // output piped says nothing about the machine. But `Mark::from_ok(false)`
+    // made it `FAIL`, so `aterm doctor > out.txt`, `aterm doctor | tee`, every
+    // CI invocation, and every capture-the-output caller got `health: FAIL —
+    // one or more checks did not pass` and exit 1 on a perfectly healthy box.
+    // A health check that fails whenever anything reads its output cannot gate
+    // anything, and the plan to have the GUI run repair "when doctor fails"
+    // would have run it every single launch.
+    //
+    // `Mark::Note` is defined for exactly this: "a fact worth reporting that is
+    // NOT a failure — nothing to fix, or nothing aterm can fix, and never a
+    // reason to refuse to launch."
+    let (tty_mark, tty_detail) = if is_tty {
+        (Mark::Ok, "tty: stdout is a terminal".to_string())
     } else {
         (
-            false,
-            "tty: stdout is not a terminal (headless/piped)".to_string(),
+            Mark::Note,
+            "tty: stdout is not a terminal (headless/piped) — expected when the \
+             output is captured, and not a health problem"
+                .to_string(),
         )
     };
 
@@ -979,7 +1032,7 @@ fn doctor_checks(
         },
         DoctorRow {
             label: "tty:",
-            mark: Mark::from_ok(tty_ok),
+            mark: tty_mark,
             detail: tty_detail,
         },
         DoctorRow {
@@ -1869,6 +1922,36 @@ mod tests {
         }
     }
 
+    /// `validate-config` validates ONE environment variable. It never opens
+    /// `aterm.toml` and never looks at the shell — so a bare `OK` from a verb
+    /// with that name invites exactly the wrong conclusion, and a real error
+    /// message used to send readers here for a broken `shell` setting, where
+    /// they got `OK` and exit 0 from the command they were told to run.
+    ///
+    /// The verb says what it did not check. The shared core does NOT, because
+    /// `doctor` renders that core's string as a single `key: …` detail line.
+    #[test]
+    fn validate_config_output_states_what_it_does_not_check() {
+        let (report, code) = diag_report("validate-config", None).expect("verb dispatches");
+        assert_eq!(code, 0, "an unset containment mode is valid");
+        assert!(
+            report.contains("does not open aterm.toml"),
+            "an OK must not read as `your configuration is valid`: {report}"
+        );
+        assert!(
+            report.contains("aterm doctor"),
+            "and it must name the verb that DOES check the shell: {report}"
+        );
+
+        // The shared core stays single-line, or doctor's table breaks.
+        let (core, _) = validate_containment_value(None);
+        assert_eq!(
+            core.trim_end().lines().count(),
+            1,
+            "doctor renders this as one `key: …` row: {core}"
+        );
+    }
+
     #[test]
     fn validate_config_exit_codes() {
         // Unset → valid (default user applies), exit 0.
@@ -1998,10 +2081,29 @@ mod tests {
         assert_eq!(code, 1);
         assert!(r.contains("$SHELL unset"), "{r}");
 
-        // No tty (headless/piped) → fail.
+        // No tty (headless/piped) → a NOTE, and the exit code does NOT move.
+        // This is the invocation every script, every CI run and every
+        // capture-the-output caller makes; scoring it FAIL meant `doctor` could
+        // never gate anything, because reading its answer changed the answer.
+        // A containment/shell problem below still fails with no tty, so the
+        // note is not a blanket.
         let (r, code) = doctor_checks(Some("/bin/sh"), true, None, false, 24, 80, &unmeasured());
-        assert_eq!(code, 1);
-        assert!(r.contains("health: FAIL") && r.contains("headless"), "{r}");
+        assert_eq!(code, 0, "a piped healthy machine is healthy: {r}");
+        assert!(r.contains("health: OK") && r.contains("headless"), "{r}");
+        assert!(
+            r.contains("not a health problem"),
+            "the note must say why it is not a failure: {r}"
+        );
+        let (r, code) = doctor_checks(
+            Some("/no/such/shell"),
+            false,
+            Some("user"),
+            false,
+            24,
+            80,
+            &unmeasured(),
+        );
+        assert_eq!(code, 1, "a real failure still fails without a tty: {r}");
 
         // Bad containment mode → fail (reuses validate-config's verdict).
         let (r, code) = doctor_checks(
@@ -2043,11 +2145,17 @@ mod tests {
         }
     }
 
-    /// The three legacy rows keep their EXACT two-valued semantics: `ok` when
-    /// they pass, `FAIL` — the same spelling scripts grep for — when they do not.
-    /// The mark column is still the aligned block it was.
+    /// `containment` and `shell` keep their EXACT two-valued semantics: `ok`
+    /// when they pass, `FAIL` — the same spelling scripts grep for — when they
+    /// do not. The mark column is still the aligned block it was.
+    ///
+    /// `tty` is no longer one of them. It measures `doctor`'s OWN stdout, so
+    /// scoring it `FAIL` meant reading doctor's answer changed the answer: every
+    /// piped, redirected or CI invocation exited 1 on a healthy machine. It is a
+    /// `note` now, like `privacy`, for the reason `Mark::Note` exists — a fact
+    /// that is never a reason to refuse to launch.
     #[test]
-    fn the_legacy_doctor_rows_are_unchanged_by_the_third_mark() {
+    fn the_two_valued_doctor_rows_are_unchanged_by_the_third_mark() {
         let (r, _) = doctor_checks(
             Some("/bin/sh"),
             true,
@@ -2069,7 +2177,7 @@ mod tests {
             80,
             &unmeasured(),
         );
-        for line in ["containment: FAIL", "tty:         FAIL"] {
+        for line in ["containment: FAIL", "tty:         note"] {
             assert!(r.lines().any(|l| l == line), "missing {line:?}\n{r}");
         }
     }

@@ -131,6 +131,7 @@ pub(crate) enum Factor {
 
 impl Factor {
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendFactor {
         match self {
             Self::Zero => wgpu::BlendFactor::Zero,
@@ -168,6 +169,7 @@ pub(crate) enum BlendOp {
 
 impl BlendOp {
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendOperation {
         match self {
             Self::Add => wgpu::BlendOperation::Add,
@@ -234,6 +236,7 @@ impl BlendComponent {
     };
 
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendComponent {
         wgpu::BlendComponent {
             src_factor: self.src.wgpu(),
@@ -311,6 +314,7 @@ impl Blend {
     }
 
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendState {
         wgpu::BlendState {
             color: self.color.wgpu(),
@@ -335,6 +339,7 @@ pub(crate) enum WriteMask {
 
 impl WriteMask {
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::ColorWrites {
         match self {
             Self::Color => wgpu::ColorWrites::COLOR,
@@ -385,6 +390,7 @@ pub(crate) enum TargetRole {
 /// the `GpuContext` (`GpuContext::pipeline_targets`) so a site cannot hand a
 /// pipeline the wrong one of the offscreen's two views.
 #[derive(Clone, Copy, Debug)]
+#[cfg(wgpu_arm)]
 pub(crate) struct TargetFormats {
     /// `GpuContext::offscreen_srgb_view_format()`.
     pub(crate) offscreen_srgb: wgpu::TextureFormat,
@@ -395,6 +401,7 @@ pub(crate) struct TargetFormats {
     pub(crate) present: Option<wgpu::TextureFormat>,
 }
 
+#[cfg(wgpu_arm)]
 impl TargetFormats {
     /// The same formats, now also able to satisfy [`TargetRole::Present`].
     pub(crate) const fn with_present(self, format: wgpu::TextureFormat) -> Self {
@@ -434,6 +441,7 @@ pub(crate) enum Topology {
 
 impl Topology {
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::PrimitiveTopology {
         match self {
             Self::TriangleList => wgpu::PrimitiveTopology::TriangleList,
@@ -489,6 +497,7 @@ pub(crate) enum AttrFormat {
 
 impl AttrFormat {
     /// The `wgpu` spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::VertexFormat {
         match self {
             Self::Uint16x4 => wgpu::VertexFormat::Uint16x4,
@@ -677,6 +686,7 @@ impl VertexLayout {
 }
 
 /// The `wgpu` spelling of one [`VertexAttr`].
+#[cfg(wgpu_arm)]
 const fn wgpu_attr(a: VertexAttr) -> wgpu::VertexAttribute {
     wgpu::VertexAttribute {
         format: a.format.wgpu(),
@@ -687,9 +697,11 @@ const fn wgpu_attr(a: VertexAttr) -> wgpu::VertexAttribute {
 
 /// The `wgpu` attribute array for [`BG_LAYOUT`], derived from it rather than
 /// re-spelled — this is what `renderer.rs::BG_ATTRS` used to be.
+#[cfg(wgpu_arm)]
 static BG_ATTRS: [wgpu::VertexAttribute; 2] =
     [wgpu_attr(BG_LAYOUT.attrs[0]), wgpu_attr(BG_LAYOUT.attrs[1])];
 /// The `wgpu` attribute array for [`GLYPH_LAYOUT`].
+#[cfg(wgpu_arm)]
 static GLYPH_ATTRS: [wgpu::VertexAttribute; 4] = [
     wgpu_attr(GLYPH_LAYOUT.attrs[0]),
     wgpu_attr(GLYPH_LAYOUT.attrs[1]),
@@ -697,12 +709,14 @@ static GLYPH_ATTRS: [wgpu::VertexAttribute; 4] = [
     wgpu_attr(GLYPH_LAYOUT.attrs[3]),
 ];
 /// The `wgpu` attribute array for [`RAIN_GLOW_LAYOUT`].
+#[cfg(wgpu_arm)]
 static RAIN_GLOW_ATTRS: [wgpu::VertexAttribute; 3] = [
     wgpu_attr(RAIN_GLOW_LAYOUT.attrs[0]),
     wgpu_attr(RAIN_GLOW_LAYOUT.attrs[1]),
     wgpu_attr(RAIN_GLOW_LAYOUT.attrs[2]),
 ];
 /// The `wgpu` attribute array for [`FIRE_LAYOUT`].
+#[cfg(wgpu_arm)]
 static FIRE_ATTRS: [wgpu::VertexAttribute; 4] = [
     wgpu_attr(FIRE_LAYOUT.attrs[0]),
     wgpu_attr(FIRE_LAYOUT.attrs[1]),
@@ -711,24 +725,28 @@ static FIRE_ATTRS: [wgpu::VertexAttribute; 4] = [
 ];
 
 /// The `wgpu` per-instance buffer layout for [`VertexLayout::Bg`].
+#[cfg(wgpu_arm)]
 static BG_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
     array_stride: BG_LAYOUT.stride,
     step_mode: wgpu::VertexStepMode::Instance,
     attributes: &BG_ATTRS,
 }];
 /// The `wgpu` per-instance buffer layout for [`VertexLayout::Glyph`].
+#[cfg(wgpu_arm)]
 static GLYPH_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
     array_stride: GLYPH_LAYOUT.stride,
     step_mode: wgpu::VertexStepMode::Instance,
     attributes: &GLYPH_ATTRS,
 }];
 /// The `wgpu` per-instance buffer layout for [`VertexLayout::RainGlow`].
+#[cfg(wgpu_arm)]
 static RAIN_GLOW_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
     array_stride: RAIN_GLOW_LAYOUT.stride,
     step_mode: wgpu::VertexStepMode::Instance,
     attributes: &RAIN_GLOW_ATTRS,
 }];
 /// The `wgpu` per-instance buffer layout for [`VertexLayout::Fire`].
+#[cfg(wgpu_arm)]
 static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
     array_stride: FIRE_LAYOUT.stride,
     step_mode: wgpu::VertexStepMode::Instance,
@@ -959,6 +977,7 @@ impl PipelineSpec {
     /// The `wgpu` colour-target state: this row's blend + write mask, over the
     /// format its [`TargetRole`] resolves to. The ONE place a `renderer.rs`
     /// construction site gets a `ColorTargetState` from.
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_color_target(&self, targets: TargetFormats) -> wgpu::ColorTargetState {
         wgpu::ColorTargetState {
             format: targets.resolve(self.target),
@@ -968,6 +987,7 @@ impl PipelineSpec {
     }
 
     /// The `wgpu` vertex-buffer list — `&[]` for a `[[vertex_id]]`-only pass.
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_vertex_buffers(&self) -> &'static [wgpu::VertexBufferLayout<'static>] {
         match self.vertex {
             VertexLayout::None => &[],
@@ -980,6 +1000,7 @@ impl PipelineSpec {
 
     /// The `wgpu` primitive state — the row's topology over `wgpu`'s defaults
     /// for everything else (no culling, CCW front face, fill mode).
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_primitive(&self) -> wgpu::PrimitiveState {
         wgpu::PrimitiveState {
             topology: self.topology.wgpu(),

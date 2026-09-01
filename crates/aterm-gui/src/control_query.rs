@@ -67,16 +67,28 @@ pub(crate) fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
 }
 
 /// The `text` / `text --json` argument tail: empty for the whole grid, `trim` to
-/// drop the trailing blank rows. ANYTHING else is `ERR usage: text [trim]` — the
+/// drop the trailing blank rows. ANYTHING else is `ERR usage: text [--json] [trim]`
+/// — the
 /// dispatch used to drop this tail on the floor, so an agent guessing a modifier
 /// (`text trim`, `text compact`) got the full grid back with no signal that it had
 /// guessed wrong (F4's sub-finding). The usage line is the `Err` so both arms answer
 /// with the same bytes.
+/// The `text` grammar, as the wire states it on a usage error.
+///
+/// It NAMES `--json`, because the verb takes it (`control.rs` routes
+/// `text --json [trim]` to the JSON emitter and strips the flag before this
+/// parser runs). The line used to read `ERR usage: text [trim]`, which is the
+/// answer to `aterm ctl text --help` and therefore the first thing a reader sees
+/// about the grammar — it denied a flag the same catalog entry documents two
+/// lines further on (audit D-9). One `const`, so the two arms and the catalog
+/// cannot drift apart again.
+pub(crate) const TEXT_USAGE: &str = "ERR usage: text [--json] [trim]\n";
+
 pub(crate) fn text_trim_arg(rest: &str) -> Result<bool, String> {
     match rest.trim() {
         "" => Ok(false),
         "trim" => Ok(true),
-        _ => Err("ERR usage: text [trim]\n".to_string()),
+        _ => Err(TEXT_USAGE.to_string()),
     }
 }
 
@@ -2280,11 +2292,12 @@ pub(crate) fn search_full_history_direction(
     strict: bool,
 ) -> Result<FullHistorySearch, SearchOptionsError> {
     // Short lock: capture the cache key and the coordinate frame only.
-    let (key_alt, key_seq, oldest, scrollback, visible_rows, absolute_row_revision) = {
+    let (key_alt, key_seq, key_epoch, oldest, scrollback, visible_rows, absolute_row_revision) = {
         let t = term_lock(term);
         (
             t.is_alternate_screen(),
             t.content_seq(),
+            t.grid().history_renumber_epoch(),
             t.grid().oldest_absolute_row(),
             t.grid().scrollback_lines(),
             t.rows() as usize,
@@ -2336,8 +2349,14 @@ pub(crate) fn search_full_history_direction(
     // cache lock, then run the potentially large query after releasing it. Searches
     // in another window can therefore proceed concurrently instead of serializing
     // behind a common one-character query over a deep history.
-    let cached_index =
-        cached_search_index(term, key_alt, key_seq, absolute_row_revision, max_lines);
+    let cached_index = cached_search_index(
+        term,
+        key_alt,
+        key_seq,
+        key_epoch,
+        absolute_row_revision,
+        max_lines,
+    );
     if let Some(index) = cached_index {
         // SA-1: the per-keystroke query layer. Literal queries narrow from the
         // previous keystroke's occurrence frame (batch-identical results, no
@@ -2393,10 +2412,26 @@ pub(crate) fn search_full_history_direction(
     // LIVE frame at read time, so a row that scrolls off mid-snapshot reads as
     // evicted (empty) — exactly what a fresh build under the shifted frame lacks.
     let visible_base = usize::try_from(oldest.saturating_add(scrollback_u64)).unwrap_or(usize::MAX);
-    let reusable =
-        take_reusable_search_index(term, key_alt, absolute_row_revision, max_lines, indexed_end);
+    let reusable = take_reusable_search_index(
+        term,
+        key_alt,
+        key_epoch,
+        absolute_row_revision,
+        max_lines,
+        retained_base,
+        indexed_end,
+    );
     let (mut index, snapshot_start) = if let Some((mut index, previous_visible_base)) = reusable {
-        index.retain_history_from(retained_base);
+        // The rows below the new retained floor are gone from the TERMINAL
+        // (retention advanced, an `ED 3` erased the scrollback), not merely
+        // un-searchable — a from-scratch rebuild over the survivors reports
+        // COMPLETE results with a zero watermark, so the drop must too, or a
+        // single `clear` latches `incomplete` for the life of the session and
+        // the find bar paints `N+` forever over a count it knows is exact. The
+        // honesty verdict for THIS query is decided once, below, from
+        // `skipped_prefix` — the only thing that means "the source still holds
+        // rows this index deliberately did not read".
+        index.drop_history_below(retained_base);
         // Scrollback is immutable only after a row leaves the visible grid.
         // Refresh from the PREVIOUS visible boundary so a row edited while it
         // was visible and then scrolled away between searches cannot retain
@@ -2452,6 +2487,7 @@ pub(crate) fn search_full_history_direction(
         let t = term_lock(term);
         if t.is_alternate_screen() != key_alt
             || t.content_seq() != key_seq
+            || t.grid().history_renumber_epoch() != key_epoch
             || t.absolute_row_revision() != absolute_row_revision
         {
             torn = true;
@@ -2479,9 +2515,15 @@ pub(crate) fn search_full_history_direction(
     // flags results incomplete, which the callers surface honestly.
     record_search_snapshot_lines(lines.len());
     index.index_visible_content(snapshot_start, &lines);
-    if skipped_prefix > 0 {
-        index.mark_history_prefix_evicted(retained_base);
-    }
+    // The completeness verdict for THIS build, stated in both directions from
+    // the window it was actually built over. `skipped_prefix > 0` means the
+    // terminal still retains history older than the configured depth cap and
+    // this index deliberately did not read it — incomplete, from exactly
+    // `retained_base`. Zero means the whole retained buffer is in the index, and
+    // saying so is the point: the index outlives the condition that made it
+    // partial (a `clear`, a scrollback eviction, a raised cap all end it), and a
+    // latched flag would go on qualifying an exact count with `+` forever.
+    index.set_history_prefix_eviction((skipped_prefix > 0).then_some(retained_base));
 
     // Run the query BEFORE moving the index into the cache (the borrow ends with the owned
     // `results`). Compute results regardless of caching so an invalid regex still returns Err.
@@ -2518,8 +2560,10 @@ pub(crate) fn search_full_history_direction(
             term: Arc::downgrade(term),
             alt_screen: key_alt,
             content_seq: key_seq,
+            history_renumber_epoch: key_epoch,
             absolute_row_revision,
             max_lines,
+            retained_base,
             visible_base,
             indexed_end,
             index: Arc::clone(&index),
@@ -2557,11 +2601,12 @@ pub(crate) fn search_full_history_point(
     anchor: (usize, usize),
     strict: bool,
 ) -> Result<FullHistoryPoint, SearchOptionsError> {
-    let (key_alt, key_seq, oldest, scrollback, visible_rows, absolute_row_revision) = {
+    let (key_alt, key_seq, key_epoch, oldest, scrollback, visible_rows, absolute_row_revision) = {
         let terminal = term_lock(term);
         (
             terminal.is_alternate_screen(),
             terminal.content_seq(),
+            terminal.grid().history_renumber_epoch(),
             terminal.grid().oldest_absolute_row(),
             terminal.grid().scrollback_lines(),
             terminal.rows() as usize,
@@ -2594,8 +2639,14 @@ pub(crate) fn search_full_history_point(
             }),
         }
     };
-    let cached_index =
-        cached_search_index(term, key_alt, key_seq, absolute_row_revision, max_lines);
+    let cached_index = cached_search_index(
+        term,
+        key_alt,
+        key_seq,
+        key_epoch,
+        absolute_row_revision,
+        max_lines,
+    );
     let Some(index) = cached_index else {
         let full = search_full_history_direction(
             term,
@@ -2713,10 +2764,28 @@ struct SearchSnapshot {
     term: Weak<Mutex<Terminal>>,
     alt_screen: bool,
     content_seq: u64,
+    /// `Grid::history_renumber_epoch()` at build time. The index is keyed by
+    /// ABSOLUTE row, and this epoch is the grid's only signal for the mutations
+    /// that slide every retained row's absolute key wholesale without touching
+    /// `content_seq` arithmetic, `base_y()` or the splice revision — a Kitty
+    /// `CSI +T` unscroll, a width rewrap of history, and a rows-only resize that
+    /// adds or trims rows at the BOTTOM (`clear` then a taller window: the
+    /// screen has no history left to reveal, so the grow appends blank rows,
+    /// which slides `oldest_absolute_row()` down by the appended count). Part of
+    /// BOTH the hit key and the reuse guard: serving or refreshing across an
+    /// advance carries pre-shift keys forward, which is how the top band of the
+    /// screen fell out of the search corpus while sitting in plain sight.
+    history_renumber_epoch: u64,
     absolute_row_revision: u64,
     /// Depth cap the `index` was built under (see [`set_search_max_lines`]); part
     /// of the cache key so a config reload that changes it forces a rebuild.
     max_lines: usize,
+    /// Oldest absolute row this snapshot's index retains. Retention only ever
+    /// ADVANCES it (rows leave the buffer, survivors keep their keys), so a
+    /// retreat is proof of a renumbering the epoch above did not report —
+    /// belt to that brace, and the guard that keeps an unsignalled slide from
+    /// ever being carried forward again.
+    retained_base: usize,
     /// Absolute row at the top of the visible grid in this generation. A stale
     /// index refresh begins here because any of these rows could have been
     /// edited in place before later scrolling into immutable history.
@@ -2777,6 +2846,7 @@ fn cached_search_index(
     term: &Arc<Mutex<Terminal>>,
     alt_screen: bool,
     content_seq: u64,
+    history_renumber_epoch: u64,
     absolute_row_revision: u64,
     max_lines: usize,
 ) -> Option<Arc<TerminalSearch>> {
@@ -2786,6 +2856,10 @@ fn cached_search_index(
         std::ptr::eq(snapshot.term.as_ptr(), Arc::as_ptr(term))
             && snapshot.alt_screen == alt_screen
             && snapshot.content_seq == content_seq
+            // A renumbering can leave the content generation matching (the
+            // unscroll removes history without rewriting a visible cell), and an
+            // index keyed by absolute row is exactly what such a slide breaks.
+            && snapshot.history_renumber_epoch == history_renumber_epoch
             && snapshot.absolute_row_revision == absolute_row_revision
             && snapshot.max_lines == max_lines
     })?;
@@ -2796,22 +2870,37 @@ fn cached_search_index(
 }
 
 /// Take ownership of a stale same-terminal index for an incremental ordinary
-/// output refresh. Revision changes (reflow/protected row splices), shrinking
-/// coordinate ranges, or concurrent readers conservatively fall back to a
-/// bounded suffix rebuild.
+/// output refresh. Revision changes (reflow/protected row splices), history
+/// RENUMBERINGS, shrinking coordinate ranges, or concurrent readers
+/// conservatively fall back to a bounded suffix rebuild.
+///
+/// The guards are the GUI twin of `Terminal::try_refresh_search_index`'s, and
+/// for the same reason: a refresh may only be served when it is
+/// indistinguishable from a from-scratch build over the current window. The
+/// index is keyed by ABSOLUTE row and the refresh re-feeds only from the
+/// previous visible base, so every row below that boundary keeps the key it was
+/// filed under — which is sound exactly while those keys still name the same
+/// content. Two guards establish that: `history_renumber_epoch` (the grid's own
+/// report that it slid the absolute space) and a `retained_base` that only ever
+/// ADVANCES (retention drops the oldest rows and leaves every survivor's key
+/// alone, so a retreat can only be a slide nothing reported).
 fn take_reusable_search_index(
     term: &Arc<Mutex<Terminal>>,
     alt_screen: bool,
+    history_renumber_epoch: u64,
     absolute_row_revision: u64,
     max_lines: usize,
+    retained_base: usize,
     indexed_end: usize,
 ) -> Option<(TerminalSearch, usize)> {
     let mut cache = search_cache_lock();
     let position = cache.iter().position(|snapshot| {
         std::ptr::eq(snapshot.term.as_ptr(), Arc::as_ptr(term))
             && snapshot.alt_screen == alt_screen
+            && snapshot.history_renumber_epoch == history_renumber_epoch
             && snapshot.absolute_row_revision == absolute_row_revision
             && snapshot.max_lines == max_lines
+            && snapshot.retained_base <= retained_base
             && snapshot.indexed_end <= indexed_end
             && Arc::strong_count(&snapshot.index) == 1
     })?;
@@ -3806,6 +3895,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         default_fg: _, // OMITTED: its twin — the effects layer's tint anchor, not per-cell content
         cursor_color: _, // frame "cursor.color" (fixed RGB or "default")
         snapshot_seq: _, // frame "seq" (the engine content version stamp)
+        content_seq: _, // OMITTED: host effect-attribution clock paired with the exact snapshot, not wire content
         process_sequence: _, // OMITTED: parser-batch provenance used only by host cursor-effect admission
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)
         // OMITTED (DMG-1 damage carrier): extraction-CONTINUITY tokens, not
@@ -4896,6 +4986,55 @@ mod tests {
         super::set_search_max_lines(saved);
     }
 
+    /// `incomplete` is a statement about THIS query's index, not a scar.
+    ///
+    /// Under a shallow cap over deep history the answer is honestly partial —
+    /// the terminal holds rows this index deliberately did not read. A `clear`
+    /// (`ED 3`) then destroys that history: the whole retained buffer now fits,
+    /// the index really is exhaustive, and continuing to say `incomplete` makes
+    /// the find bar print `N+` over a count it knows is exact for the rest of
+    /// the session. The reused index carried the flag forward because eviction
+    /// LATCHES on the incremental path; a bulk rebuild restates it instead.
+    #[test]
+    fn a_clear_ends_the_incomplete_qualifier_instead_of_latching_it() {
+        let _serial = super::search_cap_test_guard();
+        let saved = super::search_max_lines();
+        super::set_search_max_lines(16);
+
+        let owned: Vec<String> = (0..200).map(|line| format!("row {line}")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let term = term_with(&refs);
+
+        let partial = cmd_search(&term, "row 199");
+        assert!(
+            partial.contains("incomplete"),
+            "history deeper than the cap is honestly partial: {partial}"
+        );
+
+        // `clear`: home, erase the display, erase the scrollback.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b[H\x1b[2J\x1b[3JNEEDLE\r\n");
+
+        let exact = cmd_search(&term, "NEEDLE");
+        assert!(
+            exact.starts_with("OK 1"),
+            "the post-clear needle is found: {exact}"
+        );
+        assert!(
+            !exact.contains("incomplete"),
+            "nothing is left un-searched, so the count is stated plainly: {exact}"
+        );
+        let found = super::search_full_history(&term, "NEEDLE", false, false).expect("search");
+        assert!(!found.results.incomplete);
+        assert_eq!(
+            found.results.lowest_retained_line, 0,
+            "an exhaustive index reports no retained-history watermark"
+        );
+
+        super::set_search_max_lines(saved);
+    }
+
     /// Cold builds copy/index only the suffix that can survive the configured
     /// cap. The omitted prefix is still surfaced as incomplete history with an
     /// absolute retained watermark.
@@ -5470,11 +5609,12 @@ mod tests {
         let _ = super::take_narrowed_query_steps();
 
         let batch_oracle = |q: &str| {
-            let (key_alt, key_seq, revision, rows, cols) = {
+            let (key_alt, key_seq, key_epoch, revision, rows, cols) = {
                 let t = term_lock(&term);
                 (
                     t.is_alternate_screen(),
                     t.content_seq(),
+                    t.grid().history_renumber_epoch(),
                     t.absolute_row_revision(),
                     t.rows() as usize,
                     usize::from(t.grid().cols()),
@@ -5482,8 +5622,9 @@ mod tests {
             };
             let max_lines =
                 super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-            let index = super::cached_search_index(&term, key_alt, key_seq, revision, max_lines)
-                .expect("the previous search must have cached a consistent snapshot");
+            let index =
+                super::cached_search_index(&term, key_alt, key_seq, key_epoch, revision, max_lines)
+                    .expect("the previous search must have cached a consistent snapshot");
             let (results, _) = super::query_search_index(
                 &index,
                 q,
@@ -5569,11 +5710,12 @@ mod tests {
         let _ = super::take_narrowed_query_steps();
 
         let oracle = |q: &str| {
-            let (key_alt, key_seq, revision, rows, cols) = {
+            let (key_alt, key_seq, key_epoch, revision, rows, cols) = {
                 let t = term_lock(&term);
                 (
                     t.is_alternate_screen(),
                     t.content_seq(),
+                    t.grid().history_renumber_epoch(),
                     t.absolute_row_revision(),
                     t.rows() as usize,
                     usize::from(t.grid().cols()),
@@ -5581,8 +5723,9 @@ mod tests {
             };
             let max_lines =
                 super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-            let index = super::cached_search_index(&term, key_alt, key_seq, revision, max_lines)
-                .expect("the previous search must have cached a consistent snapshot");
+            let index =
+                super::cached_search_index(&term, key_alt, key_seq, key_epoch, revision, max_lines)
+                    .expect("the previous search must have cached a consistent snapshot");
             let (results, point) = super::query_search_index(
                 &index,
                 q,
@@ -5649,11 +5792,12 @@ mod tests {
         let _ = super::take_narrowed_query_steps();
 
         let batch_oracle = |q: &str| {
-            let (key_alt, key_seq, revision, rows, cols) = {
+            let (key_alt, key_seq, key_epoch, revision, rows, cols) = {
                 let t = term_lock(&term);
                 (
                     t.is_alternate_screen(),
                     t.content_seq(),
+                    t.grid().history_renumber_epoch(),
                     t.absolute_row_revision(),
                     t.rows() as usize,
                     usize::from(t.grid().cols()),
@@ -5661,8 +5805,9 @@ mod tests {
             };
             let max_lines =
                 super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-            let index = super::cached_search_index(&term, key_alt, key_seq, revision, max_lines)
-                .expect("the previous search must have cached a consistent snapshot");
+            let index =
+                super::cached_search_index(&term, key_alt, key_seq, key_epoch, revision, max_lines)
+                    .expect("the previous search must have cached a consistent snapshot");
             let (results, _) = super::query_search_index(
                 &index,
                 q,
@@ -5753,7 +5898,7 @@ mod trim_tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        cmd_blocktext_args, cmd_text, cmd_text_json, cmd_text_json_opt, cmd_text_opt,
+        TEXT_USAGE, cmd_blocktext_args, cmd_text, cmd_text_json, cmd_text_json_opt, cmd_text_opt,
         frame_rows_reply, split_trim_tail, text_trim_arg, trim_lines_reply, trimmed_len,
     };
 
@@ -5783,10 +5928,42 @@ mod trim_tests {
         for bad in ["foo", "trim extra", "TRIM", "trim=1", "--trim"] {
             assert_eq!(
                 text_trim_arg(bad),
-                Err("ERR usage: text [trim]\n".to_string()),
+                Err(TEXT_USAGE.to_string()),
                 "{bad:?} is rejected, never silently ignored"
             );
         }
+    }
+
+    /// The wire's usage line and the help catalog state ONE grammar.
+    ///
+    /// They did not. The wire said `ERR usage: text [trim]` — which is also the
+    /// answer to `aterm ctl text --help`, so it is the first thing a reader sees
+    /// about this verb — while the catalog entry two lines down documented
+    /// `--json`, and the dispatcher really does accept it. A reader who typoed a
+    /// modifier was told the flag they had just read about does not exist
+    /// (audit D-9). Two strings in two crates cannot be kept in step by
+    /// intention, so this checks them.
+    #[test]
+    fn the_text_usage_line_and_the_catalog_state_the_same_grammar() {
+        let spec = aterm_types::control_verbs::spec("text").expect("`text` is a catalog verb");
+        let grammar = TEXT_USAGE
+            .trim_end()
+            .strip_prefix("ERR usage: ")
+            .expect("the wire line keeps its ERR prefix");
+        assert!(
+            grammar.contains("--json"),
+            "the verb accepts --json, so its usage must name it: {grammar}"
+        );
+        assert!(
+            spec.summary.starts_with(grammar),
+            "catalog summary {:?} must open with the wire grammar {grammar:?}",
+            spec.summary
+        );
+        assert!(
+            spec.detail.contains(TEXT_USAGE.trim_end()),
+            "the catalog quotes the usage line verbatim; it must quote THIS one: {}",
+            spec.detail
+        );
     }
 
     /// A trailing `trim` token is split off a positional tail; a `trim` glued to

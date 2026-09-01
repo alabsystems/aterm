@@ -66,7 +66,7 @@ use aterm_core::terminal::Terminal;
 use aterm_session::Op;
 #[cfg(test)]
 use aterm_session::sink::ImmediateWrite;
-use aterm_session::sink::{InputEpoch, SinkWriter};
+use aterm_session::sink::{AcceptedOrder, InputEpoch, SinkWriter, WriteReceipt, WriteReceiptError};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_event};
 use aterm_types::mouse::MouseButton;
 
@@ -442,6 +442,16 @@ fn delivered(res: std::io::Result<usize>, intended: usize) -> Delivery {
     }
 }
 
+fn delivered_receipt(
+    result: Result<WriteReceipt, WriteReceiptError>,
+    intended: usize,
+) -> (Delivery, Option<AcceptedOrder>) {
+    match result {
+        Ok(receipt) => (delivered(Ok(receipt.accepted()), intended), receipt.order()),
+        Err(error) => (Delivery::Failed, error.order()),
+    }
+}
+
 /// What [`seam_egress`] did with a mouse/wheel event, so `App::input` knows
 /// whether the tracking-OFF local fallback (selection gesture / viewport scroll)
 /// must still run. The byte-producing decision lives ENTIRELY in `seam_egress`;
@@ -456,6 +466,60 @@ pub enum Egress {
     /// Mouse tracking is OFF: `App::input` must run the local fallback (selection
     /// gesture for a button/move, viewport scroll of `wheel_lines` for a wheel).
     TrackingOff { wheel_lines: i32, wheel_up: bool },
+}
+
+/// One egress verdict plus the order of its last conclusively accepted non-empty
+/// PTY frame. [`Delivery::Full`] deliberately also describes faithful zero-byte
+/// input (for example a legacy key release), and a multi-frame event's final
+/// verdict can erase an earlier accepted frame, so neither fact can be recovered
+/// from [`Egress`] alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EgressReceipt {
+    pub(crate) egress: Egress,
+    accepted_order: Option<AcceptedOrder>,
+}
+
+impl EgressReceipt {
+    /// Adapt a delivery reported by a guarded seam that performs the same sink
+    /// operation but must keep its terminal lock across an authorization check.
+    #[must_use]
+    pub(crate) const fn from_reported_delivery(
+        delivery: Delivery,
+        accepted_order: Option<AcceptedOrder>,
+    ) -> Self {
+        Self {
+            egress: Egress::Reported(delivery),
+            accepted_order,
+        }
+    }
+
+    /// FIFO admission is not PTY acceptance.  Keep the public egress contract
+    /// (`Full` means the ordered serializer owns the event) while withholding
+    /// the byte receipt until that serializer performs the real write.
+    #[must_use]
+    pub(crate) const fn deferred_full() -> Self {
+        Self {
+            egress: Egress::Reported(Delivery::Full),
+            accepted_order: None,
+        }
+    }
+
+    /// Whether at least one byte was conclusively accepted by the sink.
+    ///
+    /// Ordinary interactive/backpressured writes report only all-or-failed.
+    /// The guarded actuator additionally preserves an explicit accepted prefix;
+    /// that prefix may be echoed even though the whole frame was not delivered.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn accepted_nonempty(self) -> bool {
+        self.accepted_order.is_some()
+    }
+
+    /// Accepted sink order, or `None` when this event moved no bytes.
+    #[must_use]
+    pub(crate) const fn accepted_order(self) -> Option<AcceptedOrder> {
+        self.accepted_order
+    }
 }
 
 /// Resolve the `(x, y)` numbers a mouse report should carry for `term`'s CURRENT
@@ -689,18 +753,38 @@ pub enum EgressMode {
 /// either way (see [`EgressMode`]); only the parking discipline differs.  The
 /// immediate mode retains the zero-vs-partial distinction needed by the durable
 /// actuator; ordinary modes preserve their existing `Full`/`Failed` contract.
-fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8]) -> Delivery {
-    match mode {
-        EgressMode::Interactive => delivered(sink.write_frame_nonparking(bytes), bytes.len()),
-        EgressMode::Backpressured => delivered(sink.write_frame(bytes), bytes.len()),
+fn emit(
+    sink: &SinkWriter,
+    mode: EgressMode,
+    bytes: &[u8],
+    accepted_order: &mut Option<AcceptedOrder>,
+) -> Delivery {
+    debug_assert!(!bytes.is_empty());
+    let (delivery, order) = match mode {
+        EgressMode::Interactive => {
+            delivered_receipt(sink.write_frame_nonparking_with_receipt(bytes), bytes.len())
+        }
+        EgressMode::Backpressured => {
+            delivered_receipt(sink.write_frame_with_receipt(bytes), bytes.len())
+        }
         #[cfg(test)]
-        EgressMode::TryImmediate => match sink.try_write_frame_immediate(bytes) {
-            ImmediateWrite::Full => Delivery::Full,
-            ImmediateWrite::BusyZero => Delivery::BusyZero,
-            ImmediateWrite::ConflictZero => Delivery::ConflictZero,
-            ImmediateWrite::PartialInDoubt { accepted } => Delivery::PartialInDoubt { accepted },
-        },
+        EgressMode::TryImmediate => {
+            let (write, order) = sink.try_write_frame_immediate_with_receipt(bytes);
+            let delivery = match write {
+                ImmediateWrite::Full => Delivery::Full,
+                ImmediateWrite::BusyZero => Delivery::BusyZero,
+                ImmediateWrite::ConflictZero => Delivery::ConflictZero,
+                ImmediateWrite::PartialInDoubt { accepted } => {
+                    Delivery::PartialInDoubt { accepted }
+                }
+            };
+            (delivery, order)
+        }
+    };
+    if order.is_some() {
+        *accepted_order = order;
     }
+    delivery
 }
 
 /// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
@@ -733,6 +817,34 @@ pub fn seam_egress(
     ev: &InputEvent,
     mode: EgressMode,
 ) -> Egress {
+    let mut accepted_order = None;
+    seam_egress_inner(term, sink, ev, mode, &mut accepted_order)
+}
+
+/// Receipt-bearing twin of [`seam_egress`]. The byte-producing decision remains
+/// in the one inner seam; this merely preserves accepted-byte evidence that
+/// [`Egress`] intentionally erases for zero-byte and multi-frame contracts.
+pub(crate) fn seam_egress_receipt(
+    term: &Mutex<Terminal>,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    mode: EgressMode,
+) -> EgressReceipt {
+    let mut accepted_order = None;
+    let egress = seam_egress_inner(term, sink, ev, mode, &mut accepted_order);
+    EgressReceipt {
+        egress,
+        accepted_order,
+    }
+}
+
+fn seam_egress_inner(
+    term: &Mutex<Terminal>,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    mode: EgressMode,
+    accepted_order: &mut Option<AcceptedOrder>,
+) -> Egress {
     match ev {
         InputEvent::Key {
             key,
@@ -754,7 +866,7 @@ pub fn seam_egress(
             let d = if bytes.is_empty() {
                 Delivery::Full // faithful no-op (e.g. legacy release): nothing to deliver
             } else {
-                emit(sink, mode, &bytes)
+                emit(sink, mode, &bytes, accepted_order)
             };
             Egress::Reported(d)
         }
@@ -766,7 +878,7 @@ pub fn seam_egress(
                     crate::keymap::encode_committed_text(text, mode)
                 };
                 if !out.is_empty() {
-                    d = emit(sink, mode, &out);
+                    d = emit(sink, mode, &out, accepted_order);
                 }
             }
             Egress::Reported(d)
@@ -778,7 +890,7 @@ pub fn seam_egress(
             let d = if bytes.is_empty() {
                 Delivery::Full
             } else {
-                emit(sink, mode, bytes)
+                emit(sink, mode, bytes, accepted_order)
             };
             Egress::Reported(d)
         }
@@ -810,7 +922,7 @@ pub fn seam_egress(
             match report {
                 Some(bytes) => {
                     let d = match bytes {
-                        Some(b) => emit(sink, mode, &b),
+                        Some(b) => emit(sink, mode, &b, accepted_order),
                         None => Delivery::Full,
                     };
                     Egress::Reported(d)
@@ -841,7 +953,7 @@ pub fn seam_egress(
             match report {
                 Some(bytes) => {
                     let d = match bytes {
-                        Some(b) => emit(sink, mode, &b),
+                        Some(b) => emit(sink, mode, &b, accepted_order),
                         None => Delivery::Full,
                     };
                     Egress::Reported(d)
@@ -972,7 +1084,7 @@ pub fn seam_egress(
                     // the platform's setting, never from `_audit`).
                     let mut d = Delivery::Full;
                     for _ in 0..repeat {
-                        let attempt = emit(sink, mode, &b);
+                        let attempt = emit(sink, mode, &b, accepted_order);
                         if !attempt.is_full() {
                             d = attempt; // any short/failed write fails the lot
                         }
@@ -1009,7 +1121,7 @@ pub fn seam_egress(
             let d = if out.is_empty() {
                 Delivery::Full
             } else {
-                emit(sink, mode, &out)
+                emit(sink, mode, &out, accepted_order)
             };
             Egress::Reported(d)
         }
@@ -1019,7 +1131,7 @@ pub fn seam_egress(
             let mut d = Delivery::Full;
             if term_lock(term).focus_reporting_enabled() {
                 let seq: &[u8] = if *focused { b"\x1b[I" } else { b"\x1b[O" };
-                d = emit(sink, mode, seq);
+                d = emit(sink, mode, seq, accepted_order);
             }
             Egress::Reported(d)
         }
@@ -1440,6 +1552,74 @@ mod tests {
             delivered(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)), 5),
             Delivery::Failed
         );
+    }
+
+    #[test]
+    fn receipt_tracks_accepted_bytes_not_zero_byte_or_failed_attempts() {
+        let term = term_with(&[]);
+        let mut cap = CaptureSink::new();
+        let sink = SinkWriter::new(cap.master());
+        let accepted = seam_egress_receipt(
+            &term,
+            &sink,
+            &InputEvent::KeySequence(b"x".to_vec()),
+            EgressMode::Interactive,
+        );
+        assert!(accepted.accepted_nonempty());
+        drop(sink);
+        assert_eq!(cap.drain(), b"x");
+
+        let empty = seam_egress_receipt(
+            &term,
+            &SinkWriter::new(-1),
+            &InputEvent::KeySequence(Vec::new()),
+            EgressMode::Interactive,
+        );
+        assert_eq!(empty.egress, Egress::Reported(Delivery::Full));
+        assert!(!empty.accepted_nonempty());
+
+        let failed = seam_egress_receipt(
+            &term,
+            &SinkWriter::new(-1),
+            &InputEvent::KeySequence(b"x".to_vec()),
+            EgressMode::Interactive,
+        );
+        assert_eq!(failed.egress, Egress::Reported(Delivery::Failed));
+        assert!(!failed.accepted_nonempty());
+    }
+
+    #[test]
+    fn receipt_preserves_an_earlier_accepted_frame_after_a_later_failure() {
+        let mut cap = CaptureSink::new();
+        let good = SinkWriter::new(cap.master());
+        let bad = SinkWriter::new(-1);
+        let mut accepted_order = None;
+        assert_eq!(
+            emit(
+                &good,
+                EgressMode::Interactive,
+                b"first",
+                &mut accepted_order,
+            ),
+            Delivery::Full,
+        );
+        assert_eq!(
+            emit(
+                &bad,
+                EgressMode::Interactive,
+                b"second",
+                &mut accepted_order,
+            ),
+            Delivery::Failed,
+        );
+        assert!(accepted_order.is_some());
+        let receipt = EgressReceipt {
+            egress: Egress::Reported(Delivery::Failed),
+            accepted_order,
+        };
+        assert!(receipt.accepted_nonempty());
+        drop(good);
+        assert_eq!(cap.drain(), b"first");
     }
 
     /// REPLY FIDELITY (audit Finding 1): when the PTY write FAILS, the seam reports

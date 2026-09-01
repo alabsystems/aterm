@@ -125,10 +125,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("cell must survey offline: {e}"))
     }
 
-    fn find(s: &CellSurvey, name: &str) -> PkgId {
-        find_at(s, name, None)
-    }
-
     /// `find`, with an optional version for the names that resolve twice.
     /// Passing `None` still ASSERTS uniqueness rather than picking one: a name
     /// that quietly became ambiguous is a graph change worth failing on.
@@ -320,11 +316,19 @@ mod tests {
     #[test]
     fn naga_falls_with_wgpu_and_libc_has_left_the_surface() {
         let s = survey(0);
-        let wgpu = dom(&s, &find(&s, "wgpu"));
-        assert!(
-            wgpu.also.contains(&find(&s, "naga")),
-            "naga is wgpu's alone"
-        );
+        // THE FLIP: "naga is wgpu's alone" resolved the strong way — BOTH left
+        // the graph when the first-party Metal renderer became the macOS
+        // default and wgpu became the tests' dev-edge oracle. Asserted as
+        // ABSENCE (the libc shape below): a dominator of zero would also be
+        // reported for a package forge simply failed to see, so presence is
+        // the thing to refute directly.
+        for gone in ["wgpu", "wgpu-hal", "wgpu-core", "naga"] {
+            assert!(
+                !s.third_party().any(|id| id.name == gone),
+                "`{gone}` must not be in the mac-arm normal graph post-flip \
+                 (the oracle rides a dev edge, outside this survey by design)"
+            );
+        }
 
         // `libc` used to be asserted here as "a leaf" — `dom(libc).also` empty.
         // That assertion still PASSED after libc was retired to the first-party

@@ -4350,6 +4350,20 @@ mod trail_present_pacing_tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    fn output_streak_geom() -> crate::cursor_glow::Geom {
+        crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        }
+    }
+
     #[test]
     fn useful_present_consumes_near_pending_animation_tick() {
         let frame = Instant::now();
@@ -4524,6 +4538,129 @@ mod trail_present_pacing_tests {
         assert_eq!(
             ws.next_trail_tick, None,
             "and the park drops the clock, so the loop returns to 0% idle"
+        );
+    }
+
+    /// PRISM WAKE's sound episode outlives its visible comet, but that quiet
+    /// interval must not keep the frame train alive. The native scheduler owns
+    /// the engine's analytic Settle crossing as one exact wake, then parks.
+    #[test]
+    fn a_parked_output_episode_wakes_once_for_settle() {
+        let mut app = App::headless_for_test();
+        let ws = app
+            .windows
+            .get_mut(&WindowId(0))
+            .expect("the headless fixture owns window 0");
+        let t0 = Instant::now();
+        assert_eq!(ws.plan_terminal_effect_lane(t0, false, true), None);
+
+        let cfg = crate::output_streak::StreakConfig {
+            enabled: true,
+            sound: true,
+            idle_secs: 10.0,
+            ..crate::output_streak::StreakConfig::default()
+        };
+        let geom = output_streak_geom();
+        let mut engine = crate::output_streak::OutputStreak::new(23);
+        assert!(!engine.note_output(1, &[(4, 0, 40)], t0, false));
+        let spawned = t0 + Duration::from_millis(350);
+        assert!(engine.note_output(2, &[(4, 0, 40)], spawned, false));
+        let mut quads = Vec::new();
+        assert_eq!(
+            engine
+                .tick(spawned, geom, &cfg, &mut quads)
+                .cue
+                .map(|cue| cue.sound),
+            Some(crate::output_streak::StreakSound::Shimmer)
+        );
+        for step in 1..=4 {
+            quads.clear();
+            engine.tick(
+                spawned + Duration::from_millis(250 * step),
+                geom,
+                &cfg,
+                &mut quads,
+            );
+        }
+        let parked = spawned + Duration::from_secs(1);
+        assert!(!engine.is_active());
+        let settle = engine
+            .next_change_deadline(parked, cfg.idle_secs)
+            .expect("the open episode owes its closing cue");
+        assert!(settle > parked);
+        ws.output_streak = Some(Box::new(engine));
+        ws.deco_anim_until = None;
+
+        assert_eq!(
+            ws.plan_terminal_effect_lane(parked, false, true),
+            Some(settle),
+            "the quiet interval owns one exact deadline, not frame cadence"
+        );
+        assert!(ws.service_due_terminal_effect_tick(settle));
+
+        let fired = settle + Duration::from_millis(1);
+        quads.clear();
+        let frame = ws
+            .output_streak
+            .as_deref_mut()
+            .expect("engine survives until its promised wake")
+            .tick(fired, geom, &cfg, &mut quads);
+        assert_eq!(
+            frame.cue.map(|cue| cue.sound),
+            Some(crate::output_streak::StreakSound::Settle)
+        );
+        assert_eq!(
+            ws.plan_terminal_effect_lane(fired, false, true),
+            None,
+            "after Settle the lane returns to pure Wait"
+        );
+    }
+
+    /// Single-pane and composed PRISM WAKE engines are retained separately.
+    /// Only the route currently on glass may contribute a deadline: a visible
+    /// comet in a hidden route is not ticked, so accepting its `now` deadline
+    /// would manufacture an immediate wake loop that can never drain.
+    #[test]
+    fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
+        fn active_engine(now: Instant, seed: u64) -> crate::output_streak::OutputStreak {
+            let mut engine = crate::output_streak::OutputStreak::new(seed);
+            let cfg = crate::output_streak::StreakConfig {
+                enabled: true,
+                ..crate::output_streak::StreakConfig::default()
+            };
+            assert!(!engine.note_output(1, &[(4, 0, 40)], now, false));
+            let spawned = now + Duration::from_millis(350);
+            assert!(engine.note_output(2, &[(4, 0, 40)], spawned, false));
+            engine.tick(spawned, output_streak_geom(), &cfg, &mut Vec::new());
+            assert!(engine.is_active());
+            engine
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let now = Instant::now() + Duration::from_secs(1);
+        {
+            let ws = app.windows.get_mut(&wid).expect("headless window");
+            assert!(!ws.is_split());
+            ws.output_streak_panes
+                .insert((99, 0), active_engine(now, 1));
+            assert_eq!(
+                ws.output_streak_next_change_deadline(now, 10.0),
+                None,
+                "composed state is hidden on the single-pane route"
+            );
+            ws.output_streak = Some(Box::new(active_engine(now, 2)));
+            assert_eq!(ws.output_streak_next_change_deadline(now, 10.0), Some(now));
+        }
+
+        app.split_active_stub_tab(wid);
+        let ws = app.windows.get_mut(&wid).expect("headless window");
+        assert!(ws.is_split());
+        ws.output_streak_panes.clear();
+        assert_eq!(
+            ws.output_streak_next_change_deadline(now, 10.0),
+            None,
+            "single-pane state is hidden on the composed route"
         );
     }
 
@@ -11273,12 +11410,164 @@ mod pet_sing_swap_tests {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ComposedOutputStreakConfig {
+    enabled: bool,
+    intensity: f32,
+    tail: u16,
+    max_streaks: u8,
+    idle_secs: f32,
+    sound_gain: Option<f32>,
+    style: crate::cursor_glow::GlowStyle,
+    voice: aterm_effects::trail_sound::SoundVoice,
+    animate: bool,
+    now: Instant,
+}
+
+/// Whether a host route must drop PRISM WAKE before allocating an engine or
+/// inspecting frame cells. `suppressed` is route-local alt/history policy.
+#[must_use]
+pub(crate) const fn output_streak_inert(
+    enabled: bool,
+    animate: bool,
+    intensity: f32,
+    suppressed: bool,
+) -> bool {
+    !enabled || !animate || intensity <= 0.0 || suppressed
+}
+
+impl ComposedOutputStreakConfig {
+    /// Global reset conditions. Check these before touching any pane so an
+    /// inert policy neither allocates engines nor scans resident cells.
+    fn inert(self) -> bool {
+        output_streak_inert(self.enabled, self.animate, self.intensity, false)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ComposedOutputStreakPane {
+    session: u64,
+    slot: usize,
+    place: PanePlace,
+    may_speak: bool,
+    echo: crate::app_input::OutputEchoSample,
+}
+
+/// Fold one pane's engine frame with where those pixels land. Exact engine
+/// rest stays exact zero; otherwise divider moves and pane reorderings change
+/// the repaint key even when the pane-local animation sample is unchanged.
+fn placed_output_streak_fp(
+    pane_fp: u64,
+    pane: ComposedOutputStreakPane,
+    paint_index: usize,
+) -> u64 {
+    if pane_fp == 0 {
+        return 0;
+    }
+    let mut placement = aterm_effects::genome::mix(pane.session);
+    for value in [
+        u64::from(pane.place.row_off),
+        u64::from(pane.place.col_off),
+        u64::from(pane.place.rows),
+        u64::from(pane.place.cols),
+    ] {
+        placement = aterm_effects::genome::mix(placement ^ value);
+    }
+    aterm_effects::genome::mix(pane_fp ^ placement).rotate_left((paint_index % 64) as u32)
+}
+
+/// Tick and translate one coherent pane snapshot. Both the pure-terminal split
+/// and heterogeneous compositor route through this function, so geometry,
+/// suppression, audio mapping, and channel co-residency cannot drift.
+fn tick_composed_output_streak_pane(
+    engines: &mut std::collections::BTreeMap<(u64, usize), crate::output_streak::OutputStreak>,
+    pane_nova: &mut Vec<aterm_render::GlowQuad>,
+    nova: &mut Vec<aterm_render::GlowQuad>,
+    snapshot: &RenderInput,
+    content_seq: u64,
+    pane: ComposedOutputStreakPane,
+    resolved: ComposedOutputStreakConfig,
+) -> (u64, Option<aterm_effects::trail_sound::SoundEvent>) {
+    if snapshot.engine_alt || snapshot.display_offset != 0 {
+        engines.remove(&(pane.session, pane.slot));
+        return (0, None);
+    }
+    let geom = crate::cursor_glow::Geom {
+        cw: pane.place.cell_w as usize,
+        ch: pane.place.cell_h as usize,
+        rows: usize::from(pane.place.rows),
+        cols: usize::from(pane.place.cols),
+        origin_x: 0,
+        origin_y: 0,
+        win_w: u16::try_from(usize::from(pane.place.cols) * pane.place.cell_w as usize)
+            .unwrap_or(u16::MAX),
+        win_h: u16::try_from(usize::from(pane.place.rows) * pane.place.cell_h as usize)
+            .unwrap_or(u16::MAX),
+        head: 0,
+    };
+    let cfg = crate::output_streak::StreakConfig {
+        enabled: true,
+        intensity: resolved.intensity,
+        tail: resolved.tail,
+        max_streaks: resolved.max_streaks,
+        idle_secs: resolved.idle_secs,
+        dark_theme: aterm_render::theme_is_dark(snapshot.default_bg),
+        theme_bg: snapshot.default_bg,
+        theme_fg: snapshot.default_fg,
+        theme_cursor: snapshot.cursor_color,
+        sound: pane.may_speak && resolved.sound_gain.is_some(),
+    };
+    let engine = engines.entry((pane.session, pane.slot)).or_insert_with(|| {
+        crate::output_streak::OutputStreak::new(aterm_effects::genome::mix(
+            pane.session ^ aterm_effects::genome::mix(pane.slot as u64) ^ 0x5052_4953_4D5F_5057,
+        ))
+    });
+    if let Some(boundary_at) = pane.echo.last_boundary_at {
+        engine.note_turn_boundary(boundary_at);
+    }
+    if let Some(accepted_at) = pane.echo.last_accepted_at {
+        engine.note_keystroke(accepted_at);
+    }
+    engine.note_output_cells(
+        &snapshot.cells,
+        (snapshot.cursor_row, snapshot.cursor_col),
+        usize::from(pane.place.rows),
+        content_seq,
+        resolved.now,
+        pane.echo.input_hot,
+    );
+    pane_nova.clear();
+    let frame = engine.tick(resolved.now, geom, &cfg, pane_nova);
+    let sound = frame.cue.and_then(|cue| {
+        resolved.sound_gain.filter(|_| pane.may_speak).map(|gain| {
+            aterm_effects::trail_sound::SoundEvent {
+                style: resolved.style,
+                voice: resolved.voice,
+                kind: aterm_effects::trail_sound::SoundGesture::Output(cue.sound.output_gesture()),
+                pan: cue.pan,
+                heat: 0.0,
+                hue: cue.hue,
+                gain,
+                shifted: false,
+                tone: aterm_effects::tone::Tone::Technical,
+                bed: false,
+            }
+        })
+    });
+    translate_nova_into_pane(pane_nova, pane.place);
+    nova.extend_from_slice(pane_nova);
+    (frame.fp, sound)
+}
+
 /// Everything the composed sparkle pass needs that `redraw_compose` already
 /// resolved: the visible panes, the window grid + cell metrics, the focused
 /// pane's caret, and this frame's companion decision.
 pub(crate) struct ComposeDecoCtx<'a> {
     pub(crate) panes: &'a [(pane::PaneRect, Arc<Mutex<Terminal>>)],
     pub(crate) focus: u64,
+    /// Canonical focused-view slot. Session identity is insufficient because
+    /// two visible views may mirror one terminal session.
+    pub(crate) focus_index: usize,
     pub(crate) win_rows: u16,
     pub(crate) win_cols: u16,
     pub(crate) cell_w: u32,
@@ -11322,6 +11611,7 @@ pub(crate) struct ComposeDecoCtx<'a> {
 /// One visible pane's locked capture for the composed sparkle pass.
 struct PaneDecoInput {
     session: u64,
+    focused: bool,
     display_offset: i32,
     sel: aterm_core::selection::TextSelection,
 }
@@ -14350,13 +14640,13 @@ pub(crate) struct ComposedRetain {
     /// active-pane mark inked into them.
     seam: Option<RenderCell>,
     mark: Option<ActivePaneMark>,
-    /// The session the keyboard was in. Nothing in a composed CELL depends on
+    /// The visible-pane slot the keyboard was in. Nothing in a composed CELL depends on
     /// it today — the mark above is the focus term that reaches the grid, and
     /// the cursor, the selection flags and the pane grounds are all metadata
     /// re-stamped every frame — but the focused pane is the ONE pane the loop
     /// lends to host mutators, so which pane that is belongs in the ledger
     /// rather than in a reader's head.
-    focus: u64,
+    focus: usize,
     /// One entry per pane, in BLIT order.
     panes: Vec<RetainPane>,
     /// THIS frame's per-row verdict, resident across frames so a settled split
@@ -14465,7 +14755,7 @@ fn plan_composed_retention(
     seam: RenderCell,
     mark: Option<ActivePaneMark>,
     panes: &[(pane::PaneRect, Arc<Mutex<Terminal>>)],
-    focus: u64,
+    focus: usize,
     focus_blank: RenderCell,
     focus_quiet: bool,
     tiles_ready: bool,
@@ -14513,9 +14803,9 @@ fn plan_composed_retention(
     keep.resize(rows, true);
     for (i, (r, _)) in panes.iter().enumerate() {
         let prev = &l_panes[i];
-        let src = if r.session == focus {
+        let src = if i == focus {
             &ws.composed_focus_scratch
-        } else if let Some(buf) = ws.unfocused_pane_scratch.get(&r.session) {
+        } else if let Some(buf) = ws.unfocused_pane_scratch.get(&i) {
             buf
         } else {
             keep.clear();
@@ -14523,7 +14813,7 @@ fn plan_composed_retention(
             note_retain_arms(0, rows);
             return;
         };
-        let blank = if r.session == focus {
+        let blank = if i == focus {
             Some(focus_blank)
         } else {
             ws.composed_pane_stage_meta
@@ -14548,7 +14838,7 @@ fn plan_composed_retention(
             && src.display_offset == 0
             && src.row_shift == 0
             && src.engine_row_order == aterm_core::render::RowOrder::Logical
-            && (r.session != focus || focus_quiet);
+            && (i != focus || focus_quiet);
         // The rows this pane's blit can WRITE, which is its declared rectangle
         // UNION the rows its snapshot actually covers — `blit_pane_into` loops
         // over `src.rows`, not over the rectangle, so a snapshot taller than its
@@ -15326,6 +15616,283 @@ mod composed_cursor_effect_advance_tests {
             "fixture is a canonical terminal/native composition"
         );
         (app, wid, session)
+    }
+
+    fn enable_output_streak(app: &mut App) {
+        app.config.output_streak = Some(crate::app_config::OutputStreakConfig {
+            enabled: Some(true),
+            sound: Some(false),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn output_streak_inert_gate_covers_every_zero_work_policy() {
+        assert!(!output_streak_inert(true, true, 1.0, false));
+        assert!(output_streak_inert(false, true, 1.0, false));
+        assert!(output_streak_inert(true, false, 1.0, false));
+        assert!(output_streak_inert(true, true, 0.0, false));
+        assert!(output_streak_inert(true, true, 1.0, true));
+    }
+
+    #[test]
+    fn composed_output_streak_inert_policy_builds_no_pane_engines() {
+        let t0 = Instant::now();
+
+        let (mut mixed, mixed_wid, mixed_session) = mixed_fixture("fire");
+        enable_output_streak(&mut mixed);
+        mixed
+            .config
+            .output_streak
+            .as_mut()
+            .expect("configured streak")
+            .intensity = Some(0.0);
+        let mixed_term = mixed
+            .pool
+            .get(mixed_session)
+            .expect("terminal leaf")
+            .term
+            .clone();
+        term_lock(&mixed_term).process(b"mixed output");
+        assert!(
+            mixed
+                .prepare_heterogeneous_input_scratch_with_cursor_fx(
+                    mixed_wid,
+                    Some(ComposedCursorFxClock::Advance(t0)),
+                )
+                .is_some()
+        );
+        assert!(mixed.windows[&mixed_wid].output_streak_panes.is_empty());
+
+        let (mut pure, pure_wid, pure_term) = pure_fixture("fire");
+        enable_output_streak(&mut pure);
+        pure.config.motion = Some("reduced".into());
+        term_lock(&pure_term).process(b"pure output");
+        assert!(redraw_pure(&mut pure, pure_wid, t0));
+        assert!(pure.windows[&pure_wid].output_streak_panes.is_empty());
+    }
+
+    #[test]
+    fn output_streak_fingerprint_tracks_placement_while_preserving_idle_zero() {
+        let pane = ComposedOutputStreakPane {
+            session: 7,
+            slot: 0,
+            place: PanePlace {
+                row_off: 2,
+                col_off: 3,
+                rows: 10,
+                cols: 20,
+                win_rows: 24,
+                win_cols: 80,
+                cell_w: 8,
+                cell_h: 16,
+            },
+            may_speak: false,
+            echo: crate::app_input::OutputEchoSample::default(),
+        };
+        let moved = ComposedOutputStreakPane {
+            place: PanePlace {
+                col_off: 4,
+                cols: 19,
+                ..pane.place
+            },
+            ..pane
+        };
+
+        assert_eq!(placed_output_streak_fp(0, pane, 0), 0);
+        assert_eq!(placed_output_streak_fp(0, moved, 0), 0);
+        assert_ne!(
+            placed_output_streak_fp(0x1234_5678, pane, 0),
+            placed_output_streak_fp(0x1234_5678, moved, 0),
+            "divider motion must repaint an unchanged pane-local streak frame"
+        );
+    }
+
+    #[test]
+    fn mixed_output_streak_uses_content_clock_not_damage_epoch() {
+        let (mut app, wid, session) = mixed_fixture("fire");
+        enable_output_streak(&mut app);
+        let term = app.pool.get(session).expect("terminal leaf").term.clone();
+        term_lock(&term).process(b"ink");
+        let t0 = Instant::now();
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Advance(t0)),
+            )
+            .is_some()
+        );
+        assert!(app.windows[&wid].input_scratch.nova_add.is_empty());
+
+        // DECSCNM changes the rendered frame and damage epoch, but it writes no
+        // terminal content. The exact content clock must keep this a repaint.
+        term_lock(&term).process(b"\x1b[?5h");
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Advance(
+                    t0 + Duration::from_millis(400),
+                )),
+            )
+            .is_some()
+        );
+        assert!(
+            app.windows[&wid].input_scratch.nova_add.is_empty(),
+            "damage-only reverse video cannot license a streak"
+        );
+
+        term_lock(&term).process(b"!");
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Advance(
+                    t0 + Duration::from_millis(800),
+                )),
+            )
+            .is_some()
+        );
+        assert!(
+            !app.windows[&wid].input_scratch.nova_add.is_empty(),
+            "a real content edge remains the non-vacuous control"
+        );
+    }
+
+    #[test]
+    fn mixed_output_streak_retain_does_not_consume_the_next_advance_or_its_cue() {
+        use aterm_effects::trail_sound::{OutputGesture, SoundGesture};
+
+        let (mut app, wid, session) = mixed_fixture("fire");
+        enable_output_streak(&mut app);
+        app.config
+            .output_streak
+            .as_mut()
+            .expect("configured streak")
+            .sound = Some(true);
+        app.config.trail_sounds = Some(true);
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        let term = app.pool.get(session).expect("terminal leaf").term.clone();
+        term_lock(&term).process(b"base");
+        let t0 = Instant::now();
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Advance(t0)),
+            )
+            .is_some()
+        );
+        assert!(app.trail_audio.take_captured_for_test().is_empty());
+
+        term_lock(&term).process(b" output");
+        let plan = app.active_visible_leaf_plan(wid).expect("capture layout");
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
+                wid,
+                Some(ComposedCursorFxClock::Retain {
+                    observed_at: t0 + Duration::from_millis(400),
+                }),
+                &plan,
+            )
+            .into_option()
+            .is_some()
+        );
+        assert!(
+            app.windows[&wid].input_scratch.nova_add.is_empty(),
+            "Retain may only replay a successfully presented streak stream"
+        );
+        assert!(
+            app.trail_audio.take_captured_for_test().is_empty(),
+            "Retain cannot speak or consume a cue"
+        );
+
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Advance(
+                    t0 + Duration::from_millis(401),
+                )),
+            )
+            .is_some()
+        );
+        assert!(
+            !app.windows[&wid].input_scratch.nova_add.is_empty(),
+            "the content edge remains pending for the next Advance"
+        );
+        assert!(
+            app.trail_audio
+                .take_captured_for_test()
+                .iter()
+                .any(|event| matches!(event.kind, SoundGesture::Output(OutputGesture::Shimmer))),
+            "the next Advance still owns the episode-opening cue"
+        );
+    }
+
+    #[test]
+    fn mixed_output_streak_live_and_capture_emit_identical_pixels() {
+        let (mut live, live_wid, live_session) = mixed_fixture("fire");
+        let (mut capture, capture_wid, capture_session) = mixed_fixture("fire");
+        enable_output_streak(&mut live);
+        enable_output_streak(&mut capture);
+        let live_term = live
+            .pool
+            .get(live_session)
+            .expect("live terminal leaf")
+            .term
+            .clone();
+        let capture_term = capture
+            .pool
+            .get(capture_session)
+            .expect("capture terminal leaf")
+            .term
+            .clone();
+        term_lock(&live_term).process(b"base");
+        term_lock(&capture_term).process(b"base");
+        let t0 = Instant::now();
+        assert!(
+            live.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                live_wid,
+                Some(ComposedCursorFxClock::Advance(t0)),
+            )
+            .is_some()
+        );
+        let capture_plan = capture
+            .active_visible_leaf_plan(capture_wid)
+            .expect("capture layout");
+        assert!(
+            capture
+                .prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
+                    capture_wid,
+                    Some(ComposedCursorFxClock::Advance(t0)),
+                    &capture_plan,
+                )
+                .into_option()
+                .is_some()
+        );
+
+        term_lock(&live_term).process(b" output");
+        term_lock(&capture_term).process(b" output");
+        let tick = t0 + Duration::from_millis(400);
+        assert!(
+            live.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                live_wid,
+                Some(ComposedCursorFxClock::Advance(tick)),
+            )
+            .is_some()
+        );
+        assert!(
+            capture
+                .prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
+                    capture_wid,
+                    Some(ComposedCursorFxClock::Advance(tick)),
+                    &capture_plan,
+                )
+                .into_option()
+                .is_some()
+        );
+        let live_nova = &live.windows[&live_wid].input_scratch.nova_add;
+        let capture_nova = &capture.windows[&capture_wid].input_scratch.nova_add;
+        assert!(!live_nova.is_empty(), "parity control owns visible light");
+        assert_eq!(live_nova, capture_nova);
     }
 
     #[test]
@@ -17059,6 +17626,99 @@ mod composed_cursor_effect_advance_tests {
             "negative control: the retired headless second lock tears effects from later cells"
         );
     }
+
+    #[test]
+    fn duplicate_session_views_keep_focus_and_snapshot_provenance_by_leaf_slot() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).expect("test window").focused = true;
+
+        let original_view = app.windows[&wid]
+            .tab_set
+            .active()
+            .expect("initial tab")
+            .focus;
+        let mirror_view = app
+            .view_store
+            .insert_terminal(0)
+            .expect("second view identity");
+        app.pool.attach(0);
+        {
+            let ws = app.windows.get_mut(&wid).expect("test window");
+            assert!(
+                ws.tab_set
+                    .active_mut()
+                    .expect("active tab")
+                    .split_focused(crate::tab_model::SplitAxis::Horizontal, mirror_view)
+            );
+            let active = ws.tabs.active;
+            assert!(ws.layouts[active].split_focused(crate::pane::SplitDir::Vertical, 0));
+        }
+        app.sync_window(wid);
+
+        let plan = app.active_visible_leaf_plan(wid).expect("canonical plan");
+        assert_eq!(
+            plan.leaves
+                .iter()
+                .map(|leaf| (leaf.view, leaf.focused))
+                .collect::<Vec<_>>(),
+            [(original_view, false), (mirror_view, true)],
+            "canonical traversal keeps the original leaf first and focuses only the mirror"
+        );
+        let rects = app
+            .active_tree(wid)
+            .expect("terminal projection")
+            .compute_layout(24, 80);
+        assert_eq!(
+            rects.iter().map(|rect| rect.session).collect::<Vec<_>>(),
+            [0, 0],
+            "the compatibility projection preserves canonical leaf order even when ids alias"
+        );
+
+        let term = app.pool.get(0).expect("shared terminal").term.clone();
+        term_lock(&term).process(b"A");
+        let before = term_lock(&term).content_seq();
+        let advance = std::sync::Arc::clone(&term);
+        assert!(
+            app.redraw_compose_before_focused_extract(
+                wid,
+                24,
+                80,
+                false,
+                false,
+                None,
+                0,
+                Instant::now(),
+                move || term_lock(&advance).process(b"B"),
+            )
+            .is_some()
+        );
+        let after = term_lock(&term).content_seq();
+        assert!(after > before, "the interleave advanced terminal content");
+
+        let ws = app.windows.get(&wid).expect("test window");
+        assert_eq!(
+            ws.composed_retain.focus, 1,
+            "only the canonical mirror is focused"
+        );
+        assert_eq!(
+            ws.unfocused_pane_scratch
+                .get(&0)
+                .expect("original-view snapshot")
+                .content_seq,
+            before,
+            "the background view retains the token coherent with its earlier cells"
+        );
+        assert_eq!(
+            ws.composed_focus_scratch.content_seq, after,
+            "the focused mirror retains the token coherent with its later cells"
+        );
+        assert_eq!(
+            ws.capture_leaf_content_seqs,
+            [before, after],
+            "presented capture metadata preserves both exact per-view snapshots"
+        );
+    }
 }
 
 /// Project ONE terminal pane's selection into a composed frame.
@@ -17601,10 +18261,11 @@ pub(crate) fn fill_blank_pane_into(
 
 /// One terminal leaf captured while building an introspection framebuffer.
 ///
-/// `snapshot_seq` comes from that leaf's exact `cell_frame_into` extraction,
-/// before the reusable pane scratch is refilled for the next leaf.  Keeping the
-/// inventory beside the composed grid lets `image --meta` describe every visible
-/// contributor instead of falsely labelling a split frame as the focused pane.
+/// `snapshot_seq` and `content_seq` come from that leaf's exact
+/// `cell_frame_into` extraction, before the reusable pane scratch is refilled
+/// for the next leaf. Keeping the inventory beside the composed grid lets
+/// `image --meta` describe every visible contributor instead of falsely
+/// labelling a split frame as the focused pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalCaptureLeaf {
     pub(crate) view: crate::tab_model::ViewId,
@@ -17613,6 +18274,9 @@ pub(crate) struct TerminalCaptureLeaf {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
     pub(crate) snapshot_seq: u64,
+    /// Content-only arrival clock coherent with this leaf's cells. Unlike
+    /// `snapshot_seq`, damage-only frames cannot advance it.
+    pub(crate) content_seq: u64,
 }
 
 /// Focused terminal coordinate sample owned by the same lock as a capture's
@@ -17621,8 +18285,14 @@ pub(crate) struct TerminalCaptureLeaf {
 /// kitty position over an older captured grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalCaptureFocus {
+    /// Canonical view identity. Session identity is not enough when two visible
+    /// leaves mirror the same terminal.
+    pub(crate) view: crate::tab_model::ViewId,
     pub(crate) session: u64,
     pub(crate) terminal_id: u64,
+    /// Content-only arrival clock captured under the same terminal lock as the
+    /// cells. Unlike the damage epoch, an unchanged repaint cannot advance it.
+    pub(crate) content_seq: u64,
     pub(crate) alternate_screen: bool,
     pub(crate) live_viewport: bool,
     pub(crate) cursor: Option<(u16, u16)>,
@@ -19290,6 +19960,7 @@ mod motion_policy_tests {
                 false,
                 true,
                 true,
+                10.0,
             )
             .is_some(),
             "the motion-focus watcher owns a matching frame clock"
@@ -19301,6 +19972,7 @@ mod motion_policy_tests {
                 false,
                 true,
                 false,
+                10.0,
             ),
             None,
             "without OS focus, typed wake, or recording watcher no new clock is minted"
@@ -23470,6 +24142,7 @@ impl App {
             id,
             cursor_fx,
             &plan,
+            true,
             || {},
             None,
         )
@@ -23502,6 +24175,7 @@ impl App {
             id,
             cursor_fx,
             plan,
+            true,
             || {},
             None,
         )
@@ -23523,6 +24197,7 @@ impl App {
             id,
             cursor_fx,
             &plan,
+            false,
             || {},
             Some(&mut held_retry_at),
         ) {
@@ -23553,6 +24228,7 @@ impl App {
             id,
             cursor_fx,
             plan,
+            false,
             || {},
             Some(&mut held_retry_at),
         ) {
@@ -23577,6 +24253,7 @@ impl App {
             id,
             cursor_fx,
             &plan,
+            false,
             after_extract,
             None,
         )
@@ -23587,6 +24264,7 @@ impl App {
         id: WindowId,
         cursor_fx: Option<ComposedCursorFxClock>,
         plan: &crate::tab_model::VisibleLeafPlan,
+        present: bool,
         after_extract: impl FnOnce(),
         mut held_out: Option<&mut Option<Instant>>,
     ) -> Option<String> {
@@ -24244,6 +24922,22 @@ impl App {
                 return None;
             }
         }
+        match cursor_fx {
+            Some(ComposedCursorFxClock::Advance(now)) => {
+                self.compose_heterogeneous_output_streak(id, plan, now, present);
+            }
+            Some(ComposedCursorFxClock::Retain { .. }) => {
+                let window = self.windows.get_mut(&id)?;
+                window
+                    .heterogeneous_output_streak_staged
+                    .clone_from(&window.heterogeneous_output_streak_presented);
+                window
+                    .input_scratch
+                    .nova_add
+                    .clone_from(&window.heterogeneous_output_streak_presented);
+            }
+            None => {}
+        }
         self.splice_tab_strip_with(id, tab_strip);
         Some(title)
     }
@@ -24504,8 +25198,15 @@ impl App {
             state.capture_present_invert = visuals.invert;
             state.capture_present_overlay = visuals.overlay;
             match route {
-                SuccessfulPresentRoute::Terminal => {}
+                SuccessfulPresentRoute::Terminal => {
+                    state.heterogeneous_output_streak_staged.clear();
+                    state.heterogeneous_output_streak_presented.clear();
+                }
                 SuccessfulPresentRoute::Heterogeneous => {
+                    std::mem::swap(
+                        &mut state.heterogeneous_output_streak_staged,
+                        &mut state.heterogeneous_output_streak_presented,
+                    );
                     state.redraw_pending = false;
                     if let Some(frame) = state.native_ui_compiled.as_mut() {
                         frame.phase = crate::app_native::NativeCompiledPhase::Presented;
@@ -24520,6 +25221,8 @@ impl App {
                     view,
                     presented_stamp,
                 } => {
+                    state.heterogeneous_output_streak_staged.clear();
+                    state.heterogeneous_output_streak_presented.clear();
                     state.redraw_pending = false;
                     if let Some(frame) = state.native_ui_compiled.as_mut()
                         && Some(frame.stamp) == presented_stamp
@@ -25305,7 +26008,7 @@ impl App {
         let mut suppress_cursor_effect_style_after_torn = false;
         let mut cursor_fx_commit = CursorFxCommit::SAME;
         let title = if multi_pane {
-            match self.redraw_compose(
+            match self.redraw_compose_from_plan(
                 id,
                 rows,
                 cols,
@@ -25314,6 +26017,7 @@ impl App {
                 cursor_override,
                 tab_strip,
                 frame_started,
+                plan,
             ) {
                 Some(title) => title,
                 None => {
@@ -25915,6 +26619,16 @@ impl App {
             // Hoisted for the same reason as the two above: a `bool`, read before the
             // mutable window borrow below.
             let notice_sparkling = self.notice_is_sparkling();
+            let output_echo = self
+                .pool
+                .get(front_terminal.session)
+                .map(|session| {
+                    session
+                        .ctx
+                        .output_echo
+                        .sample(&session.ctx.sink, frame_started)
+                })
+                .unwrap_or_default();
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -27124,10 +27838,12 @@ impl App {
                 // are not "new output" in the sense the licence means), and a
                 // scrolled-back viewport is history, not arrival.
                 let suppressed = is_alt || display_offset != 0;
-                if !s_enabled || suppressed {
+                let animate = motion.animate(crate::motion::MotionEffect::OutputStreak);
+                if output_streak_inert(s_enabled, animate, s_intensity, suppressed) {
                     // Fully off: no engine is ever constructed on the disabled
-                    // path (the D-1 zero-cost pin), and a lingering one is
-                    // dropped so nothing animates or holds a wake.
+                    // or zero-amplitude path (the D-1 zero-cost pin), and a
+                    // lingering one is dropped so nothing animates, scans the
+                    // grid, or holds a wake.
                     ws.output_streak = None;
                     0
                 } else {
@@ -27139,13 +27855,9 @@ impl App {
                             aterm_effects::genome::mix(id.0 ^ 0x5052_4953_4D5F_574B),
                         ))
                     });
-                    // W11 REDUCED MOTION IS A PIN, NOT AN EASE: amplitude 0
-                    // makes the engine RESET — no quads, no cue, fp 0, inactive
-                    // — rather than animating a gentler comet.
-                    let animate = motion.animate(crate::motion::MotionEffect::OutputStreak);
                     let cfg = crate::output_streak::StreakConfig {
                         enabled: true,
-                        intensity: if animate { s_intensity } else { 0.0 },
+                        intensity: s_intensity,
                         tail: s_tail,
                         max_streaks: s_max,
                         idle_secs: s_idle,
@@ -27167,13 +27879,19 @@ impl App {
                     // only, never on viewport scroll, which is what makes it an
                     // honest "something was written" clock; the anchor and the
                     // empty-damage clause are the engine's own shared law.
+                    if let Some(boundary_at) = output_echo.last_boundary_at {
+                        engine.note_turn_boundary(boundary_at);
+                    }
+                    if let Some(accepted_at) = output_echo.last_accepted_at {
+                        engine.note_keystroke(accepted_at);
+                    }
                     engine.note_output_cells(
                         &ws.input_scratch.cells,
-                        cpos.row as usize,
-                        cpos.col as usize,
+                        (cpos.row as usize, cpos.col as usize),
                         rows,
+                        content_seq,
                         frame_started,
-                        false,
+                        output_echo.input_hot,
                     );
                     let frame = engine.tick(frame_started, glow_geom, &cfg, &mut ws.nova_scratch);
                     if let Some(cue) = frame.cue {
@@ -27205,14 +27923,9 @@ impl App {
                     .push(aterm_effects::trail_sound::SoundEvent {
                         style: glow_cfg.style,
                         voice: self.config.trail_sound_voice(),
-                        kind: aterm_effects::trail_sound::SoundGesture::Output(match cue.sound {
-                            crate::output_streak::StreakSound::Shimmer => {
-                                aterm_effects::trail_sound::OutputGesture::Shimmer
-                            }
-                            crate::output_streak::StreakSound::Settle => {
-                                aterm_effects::trail_sound::OutputGesture::Settle
-                            }
-                        }),
+                        kind: aterm_effects::trail_sound::SoundGesture::Output(
+                            cue.sound.output_gesture(),
+                        ),
                         pan: cue.pan,
                         // Output is NOT authorship: it must not read the typing
                         // heat, or a busy hand would make the machine louder.
@@ -28001,6 +28714,9 @@ impl App {
             ws.capture_leaf_snapshot_seqs.clear();
             ws.capture_leaf_snapshot_seqs
                 .push(ws.input_scratch.snapshot_seq);
+            ws.capture_leaf_content_seqs.clear();
+            ws.capture_leaf_content_seqs
+                .push(ws.input_scratch.content_seq);
         }
         // Reflect the program-set title (OSC 0/2) in the window chrome, falling
         // back to "aterm" when nothing has set one. Only calls set_title on an
@@ -29497,6 +30213,7 @@ impl App {
             let (focus, cursor_fx_sample) = {
                 let ws = self.windows.get_mut(&wid)?;
                 term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+                let content_seq = ws.input_scratch.content_seq;
                 let dbg = if term.modes().reverse_video() {
                     term.default_foreground()
                 } else {
@@ -29511,12 +30228,15 @@ impl App {
                     rows: *pane_rows,
                     cols: *pane_cols,
                     snapshot_seq: ws.input_scratch.snapshot_seq,
+                    content_seq,
                 });
                 let live_viewport = term.grid().display_offset() == 0;
                 let cursor = term.cursor();
                 let focus = TerminalCaptureFocus {
+                    view: *view,
                     session: *session,
                     terminal_id: term.render_identity(),
+                    content_seq,
                     alternate_screen: term.is_alternate_screen(),
                     live_viewport,
                     cursor: (term.cursor_visible() && live_viewport)
@@ -29663,6 +30383,7 @@ impl App {
                 (Vec::new(), Vec::new(), Vec::new())
             };
             term.cell_frame_into(&mut ws.pane_scratch, pane_rows, pane_cols);
+            let content_seq = ws.pane_scratch.content_seq;
             // Preserve an engine-exact pane snapshot for the decoration pass.
             // `pane_scratch` may receive host IME paint below; scanner/kitty
             // palettes must stay paired with the preedit-free terminal cells
@@ -29671,7 +30392,7 @@ impl App {
                 ws.composed_focus_scratch.clone_from(&ws.pane_scratch);
             } else {
                 ws.unfocused_pane_scratch
-                    .entry(session)
+                    .entry(pane_index)
                     .or_default()
                     .clone_from(&ws.pane_scratch);
             }
@@ -29686,8 +30407,10 @@ impl App {
                 focused_cursor_rgb = Some(terminal_cursor_rgb(&term));
                 let live_viewport = term.grid().display_offset() == 0;
                 capture_focus = Some(TerminalCaptureFocus {
+                    view,
                     session,
                     terminal_id: term.render_identity(),
+                    content_seq,
                     alternate_screen: term.is_alternate_screen(),
                     live_viewport,
                     cursor: (term.cursor_visible() && live_viewport).then(|| {
@@ -29762,15 +30485,14 @@ impl App {
                 rows: pane_rows,
                 cols: pane_cols,
                 snapshot_seq,
+                content_seq,
             });
             if advance_cursor_fx {
                 term.take_damage();
             }
         }
-        let visible_sessions: std::collections::BTreeSet<_> =
-            leaves.iter().map(|leaf| leaf.session).collect();
         ws.unfocused_pane_scratch
-            .retain(|session, _| visible_sessions.contains(session));
+            .retain(|pane_index, _| leaves.get(*pane_index).is_some_and(|leaf| !leaf.focused));
         ws.input_scratch.default_bg = sole_default_bg.unwrap_or(aterm_core::render::COLOR_UNSET);
         ws.input_scratch.cursor_color =
             focused_cursor_rgb.map_or(aterm_core::render::COLOR_UNSET, aterm_render::rgb_to_u32);
@@ -29813,6 +30535,248 @@ impl App {
         Some((grid, plan))
     }
 
+    /// Resolve one frame's shared PRISM WAKE host policy before borrowing
+    /// window state.
+    fn composed_output_streak_config(
+        &self,
+        now: Instant,
+        win_focused: bool,
+        animate: bool,
+    ) -> ComposedOutputStreakConfig {
+        let sound_gain = trail_sound_gain(
+            win_focused,
+            self.config.trail_sounds_or_default()
+                && self.config.output_streak_sound_or_default()
+                && self
+                    .serious_mode_policy()
+                    .allows(crate::motion::SeriousEffect::TerminalSound),
+            self.config.trail_sound_volume(),
+        );
+        ComposedOutputStreakConfig {
+            enabled: self.config.output_streak_enabled_or_default(),
+            intensity: self.config.output_streak_intensity_or_default(),
+            tail: self.config.output_streak_tail_or_default(),
+            max_streaks: self.config.output_streak_max_streaks_or_default(),
+            idle_secs: self.config.output_streak_idle_secs_or_default(),
+            sound_gain,
+            style: self.glow_config().style,
+            voice: self.config.trail_sound_voice(),
+            animate,
+            now,
+        }
+    }
+
+    /// PRISM WAKE in the COMPOSED path — one comet per PANE, so a split shows
+    /// arrival where it actually happened rather than going silently dark in
+    /// half the layouts (design Q5; the single-pane present ticks its own
+    /// engine in `redraw_window_with_layout`).
+    ///
+    /// Deliberately its OWN pass rather than a block inside
+    /// [`Self::compose_word_decorations`]: that function early-returns whenever
+    /// Sparkle Words is unconfigured, and the streak is not a Sparkle Words
+    /// feature — hanging it there would have made "rainbow streak on output"
+    /// silently depend on an unrelated toy being enabled. It runs AFTER the
+    /// decoration pass and only ever APPENDS to `nova_scratch`, which is the
+    /// same co-residency discipline the single-pane path keeps: the decorations
+    /// own the channel's clear, the streak owns nothing.
+    ///
+    /// TWO honest differences from the single-pane path:
+    ///
+    /// * **The licence clock is the exact per-pane `Terminal::content_seq`**
+    ///   captured under the same authorization hold as the resident cells.
+    ///   Damage-only frames cannot mint output, and this pass never re-locks.
+    /// * **Only the FOCUSED pane may speak.** Every visible pane animates —
+    ///   they are all on glass — but one pip per pane per episode would turn a
+    ///   four-way split into a chord. A capture never speaks.
+    pub(crate) fn compose_output_streak(&mut self, wid: WindowId, ctx: &ComposeDecoCtx<'_>) -> u64 {
+        let resolved =
+            self.composed_output_streak_config(ctx.now, ctx.win_focused, ctx.animate_streak);
+        let trail_audio = &mut self.trail_audio;
+        let pool = &self.pool;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return 0;
+        };
+        // Panes this window stopped showing take their engines with them — the
+        // `retain_panes` discipline applied to streak state, so a closed pane
+        // can neither leak an engine nor replay its arrival history if the
+        // session id is ever reused.
+        ws.output_streak_panes.retain(|(session, pane_index), _| {
+            ctx.panes
+                .get(*pane_index)
+                .is_some_and(|(pane, _)| pane.session == *session)
+        });
+        if resolved.inert() {
+            // Fully off: no engine survives, none is ever built, and the
+            // channel is untouched (the D-1 zero-cost pin, composed side).
+            ws.output_streak_panes.clear();
+            return 0;
+        }
+
+        let mut fp: u64 = 0;
+        let (engines, pane_nova, nova, focus_snapshot, background_snapshots) = (
+            &mut ws.output_streak_panes,
+            &mut ws.pane_nova,
+            &mut ws.nova_scratch,
+            &ws.composed_focus_scratch,
+            &ws.unfocused_pane_scratch,
+        );
+        for (index, (r, _)) in ctx.panes.iter().enumerate() {
+            let place = PanePlace {
+                row_off: r.row_off,
+                col_off: r.col_off,
+                rows: r.rows,
+                cols: r.cols,
+                win_rows: ctx.win_rows,
+                win_cols: ctx.win_cols,
+                cell_w: ctx.cell_w,
+                cell_h: ctx.cell_h,
+            };
+            let focused_pane = index == ctx.focus_index;
+            let snapshot = if focused_pane {
+                focus_snapshot
+            } else {
+                let Some(snapshot) = background_snapshots.get(&index) else {
+                    continue;
+                };
+                snapshot
+            };
+            let pane = ComposedOutputStreakPane {
+                session: r.session,
+                slot: index,
+                place,
+                may_speak: ctx.present && focused_pane,
+                echo: pool
+                    .get(r.session)
+                    .map(|session| session.ctx.output_echo.sample(&session.ctx.sink, ctx.now))
+                    .unwrap_or_default(),
+            };
+            let (pane_fp, sound) = tick_composed_output_streak_pane(
+                engines,
+                pane_nova,
+                nova,
+                snapshot,
+                snapshot.content_seq,
+                pane,
+                resolved,
+            );
+            if let Some(sound) = sound {
+                trail_audio.push(sound);
+            }
+            // ORDER-SENSITIVE, the deco fold's rule: two panes streaming
+            // identical output must not cancel each other out of the RepaintKey.
+            fp ^= placed_output_streak_fp(pane_fp, pane, index);
+        }
+        let active = engines.values().any(|engine| engine.is_active());
+        if active {
+            // Composed panes share the same phase-locked decoration lane as
+            // the single-pane engine. Refresh it while any pane has moving
+            // light; the exact idle/Settle interval is handled by
+            // `output_streak_next_change_deadline` without frame polling.
+            ws.note_deco_animating(ctx.now);
+        }
+        fp
+    }
+
+    /// PRISM WAKE for a mixed terminal/native frame. Terminal snapshots come
+    /// from the heterogeneous route's committed per-view cache; native leaves
+    /// contribute no engine. The pane tick/emitter is shared with pure splits,
+    /// making live and capture pixels differ only in whether sound is allowed.
+    pub(crate) fn compose_heterogeneous_output_streak(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        now: Instant,
+        present: bool,
+    ) -> u64 {
+        let raw_focused = self.windows.get(&wid).is_some_and(|window| window.focused);
+        let motion_focused = self.cursor_fx_focus(wid, raw_focused, now);
+        let animate = self
+            .motion_policy(motion_focused)
+            .animate(crate::motion::MotionEffect::OutputStreak);
+        let resolved = self.composed_output_streak_config(now, raw_focused, animate);
+        let (cell_w, cell_h) = self.win_cell_size(wid);
+        let view_store = &self.view_store;
+        let trail_audio = &mut self.trail_audio;
+        let pool = &self.pool;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return 0;
+        };
+        ws.output_streak_panes.retain(|(session, pane_index), _| {
+            plan.leaves.get(*pane_index).is_some_and(|leaf| {
+                matches!(
+                    view_store.get(leaf.view),
+                    Some(crate::tab_model::View::Terminal(terminal))
+                        if terminal.session == *session
+                )
+            })
+        });
+        ws.heterogeneous_output_streak_staged.clear();
+        if resolved.inert() {
+            ws.output_streak_panes.clear();
+            ws.input_scratch.nova_add.clear();
+            return 0;
+        }
+
+        let (win_rows, win_cols) = (ws.rows, ws.cols);
+        let (engines, pane_nova, nova, caches) = (
+            &mut ws.output_streak_panes,
+            &mut ws.pane_nova,
+            &mut ws.heterogeneous_output_streak_staged,
+            &ws.leaf_render_cache,
+        );
+        let mut fp = 0u64;
+        for (index, leaf) in plan.leaves.iter().enumerate() {
+            let Some(crate::tab_model::View::Terminal(terminal)) =
+                view_store.get(leaf.view).copied()
+            else {
+                continue;
+            };
+            let Some(snapshot) = caches.get(&leaf.view).map(|cache| &cache.input) else {
+                engines.remove(&(terminal.session, index));
+                continue;
+            };
+            let place = PanePlace {
+                row_off: leaf.rect.origin.y.round().max(0.0) as u16,
+                col_off: leaf.rect.origin.x.round().max(0.0) as u16,
+                rows: (leaf.rect.size.height.round() as u16).max(1),
+                cols: (leaf.rect.size.width.round() as u16).max(1),
+                win_rows,
+                win_cols,
+                cell_w: cell_w as u32,
+                cell_h: cell_h as u32,
+            };
+            let pane = ComposedOutputStreakPane {
+                session: terminal.session,
+                slot: index,
+                place,
+                may_speak: present && leaf.focused,
+                echo: pool
+                    .get(terminal.session)
+                    .map(|session| session.ctx.output_echo.sample(&session.ctx.sink, now))
+                    .unwrap_or_default(),
+            };
+            let (pane_fp, sound) = tick_composed_output_streak_pane(
+                engines,
+                pane_nova,
+                nova,
+                snapshot,
+                snapshot.content_seq,
+                pane,
+                resolved,
+            );
+            if let Some(sound) = sound {
+                trail_audio.push(sound);
+            }
+            fp ^= placed_output_streak_fp(pane_fp, pane, index);
+        }
+        ws.input_scratch.nova_add.clone_from(nova);
+        let active = engines.values().any(|engine| engine.is_active());
+        if active {
+            ws.note_deco_animating(now);
+        }
+        fp
+    }
+
     /// SPARKLE WORDS, ANIMATED INK, PEEKING CATS, NOVAS and the CURSOR
     /// COMPANION on a COMPOSED (split) frame — one emission per VISIBLE pane,
     /// translated into window coords and APPENDED to the same four
@@ -29832,191 +30796,6 @@ impl App {
     /// changed pays a scan plus one extraction. The two safety budgets — the
     /// §6.4 flash limiter and the §3.2 supernova mutex — and the single 2 MiB
     /// cat atlas stay window-wide because all the panes drive ONE engine.
-    /// PRISM WAKE in the COMPOSED path — one comet per PANE, so a split shows
-    /// arrival where it actually happened rather than going silently dark in
-    /// half the layouts (design Q5; the single-pane present ticks its own
-    /// engine in `redraw_window_with_layout`).
-    ///
-    /// Deliberately its OWN pass rather than a block inside
-    /// [`Self::compose_word_decorations`]: that function early-returns whenever
-    /// Sparkle Words is unconfigured, and the streak is not a Sparkle Words
-    /// feature — hanging it there would have made "rainbow streak on output"
-    /// silently depend on an unrelated toy being enabled. It runs AFTER the
-    /// decoration pass and only ever APPENDS to `nova_scratch`, which is the
-    /// same co-residency discipline the single-pane path keeps: the decorations
-    /// own the channel's clear, the streak owns nothing.
-    ///
-    /// TWO honest differences from the single-pane path, both forced by what a
-    /// composed frame can see:
-    ///
-    /// * **The licence clock is the pane snapshot's `snapshot_seq`** (the damage
-    ///   epoch), not `Terminal::content_seq` — a composed pass reads resident
-    ///   snapshots under the frame's authorization fence and never re-locks the
-    ///   terminals, and `RenderInput` carries no content clock. The epoch
-    ///   advances on net-new grid damage, which for a live-bottom pane IS output
-    ///   arriving; the scrolled-back case that would otherwise differ is already
-    ///   suppressed below, and the empty-damage and echo clauses still apply.
-    /// * **Only the FOCUSED pane may speak.** Every visible pane animates —
-    ///   they are all on glass — but one pip per pane per episode would turn a
-    ///   four-way split into a chord.
-    pub(crate) fn compose_output_streak(
-        &mut self,
-        wid: WindowId,
-        ctx: &ComposeDecoCtx<'_>,
-    ) -> u64 {
-        // Knobs first: every one is an `&self` method, so they must resolve
-        // before the `self.windows` borrow (the `compose_word_decorations`
-        // prologue's rule).
-        let enabled = self.config.output_streak_enabled_or_default();
-        let intensity = self.config.output_streak_intensity_or_default();
-        let tail = self.config.output_streak_tail_or_default();
-        let max_streaks = self.config.output_streak_max_streaks_or_default();
-        let idle_secs = self.config.output_streak_idle_secs_or_default();
-        let sound_key = self.config.output_streak_sound_or_default();
-        let sound_gain = trail_sound_gain(
-            ctx.win_focused,
-            self.config.trail_sounds_or_default()
-                && sound_key
-                && self
-                    .serious_mode_policy()
-                    .allows(crate::motion::SeriousEffect::TerminalSound),
-            self.config.trail_sound_volume(),
-        );
-        let style = self.glow_config().style;
-        let voice = self.config.trail_sound_voice();
-        let load_shed = self.load_shed_active();
-        let trail_audio = &mut self.trail_audio;
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return 0;
-        };
-        // Panes this window stopped showing take their engines with them — the
-        // `retain_panes` discipline applied to streak state, so a closed pane
-        // can neither leak an engine nor replay its arrival history if the
-        // session id is ever reused.
-        ws.output_streak_panes
-            .retain(|s, _| ctx.panes.iter().any(|(r, _)| r.session == *s));
-        if !enabled {
-            // Fully off: no engine survives, none is ever built, and the
-            // channel is untouched (the D-1 zero-cost pin, composed side).
-            ws.output_streak_panes.clear();
-            return 0;
-        }
-
-        let mut fp: u64 = 0;
-        for (index, (r, _)) in ctx.panes.iter().enumerate() {
-            let place = PanePlace {
-                row_off: r.row_off,
-                col_off: r.col_off,
-                rows: r.rows,
-                cols: r.cols,
-                win_rows: ctx.win_rows,
-                win_cols: ctx.win_cols,
-                cell_w: ctx.cell_w,
-                cell_h: ctx.cell_h,
-            };
-            let focused_pane = r.session == ctx.focus;
-            let snapshot = if focused_pane {
-                &ws.composed_focus_scratch
-            } else {
-                let Some(snapshot) = ws.unfocused_pane_scratch.get(&r.session) else {
-                    continue;
-                };
-                snapshot
-            };
-            // SUPPRESSED where the effect would be wrong rather than merely
-            // unwanted, exactly as the single-pane path rules it: the alt
-            // screen is a TUI's own canvas, and a scrolled-back viewport is
-            // history, not arrival. Load shed drops it like every other
-            // decoration.
-            if load_shed || snapshot.engine_alt || snapshot.display_offset != 0 {
-                ws.output_streak_panes.remove(&r.session);
-                continue;
-            }
-            // Pane-LOCAL geometry: the emitter draws in this pane's own grid
-            // pixels and `translate_nova_into_pane` below shifts and clips them
-            // into the window, so the origin is 0 and the "window" is the pane.
-            let geom = crate::cursor_glow::Geom {
-                cw: ctx.cell_w as usize,
-                ch: ctx.cell_h as usize,
-                rows: usize::from(r.rows),
-                cols: usize::from(r.cols),
-                origin_x: 0,
-                origin_y: 0,
-                win_w: u16::try_from(usize::from(r.cols) * ctx.cell_w as usize)
-                    .unwrap_or(u16::MAX),
-                win_h: u16::try_from(usize::from(r.rows) * ctx.cell_h as usize)
-                    .unwrap_or(u16::MAX),
-                head: 0,
-            };
-            let cfg = crate::output_streak::StreakConfig {
-                enabled: true,
-                // W11 is a PIN, not an ease: amplitude 0 resets the engine.
-                intensity: if ctx.animate_streak { intensity } else { 0.0 },
-                tail,
-                max_streaks,
-                idle_secs,
-                dark_theme: aterm_render::theme_is_dark(snapshot.default_bg),
-                theme_bg: snapshot.default_bg,
-                theme_fg: snapshot.default_fg,
-                theme_cursor: snapshot.cursor_color,
-                // Only the focused pane speaks (see the fn doc), and only
-                // through the one focus x master x volume law.
-                sound: focused_pane && sound_gain.is_some(),
-            };
-            let engine = ws
-                .output_streak_panes
-                .entry(r.session)
-                .or_insert_with(|| {
-                    crate::output_streak::OutputStreak::new(aterm_effects::genome::mix(
-                        r.session ^ 0x5052_4953_4D5F_5057,
-                    ))
-                });
-            engine.note_output_cells(
-                &snapshot.cells,
-                snapshot.cursor_row,
-                snapshot.cursor_col,
-                usize::from(r.rows),
-                ctx.now,
-                false,
-            );
-            ws.pane_nova.clear();
-            let frame = engine.tick(ctx.now, geom, &cfg, &mut ws.pane_nova);
-            if let Some(cue) = frame.cue
-                && let Some(gain) = sound_gain
-            {
-                trail_audio.push(aterm_effects::trail_sound::SoundEvent {
-                    style,
-                    voice,
-                    kind: aterm_effects::trail_sound::SoundGesture::Output(match cue.sound {
-                        crate::output_streak::StreakSound::Shimmer => {
-                            aterm_effects::trail_sound::OutputGesture::Shimmer
-                        }
-                        crate::output_streak::StreakSound::Settle => {
-                            aterm_effects::trail_sound::OutputGesture::Settle
-                        }
-                    }),
-                    pan: cue.pan,
-                    // Output is not authorship: it never reads typing heat.
-                    heat: 0.0,
-                    hue: cue.hue,
-                    gain,
-                    // No key is in hand at all — the machine spoke, not a hand —
-                    // which is the field's own "every non-Typed gesture carries
-                    // false" identity.
-                    shifted: false,
-                    tone: aterm_effects::tone::Tone::Technical,
-                    bed: false,
-                });
-            }
-            translate_nova_into_pane(&mut ws.pane_nova, place);
-            ws.nova_scratch.extend_from_slice(&ws.pane_nova);
-            // ORDER-SENSITIVE, the deco fold's rule: two panes streaming
-            // identical output must not cancel each other out of the RepaintKey.
-            fp ^= frame.fp.rotate_left((index % 64) as u32);
-        }
-        fp
-    }
-
     pub(crate) fn compose_word_decorations(
         &mut self,
         wid: WindowId,
@@ -30033,20 +30812,16 @@ impl App {
         let bonk_voice = self.config.trail_sound_voice();
         let load_shed = self.load_shed_active();
         let Some(rs) = self.sparkle.as_ref() else {
-            let focus_place =
-                ctx.panes
-                    .iter()
-                    .find(|(r, _)| r.session == ctx.focus)
-                    .map(|(r, _)| PanePlace {
-                        row_off: r.row_off,
-                        col_off: r.col_off,
-                        rows: r.rows,
-                        cols: r.cols,
-                        win_rows: ctx.win_rows,
-                        win_cols: ctx.win_cols,
-                        cell_w: ctx.cell_w,
-                        cell_h: ctx.cell_h,
-                    });
+            let focus_place = ctx.panes.get(ctx.focus_index).map(|(r, _)| PanePlace {
+                row_off: r.row_off,
+                col_off: r.col_off,
+                rows: r.rows,
+                cols: r.cols,
+                win_rows: ctx.win_rows,
+                win_cols: ctx.win_cols,
+                cell_w: ctx.cell_w,
+                cell_h: ctx.cell_h,
+            });
             {
                 let Some(ws) = self.windows.get_mut(&wid) else {
                     return 0;
@@ -30094,20 +30869,16 @@ impl App {
 
         let mut fp: u64 = 0;
         let mut focus_place: Option<PanePlace> = None;
-        let companion_focus_place =
-            ctx.panes
-                .iter()
-                .find(|(r, _)| r.session == ctx.focus)
-                .map(|(r, _)| PanePlace {
-                    row_off: r.row_off,
-                    col_off: r.col_off,
-                    rows: r.rows,
-                    cols: r.cols,
-                    win_rows: ctx.win_rows,
-                    win_cols: ctx.win_cols,
-                    cell_w: ctx.cell_w,
-                    cell_h: ctx.cell_h,
-                });
+        let companion_focus_place = ctx.panes.get(ctx.focus_index).map(|(r, _)| PanePlace {
+            row_off: r.row_off,
+            col_off: r.col_off,
+            rows: r.rows,
+            cols: r.cols,
+            win_rows: ctx.win_rows,
+            win_cols: ctx.win_cols,
+            cell_w: ctx.cell_w,
+            cell_h: ctx.cell_h,
+        });
         for (index, (r, _)) in ctx.panes.iter().enumerate() {
             let place = PanePlace {
                 row_off: r.row_off,
@@ -30134,10 +30905,11 @@ impl App {
             // frame's DEC-2026 authorization fence. Relocking here used to let
             // a newly opened synchronized episode birth sparkles or sample a
             // kitty palette over older staged cells.
-            let snapshot = if r.session == ctx.focus {
+            let focused_pane = index == ctx.focus_index;
+            let snapshot = if focused_pane {
                 &ws.composed_focus_scratch
             } else {
-                let Some(snapshot) = ws.unfocused_pane_scratch.get(&r.session) else {
+                let Some(snapshot) = ws.unfocused_pane_scratch.get(&index) else {
                     continue;
                 };
                 snapshot
@@ -30167,7 +30939,7 @@ impl App {
             // alt-screen / load-shed frame (it lives inside that path's
             // `!deco_suspend` branch). Leaving this `None` is how a composed
             // frame inherits the same rule.
-            if r.session == ctx.focus {
+            if focused_pane {
                 focus_place = Some(place);
             }
             // `set_presentable` MUST precede this rescan. A freshly bound pane
@@ -30193,6 +30965,7 @@ impl App {
             }
             let input = PaneDecoInput {
                 session: r.session,
+                focused: focused_pane,
                 display_offset: d_off,
                 sel: snapshot.selection.clone(),
             };
@@ -30213,7 +30986,8 @@ impl App {
             let companion_pet = ctx.pet_visible && ctx.pet.alpha > 0;
             let companion_duty =
                 cursor_companion_duty(companion_pet, ctx.kitty_alpha, ctx.focus_cursor);
-            let companion_at = (input.session == ctx.focus)
+            let companion_at = input
+                .focused
                 .then(|| {
                     cursor_companion_on_glass(
                         companion_duty,
@@ -30283,7 +31057,7 @@ impl App {
             // exactly the pet's own pixel space (no translate needed).
             {
                 let (word_decos, cursor_pet) = (&mut ws.word_decos, &mut ws.cursor_pet);
-                let bat_on = input.session == ctx.focus && ctx.pet_visible;
+                let bat_on = input.focused && ctx.pet_visible;
                 for cue in word_decos.drain_peek_cues() {
                     if bat_on {
                         let (x0, x1, y0, y1) = cue.head_px;
@@ -30656,6 +31430,7 @@ impl App {
         clippy::too_many_arguments,
         reason = "a window's full compose inputs (id/dims/invert/drag-hover/cursor-override/tab-strip); bundling them into a struct only relocates the argument list"
     )]
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn redraw_compose(
         &mut self,
         wid: WindowId,
@@ -30667,6 +31442,36 @@ impl App {
         tab_strip: u64,
         now: Instant,
     ) -> Option<Arc<str>> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        self.redraw_compose_from_plan(
+            wid,
+            rows,
+            cols,
+            invert,
+            drag_hover,
+            cursor_override,
+            tab_strip,
+            now,
+            &plan,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the frame-owned plan joins the existing composed-redraw inputs"
+    )]
+    fn redraw_compose_from_plan(
+        &mut self,
+        wid: WindowId,
+        rows: usize,
+        cols: usize,
+        invert: bool,
+        drag_hover: bool,
+        cursor_override: Option<CursorStyle>,
+        tab_strip: u64,
+        now: Instant,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<Arc<str>> {
         self.redraw_compose_after_focused_extract(
             wid,
             rows,
@@ -30676,6 +31481,8 @@ impl App {
             cursor_override,
             tab_strip,
             now,
+            plan,
+            || {},
             || {},
         )
     }
@@ -30697,6 +31504,7 @@ impl App {
         now: Instant,
         after_focused_extract: impl FnOnce(),
     ) -> Option<Arc<str>> {
+        let plan = self.active_visible_leaf_plan(wid)?;
         self.redraw_compose_after_focused_extract(
             wid,
             rows,
@@ -30706,7 +31514,42 @@ impl App {
             cursor_override,
             tab_strip,
             now,
+            &plan,
+            || {},
             after_focused_extract,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test seam mirrors the shipping composed-redraw inputs and adds only a deterministic interleave hook"
+    )]
+    fn redraw_compose_before_focused_extract(
+        &mut self,
+        wid: WindowId,
+        rows: usize,
+        cols: usize,
+        invert: bool,
+        drag_hover: bool,
+        cursor_override: Option<CursorStyle>,
+        tab_strip: u64,
+        now: Instant,
+        before_focused_extract: impl FnOnce(),
+    ) -> Option<Arc<str>> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        self.redraw_compose_after_focused_extract(
+            wid,
+            rows,
+            cols,
+            invert,
+            drag_hover,
+            cursor_override,
+            tab_strip,
+            now,
+            &plan,
+            before_focused_extract,
+            || {},
         )
     }
 
@@ -30724,6 +31567,8 @@ impl App {
         cursor_override: Option<CursorStyle>,
         tab_strip: u64,
         now: Instant,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        before_focused_extract: impl FnOnce(),
         after_focused_extract: impl FnOnce(),
     ) -> Option<Arc<str>> {
         // Read theme BEFORE borrowing `ws` (fill_divider_grid needs it after the
@@ -30757,12 +31602,31 @@ impl App {
                 .map_or(1000, |config| config.sync_timeout_ms),
         )
         .min(SYNC_HOLD_CAP);
+        let focus_index = plan.leaves.iter().position(|leaf| leaf.focused)?;
+        let focus = self
+            .view_store
+            .get(plan.leaves.get(focus_index)?.view)
+            .copied()?
+            .terminal_session()?;
         let ws = self.windows.get(&wid)?;
         let tree = &ws.layouts[ws.tabs.active];
-        let focus = tree.focus();
         let blink_phase = ws.blink_phase;
         let last_present = ws.last_present;
         let rects = tree.compute_layout(ws.rows, ws.cols);
+        // The terminal compatibility projection must preserve canonical leaf
+        // order. Session-only focus cannot prove this when two views mirror one
+        // terminal, so bind every slot before any snapshot is consumed.
+        if rects.len() != plan.leaves.len()
+            || rects.iter().zip(&plan.leaves).any(|(rect, leaf)| {
+                self.view_store
+                    .get(leaf.view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    != Some(rect.session)
+            })
+        {
+            return None;
+        }
         // Fold every visible pane's damage epoch into one key term (wrapping add is
         // fine — the early-out only needs the combination to CHANGE on any change).
         let mut damage_epoch: u64 = 0;
@@ -30860,11 +31724,14 @@ impl App {
         // Clone each pane's `term` handle OUT of the `&self`/`ws` borrow so the
         // mutating composition loop below can write this window's `input_scratch`/
         // `pane_scratch` freely. Cheap: an `Arc` clone per visible pane. Panes whose
-        // session was just torn down (impossible mid-redraw) are skipped.
+        // session was just torn down (impossible mid-redraw) abort the frame.
+        // Keeping this vector index-identical to `rects` is semantic: canonical
+        // tabs may show two distinct views of one session, and their focused
+        // identity is the leaf index rather than the duplicated session id.
         let panes: Vec<(pane::PaneRect, Arc<Mutex<Terminal>>)> = rects
             .iter()
-            .filter_map(|r| self.pool.get(r.session).map(|s| (*r, s.term.clone())))
-            .collect();
+            .map(|r| self.pool.get(r.session).map(|s| (*r, s.term.clone())))
+            .collect::<Option<_>>()?;
         // Exact title/blank samples for the background snapshots staged in
         // pass 1. Pass 2 is host-only: no pane can enter synchronized output
         // between its authorization fence and the cells that reach glass. The
@@ -30928,11 +31795,16 @@ impl App {
         // extraction-lock DEC-2026 fence before the focused pane mutates any
         // cursor/rain/companion state. A late hold can discard host-only pane
         // snapshots, but it cannot advance the visible effect clock off-glass.
-        let focused_pane_index = panes.iter().position(|(r, _)| r.session == focus);
         let pane_indices = (0..panes.len())
-            .filter(|index| Some(*index) != focused_pane_index)
-            .chain(focused_pane_index);
+            .filter(|index| *index != focus_index)
+            .chain(std::iter::once(focus_index));
+        let mut before_focused_extract = Some(before_focused_extract);
         for pane_index in pane_indices {
+            if pane_index == focus_index
+                && let Some(hook) = before_focused_extract.take()
+            {
+                hook();
+            }
             let (r, term) = &panes[pane_index];
             let mut term = term_lock(term);
             let preflight = self
@@ -30967,7 +31839,7 @@ impl App {
             damage_epoch = damage_epoch.wrapping_add(term.damage_epoch());
             pane_selection_fp =
                 crate::fold_pane_selection_fp(pane_selection_fp, pane_index, term.text_selection());
-            if r.session == focus {
+            if pane_index == focus_index {
                 focus_selection = SelectionFingerprint::of(term.text_selection());
                 let cp = term.cursor();
                 focus_cur_pos = (cp.row, cp.col);
@@ -31203,7 +32075,7 @@ impl App {
                     );
                 }
             } else if let Some(ws) = self.windows.get_mut(&wid) {
-                let staged = ws.unfocused_pane_scratch.entry(r.session).or_default();
+                let staged = ws.unfocused_pane_scratch.entry(pane_index).or_default();
                 let refill = term.cell_frame_damage_scoped_into(
                     staged,
                     usize::from(r.rows),
@@ -31483,10 +32355,7 @@ impl App {
         // pane's caret, and its viewport clamp is that pane's grid. Anything
         // else and a cat in the left half of a vertical split would happily walk
         // over the divider into the right one.
-        let focus_pane_dims = panes
-            .iter()
-            .find(|(r, _)| r.session == focus)
-            .map(|(r, _)| (r.rows, r.cols));
+        let focus_pane_dims = panes.get(focus_index).map(|(r, _)| (r.rows, r.cols));
         // PETTING (wave 1): the hit-box's frame-space origin — the effects
         // origin plus the FOCUSED pane's pixel offset, because the pet's
         // world (and so `body_px`) is that pane's grid, exactly like
@@ -31741,6 +32610,7 @@ impl App {
             &ComposeDecoCtx {
                 panes: &panes,
                 focus,
+                focus_index,
                 win_rows: rows.min(u16::MAX as usize) as u16,
                 win_cols: cols.min(u16::MAX as usize) as u16,
                 cell_w: glow_cw as u32,
@@ -31771,6 +32641,7 @@ impl App {
             &ComposeDecoCtx {
                 panes: &panes,
                 focus,
+                focus_index,
                 win_rows: rows.min(u16::MAX as usize) as u16,
                 win_cols: cols.min(u16::MAX as usize) as u16,
                 cell_w: glow_cw as u32,
@@ -31986,8 +32857,8 @@ impl App {
         // cells instead of the seam. Answered HERE, before the fill, so that
         // frame composes untiled (whole-grid seam) exactly as it did before.
         // Every other exit from this function is after the last blit.
-        let tiles_ready = panes.iter().enumerate().all(|(i, (r, _))| {
-            r.session == focus
+        let tiles_ready = panes.iter().enumerate().all(|(i, _)| {
+            i == focus_index
                 || ws
                     .composed_pane_stage_meta
                     .get(i)
@@ -32016,7 +32887,7 @@ impl App {
             divider_cell(theme),
             active_pane_mark,
             &panes,
-            focus,
+            focus_index,
             focus_blank,
             focus_quiet,
             tiles_ready,
@@ -32075,9 +32946,10 @@ impl App {
         // one" claim on the path that takes over.
         let mut preedit_drawn = false;
         ws.capture_leaf_snapshot_seqs.clear();
+        ws.capture_leaf_content_seqs.clear();
         for (pane_index, (r, _)) in panes.iter().enumerate() {
             let (sub_rows, sub_cols) = (r.rows as usize, r.cols as usize);
-            let focused_pane = r.session == focus;
+            let focused_pane = pane_index == focus_index;
             if focused_pane {
                 // Move the exact A extraction into the ordinary pane slot for
                 // host-only prediction/blit work. The swap is allocation-free
@@ -32128,10 +33000,10 @@ impl App {
                 // resident buffer — capacity kept across frames (no shrink/grow
                 // churn), identity kept (the scoped refill can fire). Swapped
                 // back at the loop's end. `or_default()` mints an empty buffer
-                // the first frame a session appears; `focus` never lands here
-                // (this is the `else` of `r.session == focus`), so it can never
+                // the first frame a pane appears; `focus` never lands here
+                // (this is the `else` of `pane_index == focus_index`), so it can never
                 // collide with `composed_focus_scratch`.
-                let buf = ws.unfocused_pane_scratch.entry(r.session).or_default();
+                let buf = ws.unfocused_pane_scratch.entry(pane_index).or_default();
                 std::mem::swap(&mut ws.pane_scratch, buf);
             }
             // Every pane already lives in a resident buffer captured under its
@@ -32142,6 +33014,8 @@ impl App {
             let (title, pred_paint, blank) = if focused_pane {
                 ws.capture_leaf_snapshot_seqs
                     .push(ws.pane_scratch.snapshot_seq);
+                ws.capture_leaf_content_seqs
+                    .push(ws.pane_scratch.content_seq);
                 if sole_pane {
                     ws.input_scratch.default_bg = aterm_render::rgb_to_u32(focus_blank.bg);
                 }
@@ -32200,6 +33074,8 @@ impl App {
                     .cloned()?;
                 ws.capture_leaf_snapshot_seqs
                     .push(ws.pane_scratch.snapshot_seq);
+                ws.capture_leaf_content_seqs
+                    .push(ws.pane_scratch.content_seq);
                 (title, None, blank)
             };
             // ---- Pane guard dropped: host-state-only prediction work. The
@@ -32232,7 +33108,7 @@ impl App {
             // The cursor (window coords) is drawn SOLID only in the focused
             // pane; other panes contribute none. Pure `pane_scratch` reads —
             // no lock needed.
-            let cursor = (r.session == focus
+            let cursor = (focused_pane
                 && ws.pane_scratch.cursor_visible
                 && ws.pane_scratch.cursor_row < sub_rows
                 && ws.pane_scratch.cursor_col < sub_cols)
@@ -32326,19 +33202,18 @@ impl App {
                 // shared identity for the next iteration — the mirror of the
                 // focused swap-back above. The entry exists (the swap-in minted
                 // it), so `get_mut` cannot miss.
-                if let Some(buf) = ws.unfocused_pane_scratch.get_mut(&r.session) {
+                if let Some(buf) = ws.unfocused_pane_scratch.get_mut(&pane_index) {
                     std::mem::swap(&mut ws.pane_scratch, buf);
                 }
             }
         }
-        // Prune per-session buffers to the LIVE pane set (like leaf_render_cache
-        // above), so a closed pane's buffer cannot linger past its session.
-        {
-            let live: std::collections::BTreeSet<u64> =
-                panes.iter().map(|(r, _)| r.session).collect();
-            ws.unfocused_pane_scratch
-                .retain(|sid, _| live.contains(sid));
-        }
+        // Prune to the live UNFOCUSED pane slots. Session identity is not a
+        // sufficient key: canonical layout permits two views of one session.
+        ws.unfocused_pane_scratch.retain(|pane_index, _| {
+            panes
+                .get(*pane_index)
+                .is_some_and(|_| *pane_index != focus_index)
+        });
         // All pure/mixed and live/capture composed paths share this exact
         // projection.  The engine streams are window-absolute; the tab-strip
         // splice below only re-tags their damage rows and shifts cell streams.
@@ -32459,7 +33334,7 @@ impl App {
         ws.composed_retain.cols = cols;
         ws.composed_retain.seam = Some(divider_cell(theme));
         ws.composed_retain.mark = active_pane_mark;
-        ws.composed_retain.focus = focus;
+        ws.composed_retain.focus = focus_index;
         ws.stamp_present_decision(key);
         // FL-1: this committed compose IS the redraw any outstanding recovery
         // edge asked for — acknowledge the delivery. Without this, a
@@ -33125,17 +34000,12 @@ impl App {
         // BOTTOM pane's row-0 match does not sit under a top bar, so floating
         // the bar away was needless; a top pane's offsets keep working).
         let focus_row_off: i64 = if multi_pane {
-            self.active_tree(wid)
-                .and_then(|t| {
-                    let focus = t.focus();
-                    let (rows, cols) = self
-                        .windows
-                        .get(&wid)
-                        .map_or((0, 0), |ws| (ws.rows, ws.cols));
-                    t.compute_layout(rows, cols)
-                        .iter()
-                        .find(|r| r.session == focus)
-                        .map(|r| i64::from(r.row_off))
+            self.active_visible_leaf_plan(wid)
+                .and_then(|plan| {
+                    plan.leaves
+                        .into_iter()
+                        .find(|leaf| leaf.focused)
+                        .map(|leaf| leaf.rect.origin.y.round() as i64)
                 })
                 .unwrap_or(0)
         } else {
@@ -33214,6 +34084,11 @@ impl App {
                             is_regex: s.is_regex,
                             regex_error: s.regex_error,
                             truncated: s.truncated,
+                            // The batch is older than the screen: output landed
+                            // after it was counted and the search is not re-run
+                            // per PTY burst. The bar marks the number rather
+                            // than asserting a census it knows has moved.
+                            stale: s.results_dirty,
                         },
                         preedit_span,
                         cur_term_row,

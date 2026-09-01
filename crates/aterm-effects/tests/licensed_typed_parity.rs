@@ -638,16 +638,24 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // RE-DERIVED 2026-08-31 (EVEN PACING): the LUT is resampled so equal cell
     // steps are equal perceived colour steps — the rainbow entry alone moves,
     // the other eight byte-identical.
+    // RE-DERIVED 2026-09-01 for Water alone: its broad wake moved below glyph
+    // ink, overlapping repaint owners deduplicate, and jump reflections drain
+    // into age-derived beads. The other eight entries remain the v0.69 values
+    // above; Water is captured on this rebased tree, not carried from v0.68.
+    // Re-captured only after combining those visible changes with the
+    // field-complete frame digest and perceptually paced spectrum anchors.
+    // Cursor field-isolation, plane geometry, and Water ownership/drain tests
+    // independently prove why the merged fold moved.
     const GOLDEN: [u64; 9] = [
-        306_550_098_623_546_329,
-        1_297_071_605_659_407_894,
-        5_739_968_975_458_845_712,
-        11_402_529_203_733_425_666,
-        6_172_793_737_777_569_531,
-        10_228_138_411_549_286_995,
-        2_700_001_605_285_599_990,
-        2_241_811_593_972_689_823,
-        9_908_140_915_523_321_503,
+        12_541_784_599_013_147_129,
+        1_564_493_126_147_229_498,
+        8_767_316_529_295_529_117,
+        5_181_506_246_111_895_746,
+        17_288_162_128_308_037_669,
+        7_964_602_191_947_693_616,
+        17_267_923_897_133_204_901,
+        3_816_899_345_458_622_939,
+        11_368_127_483_310_326_334,
     ];
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];

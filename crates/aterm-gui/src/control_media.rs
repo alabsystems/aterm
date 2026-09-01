@@ -338,6 +338,57 @@ fn recv_capture_reply<T>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageTargetError {
+    AdmissionRefused,
+    AutomaticUnavailable,
+    InvalidRequested,
+}
+
+fn prepare_image_target(
+    want_bytes: bool,
+    clean: bool,
+    requested: &str,
+    sock_dir: &std::path::Path,
+    handoff: &mut crate::control::ReplyRetentionPermit,
+) -> Result<(control_auth::ConfinedImage, Option<String>), ImageTargetError> {
+    if want_bytes {
+        return Ok((control_auth::ConfinedImage::in_memory(), None));
+    }
+
+    let target = if requested.is_empty() {
+        let stem = if clean {
+            "aterm-clean"
+        } else {
+            "aterm-control"
+        };
+        control_auth::confine_automatic_image_path_with_admission(sock_dir, stem, |path| {
+            handoff.try_reconcile_for_resolved_path(path)
+        })
+        .map_err(|error| match error {
+            control_auth::ArtifactConfinementError::AdmissionRefused => {
+                ImageTargetError::AdmissionRefused
+            }
+            control_auth::ArtifactConfinementError::Invalid => {
+                ImageTargetError::AutomaticUnavailable
+            }
+        })?
+    } else {
+        control_auth::confine_image_path_with_admission(sock_dir, requested, |path| {
+            handoff.try_reconcile_for_resolved_path(path)
+        })
+        .map_err(|error| match error {
+            control_auth::ArtifactConfinementError::AdmissionRefused => {
+                ImageTargetError::AdmissionRefused
+            }
+            control_auth::ArtifactConfinementError::Invalid => ImageTargetError::InvalidRequested,
+        })?
+    };
+    // For the reply only — the writer re-opens via the dir fd, not this string.
+    let path = target.display_path().to_string_lossy().into_owned();
+    Ok((target, Some(path)))
+}
+
 pub(crate) fn cmd_image(
     proxy: &EventLoopProxy<Wake>,
     queue: &ImageQueue,
@@ -365,56 +416,36 @@ pub(crate) fn cmd_image(
             _ => (false, t),
         }
     };
-    let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
+    let permit = if want_bytes {
+        crate::control::ReplyRetention::try_reserve_in_memory()
+    } else {
+        crate::control::ReplyRetention::try_reserve_for_path(sock_dir)
+    };
+    let Some(mut handoff) = permit else {
         return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
     };
-    let admission_refused = std::cell::Cell::new(false);
-    let target = if rest.is_empty() {
-        let stem = if clean {
-            "aterm-clean"
-        } else {
-            "aterm-control"
-        };
-        let Some(target) =
-            control_auth::confine_automatic_image_path_with_admission(sock_dir, stem, |path| {
-                let admitted = handoff.try_reconcile_for_resolved_path(path);
-                admission_refused.set(!admitted);
-                admitted
-            })
-        else {
-            if admission_refused.get() {
-                return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
-            }
+    let (target, path) = match prepare_image_target(want_bytes, clean, rest, sock_dir, &mut handoff)
+    {
+        Ok(prepared) => prepared,
+        Err(ImageTargetError::AdmissionRefused) => {
+            return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+        }
+        Err(ImageTargetError::AutomaticUnavailable) => {
             return "ERR image: could not create the automatic capture path\n".into();
-        };
-        target
-    } else {
-        let requested = rest.to_string();
-        let Some(target) =
-            control_auth::confine_image_path_with_admission(sock_dir, &requested, |path| {
-                let admitted = handoff.try_reconcile_for_resolved_path(path);
-                admission_refused.set(!admitted);
-                admitted
-            })
-        else {
-            if admission_refused.get() {
-                return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
-            }
+        }
+        Err(ImageTargetError::InvalidRequested) => {
             log_denial(
                 AUDIT_SUBSYSTEM,
-                &format!("image write '{requested}'"),
+                &format!("image write '{rest}'"),
                 aterm_containment::mode_or_containment(),
                 "path escapes images/ subdir or names a nested target",
             );
             return "ERR path: give a bare filename (no '/'); captures are confined to the \
-                app's Application Support images/ dir. Omit the path to auto-name one — \
-                the OK reply prints the full written path.\n"
+                    app's Application Support images/ dir. Omit the path to auto-name one — \
+                    the OK reply prints the full written path.\n"
                 .into();
-        };
-        target
+        }
     };
-    // For the reply only — the writer re-opens via the dir fd, not this string.
-    let path = target.display_path().to_string_lossy().into_owned();
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
@@ -471,7 +502,12 @@ pub(crate) fn cmd_image(
                         Err(error) => return error.into(),
                     }
                 }
-                None => image_file_reply(w, h, &path, want_metadata, frame_metadata.get()),
+                None => {
+                    let Some(path) = path.as_deref() else {
+                        return "ERR image: byte capture returned no PNG\n".into();
+                    };
+                    image_file_reply(w, h, path, want_metadata, frame_metadata.get())
+                }
             };
             crate::control::ControlReply::with_handoff(body, retention)
         }
@@ -501,6 +537,42 @@ fn image_byte_reply_png_fits(png_len: usize) -> bool {
     png_len <= MAX_IMAGE_BYTE_REPLY_PNG_BYTES
 }
 
+fn padded_base64_len(input_len: usize) -> Option<usize> {
+    input_len
+        .checked_add(2)
+        .and_then(|rounded| (rounded / 3).checked_mul(4))
+}
+
+fn append_padded_base64(output: &mut String, input: &[u8]) {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let (chunks, remainder) = input.as_chunks::<3>();
+    for &[a, b, c] in chunks {
+        let value = (u32::from(a) << 16) | (u32::from(b) << 8) | u32::from(c);
+        output.push(char::from(ALPHABET[((value >> 18) & 0x3f) as usize]));
+        output.push(char::from(ALPHABET[((value >> 12) & 0x3f) as usize]));
+        output.push(char::from(ALPHABET[((value >> 6) & 0x3f) as usize]));
+        output.push(char::from(ALPHABET[(value & 0x3f) as usize]));
+    }
+    match remainder {
+        [a] => {
+            let value = u32::from(*a) << 16;
+            output.push(char::from(ALPHABET[((value >> 18) & 0x3f) as usize]));
+            output.push(char::from(ALPHABET[((value >> 12) & 0x3f) as usize]));
+            output.push('=');
+            output.push('=');
+        }
+        [a, b] => {
+            let value = (u32::from(*a) << 16) | (u32::from(*b) << 8);
+            output.push(char::from(ALPHABET[((value >> 18) & 0x3f) as usize]));
+            output.push(char::from(ALPHABET[((value >> 12) & 0x3f) as usize]));
+            output.push(char::from(ALPHABET[((value >> 6) & 0x3f) as usize]));
+            output.push('=');
+        }
+        _ => {}
+    }
+}
+
 fn image_bytes_reply(
     width: u32,
     height: u32,
@@ -511,8 +583,8 @@ fn image_bytes_reply(
     if !image_byte_reply_png_fits(png.len()) {
         return Err("ERR image: PNG too large to return as bytes\n".to_string());
     }
-    let base64 = aterm_codec::base64::encode(png)
-        .map_err(|_| "ERR image: PNG too large to return as bytes\n".to_string())?;
+    let encoded_len = padded_base64_len(png.len())
+        .ok_or_else(|| "ERR image: PNG too large to return as bytes\n".to_string())?;
     if want_metadata {
         let metadata = image_metadata_fields(metadata);
         if metadata.len().saturating_add("image-meta \n".len())
@@ -520,13 +592,28 @@ fn image_bytes_reply(
         {
             return Err("ERR image: metadata too large to return as bytes\n".to_string());
         }
-        Ok(format!(
-            "OK 2\nimage-meta {}\n{width} {height} {} {base64}\n",
-            metadata,
+        let mut body = String::with_capacity(
+            encoded_len
+                .saturating_add(IMAGE_BYTE_ROW_OVERHEAD)
+                .saturating_add(metadata.len())
+                .saturating_add("image-meta \n".len()),
+        );
+        write!(
+            &mut body,
+            "OK 2\nimage-meta {metadata}\n{width} {height} {} ",
             png.len(),
-        ))
+        )
+        .expect("writing to a String cannot fail");
+        append_padded_base64(&mut body, png);
+        body.push('\n');
+        Ok(body)
     } else {
-        Ok(format!("OK 1\n{width} {height} {} {base64}\n", png.len()))
+        let mut body = String::with_capacity(encoded_len.saturating_add(IMAGE_BYTE_ROW_OVERHEAD));
+        write!(&mut body, "OK 1\n{width} {height} {} ", png.len())
+            .expect("writing to a String cannot fail");
+        append_padded_base64(&mut body, png);
+        body.push('\n');
+        Ok(body)
     }
 }
 
@@ -612,55 +699,49 @@ pub(crate) fn cmd_window(
         AuxTarget::Update => "aterm-update",
     };
     let p = path_arg.trim();
-    let admission_refused = std::cell::Cell::new(false);
     let confined = if p.is_empty() {
-        let Some(target) = control_auth::confine_automatic_image_path_with_admission(
+        match control_auth::confine_automatic_image_path_with_admission(
             sock_dir,
             default_stem,
-            |path| {
-                let admitted = handoff.try_reconcile_for_resolved_path(path);
-                admission_refused.set(!admitted);
-                admitted
-            },
-        ) else {
-            if admission_refused.get() {
+            |path| handoff.try_reconcile_for_resolved_path(path),
+        ) {
+            Ok(target) => target,
+            Err(control_auth::ArtifactConfinementError::AdmissionRefused) => {
                 return format!(
                     "ERR window capture: {}\n",
                     crate::control::ARTIFACT_HANDOFF_BUSY
                 )
                 .into();
             }
-            return "ERR window: could not create the automatic capture path\n".into();
-        };
-        target
+            Err(control_auth::ArtifactConfinementError::Invalid) => {
+                return "ERR window: could not create the automatic capture path\n".into();
+            }
+        }
     } else {
-        let requested = p.to_string();
-        let Some(target) =
-            control_auth::confine_image_path_with_admission(sock_dir, &requested, |path| {
-                let admitted = handoff.try_reconcile_for_resolved_path(path);
-                admission_refused.set(!admitted);
-                admitted
-            })
-        else {
-            if admission_refused.get() {
+        match control_auth::confine_image_path_with_admission(sock_dir, p, |path| {
+            handoff.try_reconcile_for_resolved_path(path)
+        }) {
+            Ok(target) => target,
+            Err(control_auth::ArtifactConfinementError::AdmissionRefused) => {
                 return format!(
                     "ERR window capture: {}\n",
                     crate::control::ARTIFACT_HANDOFF_BUSY
                 )
                 .into();
             }
-            log_denial(
-                AUDIT_SUBSYSTEM,
-                &format!("window write '{requested}'"),
-                aterm_containment::mode_or_containment(),
-                "path escapes images/ subdir or names a nested target",
-            );
-            return "ERR path: give a bare filename (no '/'); captures are confined to the \
-                app's Application Support images/ dir. Omit the path to auto-name one — \
-                the OK reply prints the full written path.\n"
-                .into();
-        };
-        target
+            Err(control_auth::ArtifactConfinementError::Invalid) => {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &format!("window write '{p}'"),
+                    aterm_containment::mode_or_containment(),
+                    "path escapes images/ subdir or names a nested target",
+                );
+                return "ERR path: give a bare filename (no '/'); captures are confined to the \
+                    app's Application Support images/ dir. Omit the path to auto-name one — \
+                    the OK reply prints the full written path.\n"
+                    .into();
+            }
+        }
     };
     // For the reply only — the writer re-opens via the dir fd, not this string.
     let path = confined.display_path().to_string_lossy().into_owned();
@@ -922,7 +1003,6 @@ fn collect_video_frame_rows(
             }
         }
     }
-    recording.validate_path_identity().ok()?;
     Some(rows)
 }
 
@@ -1150,7 +1230,13 @@ mod confined_video_reader {
 
         let Some(lease) =
             control_auth::retain_video_artifact_path(instance_dir, recording_name, &recording)
-                .map_err(|_| "recording namespace changed while acquiring retention")?
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        crate::control::ARTIFACT_HANDOFF_BUSY
+                    } else {
+                        "recording namespace changed while acquiring retention"
+                    }
+                })?
         else {
             return Err("recording retention sweep is in progress");
         };
@@ -1457,16 +1543,16 @@ pub(crate) fn cmd_video(
     let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
         return format!("ERR video: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
     };
-    let admission_refused = std::cell::Cell::new(false);
-    let Some(dir) = control_auth::confine_video_dir_with_admission(sock_dir, |path| {
-        let admitted = handoff.try_reconcile_for_resolved_path(path);
-        admission_refused.set(!admitted);
-        admitted
-    }) else {
-        if admission_refused.get() {
+    let dir = match control_auth::confine_video_dir_with_admission(sock_dir, |path| {
+        handoff.try_reconcile_for_resolved_path(path)
+    }) {
+        Ok(dir) => dir,
+        Err(control_auth::ArtifactConfinementError::AdmissionRefused) => {
             return format!("ERR video: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
         }
-        return "ERR video: could not create the recording dir\n".into();
+        Err(control_auth::ArtifactConfinementError::Invalid) => {
+            return "ERR video: could not create the recording dir\n".into();
+        }
     };
     let cancel = crate::VideoCancellation::new();
     let mut cancel_on_drop = CancelVideoRequestOnDrop(Some(cancel.clone()));
@@ -3172,6 +3258,42 @@ mod video_parse_tests {
     }
 
     #[test]
+    fn image_reply_base64_appends_without_a_second_buffer() {
+        for len in 0..=257 {
+            let bytes = (0..len)
+                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+                .collect::<Vec<_>>();
+            let expected = aterm_codec::base64::encode(&bytes).expect("bounded test input");
+            let encoded_len = padded_base64_len(bytes.len()).expect("bounded test input");
+            assert_eq!(encoded_len, expected.len());
+
+            let mut appended = String::with_capacity(encoded_len);
+            let reserved = appended.capacity();
+            append_padded_base64(&mut appended, &bytes);
+            assert_eq!(appended, expected, "base64 parity at input length {len}");
+            assert_eq!(
+                appended.capacity(),
+                reserved,
+                "the pre-sized destination must not reallocate at input length {len}",
+            );
+        }
+    }
+
+    #[test]
+    fn image_bytes_target_bypasses_filesystem_confinement() {
+        let mut permit = crate::control::ReplyRetentionPermit::unmetered_for_test();
+        let (_target, display_path) = prepare_image_target(
+            true,
+            false,
+            "nested/paths-are-invalid-for-file-output.png",
+            std::path::Path::new("missing-socket-directory"),
+            &mut permit,
+        )
+        .expect("inline output needs no filesystem target");
+        assert_eq!(display_path, None);
+    }
+
+    #[test]
     fn image_meta_is_an_opt_in_flag_and_preserves_legacy_names() {
         assert_eq!(
             parse_image_options("plain --meta --bytes shot.png"),
@@ -3727,8 +3849,10 @@ mod video_parse_tests {
             .prepare_retention_for_test()
             .expect("the queued frame paths still validate at the wire edge");
         drop(reply);
+        super::control_auth::wait_for_artifact_cleanup_for_test(&oldest_path);
 
         let mut next = super::control_auth::confine_video_dir(&tmp).unwrap();
+        let next_path = next.path().to_path_buf();
         let next_index = next
             .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
             .unwrap();
@@ -3736,6 +3860,7 @@ mod video_parse_tests {
         drop(next.publish_marker().unwrap());
         drop(next_index);
         drop(next);
+        super::control_auth::wait_for_artifact_cleanup_for_test(&next_path);
         assert!(
             !oldest_path.exists(),
             "after the wire guard drops, the oldest recording becomes eligible"
@@ -3767,6 +3892,7 @@ mod video_parse_tests {
             .expect("reader identities validate before namespace replacement");
 
         let original = instance_root(&tmp, INSTANCE);
+        let selected_key = original.join(format!("rec-{:020}-000", RECORDINGS - 1));
         let moved = original.with_file_name(format!("{INSTANCE}-original"));
         std::fs::rename(&original, &moved).unwrap();
         for sequence in 100..(100 + RECORDINGS) {
@@ -3781,6 +3907,7 @@ mod video_parse_tests {
         std::fs::write(replacement.join("sentinel"), b"replacement").unwrap();
 
         drop(reply);
+        super::control_auth::wait_for_artifact_cleanup_for_test(&selected_key);
 
         let recording_count = |root: &std::path::Path| {
             std::fs::read_dir(root)

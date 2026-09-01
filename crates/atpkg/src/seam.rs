@@ -60,7 +60,17 @@ pub const DEFAULT_SEAM: &str = "trust";
 pub const SEAM_PROGRAM: &str = "trust";
 
 /// The one fix printed whenever attach refuses an entry atpkg does not own.
-pub const DETACH_FIX: &str = "aterm pkg seam detach --force";
+///
+/// This read `aterm pkg seam detach --force` until 2026-09-01. There is no
+/// `seam` verb: `VERBS` (`cli.rs:33-56`) lists twenty-two names and `seam` is
+/// not among them, nor does the string occur anywhere else in `crates/atpkg`.
+/// So the ONE remedy printed on this refusal named a command that exits 2 —
+/// and the refusal is about an entry under `~/.rustup` that aterm deliberately
+/// will not touch, so the action has to be the user's anyway. Both commands
+/// below are real: `rustup toolchain uninstall` is rustup's own, and `repair`
+/// is in `VERBS`.
+pub const DETACH_FIX: &str =
+    "remove that entry yourself (e.g. `rustup toolchain uninstall trust`), then `aterm pkg repair`";
 
 /// The record-key prefix in `status.toml`'s `seams` list (`rustup:<name>`).
 const RECORD_PREFIX: &str = "rustup:";

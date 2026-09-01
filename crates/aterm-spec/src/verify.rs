@@ -739,6 +739,26 @@ pub fn ty_evidence_header(ty: &Path) -> String {
     format!("ty binary: {} [{}]\n", ty.display(), ty_build_stamp(ty))
 }
 
+/// The identity of the SOLVER a certificate bundle came from, for the same
+/// reason [`ty_evidence_header`] exists one function up: a gate panic must name
+/// the binary an operator has to act on.
+///
+/// The ay lane learned this on 2026-08-31, when `sparkle_v2` went red with
+/// `nova_budget_closed_form got=unknown` on an obligation unchanged since July
+/// and named no binary. FOUR ay builds were installed and discovery bound the
+/// one that disagreed (a stale 0.10.0; 0.5.0, 0.13.0 and 0.22.0 all discharged
+/// it). Unlike `ty`, ay names its OWN build on every solve
+/// (`c ay.session.start … build.stamp=…`), so the bundle script records that
+/// per verdict — this header is the harness-level companion for the failures
+/// that never reach a solve at all (a missing script, a bundle that produced no
+/// output), where the path and mtime are the only facts there are.
+#[must_use]
+// Skip: diagnostic string formatting for a verification harness.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn ay_evidence_header(ay: &Path) -> String {
+    format!("ay binary: {} [{}]\n", ay.display(), ty_build_stamp(ay))
+}
+
 fn ty_build_stamp(ty: &Path) -> String {
     std::fs::metadata(ty)
         .and_then(|md| md.modified())

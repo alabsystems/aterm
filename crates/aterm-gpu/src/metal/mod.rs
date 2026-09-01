@@ -1612,7 +1612,7 @@ mod tests {
 
     use super::blit::MetalBlit;
     use crate::renderer::{BlitTestEffects, BlitTestTarget};
-    use crate::{DropOverlay, GpuRenderer, PresentCrop, WindowGpu};
+    use crate::{DropOverlay, GpuRenderer, PresentCrop, TrayQuad, WindowGpu};
 
     const ROWS: usize = 6;
     const COLS: usize = 24;
@@ -1741,6 +1741,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         let mut win = WindowGpu::new();
         let input = representative_input();
 
@@ -2042,6 +2045,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
@@ -2230,6 +2236,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
@@ -2491,6 +2500,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
@@ -2734,6 +2746,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
 
         const W: usize = 16;
         const H: usize = 16;
@@ -3012,6 +3027,8 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
         let mut wg_win = WindowGpu::new();
@@ -3074,6 +3091,794 @@ mod tests {
         );
     }
 
+    /// W6b — THE ARMED INLINE-IMAGE DIFFERENTIAL (the map's W6a deferral
+    /// "inline-image planes on the armed arm", closed): `render_input` with a
+    /// REAL OSC-1337 inline-image screen through the wgpu arm and the ARMED
+    /// PRODUCTION Metal arm — the retained CPU-side texel stack
+    /// (`ImagePlane::metal_texels`) re-mints the plane on the Metal side and
+    /// the image draw groups join the armed plan. Byte-identical, N=5, on
+    /// TWO inputs: the second adds a translucent second image so the plane
+    /// REBUILD path (a moved `epoch` key ⇒ armed re-mint + re-upload) and
+    /// the image alpha-blend axis are both live mid-test.
+    ///
+    /// NON-VACUITY: the armed plan must contain at least one image stream
+    /// (a fixture that decodes nothing would compare two image-free frames
+    /// and prove no closure), and the armed window's plane must hold its
+    /// resident texels with a moving epoch across the rebuild.
+    #[test]
+    fn armed_inline_image_plane_matches_the_wgpu_arm_byte_for_byte() {
+        use crate::renderer::StreamId;
+        const N: usize = 5;
+        if device().is_none() {
+            return;
+        }
+        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                return;
+            }
+        };
+        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        wg.disarm_metal_for_test();
+        let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
+        armed.arm_metal_for_test();
+        wg.debug_block_on_lazy_fallbacks();
+        armed.debug_block_on_lazy_fallbacks();
+        let mut wg_win = WindowGpu::new();
+        let mut armed_win = WindowGpu::new();
+        let (cw, ch) = wg.cell_size();
+
+        // Solid-colour RGBA PNG bytes (the inline_image_parity fixture recipe).
+        let png = |w: u32, h: u32, rgba: [u8; 4]| -> Vec<u8> {
+            let mut pix = Vec::with_capacity((w * h * 4) as usize);
+            for _ in 0..(w * h) {
+                pix.extend_from_slice(&rgba);
+            }
+            let mut out = Vec::new();
+            {
+                let mut enc = aterm_png::Encoder::new(&mut out, w, h);
+                enc.set_color(aterm_png::ColorType::Rgba);
+                enc.set_depth(aterm_png::BitDepth::Eight);
+                let mut writer = enc.write_header().expect("png header");
+                writer.write_image_data(&pix).expect("png data");
+            }
+            out
+        };
+        let osc = |args: &str, payload: &[u8]| -> Vec<u8> {
+            let b64 = aterm_codec::base64::encode(payload).expect("encode");
+            let mut out = Vec::new();
+            out.extend_from_slice(b"\x1b]1337;File=");
+            out.extend_from_slice(args.as_bytes());
+            out.push(b':');
+            out.extend_from_slice(b64.as_bytes());
+            out.extend_from_slice(b"\x1b\\");
+            out
+        };
+        let input_for = |second_image: Option<[u8; 4]>| -> RenderInput {
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            term.set_cell_pixel_size(cw as u16, ch as u16);
+            term.process(b"\x1b[33mimg>\x1b[0m under");
+            term.process(b"\r");
+            term.process(&osc(
+                "inline=1;width=2;height=2",
+                &png(2 * cw as u32, 2 * ch as u32, [40, 200, 90, 255]),
+            ));
+            if let Some(rgba) = second_image {
+                // A TRANSLUCENT image at another cell: a distinct placement
+                // (plane rebuild ⇒ epoch move) and a live alpha-blend axis.
+                term.process(b"\r\n\r\n");
+                term.process(&osc(
+                    "inline=1;width=2;height=1",
+                    &png(2 * cw as u32, ch as u32, rgba),
+                ));
+            }
+            term.process(b"\r\n$ tail");
+            term.cell_frame(ROWS, COLS)
+        };
+
+        let mut first_epoch = None;
+        // Phase 2 keeps phase 1's footprints and changes ONLY the second
+        // image's texels: the plane rebuilds at IDENTICAL dims, so the
+        // rebuild EPOCH is the one moving key component — the axis that
+        // keeps a stale same-size plane impossible on the armed arm.
+        for (phase, input) in [
+            (0u32, input_for(None)),
+            (1, input_for(Some([220, 40, 160, 128]))),
+            (2, input_for(Some([30, 120, 255, 128]))),
+        ] {
+            for run in 0..N {
+                let expected = wg.render_input(&mut wg_win, &input, None);
+                let actual = armed.render_input(&mut armed_win, &input, None);
+                assert!(
+                    armed.metal_render_armed(),
+                    "phase {phase} run {run}: the armed renderer must hold its arm"
+                );
+                // NON-VACUITY: the armed plan drew at least one image stream.
+                let plan = armed.last_frame_plan_streams_for_test();
+                assert!(
+                    plan.iter().any(|(s, _)| matches!(
+                        s,
+                        StreamId::Image
+                            | StreamId::ImageUnder
+                            | StreamId::ImageBelowBg
+                            | StreamId::ImageBgCover
+                    )),
+                    "phase {phase} run {run}: the fixture decoded no image draw — \
+                     the differential would be vacuous (plan: {plan:?})"
+                );
+                assert_eq!(
+                    (expected.width, expected.height),
+                    (actual.width, actual.height),
+                    "phase {phase} run {run}: frame geometry diverged"
+                );
+                if expected.pixels != actual.pixels {
+                    let diffs = expected
+                        .pixels
+                        .iter()
+                        .zip(&actual.pixels)
+                        .filter(|(e, a)| e != a)
+                        .count();
+                    let first = expected
+                        .pixels
+                        .iter()
+                        .zip(&actual.pixels)
+                        .position(|(e, a)| e != a)
+                        .expect("some pixel differs");
+                    panic!(
+                        "phase {phase} run {run}: THE ARMED IMAGE-PLANE FRAME IS NOT \
+                         BYTE-IDENTICAL to wgpu: {diffs} of {} px differ, first at \
+                         index {first} (wgpu {:08x} != metal {:08x})",
+                        expected.pixels.len(),
+                        expected.pixels[first],
+                        actual.pixels[first],
+                    );
+                }
+            }
+            // NON-VACUITY: resident texels + a moving epoch across the rebuild.
+            let (epoch, has_texels) = armed_win
+                .image_plane_probe_for_test()
+                .expect("the armed window holds an image plane");
+            assert!(
+                has_texels,
+                "phase {phase}: the armed plane must retain its CPU-side texels"
+            );
+            match first_epoch {
+                None => first_epoch = Some(epoch),
+                Some(prev) => assert!(
+                    epoch > prev,
+                    "the two-image rebuild must move the plane epoch \
+                     (armed re-upload unarmed otherwise): {epoch} <= {prev}"
+                ),
+            }
+        }
+        eprintln!(
+            "armed inline-image differential: byte-identical x {N} runs x 3 \
+             inputs (dims-moving rebuild, SAME-DIMS texel rebuild via the \
+             epoch salt, translucent image — all armed)"
+        );
+    }
+
+    /// W6b — THE ARMED READBACK-EFFECTS DIFFERENTIAL (three W6a deferrals
+    /// closed at once): `render_input` with the comet BLOOM, the heat
+    /// SHIMMER (phase pinned) and a settings-card TRAY all live, through the
+    /// wgpu arm and the ARMED PRODUCTION Metal arm — the in-place
+    /// bloom/shimmer/tray passes on the Metal offscreen against their
+    /// shipped wgpu twins. Byte-identical x N=5.
+    ///
+    /// NON-VACUITY per layer (byte-level, not counters): with the SAME armed
+    /// renderer, turning each layer off must MOVE the armed bytes — a pass
+    /// that silently did not run cannot pass as agreement. THE SKIP MIRROR:
+    /// after N identical-card presents each arm must have uploaded the card
+    /// exactly once (`tray_uploads`), and a changed card exactly once more —
+    /// the wgpu unchanged-bytes discipline, mirrored and measured.
+    #[test]
+    fn armed_readback_effects_match_the_wgpu_arm_byte_for_byte() {
+        const N: usize = 5;
+        if device().is_none() {
+            return;
+        }
+        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                return;
+            }
+        };
+        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        wg.disarm_metal_for_test();
+        let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
+        armed.arm_metal_for_test();
+        for g in [&mut wg, &mut armed] {
+            g.debug_block_on_lazy_fallbacks();
+            g.set_bloom(true);
+            g.set_shimmer(true);
+            // The pass's one wall-clock term, pinned identically (the
+            // heat_shimmer suite's discipline).
+            g.set_shimmer_phase_for_test(Some(1.375));
+        }
+        let mut wg_win = WindowGpu::new();
+        let mut armed_win = WindowGpu::new();
+        let (cw, ch) = wg.cell_size();
+
+        // A warm ember comet on row 4 + the fire-style marker: exactly the
+        // heat_shimmer fixture recipe, arming `shimmer_live` AND the bloom.
+        let mut input = representative_input();
+        input.cursor_glow_add = (4..14)
+            .map(|c| aterm_render::GlowQuad {
+                row: 4,
+                x: (c * cw) as u16,
+                y: (4 * ch) as u16,
+                w: cw as u16,
+                h: ch as u16,
+                color: aterm_render::premul_rgb(0x00FF_6A00, 230),
+                alpha: 0,
+            })
+            .collect();
+        input.fire_patch = vec![aterm_render::FirePatch::default()];
+
+        // A deterministic straight-alpha gradient card.
+        let (pw, ph) = (40u32, 24u32);
+        let card_a: Vec<u8> = (0..pw * ph)
+            .flat_map(|i| {
+                let (x, y) = (i % pw, i / pw);
+                [
+                    (x * 6 % 256) as u8,
+                    (y * 10 % 256) as u8,
+                    170,
+                    (40 + (x + y) * 3 % 216) as u8,
+                ]
+            })
+            .collect();
+        let mut card_b = card_a.clone();
+        for px in card_b.as_chunks_mut::<4>().0 {
+            px[2] = 40; // a visibly different card, same dims
+        }
+        let tray = |rgba: &'static [u8]| TrayQuad {
+            rgba,
+            pw,
+            ph,
+            dx: 3 * cw as u32,
+            dy: ch as u32,
+        };
+        let card_a: &'static [u8] = card_a.leak();
+        let card_b: &'static [u8] = card_b.leak();
+
+        let mut armed_frame = None;
+        for run in 0..N {
+            let expected = wg.render_input(&mut wg_win, &input, Some(tray(card_a)));
+            let actual = armed.render_input(&mut armed_win, &input, Some(tray(card_a)));
+            assert!(armed.metal_render_armed(), "run {run}: arm must be live");
+            assert_eq!(
+                (expected.width, expected.height),
+                (actual.width, actual.height),
+                "run {run}: frame geometry diverged"
+            );
+            if expected.pixels != actual.pixels {
+                let diffs = expected
+                    .pixels
+                    .iter()
+                    .zip(&actual.pixels)
+                    .filter(|(e, a)| e != a)
+                    .count();
+                let first = expected
+                    .pixels
+                    .iter()
+                    .zip(&actual.pixels)
+                    .position(|(e, a)| e != a)
+                    .expect("some pixel differs");
+                panic!(
+                    "run {run}: THE ARMED EFFECTS FRAME IS NOT BYTE-IDENTICAL to \
+                     wgpu: {diffs} of {} px differ, first at index {first} \
+                     (wgpu {:08x} != metal {:08x}). Localize by layer: turn the \
+                     bloom, shimmer and tray off one at a time and re-diff",
+                    expected.pixels.len(),
+                    expected.pixels[first],
+                    actual.pixels[first],
+                );
+            }
+            armed_frame = Some(actual);
+        }
+        // THE SKIP MIRROR, measured: N identical cards = ONE upload per arm.
+        assert_eq!(
+            (wg.tray_uploads(), armed.tray_uploads()),
+            (1, 1),
+            "the unchanged-bytes card skip must hold on BOTH arms across {N} presents"
+        );
+        // A changed card (same dims) re-uploads exactly once per arm, and the
+        // frames stay byte-identical.
+        let expected = wg.render_input(&mut wg_win, &input, Some(tray(card_b)));
+        let actual = armed.render_input(&mut armed_win, &input, Some(tray(card_b)));
+        assert_eq!(
+            expected.pixels, actual.pixels,
+            "changed-card frames diverged between the arms"
+        );
+        assert_eq!(
+            (wg.tray_uploads(), armed.tray_uploads()),
+            (2, 2),
+            "a changed card must upload exactly once more per arm"
+        );
+
+        // NON-VACUITY: each layer's absence must MOVE the armed bytes.
+        let base = armed_frame.expect("N runs produced a frame").pixels;
+        armed.set_bloom(false);
+        let no_bloom = armed.render_input(&mut armed_win, &input, Some(tray(card_a)));
+        assert_ne!(
+            no_bloom.pixels, base,
+            "bloom-off must change the armed frame — the in-place bloom pass \
+             painted nothing (vacuous differential)"
+        );
+        armed.set_bloom(true);
+        armed.set_shimmer(false);
+        let no_shimmer = armed.render_input(&mut armed_win, &input, Some(tray(card_a)));
+        assert_ne!(
+            no_shimmer.pixels, base,
+            "shimmer-off must change the armed frame — the in-place refract \
+             painted nothing (vacuous differential)"
+        );
+        armed.set_shimmer(true);
+        let no_tray = armed.render_input(&mut armed_win, &input, None);
+        assert_ne!(
+            no_tray.pixels, base,
+            "tray-off must change the armed frame — the card bake painted \
+             nothing (vacuous differential)"
+        );
+        eprintln!(
+            "armed readback-effects differential: byte-identical x {N} runs + \
+             changed-card run; bloom/shimmer/tray each proven live; card \
+             uploads (1 then 2) mirrored on both arms"
+        );
+    }
+
+    /// W6b — THE ARMED TAP-RING DIFFERENTIAL (the W5/W6a deferral "the
+    /// production VideoTap/PresentedFrameTap ring is wgpu-only", closed):
+    /// the PRODUCTION ring with METAL staging slots rides the armed §2
+    /// Submit B onto a REAL standalone first-party swapchain drawable — the
+    /// copy appended before commit, the harvest STATUS-POLLED off a probe
+    /// of that very command buffer — and every harvested frame must be
+    /// BYTE-IDENTICAL to the drawable bytes the same present produced
+    /// (which the present differentials already pin to wgpu). The one-shot
+    /// `PresentedFrameTap` arm captures the first present the same way.
+    ///
+    /// NON-VACUITY: three DIFFERENT inputs produce three DIFFERENT expected
+    /// byte sets (a ring replaying one stale frame cannot pass), the take
+    /// must hold exactly N frames with zero drops, and the recording is
+    /// proven to have ridden the armed arm (`metal_render_armed`).
+    #[test]
+    fn armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte() {
+        const N: usize = 3;
+        if device().is_none() {
+            return;
+        }
+        let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no renderer/font: {e}");
+                return;
+            }
+        };
+        armed.arm_metal_for_test();
+        armed.debug_block_on_lazy_fallbacks();
+        let mut win = WindowGpu::new();
+        let input_for = |i: usize| -> RenderInput {
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            term.process(format!("$ tap ring frame {i}\r\n").as_bytes());
+            term.process(format!("\x1b[3{}mpayload {}\x1b[0m", (i % 6) + 1, i * 37).as_bytes());
+            term.cell_frame(ROWS, COLS)
+        };
+        // Destination: letterboxed like the translucency differential, so
+        // the captured bytes include the bands.
+        let (fw, fh) = {
+            let f = armed.render_input(&mut win, &input_for(0), None);
+            (f.width as u32, f.height as u32)
+        };
+        let (dw, dh) = (fw + 9, fh + 7);
+        assert!(
+            armed.metal_render_armed(),
+            "the first frame must mint the arm"
+        );
+        armed
+            .video_begin_metal_standin_for_test(
+                &mut win,
+                dw,
+                dh,
+                crate::video_tap::CaptureOpts {
+                    half_res: false,
+                    budget_bytes: crate::video_tap::DEFAULT_BUDGET,
+                    fps_cap: None,
+                    requested_ms: 0,
+                },
+            )
+            .expect("armed ring begins");
+        armed
+            .presented_snapshot_begin_metal_standin_for_test(&mut win, dw, dh)
+            .expect("armed one-shot begins");
+        let mut presented: Vec<Vec<u8>> = Vec::new();
+        for i in 0..N {
+            let bytes = armed
+                .metal_present_bytes_for_test(&mut win, &input_for(i), (dw, dh), false)
+                .expect("armed present");
+            assert_eq!(bytes.len(), (dw * dh * 4) as usize);
+            armed.video_after_present(&mut win, (i as u64 + 1) * 1_000);
+            armed
+                .presented_snapshot_after_present(&mut win, (i as u64 + 1) * 1_000)
+                .expect("snapshot after-present");
+            presented.push(bytes);
+        }
+        assert_ne!(
+            presented[0], presented[1],
+            "non-vacuity: distinct inputs must present distinct bytes"
+        );
+        assert_ne!(presented[1], presented[2], "as above");
+        let take = armed.video_finish(&mut win).expect("a recording was live");
+        assert_eq!(
+            (take.frames.len(), take.dropped),
+            (N, 0),
+            "the armed ring must harvest every present with zero drops \
+             (frames={}, dropped={})",
+            take.frames.len(),
+            take.dropped
+        );
+        for (i, f) in take.frames.iter().enumerate() {
+            assert_eq!((f.w, f.h), (dw, dh), "frame {i} geometry");
+            assert_eq!(
+                f.rgba, presented[i],
+                "frame {i}: THE ARMED RING'S HARVEST IS NOT BYTE-IDENTICAL to \
+                 the Submit B destination it rode"
+            );
+        }
+        armed
+            .presented_snapshot_finish(&mut win)
+            .expect("one-shot finishes");
+        let snap = armed
+            .presented_snapshot_take(&mut win)
+            .expect("one-shot yields its frame");
+        assert_eq!(
+            snap.rgba, presented[0],
+            "the one-shot must capture the FIRST armed present byte-for-byte"
+        );
+        eprintln!(
+            "armed tap-ring differential: {N} status-polled harvests + the \
+             one-shot, all byte-identical to their Submit B destinations \
+             ({}x{} letterboxed)",
+            dw, dh
+        );
+    }
+
+    /// W6b — THE ARMED SCISSOR DIFFERENTIAL (the W6a deferral "scissored
+    /// dirty-row repaint on armed presents", closed): the SAME typed-then-
+    /// scrolled present sequence through the wgpu arm and the ARMED arm,
+    /// with the residency RE-KEYED onto the Metal offscreen
+    /// (`PresentPrev::on_metal`). Every step's presented bytes must be
+    /// byte-identical across the arms, AND the CADENCE must be identical:
+    /// same `scissor_taken`, same `full_repaints`, same `scroll_rescues` —
+    /// an armed arm that silently fell back to Full on every present (the
+    /// W6a behavior) fails the cadence assert by name.
+    ///
+    /// The E7 whole-row scroll rescue rides the same sequence
+    /// (`scroll_display` notches with the cursor hidden — the
+    /// scroll_blit_gpu fixture recipe), so the armed
+    /// `metal_shift_offscreen_band_px` rescue path is byte-verified too.
+    #[test]
+    fn armed_scissored_present_cadence_matches_wgpu_byte_for_byte() {
+        if device().is_none() {
+            return;
+        }
+        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                return;
+            }
+        };
+        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        wg.disarm_metal_for_test();
+        let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
+        armed.arm_metal_for_test();
+        for g in [&mut wg, &mut armed] {
+            g.debug_block_on_lazy_fallbacks();
+            // The scissor_repaint recipe: no wall-clock pass may run between
+            // the two arms' renders.
+            g.set_shimmer(false);
+        }
+        let mut wg_win = WindowGpu::new();
+        let mut armed_win = WindowGpu::new();
+
+        // Scrollback with overshooting glyphs (the E7 fixture recipe),
+        // cursor hidden so the rescue's cursor clause stays quiet.
+        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        term.process(b"\x1b[?25l");
+        for i in 0..60 {
+            term.process(format!("(|_gy) line {i} tail\r\n").as_bytes());
+        }
+
+        let mut step = 0u32;
+        let mut check = |wg: &mut GpuRenderer,
+                         armed: &mut GpuRenderer,
+                         wg_win: &mut WindowGpu,
+                         armed_win: &mut WindowGpu,
+                         input: &RenderInput,
+                         what: &str| {
+            let e = wg.present_input_readback(wg_win, input);
+            let a = armed.present_input_readback(armed_win, input);
+            assert!(armed.metal_render_armed(), "step {step}: arm live");
+            assert_eq!(
+                (e.width, e.height),
+                (a.width, a.height),
+                "step {step} ({what}): geometry diverged"
+            );
+            if e.pixels != a.pixels {
+                let diffs = e
+                    .pixels
+                    .iter()
+                    .zip(&a.pixels)
+                    .filter(|(x, y)| x != y)
+                    .count();
+                panic!(
+                    "step {step} ({what}): THE ARMED SCISSORED PRESENT IS NOT \
+                     BYTE-IDENTICAL to wgpu: {diffs} of {} px differ",
+                    e.pixels.len()
+                );
+            }
+            step += 1;
+        };
+
+        // Warm frame (Full on both), then three typed deltas (Dirty scissor
+        // on both), then six scroll notches (E7 rescue on both), then one
+        // more typed delta after the scroll (Dirty again).
+        let input = term.cell_frame(ROWS, COLS);
+        check(
+            &mut wg,
+            &mut armed,
+            &mut wg_win,
+            &mut armed_win,
+            &input,
+            "warm",
+        );
+        for t in 0..3 {
+            term.process(format!("k{t}").as_bytes());
+            let input = term.cell_frame(ROWS, COLS);
+            check(
+                &mut wg,
+                &mut armed,
+                &mut wg_win,
+                &mut armed_win,
+                &input,
+                "typed",
+            );
+        }
+        for _ in 0..3 {
+            term.scroll_display(2);
+            let input = term.cell_frame(ROWS, COLS);
+            check(
+                &mut wg,
+                &mut armed,
+                &mut wg_win,
+                &mut armed_win,
+                &input,
+                "scroll",
+            );
+        }
+        for _ in 0..3 {
+            term.scroll_display(-1);
+            let input = term.cell_frame(ROWS, COLS);
+            check(
+                &mut wg,
+                &mut armed,
+                &mut wg_win,
+                &mut armed_win,
+                &input,
+                "scroll-back",
+            );
+        }
+
+        // THE CADENCE MIRROR — and the scissor's non-vacuity.
+        assert_eq!(
+            (wg.scissor_taken(), wg.full_repaints(), wg.scroll_rescues()),
+            (
+                armed.scissor_taken(),
+                armed.full_repaints(),
+                armed.scroll_rescues()
+            ),
+            "the armed arm's repaint cadence diverged from wgpu's \
+             (wgpu scissor/full/rescue vs armed)"
+        );
+        assert!(
+            armed.scissor_taken() >= 3,
+            "non-vacuity: the typed deltas must take the scissor on the armed \
+             arm (took {} of >= 3)",
+            armed.scissor_taken()
+        );
+        assert!(
+            armed.scroll_rescues() >= 2,
+            "non-vacuity: the scroll notches must take the E7 rescue on the \
+             armed arm (took {} of >= 2)",
+            armed.scroll_rescues()
+        );
+        eprintln!(
+            "armed scissor differential: {} steps byte-identical; cadence \
+             scissor={} full={} rescues={} on BOTH arms",
+            step,
+            armed.scissor_taken(),
+            armed.full_repaints(),
+            armed.scroll_rescues()
+        );
+    }
+
+    /// W6b — SUBMIT-A PIPELINING, armed and byte-verified (the W6a deferral
+    /// "every Submit A is waited", closed): N frames through the armed
+    /// PRODUCTION path must stay byte-identical to wgpu while the arm
+    /// provably (a) HOLDS each frame's Submit A in flight at return — the
+    /// pipelining itself — and (b) WAITS exactly the previous one at the
+    /// top of the next frame's staging, before any shared-storage rewrite
+    /// (the discipline). A regression that quietly re-waits every submit
+    /// fails (b)'s growth pattern check... by staying byte-identical but
+    /// never holding an in-flight handle, which fails (a) by name.
+    #[test]
+    fn armed_submit_a_pipelines_and_stays_byte_identical() {
+        const N: usize = 6;
+        if device().is_none() {
+            return;
+        }
+        let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                return;
+            }
+        };
+        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        wg.disarm_metal_for_test();
+        let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
+        armed.arm_metal_for_test();
+        wg.debug_block_on_lazy_fallbacks();
+        armed.debug_block_on_lazy_fallbacks();
+        let mut wg_win = WindowGpu::new();
+        let mut armed_win = WindowGpu::new();
+        for i in 0..N {
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            term.process(format!("$ pipeline frame {i}\r\n").as_bytes());
+            term.process(format!("\x1b[3{}mrow {}\x1b[0m tail", (i % 6) + 1, i * 13).as_bytes());
+            let input = term.cell_frame(ROWS, COLS);
+            let expected = wg.render_input(&mut wg_win, &input, None);
+            let actual = armed.render_input(&mut armed_win, &input, None);
+            assert_eq!(
+                expected.pixels, actual.pixels,
+                "frame {i}: bytes diverged under pipelining"
+            );
+            let (inflight, awaited) = armed.metal_pipeline_probe_for_test();
+            assert!(
+                inflight,
+                "frame {i}: Submit A must be HELD IN FLIGHT at return — the \
+                 pipelining is not live"
+            );
+            assert_eq!(
+                awaited, i as u64,
+                "frame {i}: the staging wait must have consumed exactly the \
+                 prior frames' submits (the shared-storage discipline)"
+            );
+        }
+        eprintln!(
+            "armed pipelining: {N} frames byte-identical; Submit A held in \
+             flight each frame; staging awaited exactly N-1 priors"
+        );
+    }
+
+    /// W6b — THE MULTI-WINDOW STALE-LAYER DISARM EDGE (W6a deferral 7,
+    /// closed and ARMED): window A attaches its armed swapchain under its
+    /// parent layer (the REAL `metal_attach_surface`); window B's attach
+    /// FAILS (no parent layer) and DISARMS the renderer; window A's next
+    /// present runs the disarm sweep, which must DROP its armed surface —
+    /// and `Swapchain::drop`'s `removeFromSuperlayer` discipline must leave
+    /// A's parent with ZERO sublayers, so the wgpu layer underneath
+    /// presents visibly instead of under a stale Metal frame.
+    ///
+    /// NON-VACUITY: the attach really parented (1 sublayer before the
+    /// disarm), the disarm really happened (`metal_render_armed` flips),
+    /// and the sweep is a no-op for a window that never armed.
+    #[test]
+    fn a_disarm_unparents_the_previously_armed_windows_stale_layer() {
+        if device().is_none() {
+            return;
+        }
+        let _pool = ffi::AutoreleasePool::new();
+        let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no renderer/font: {e}");
+                return;
+            }
+        };
+        armed.arm_metal_for_test();
+        armed.debug_block_on_lazy_fallbacks();
+        let mut win = WindowGpu::new();
+        // Mint the arm (attach requires it live).
+        let input = representative_input();
+        let _ = armed.render_input(&mut win, &input, None);
+        assert!(armed.metal_render_armed(), "arm minted");
+
+        // Window A's parent layer (the winit view-layer stand-in) + attach.
+        let parent = plain_calayer();
+        let ms = armed
+            .metal_attach_for_test(Some(&parent), 64, 48)
+            .expect("window A's armed attach succeeds under a live parent");
+        assert_eq!(
+            sublayer_count(&parent),
+            1,
+            "non-vacuity: the armed swapchain is PARENTED under window A"
+        );
+        let mut a_metal = Some(ms);
+
+        // While ARMED, the sweep must not touch window A's surface.
+        armed.metal_disarm_sweep(&mut a_metal);
+        assert!(
+            a_metal.is_some() && sublayer_count(&parent) == 1,
+            "the sweep is a no-op while the renderer is armed"
+        );
+
+        // Window B's attach fails (no parent layer) — THE DISARM.
+        assert!(
+            armed.metal_attach_for_test(None, 64, 48).is_none(),
+            "window B's attach must fail without a parent layer"
+        );
+        assert!(
+            !armed.metal_render_armed(),
+            "non-vacuity: the failed attach must DISARM the renderer"
+        );
+
+        // Window A's next present: the sweep drops the armed surface and
+        // the Drop discipline unparents the stale layer.
+        armed.metal_disarm_sweep(&mut a_metal);
+        assert!(
+            a_metal.is_none(),
+            "the disarm sweep must drop window A's armed swapchain"
+        );
+        assert_eq!(
+            sublayer_count(&parent),
+            0,
+            "THE STALE LAYER MUST BE UNPARENTED: window A's parent still \
+             holds a sublayer after the disarm sweep — the wgpu frame \
+             underneath would present invisibly"
+        );
+
+        // A window that never armed: the sweep stays a no-op.
+        let mut never_armed: Option<crate::metal::present::MetalWindowSurface> = None;
+        armed.metal_disarm_sweep(&mut never_armed);
+        assert!(never_armed.is_none());
+        eprintln!(
+            "disarm edge: attach parented, failed attach disarmed, the sweep \
+             unparented the stale layer (sublayers 1 -> 0)"
+        );
+    }
+
+    /// The disarm-edge test's CALayer helpers (the swapchain stacking
+    /// tests' recipe, local to this module's tests).
+    fn plain_calayer() -> ffi::Obj {
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: alloc/init, +1, exactly as `Swapchain::new_layer`.
+        unsafe {
+            let alloc: unsafe extern "C" fn(ffi::ClassPtr, ffi::Sel) -> ffi::Id = ffi::msg();
+            let raw = alloc(ffi::class(c"CALayer"), ffi::sel(c"alloc"));
+            let init: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            ffi::Obj::from_owned(init(raw, ffi::sel(c"init"))).expect("CALayer init")
+        }
+    }
+
+    fn sublayer_count(layer: &ffi::Obj) -> usize {
+        let _pool = ffi::AutoreleasePool::new();
+        // SAFETY: `sublayers` returns a +0 NSArray (or nil) owned by the
+        // pool; `count` is an NSUInteger getter on it.
+        unsafe {
+            let get: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+            let arr = get(layer.id(), ffi::sel(c"sublayers"));
+            if arr.is_null() {
+                return 0;
+            }
+            let count: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> usize = ffi::msg();
+            count(arr, ffi::sel(c"count"))
+        }
+    }
+
     /// W6a — THE ARMED PRESENT DIFFERENTIAL, and THE TRANSLUCENT HOLE
     /// (map §6, judged W6 hole 1): `background_opacity` -> the present path
     /// -> PRESENTED BYTES, end to end, with a GENUINELY TRANSLUCENT
@@ -3109,6 +3914,8 @@ mod tests {
                     return;
                 }
             };
+            // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+            wg.disarm_metal_for_test();
             wg.set_background_opacity(opacity);
             let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
             armed.arm_metal_for_test();
@@ -3214,6 +4021,8 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; the ORACLE twin disarms.
+        wg.disarm_metal_for_test();
         let mut armed = GpuRenderer::new(18.0, Theme::default()).expect("second renderer");
         armed.arm_metal_for_test();
         let mut wg_win = WindowGpu::new();
@@ -3340,6 +4149,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         // Bloom and shimmer are PRESENT-time layers (rows 12/13, W5); the
         // encode-plan replay compares the offscreen before them.
         gpu.set_bloom(false);
@@ -3793,6 +4605,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
         let mut win = WindowGpu::new();
@@ -3990,6 +4805,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
         let mut win = WindowGpu::new();
@@ -4154,6 +4972,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         gpu.set_shimmer_phase_for_test(Some(0.37));
         gpu.set_sdr_glow_boost(0.0);
         let (cw, ch) = gpu.cell_size();
@@ -4396,6 +5217,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         const W: usize = 18;
         const H: usize = 14;
         const BW: usize = 9;
@@ -4529,6 +5353,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         const W: usize = 24;
         const H: usize = 16;
         const REGION: [u32; 4] = [4, 2, 20, 12];
@@ -4709,6 +5536,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         const W: usize = 20;
         const H: usize = 14;
         const OFF: [f32; 2] = [3.0, 2.0];
@@ -4890,6 +5720,9 @@ mod tests {
                 return;
             }
         };
+        // THE FLIP: construct-time selection is Metal; this ladder test drives
+        // the wgpu ORACLE arm explicitly, so it disarms the flipped default.
+        gpu.disarm_metal_for_test();
         const W: usize = 20;
         const H: usize = 12;
         const PW: usize = 8;

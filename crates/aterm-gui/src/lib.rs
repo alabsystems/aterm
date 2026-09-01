@@ -5578,6 +5578,9 @@ impl Lease {
 
 pub struct SessionCtx {
     pub sink: Arc<SinkWriter>,
+    /// Accepted-input evidence shared by every input capability for this PTY,
+    /// including direct cross-session control writes and every visible view.
+    pub(crate) output_echo: Arc<crate::app_input::OutputEchoTracker>,
     pub edges: std::sync::Mutex<EdgeTable>,
     pub self_id: SessionId,
     pub nonce: LaunchNonce,
@@ -8171,6 +8174,12 @@ struct WindowState {
     /// design §6.3), copied into `input_scratch.nova_add` (resident → no
     /// per-frame alloc while novas animate).
     nova_scratch: Vec<aterm_render::GlowQuad>,
+    /// Heterogeneous PRISM WAKE output staged by the current `Advance` frame.
+    /// It becomes capture authority only at the successful-present seam.
+    heterogeneous_output_streak_staged: Vec<aterm_render::GlowQuad>,
+    /// Last successfully presented heterogeneous PRISM WAKE stream. A
+    /// `Retain` capture copies this verbatim and never touches engine state.
+    heterogeneous_output_streak_presented: Vec<aterm_render::GlowQuad>,
     /// PANE-LOCAL sparkle output while composing a split frame: one pane's
     /// tick emits here, the `translate_*_into_pane` helpers shift it into
     /// window coords, and it is APPENDED to the four `*_scratch` accumulators
@@ -8184,14 +8193,17 @@ struct WindowState {
     /// on master-off / layout-space change. `set_config` on hot reload keeps
     /// the tick epoch.
     matrix_rain: Option<Box<matrix_rain::MatrixRain>>,
-    /// PRISM WAKE, per PANE — the COMPOSED path's engines, keyed by session.
+    /// PRISM WAKE, per PANE — the COMPOSED path's engines, keyed by
+    /// `(session, visible-pane index)`. The index keeps two canonical views of
+    /// one session independent instead of letting the first consume the
+    /// second's arrival token.
     /// A split shows several live terminals at once and each carries its own
     /// arrival clock, so one engine per window would blend their streams into
     /// nonsense (and let a chatty pane spend the quiet pane's spawn budget).
     /// Pruned against the visible plan beside `unfocused_pane_scratch`, the
     /// `retain_panes` discipline: a closed pane's engine cannot outlive it.
     /// The single-pane present uses `output_streak` below instead.
-    output_streak_panes: std::collections::BTreeMap<u64, output_streak::OutputStreak>,
+    output_streak_panes: std::collections::BTreeMap<(u64, usize), output_streak::OutputStreak>,
     /// PRISM WAKE — the output streak. Built LAZILY at the first enabled tick
     /// (the same zero-cost pin as `matrix_rain`: an off config constructs no
     /// engine at all) and dropped on master-off. Appends its light to
@@ -8441,6 +8453,10 @@ struct WindowState {
     /// making the vector provenance for that successful frame rather than for
     /// an earlier or dropped layout.
     capture_leaf_snapshot_seqs: Vec<u64>,
+    /// Content-only generation paired one-for-one with
+    /// `capture_leaf_snapshot_seqs`, captured under the same terminal hold as
+    /// each committed leaf. Damage-only repaints cannot advance this clock.
+    capture_leaf_content_seqs: Vec<u64>,
     /// Leading edge of the newest output burst that has not yet seeded a sparkle
     /// rescan. Headless has no present loop, so its first `image` capture consumes
     /// this to reconstruct the birth tick before sampling the effect at capture
@@ -8535,8 +8551,10 @@ struct WindowState {
     /// between the old probe/extract locks from pairing A effects with B cells,
     /// without adding a steady-state allocation.
     composed_focus_scratch: RenderInput,
-    /// One PERSISTENT snapshot buffer per UNFOCUSED terminal pane, keyed by
-    /// session id. The compose pass-2 loop used to refill a single shared
+    /// One PERSISTENT snapshot buffer per UNFOCUSED visible pane, keyed by its
+    /// pane index in the frame's canonical order. A session may have multiple
+    /// visible views, so session identity alone cannot own a snapshot. The
+    /// compose pass-2 loop used to refill a single shared
     /// `pane_scratch` for every background pane in turn, so a strip of panes
     /// with DIFFERENT row/col counts shrank+grew that one buffer's `Vec`-of-
     /// rows on every presented frame — `cell_frame_fill`'s `resize_with` drops
@@ -8547,7 +8565,7 @@ struct WindowState {
     /// continuity (so the damage-scoped refill's scoped arm can fire on splits,
     /// which a cross-terminal shared buffer can never do). Pruned to the live
     /// pane set after each compose, like `leaf_render_cache`.
-    unfocused_pane_scratch: std::collections::BTreeMap<u64, RenderInput>,
+    unfocused_pane_scratch: std::collections::BTreeMap<usize, RenderInput>,
     /// Pane-indexed title/blank observations paired with the pure compositor's
     /// pass-1 resident snapshots. Refilled without reallocating; pass 2 is then
     /// host-only and cannot refresh terminal state after DEC authorization.
@@ -9335,6 +9353,27 @@ impl WindowState {
         self.deco_anim_until.is_some_and(|until| now < until) && self.front_terminal().is_some()
     }
 
+    /// Earliest exact PRISM WAKE transition across the single-pane engine and
+    /// the composed-pane engines for the route currently on glass. A visible
+    /// comet answers `now` and therefore stays on frame cadence; once the glass
+    /// is clear, an open episode answers only its earliest exact idle/Settle
+    /// transition so the window can park. State retained by the hidden route is
+    /// excluded: it is not ticked and therefore must never pin an immediate
+    /// wake forever.
+    fn output_streak_next_change_deadline(&self, now: Instant, idle_secs: f32) -> Option<Instant> {
+        self.front_terminal()?;
+        if !self.is_split() {
+            return self
+                .output_streak
+                .as_deref()
+                .and_then(|engine| engine.next_change_deadline(now, idle_secs));
+        }
+        self.output_streak_panes
+            .values()
+            .filter_map(|engine| engine.next_change_deadline(now, idle_secs))
+            .min()
+    }
+
     /// THE TERMINAL-EFFECTS LANE'S WHOLE PARK DECISION, for one window, in one
     /// place: which of the three arms this park takes, what it leaves in
     /// `next_trail_tick`, and the deadline (if any) it owes the fold.
@@ -9357,13 +9396,14 @@ impl WindowState {
     ///    `next_trail_tick`.
     /// 2. A previously armed cursor-effect settle present whose focus/typed
     ///    wake expired before its deadline fired.
-    /// 3. The reduced-motion cat's bounded one-shot erase.
+    /// 3. An exact one-shot: the reduced-motion cat's bounded erase or PRISM
+    ///    WAKE's analytic episode-settle crossing.
     /// 4. PARK — drop every clock in this lane; the loop returns to pure `Wait`.
     ///
     /// Arm 1 preempts arm 3, and that asymmetry is safe in the direction it goes:
     /// arm 1 is the FRAME cadence, strictly finer than arm 3's bounded one-shot,
-    /// so a pending reduced-motion erase can only land earlier, never later. Once
-    /// the decorations rest, arm 3 re-arms the one-shot exactly as before.
+    /// so a pending erase/settle can only land earlier, never later. Once the
+    /// decorations rest, arm 3 re-arms the exact one-shot.
     #[cfg(test)]
     fn plan_terminal_effect_lane(
         &mut self,
@@ -9371,7 +9411,13 @@ impl WindowState {
         cursor_cat_motion: bool,
         has_glass: bool,
     ) -> Option<Instant> {
-        self.plan_terminal_effect_lane_with_recording(now, cursor_cat_motion, has_glass, false)
+        self.plan_terminal_effect_lane_with_recording(
+            now,
+            cursor_cat_motion,
+            has_glass,
+            false,
+            10.0,
+        )
     }
 
     fn plan_terminal_effect_lane_with_recording(
@@ -9380,6 +9426,7 @@ impl WindowState {
         cursor_cat_motion: bool,
         has_glass: bool,
         recording_watcher: bool,
+        output_streak_idle_secs: f32,
     ) -> Option<Instant> {
         // M2 stream fade shares the frame-paced wake: while any ink is still
         // drying (or the LAST present painted a tint that must be settled to
@@ -9397,6 +9444,9 @@ impl WindowState {
         // this decoration armed. See `deco_anim_until` for the freeze that taught
         // us the difference.
         let deco_wake = self.deco_anim_frame_active(now);
+        let streak_deadline = has_glass
+            .then(|| self.output_streak_next_change_deadline(now, output_streak_idle_secs))
+            .flatten();
         // LUMEN cursor aurora: while any light is alive on a focused window,
         // re-present so the comet/bloom/ring/sparks animate, then disarm (→ pure
         // `Wait`, 0% idle) the moment they decay to nothing. Coarse-only effects
@@ -9507,11 +9557,17 @@ impl WindowState {
             // manufacture a wake train, so the following park remains 0%-idle.
             Some(d)
         } else if has_glass
-            && let Some(d) =
-                self.static_cursor_cat_deadline(now, cursor_cat_motion, recording_watcher)
+            && let Some(d) = match (
+                streak_deadline,
+                self.static_cursor_cat_deadline(now, cursor_cat_motion, recording_watcher),
+            ) {
+                (Some(streak), Some(cat)) => Some(streak.min(cat)),
+                (streak, cat) => streak.or(cat),
+            }
         {
-            // One bounded hold, one erase wake. No frame cadence and no bob/fade
-            // work under reduced motion.
+            // One exact one-shot: either PRISM WAKE's analytic episode-settle
+            // crossing or the reduced-motion cat's bounded erase. Neither
+            // keeps frame cadence alive while its pixels are stationary.
             self.next_trail_tick = Some(d);
             Some(d)
         } else {
@@ -9622,6 +9678,8 @@ impl WindowState {
         self.ink_scratch.clear();
         self.free_scratch.clear();
         self.nova_scratch.clear();
+        self.heterogeneous_output_streak_staged.clear();
+        self.heterogeneous_output_streak_presented.clear();
         self.rain_scratch.clear();
         self.rain_add_scratch.clear();
         self.rain_hidden_band.clear();
@@ -10089,6 +10147,8 @@ impl WindowState {
             ink_scratch: Vec::new(),
             free_scratch: Vec::new(),
             nova_scratch: Vec::new(),
+            heterogeneous_output_streak_staged: Vec::new(),
+            heterogeneous_output_streak_presented: Vec::new(),
             pane_deco: Vec::new(),
             pane_ink: Vec::new(),
             pane_free: Vec::new(),
@@ -10129,6 +10189,7 @@ impl WindowState {
             capture_client_requested: false,
             capture_present_client: None,
             capture_leaf_snapshot_seqs: Vec::new(),
+            capture_leaf_content_seqs: Vec::new(),
             pending_deco_birth: None,
             redraw_pending: false,
             present_retry: PresentRetry::default(),
@@ -17666,6 +17727,7 @@ impl ApplicationHandler<Wake> for App {
         let rain_tick_interval = self
             .rain
             .map(|c| Duration::from_millis(1000 / u64::from(c.fps)));
+        let output_streak_idle_secs = self.config.output_streak_idle_secs_or_default();
         let native_preview_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
         for (id, ws) in self.windows.iter_mut() {
             // Input hinting is shared with normal mode and may have charged a cursor
@@ -17874,6 +17936,7 @@ impl ApplicationHandler<Wake> for App {
                 cursor_cat_motion,
                 has_glass,
                 native_preview_recording_window == Some(*id),
+                output_streak_idle_secs,
             ) {
                 fold_owned_deadline(
                     &mut deadline,
@@ -24392,6 +24455,7 @@ fn stub_session(id: u64) -> Session {
 fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
     let ctx = Arc::new(SessionCtx {
         sink,
+        output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         edges: std::sync::Mutex::new(EdgeTable::new()),
         turn_lease: std::sync::Mutex::new(None),
         self_id: SessionId::generate(),
@@ -31534,10 +31598,16 @@ mod early_out_tests {
     fn split_compose_recovery_bypasses_identical_key_at_shipping_callsite() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // Split through the APP, not by reaching into `ws.layouts` directly.
+        // The direct form left `tab_set` unsplit, and `redraw_compose` resolves
+        // its plan from `tab_set` (`active_visible_leaf_plan`) — so the fixture
+        // built a window that had a split in one model and not in the other, and
+        // the very first compose returned `None`. The test then failed on its
+        // own setup, one assertion before the property it exists to check. The
+        // sibling test directly below it already used this call.
+        app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Vertical);
         let (rows, cols) = {
-            let ws = app.windows.get_mut(&wid).expect("fixture window");
-            let active = ws.tabs.active;
-            assert!(ws.layouts[active].split_focused(crate::pane::SplitDir::Vertical, 0));
+            let ws = app.windows.get(&wid).expect("fixture window");
             (usize::from(ws.rows), usize::from(ws.cols))
         };
         let now = std::time::Instant::now();
@@ -33864,6 +33934,7 @@ mod session_pool_tests {
         let self_id = SessionId::generate();
         let ctx = Arc::new(SessionCtx {
             sink: Arc::new(SinkWriter::new(-1)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id,
@@ -35699,9 +35770,24 @@ mod spec_xref_gate {
         // `spec-link: harness manifest ...` line. That auxiliary record is not a
         // second primary header and must not invalidate an honest DesignOnly report.
         let live_modules = registered_modules();
+        // The count is a TRIPWIRE, not a gate: this test checks the report SHAPE
+        // against the live set, and the number exists so the fixture cannot
+        // silently stop being representative. Bumping it is the sanctioned
+        // response — but only after checking that the growth is a new machine
+        // and not the same one twice, which is the failure a bare count hides
+        // (and which `duplicate_coverage` two blocks up exists to refuse).
+        let mut names: Vec<&str> = live_modules.iter().map(SpecModule::name).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
         assert_eq!(
-            live_modules.len(),
-            147,
+            names.len(),
+            total,
+            "the module registry contains a DUPLICATE machine name; the count \
+             below would have absorbed it"
+        );
+        assert_eq!(
+            total, 148,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(

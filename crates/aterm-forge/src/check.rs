@@ -53,6 +53,7 @@
 //! | `[OB-13]` | every CARVED path is still absent | `vendor/forge.toml` `[[carved]]` |
 //! | `[OB-14]` | the measured surface conforms to its ratchet | `tools/forge-budget.tsv` |
 //! | `[OB-15]` | no `[patch]` CAPTURES a differential oracle | `[dev-dependencies]` + `Cargo.lock` |
+//! | `[OB-16]` | the mirror's `[source]` fragment and `Cargo.lock` agree, and a present mirror covers the lock | [`crate::mirror_config`] + [`crate::mirror`] |
 //!
 //! # What it deliberately does NOT re-check
 //!
@@ -64,6 +65,7 @@
 //! Re-implementing either here would give the repository two definitions of one
 //! obligation and no way to say which is authoritative.
 
+use crate::mirror_config::{self, Finding};
 use crate::model::{Cell, Graph, PkgId};
 use crate::{Outcome, PRECISION_NOTE, attest, budget, resolve};
 use aterm_census::scan_set::{REVIEWED_VENDORED_CRATES, VendoredMode};
@@ -680,6 +682,59 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         }
     }
 
+    // -- [OB-16] the mirror -----------------------------------------------------
+    // TODO(mirror-gate-wiring) DISCHARGED. The mirror is not load-bearing yet:
+    // no default is flipped and the directory is not in this tree. That is
+    // exactly why the obligation is worth carrying NOW — it is the state in
+    // which the fragment can drift from the lock with nothing to notice, and
+    // the drift would first be visible in a public snapshot nobody can rebuild.
+    let _ = writeln!(
+        log,
+        "  [OB-16] MIRROR HONESTY — the shippable `[source]` fragment agrees with Cargo.lock, \
+         and a mirror that IS present covers it:"
+    );
+    let mut mirror_fails = 0usize;
+    // The mirror's rows are judged against this machine's cargo cache when it
+    // has one — the gate runs where that cache exists, which is exactly where
+    // an edited `deps`/`features` row is still catchable.
+    for finding in mirror_config::audit(root, &crate::mirror::RowAnchor::discover()) {
+        match finding {
+            Finding::Fail(why) => {
+                mirror_fails += 1;
+                let _ = writeln!(log, "  ✗ FAIL [OB-16] {why}");
+            }
+            Finding::Note(what) => {
+                notes += 1;
+                let _ = writeln!(log, "    • NOTE [OB-16] {what}");
+            }
+        }
+    }
+    fails += mirror_fails;
+    if mirror_fails == 0 {
+        let _ = writeln!(
+            log,
+            "    OK — nothing in this tree claims a mirror it does not have."
+        );
+    }
+    // The limits, stated in the gate's own output rather than in a doc nobody
+    // reads next to the verdict. An obligation that does not say what it
+    // leaves unproven is read as proving everything.
+    let _ = writeln!(
+        log,
+        "    • NOTE [OB-16 scope] this proves AGREEMENT WITH `Cargo.lock` plus, where this \
+         machine has a cargo cache, that each mirrored index row is UPSTREAM'S OWN BYTES — \
+         `deps` and `features` included, which no checksum in a mirror covers. It does NOT \
+         prove the tarballs are upstream's (a lock written against a compromised registry \
+         mirrors that compromise faithfully, with every checksum matching); on a machine with \
+         NO cargo cache the row comparison degrades to Cargo.lock's resolved dependency edges, \
+         which record no features at all, and the verify report says how many rows it could \
+         anchor; it does NOT prove any build actually USED a mirror, because nothing here \
+         flips a default; it does NOT verify a bundle (`cargo forge mirror check-bundle`) or \
+         any signature — signing and delivery are the owner's ceremony, \
+         TODO(mirror-delivery-atpkg); and it runs no cargo and no network, so upstream yank \
+         status is outside it entirely."
+    );
+
     // -- verdict --------------------------------------------------------------
     // Counted separately in the verdict because they are separate things: a
     // fork is third-party source under standing review, a first-party target
@@ -1127,8 +1182,10 @@ mod tests {
             [
                 ("arrayvec", "crates/aterm-arrayvec"),
                 ("cfg-if", "crates/aterm-cfg-if"),
+                ("core_maths", "crates/aterm-core-maths"),
                 ("libc", "crates/aterm-libc"),
                 ("log", "crates/aterm-log-shim"),
+                ("once_cell", "crates/aterm-once-cell"),
                 ("profiling", "crates/aterm-profiling"),
                 ("tracing", "crates/aterm-tracing"),
             ]
@@ -1398,7 +1455,14 @@ reason = \"no arch intrinsics reach the shipped build\"
                 "a RED report carries the precision note"
             );
         }
-        for tag in ["[OB-1..OB-10]", "[OB-11]", "[OB-12]", "[OB-13]", "[OB-14]"] {
+        for tag in [
+            "[OB-1..OB-10]",
+            "[OB-11]",
+            "[OB-12]",
+            "[OB-13]",
+            "[OB-14]",
+            "[OB-16]",
+        ] {
             assert!(
                 log.contains(tag),
                 "every obligation must report; `{tag}` did not:\n{log}"
@@ -1504,5 +1568,31 @@ reason = \"no arch intrinsics reach the shipped build\"
                 e.path
             );
         }
+    }
+
+    /// THE ORACLE SHAPE OB-15 CANNOT SEE, pinned by name. The W6b flip moved
+    /// the wgpu differential oracle out of every dev-dependency table: it is
+    /// now an OPTIONAL NORMAL dependency of aterm-gpu behind the
+    /// `wgpu-oracle` feature, activated only by aterm-gpu's target-gated
+    /// SELF-dev-dependency. `dev_dependency_oracles` scans dev-dep tables, so
+    /// a future `[patch.crates-io] wgpu` row would capture that oracle with
+    /// OB-15 silent — the exact trap OB-15 exists for, in a shape its scanner
+    /// is structurally blind to (judged at the flip). Until the scanner
+    /// learns feature-activated oracles, this pin refuses the patch row
+    /// directly.
+    #[test]
+    fn the_wgpu_oracle_rides_a_shape_ob15_cannot_see_so_the_patch_row_is_pinned_shut() {
+        let root = repo_root();
+        let (forks, _) = read_manifest_patches(&root).expect("root manifest reads");
+        assert!(
+            !forks.iter().any(|e| e.name == "wgpu"),
+            "[patch.crates-io] carries a `wgpu` row. The wgpu differential \
+             oracle is a feature-activated optional dep (aterm-gpu's \
+             `wgpu-oracle`, enabled by its self-dev-dependency) — OB-15's \
+             dev-dep scanner cannot see it, so this patch would point the \
+             oracle at the implementation it exists to check and NOTHING \
+             would go red. Teach `dev_dependency_oracles` the \
+             feature-activated shape and arm it before removing this pin."
+        );
     }
 }

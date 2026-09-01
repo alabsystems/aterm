@@ -1,3 +1,5 @@
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
 //! Window startup notification to handle window raising.
 //!
 //! The [`ActivationToken`] is essential to ensure that your newly

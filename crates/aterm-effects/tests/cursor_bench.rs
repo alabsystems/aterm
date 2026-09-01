@@ -338,13 +338,13 @@ fn bench_cursor_water_outlier_jump() {
     const JUMP_ITERATIONS: usize = 200;
     // A 4,095-cell diagonal is tail-capped at MAX_SPARKS=512 resident path
     // samples; appending the live destination makes 512 adjacent segments.
-    // Water rasterizes both its undertow and crest across every segment, so
-    // even the 1 px hostile geometry must produce at least one clipped quad
-    // per layer per segment. The shared per-stream upload ceiling is
+    // Water rasterizes both its undertow and crest across every segment into
+    // the UNDER-INK stream, so even the 1 px hostile geometry must produce at
+    // least one clipped quad per layer per segment. The shared per-stream upload ceiling is
     // CursorGlow::MAX_QUADS=16,384 (private production constants, repeated
     // here deliberately so a cap change must be reviewed against this gate).
-    const MIN_OVER_QUADS: usize = 2 * 512;
-    const MAX_OVER_QUADS: usize = 16_384;
+    const MIN_UNDER_QUADS: usize = 2 * 512;
+    const MAX_STREAM_QUADS: usize = 16_384;
     let config = config(GlowStyle::Water);
     let geometry = Geom {
         cw: 1,
@@ -402,22 +402,20 @@ fn bench_cursor_water_outlier_jump() {
          under quads {min_under_quads}..={max_under_quads}"
     );
     assert!(
-        min_over_quads >= MIN_OVER_QUADS,
+        min_under_quads >= MIN_UNDER_QUADS,
         "authenticated 4,095-cell water jump emitted too little wake: \
-         over quads {min_over_quads}..={max_over_quads}, expected every frame >= \
-         {MIN_OVER_QUADS}"
+         under quads {min_under_quads}..={max_under_quads}, expected every frame >= \
+         {MIN_UNDER_QUADS}"
     );
     assert!(
-        max_over_quads <= MAX_OVER_QUADS,
-        "authenticated 4,095-cell water jump exceeded the per-stream cap: \
-         over quads {min_over_quads}..={max_over_quads}, expected every frame <= \
-         {MAX_OVER_QUADS}"
+        max_under_quads < MAX_STREAM_QUADS && max_over_quads < MAX_STREAM_QUADS,
+        "authenticated 4,095-cell water jump saturated a per-stream cap: \
+         under {min_under_quads}..={max_under_quads}, over \
+         {min_over_quads}..={max_over_quads}, expected each < {MAX_STREAM_QUADS}"
     );
-    assert_eq!(
-        (min_under_quads, max_under_quads),
-        (0, 0),
-        "Water owns only the over-ink stream; unexpected under-ink quads across \
-         the run (min, max)"
+    assert!(
+        min_over_quads > 0,
+        "every synthetic jump frame must retain Water's over-ink splash accents"
     );
     assert!(
         p90.as_micros() < 2_000,

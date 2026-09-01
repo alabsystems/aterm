@@ -29,6 +29,15 @@ aterm-toml = { workspace = true }
 # uses, and `REVIEWED_VENDORED_CRATES` itself — read directly rather than
 # re-parsed, so the vendor registry has exactly one definition.
 aterm-census = { workspace = true }
+# The mirror generator's one hash: sha256 over `.crate` bytes, compared
+# against `Cargo.lock` and the emitted index rows. First-party — the plan
+# (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1 build order) names this exact
+# addition; the `sha2` this crate once declared-but-never-used is long gone.
+aterm-digest = { workspace = true }
+# Parse cargo's registry metadata as JSON before trusting any identity or
+# checksum field. The raw row is still emitted byte-for-byte (apart from the
+# deliberate yanked rewrite), so this is validation rather than regeneration.
+aterm-json = { workspace = true }
 
 [lints]
 workspace = true

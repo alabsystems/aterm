@@ -1100,7 +1100,7 @@ impl crate::control::WireRetention for CaptureReplyRetention {
 impl Drop for CaptureReplyRetention {
     fn drop(&mut self) {
         if self.committed {
-            crate::control_auth::prune_automatic_image_dir(&self.target);
+            crate::control_auth::ConfinedImage::arm_automatic_prune(&self.target);
         } else if let Some(file) = self.file.take() {
             let _ = file.remove_exact();
         }
@@ -1134,6 +1134,9 @@ fn send_capture_reply_after_validation<T: Send>(
     // another capture cannot replace/prune the advertised identity before the
     // client consumes OK. The shared namespace advisory lock also excludes
     // same-uid explicit-name replacement across processes.
+    // The file pins the inode; the lease pins its advertised name. Both remain
+    // live through ACK so a later capture cannot replace the path after OK but
+    // before the client opens it.
     let guard = CaptureReplyRetention {
         target,
         file: Some(file),
@@ -2400,24 +2403,43 @@ impl App {
         now: Instant,
         exact_focus: crate::app_render::TerminalCaptureFocus,
     ) {
-        let Some(rects) = self
-            .active_tree(wid)
-            .zip(self.windows.get(&wid))
-            .map(|(tree, ws)| tree.compute_layout(ws.rows, ws.cols))
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return;
+        };
+        let Some(focus_index) = plan
+            .leaves
+            .iter()
+            .position(|leaf| leaf.focused && leaf.view == exact_focus.view)
         else {
             return;
         };
-        let Some(focus) = self.active_tree(wid).map(crate::pane::PaneTree::focus) else {
-            return;
-        };
+        let focus = exact_focus.session;
         let panes: Vec<(
             crate::pane::PaneRect,
             std::sync::Arc<std::sync::Mutex<Terminal>>,
-        )> = rects
+        )> = plan
+            .leaves
             .iter()
-            .filter_map(|r| self.pool.get(r.session).map(|s| (*r, s.term.clone())))
-            .collect();
-        if panes.is_empty() {
+            .map(|leaf| {
+                let crate::tab_model::View::Terminal(terminal) =
+                    self.view_store.get(leaf.view).copied()?
+                else {
+                    return None;
+                };
+                let rect = crate::pane::PaneRect {
+                    session: terminal.session,
+                    row_off: leaf.rect.origin.y.round().max(0.0) as u16,
+                    col_off: leaf.rect.origin.x.round().max(0.0) as u16,
+                    rows: (leaf.rect.size.height.round() as u16).max(1),
+                    cols: (leaf.rect.size.width.round() as u16).max(1),
+                };
+                self.pool
+                    .get(terminal.session)
+                    .map(|session| (rect, session.term.clone()))
+            })
+            .collect::<Option<_>>()
+            .unwrap_or_default();
+        if panes.len() != plan.leaves.len() {
             return;
         }
         let raw_focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
@@ -2527,10 +2549,8 @@ impl App {
             pet_visible,
             !animate_cat,
         );
-        let (pane_rows, pane_cols, pane_origin) = panes
-            .iter()
-            .find(|(r, _)| r.session == focus)
-            .map_or((0, 0, (0, 0)), |(r, _)| {
+        let (pane_rows, pane_cols, pane_origin) =
+            panes.get(focus_index).map_or((0, 0, (0, 0)), |(r, _)| {
                 (
                     r.rows,
                     r.cols,
@@ -2584,6 +2604,7 @@ impl App {
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
             focus,
+            focus_index,
             win_rows,
             win_cols,
             cell_w: cell_w as u32,
@@ -2796,6 +2817,11 @@ impl App {
             // possibly newer synchronized-output episode.
             return;
         }
+        let output_echo = self
+            .pool
+            .get(exact_focus.session)
+            .map(|session| session.ctx.output_echo.sample(&session.ctx.sink, now))
+            .unwrap_or_default();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3170,11 +3196,13 @@ impl App {
         // history is not arrival), and silent under load shed like every other
         // decoration.
         {
-            let enabled = streak_enabled
-                && !load_shed
-                && !ws.input_scratch.engine_alt
-                && ws.input_scratch.display_offset == 0;
-            if !enabled {
+            let suppressed = ws.input_scratch.engine_alt || ws.input_scratch.display_offset != 0;
+            if crate::app_render::output_streak_inert(
+                streak_enabled,
+                streak_animates,
+                streak_intensity,
+                suppressed,
+            ) {
                 ws.output_streak = None;
             } else {
                 let geom = crate::cursor_glow::Geom {
@@ -3190,11 +3218,7 @@ impl App {
                 };
                 let cfg = crate::output_streak::StreakConfig {
                     enabled: true,
-                    intensity: if streak_animates {
-                        streak_intensity
-                    } else {
-                        0.0
-                    },
+                    intensity: streak_intensity,
                     tail: streak_tail,
                     max_streaks: streak_max,
                     idle_secs: streak_idle,
@@ -3212,13 +3236,19 @@ impl App {
                         aterm_effects::genome::mix(wid.0 ^ 0x5052_4953_4D5F_574B),
                     ))
                 });
+                if let Some(boundary_at) = output_echo.last_boundary_at {
+                    engine.note_turn_boundary(boundary_at);
+                }
+                if let Some(accepted_at) = output_echo.last_accepted_at {
+                    engine.note_keystroke(accepted_at);
+                }
                 engine.note_output_cells(
                     &ws.input_scratch.cells,
-                    ws.input_scratch.cursor_row,
-                    ws.input_scratch.cursor_col,
+                    (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
                     rows,
+                    exact_focus.content_seq,
                     now,
-                    false,
+                    output_echo.input_hot,
                 );
                 engine.tick(now, geom, &cfg, &mut ws.nova_scratch);
             }
@@ -3329,10 +3359,10 @@ impl App {
     }
 
     /// Reconstruct the leaf inventory of a just-presented pure-terminal frame
-    /// without touching a terminal lock. `capture_leaf_snapshot_seqs` was filled
-    /// in the exact pane extraction loop that built `input_scratch`; the
-    /// synchronous present barrier guarantees no later staged frame can replace
-    /// either half before this function runs.
+    /// without touching a terminal lock. `capture_leaf_snapshot_seqs` and its
+    /// content-clock twin were filled in the exact pane extraction loop that
+    /// built `input_scratch`; the synchronous present barrier guarantees no
+    /// later staged frame can replace either half before this function runs.
     pub(crate) fn presented_terminal_capture_grid(
         &self,
         wid: crate::WindowId,
@@ -3373,13 +3403,21 @@ impl App {
         let Some(window) = self.windows.get(&wid) else {
             return false;
         };
-        if plan.leaves.is_empty() || plan.leaves.len() != window.capture_leaf_snapshot_seqs.len() {
+        if plan.leaves.is_empty()
+            || plan.leaves.len() != window.capture_leaf_snapshot_seqs.len()
+            || plan.leaves.len() != window.capture_leaf_content_seqs.len()
+        {
             return false;
         }
         grid.composed = composed;
         grid.focus = None;
         grid.leaves.clear();
-        for (leaf, snapshot_seq) in plan.leaves.iter().zip(&window.capture_leaf_snapshot_seqs) {
+        for ((leaf, snapshot_seq), content_seq) in plan
+            .leaves
+            .iter()
+            .zip(&window.capture_leaf_snapshot_seqs)
+            .zip(&window.capture_leaf_content_seqs)
+        {
             let Some(crate::tab_model::View::Terminal(terminal)) =
                 self.view_store.get(leaf.view).copied()
             else {
@@ -3393,6 +3431,7 @@ impl App {
                 rows: (leaf.rect.size.height.round() as usize).max(1),
                 cols: (leaf.rect.size.width.round() as usize).max(1),
                 snapshot_seq: *snapshot_seq,
+                content_seq: *content_seq,
             });
         }
         true
@@ -5348,8 +5387,16 @@ impl App {
                 "layout tab={active} panes=0 zoomed=false terminal=false"
             )];
         };
-        let focus = tree.focus();
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return Vec::new();
+        };
+        let Some(focus_index) = plan.leaves.iter().position(|leaf| leaf.focused) else {
+            return Vec::new();
+        };
         let rects = tree.compute_layout(ws.rows, ws.cols);
+        if rects.len() != plan.leaves.len() {
+            return Vec::new();
+        }
         let mut lines = Vec::with_capacity(rects.len() + 1);
         lines.push(format!(
             "layout tab={} panes={} zoomed={} terminal=true",
@@ -5357,7 +5404,7 @@ impl App {
             rects.len(),
             tree.is_zoomed(),
         ));
-        for r in &rects {
+        for (index, r) in rects.iter().enumerate() {
             lines.push(format!(
                 "pane session={} rect={},{},{}x{} focused={}",
                 r.session,
@@ -5365,7 +5412,7 @@ impl App {
                 r.col_off,
                 r.rows,
                 r.cols,
-                r.session == focus,
+                index == focus_index,
             ));
         }
         lines
@@ -8983,6 +9030,7 @@ mod terminal_split_capture_tests {
         {
             let window = app.windows.get_mut(&wid).unwrap();
             window.capture_leaf_snapshot_seqs = vec![window.input_scratch.snapshot_seq];
+            window.capture_leaf_content_seqs = vec![0];
             window.capture_present_serial = 1;
         }
 
@@ -9019,6 +9067,7 @@ mod terminal_split_capture_tests {
         {
             let window = app.windows.get_mut(&wid).unwrap();
             window.capture_leaf_snapshot_seqs = vec![window.input_scratch.snapshot_seq];
+            window.capture_leaf_content_seqs = vec![0];
         }
 
         assert!(
@@ -9227,11 +9276,12 @@ mod terminal_split_capture_tests {
         );
         let capture_leaf_snapshot_seqs: Vec<_> =
             single.leaves.iter().map(|leaf| leaf.snapshot_seq).collect();
+        let capture_leaf_content_seqs: Vec<_> =
+            single.leaves.iter().map(|leaf| leaf.content_seq).collect();
         assert_eq!(capture_leaf_snapshot_seqs.len(), 1);
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .capture_leaf_snapshot_seqs = capture_leaf_snapshot_seqs;
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.capture_leaf_snapshot_seqs = capture_leaf_snapshot_seqs;
+        window.capture_leaf_content_seqs = capture_leaf_content_seqs;
 
         let mut gpu = match aterm_gpu::GpuRenderer::new(font_px, app.theme) {
             Ok(gpu) => gpu,
@@ -9253,7 +9303,7 @@ mod terminal_split_capture_tests {
         let (_, cell_h) = app.backend.cell_size();
         let mut window_gpu = aterm_gpu::WindowGpu::new();
         app.backend
-            .gpu_ref()
+            .gpu_mut()
             .expect("installed GPU fixture")
             .virtual_begin(
                 &mut window_gpu,
@@ -9441,6 +9491,7 @@ mod terminal_split_capture_tests {
         {
             let window = app.windows.get_mut(&wid).unwrap();
             window.capture_leaf_snapshot_seqs.clear();
+            window.capture_leaf_content_seqs.clear();
             let scratch = &mut window.input_scratch;
             scratch.cursor_trail.clear();
             scratch.cursor_glow_add.clear();
@@ -10933,6 +10984,7 @@ mod encode_worker_tests {
         );
 
         drop(retention);
+        control_auth::wait_for_artifact_cleanup_for_test(&path);
         assert!(
             !oldest.exists(),
             "a post-publication failure still runs the bounded retention sweep"
@@ -13151,7 +13203,22 @@ mod headless_cursor_fx_tests {
         app.config.motion = Some("reduced".into());
         app.recompute_sparkle();
         app.sparkle = None;
-        let now = Instant::now();
+        // FUTURE-ANCHORED, deliberately. The capture samples its own
+        // uninjectable `Instant::now()` inside `render_image`, and the singer's
+        // lazy finger-lift is the last note plus `SING_REPEAT_GAP` = 250 ms —
+        // so with the notes stamped at plain `now`, any stall over 250 ms
+        // between here and the capture instant (the pixel-backend build, the
+        // font seal, a starved scheduler; reproduced on demand with a 1.5 s
+        // SIGSTOP and at ~12% under 12 spinners) let the key "lift" before the
+        // capture looked, and the companion the test exists to see was gone.
+        // Anchoring the stamps 60 s ahead keeps every relative offset and makes
+        // "still held at the capture instant" true for any stall under a
+        // minute. Safe by construction: every reader on this path measures via
+        // `saturating_duration_since`, so a capture clock earlier than the
+        // stamps reads as zero elapsed — mid-hold. The released-singer decay is
+        // NOT this test's law; the injected-clock sibling above and
+        // kitty_sing's own units pin expiry deterministically.
+        let now = Instant::now() + Duration::from_secs(60);
         {
             let ws = app.windows.get_mut(&wid).expect("headless window 0");
             ws.focused = true;

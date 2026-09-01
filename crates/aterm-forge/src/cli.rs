@@ -37,11 +37,65 @@ USAGE
         THE GATE VERB. attest + patch-liveness + census cross-check, with no
         compilation and no network. Wired as `xtask gate forge`.
 
+  cargo forge mirror emit --out DIR
+        The Lane 1 generator: walk Cargo.lock's registry-sourced entries,
+        verify each cached .crate against the lock checksum (refusing by name
+        on mismatch), and emit a cargo `local-registry` — index/ JSON rows
+        plus .crate copies. Missing cache files come back as a fetch list and
+        a RED exit, never a silent skip.
+
+  cargo forge mirror verify --dir DIR
+        Re-hash every .crate in an emitted mirror against its index row AND
+        Cargo.lock, both directions (missing + stray). Any drift is named and
+        the exit is nonzero. Also judges each row's CONTENT, which no checksum
+        covers: byte-for-byte against cargo's own sparse-index cache where one
+        exists, and against Cargo.lock's resolved dependency edges everywhere.
+        The verdict prints how many rows it could anchor and says plainly what
+        an unanchored row does not prove.
+
+  cargo forge mirror bundle --dir DIR --out FILE
+        Pack a VERIFIED mirror into one deterministic, uncompressed bundle: a
+        manifest holding every package name/version/cksum, each entry's
+        sha256, the payload digest and the lock digest it was emitted from,
+        then the bytes. Byte-identical on a second run from the same input.
+        Refuses to bundle a mirror that does not verify. Never signs.
+
+  cargo forge mirror check-bundle --file FILE
+        Verify a bundle WITHOUT unpacking: header, manifest digest, structural
+        rules, payload digest, every entry digest, every package cksum, every
+        index row, and (when run in a workspace) whether it was built for THIS
+        Cargo.lock. Proves INTEGRITY and SHAPE, not PROVENANCE: every digest a
+        bundle carries is inside it, so an attacker who edits it re-seals them.
+        Only a signature over the printed bundle-sha256 closes that, and
+        signing is the owner's ceremony.
+
+  cargo forge mirror unbundle --file FILE --out DIR [--force]
+        check-bundle, then extract — re-hashing every entry as it is written
+        and stat'ing every path afterwards, so the count it reports is the
+        filesystem's. Judges row CONTENT with the same two anchors check-bundle
+        uses and PRINTS how far each got: a bundle for a different lock is
+        still extractable, but the edges THIS lock resolved are required of
+        every row they cover, because on a delivery target they are the only
+        anchor left. NOTHING is created until the bundle verifies AND the
+        output tree is judged: a bundle may only name mirror paths, and --out
+        must be absent or empty unless --force is given. A filesystem that
+        fails part-way can still leave a partial tree; the failure says how
+        many files landed.
+
+  cargo forge mirror config [--write]
+        Print the shippable `[source]` fragment for this lock; --write puts it
+        at tools/cargo-mirror-config.toml. Flips NO default: cargo does not
+        read that path. `cargo forge check` [OB-16] fails if the file and
+        Cargo.lock disagree about what is mirrored.
+
 OPTIONS
   --root PATH      Workspace root (default: discovered from CWD)
   --cell NAME      Restrict to one cell; repeatable. Default: every cell.
   --top N          Rows in the ranked survey table (default 40)
   --json PATH      Also write the survey as JSON
+  --file PATH      The bundle file (mirror check-bundle / unbundle)
+  --write          mirror config: write the fragment instead of printing it
+  --force          mirror unbundle: extract into a directory that is not empty
   -h, --help       This text
 
 EXIT CODES
@@ -67,6 +121,27 @@ pub enum Cmd {
     Check {
         cells: Vec<String>,
     },
+    MirrorEmit {
+        out: PathBuf,
+    },
+    MirrorVerify {
+        dir: PathBuf,
+    },
+    MirrorBundle {
+        dir: PathBuf,
+        out: PathBuf,
+    },
+    MirrorUnbundle {
+        file: PathBuf,
+        out: PathBuf,
+        force: bool,
+    },
+    MirrorCheckBundle {
+        file: PathBuf,
+    },
+    MirrorConfig {
+        write: bool,
+    },
     Help,
 }
 
@@ -84,6 +159,7 @@ pub enum ParseError {
     BadNumber(String),
     UnexpectedArg(String),
     MissingOperand(&'static str),
+    UnknownMirrorAction(String),
 }
 
 impl ParseError {
@@ -93,8 +169,14 @@ impl ParseError {
         match self {
             Self::NoVerb => "no verb given — try `cargo forge survey`".into(),
             Self::UnknownVerb(v) => {
-                format!("unknown verb `{v}` — expected survey, blame, budget, attest or check")
+                format!(
+                    "unknown verb `{v}` — expected survey, blame, budget, attest, check or mirror"
+                )
             }
+            Self::UnknownMirrorAction(a) => format!(
+                "unknown mirror action `{a}` — expected emit, verify, bundle, unbundle, \
+                 check-bundle or config"
+            ),
             Self::MissingValue(flag) => format!("`{flag}` needs a value"),
             Self::BadNumber(s) => format!("`{s}` is not a number"),
             Self::UnexpectedArg(a) => format!("unexpected argument `{a}`"),
@@ -111,6 +193,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
     let mut json: Option<PathBuf> = None;
     let mut update = false;
     let mut allow_regress: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut write = false;
+    let mut force = false;
     let mut operand: Option<String> = None;
 
     let verb = loop {
@@ -147,6 +234,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
             "--json" => json = Some(PathBuf::from(next(&mut it, "--json")?)),
             "--update" => update = true,
             "--allow-regress" => allow_regress = Some(next(&mut it, "--allow-regress")?),
+            "--out" => out = Some(PathBuf::from(next(&mut it, "--out")?)),
+            "--dir" => dir = Some(PathBuf::from(next(&mut it, "--dir")?)),
+            "--file" => file = Some(PathBuf::from(next(&mut it, "--file")?)),
+            "--write" => write = true,
+            "--force" => force = true,
             other if other.starts_with('-') => return Err(ParseError::UnexpectedArg(other.into())),
             other => operand = Some(other.to_string()),
         }
@@ -164,6 +256,49 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
         },
         "attest" => Cmd::Attest,
         "check" => Cmd::Check { cells },
+        "mirror" => match operand.as_deref() {
+            Some("emit") => Cmd::MirrorEmit {
+                out: out.ok_or(ParseError::MissingOperand(
+                    "`--out DIR` (where mirror emit writes the local registry)",
+                ))?,
+            },
+            Some("verify") => Cmd::MirrorVerify {
+                dir: dir.ok_or(ParseError::MissingOperand(
+                    "`--dir DIR` (the emitted local registry to re-hash)",
+                ))?,
+            },
+            Some("bundle") => Cmd::MirrorBundle {
+                dir: dir.ok_or(ParseError::MissingOperand(
+                    "`--dir DIR` (the emitted local registry to pack)",
+                ))?,
+                out: out.ok_or(ParseError::MissingOperand(
+                    "`--out FILE` (where mirror bundle writes the bundle)",
+                ))?,
+            },
+            Some("unbundle") => Cmd::MirrorUnbundle {
+                file: file.ok_or(ParseError::MissingOperand(
+                    "`--file FILE` (the bundle to verify and extract)",
+                ))?,
+                out: out.ok_or(ParseError::MissingOperand(
+                    "`--out DIR` (where mirror unbundle extracts the mirror)",
+                ))?,
+                force,
+            },
+            Some("check-bundle") => Cmd::MirrorCheckBundle {
+                file: file.ok_or(ParseError::MissingOperand(
+                    "`--file FILE` (the bundle to verify without unpacking)",
+                ))?,
+            },
+            Some("config") => Cmd::MirrorConfig { write },
+            Some(a) => return Err(ParseError::UnknownMirrorAction(a.to_string())),
+            None => {
+                return Err(ParseError::MissingOperand(
+                    "a mirror action: emit --out DIR, verify --dir DIR, \
+                     bundle --dir DIR --out FILE, unbundle --file FILE --out DIR, \
+                     check-bundle --file FILE, or config [--write]",
+                ));
+            }
+        },
         other => return Err(ParseError::UnknownVerb(other.to_string())),
     };
     Ok(Invocation { root, cmd })
@@ -223,6 +358,103 @@ mod tests {
             p(&["survey", "--top"]).unwrap_err(),
             ParseError::MissingValue("--top")
         );
+    }
+
+    #[test]
+    fn mirror_emit_takes_out_and_verify_takes_dir() {
+        let a = p(&["mirror", "emit", "--out", "/tmp/m"]).unwrap();
+        assert_eq!(
+            a.cmd,
+            Cmd::MirrorEmit {
+                out: PathBuf::from("/tmp/m")
+            }
+        );
+        let b = p(&["mirror", "verify", "--dir", "/tmp/m"]).unwrap();
+        assert_eq!(
+            b.cmd,
+            Cmd::MirrorVerify {
+                dir: PathBuf::from("/tmp/m")
+            }
+        );
+    }
+
+    #[test]
+    fn mirror_without_an_action_or_flag_names_what_to_type() {
+        let e = p(&["mirror"]).unwrap_err();
+        assert!(e.message().contains("emit --out DIR"), "{}", e.message());
+        let e = p(&["mirror", "emit"]).unwrap_err();
+        assert!(e.message().contains("--out DIR"), "{}", e.message());
+        let e = p(&["mirror", "shred"]).unwrap_err();
+        assert!(e.message().contains("`shred`"), "{}", e.message());
+    }
+
+    #[test]
+    fn the_delivery_verbs_take_their_own_operands() {
+        assert_eq!(
+            p(&["mirror", "bundle", "--dir", "/tmp/m", "--out", "/tmp/b"])
+                .unwrap()
+                .cmd,
+            Cmd::MirrorBundle {
+                dir: PathBuf::from("/tmp/m"),
+                out: PathBuf::from("/tmp/b")
+            }
+        );
+        assert_eq!(
+            p(&["mirror", "unbundle", "--file", "/tmp/b", "--out", "/tmp/m"])
+                .unwrap()
+                .cmd,
+            Cmd::MirrorUnbundle {
+                file: PathBuf::from("/tmp/b"),
+                out: PathBuf::from("/tmp/m"),
+                force: false
+            }
+        );
+        // The escape hatch is OFF unless it is typed, and it is the only way
+        // to extract into a populated tree.
+        assert_eq!(
+            p(&[
+                "mirror", "unbundle", "--file", "/tmp/b", "--out", "/tmp/m", "--force"
+            ])
+            .unwrap()
+            .cmd,
+            Cmd::MirrorUnbundle {
+                file: PathBuf::from("/tmp/b"),
+                out: PathBuf::from("/tmp/m"),
+                force: true
+            }
+        );
+        assert_eq!(
+            p(&["mirror", "check-bundle", "--file", "/tmp/b"])
+                .unwrap()
+                .cmd,
+            Cmd::MirrorCheckBundle {
+                file: PathBuf::from("/tmp/b")
+            }
+        );
+        assert_eq!(
+            p(&["mirror", "config"]).unwrap().cmd,
+            Cmd::MirrorConfig { write: false }
+        );
+        assert_eq!(
+            p(&["mirror", "config", "--write"]).unwrap().cmd,
+            Cmd::MirrorConfig { write: true }
+        );
+    }
+
+    /// `bundle` needs BOTH operands and says which one is missing — the shape
+    /// that costs a run when the message only says "missing operand".
+    #[test]
+    fn each_delivery_verb_names_the_operand_it_lacks() {
+        for (args, want) in [
+            (vec!["mirror", "bundle", "--out", "/tmp/b"], "--dir DIR"),
+            (vec!["mirror", "bundle", "--dir", "/tmp/m"], "--out FILE"),
+            (vec!["mirror", "unbundle", "--out", "/tmp/m"], "--file FILE"),
+            (vec!["mirror", "unbundle", "--file", "/tmp/b"], "--out DIR"),
+            (vec!["mirror", "check-bundle"], "--file FILE"),
+        ] {
+            let e = p(&args).unwrap_err();
+            assert!(e.message().contains(want), "{args:?}: {}", e.message());
+        }
     }
 
     #[test]

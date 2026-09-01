@@ -190,3 +190,94 @@ fn cursor_near_top_shrink_preserves_all_content() {
     }
     grid.assert_invariants();
 }
+
+/// ABSOLUTE-ROW HONESTY across a rows-only resize.
+///
+/// `oldest_absolute_row()` is `absolute_row_counter − visible − scrollback`,
+/// and a rows-only resize deliberately leaves the counter alone. Moving rows
+/// ACROSS the live/history boundary keeps the retained total fixed, so every
+/// key survives — that is the relabel the resize is designed around. Adding
+/// blank rows at the BOTTOM (a grow with no history to reveal) or trimming
+/// trailing blanks (a shrink) changes the total, which SLIDES the whole
+/// absolute space under every retained row.
+///
+/// That slide must be REPORTED, because an absolute-row-keyed cache carrying
+/// pre-slide keys forward silently answers about the wrong rows. The GUI search
+/// index did exactly that — after `clear` + a taller window, find went blind to
+/// the top band of the screen while it sat in plain sight.
+#[test]
+fn a_rows_only_resize_reports_the_renumbering_it_causes() {
+    // The `clear` fixture: real absolute numbering (rows have scrolled), then
+    // `ED 3` takes the history away — so a later grow has nothing to reveal.
+    let cleared = |rows: u16| {
+        let mut grid = Grid::with_scrollback(rows, 20, 100);
+        let names: Vec<String> = (0..20).map(|i| format!("old {i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        write_lines(&mut grid, &refs);
+        grid.erase_scrollback();
+        grid.erase_screen();
+        grid.set_cursor(0, 0);
+        assert_eq!(grid.scrollback_lines(), 0, "the clear took the history");
+        assert!(
+            grid.oldest_absolute_row() > 0,
+            "…but not the absolute numbering the rows already earned"
+        );
+        grid
+    };
+
+    // GROW with nothing to reveal: blank rows are appended at the bottom.
+    let mut grid = cleared(5);
+    write_lines(&mut grid, &["a", "b", "c"]);
+    let before = grid.oldest_absolute_row();
+    let epoch = grid.history_renumber_epoch();
+    grid.resize(9, 20);
+    assert_eq!(
+        grid.oldest_absolute_row(),
+        before - 4,
+        "the appended rows slid every retained row's absolute key"
+    );
+    assert!(
+        grid.history_renumber_epoch() > epoch,
+        "a slide nothing else can see must raise the renumber epoch"
+    );
+    grid.assert_invariants();
+
+    // GROW that reveals history instead: a pure relabel, no slide, no bump.
+    let mut grid = Grid::with_scrollback(3, 20, 4);
+    let names: Vec<String> = (0..20).map(|i| format!("h{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    write_lines(&mut grid, &refs);
+    assert!(grid.scrollback_lines() >= 2, "history to reveal");
+    let before = grid.oldest_absolute_row();
+    assert!(before > 0, "the fixture has really scrolled");
+    let epoch = grid.history_renumber_epoch();
+    grid.resize(5, 20);
+    assert_eq!(
+        grid.oldest_absolute_row(),
+        before,
+        "the reveal is a relabel: every absolute key survives it"
+    );
+    assert_eq!(
+        grid.history_renumber_epoch(),
+        epoch,
+        "so there is nothing to report and no spurious rebuild is asked for"
+    );
+    grid.assert_invariants();
+
+    // SHRINK that only trims trailing blanks: the same slide, upward.
+    let mut grid = cleared(8);
+    write_lines(&mut grid, &["a", "b"]);
+    let before = grid.oldest_absolute_row();
+    let epoch = grid.history_renumber_epoch();
+    grid.resize(5, 20);
+    assert_eq!(
+        grid.oldest_absolute_row(),
+        before + 3,
+        "trimming trailing blanks slid the space the other way"
+    );
+    assert!(
+        grid.history_renumber_epoch() > epoch,
+        "and is reported for the same reason"
+    );
+    grid.assert_invariants();
+}

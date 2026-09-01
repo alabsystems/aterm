@@ -7,11 +7,12 @@
 //! Plus the `egress_to_outcome` reply mapper and the `base_logical_key` cfg pair.
 //! A verbatim inherent-impl split of `App`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{CustodyTransition, Terminal};
-use aterm_session::sink::SinkWriter;
+use aterm_session::sink::{AcceptedOrder, SinkWriter};
 use winit::event::{ElementState, KeyEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -54,6 +55,577 @@ const INPUT_HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(5
 /// watching echo. The engine then measures its own budget from there, so a
 /// queued keystroke stays licensed for at most ~2.25 s after the keypress.
 const ORDERED_EGRESS_WITNESS_GRACE: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// Per-session evidence that recently accepted input can explain output.
+///
+/// The tracker lives in [`crate::SessionCtx`], not a window: one session may be
+/// visible in several windows or panes, and a delayed paste may complete after
+/// focus moved. Renderers take only non-parking lock attempts, so attribution
+/// adds neither a registry lock, a grid scan, nor a UI-thread wait.
+#[derive(Default)]
+pub(crate) struct OutputEchoTracker {
+    active_writes: AtomicUsize,
+    published: Mutex<OutputEchoPublished>,
+}
+
+/// Acceptance-ordered echo evidence. The sink token, timestamps, and spill mode
+/// move under one tiny lock so a renderer can never combine different writes.
+#[derive(Default)]
+struct OutputEchoPublished {
+    order: Option<AcceptedOrder>,
+    last_accepted_us: u64,
+    last_boundary_us: u64,
+    /// `Some(true)` refreshes the accepted-input shadow after a spilled echoable
+    /// frame drains; `Some(false)` merely keeps a boundary hot until it drains.
+    spill_debt: Option<bool>,
+}
+
+/// One coherent render-time view of a session's echo evidence.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OutputEchoSample {
+    pub(crate) input_hot: bool,
+    pub(crate) last_accepted_at: Option<std::time::Instant>,
+    pub(crate) last_boundary_at: Option<std::time::Instant>,
+}
+
+/// RAII ownership of one real egress attempt.  Dropping on an early return or
+/// panic cannot strand a session permanently hot.
+pub(crate) struct OutputEchoWrite<'a> {
+    tracker: &'a OutputEchoTracker,
+    counted: bool,
+    kind: OutputEchoInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputEchoInput {
+    Echoable,
+    TurnBoundary,
+    Ignored,
+}
+
+impl OutputEchoInput {
+    fn raw_editor(bytes: &[u8]) -> Self {
+        if bytes
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            Self::TurnBoundary
+        } else {
+            Self::Echoable
+        }
+    }
+
+    fn of(ev: &InputEvent) -> Self {
+        let release = matches!(
+            ev,
+            InputEvent::Key {
+                event_type: aterm_types::keyboard::KeyEventType::Release,
+                ..
+            }
+        );
+        match ev {
+            InputEvent::Key { .. } if is_plain_enter(ev) && !release => Self::TurnBoundary,
+            InputEvent::KeySequence(bytes) => Self::raw_editor(bytes),
+            InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::Paste(..) => Self::Echoable,
+            _ => Self::Ignored,
+        }
+    }
+}
+
+impl OutputEchoTracker {
+    /// Begin immediately before the real PTY seam (never at FIFO admission).
+    fn begin(&self, kind: OutputEchoInput) -> OutputEchoWrite<'_> {
+        let counted = kind != OutputEchoInput::Ignored
+            && self
+                .active_writes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    active.checked_add(1)
+                })
+                .is_ok();
+        // On the physically unreachable overflow case the saturated non-zero
+        // count is already fail-closed (hot), and this guard must not decrement
+        // a write it did not count.
+        OutputEchoWrite {
+            tracker: self,
+            counted,
+            kind,
+        }
+    }
+
+    pub(crate) fn begin_event(&self, ev: &InputEvent) -> OutputEchoWrite<'_> {
+        self.begin(OutputEchoInput::of(ev))
+    }
+
+    /// Allocation-free raw editor-input arm for trait hosts that already own
+    /// the exact bytes and must preserve them verbatim.
+    pub(crate) fn begin_raw_editor(&self, bytes: &[u8]) -> OutputEchoWrite<'_> {
+        self.begin(OutputEchoInput::raw_editor(bytes))
+    }
+
+    /// Sample echo evidence against the render frame's injected clock.
+    pub(crate) fn sample(&self, sink: &SinkWriter, now: std::time::Instant) -> OutputEchoSample {
+        let clock_us = crate::metrics::now_us().max(1);
+        let mut published = match self.published.try_lock() {
+            Ok(published) => published,
+            Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A writer is publishing the one coherent record. Never put the
+                // event loop behind it: one conservative hot frame is cheaper
+                // than either a mixed snapshot or a UI-thread wait.
+                return OutputEchoSample {
+                    input_hot: true,
+                    ..OutputEchoSample::default()
+                };
+            }
+        };
+        if published.spill_debt.is_some()
+            && sink.try_egress_drained_to_kernel() == Some(true)
+            && published.spill_debt.take() == Some(true)
+        {
+            published.last_accepted_us = clock_us;
+        }
+        let last_us = published.last_accepted_us;
+        let boundary_us = published.last_boundary_us;
+        let debt = published.spill_debt.is_some();
+        let at = |stamp| {
+            now.checked_sub(std::time::Duration::from_micros(
+                clock_us.saturating_sub(stamp),
+            ))
+            .unwrap_or(now)
+        };
+        let last_accepted_at = (last_us != 0).then(|| at(last_us));
+        let last_boundary_at = (boundary_us != 0).then(|| at(boundary_us));
+        OutputEchoSample {
+            input_hot: self.active_writes.load(Ordering::Acquire) != 0 || debt,
+            last_accepted_at,
+            last_boundary_at,
+        }
+    }
+
+    /// Publish one state-affecting acceptance in sink order. A writer may be
+    /// descheduled after the sink accepts its bytes and before it reaches this
+    /// method; the opaque sink token makes a late older completion a no-op.
+    fn publish(&self, order: AcceptedOrder, kind: OutputEchoInput, stamp: u64, sink: &SinkWriter) {
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if published.order.is_some_and(|current| current >= order) {
+            return;
+        }
+        published.order = Some(order);
+        match kind {
+            OutputEchoInput::Echoable => {
+                published.last_accepted_us = stamp;
+                published.spill_debt = Some(true);
+            }
+            OutputEchoInput::TurnBoundary => {
+                // Bare Enter submits a turn. Its response is authored output,
+                // not editor echo, so it clears the direct shadow. The false
+                // debt stays hot only while accepted bytes remain spilled.
+                published.last_boundary_us = stamp;
+                published.last_accepted_us = 0;
+                published.spill_debt = Some(false);
+            }
+            OutputEchoInput::Ignored => unreachable!("ignored input has no echo publication"),
+        }
+        if published.spill_debt.is_some()
+            && sink.try_egress_drained_to_kernel() == Some(true)
+            && published.spill_debt.take() == Some(true)
+        {
+            published.last_accepted_us = stamp;
+        }
+    }
+}
+
+impl OutputEchoWrite<'_> {
+    /// Complete with the seam's narrow receipt.  Zero-byte success and failed
+    /// writes never manufacture a post-return echo timestamp; an explicitly
+    /// accepted guarded prefix does.
+    fn finish(mut self, receipt: input::EgressReceipt, sink: &SinkWriter) {
+        if self.kind != OutputEchoInput::Ignored
+            && let Some(order) = receipt.accepted_order()
+        {
+            let stamp = crate::metrics::now_us().max(1);
+            self.tracker.publish(order, self.kind, stamp, sink);
+        }
+        self.release();
+    }
+
+    pub(crate) fn finish_delivery(
+        self,
+        delivery: input::Delivery,
+        accepted_order: Option<AcceptedOrder>,
+        sink: &SinkWriter,
+    ) {
+        self.finish(
+            input::EgressReceipt::from_reported_delivery(delivery, accepted_order),
+            sink,
+        );
+    }
+
+    fn release(&mut self) {
+        if self.counted {
+            self.tracker.active_writes.fetch_sub(1, Ordering::AcqRel);
+            self.counted = false;
+        }
+    }
+}
+
+/// One receipt-bearing, echo-aware direct egress. Control-thread targets use
+/// this when they cannot post `Wake::Input`; the source-blind encoder remains
+/// the sole byte authority.
+pub(crate) fn tracked_egress(
+    term: &Mutex<Terminal>,
+    sink: &SinkWriter,
+    tracker: &OutputEchoTracker,
+    ev: &InputEvent,
+    mode: input::EgressMode,
+) -> input::EgressReceipt {
+    let write = tracker.begin_event(ev);
+    let receipt = input::seam_egress_receipt(term, sink, ev, mode);
+    write.finish(receipt, sink);
+    receipt
+}
+
+impl Drop for OutputEchoWrite<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+mod output_echo_tracker_tests {
+    use super::*;
+    use aterm_types::keyboard::{
+        Key as TKey, KeyEventType, Modifiers as TMods, NamedKey as TNamed,
+    };
+
+    #[cfg(unix)]
+    fn model_state(
+        tracker: &OutputEchoTracker,
+        older: AcceptedOrder,
+        newer: AcceptedOrder,
+        accepted: i64,
+        older_done: bool,
+        newer_done: bool,
+        sample: Option<OutputEchoSample>,
+    ) -> aterm_spec::interp::State {
+        let published = tracker
+            .published
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let published_order = match published.order {
+            None => 0,
+            Some(order) if order == older => 1,
+            Some(order) if order == newer => 2,
+            Some(order) => panic!("unexpected receipt order in tracker projection: {order:?}"),
+        };
+        let (sampled, sample_order, sample_accepted, sample_boundary) =
+            sample.map_or((0, 0, 0, 0), |sample| {
+                (
+                    1,
+                    published_order,
+                    i64::from(sample.last_accepted_at.is_some()),
+                    i64::from(sample.last_boundary_at.is_some()),
+                )
+            });
+        [
+            ("accepted", accepted),
+            ("older_done", i64::from(older_done)),
+            ("newer_done", i64::from(newer_done)),
+            ("published_order", published_order),
+            (
+                "accepted_shadow",
+                i64::from(published.last_accepted_us != 0),
+            ),
+            (
+                "boundary_shadow",
+                i64::from(published.last_boundary_us != 0),
+            ),
+            ("sampled", sampled),
+            ("sample_order", sample_order),
+            ("sample_accepted", sample_accepted),
+            ("sample_boundary", sample_boundary),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[cfg(unix)]
+    fn require_model_transition(
+        action: &str,
+        before: &aterm_spec::interp::State,
+        after: &aterm_spec::interp::State,
+    ) {
+        let (ok, evidence) = aterm_spec::verify::validate_transition_tiered(
+            &aterm_spec::derive::output_echo_receipt_publication_model(),
+            &[],
+            before,
+            after,
+            Some(action),
+            "OutputEchoTracker acceptance-order conformance",
+        );
+        assert!(ok, "real {action} transition rejected:\n{evidence}");
+    }
+
+    fn enter(mods: TMods, event_type: KeyEventType) -> InputEvent {
+        InputEvent::Key {
+            key: TKey::Named(TNamed::Enter),
+            mods,
+            base_layout: None,
+            event_type,
+        }
+    }
+
+    #[test]
+    fn only_unmodified_enter_press_or_repeat_is_a_turn_boundary() {
+        assert_eq!(
+            OutputEchoInput::of(&enter(TMods::empty(), KeyEventType::Press)),
+            OutputEchoInput::TurnBoundary
+        );
+        assert_eq!(
+            OutputEchoInput::of(&enter(TMods::empty(), KeyEventType::Repeat)),
+            OutputEchoInput::TurnBoundary
+        );
+        assert_eq!(
+            OutputEchoInput::of(&enter(TMods::empty(), KeyEventType::Release)),
+            OutputEchoInput::Echoable,
+            "a Kitty key-up cannot clear accepted-input evidence"
+        );
+        assert_eq!(
+            OutputEchoInput::of(&enter(TMods::SHIFT, KeyEventType::Press)),
+            OutputEchoInput::Echoable,
+            "modified Enter belongs to the foreground editor"
+        );
+        assert_eq!(
+            OutputEchoInput::of(&InputEvent::Focus(true)),
+            OutputEchoInput::Ignored,
+            "terminal protocol reports are not editor echo"
+        );
+        assert_eq!(
+            OutputEchoInput::of(&InputEvent::KeySequence(b"echo hi\r".to_vec())),
+            OutputEchoInput::TurnBoundary
+        );
+        assert_eq!(
+            OutputEchoInput::of(&InputEvent::KeySequence(b"echo hi".to_vec())),
+            OutputEchoInput::Echoable
+        );
+    }
+
+    #[test]
+    fn active_write_is_raii_hot_and_a_failed_write_stamps_nothing() {
+        let tracker = Arc::new(OutputEchoTracker::default());
+        let sink = SinkWriter::new(-1);
+        let now = std::time::Instant::now();
+        let write = tracker.begin(OutputEchoInput::Echoable);
+        assert!(tracker.sample(&sink, now).input_hot);
+        drop(write);
+        assert!(!tracker.sample(&sink, now).input_hot);
+
+        let term = Mutex::new(Terminal::new(24, 80));
+        let ev = InputEvent::KeySequence(b"x".to_vec());
+        let write = tracker.begin(OutputEchoInput::of(&ev));
+        let receipt = input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        write.finish(receipt, &sink);
+        assert!(tracker.sample(&sink, now).last_accepted_at.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_order_rejects_an_older_completion_after_enter() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        let sink = SinkWriter::new(pipe[1]);
+        let term = Mutex::new(Terminal::new(24, 80));
+        let tracker = OutputEchoTracker::default();
+
+        // Keep both guards alive, but complete them in reverse order. This is
+        // the real race: an older writer can be descheduled after its sink
+        // acceptance while Enter is accepted and published by another thread.
+        let echo_event = InputEvent::KeySequence(b"x".to_vec());
+        let echo_write = tracker.begin_event(&echo_event);
+        let echo_receipt =
+            input::seam_egress_receipt(&term, &sink, &echo_event, input::EgressMode::Interactive);
+        let boundary_event = enter(TMods::empty(), KeyEventType::Press);
+        let boundary_write = tracker.begin_event(&boundary_event);
+        let boundary_receipt = input::seam_egress_receipt(
+            &term,
+            &sink,
+            &boundary_event,
+            input::EgressMode::Interactive,
+        );
+        let echo_order = echo_receipt.accepted_order().expect("echo accepted order");
+        let boundary_order = boundary_receipt
+            .accepted_order()
+            .expect("boundary accepted order");
+        assert!(echo_order < boundary_order);
+
+        let initial = model_state(&tracker, echo_order, boundary_order, 0, false, false, None);
+        assert_eq!(
+            initial,
+            aterm_spec::derive::output_echo_receipt_publication_model().init_state()
+        );
+        let echo_accepted =
+            model_state(&tracker, echo_order, boundary_order, 1, false, false, None);
+        require_model_transition("AcceptOlderEcho", &initial, &echo_accepted);
+        let both_accepted =
+            model_state(&tracker, echo_order, boundary_order, 2, false, false, None);
+        require_model_transition("AcceptNewerBoundary", &echo_accepted, &both_accepted);
+
+        boundary_write.finish(boundary_receipt, &sink);
+        let boundary_published =
+            model_state(&tracker, echo_order, boundary_order, 2, false, true, None);
+        require_model_transition("PublishNewerBoundary", &both_accepted, &boundary_published);
+        echo_write.finish(echo_receipt, &sink);
+        let stale_discarded =
+            model_state(&tracker, echo_order, boundary_order, 2, true, true, None);
+        require_model_transition("PublishOlderEcho", &boundary_published, &stale_discarded);
+        let sample = tracker.sample(&sink, std::time::Instant::now());
+        assert!(sample.last_boundary_at.is_some());
+        assert!(sample.last_accepted_at.is_none());
+        assert!(!sample.input_hot);
+        let sampled = model_state(
+            &tracker,
+            echo_order,
+            boundary_order,
+            2,
+            true,
+            true,
+            Some(sample),
+        );
+        require_model_transition("Sample", &stale_discarded, &sampled);
+
+        // Negative control: the pre-fix delayed completion revived the older
+        // echo shadow after Enter. The healthy action must reject that exact
+        // post-state, while Buggy=1 admits it and violates the boundary law.
+        let mut overwritten = boundary_published.clone();
+        overwritten.insert("older_done", 1);
+        overwritten.insert("published_order", 1);
+        overwritten.insert("accepted_shadow", 1);
+        let model = aterm_spec::derive::output_echo_receipt_publication_model();
+        let (healthy_admits, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &boundary_published,
+            &overwritten,
+            Some("PublishOlderEcho"),
+            "OutputEchoTracker stale-publication negative control",
+        );
+        assert!(!healthy_admits, "healthy model admitted stale overwrite");
+        let (buggy_admits, evidence) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[("Buggy", 1)],
+            &boundary_published,
+            &overwritten,
+            Some("PublishOlderEcho"),
+            "OutputEchoTracker stale-publication mutant",
+        );
+        assert!(
+            buggy_admits,
+            "mutant did not admit stale overwrite: {evidence}"
+        );
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        assert!(!buggy.check_invariant("BoundaryRetiresOlderEcho", &overwritten));
+
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    #[test]
+    fn contended_publication_sampling_is_nonparking_and_conservative() {
+        let tracker = OutputEchoTracker::default();
+        let sink = SinkWriter::new(-1);
+        let _publication = tracker
+            .published
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let sample = tracker.sample(&sink, std::time::Instant::now());
+        assert!(sample.input_hot);
+        assert!(sample.last_accepted_at.is_none());
+        assert!(sample.last_boundary_at.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_editor_input_discounts_but_enter_opens_the_turn_immediately() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        let sink = SinkWriter::new(pipe[1]);
+        let term = Mutex::new(Terminal::new(24, 80));
+        let tracker = Arc::new(OutputEchoTracker::default());
+        let now = std::time::Instant::now();
+        let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
+        assert!(!streak.note_output(1, &[(2, 0, 0)], now, false));
+
+        term_lock(&term).process(b"\x1b[?1004h");
+        let focus = InputEvent::Focus(true);
+        tracked_egress(
+            &term,
+            &sink,
+            &tracker,
+            &focus,
+            input::EgressMode::Backpressured,
+        );
+        let protocol = tracker.sample(&sink, now);
+        assert!(protocol.last_accepted_at.is_none());
+        assert!(protocol.last_boundary_at.is_none());
+        assert!(!protocol.input_hot, "focus reports cannot shadow output");
+
+        let typed = InputEvent::KeySequence(b"x".to_vec());
+        let write = tracker.begin(OutputEchoInput::of(&typed));
+        let receipt =
+            input::seam_egress_receipt(&term, &sink, &typed, input::EgressMode::Interactive);
+        write.finish(receipt, &sink);
+        let echo = tracker.sample(&sink, now);
+        streak.note_keystroke(echo.last_accepted_at.expect("accepted editor input"));
+        assert!(!streak.note_output(2, &[(2, 0, 0)], now, echo.input_hot));
+
+        let paste = InputEvent::Paste("paste".into(), input::PasteFraming::AtDrain);
+        let write = tracker.begin(OutputEchoInput::of(&paste));
+        let receipt =
+            input::seam_egress_receipt(&term, &sink, &paste, input::EgressMode::Backpressured);
+        write.finish(receipt, &sink);
+        let paste_echo = tracker.sample(&sink, now);
+        streak.note_keystroke(paste_echo.last_accepted_at.expect("accepted paste receipt"));
+        assert!(!streak.note_output(3, &[(2, 0, 0)], now, paste_echo.input_hot));
+
+        let boundary = enter(TMods::empty(), KeyEventType::Press);
+        let write = tracker.begin(OutputEchoInput::of(&boundary));
+        let receipt =
+            input::seam_egress_receipt(&term, &sink, &boundary, input::EgressMode::Interactive);
+        write.finish(receipt, &sink);
+        let turn = tracker.sample(&sink, now);
+        assert!(turn.last_accepted_at.is_none());
+        assert!(!turn.input_hot);
+        streak.note_turn_boundary(turn.last_boundary_at.expect("accepted Enter"));
+        assert!(
+            streak.note_output(4, &[(3, 0, 0)], now, turn.input_hot),
+            "the command response immediately after Enter is authored output"
+        );
+
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    #[test]
+    fn fifo_admission_receipt_is_not_pty_acceptance() {
+        let receipt = input::EgressReceipt::deferred_full();
+        assert_eq!(
+            receipt.egress,
+            input::Egress::Reported(input::Delivery::Full),
+            "FIFO admission retains the caller's ordered-delivery contract"
+        );
+        assert!(
+            !receipt.accepted_nonempty(),
+            "only the writer thread's real seam may stamp echo evidence"
+        );
+    }
+}
 
 /// The surface that OWNS the in-flight IME composition of one window — resolved
 /// per frame by [`App::preedit_owner`], mirroring [`App::on_ime_commit`]'s
@@ -314,12 +886,14 @@ pub(crate) mod paste_order {
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-    use super::{InputEvent, SinkWriter, Terminal};
+    use super::{InputEvent, OutputEchoInput, OutputEchoTracker, SinkWriter, Terminal};
 
     /// A deferred egress: run `seam_egress(term, sink, ev)` on the writer thread.
     struct Job {
         term: Arc<Mutex<Terminal>>,
         sink: Arc<SinkWriter>,
+        echo: Arc<OutputEchoTracker>,
+        echo_kind: OutputEchoInput,
         ev: InputEvent,
         pending: Arc<AtomicUsize>,
         /// The hardware key-arrival stamp CLAIMED from the metrics module at
@@ -351,12 +925,14 @@ pub(crate) mod paste_order {
         while let Ok(job) = rx.recv() {
             // The egress-order writer thread is expendable: block under SPILL_CAP so
             // a wedged foreground applies backpressure HERE, not by growing the spill.
-            crate::input::seam_egress(
+            let write = job.echo.begin(job.echo_kind);
+            let receipt = crate::input::seam_egress_receipt(
                 &job.term,
                 &job.sink,
                 &job.ev,
                 crate::input::EgressMode::Backpressured,
             );
+            write.finish(receipt, &job.sink);
             // The bytes are on the wire NOW — book the slice the UI thread could
             // not: hardware key arrival → completed write, including the time this
             // job spent queued behind the paste ahead of it.
@@ -414,6 +990,7 @@ pub(crate) mod paste_order {
     pub(super) fn enqueue(
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
+        echo: &Arc<OutputEchoTracker>,
         ev: InputEvent,
     ) -> Result<bool, InputEvent> {
         let master = sink.master();
@@ -447,9 +1024,12 @@ pub(crate) mod paste_order {
         } else {
             crate::metrics::take_key_arrival()
         };
+        let echo_kind = OutputEchoInput::of(&ev);
         let job = Job {
             term: term.clone(),
             sink: sink.clone(),
+            echo: echo.clone(),
+            echo_kind,
             ev,
             pending,
             key_ns,
@@ -481,19 +1061,25 @@ pub(crate) mod paste_order {
     pub(super) fn ordered_or_inline(
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
+        echo: &Arc<OutputEchoTracker>,
         ev: &InputEvent,
         mode: crate::input::EgressMode,
-    ) -> (crate::input::Egress, bool) {
+    ) -> (crate::input::EgressReceipt, bool) {
         if is_ordering(sink.master()) {
-            match enqueue(term, sink, ev.clone()) {
-                Ok(_) => (
-                    crate::input::Egress::Reported(crate::input::Delivery::Full),
-                    false,
-                ),
-                Err(ev) => (crate::input::seam_egress(term, sink, &ev, mode), true),
+            match enqueue(term, sink, echo, ev.clone()) {
+                Ok(_) => (crate::input::EgressReceipt::deferred_full(), false),
+                Err(ev) => {
+                    let write = echo.begin(OutputEchoInput::of(&ev));
+                    let receipt = crate::input::seam_egress_receipt(term, sink, &ev, mode);
+                    write.finish(receipt, sink);
+                    (receipt, true)
+                }
             }
         } else {
-            (crate::input::seam_egress(term, sink, ev, mode), true)
+            let write = echo.begin(OutputEchoInput::of(ev));
+            let receipt = crate::input::seam_egress_receipt(term, sink, ev, mode);
+            write.finish(receipt, sink);
+            (receipt, true)
         }
     }
 
@@ -2210,7 +2796,11 @@ impl App {
         let Some(session) = self.pool.get(target_session) else {
             return InputOutcome::Ok;
         };
-        let (term, sink) = (session.term.clone(), session.ctx.sink.clone());
+        let (term, sink, echo) = (
+            session.term.clone(),
+            session.ctx.sink.clone(),
+            session.ctx.output_echo.clone(),
+        );
         // SELECTION CUSTODY (R1): the SAME gate the seam applies, through the
         // same helper. A hidden session is reached only by a held key whose
         // press already established session ownership, so in practice every
@@ -2256,9 +2846,14 @@ impl App {
             let mut terminal = term_lock(&term);
             let _ = apply_press_custody(&mut terminal, press_kind);
         }
-        let (egress, _) =
-            paste_order::ordered_or_inline(&term, &sink, &ev, input::EgressMode::Interactive);
-        egress_to_outcome(egress)
+        let (receipt, _) = paste_order::ordered_or_inline(
+            &term,
+            &sink,
+            &echo,
+            &ev,
+            input::EgressMode::Interactive,
+        );
+        egress_to_outcome(receipt.egress)
     }
 
     /// Route an input event through the complete convergence seam while pinning
@@ -2546,15 +3141,26 @@ impl App {
         // to it (letters typed into different sessions never assemble one
         // word) — the same id the render drain hands the Kitty Log.
         let terminal = match target_session {
-            Some(session) => self
-                .pool
-                .get(session)
-                .map(|owner| (owner.term.clone(), owner.ctx.sink.clone(), session)),
-            None => self
-                .front_terminal_mirror(wid)
-                .map(|terminal| (terminal.term, terminal.sink, terminal.session)),
+            Some(session) => self.pool.get(session).map(|owner| {
+                (
+                    owner.term.clone(),
+                    owner.ctx.sink.clone(),
+                    owner.ctx.output_echo.clone(),
+                    session,
+                )
+            }),
+            None => self.front_terminal_mirror(wid).and_then(|terminal| {
+                self.pool.get(terminal.session).map(|owner| {
+                    (
+                        terminal.term,
+                        terminal.sink,
+                        owner.ctx.output_echo.clone(),
+                        terminal.session,
+                    )
+                })
+            }),
         };
-        let Some((term, sink, session)) = terminal else {
+        let Some((term, sink, output_echo, session)) = terminal else {
             return match ev {
                 InputEvent::Resize {
                     rows,
@@ -3383,13 +3989,14 @@ impl App {
                 // common inline one — so the classified cosmetic feeds below can still
                 // read it after the dispatch (see their note on why they now run AFTER
                 // the write).
-                let (egress, wrote_inline) = paste_order::ordered_or_inline(
+                let (receipt, wrote_inline) = paste_order::ordered_or_inline(
                     &term,
                     &sink,
+                    &output_echo,
                     &ev,
                     input::EgressMode::Interactive,
                 );
-                let outcome = egress_to_outcome(egress);
+                let outcome = egress_to_outcome(receipt.egress);
                 // A queued key has not crossed the PTY boundary yet, and a
                 // failed inline write never will. Its arrival-time cursor
                 // licences must not be spendable by concurrent program output.
@@ -3712,6 +4319,7 @@ impl App {
                     ev,
                     &term,
                     &sink,
+                    &output_echo,
                     input_now.expect("paste dispatch owns an injected input timestamp"),
                 )
             }
@@ -4348,6 +4956,7 @@ impl App {
         ev: InputEvent,
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
+        echo: &Arc<OutputEchoTracker>,
         input_now: std::time::Instant,
     ) -> InputOutcome {
         debug_assert!(matches!(&ev, InputEvent::Paste(..)));
@@ -4371,14 +4980,22 @@ impl App {
         // loop) AND any keystroke submitted while it drains queues BEHIND it, so
         // the child sees the paste before that later input. Falls back to a
         // detached write only if the FIFO writer thread could not be spawned.
-        match paste_order::enqueue(term, sink, ev) {
+        match paste_order::enqueue(term, sink, echo, ev) {
             Ok(_queued_behind_existing) => {}
             Err(ev) => {
                 let term = term.clone();
                 let sink = sink.clone();
+                let echo = echo.clone();
                 std::thread::spawn(move || {
                     // Detached paste fallback: expendable thread, block under SPILL_CAP.
-                    input::seam_egress(&term, &sink, &ev, input::EgressMode::Backpressured);
+                    let write = echo.begin(OutputEchoInput::Echoable);
+                    let receipt = input::seam_egress_receipt(
+                        &term,
+                        &sink,
+                        &ev,
+                        input::EgressMode::Backpressured,
+                    );
+                    write.finish(receipt, &sink);
                 });
             }
         }
@@ -5314,10 +5931,12 @@ impl App {
                     paste_order::ordered_or_inline(
                         &session.term,
                         &session.ctx.sink,
+                        &session.ctx.output_echo,
                         &event,
                         input::EgressMode::Interactive,
                     )
                     .0
+                    .egress
                 };
                 #[cfg(test)]
                 {

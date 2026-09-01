@@ -31,11 +31,12 @@
 //! * **First observation BASELINES.** A cold engine (or one whose counter went
 //!   backwards — a session or tab switch) records the counter and mints nothing,
 //!   so attaching to a busy session never fires a burst of comets for history.
-//! * **ECHO DISCOUNT.** A delta within [`ECHO_DISCOUNT_MS`] of a keystroke, or
-//!   one arriving while the host reports `input_hot`, is the user's own typing
-//!   coming back and mints NOTHING. The `input_hot` term is load-bearing, not
-//!   belt-and-braces: paste does not stamp a keystroke, and without it a large
-//!   paste into a quiet prompt reads as program output.
+//! * **ECHO DISCOUNT.** A delta within [`ECHO_DISCOUNT_MS`] of conclusively
+//!   accepted editor input, or one arriving while the host reports `input_hot`,
+//!   is the user's own typing coming back and mints NOTHING. `input_hot` covers
+//!   the active/spilled interval; the accepted-input receipt covers its short
+//!   post-write echo shadow. A submitted turn boundary clears that shadow so a
+//!   fast command response remains authored output.
 //! * **EMPTY DAMAGE MINTS NOTHING.** The host passes only spans that still carry
 //!   ink. `\x1b[2K` over an already-blank line advances the content counter, and
 //!   without this clause an idle TUI redrawing its own chrome would shimmer
@@ -87,11 +88,11 @@ use std::time::Duration;
 use crate::cursor_glow::Geom;
 use crate::effect_util::{lerp_rgb, push_grid_quad};
 use crate::genome;
-use crate::spectrum::{clear_light_of_cyan, spectrum, spectrum_snap_index};
-use crate::trail_sweep::row_sweep_cells;
+use crate::spectrum::{clear_light_of_cyan, spectrum, spectrum_stop, spectrum_stop_position};
+use crate::trail_sound::OutputGesture;
 use crate::typing_momentum::TypingMomentum;
 
-/// A content-counter delta this close behind a keystroke is the user's own echo
+/// A content-counter delta this close behind accepted editor input is its echo
 /// and mints nothing. Matches the rain weather machine's discount so the two
 /// output-activity consumers cannot disagree about what "your own typing" is.
 pub const ECHO_DISCOUNT_MS: u64 = 250;
@@ -164,6 +165,20 @@ pub enum StreakSound {
     Shimmer,
     /// The episode's closing exhale, quieter still, on the drain to rest.
     Settle,
+}
+
+impl StreakSound {
+    /// The one shipping synth gesture for this visual edge.
+    ///
+    /// Kept beside the source enum so native, composed, and formal-conformance
+    /// hosts cannot silently assign different voices to the same streak cue.
+    #[must_use]
+    pub const fn output_gesture(self) -> OutputGesture {
+        match self {
+            Self::Shimmer => OutputGesture::Shimmer,
+            Self::Settle => OutputGesture::Settle,
+        }
+    }
 }
 
 /// One sound cue: what to play and where it happened.
@@ -283,11 +298,13 @@ struct Pending {
 /// PRISM WAKE's state machine. ONE PER PANE — see the module docs for the law.
 ///
 /// Not one per window, and the difference is the design rather than a detail:
-/// `crates/aterm-gui/src/lib.rs` holds `output_streak_panes: BTreeMap<u64,
-/// OutputStreak>` keyed by session id, and says why at the field — "a split
-/// shows several live terminals at once and each carries its own arrival clock,
-/// so one engine per window would blend their streams into nonsense (and let a
-/// chatty pane spend the quiet pane's spawn budget)". The sibling
+/// `crates/aterm-gui/src/lib.rs` holds `output_streak_panes: BTreeMap<(u64,
+/// usize), OutputStreak>` keyed by `(session id, visible pane slot)`, and says
+/// why at the field — "a split shows several live terminal views at once and
+/// each carries its own arrival clock, so one engine per window would blend
+/// their streams into nonsense (and let a chatty pane spend the quiet pane's
+/// spawn budget)". The slot keeps two visible views of one session independent.
+/// The sibling
 /// `output_streak: Option<Box<OutputStreak>>` beside it is the SINGLE-PANE
 /// present, not a second scope.
 ///
@@ -308,7 +325,7 @@ pub struct OutputStreak {
     /// hosts (whose snapshots carry only a synthetic, always-advancing frame
     /// seq) share this law with the hosts that have a real content clock.
     last_token: Option<u64>,
-    /// Last keystroke stamp, for the echo discount.
+    /// Last accepted editor-input stamp, for the echo discount.
     last_key: Option<Instant>,
     /// Newest licensed span awaiting a spawn decision.
     pending: Option<Pending>,
@@ -357,13 +374,36 @@ impl OutputStreak {
     /// engine is at rest. The host arms its effect lane on this; `None` is what
     /// lets the window park to a pure wait.
     #[must_use]
-    pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
+    pub fn next_change_deadline(&self, now: Instant, idle_secs: f32) -> Option<Instant> {
         if !self.drawing {
-            // Even with nothing on glass, a live episode still owes its Settle
-            // exhale at the analytic drain crossing.
-            return self.pending_settle_deadline();
+            // Even with nothing on glass, a live episode still owes both its
+            // mandatory idle retirement and its analytic Settle crossing. The
+            // earlier transition owns the wake; after an idle tick consumes
+            // `last_output`, only the still-pending Settle remains.
+            return [
+                self.pending_idle_deadline(idle_secs),
+                self.pending_settle_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|deadline| deadline.max(now));
         }
         Some(now)
+    }
+
+    /// The mandatory idle cutoff for the current episode. Invalid values drain
+    /// immediately, matching [`Self::idle_drained`].
+    fn pending_idle_deadline(&self, idle_secs: f32) -> Option<Instant> {
+        if !self.in_episode {
+            return None;
+        }
+        let last = self.last_output?;
+        let idle = idle_duration(idle_secs).unwrap_or(Duration::ZERO);
+        // Configuration may name a duration that this platform's `Instant`
+        // cannot represent. Invalid or out-of-range values match
+        // `idle_drained` and cut the episode off immediately.
+        Some(last.checked_add(idle).unwrap_or(last))
     }
 
     /// The instant the current episode drains, if one is open and owed a
@@ -397,10 +437,20 @@ impl OutputStreak {
         self.last_token = None;
     }
 
-    /// One keystroke at `now`, for the echo discount. The host forwards its own
-    /// key stamps; nothing else about typing reaches this engine.
+    /// One conclusively accepted editor input at `now`, for the echo discount.
+    /// The compatibility name predates paste/FIFO receipt tracking; hosts may
+    /// forward printable keys, mapped sequences, IME text, or paste receipts.
     pub fn note_keystroke(&mut self, now: Instant) {
         self.last_key = Some(now);
+    }
+
+    /// A submitted turn boundary at `now`. Clear only an older/equal editor
+    /// shadow: hosts may replay their latest per-session receipt every frame,
+    /// and an old boundary must not erase input accepted after it.
+    pub fn note_turn_boundary(&mut self, now: Instant) {
+        if self.last_key.is_none_or(|accepted| accepted <= now) {
+            self.last_key = None;
+        }
     }
 
     /// One frame-time output observation: the terminal's content-generation
@@ -459,17 +509,32 @@ impl OutputStreak {
     /// the overwhelming majority of real output. The span is that row's true
     /// ink extent, which is also how EMPTY DAMAGE MINTS NOTHING is enforced
     /// here: a row carrying no ink yields no span at all.
+    /// `token` is the host's content-only generation/damage token and is
+    /// checked before that row walk, so unchanged frames do not scan cells.
     ///
     /// Returns whether the observation was LICENSED (see [`Self::note_output`]).
     pub fn note_output_cells(
         &mut self,
         cells: &[Vec<aterm_core::terminal::RenderCell>],
-        cursor_row: usize,
-        cursor_col: usize,
+        cursor: (usize, usize),
         rows: usize,
+        token: u64,
         now: Instant,
         input_hot: bool,
     ) -> bool {
+        // The caller already owns the content/damage clock that licensed this
+        // observation. Refuse a baseline or unchanged frame before touching a
+        // row: an idle enabled engine must cost one scalar comparison, not a
+        // full-width glyph scan on every repaint.
+        if self.last_token.is_none() || self.last_token == Some(token) {
+            return self.note_output(token, &[], now, input_hot);
+        }
+        if input_hot || self.within_echo_window(now) {
+            // Still consume the changed token, but do not derive geometry for
+            // output the echo gate will reject regardless.
+            return self.note_output(token, &[], now, input_hot);
+        }
+        let (cursor_row, cursor_col) = cursor;
         let anchor_row = if cursor_col > 0 {
             cursor_row
         } else {
@@ -477,36 +542,30 @@ impl OutputStreak {
         };
         let span = cells
             .get(anchor_row)
-            .and_then(|row| row.iter().rposition(|c| c.ch != ' '))
             .filter(|_| anchor_row < rows)
-            .map(|end| {
+            .and_then(|row| {
+                // One forward pass owns BOTH ends of the ink extent. A
+                // `position` + `rposition` pair would rescan the row, while
+                // defaulting the left edge to zero charges leading blanks to
+                // both comet work and sound-pan geometry.
+                let mut extent: Option<(usize, usize)> = None;
+                for (col, cell) in row.iter().enumerate() {
+                    if cell.ch != ' ' {
+                        extent = Some(match extent {
+                            Some((left, _)) => (left, col),
+                            None => (col, col),
+                        });
+                    }
+                }
+                extent
+            })
+            .map(|(start, end)| {
                 [(
                     anchor_row as u16,
-                    0u16,
+                    u16::try_from(start).unwrap_or(u16::MAX),
                     u16::try_from(end).unwrap_or(u16::MAX),
                 )]
             });
-        // THE ARRIVAL TOKEN, derived from the very row the comet would light:
-        // its index folded with its glyphs. This is a CONTENT clock by
-        // construction — it moves when what is written moves and stands still
-        // when the screen is merely repainted — which is what the composed
-        // hosts need, since their snapshots carry only a synthetic frame seq
-        // that advances on every single frame and would otherwise licence a
-        // comet forever (a split that never settles is a split that never
-        // returns to 0% idle).
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut token = FNV_OFFSET;
-        let mut fold = |v: u64| {
-            token ^= v;
-            token = token.wrapping_mul(FNV_PRIME);
-        };
-        fold(anchor_row as u64);
-        if let Some(row) = cells.get(anchor_row) {
-            for c in row {
-                fold(u64::from(u32::from(c.ch)));
-            }
-        }
         self.note_output(
             token,
             span.as_ref().map_or(&[][..], |s| &s[..]),
@@ -515,7 +574,7 @@ impl OutputStreak {
         )
     }
 
-    /// Whether `now` sits inside the echo shadow of the last keystroke.
+    /// Whether `now` sits inside the echo shadow of the last accepted input.
     fn within_echo_window(&self, now: Instant) -> bool {
         self.last_key.is_some_and(|k| {
             now.saturating_duration_since(k) <= Duration::from_millis(ECHO_DISCOUNT_MS)
@@ -560,6 +619,10 @@ impl OutputStreak {
             self.comets = Default::default();
             self.ribbon = None;
             self.pending = None;
+            // The exact idle transition has been consumed. If momentum still
+            // owes a later Settle, its analytic crossing is now the sole wake;
+            // retaining this stamp would keep returning an overdue deadline.
+            self.last_output = None;
             self.drawing = false;
             return StreakFrame { fp: 0, cue };
         }
@@ -585,10 +648,7 @@ impl OutputStreak {
             // Nothing has ever been licensed: only a live comet keeps us awake.
             return self.comets.iter().all(Option::is_none) && self.ribbon.is_none();
         };
-        if !cfg.idle_secs.is_finite() || cfg.idle_secs <= 0.0 {
-            return true;
-        }
-        now.saturating_duration_since(last).as_secs_f32() > cfg.idle_secs
+        idle_duration(cfg.idle_secs).is_none_or(|idle| now.saturating_duration_since(last) >= idle)
     }
 
     /// Spend a pending licensed observation: spawn a comet, refresh the flood
@@ -608,7 +668,7 @@ impl OutputStreak {
         // GOVERNOR 4 — FLOOD COALESCING. Past saturation nothing new spawns; the
         // single ribbon carries the activity at constant cost, mutely.
         if m >= SATURATED {
-            self.refresh_ribbon(pending, cfg);
+            self.refresh_ribbon(pending, cfg, geom);
             return None;
         }
 
@@ -634,10 +694,11 @@ impl OutputStreak {
         let tail_span = u32::from(TAIL_MAX - TAIL_MIN);
         let tail = TAIL_MIN + ((genome::field(key, 16, 8) as u32 * tail_span) / 255) as u16;
 
+        let (from_col, to_col) = clipped_span(pending, geom.cols)?;
         self.comets[slot] = Some(Comet {
             row: pending.row,
-            from_col: i32::from(pending.left),
-            to_col: i32::from(pending.right).min(geom.cols as i32 - 1),
+            from_col,
+            to_col,
             progress: 0.0,
             dur_s: dur_ms as f32 / 1000.0,
             tail: tail.min(cfg.tail.clamp(TAIL_MIN, TAIL_MAX)),
@@ -709,23 +770,29 @@ impl OutputStreak {
     /// Dracula through violet. Pure position selection on THE ONE SPECTRUM; the
     /// per-comet genome only jitters within a stop's neighbourhood.
     fn hue_for(&self, pending: Pending, cfg: &StreakConfig) -> f32 {
-        let stops = crate::spectrum::SPECTRUM_STOPS.max(1) as f32;
-        let anchor = spectrum_snap_index(hue_position_of(cfg.theme_cursor)) as f32 / stops;
+        let named = nearest_spectrum_stop_by_hue(cfg.theme_cursor);
+        let anchor = spectrum_stop_position(named);
         let key = genome::mix(self.seed ^ u64::from(pending.row));
-        let jitter = (genome::field(key, 0, 8) as f32 / 255.0 - 0.5) * (1.0 / stops);
-        (anchor + jitter).rem_euclid(1.0)
+        let jitter = (genome::field(key, 0, 8) as f32 / 255.0 * 2.0 - 1.0)
+            * spectrum_stop_jitter_radius(named);
+        // The spectrum is an arc, not a loop: jitter at red/violet clamps to
+        // that endpoint instead of wrapping into the opposite named colour.
+        (anchor + jitter).clamp(0.0, 1.0)
     }
 
     /// Refresh (or open) the flood ribbon on the newest output row.
-    fn refresh_ribbon(&mut self, pending: Pending, cfg: &StreakConfig) {
+    fn refresh_ribbon(&mut self, pending: Pending, cfg: &StreakConfig, geom: Geom) {
         let hue = match self.ribbon {
             Some(r) => r.hue,
             None => self.hue_for(pending, cfg),
         };
+        let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
+            return;
+        };
         self.ribbon = Some(Ribbon {
             row: pending.row,
-            from_col: i32::from(pending.left),
-            to_col: i32::from(pending.right),
+            from_col,
+            to_col,
             hue,
             since_output_s: 0.0,
         });
@@ -761,7 +828,6 @@ impl OutputStreak {
     fn emit(&self, geom: Geom, cfg: &StreakConfig, out: &mut Vec<GlowQuad>) -> u64 {
         let before = out.len();
         let mut fp: u64 = 0;
-        let mut cells: Vec<(i32, i32)> = Vec::new();
 
         for c in self.comets.iter().flatten() {
             // MONOTONE fade — one decay across the life, never an oscillation,
@@ -769,19 +835,23 @@ impl OutputStreak {
             let life = 1.0 - c.progress;
             let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
             let tail_start = head - f32::from(c.tail);
-            cells.clear();
-            row_sweep_cells(
-                &mut cells,
-                i32::from(c.row),
-                tail_start.floor() as i32 - 1,
-                head.round() as i32,
-            );
-            for &(row, col) in &cells {
+            // `row_sweep_cells(from - 1, to)` is exactly this inclusive
+            // same-row range. Emit it directly: no temporary Vec, no resident
+            // scratch to clear, and the hot tick keeps its no-allocation law.
+            for col in tail_start.floor() as i32..=head.round() as i32 {
                 let u = ((head - col as f32) / f32::from(c.tail).max(1.0)).clamp(0.0, 1.0);
                 // Bright head, fading tail; squared so the tail thins fast and
                 // the comet reads as motion rather than a painted bar.
                 let shape = (1.0 - u) * (1.0 - u);
-                self.push_cell(out, geom, cfg, row, col, c.hue + u * HUE_SPAN, shape * life);
+                self.push_cell(
+                    out,
+                    geom,
+                    cfg,
+                    i32::from(c.row),
+                    col,
+                    c.hue + u * HUE_SPAN,
+                    shape * life,
+                );
             }
             fp = fp
                 .wrapping_mul(1_000_003)
@@ -790,16 +860,14 @@ impl OutputStreak {
         }
 
         if let Some(r) = self.ribbon {
-            cells.clear();
-            row_sweep_cells(&mut cells, i32::from(r.row), r.from_col - 1, r.to_col);
             // The ribbon is a FLAT, constant-cost texture: no head, no sweep,
             // one steady low-amplitude wash whose hue drifts far under the
             // photosensitivity invariant.
             let fade =
                 1.0 - (r.since_output_s / (RIBBON_LINGER_MS as f32 / 1000.0)).clamp(0.0, 1.0) * 0.5;
-            for &(row, col) in &cells {
+            for col in r.from_col..=r.to_col {
                 let t = r.hue + (col as f32 / geom.cols.max(1) as f32) * HUE_SPAN;
-                self.push_cell(out, geom, cfg, row, col, t, 0.55 * fade);
+                self.push_cell(out, geom, cfg, i32::from(r.row), col, t, 0.55 * fade);
             }
             fp = fp
                 .wrapping_mul(31)
@@ -860,6 +928,28 @@ impl OutputStreak {
     }
 }
 
+/// Clip one licensed span to the visible columns without relocating a wholly
+/// off-screen or malformed span onto the viewport edge.
+fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
+    if pending.right < pending.left || usize::from(pending.left) >= cols {
+        return None;
+    }
+    let last_col = i32::try_from(cols.checked_sub(1)?).unwrap_or(i32::MAX);
+    Some((
+        i32::from(pending.left),
+        i32::from(pending.right).min(last_col),
+    ))
+}
+
+/// Canonical mandatory-idle duration. Both scheduling and consumption use the
+/// same rounded `Duration`, so a wake at the promised boundary is consumed on
+/// that tick rather than rescheduling itself due to a second float conversion.
+fn idle_duration(idle_secs: f32) -> Option<Duration> {
+    (idle_secs.is_finite() && idle_secs > 0.0)
+        .then(|| Duration::try_from_secs_f32(idle_secs).ok())
+        .flatten()
+}
+
 /// Equal-power pan position `-1..=1` from a span's centre column.
 fn pan_of(pending: Pending, geom: Geom) -> f32 {
     let cols = geom.cols.max(1) as f32;
@@ -867,9 +957,50 @@ fn pan_of(pending: Pending, geom: Geom) -> f32 {
     ((centre / cols) * 2.0 - 1.0).clamp(-1.0, 1.0)
 }
 
-/// Where a theme colour sits on the spectrum arc `0..1`, by hue angle. Used only
-/// to pick an ENTRY STOP — the colour itself never enters the emission path, so
-/// this is position selection, not a second ramp.
+/// Nearest named spectrum colour by circular HSV hue. `hue_position_of`
+/// returns a hue-domain turn, while `spectrum_stop_position` returns an arc
+/// parameter; comparing in hue space first keeps those domains distinct even
+/// when the spectrum arc is perceptually re-paced.
+fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
+    let hue = hue_position_of(rgb);
+    let mut nearest = 0;
+    let mut nearest_distance = f32::INFINITY;
+    for index in 0..crate::spectrum::SPECTRUM_STOPS {
+        let stop_hue = hue_position_of(spectrum_stop(index));
+        let direct = (hue - stop_hue).abs();
+        let distance = direct.min(1.0 - direct);
+        if distance < nearest_distance {
+            nearest = index;
+            nearest_distance = distance;
+        }
+    }
+    nearest
+}
+
+/// Half the narrower adjacent arc gap for one named stop. That is exactly its
+/// Voronoi radius, so genome jitter cannot cross into a neighbour even when
+/// the canonical spectrum uses non-uniform perceptual pacing. Endpoints use
+/// their sole adjacent gap and clamp against the end of the arc in `hue_for`.
+fn spectrum_stop_jitter_radius(index: usize) -> f32 {
+    let last = crate::spectrum::SPECTRUM_STOPS.saturating_sub(1);
+    if last == 0 {
+        return 0.0;
+    }
+    let index = index.min(last);
+    let at = spectrum_stop_position(index);
+    let gap = if index == 0 {
+        spectrum_stop_position(1) - at
+    } else if index == last {
+        at - spectrum_stop_position(last - 1)
+    } else {
+        (at - spectrum_stop_position(index - 1)).min(spectrum_stop_position(index + 1) - at)
+    };
+    gap.max(0.0) * 0.5
+}
+
+/// A colour's circular HSV hue turn (`0..1`). Used only to compare the theme
+/// colour with named spectrum colours; this is deliberately not a spectrum-arc
+/// parameter, and the colour itself never enters the emission path.
 fn hue_position_of(rgb: u32) -> f32 {
     let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
@@ -987,8 +1118,177 @@ mod tests {
         assert!(e.note_output(9_001, &span(1), t0 + Duration::from_millis(40), false));
     }
 
-    /// THE ECHO DISCOUNT: your own typing — by keystroke stamp OR by the host's
-    /// `input_hot` flag, which is the arm that covers PASTE — mints nothing.
+    /// The cell convenience path trusts the host's content clock before it
+    /// derives geometry. Changing glyphs under an unchanged token is still an
+    /// unchanged observation; advancing the token licenses the same row and
+    /// records its true ink extent.
+    #[test]
+    fn cell_observation_is_gated_by_the_host_token_before_geometry() {
+        let t0 = Instant::now();
+        let mut e = OutputStreak::new(9);
+        let mut cells = vec![vec![aterm_core::terminal::RenderCell::default(); 8]; 3];
+        cells[1][2].ch = 'a';
+        assert!(!e.note_output_cells(&cells, (2, 0), 3, 10, t0, false));
+
+        cells[1][6].ch = 'z';
+        assert!(
+            !e.note_output_cells(&cells, (2, 0), 3, 10, t0 + Duration::from_millis(20), false,),
+            "glyph churn without a content-clock edge is only a repaint"
+        );
+        assert!(e.pending.is_none());
+
+        assert!(e.note_output_cells(&cells, (2, 0), 3, 11, t0 + Duration::from_millis(40), false,));
+        let pending = e.pending.expect("changed token licenses the ink row");
+        assert_eq!(
+            (pending.row, pending.left, pending.right),
+            (1, 2, 6),
+            "leading/trailing blanks stay outside the sparse ink extent"
+        );
+    }
+
+    #[test]
+    fn cell_observation_all_blank_row_mints_nothing() {
+        let t0 = Instant::now();
+        let mut e = OutputStreak::new(9);
+        let cells = vec![vec![aterm_core::terminal::RenderCell::default(); 8]; 3];
+        assert!(!e.note_output_cells(&cells, (2, 0), 3, 10, t0, false));
+        assert!(
+            !e.note_output_cells(&cells, (2, 0), 3, 11, t0 + Duration::from_millis(20), false,)
+        );
+        assert!(e.pending.is_none(), "a blank anchor row has no ink extent");
+    }
+
+    #[test]
+    fn sound_edges_have_one_canonical_output_gesture_mapping() {
+        assert_eq!(
+            StreakSound::Shimmer.output_gesture(),
+            OutputGesture::Shimmer
+        );
+        assert_eq!(StreakSound::Settle.output_gesture(), OutputGesture::Settle);
+    }
+
+    #[test]
+    fn theme_hue_uses_named_stop_positions_with_bounded_non_wrapping_jitter() {
+        let pending = Pending {
+            row: 9,
+            left: 3,
+            right: 12,
+        };
+        let last = crate::spectrum::SPECTRUM_STOPS - 1;
+        for named in 0..crate::spectrum::SPECTRUM_STOPS {
+            let cursor = spectrum_stop(named);
+            assert_eq!(
+                nearest_spectrum_stop_by_hue(cursor),
+                named,
+                "named stop {named} must select itself"
+            );
+            let cfg = StreakConfig {
+                theme_cursor: cursor,
+                ..cfg_on()
+            };
+            let anchor = spectrum_stop_position(named);
+            let lower_midpoint = if named == 0 {
+                0.0
+            } else {
+                (spectrum_stop_position(named - 1) + anchor) * 0.5
+            };
+            let upper_midpoint = if named == last {
+                1.0
+            } else {
+                (anchor + spectrum_stop_position(named + 1)) * 0.5
+            };
+            let expected_radius = if named == 0 {
+                upper_midpoint - anchor
+            } else if named == last {
+                anchor - lower_midpoint
+            } else {
+                (anchor - lower_midpoint).min(upper_midpoint - anchor)
+            };
+            assert!(
+                (spectrum_stop_jitter_radius(named) - expected_radius).abs() <= f32::EPSILON,
+                "stop {named} radius must follow its actual neighbouring gaps"
+            );
+            for seed in 0..32 {
+                let actual = OutputStreak::new(seed).hue_for(pending, &cfg);
+                let key = genome::mix(seed ^ u64::from(pending.row));
+                let jitter =
+                    (genome::field(key, 0, 8) as f32 / 255.0 * 2.0 - 1.0) * expected_radius;
+                let expected = (anchor + jitter).clamp(0.0, 1.0);
+                assert!(
+                    (actual - expected).abs() <= f32::EPSILON,
+                    "named stop {named}, seed {seed}: {actual} != {expected}"
+                );
+                assert!(
+                    (lower_midpoint..=upper_midpoint).contains(&actual),
+                    "jitter escaped stop {named}'s Voronoi interval: {actual} not in \
+                     {lower_midpoint}..={upper_midpoint}"
+                );
+            }
+        }
+
+        // The red→violet spectrum is an arc, not a loop. Positive jitter on
+        // exact violet must pin at the end instead of wrapping back to red.
+        let violet_edge = StreakConfig {
+            theme_cursor: spectrum_stop(crate::spectrum::SPECTRUM_STOPS - 1),
+            ..cfg_on()
+        };
+        assert_eq!(
+            nearest_spectrum_stop_by_hue(violet_edge.theme_cursor),
+            crate::spectrum::SPECTRUM_STOPS - 1
+        );
+        let violet_lower = (spectrum_stop_position(last - 1) + spectrum_stop_position(last)) * 0.5;
+        for seed in 0..256 {
+            let actual = OutputStreak::new(seed).hue_for(pending, &violet_edge);
+            assert!(actual >= violet_lower, "violet jitter wrapped: {actual}");
+        }
+
+        // #55FF00 is HSV hue 100°: between yellow (60°) and green (120°), and
+        // unambiguously nearer green. This catches accidental arc-t comparison.
+        assert_eq!(nearest_spectrum_stop_by_hue(0x0055_FF00), 3);
+    }
+
+    #[test]
+    fn clipping_rejects_malformed_and_wholly_off_right_spans() {
+        assert_eq!(
+            clipped_span(
+                Pending {
+                    row: 0,
+                    left: 6,
+                    right: 12,
+                },
+                8,
+            ),
+            Some((6, 7)),
+            "a partly visible span clips only its right edge"
+        );
+        assert_eq!(
+            clipped_span(
+                Pending {
+                    row: 0,
+                    left: 8,
+                    right: 12,
+                },
+                8,
+            ),
+            None,
+            "a wholly off-right span must not relocate onto the last cell"
+        );
+        assert_eq!(
+            clipped_span(
+                Pending {
+                    row: 0,
+                    left: 5,
+                    right: 4,
+                },
+                8,
+            ),
+            None,
+            "a reversed span is malformed rather than a one-cell flash"
+        );
+    }
+
+    /// THE ECHO DISCOUNT: accepted editor input — by post-write receipt OR by
+    /// the host's active/spill `input_hot` flag — mints nothing.
     #[test]
     fn echo_discount_mints_nothing_including_paste() {
         let t0 = Instant::now();
@@ -999,12 +1299,31 @@ mod tests {
             !e.note_output(2, &span(2), t0 + Duration::from_millis(200), false),
             "a delta inside the echo window is the user's own typing"
         );
-        // PASTE: no keystroke stamp at all, but the host reports input in flight.
+        // Active/spilled input is discounted before its completion receipt.
         let mut e2 = OutputStreak::new(1);
         e2.note_output(1, &span(2), t0, false);
         assert!(
             !e2.note_output(2, &span(2), t0 + Duration::from_secs(9), true),
-            "input_hot alone must discount the echo — paste stamps no key"
+            "input_hot alone must discount output while input is active/spilled"
+        );
+    }
+
+    #[test]
+    fn submitted_turn_boundary_clears_only_older_echo_shadow() {
+        let t0 = Instant::now();
+        let mut e = OutputStreak::new(1);
+        e.note_output(1, &span(2), t0, false);
+        e.note_keystroke(t0 + Duration::from_millis(10));
+        e.note_turn_boundary(t0 + Duration::from_millis(20));
+        assert!(e.note_output(2, &span(2), t0 + Duration::from_millis(21), false));
+
+        let mut newer = OutputStreak::new(1);
+        newer.note_output(1, &span(2), t0, false);
+        newer.note_keystroke(t0 + Duration::from_millis(30));
+        newer.note_turn_boundary(t0 + Duration::from_millis(20));
+        assert!(
+            !newer.note_output(2, &span(2), t0 + Duration::from_millis(31), false),
+            "a replayed older boundary must not erase newer accepted input"
         );
     }
 
@@ -1192,7 +1511,106 @@ mod tests {
         assert_eq!(f.fp, 0);
         assert!(out.is_empty());
         assert!(!e.is_active());
-        assert_eq!(e.next_change_deadline(late), None);
+        assert_eq!(e.next_change_deadline(late, cfg.idle_secs), None);
+    }
+
+    /// A short mandatory idle cutoff may precede momentum's analytic Settle.
+    /// The parked engine wakes at that earlier instant, consumes it exactly on
+    /// the boundary, then arms only the later Settle instead of spinning on an
+    /// overdue idle deadline.
+    #[test]
+    fn parked_episode_wakes_at_idle_cutoff_before_later_settle() {
+        let t0 = Instant::now();
+        let cfg = StreakConfig {
+            idle_secs: 2.0,
+            ..cfg_on()
+        };
+        let mut e = OutputStreak::new(71);
+        assert!(!e.note_output(1, &span(4), t0, false));
+        let spawned = t0 + Duration::from_millis(300);
+        assert!(e.note_output(2, &span(4), spawned, false));
+        let mut out = Vec::new();
+        assert_eq!(
+            e.tick(spawned, geom(), &cfg, &mut out)
+                .cue
+                .map(|cue| cue.sound),
+            Some(StreakSound::Shimmer)
+        );
+        e.momentum.set_value(spawned, 1.0);
+        for step in 1..=4 {
+            out.clear();
+            e.tick(
+                spawned + Duration::from_millis(250 * step),
+                geom(),
+                &cfg,
+                &mut out,
+            );
+        }
+        let parked = spawned + Duration::from_secs(1);
+        assert!(!e.is_active());
+        let idle = spawned + Duration::from_secs(2);
+        assert_eq!(e.next_change_deadline(parked, cfg.idle_secs), Some(idle));
+
+        out.clear();
+        let drained = e.tick(idle, geom(), &cfg, &mut out);
+        assert_eq!(drained.fp, 0);
+        assert!(
+            drained.cue.is_none(),
+            "momentum still owes its later Settle"
+        );
+        let settle = e
+            .next_change_deadline(idle, cfg.idle_secs)
+            .expect("the episode still owes its analytic Settle");
+        assert!(
+            settle > idle,
+            "the consumed idle cutoff cannot spin overdue"
+        );
+    }
+
+    #[test]
+    fn fractional_idle_deadline_is_consumed_at_the_exact_promised_boundary() {
+        let t0 = Instant::now();
+        let cfg = StreakConfig {
+            idle_secs: 0.1,
+            ..cfg_on()
+        };
+        let mut e = OutputStreak::new(73);
+        assert!(!e.note_output(1, &span(4), t0, false));
+        let spawned = t0 + Duration::from_millis(300);
+        assert!(e.note_output(2, &span(4), spawned, false));
+        let mut out = Vec::new();
+        e.tick(spawned, geom(), &cfg, &mut out);
+        // Model the natural parked interval without depending on this seed's
+        // randomized comet duration; the episode and momentum stay live.
+        e.comets = Default::default();
+        e.drawing = false;
+
+        let exact = spawned + Duration::from_secs_f32(cfg.idle_secs);
+        assert_eq!(e.next_change_deadline(spawned, cfg.idle_secs), Some(exact));
+        out.clear();
+        e.tick(exact, geom(), &cfg, &mut out);
+        assert!(e.last_output.is_none(), "the exact cutoff was consumed");
+        assert_ne!(
+            e.next_change_deadline(exact, cfg.idle_secs),
+            Some(exact),
+            "float rounding cannot manufacture an overdue wake loop"
+        );
+    }
+
+    #[test]
+    fn huge_finite_idle_value_drains_immediately_without_panicking() {
+        let last = Instant::now();
+        let cfg = StreakConfig {
+            idle_secs: f32::MAX,
+            ..cfg_on()
+        };
+        let mut e = OutputStreak::new(79);
+        e.in_episode = true;
+        e.last_output = Some(last);
+
+        assert_eq!(idle_duration(f32::MAX), None);
+        assert_eq!(e.pending_idle_deadline(f32::MAX), Some(last));
+        assert!(e.idle_drained(last, &cfg));
     }
 
     /// CLOCKLESS DETERMINISM: the same seed and the same injected `(now, input)`

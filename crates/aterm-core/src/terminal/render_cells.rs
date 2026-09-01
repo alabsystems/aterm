@@ -1396,6 +1396,7 @@ impl Terminal {
         // O(1), and idempotent within a damage session, so reading it here is free
         // even when the frontend also reads it for its present early-out.
         scratch.snapshot_seq = self.damage_epoch();
+        scratch.content_seq = self.content_seq();
         scratch.process_sequence = self.transient.pipeline_timestamps.process_sequence;
 
         // DMG-1 damage carrier: extraction-continuity tokens. Stamped by EVERY

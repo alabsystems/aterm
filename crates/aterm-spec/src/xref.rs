@@ -1252,6 +1252,11 @@ pub fn model_registry() -> Vec<Model> {
         gpu_loss_recovery_model(),
         recovery_redraw_model(),
         predictive_echo_visibility_model(),
+        // Sink-ordered output-echo receipts may complete on GUI writers in the
+        // opposite order. The tracker retains the highest accepted order and
+        // publishes/samples its timestamp tuple coherently; Tier-1 drives the
+        // real sink receipts and tracker in aterm-gui/src/app_input.rs.
+        output_echo_receipt_publication_model(),
         // Streaming-search lifecycle: drift-free twin of aterm-search's
         // StreamingSearch engine (supersedes the never-committed hand
         // StreamingSearch.tla). Registering it enrolls every action in the

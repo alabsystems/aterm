@@ -30,8 +30,19 @@
 //! geometry the splice records for the mouse path. The answer — `2/7`, `no matches`,
 //! `bad regex` — outranks them: on a narrow window the toggles are dropped so the
 //! readout survives, and a failed search additionally tints the QUERY ITSELF, because
-//! that is where the eye already is. Truncation stays honest at every width, as the
-//! full `no matches (partial history)` or the same `+` marker the count form uses.
+//! that is where the eye already is.
+//!
+//! A count is only ever painted bare when it is an exact census of the present
+//! screen. Two qualifiers say otherwise and survive at EVERY width — the ladder
+//! shortens by dropping the `i/` position, never the marker:
+//!
+//! * `+` — the index was capped (history deeper than `search_history_lines`), so
+//!   the total is a floor. Spelled out as `no matches (partial history)` where
+//!   the status zone is wide enough.
+//! * `…` — the terminal changed since the count was taken (output arrived, the
+//!   screen repainted). The search is deliberately not re-run per PTY batch, so
+//!   the number is a past census and can be wrong in EITHER direction; it
+//!   refreshes on the next edit or ⌘S/⌘R. Spelled out as `(stale)`.
 //!
 //! Pure + themed like the config-notice bands (it reuses
 //! [`crate::settings::blank_row`]/[`crate::settings::write_str`] +
@@ -115,6 +126,16 @@ pub(crate) struct FindBarView {
     /// Scrollback ran deeper than the search index cap (older history unsearched), so a
     /// zero-match reads `no matches (partial history)` rather than a definitive miss.
     pub truncated: bool,
+    /// The terminal changed since `total` was counted — new output, a repaint, a
+    /// `clear` — and the search is deliberately NOT re-run per PTY batch (that is
+    /// one full scan per burst on the UI thread). The count is therefore a past
+    /// census of a screen that has since moved, so the bar marks it `…` instead
+    /// of asserting `1/6` at a window that now holds eight hits.
+    ///
+    /// Distinct from [`Self::truncated`] on purpose: `+` says "at least this
+    /// many", a floor; `…` says "this many, as of before the last output" and
+    /// can be wrong in EITHER direction. Both can hold at once (`1/6+…`).
+    pub stale: bool,
 }
 
 impl FindBarView {
@@ -186,7 +207,27 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     if v.query.is_empty() {
         return None;
     }
-    let plus = if v.truncated { "+" } else { "" };
+    // The two qualifiers, in one place because every form below carries them and
+    // NO form is allowed to drop them to fit: a shortened count that has quietly
+    // shed its `+` or `…` is a bare assertion the bar knows is not true. The
+    // ladder therefore shortens by dropping the `i/` position (which the user can
+    // still read off the highlight) and never the marker.
+    //
+    // `+`: the index was capped, so `total` is a floor — there may be more in the
+    // history it could not reach. `…`: the terminal has changed since `total` was
+    // counted, so it is a past census and can be off in either direction.
+    let mark = match (v.truncated, v.stale) {
+        (true, true) => "+…",
+        (true, false) => "+",
+        (false, true) => "…",
+        (false, false) => "",
+    };
+    let spelled = match (v.truncated, v.stale) {
+        (true, true) => " (partial history, stale)",
+        (true, false) => " (partial history)",
+        (false, true) => " (stale)",
+        (false, false) => "",
+    };
     let (candidates, fg, bold) = if v.regex_error {
         (
             vec!["bad regex".to_string(), "re!".to_string()],
@@ -194,20 +235,11 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             true,
         )
     } else if v.total == 0 {
-        // `+` is the same "…and history was deeper than the index" marker the count
-        // form uses, so the honest qualifier survives at every width.
         (
             vec![
-                format!(
-                    "no matches{}",
-                    if v.truncated {
-                        " (partial history)"
-                    } else {
-                        ""
-                    }
-                ),
-                format!("no matches{plus}"),
-                format!("0 hits{plus}"),
+                format!("no matches{spelled}"),
+                format!("no matches{mark}"),
+                format!("0 hits{mark}"),
             ],
             c.warn,
             false,
@@ -215,9 +247,8 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     } else {
         (
             vec![
-                format!("{}/{}{}", v.idx, v.total, plus),
-                format!("{}/{}", v.idx, v.total),
-                format!("{}{plus}", v.total),
+                format!("{}/{}{mark}", v.idx, v.total),
+                format!("{}{mark}", v.total),
             ],
             c.value,
             true,
@@ -540,6 +571,7 @@ mod tests {
             is_regex: false,
             regex_error: false,
             truncated: false,
+            stale: false,
         }
     }
 
@@ -1021,6 +1053,81 @@ mod tests {
             90,
         ));
         assert!(s.contains("bad regex"), "{s}");
+    }
+
+    /// A count is painted BARE only when it is an exact census of the present
+    /// screen. Output since the count marks it `…`; a capped index marks it `+`;
+    /// both mark it `+…`. And no width sheds a marker to fit — the ladder gives
+    /// up the `i/` position first, because a shortened `1/6` that has quietly
+    /// dropped its qualifier is the exact lie this marker exists to prevent.
+    #[test]
+    fn a_count_the_screen_has_moved_past_is_never_painted_bare() {
+        // The STATUS row only: the key-hint row spells `Ctrl+S`, and a `+` there
+        // is not a qualifier.
+        let status_row = |v: &FindBarView, cols: usize| {
+            let p = paint(v, cols);
+            text(&p.rows[p.field_row])
+        };
+        let counted = FindBarView {
+            idx: 1,
+            total: 6,
+            ..view("needle")
+        };
+        let bare = status_row(&counted, 90);
+        assert!(bare.contains("1/6"), "{bare}");
+        assert!(
+            !bare.contains('…') && !bare.contains('+'),
+            "an exact census is stated plainly: {bare}"
+        );
+
+        let moved = FindBarView {
+            idx: 1,
+            total: 6,
+            stale: true,
+            ..view("needle")
+        };
+        // Wherever the exact form finds room to state a number, the qualified
+        // form finds room to qualify it — the ladder shortens the POSITION, not
+        // the marker. (A window too narrow for any status at all paints none;
+        // that is the pre-existing "even the shortest form won't fit" arm, and
+        // saying nothing is not a false claim.)
+        let mut widths_checked = 0;
+        for cols in [40usize, 50, 60, 72, 90, 140, 200] {
+            if !status_row(&counted, cols).contains("1/6") {
+                continue;
+            }
+            widths_checked += 1;
+            let painted = status_row(&moved, cols);
+            assert!(
+                painted.contains('…'),
+                "cols={cols} dropped the staleness marker: {painted}"
+            );
+        }
+        assert!(widths_checked >= 4, "the width sweep must actually sweep");
+
+        let both = FindBarView {
+            truncated: true,
+            stale: true,
+            ..FindBarView {
+                idx: 1,
+                total: 6,
+                ..view("needle")
+            }
+        };
+        let painted = status_row(&both, 90);
+        assert!(painted.contains("1/6+…"), "{painted}");
+
+        // The spelled-out no-match forms carry the same two facts.
+        let none = FindBarView {
+            idx: 1,
+            total: 0,
+            stale: true,
+            ..view("needle")
+        };
+        let wide = status_row(&none, 180);
+        assert!(wide.contains("no matches (stale)"), "{wide}");
+        let narrow = status_row(&none, 60);
+        assert!(narrow.contains('…'), "{narrow}");
     }
 
     /// Every width × height stays exactly `cols` wide and never panics — including a

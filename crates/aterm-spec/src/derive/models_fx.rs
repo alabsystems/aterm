@@ -534,6 +534,237 @@ pub fn effect_phase_lock_model() -> Model {
     }
 }
 
+/// PRISM WAKE's cross-component episode delivery: one opening cue survives the
+/// synth's shared keystroke gap, the host parks only after arming the analytic
+/// settle crossing, and that one wake closes the episode. Output cues never
+/// claim the human voice gap, so the next authored key remains admissible.
+///
+/// The three `Buggy*` actions replay the exact regression classes this model
+/// exists to catch: thinning the sole Shimmer immediately after Enter, parking
+/// an open episode without its settle wake, and letting a machine-output cue
+/// consume the next human admission slot.
+///
+/// Tier-1 drives `OutputStreak`'s public analytic deadline and `TrailSynth`'s
+/// public admission surface. Native and web hosts' folds of that deadline
+/// remain separate host-level unit tests; this model does not claim to execute
+/// either event loop.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn output_streak_episode_delivery_model() -> Model {
+    crate::ty_model! {
+        OutputStreakEpisodeDelivery {
+            const Buggy = 0;
+            // 0 Idle, 1 Visible, 2 Parked/open, 3 Settled.
+            var phase = 0;
+            var shimmer = 0;
+            var settle = 0;
+            var wake = 0;
+            // One means a human voice currently owns the shared min-gap.
+            var human_gap = 0;
+            // A separately governed output cue was delivered while the human
+            // slot was open; the next human attempt checks that it stayed open.
+            var audio_checked = 0;
+            var next_human = 0;
+
+            action HumanVoice when (phase == 0 && human_gap == 0) {
+                human_gap = 1;
+            }
+            action OpenOutput when (phase == 0 && human_gap == 1) {
+                phase = 1;
+                shimmer = 1;
+            }
+            action RetireVisuals when (phase == 1) {
+                phase = 2;
+                wake = 1;
+            }
+            action SettleAtWake when (phase == 2 && wake == 1) {
+                phase = 3;
+                wake = 0;
+                settle = 1;
+            }
+            action HumanGapElapses when (human_gap == 1) {
+                human_gap = 0;
+            }
+            action CheckOutputDoesNotClaimHuman when (
+                phase > 0 && human_gap == 0 && audio_checked == 0
+            ) {
+                audio_checked = 1;
+            }
+            action NextHuman when (
+                audio_checked == 1 && human_gap == 0 && next_human == 0
+            ) {
+                next_human = 1;
+                human_gap = 1;
+            }
+            action BuggyThinOpening when (
+                Buggy == 1 && phase == 0 && human_gap == 1
+            ) {
+                phase = 1;
+                shimmer = 0;
+            }
+            action BuggyRetireWithoutWake when (Buggy == 1 && phase == 1) {
+                phase = 2;
+                wake = 0;
+            }
+            action BuggyClaimHumanGap when (
+                Buggy == 1 && phase > 0 && human_gap == 0 &&
+                audio_checked == 0
+            ) {
+                audio_checked = 1;
+                human_gap = 1;
+            }
+
+            invariant Bounds:
+                phase <= 3 && shimmer <= 1 && settle <= 1 && wake <= 1 &&
+                human_gap <= 1 && audio_checked <= 1 && next_human <= 1;
+            invariant OpeningCueSurvivesSharedGap:
+                if phase > 0 { shimmer == 1 } else { shimmer == 0 };
+            invariant ParkedEpisodeOwnsSettleWake:
+                if phase == 2 { wake == 1 } else { wake <= 1 };
+            invariant SettledEpisodeClosesExactlyOnce:
+                if phase == 3 {
+                    shimmer == 1 && settle == 1 && wake == 0
+                } else {
+                    settle == 0
+                };
+            invariant OutputNeverClaimsHumanGap:
+                if audio_checked == 1 && next_human == 0 {
+                    human_gap == 0
+                } else {
+                    human_gap <= 1
+                };
+            invariant NextHumanFollowsCheckedOutput:
+                if next_human == 1 {
+                    audio_checked == 1
+                } else {
+                    next_human == 0
+                };
+        }
+    }
+}
+
+/// Acceptance-ordered publication of the GUI's output-echo evidence.
+///
+/// A sink receipt is ordered where its bytes enter the direct/spill serializer,
+/// but its writer may be descheduled before publishing that receipt to the
+/// render-time tracker. This bounded machine fixes the regression-shaped pair:
+/// receipt 1 is an older echoable input and receipt 2 is the newer Enter turn
+/// boundary. Their completions may publish in either order. The newer boundary
+/// must remain authoritative even when the older completion arrives last, and a
+/// sample must observe one whole published timestamp tuple rather than fields
+/// from both versions.
+///
+/// The opaque production `aterm_session::sink::AcceptedOrder` never exposes a
+/// number. `1` and `2` here are only relative classes established by Tier-1's
+/// real `older < newer` comparison. Timestamp values likewise project to
+/// presence bits; wall-clock arithmetic is outside this ordering contract.
+///
+/// `Buggy=1` replays both defects independently. `PublishOlderEcho` overwrites a
+/// newer publication, matching the pre-token completion-order race. `Sample`
+/// combines the boundary's publication order with the older echo timestamps,
+/// matching the pre-mutex independent-atomic read. Tier-0 contains an explicit
+/// trace for each mutant so one counterexample cannot mask the other.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn output_echo_receipt_publication_model() -> Model {
+    crate::ty_model! {
+        OutputEchoReceiptPublication {
+            const Buggy = 0;
+            // Sink acceptance high-water: 0 none, 1 older echo, 2 newer Enter.
+            var accepted = 0;
+            var older_done = 0;
+            var newer_done = 0;
+            // Tracker high-water: 0 none, 1 older echo, 2 newer Enter.
+            var published_order = 0;
+            // Timestamp-presence projection of the one mutex-owned record.
+            var accepted_shadow = 0;
+            var boundary_shadow = 0;
+            // One render-time sample of that record.
+            var sampled = 0;
+            var sample_order = 0;
+            var sample_accepted = 0;
+            var sample_boundary = 0;
+
+            action AcceptOlderEcho when (accepted == 0) {
+                accepted = 1;
+            }
+            action AcceptNewerBoundary when (accepted == 1) {
+                accepted = 2;
+            }
+            action PublishOlderEcho when (accepted > 0 && older_done == 0) {
+                older_done = 1;
+                published_order = if Buggy == 1 || published_order <= 0 {
+                    1
+                } else {
+                    published_order
+                };
+                accepted_shadow = if Buggy == 1 || published_order <= 0 {
+                    1
+                } else {
+                    accepted_shadow
+                };
+            }
+            action PublishNewerBoundary when (accepted > 1 && newer_done == 0) {
+                newer_done = 1;
+                published_order = 2;
+                accepted_shadow = 0;
+                boundary_shadow = 1;
+            }
+            action Sample when (published_order > 0 && sampled == 0) {
+                sampled = 1;
+                sample_order = published_order;
+                // The mutant represents the sampler observing the boundary's
+                // generation/debt store between the older timestamp loads.
+                sample_accepted = if Buggy == 1 && older_done == 1 &&
+                    newer_done == 1 && published_order == 2 {
+                    1
+                } else {
+                    accepted_shadow
+                };
+                sample_boundary = if Buggy == 1 && older_done == 1 &&
+                    newer_done == 1 && published_order == 2 {
+                    0
+                } else {
+                    boundary_shadow
+                };
+            }
+
+            invariant LatestCompletedOrderWins:
+                published_order == if newer_done == 1 {
+                    2
+                } else if older_done == 1 {
+                    1
+                } else {
+                    0
+                };
+            invariant BoundaryRetiresOlderEcho:
+                if newer_done == 1 {
+                    published_order == 2 && accepted_shadow == 0 &&
+                    boundary_shadow == 1
+                } else {
+                    boundary_shadow == 0
+                };
+            invariant SampleIsOnePublishedVersion:
+                if sampled == 1 {
+                    if sample_order == 1 {
+                        sample_accepted == 1 && sample_boundary == 0
+                    } else {
+                        sample_order == 2 && sample_accepted == 0 &&
+                        sample_boundary == 1
+                    }
+                } else {
+                    sample_order == 0 && sample_accepted == 0 &&
+                    sample_boundary == 0
+                };
+            invariant StateBounded:
+                accepted <= 2 && older_done <= 1 && newer_done <= 1 &&
+                published_order <= accepted && accepted_shadow <= 1 &&
+                boundary_shadow <= 1 && sampled <= 1 && sample_order <= 2 &&
+                sample_accepted <= 1 && sample_boundary <= 1;
+        }
+    }
+}
+
 /// PHOSPHOR rain lifecycle (docs/matrix-rain-design.md §5/§10), authored via
 /// [`ty_model!`] in the [`nova_phase_model`] shape: `{0 Idle, 1 Raining,
 /// 2 Draining}`. `Activity` (a host activity event — enable, a content-seq

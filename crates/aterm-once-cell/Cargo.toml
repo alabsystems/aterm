@@ -1,0 +1,116 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
+# crates/aterm-cfg-if, crates/aterm-arrayvec, crates/aterm-log-shim,
+# crates/aterm-libc and crates/aterm-core-maths.
+#
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect thirteen
+# third-party consumers' `once_cell = "1.x"` lines at this code the package must
+# be called `once_cell` — nothing else works. The DIRECTORY keeps the `aterm-`
+# prefix so a `ls crates/` or a stack trace still reads as ours and nobody
+# mistakes this for vendored upstream (that lives under `vendor/`).
+name = "once_cell"
+# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
+# consumers, not an aterm release number, and it must satisfy the STRICTEST
+# requirement in the graph — `read-fonts 0.43.2` asks for `1.21.4`, i.e.
+# `^1.21.4`, so 1.21.3 would make the row silently inert. 1.21.4 is also what
+# the lock held before the swap, so the lockfile's version line does not move.
+#
+# It must ALSO stay >= every other `1.x` this workspace forces into the graph —
+# the rule crates/aterm-arrayvec learned the expensive way, when a shim at 0.7.6
+# left the registry copy (forced in at 0.7.8 by its own dev-dep oracle)
+# satisfying all six consumers while the patch row silently did nothing, with no
+# warning from cargo. Nothing else pins a `1.x` `once_cell` here — see
+# `[dev-dependencies]` for why this crate deliberately takes no oracle — so the
+# shim is the only candidate and every `^1.12`…`^1.21.4` consumer resolves to
+# it. `cargo forge check` fails the build if that ever stops being true.
+version = "1.21.4"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party `once_cell` replacement for aterm (sync/unsync/race cells over std's OnceLock, Mutex and Cell; replaces the crates.io once_cell package)"
+
+# `once_cell` is both the PACKAGE and the crate root every consumer writes
+# (`use once_cell::sync::Lazy;`). Cargo would derive it from the package name on
+# its own; it is declared so the two can never drift.
+[lib]
+name = "once_cell"
+path = "src/lib.rs"
+
+[dependencies]
+# NONE, AND THAT IS PART OF THE POINT. Upstream's three are all optional
+# (critical-section, parking_lot_core, portable-atomic) and none is enabled on
+# any of aterm's five cells — measured, and re-measured every run by
+# `tests/consumers.rs::no_cell_enables_a_feature_this_shim_ignores`.
+
+[features]
+# UPSTREAM'S FEATURE NAMES, ACCEPTED AND IGNORED — the aterm-profiling pattern.
+#
+# A `[patch]` target must DECLARE every feature name its consumers ask for or
+# cargo fails the resolve outright ("feature `race` does not exist"), so all
+# nine upstream names are here. They gate nothing: this shim always provides
+# `sync`, `unsync` and `race`, because every aterm cell has `std` and there is
+# no configuration in which withholding a module would help. The arrows between
+# them are upstream's, kept so a `--features` line means the same thing on both
+# sides.
+#
+# The four that would change upstream's IMPLEMENTATION rather than its surface
+# — `critical-section`, `atomic-polyfill`, `parking_lot`, `portable-atomic` —
+# are therefore silent no-ops here, which is only safe while nothing turns one
+# on. `tests/consumers.rs` re-derives the feature resolution for all five cells
+# and fails, naming the cell and the feature, the day one is enabled.
+default = ["std"]
+std = ["alloc"]
+alloc = ["race"]
+race = []
+unstable = []
+critical-section = ["portable-atomic"]
+atomic-polyfill = ["critical-section"]
+parking_lot = []
+portable-atomic = []
+
+[dev-dependencies]
+# NO DIFFERENTIAL ORACLE, AND THE OMISSION IS JUDGED RATHER THAN FORGOTTEN.
+#
+# [OB-15] IS CLEAN HERE, checked before this row was written because the same
+# question came back FAIL-shaped for `libm` when it was asked for `core_maths`:
+# `once_cell` is named in NO manifest anywhere in this repository — not in the
+# workspace, not under vendor/, tools/ or apps/, not in the separate
+# libc-oracle workspace — so nothing this patch row redirects was ever a
+# differential reference. `cargo forge check` reports [OB-15]'s OK arm ("no
+# patched package is held as a dev-dependency oracle"), not its NOTE and not
+# its FAIL.
+#
+# COULD one be added anyway? Yes, and it was tried before being rejected.
+# `[patch.crates-io]` rewrites dev edges, so a plain `once_cell = "1"` here
+# would resolve to THIS CRATE and capture the oracle; but the arrayvec escape —
+# a pin the shim cannot satisfy, `=1.21.3` — does keep a real registry copy in
+# Cargo.lock, and [OB-15] reports that as its deliberate NOTE. Two measurements
+# sank it:
+#
+#   1. A SELF-REFERENTIAL DEV-DEP MAKES `-p once_cell` AMBIGUOUS. Measured on
+#      this tree: with the pin in place, `cargo build -p once_cell` fails with
+#      "specification `once_cell` is ambiguous", listing 1.21.3 and 1.21.4, and
+#      every `-p once_cell` in a script or a gate breaks with it.
+#      `crates/aterm-arrayvec` escapes this only because ITS oracle is declared
+#      by a different crate (`crates/aterm-alloc`, which owns the real
+#      implementation). `once_cell` has no such sibling: the implementation is
+#      here, so hosting the differential elsewhere would file it under a crate
+#      with no relation to it.
+#   2. THE PROPERTY TESTS ARE THE SHARPER INSTRUMENT, which is NOT true of
+#      `arrayvec`. What has to be right here is not a value-for-value table but
+#      four CONTRACTS: exactly-once initialisation under contention, retry
+#      after a failed initialiser, laziness, and what a panicking initialiser
+#      leaves behind. `tests/behaviour.rs` asserts each directly AND carries a
+#      CONTROL — it runs the decisive test against a deliberately racy
+#      reference cell, which must fail — so the tripwire is demonstrated to
+#      catch the exact bug it exists to prevent. A value differential cannot
+#      show that, and upstream would pass the racy version too.
+#
+# The version-pin escape stays available if a future divergence ever needs it.
+# It costs the `-p` spelling and an [OB-15] NOTE.
+
+[lints]
+workspace = true

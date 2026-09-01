@@ -1,3 +1,5 @@
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
 //! Contains traits with platform-specific methods in them.
 //!
 //! Only the modules corresponding to the platform you're compiling to will be available.

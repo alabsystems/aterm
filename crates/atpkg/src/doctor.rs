@@ -1176,11 +1176,8 @@ mod tests {
     /// recorded fault. It must be named.
     #[test]
     fn a_wanted_program_that_never_arrived_is_unexplained() {
-        let (unexplained, on_purpose) = split_missing(
-            &names(&["ay", "trust"]),
-            &builds(&["ay"]),
-            &names(&[]),
-        );
+        let (unexplained, on_purpose) =
+            split_missing(&names(&["ay", "trust"]), &builds(&["ay"]), &names(&[]));
         assert_eq!(unexplained, vec!["trust".to_string()]);
         assert!(on_purpose.is_empty());
     }
@@ -1225,8 +1222,8 @@ mod tests {
     fn the_suppressed_compiler_tuple_is_reported() {
         let (unexplained, on_purpose) = split_missing(
             &names(&[
-                "ay", "clean", "nn", "ny", "trust", "trust-cg", "trust-ir", "trust-mc",
-                "trust-vc", "ty",
+                "ay", "clean", "nn", "ny", "trust", "trust-cg", "trust-ir", "trust-mc", "trust-vc",
+                "ty",
             ]),
             &builds(&["ay", "clean", "nn", "ny", "trust-mc", "ty"]),
             &names(&["trust"]),

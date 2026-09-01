@@ -941,6 +941,7 @@ pub(crate) fn spawn_session(
     // Per-session fabric identity (day-one single local session: a fresh id+nonce).
     let ctx = Arc::new(SessionCtx {
         sink: sink.clone(),
+        output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         edges: std::sync::Mutex::new(EdgeTable::new()),
         turn_lease: std::sync::Mutex::new(None),
         self_id,

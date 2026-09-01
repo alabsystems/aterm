@@ -83,6 +83,7 @@ impl TexelFormat {
     }
 
     /// The wgpu spelling.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::TextureFormat {
         match self {
             Self::R8Unorm => wgpu::TextureFormat::R8Unorm,
@@ -98,6 +99,7 @@ impl TexelFormat {
     /// format arrives resolved (e.g. `format_plan::offscreen_format`). `None`
     /// for a format outside the map's closed set of six, which no production
     /// texture uses.
+    #[cfg(wgpu_arm)]
     pub(crate) const fn from_wgpu(f: wgpu::TextureFormat) -> Option<Self> {
         match f {
             wgpu::TextureFormat::R8Unorm => Some(Self::R8Unorm),
@@ -161,6 +163,7 @@ impl TexUsage {
         copy_dst: true,
     };
 
+    #[cfg(wgpu_arm)]
     const fn wgpu(self) -> wgpu::TextureUsages {
         let mut u = wgpu::TextureUsages::empty();
         if self.sampled {
@@ -211,6 +214,7 @@ pub(crate) enum SamplerKind {
 /// differential ladder and becomes the live one at W6.
 #[derive(Clone, Copy)]
 pub(crate) enum DeviceHandle<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu {
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
@@ -240,6 +244,7 @@ impl DeviceHandle<'_> {
         alias: Option<TexelFormat>,
     ) -> LayerTexture {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => {
                 let view_formats: &[wgpu::TextureFormat] = match alias {
                     Some(a) => &[a.wgpu()],
@@ -303,6 +308,7 @@ impl DeviceHandle<'_> {
             return;
         }
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { queue, .. } => {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -359,6 +365,7 @@ impl DeviceHandle<'_> {
     /// `newBufferWithLength:0` returns nil.
     pub(crate) fn create_instance_buffer(&self, label: &'static str, size: u64) -> LayerBuffer {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => {
                 LayerBuffer::Wgpu(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
@@ -379,6 +386,7 @@ impl DeviceHandle<'_> {
     /// `MTLBuffer` on Metal).
     pub(crate) fn create_uniform_buffer(&self, label: &'static str, size: u64) -> LayerBuffer {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => {
                 LayerBuffer::Wgpu(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
@@ -407,6 +415,7 @@ impl DeviceHandle<'_> {
     /// waiting out its command buffers before rewriting a stream.
     pub(crate) unsafe fn write_buffer_from_zero(&self, buf: &LayerBuffer, bytes: &[u8]) {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { queue, .. } => queue.write_buffer(buf.wgpu(), 0, bytes),
             #[cfg(target_os = "macos")]
             Self::Metal(_) => {
@@ -426,6 +435,7 @@ impl DeviceHandle<'_> {
     /// One of the two clamp samplers.
     pub(crate) fn create_sampler(&self, label: &'static str, kind: SamplerKind) -> LayerSampler {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => {
                 let filter = match kind {
                     SamplerKind::NearestClamp => wgpu::FilterMode::Nearest,
@@ -459,8 +469,10 @@ impl DeviceHandle<'_> {
     /// until their own wave (bind-group layouts, bind groups, pipelines,
     /// shader modules). Panics by name on the Metal arm, exactly like
     /// [`LayerTexture::wgpu`].
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_device(&self) -> &wgpu::Device {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => device,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -472,6 +484,7 @@ impl DeviceHandle<'_> {
     /// The device's buffer-size ceiling, for the geometric-grow cap.
     pub(crate) fn max_buffer_size(&self) -> u64 {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => device.limits().max_buffer_size,
             #[cfg(target_os = "macos")]
             Self::Metal(mint) => mint.device().max_buffer_length() as u64,
@@ -481,6 +494,7 @@ impl DeviceHandle<'_> {
     /// The device's 2-D texture dimension ceiling, for the atlas clamps.
     pub(crate) fn max_texture_dim(&self) -> u32 {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { device, .. } => device.limits().max_texture_dimension_2d,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => {
@@ -496,6 +510,7 @@ impl DeviceHandle<'_> {
 /// A texture on whichever backend created it.
 #[derive(Debug)]
 pub(crate) enum LayerTexture {
+    #[cfg(wgpu_arm)]
     Wgpu(wgpu::Texture),
     #[cfg(target_os = "macos")]
     Metal(SealedTexture),
@@ -506,8 +521,10 @@ impl LayerTexture {
     /// until their own wave (bind groups, encode, present). Panics by name on
     /// the Metal variant: that panic is unreachable from production until the
     /// W6 flip re-routes those seams.
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Texture {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -519,8 +536,10 @@ impl LayerTexture {
     }
 
     /// [`Self::wgpu`], by value.
+    #[cfg(wgpu_arm)]
     pub(crate) fn into_wgpu(self) -> wgpu::Texture {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -535,6 +554,7 @@ impl LayerTexture {
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &SealedTexture {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(_) => panic!(
                 "device layer: a WGPU texture reached a Metal-only seam — \
                  the caller mixed handles across backends"
@@ -547,6 +567,7 @@ impl LayerTexture {
     /// scratch's reuse key).
     pub(crate) fn width(&self) -> u32 {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t.width(),
             #[cfg(target_os = "macos")]
             Self::Metal(t) => t.width() as u32,
@@ -556,6 +577,7 @@ impl LayerTexture {
     /// The texture's texel height, on either backend.
     pub(crate) fn height(&self) -> u32 {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(t) => t.height(),
             #[cfg(target_os = "macos")]
             Self::Metal(t) => t.height() as u32,
@@ -573,6 +595,7 @@ impl LayerTexture {
     )]
     pub(crate) fn alias_view(&self, format: TexelFormat) -> LayerTextureView {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(t) => LayerTextureView::Wgpu(t.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(format.wgpu()),
                 ..Default::default()
@@ -596,6 +619,7 @@ impl LayerTexture {
                   the plain lib target has no caller until its wave routes it"
 )]
 pub(crate) enum LayerTextureView {
+    #[cfg(wgpu_arm)]
     Wgpu(wgpu::TextureView),
     #[cfg(target_os = "macos")]
     Metal(SealedTexture),
@@ -608,8 +632,10 @@ pub(crate) enum LayerTextureView {
 )]
 impl LayerTextureView {
     /// The live wgpu view — same crossing contract as [`LayerTexture::wgpu`].
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::TextureView {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(v) => v,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -623,6 +649,7 @@ impl LayerTextureView {
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &SealedTexture {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(_) => panic!(
                 "device layer: a WGPU texture view reached a Metal-only seam \
                  — the caller mixed handles across backends"
@@ -635,6 +662,7 @@ impl LayerTextureView {
 /// A buffer on whichever backend created it.
 #[derive(Debug)]
 pub(crate) enum LayerBuffer {
+    #[cfg(wgpu_arm)]
     Wgpu(wgpu::Buffer),
     #[cfg(target_os = "macos")]
     Metal(SharedBuffer),
@@ -643,8 +671,10 @@ pub(crate) enum LayerBuffer {
 impl LayerBuffer {
     /// The live wgpu buffer — same crossing contract as
     /// [`LayerTexture::wgpu`].
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Buffer {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(b) => b,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -656,8 +686,10 @@ impl LayerBuffer {
     }
 
     /// [`Self::wgpu`], by value.
+    #[cfg(wgpu_arm)]
     pub(crate) fn into_wgpu(self) -> wgpu::Buffer {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(b) => b,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -671,6 +703,7 @@ impl LayerBuffer {
     /// `wgpu::Buffer::slice`, forwarded — so the pre-existing
     /// `.buf.slice(..)` call sites in the (untouched, W5) present path keep
     /// compiling verbatim over the routed field.
+    #[cfg(wgpu_arm)]
     pub(crate) fn slice<S: std::ops::RangeBounds<wgpu::BufferAddress>>(
         &self,
         bounds: S,
@@ -682,6 +715,7 @@ impl LayerBuffer {
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &mtl::Obj {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(_) => panic!(
                 "device layer: a WGPU buffer reached a Metal-only seam — \
                  the caller mixed handles across backends"
@@ -694,6 +728,7 @@ impl LayerBuffer {
 /// A sampler on whichever backend created it.
 #[derive(Debug)]
 pub(crate) enum LayerSampler {
+    #[cfg(wgpu_arm)]
     Wgpu(wgpu::Sampler),
     #[cfg(target_os = "macos")]
     Metal(mtl::Obj),
@@ -707,8 +742,10 @@ pub(crate) enum LayerSampler {
 impl LayerSampler {
     /// The live wgpu sampler — same crossing contract as
     /// [`LayerTexture::wgpu`].
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Sampler {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(s) => s,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -719,8 +756,10 @@ impl LayerSampler {
     }
 
     /// [`Self::wgpu`], by value.
+    #[cfg(wgpu_arm)]
     pub(crate) fn into_wgpu(self) -> wgpu::Sampler {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(s) => s,
             #[cfg(target_os = "macos")]
             Self::Metal(_) => panic!(
@@ -734,6 +773,7 @@ impl LayerSampler {
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &mtl::Obj {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu(_) => panic!(
                 "device layer: a WGPU sampler reached a Metal-only seam — \
                  the caller mixed handles across backends"
@@ -773,17 +813,69 @@ use crate::metal::encoder::{
 #[cfg(target_os = "macos")]
 use crate::metal::ffi::LoadAction;
 
+/// THE FLIP's neutral f64 colour quadruple — `wgpu::Color`'s exact shape,
+/// spelled without the crate so the shared frame planner compiles on the
+/// wgpu-free macOS production build. The Wgpu arm converts loss-lessly at the
+/// encode boundary (`ClearColor4::wgpu`); the Metal arm builds its
+/// `MTLClearColor` from the same four doubles, as it always did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ClearColor4 {
+    pub(crate) r: f64,
+    pub(crate) g: f64,
+    pub(crate) b: f64,
+    pub(crate) a: f64,
+}
+
+impl ClearColor4 {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the frame-plan tests spell their loads with these; the \
+                      production planner derives every clear from theme_color_alpha"
+        )
+    )]
+    pub(crate) const BLACK: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    #[allow(
+        dead_code,
+        reason = "kept beside BLACK as the two canonical clears; the frame-plan \
+                  spellings reach for whichever a case needs"
+    )]
+    pub(crate) const TRANSPARENT: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    };
+
+    /// The wgpu spelling (bit-identical: four f64 fields either way).
+    #[cfg(wgpu_arm)]
+    pub(crate) const fn wgpu(self) -> wgpu::Color {
+        wgpu::Color {
+            r: self.r,
+            g: self.g,
+            b: self.b,
+            a: self.a,
+        }
+    }
+}
+
 /// What happens to the pass target's texels before the first draw — the
 /// backend-neutral spelling of `wgpu::LoadOp<wgpu::Color>` restricted to the
 /// two states the frame ladder uses (map §2: "pass 0 Clear-or-Load, later
-/// passes Load"). Carries the `wgpu::Color` f64 quadruple on BOTH arms so the
+/// passes Load"). Carries the f64 quadruple on BOTH arms so the
 /// Wgpu arm round-trips the exact value it was handed and the Metal arm's
 /// `MTLClearColor` is built from the same four doubles.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FrameLoad {
     /// Clear to this colour (linear for an sRGB-typed view, raw for Unorm —
     /// the call site's `theme_color_alpha` already speaks the view's space).
-    Clear(wgpu::Color),
+    Clear(ClearColor4),
     /// Keep the texels the previous pass/frame stored.
     Load,
 }
@@ -793,6 +885,7 @@ pub(crate) enum FrameLoad {
 /// which is exactly what `render_pass` seals against.
 #[derive(Clone, Copy)]
 pub(crate) enum FrameView<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::TextureView),
     #[cfg(target_os = "macos")]
     #[allow(
@@ -806,6 +899,7 @@ pub(crate) enum FrameView<'a> {
 /// A render pipeline on one backend.
 #[derive(Clone, Copy)]
 pub(crate) enum FramePipeline<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::RenderPipeline),
     #[cfg(target_os = "macos")]
     #[allow(
@@ -822,6 +916,7 @@ pub(crate) enum FramePipeline<'a> {
 /// module's opinion).
 #[derive(Clone, Copy)]
 pub(crate) enum FrameAtlas<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::BindGroup),
     #[cfg(target_os = "macos")]
     #[allow(
@@ -844,6 +939,7 @@ pub(crate) enum FrameAtlas<'a> {
 /// `set_instance_stream`, which is what arms the no-stream draw refusal).
 #[derive(Clone, Copy)]
 pub(crate) enum FrameStream<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu(wgpu::BufferSlice<'a>),
     #[cfg(target_os = "macos")]
     #[allow(
@@ -860,6 +956,7 @@ pub(crate) enum FrameStream<'a> {
 /// argument tables are per-stage, so one buffer costs two binds there).
 #[derive(Clone, Copy)]
 pub(crate) enum FrameUniforms<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::BindGroup),
     #[cfg(target_os = "macos")]
     #[allow(
@@ -883,6 +980,7 @@ pub(crate) enum FrameUniforms<'a> {
 /// foreign loss domain.
 #[derive(Clone, Copy)]
 pub(crate) enum FrameCopyTexture<'a> {
+    #[cfg(wgpu_arm)]
     Wgpu(&'a wgpu::Texture),
     #[cfg(target_os = "macos")]
     #[allow(
@@ -898,6 +996,7 @@ pub(crate) enum FrameCopyTexture<'a> {
 #[must_use = "an unsubmitted or unobserved frame commit hides device loss"]
 pub(crate) enum SubmittedFrame {
     /// wgpu owns completion tracking; there is nothing further to hold.
+    #[cfg(wgpu_arm)]
     Wgpu,
     /// The W1 `Submitted`: wait on it, or poll `try_outcome` (the map's
     /// completion-handler substitute).
@@ -913,6 +1012,7 @@ pub(crate) enum SubmittedFrame {
 /// One frame's command encoder on one backend — the object the shared plan
 /// walker (`renderer.rs::run_frame_plan`) drives.
 pub(crate) enum FrameEncoder<'s> {
+    #[cfg(wgpu_arm)]
     Wgpu {
         enc: wgpu::CommandEncoder,
         queue: &'s wgpu::Queue,
@@ -924,6 +1024,7 @@ pub(crate) enum FrameEncoder<'s> {
 impl<'s> FrameEncoder<'s> {
     /// The live production arm: a wgpu command encoder with the exact
     /// descriptor the pre-seam `encode_frame` created ("aterm-gpu frame").
+    #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(device: &wgpu::Device, queue: &'s wgpu::Queue, label: &'static str) -> Self {
         Self::Wgpu {
             enc: device
@@ -957,6 +1058,7 @@ impl<'s> FrameEncoder<'s> {
         uniforms: FrameUniforms<'_>,
     ) -> Result<FramePass<'e, 's>, String> {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { enc, .. } => {
                 let FrameView::Wgpu(view) = view else {
                     panic!(
@@ -971,7 +1073,7 @@ impl<'s> FrameEncoder<'s> {
                     );
                 };
                 let load = match load {
-                    FrameLoad::Clear(c) => wgpu::LoadOp::Clear(c),
+                    FrameLoad::Clear(c) => wgpu::LoadOp::Clear(c.wgpu()),
                     FrameLoad::Load => wgpu::LoadOp::Load,
                 };
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1063,6 +1165,7 @@ impl<'s> FrameEncoder<'s> {
         height: u32,
     ) -> Result<(), String> {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { enc, .. } => {
                 let (FrameCopyTexture::Wgpu(src), FrameCopyTexture::Wgpu(dst)) = (src, dst) else {
                     panic!(
@@ -1125,6 +1228,7 @@ impl<'s> FrameEncoder<'s> {
     /// handle the caller waits on or polls.
     pub(crate) fn submit(self) -> SubmittedFrame {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { enc, queue } => {
                 queue.submit([enc.finish()]);
                 SubmittedFrame::Wgpu
@@ -1144,6 +1248,7 @@ impl<'s> FrameEncoder<'s> {
               put a heap allocation on the keystroke-echo path to save nothing"
 )]
 pub(crate) enum FramePass<'e, 's> {
+    #[cfg(wgpu_arm)]
     Wgpu {
         pass: wgpu::RenderPass<'e>,
         /// Ties the unused-on-wgpu session lifetime so the enum's Metal arm
@@ -1159,6 +1264,7 @@ impl FramePass<'_, '_> {
     /// the walker owns the tracker).
     pub(crate) fn set_pipeline(&mut self, pipeline: FramePipeline<'_>) {
         match (self, pipeline) {
+            #[cfg(wgpu_arm)]
             (Self::Wgpu { pass, .. }, FramePipeline::Wgpu(p)) => pass.set_pipeline(p),
             #[cfg(target_os = "macos")]
             (Self::Metal(pass), FramePipeline::Metal(pso)) => pass.set_pipeline(pso),
@@ -1176,6 +1282,7 @@ impl FramePass<'_, '_> {
     /// dedup is sound on either arm.
     pub(crate) fn bind_atlas(&mut self, atlas: FrameAtlas<'_>) {
         match (self, atlas) {
+            #[cfg(wgpu_arm)]
             (Self::Wgpu { pass, .. }, FrameAtlas::Wgpu(bg)) => pass.set_bind_group(1, bg, &[]),
             #[cfg(target_os = "macos")]
             (
@@ -1202,6 +1309,7 @@ impl FramePass<'_, '_> {
     /// W1 `set_instance_stream` at `INSTANCE_STREAM_SLOT`.
     pub(crate) fn set_stream(&mut self, stream: FrameStream<'_>) {
         match (self, stream) {
+            #[cfg(wgpu_arm)]
             (Self::Wgpu { pass, .. }, FrameStream::Wgpu(slice)) => {
                 pass.set_vertex_buffer(0, slice);
             }
@@ -1221,6 +1329,7 @@ impl FramePass<'_, '_> {
     /// cannot fail.
     pub(crate) fn draw_quads(&mut self, instances: u32) -> Result<(), String> {
         match self {
+            #[cfg(wgpu_arm)]
             Self::Wgpu { pass, .. } => {
                 pass.draw(0..6, 0..instances);
                 Ok(())

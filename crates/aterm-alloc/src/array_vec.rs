@@ -1467,10 +1467,14 @@ mod kani_proofs {
         kani::assert(av.len() == 4, "len must equal capacity after filling");
         kani::assert(av.is_full(), "is_full must be true at capacity");
 
-        // try_push must fail and return the value back.
+        // try_push must fail and return the value back. `try_push` yields
+        // `Result<(), CapacityError<T>>`, not `Result<(), T>` — comparing against
+        // `Err(99)` did not type-check, so this harness never compiled and the
+        // whole crate's `list` step died with it, taking harness discovery for the
+        // entire workspace down (the lane then exits 2, having proved nothing).
         let result = av.try_push(99);
         kani::assert(
-            result == Err(99),
+            result == Err(CapacityError::new(99)),
             "try_push must return Err(value) when full",
         );
 

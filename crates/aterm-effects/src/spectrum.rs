@@ -1044,11 +1044,7 @@ pub(crate) fn spectrum_path_of(t: f32) -> f32 {
 
 /// Where along a leg the pace has spent `want` — the inverse of the cumulative
 /// cost, by binary search and one linear step inside the bracket it lands in.
-fn spectrum_pace_at(
-    cum: &[(f64, [f64; 3])],
-    cost: &impl Fn([f64; 3]) -> f64,
-    want: f64,
-) -> f64 {
+fn spectrum_pace_at(cum: &[(f64, [f64; 3])], cost: &impl Fn([f64; 3]) -> f64, want: f64) -> f64 {
     if want <= 0.0 {
         return cum[0].0;
     }
@@ -1734,7 +1730,6 @@ pub(crate) fn spectrum_caret_max_byte_rate(base: u32, mix: f32) -> f32 {
 /// resolves to the anchor's own bytes.
 #[inline]
 #[must_use]
-#[cfg(test)]
 pub(crate) fn spectrum_stop_position(i: usize) -> f32 {
     SPECTRUM_ANCHOR_AT[i.min(SPECTRUM_STOPS - 1)] as f32 / (SPECTRUM_LUT_LEN - 1) as f32
 }
@@ -2005,8 +2000,7 @@ mod tests {
         );
         for (i, &anchor) in SPECTRUM_ANCHORS.iter().enumerate() {
             assert_eq!(
-                SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[i]],
-                anchor,
+                SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[i]], anchor,
                 "table index {} is not anchor {i}",
                 SPECTRUM_ANCHOR_AT[i]
             );
@@ -2178,8 +2172,12 @@ mod tests {
             let floor = lum[seg].min(lum[seg + 1]);
             // THE INTERVAL IS THE ONE BETWEEN TWO NAMES, wherever the pace put
             // them — not a fixed count of entries.
-            for idx in SPECTRUM_ANCHOR_AT[seg] + 1..SPECTRUM_ANCHOR_AT[seg + 1] {
-                let y = luminance(SPECTRUM_LUT[idx]);
+            for &entry in SPECTRUM_LUT
+                .iter()
+                .take(SPECTRUM_ANCHOR_AT[seg + 1])
+                .skip(SPECTRUM_ANCHOR_AT[seg] + 1)
+            {
+                let y = luminance(entry);
                 let dip = (floor - y) / floor;
                 if dip > worst_dip {
                     worst_dip = dip;
@@ -2263,8 +2261,8 @@ mod tests {
         // roof's 0.50 floor and back), so the exception zone is that interval
         // and the guard is that it may not creep past it — the other five
         // intervals hold S = 1 exactly, entry for entry.
-        let taper =
-            (SPECTRUM_ANCHOR_AT[SPECTRUM_ROOF_SEG] + 1)..=(SPECTRUM_ANCHOR_AT[SPECTRUM_ROOF_SEG + 1] - 1);
+        let taper = (SPECTRUM_ANCHOR_AT[SPECTRUM_ROOF_SEG] + 1)
+            ..=(SPECTRUM_ANCHOR_AT[SPECTRUM_ROOF_SEG + 1] - 1);
         for (i, &rgb) in SPECTRUM_LUT.iter().enumerate() {
             let (_, s, _) = spectrum_hsv(rgb);
             if taper.contains(&i) {
@@ -2365,7 +2363,8 @@ mod tests {
                 })
                 .max()
                 .unwrap_or(0);
-            let ceiling = if (SPECTRUM_CROSSING_AT..SPECTRUM_CROSSING_AT + SPECTRUM_CROSSING_ENTRIES)
+            let ceiling = if (SPECTRUM_CROSSING_AT
+                ..SPECTRUM_CROSSING_AT + SPECTRUM_CROSSING_ENTRIES)
                 .contains(&i)
             {
                 16

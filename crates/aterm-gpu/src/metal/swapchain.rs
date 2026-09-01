@@ -216,6 +216,31 @@ struct CgSize {
     height: f64,
 }
 
+/// `CGPoint`/`CGRect` — the `setFrame:` argument, two and four `double`s.
+///
+/// Sound as an ARGUMENT through this module's single bare `objc_msgSend` on
+/// both arches aterm ships: an HFA in `v0`-`v3` on `aarch64`, and a by-memory
+/// aggregate that `extern "C"` already lays out correctly on `x86_64`. A
+/// CGRect *return* would NOT be — SysV routes an over-16-byte return through
+/// `objc_msgSend_stret`, which the `ffi` header deliberately does not declare.
+/// That asymmetry is why [`Swapchain::sync_layer_geometry`] reads only the
+/// scalar `contentsScale` and DERIVES the frame, instead of reading the
+/// parent's `bounds` the way the CPU presenter (which has objc2 to hide the
+/// stret split) can afford to.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct CgPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct CgRect {
+    origin: CgPoint,
+    size: CgSize,
+}
+
 /// Everything one swapchain configure sets — the module header's table, as
 /// data. Built by [`Self::aterm_present`] for the shipped values; tests build
 /// non-default values by hand to prove every setter is live.
@@ -299,6 +324,11 @@ pub(crate) struct Swapchain {
     layer: Obj,
     /// Whether [`Self::attached`] parented the layer, and drop must unparent.
     is_attached: bool,
+    /// Change gate for [`Self::sync_layer_geometry`]: the
+    /// `(contentsScale, width, height)` the layer's geometry was last written
+    /// from, or `None` before the first sync (and forever on the standalone
+    /// shape, which has no parent to read a scale from).
+    applied_geometry: Option<(f64, usize, usize)>,
     format: PixelFormat,
     width: usize,
     height: usize,
@@ -322,6 +352,7 @@ impl Swapchain {
         Ok(Self {
             layer,
             is_attached: false,
+            applied_geometry: None,
             format: config.format,
             width: config.width,
             height: config.height,
@@ -349,14 +380,135 @@ impl Swapchain {
             let add: unsafe extern "C" fn(Id, Sel, Id) = msg();
             add(parent.id(), sel(c"addSublayer:"), layer.id());
         }
-        Ok(Self {
+        let mut sc = Self {
             layer,
             is_attached: true,
+            applied_geometry: None,
             format: config.format,
             width: config.width,
             height: config.height,
             latch,
-        })
+        };
+        sc.sync_layer_geometry();
+        Ok(sc)
+    }
+
+    /// Adopt the PARENT layer's `contentsScale`, so a device pixel in the
+    /// drawable is a device pixel on the display.
+    ///
+    /// **This is the one responsibility `raw-window-metal` used to carry.**
+    /// While wgpu owned the layer, that crate ran a KVO observer over the root
+    /// layer which — as `aterm-gui/src/platform.rs`'s anchor note records —
+    /// "syncs only `bounds` and `contentsScale`", and gravity is computed on
+    /// the LOGICAL size (`physical / contentsScale`). The flip to the
+    /// first-party arm (v0.69.0) took the layer and left the observer behind.
+    /// A freshly `init`ed `CAMetalLayer` defaults to `contentsScale = 1.0`, so
+    /// on a 2x display CoreAnimation read every device pixel of the drawable
+    /// as a POINT: the grid drew at twice its intended size — anchored at the
+    /// top-left corner, spilling off the right and bottom of the window — and
+    /// the compositor resampled the 1x-backed surface onto a Retina panel, so
+    /// the text went soft as well. One missing property, both symptoms.
+    ///
+    /// `drawableSize` is NOT touched here and stays explicit (the module
+    /// header's table): the drawable is already in device pixels and was
+    /// always correct. `contentsScale` is the term that tells CoreAnimation
+    /// how to read it.
+    ///
+    /// Called at attach AND from every per-present reconcile, which is what
+    /// makes this equivalent to the observer it replaces: dragging a window
+    /// between a Retina and a non-Retina display changes the parent's
+    /// `contentsScale` with NO resize and no reconfigure, so only a poll on
+    /// the present path can see it. Change-gated, so a steady present costs
+    /// one property read and nothing else.
+    ///
+    /// The standalone (headless) shape has no parent — the module header's
+    /// table — and is deliberately left alone, which is also precisely why no
+    /// test in this file could ever have caught the regression: they all build
+    /// standalone layers, where an unset `contentsScale` is invisible.
+    pub(crate) fn sync_layer_geometry(&mut self) {
+        if !self.is_attached {
+            return;
+        }
+        let _pool = AutoreleasePool::new();
+        // SAFETY: `superlayer` returns a BORROWED (autoreleased) `CALayer` or
+        // nil — never released here, per the module header's autoreleased-
+        // return rule. `contentsScale` returns `CGFloat` (a `double` in `d0`)
+        // and `setContentsScale:` takes one by value: both are scalar on every
+        // arch aterm ships, so neither needs the `objc_msgSend_stret` path the
+        // `ffi` header deliberately does not declare. Prototypes are written
+        // out per selector, per that same convention.
+        unsafe {
+            let superlayer: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let parent = superlayer(self.layer.id(), sel(c"superlayer"));
+            if parent.is_null() {
+                return;
+            }
+            let get_scale: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
+            let scale = get_scale(parent, sel(c"contentsScale"));
+            // Positive-only, which also rejects NaN: a zero or negative scale
+            // would divide the contents to nothing, and keeping whatever the
+            // layer already holds beats blanking the window.
+            if scale > 0.0 && self.applied_geometry != Some((scale, self.width, self.height)) {
+                // Both properties carry implicit animations; an action-free
+                // transaction is what keeps a scale change from animating the
+                // terminal's surface into place, exactly as
+                // `MacCpuPresenter::sync_layer_geometry` requires of its
+                // caller on the CPU floor.
+                let txn = class(c"CATransaction");
+                let cls_void: unsafe extern "C" fn(ClassPtr, Sel) = msg();
+                let cls_bool: unsafe extern "C" fn(ClassPtr, Sel, bool) = msg();
+                cls_void(txn, sel(c"begin"));
+                cls_bool(txn, sel(c"setDisableActions:"), true);
+                let set_scale: unsafe extern "C" fn(Id, Sel, f64) = msg();
+                set_scale(self.layer.id(), sel(c"setContentsScale:"), scale);
+                // …and give the layer the bounds its contents actually
+                // occupy. Measured on the shipped v0.69.0: the attached layer
+                // is left at `CGRectZero` for the window's life. It renders
+                // anyway — `masksToBounds` defaults NO and the gravity anchor
+                // is the origin corner — so this is not what broke the
+                // window, and it is deliberately a SEPARATE write from the
+                // scale above. It is here because a zero-bounds layer is a
+                // trap for everything that legitimately consults bounds
+                // (hit-testing, a future `masksToBounds`, any resizing
+                // gravity), and because it makes the module's real invariant
+                // — `bounds x contentsScale == drawableSize` — hold by
+                // construction rather than by luck.
+                let set_frame: unsafe extern "C" fn(Id, Sel, CgRect) = msg();
+                set_frame(
+                    self.layer.id(),
+                    sel(c"setFrame:"),
+                    CgRect {
+                        // The origin corner is where the gravity anchor
+                        // already puts the contents, so growing the rect from
+                        // zero to its true size moves nothing on glass.
+                        origin: CgPoint { x: 0.0, y: 0.0 },
+                        size: CgSize {
+                            #[expect(
+                                clippy::cast_precision_loss,
+                                reason = "drawable extents are far below 2^53"
+                            )]
+                            width: self.width as f64 / scale,
+                            #[expect(clippy::cast_precision_loss, reason = "as above")]
+                            height: self.height as f64 / scale,
+                        },
+                    },
+                );
+                cls_void(txn, sel(c"commit"));
+                self.applied_geometry = Some((scale, self.width, self.height));
+            }
+        }
+    }
+
+    /// The `contentsScale` this layer currently holds, read back off the live
+    /// `CAMetalLayer` — never echoed from [`Self::applied_geometry`]. The gate
+    /// asks the layer itself, exactly as [`Self::layer_state`]'s siblings do.
+    pub(crate) fn contents_scale(&self) -> f64 {
+        let _pool = AutoreleasePool::new();
+        // SAFETY: scalar `CGFloat` getter on our live +1 layer.
+        unsafe {
+            let get_scale: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
+            get_scale(self.layer.id(), sel(c"contentsScale"))
+        }
     }
 
     /// `[[CAMetalLayer alloc] init]` — +1, owned.
@@ -1189,6 +1341,123 @@ mod tests {
             1,
             "Swapchain::drop removes its own layer and only its own"
         );
+    }
+    /// Force a `CALayer`'s `contentsScale` — the ONE knob a headless test
+    /// needs to stand in for a Retina display. `contentsScale` is a plain
+    /// layer property with no compositor in the loop: a parented sublayer
+    /// either adopts it or it does not, and that is decidable offscreen.
+    fn set_contents_scale(layer: &Obj, scale: f64) {
+        let _pool = AutoreleasePool::new();
+        // SAFETY: scalar `CGFloat` setter on a live +1 `CALayer`.
+        unsafe {
+            let set: unsafe extern "C" fn(Id, Sel, f64) = msg();
+            set(layer.id(), sel(c"setContentsScale:"), scale);
+        }
+    }
+
+    /// S5 — THE RETINA GATE. The v0.69.0 regression in one assertion: the
+    /// flip to the first-party Metal arm took the `CAMetalLayer` from wgpu
+    /// and left `raw-window-metal`'s KVO observer — the thing that adopted
+    /// the root layer's `contentsScale` — behind. A fresh `CAMetalLayer`
+    /// defaults to `contentsScale = 1.0`, so on a 2x display CoreAnimation
+    /// read every DEVICE PIXEL of the drawable as a POINT: the grid drew 2x
+    /// oversized, anchored top-left and spilling off the right edge, and the
+    /// surface was resampled onto the panel, so the text went soft too.
+    ///
+    /// Why this test can see what every other test in this file cannot: the
+    /// rest drive STANDALONE layers, which have no parent to inherit from,
+    /// so an unset `contentsScale` is invisible by construction — and the
+    /// one attach test that does exist parented onto a `[[CALayer alloc]
+    /// init]` whose own scale is the same 1.0 default, which cannot tell
+    /// "adopted" from "never set". Setting the parent to a NON-1.0 scale is
+    /// the whole difference, and it needs no window, no compositor and no
+    /// display: `contentsScale` is a property, and adoption is a property
+    /// read.
+    #[test]
+    fn attach_adopts_the_parents_contents_scale_and_follows_it() {
+        let Some(dev) = device() else { return };
+        let _test_pool = AutoreleasePool::new();
+        let parent = plain_calayer();
+        // A Retina parent, which is what the winit view's backing layer is
+        // on the display this regression shipped against.
+        set_contents_scale(&parent, 2.0);
+
+        let config = SwapchainConfig {
+            format: PixelFormat::Bgra8Unorm,
+            width: 16,
+            height: 16,
+            framebuffer_only: false,
+            display_sync: false,
+            maximum_drawables: 2,
+            opaque: true,
+        };
+        let mut sc = Swapchain::attached(&dev, &parent, &config, Arc::new(loss::LossLatch::new()))
+            .expect("attached swapchain");
+        assert!(
+            (sc.contents_scale() - 2.0).abs() < f64::EPSILON,
+            "attach must ADOPT the parent's contentsScale — got {}, the 1.0 \
+             default means the drawable's device pixels composite as POINTS \
+             and the grid draws 2x oversized and cropped (v0.69.0)",
+            sc.contents_scale()
+        );
+
+        // THE DISPLAY DRAG. Moving a window between a Retina and a
+        // non-Retina screen changes the parent's scale with NO resize and no
+        // reconfigure, so nothing in the drift set moves — only the poll can
+        // see it. A fix applied at attach alone would fail from here down.
+        set_contents_scale(&parent, 1.0);
+        sc.sync_layer_geometry();
+        assert!(
+            (sc.contents_scale() - 1.0).abs() < f64::EPSILON,
+            "the per-present poll must FOLLOW the parent down to 1x — got {}",
+            sc.contents_scale()
+        );
+        set_contents_scale(&parent, 3.0);
+        sc.sync_layer_geometry();
+        assert!(
+            (sc.contents_scale() - 3.0).abs() < f64::EPSILON,
+            "…and back up to 3x — got {}",
+            sc.contents_scale()
+        );
+
+        // A non-positive parent scale is refused, not adopted: dividing the
+        // contents by zero would blank the window, and keeping the last good
+        // scale is strictly better.
+        set_contents_scale(&parent, 0.0);
+        sc.sync_layer_geometry();
+        assert!(
+            (sc.contents_scale() - 3.0).abs() < f64::EPSILON,
+            "a zero parent scale must be refused, leaving the last good 3.0 \
+             in place — got {}",
+            sc.contents_scale()
+        );
+    }
+
+    /// S5b — the standalone shape has no parent, so the sync is a no-op and
+    /// must not touch (or crash on) a layer with a nil `superlayer`. This is
+    /// the arm the headless tests all exercise, pinned so the poll added on
+    /// the present path stays free for them.
+    #[test]
+    fn a_standalone_swapchain_has_no_parent_to_adopt_a_scale_from() {
+        let Some(dev) = device() else { return };
+        let _test_pool = AutoreleasePool::new();
+        let config = SwapchainConfig {
+            format: PixelFormat::Bgra8Unorm,
+            width: 8,
+            height: 8,
+            framebuffer_only: false,
+            display_sync: false,
+            maximum_drawables: 2,
+            opaque: true,
+        };
+        let mut sc = Swapchain::standalone(&dev, &config, Arc::new(loss::LossLatch::new()))
+            .expect("standalone swapchain");
+        sc.sync_layer_geometry();
+        assert!(
+            sc.contents_scale() > 0.0,
+            "the standalone layer keeps its own default scale"
+        );
+        assert!(sc.acquire().is_ok(), "and still vends after the no-op sync");
     }
 
     /// S4 — THE BOUNDED FAILURE MODE, driven through the one nil arm a

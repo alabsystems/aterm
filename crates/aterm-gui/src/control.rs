@@ -49,7 +49,6 @@ use winit::event_loop::EventLoopProxy;
 use crate::control_auth::{self, AuthOutcome};
 use crate::input::{
     Delivery, Egress, EgressMode, InputEvent, InputOutcome, PasteFraming, ScrollIntent, Source,
-    seam_egress,
 };
 use crate::session_store::Store;
 use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested, Subscribers};
@@ -1420,7 +1419,8 @@ fn edge_scope_from_first_line(
 /// path string) lets the writer `openat` the final component under a dir fd, so
 /// no intermediate path component can be symlink-swapped after the check.
 pub struct ImageReq {
-    /// The confined image target (canonical `images/` dir + validated filename).
+    /// A confined image target for file output, or a descriptor-free sentinel
+    /// for `--bytes` that the encode worker consumes before any file operation.
     pub target: control_auth::ConfinedImage,
     /// CLEAN capture: suppress ALL host-owned visual bling (cursor trail + LUMEN glow +
     /// sparkle-word decorations + the animated Scene) so the AI reads the bare terminal
@@ -1552,6 +1552,7 @@ const ARTIFACT_HANDOFF_SUFFIX_UNITS: usize =
     crate::pinned_dir::PINNED_DIR_OPERATION_DESCRIPTOR_UNITS;
 const ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT: usize =
     crate::pinned_dir::PINNED_DIR_OPEN_COMPONENT_LIMIT + ARTIFACT_HANDOFF_SUFFIX_UNITS;
+const ARTIFACT_CLEANUP_TEST_LIMIT: usize = 32;
 pub(crate) const ARTIFACT_HANDOFF_BUSY: &str = "artifact handoff busy; retry";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1578,6 +1579,53 @@ pub(crate) struct ReplyRetentionPermit(ArtifactHandoffPermit);
 /// deliberately outside the acknowledgement/quarantine state machine.
 pub(crate) struct WriteOnlyRetention {
     _permit: ArtifactHandoffPermit,
+}
+
+/// One reserved descriptor chain for the asynchronous retention worker. It is
+/// intentionally separate from the correctness-critical video-retention lane:
+/// best-effort namespace GC may be deferred, while an armed video's convergence
+/// sweep must never lose admission merely because housekeeping is in progress.
+pub(crate) struct ArtifactCleanupPermit {
+    live: &'static AtomicUsize,
+}
+
+impl Drop for ArtifactCleanupPermit {
+    fn drop(&mut self) {
+        let previous = self.live.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "artifact cleanup permit underflow");
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VideoRetentionUsage {
+    live: usize,
+    descriptor_units: usize,
+}
+
+/// A slot reserved while one distinct video artifact is live. The final lease
+/// transfers this token, together with its already-pinned root, to the cleanup
+/// worker. Reserving before publication makes the final Drop enqueue
+/// nonblocking and infallible under ordinary queue pressure.
+#[derive(Debug)]
+pub(crate) struct VideoRetentionPermit {
+    usage: &'static Mutex<VideoRetentionUsage>,
+    descriptor_units: usize,
+}
+
+impl Drop for VideoRetentionPermit {
+    fn drop(&mut self) {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(usage.live > 0, "video retention permit underflow");
+        debug_assert!(
+            usage.descriptor_units >= self.descriptor_units,
+            "video retention descriptor budget underflow"
+        );
+        usage.live = usage.live.saturating_sub(1);
+        usage.descriptor_units = usage.descriptor_units.saturating_sub(self.descriptor_units);
+    }
 }
 
 #[cfg(test)]
@@ -1772,23 +1820,93 @@ enum ReplyRetentionPhase {
 impl ReplyRetention {
     #[cfg(test)]
     pub(crate) fn try_reserve() -> Option<ReplyRetentionPermit> {
+        Self::try_reserve_in_memory()
+    }
+
+    /// Reserve one live-object slot for a target-free artifact body. Inline
+    /// replies never open or publish a filesystem path, so charging a retained
+    /// directory chain would create false backpressure without protecting a
+    /// resource they own.
+    pub(crate) fn try_reserve_in_memory() -> Option<ReplyRetentionPermit> {
         ArtifactHandoffPermit::try_acquire(1).map(ReplyRetentionPermit)
     }
 
-    /// Reserve the count slot plus a conservative descriptor charge before
-    /// opening any artifact path. `PinnedDir` retains one handle per absolute
-    /// component; the fixed suffix covers artifact subdirectories, files, and
-    /// transient validation handles.
+    /// Reserve the count slot plus a cheap lexical descriptor estimate before
+    /// resolving an artifact path. Exact canonical depth is reconciled by
+    /// `PinnedDir` immediately before it opens the retained ancestor chain.
+    /// Keeping this first phase lexical means a saturated request never performs
+    /// avoidable filesystem I/O merely to learn that no live slot is available.
     pub(crate) fn try_reserve_for_path(path: &std::path::Path) -> Option<ReplyRetentionPermit> {
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| {
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            }
-        });
-        let descriptor_units = artifact_descriptor_units(&resolved);
+        let descriptor_units = artifact_descriptor_units(path);
         ArtifactHandoffPermit::try_acquire(descriptor_units).map(ReplyRetentionPermit)
+    }
+
+    /// Transfer one already-open exact directory chain to the singleton cleanup
+    /// worker. Paths outside the normal pinned-depth contract are refused, and
+    /// at most one such capability can outlive its reply permit.
+    pub(crate) fn try_reserve_cleanup_for_path(
+        path: &std::path::Path,
+    ) -> Option<ArtifactCleanupPermit> {
+        if artifact_descriptor_units(path) > ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT {
+            return None;
+        }
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        let limit = if cfg!(test) {
+            ARTIFACT_CLEANUP_TEST_LIMIT
+        } else {
+            1
+        };
+        LIVE.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .ok()
+        .map(|_| ArtifactCleanupPermit { live: &LIVE })
+    }
+
+    fn try_reserve_video_retention_from(
+        usage: &'static Mutex<VideoRetentionUsage>,
+        live_limit: usize,
+        descriptor_limit: usize,
+        descriptor_units: usize,
+    ) -> Option<VideoRetentionPermit> {
+        let mut current = usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available = current.live < live_limit
+            && descriptor_units > 0
+            && descriptor_units <= descriptor_limit
+            && current.descriptor_units <= descriptor_limit - descriptor_units;
+        if !available {
+            return None;
+        }
+        current.live += 1;
+        current.descriptor_units += descriptor_units;
+        Some(VideoRetentionPermit {
+            usage,
+            descriptor_units,
+        })
+    }
+
+    /// Pre-reserve the exact-root capacity an eventual armed video sweep will
+    /// transfer to the cleanup worker. This is deliberately independent from
+    /// best-effort namespace cleanup admission.
+    pub(crate) fn try_reserve_video_retention_for_path(
+        path: &std::path::Path,
+    ) -> Option<VideoRetentionPermit> {
+        static USAGE: Mutex<VideoRetentionUsage> = Mutex::new(VideoRetentionUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+        let units = artifact_descriptor_units(path);
+        let (live_limit, descriptor_limit) = if cfg!(test) {
+            (
+                ARTIFACT_CLEANUP_TEST_LIMIT,
+                ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT.saturating_mul(ARTIFACT_CLEANUP_TEST_LIMIT),
+            )
+        } else {
+            (ARTIFACT_HANDOFF_LIMIT, ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT)
+        };
+        Self::try_reserve_video_retention_from(&USAGE, live_limit, descriptor_limit, units)
     }
 
     #[cfg(test)]
@@ -4591,17 +4709,67 @@ fn read_request_line(reader: &mut impl BufRead) -> Option<String> {
 }
 
 /// Read one line under one monotonic operation deadline. Kernel socket
-/// timeouts bound individual reads, so the remaining budget must be re-armed
-/// before every byte; otherwise a peer can retain a guarded artifact forever
-/// by sending each next byte just before a fresh full timeout expires.
+/// timeouts bound individual reads, so the remaining budget is re-armed before
+/// every underlying buffer refill. A peer therefore cannot retain a guarded
+/// artifact forever by dribbling each next chunk just before a fresh timeout.
+///
+/// A DETACHED PEER STILL HAS ITS BYTES READ. The one-shot `aterm ctl` client
+/// writes `ACK <nonce>` and exits in the same breath, so by the time this
+/// server reads the acknowledgement the peer is usually already gone — and on
+/// Darwin `setsockopt(SO_RCVTIMEO)` answers EINVAL for an AF_UNIX socket whose
+/// peer has detached, while `recv` on that same socket still returns every
+/// queued byte. Bailing out because the BOUND could not be re-armed therefore
+/// discarded a valid acknowledgement that was already sitting in the receive
+/// queue, and every named capture fell through to the failed-ACK quarantine
+/// instead (see [`enter_detached_peer_drain`]).
 fn read_request_line_until(
     stream: &CtlStream,
     reader: &mut impl BufRead,
     deadline: std::time::Instant,
 ) -> Option<String> {
+    // Latched, not re-tested per refill: once Darwin has refused the bound for
+    // a detached peer, another failing syscall buys nothing.
+    let mut draining_detached_peer = false;
     read_request_line_with_policy(reader, false, || {
-        stream.set_read_timeout(Some(remaining_artifact_io_budget(deadline)?))
+        // The absolute deadline still governs, drain or not: it is the one
+        // bound a peer cannot influence.
+        let budget = remaining_artifact_io_budget(deadline)?;
+        if draining_detached_peer {
+            return Ok(());
+        }
+        match stream.set_read_timeout(Some(budget)) {
+            Ok(()) => Ok(()),
+            Err(refused) => {
+                enter_detached_peer_drain(stream, refused)?;
+                draining_detached_peer = true;
+                Ok(())
+            }
+        }
     })
+}
+
+/// Recover from Darwin's detached-peer `EINVAL` by making the reads that follow
+/// non-blocking instead.
+///
+/// For this exact error the socket is no longer connected, so it yields the
+/// bytes already queued and then EOF. We still switch to non-blocking rather
+/// than assuming that property: an unexpectedly attached peer surfaces as
+/// `WouldBlock` instead of parking a control worker.
+///
+/// Every other error is returned unchanged. Treating an unrelated timeout-arm
+/// failure as proof of detachment would hide the original fault and silently
+/// weaken the acknowledgement deadline.
+#[cfg(target_os = "macos")]
+fn enter_detached_peer_drain(stream: &CtlStream, refused: std::io::Error) -> std::io::Result<()> {
+    if refused.raw_os_error() != Some(libc::EINVAL) {
+        return Err(refused);
+    }
+    stream.set_nonblocking(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn enter_detached_peer_drain(_stream: &CtlStream, refused: std::io::Error) -> std::io::Result<()> {
+    Err(refused)
 }
 
 /// Read one authenticated polling request without imposing an application idle
@@ -4625,10 +4793,13 @@ fn read_request_line_with_policy(
 ) -> Option<String> {
     let mut buf = Vec::with_capacity(64);
     loop {
+        // `fill_buf` performs at most one underlying read and otherwise exposes
+        // bytes it already owns. Re-arm the absolute socket deadline once per
+        // refill, then consume the whole buffered chunk instead of issuing one
+        // `setsockopt` and one `read` call for every byte of an ACK line.
         before_read().ok()?;
-        let mut byte = [0u8; 1];
-        match reader.read(&mut byte) {
-            Ok(0) => {
+        match reader.fill_buf() {
+            Ok([]) => {
                 // EOF: yield a final unterminated line if any, else stop.
                 return if buf.is_empty() {
                     None
@@ -4636,14 +4807,19 @@ fn read_request_line_with_policy(
                     Some(decode_request_line(buf))
                 };
             }
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    return Some(decode_request_line(buf));
-                }
-                if buf.len() >= MAX_REQUEST_LINE {
+            Ok(available) => {
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let chunk_len = newline.unwrap_or(available.len());
+                let remaining = MAX_REQUEST_LINE.saturating_sub(buf.len());
+                if chunk_len > remaining {
                     return None; // runaway line: drop the connection
                 }
-                buf.push(byte[0]);
+                buf.extend_from_slice(&available[..chunk_len]);
+                let consumed = chunk_len + usize::from(newline.is_some());
+                reader.consume(consumed);
+                if newline.is_some() {
+                    return Some(decode_request_line(buf));
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error)
@@ -5633,7 +5809,13 @@ fn run_feed_bin<W: Write>(
         let Some((term, _, _, ctx)) = resolve_active(active) else {
             return Err("ERR input dispatch unavailable\n".to_string());
         };
-        seam_egress(&term, &ctx.sink, &event, EgressMode::Backpressured);
+        crate::app_input::tracked_egress(
+            &term,
+            &ctx.sink,
+            &ctx.output_echo,
+            &event,
+            EgressMode::Backpressured,
+        );
         Ok(InputOutcome::Ok)
     };
     let mut clear_license = |_session| "OK\n".to_string();
@@ -5961,22 +6143,24 @@ where
             };
         }
 
-        if paste {
-            // PASTE semantics: run the payload through `format_paste` under the target's
-            // lock (bracketed-paste guards when DECSET 2004 is on + control-byte sanitize
-            // + LF->CR), exactly as the `paste` verb does — then write the transformed
-            // bytes. Reading the mode HERE, as the bytes are made, IS the verb's framing
-            // contract (`PasteFraming::AtDrain`): a driver was shown no confirmation, so
-            // there is no earlier answer to keep faith with. A human Cmd-V differs on
-            // purpose — it carries the mode its confirmation was judged under. The payload
-            // is interpreted as UTF-8 (lossy): a paste is text, and the sanitizer would
-            // strip raw control bytes anyway.
-            let text = String::from_utf8_lossy(&payload);
-            let out = term_lock(&term).format_paste(&text);
-            control_input::write_pty(&ctx.sink, &out);
+        crate::metrics::note_input();
+        crate::note_unseamed_control_bytes(&payload);
+        let event = if paste {
+            // AtDrain preserves the old direct route's mode-at-write framing.
+            InputEvent::Paste(
+                String::from_utf8_lossy(&payload).into_owned(),
+                PasteFraming::AtDrain,
+            )
         } else {
-            control_input::write_pty(&ctx.sink, &payload);
-        }
+            InputEvent::KeySequence(payload)
+        };
+        crate::app_input::tracked_egress(
+            &term,
+            &ctx.sink,
+            &ctx.output_echo,
+            &event,
+            EgressMode::Backpressured,
+        );
         format!("OK {n} bytes\n")
     });
     if writer.write_all(response.as_bytes()).is_err() {
@@ -6620,7 +6804,7 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
 //
 // These run ON THE CONTROL THREAD against a RESOLVED `@<selector>` target — NOT
 // the active tab — so there is no App UI/gesture/window state to touch and NO
-// `Wake::Input` is posted. They reuse the source-blind seam (`seam_egress`) and
+// `Wake::Input` is posted. They reuse the source-blind tracked seam and
 // the engine's own viewport/geometry APIs directly, with `(target_term,
 // target_sink) = (term, &ctx.sink)` resolved exactly as `send`/`feed` do. The
 // op-scope gate (`cross_session_authorized`) has already passed before any of
@@ -6653,11 +6837,33 @@ fn cross_input(
             // announcing a gap for a verb the ledger never records would be its
             // own kind of dishonesty.
             crate::note_unseamed_control_input(&ev);
-            seam_egress(term, &ctx.sink, &ev, EgressMode::Backpressured);
+            crate::app_input::tracked_egress(
+                term,
+                &ctx.sink,
+                &ctx.output_echo,
+                &ev,
+                EgressMode::Backpressured,
+            );
             "OK\n".to_string()
         }
         None => err.to_string(),
     }
+}
+
+/// Raw `send`/`feed` bytes are still terminal input: retain their historical
+/// unlogged-input/latency accounting while routing the frame through the same
+/// per-session echo receipt as vocabulary input.
+fn cross_raw_input(term: &Arc<Mutex<Terminal>>, ctx: &SessionCtx, bytes: Vec<u8>) {
+    crate::metrics::note_input();
+    crate::note_unseamed_control_bytes(&bytes);
+    let event = InputEvent::KeySequence(bytes);
+    crate::app_input::tracked_egress(
+        term,
+        &ctx.sink,
+        &ctx.output_echo,
+        &event,
+        EgressMode::Backpressured,
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6716,7 +6922,15 @@ fn operator_input(
     let Some(ev) = ev else {
         return Delivery::BusyZero;
     };
-    match seam_egress(term, &ctx.sink, &ev, EgressMode::TryImmediate) {
+    match crate::app_input::tracked_egress(
+        term,
+        &ctx.sink,
+        &ctx.output_echo,
+        &ev,
+        EgressMode::TryImmediate,
+    )
+    .egress
+    {
         Egress::Reported(delivery) => delivery,
         Egress::TrackingOff { .. } => Delivery::BusyZero,
     }
@@ -6744,6 +6958,7 @@ fn operator_input_if_epoch(
     let Some(ev) = ev else {
         return Delivery::BusyZero;
     };
+    let echo_write = ctx.output_echo.begin_event(&ev);
     // This is inside the host actuation gate in production. A blocking terminal
     // acquisition here would let output/reflow hold fleet-fault, unmanagement,
     // and shutdown behind an unbounded wait. Refuse with zero bytes instead.
@@ -6781,19 +6996,23 @@ fn operator_input_if_epoch(
         _ => return Delivery::BusyZero,
     };
     if bytes.is_empty() {
-        return Delivery::FullAt { epoch: expected };
+        let delivery = Delivery::FullAt { epoch: expected };
+        echo_write.finish_delivery(delivery, None, &ctx.sink);
+        return delivery;
     }
-    let (outcome, epoch) = ctx
+    let (outcome, epoch, accepted_order) = ctx
         .sink
-        .try_write_frame_immediate_if_epoch(expected, &bytes);
-    match outcome {
+        .try_write_frame_immediate_if_epoch_with_receipt(expected, &bytes);
+    let delivery = match outcome {
         aterm_session::sink::ImmediateWrite::Full => Delivery::FullAt { epoch },
         aterm_session::sink::ImmediateWrite::BusyZero => Delivery::BusyZero,
         aterm_session::sink::ImmediateWrite::ConflictZero => Delivery::ConflictZero,
         aterm_session::sink::ImmediateWrite::PartialInDoubt { accepted } => {
             Delivery::PartialInDoubt { accepted }
         }
-    }
+    };
+    echo_write.finish_delivery(delivery, accepted_order, &ctx.sink);
+    delivery
 }
 
 /// Should an explicit-selector request be applied through the App INPUT SEAM
@@ -7019,7 +7238,15 @@ fn cross_mouse_apply(
     rest: &str,
 ) -> Result<bool, String> {
     let ev = parse_mouse(rest)?;
-    match seam_egress(term, &ctx.sink, &ev, EgressMode::Backpressured) {
+    match crate::app_input::tracked_egress(
+        term,
+        &ctx.sink,
+        &ctx.output_echo,
+        &ev,
+        EgressMode::Backpressured,
+    )
+    .egress
+    {
         // Tracking ON but the PTY write failed: honest error, not a false OK.
         Egress::Reported(crate::input::Delivery::Failed) => Err("ERR write failed\n".to_string()),
         // Tracking ON: the seam already wrote the report to the target sink.
@@ -7456,7 +7683,7 @@ fn handle(
     // write_input answer for the real process, not as a host that keeps none; and
     // `session` BINDS the host, so a sid from elsewhere is refused rather than
     // served against this target.
-    let host = GuiHost::with_fleet(session, term, Some(proxy), subscribers, store, &ctx.sink);
+    let host = GuiHost::with_fleet(session, term, Some(proxy), subscribers, store, ctx);
 
     // `--json` READ MODE: a structured-JSON foundation for the read verbs. The flag
     // is parsed off `rest` HERE (additive: a line without it is byte-identical text)
@@ -7472,7 +7699,8 @@ fn handle(
     {
         let json = match verb {
             // `text --json [trim]`: the tail is parsed, never dropped — an unknown
-            // token is `ERR usage: text [trim]`, the same answer as the text form.
+            // token is `ERR usage: text [--json] [trim]`, the same answer as the
+            // text form.
             "text" => Some(match control_query::text_trim_arg(&body) {
                 Ok(trim) => control_query::cmd_text_json_opt(term, trim),
                 Err(usage) => usage,
@@ -7794,7 +8022,10 @@ fn handle(
             Some(InputEvent::KeySequence(control_input::send_bytes(rest))),
             "ERR\n",
         ),
-        "send" => control_input::cmd_send(&ctx.sink, rest),
+        "send" => {
+            cross_raw_input(term, ctx, control_input::send_bytes(rest));
+            "OK\n".to_string()
+        }
         // Phase 0.5: the SELF (active-tab) path funnels `key`/`ctrl`/`mouse`/`paste`/
         // `focus`/`resize`/`scroll` through the source-blind `App::input` seam on the
         // EVENT LOOP (posts `Wake::Input` / a reply-bearing resize), so the bytes are
@@ -7805,11 +8036,11 @@ fn handle(
         //
         // P1.2 follow-up: the CROSS-session (`@other`) path no longer fails closed. A
         // background target is NOT the active tab, so there is no App UI/gesture/window
-        // state to touch — and `seam_egress` is already source-blind and session-
+        // state to touch — and the tracked egress seam is source-blind and session-
         // agnostic (it reads the modes from the GIVEN term and writes the GIVEN sink).
         // So a cross arm resolves `(target_term, target_sink) = (term, &ctx.sink)` the
         // SAME way `send`/`feed` already do, builds the IDENTICAL `InputEvent` via the
-        // shared `parse_*` helpers, and calls `seam_egress` DIRECTLY on the control
+        // shared `parse_*` helpers, and calls tracked egress DIRECTLY on the control
         // thread (no `Wake::Input`). Op-scope is already `WriteInput`-gated above
         // (`cross_session_authorized`), so these run only after the edge/owner check.
         // An explicit `@<sid>` that resolved to the tab ON SCREEN is not a
@@ -7853,7 +8084,14 @@ fn handle(
             }
             Err(error) => error.to_string(),
         },
-        "feed" => control_input::cmd_feed(&ctx.sink, rest),
+        "feed" => match control_input::feed_bytes(rest) {
+            Ok(bytes) => {
+                let n = bytes.len();
+                cross_raw_input(term, ctx, bytes);
+                format!("OK {n} bytes\n")
+            }
+            Err(error) => error.to_string(),
+        },
         "signal" => control_input::cmd_signal(master, rest),
         "mouse" if is_cross && targets_front => front_routed_input(
             proxy,
@@ -8797,6 +9035,39 @@ mod tests {
         assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
     }
 
+    #[test]
+    fn video_retention_capacity_is_reserved_and_returned_exactly() {
+        static USAGE: Mutex<VideoRetentionUsage> = Mutex::new(VideoRetentionUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+
+        let first = ReplyRetention::try_reserve_video_retention_from(&USAGE, 1, 8, 4)
+            .expect("first distinct video reserves its future retention sweep");
+        assert_eq!(
+            *USAGE.lock().unwrap(),
+            VideoRetentionUsage {
+                live: 1,
+                descriptor_units: 4,
+            }
+        );
+        assert!(
+            ReplyRetention::try_reserve_video_retention_from(&USAGE, 1, 8, 1).is_none(),
+            "the distinct-video count bound is independent of GC queue pressure"
+        );
+        assert!(
+            ReplyRetention::try_reserve_video_retention_from(&USAGE, 2, 8, 5).is_none(),
+            "the descriptor bound is enforced independently of count"
+        );
+
+        drop(first);
+        assert_eq!(*USAGE.lock().unwrap(), VideoRetentionUsage::default());
+        let reopened = ReplyRetention::try_reserve_video_retention_from(&USAGE, 1, 8, 8)
+            .expect("dropping the sweep returns both accounting dimensions");
+        drop(reopened);
+        assert_eq!(*USAGE.lock().unwrap(), VideoRetentionUsage::default());
+    }
+
     /// Drive the shipping reservation through a real failed ACK. The permit
     /// must remain charged while its guard is in the process-global quarantine,
     /// then return only when the quarantine reaper drops that guard.
@@ -9347,6 +9618,223 @@ mod tests {
         );
     }
 
+    /// Read the guarded frame, acknowledge it, and CLOSE — the exact shape of
+    /// the shipping one-shot `aterm ctl` client, which exits the instant its
+    /// ACK is flushed. Returns the outcome the server reached.
+    ///
+    /// The close happens before the server reads, deliberately and
+    /// deterministically: that ordering is the whole hazard. Darwin refuses
+    /// `setsockopt(SO_RCVTIMEO)` on an AF_UNIX socket whose peer has detached,
+    /// so a server that re-arms its read bound per refill finds the bound
+    /// unarmable and — before this was fixed — abandoned an acknowledgement
+    /// that was already sitting in its own receive queue.
+    fn acknowledge_then_exit(
+        client: CtlStream,
+        server: &CtlStream,
+        pending: PendingArtifactAck,
+    ) -> ArtifactAckOutcome {
+        {
+            let mut writing = &client;
+            let mut reader = BufReader::new(&client);
+            let mut response = String::new();
+            reader.read_line(&mut response).unwrap();
+            assert!(response.starts_with("OK "), "guarded OK: {response:?}");
+            let mut challenge = String::new();
+            reader.read_line(&mut challenge).unwrap();
+            let nonce = challenge
+                .trim_end()
+                .strip_prefix(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX)
+                .expect("challenge trailer");
+            writing
+                .write_all(
+                    format!(
+                        "{}{nonce}\n",
+                        aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            writing.flush().unwrap();
+        }
+        // The one-shot client process exits HERE, with its ACK already in the
+        // server's receive queue and unread.
+        drop(client);
+        let mut server_reader = BufReader::new(server);
+        await_guarded_reply_close_with_quarantine(
+            server,
+            &mut server_reader,
+            pending,
+            std::time::Duration::from_millis(40),
+        )
+    }
+
+    fn guarded_probe_reply(retention: ReplyRetention) -> ControlReply {
+        ControlReply::guarded(
+            "OK 1 1 /private/artifact.png\n".to_string(),
+            Some(retention),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detached_peer_drain_preserves_unrelated_timeout_errors() {
+        let (_client, server) = CtlStream::pair().unwrap();
+        let error =
+            enter_detached_peer_drain(&server, std::io::Error::from_raw_os_error(libc::EBADF))
+                .expect_err("only Darwin's detached-peer EINVAL authorizes a drain");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// THE REGRESSION THAT SHIPPED. A client that acknowledges and exits in the
+    /// same breath — every `aterm ctl image <name>` — was recorded as a FAILED
+    /// acknowledgement, so its guard and its admission permit went to the 30 s
+    /// quarantine instead of being released. Four named captures filled the
+    /// pool; the fifth got "artifact handoff busy; retry" and kept getting it
+    /// for thirty seconds, so the release self-check's typed take — one named
+    /// capture per keystroke, sixty-seven of them — died at frame four.
+    #[test]
+    fn peer_ack_then_immediate_exit_releases_the_guard() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let (client, server) = CtlStream::pair().unwrap();
+        let reply = guarded_probe_reply(ReplyRetention::new(WireProbe {
+            alive: Arc::clone(&alive),
+            prepared,
+            fail_prepare: false,
+        }));
+        let mut writer = &server;
+        let pending = write_control_reply(&mut writer, reply)
+            .unwrap()
+            .expect("guarded response");
+        assert_eq!(
+            acknowledge_then_exit(client, &server, pending),
+            ArtifactAckOutcome::PeerAcknowledged,
+            "an ACK already in the receive queue is proof of consumption, \
+             whether or not its writer is still attached"
+        );
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "the exact ACK transition releases the guard immediately"
+        );
+    }
+
+    /// The capacity half of the same regression, and the gate nothing had:
+    /// SEQUENTIAL guarded replies, many more than the pool holds, each
+    /// acknowledged by a client that exits at once. Every one must be admitted,
+    /// and the pool must be exactly empty at the end — nothing here ever tested
+    /// more than a single reply, which is why four-then-stuck shipped.
+    ///
+    /// Under the bug the acknowledgement assertion trips first, on capture
+    /// zero; the admission `panic!` below is the one that speaks for the
+    /// SHIPPED symptom, where the first four captures answered OK and the fifth
+    /// got "artifact handoff busy; retry" for the next thirty seconds.
+    #[test]
+    fn sequential_acknowledged_replies_never_exhaust_the_handoff_pool() {
+        // Charge each reply so the descriptor budget saturates at exactly the
+        // live cap, the way a real capture path's pinned chain does.
+        const CHARGE: usize = ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT / ARTIFACT_HANDOFF_LIMIT;
+        const CAPTURES: usize = 120;
+        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+
+        for capture in 0..CAPTURES {
+            let permit = ArtifactHandoffPermit::try_acquire_from(
+                &USAGE,
+                ARTIFACT_HANDOFF_LIMIT,
+                ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT,
+                CHARGE,
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "capture {capture} was refused admission: a released reply \
+                     is still holding its handoff permit"
+                )
+            });
+            let alive = Arc::new(AtomicBool::new(true));
+            let (client, server) = CtlStream::pair().unwrap();
+            let reply = guarded_probe_reply(ReplyRetentionPermit(permit).retain(WireProbe {
+                alive: Arc::clone(&alive),
+                prepared: Arc::new(AtomicBool::new(false)),
+                fail_prepare: false,
+            }));
+            let mut writer = &server;
+            let pending = write_control_reply(&mut writer, reply)
+                .unwrap()
+                .expect("guarded response");
+            assert_eq!(
+                acknowledge_then_exit(client, &server, pending),
+                ArtifactAckOutcome::PeerAcknowledged,
+                "capture {capture} lost its acknowledgement"
+            );
+            assert!(
+                !alive.load(Ordering::Acquire),
+                "capture {capture} kept its guard past the acknowledgement"
+            );
+        }
+
+        assert_eq!(
+            *USAGE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ArtifactHandoffUsage {
+                live: 0,
+                descriptor_units: 0,
+            },
+            "every one of {CAPTURES} sequential captures gave its permit back"
+        );
+    }
+
+    /// Draining a detached peer recovers ITS BYTES, not its verdict. A one-shot
+    /// client that exits without acknowledging — silently, or with a wrong line
+    /// — must still be a failed handoff, or the fix above would have turned
+    /// "the peer went away" into proof the response was consumed.
+    #[test]
+    fn detached_peer_without_a_valid_ack_is_still_quarantined() {
+        for (label, farewell) in [
+            ("silent exit", None),
+            ("wrong line", Some("ACK not-the-nonce\n")),
+            ("unterminated", Some("ACK ")),
+        ] {
+            let alive = Arc::new(AtomicBool::new(true));
+            let (client, server) = CtlStream::pair().unwrap();
+            let reply = guarded_probe_reply(ReplyRetention::new(WireProbe {
+                alive: Arc::clone(&alive),
+                prepared: Arc::new(AtomicBool::new(false)),
+                fail_prepare: false,
+            }));
+            let mut writer = &server;
+            let pending = write_control_reply(&mut writer, reply)
+                .unwrap()
+                .expect("guarded response");
+            if let Some(farewell) = farewell {
+                let mut writing = &client;
+                writing.write_all(farewell.as_bytes()).unwrap();
+                writing.flush().unwrap();
+            }
+            drop(client);
+            let mut server_reader = BufReader::new(&server);
+            assert_eq!(
+                await_guarded_reply_close_with_quarantine(
+                    &server,
+                    &mut server_reader,
+                    pending,
+                    // Long enough that the reaper cannot beat the assertion
+                    // below to the guard; this test is about the verdict, not
+                    // about how quickly the grace expires.
+                    std::time::Duration::from_secs(2),
+                ),
+                ArtifactAckOutcome::AcknowledgementQuarantined,
+                "{label} must not read as a consume acknowledgement"
+            );
+            assert!(
+                alive.load(Ordering::Acquire),
+                "{label} keeps the guard until its quarantine grace elapses"
+            );
+        }
+    }
+
     #[test]
     fn pre_pipelined_ack_guess_is_failed_and_quarantined() {
         let alive = Arc::new(AtomicBool::new(true));
@@ -9542,9 +10030,7 @@ mod tests {
         );
     }
 
-    // `cmd_feed`/`cmd_send` are drawn only by the unix-gated pipe-backed tests.
-    #[cfg(unix)]
-    use super::control_input::{cmd_feed, cmd_send};
+    use super::control_input::{feed_bytes, send_bytes};
     use super::control_input::{parse_resize, parse_tab, paste_text, take_mods};
     use super::control_media::{
         MAX_IMAGE_PAYLOAD_BYTES, cmd_image_read, image_payload, image_read_line,
@@ -11138,20 +11624,8 @@ mod tests {
     /// `send` is byte-faithful: interior whitespace is NOT collapsed (the line
     /// decoder / dispatcher preserve the tail verbatim).
     #[test]
-    #[cfg(unix)]
-    fn send_preserves_whitespace() {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let sink = SinkWriter::new(fds[1]);
-        let reply = cmd_send(&sink, "a   b\tc");
-        assert_eq!(reply, "OK\n");
-        // `SinkWriter::new` does NOT own the fd, so close the write end explicitly
-        // (mirroring `input::tests::egress_bytes`) or `read_to_end` blocks forever.
-        unsafe { libc::close(fds[1]) };
-        let mut got = Vec::new();
-        let mut r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-        r.read_to_end(&mut got).unwrap();
-        assert_eq!(got, b"a   b\tc");
+    fn send_bytes_preserves_whitespace() {
+        assert_eq!(send_bytes("a   b\tc"), b"a   b\tc");
     }
 
     /// ITEM 1 keystone: the styled `screen` frame carries EVERY resolved
@@ -11606,7 +12080,37 @@ mod tests {
         let dead = SessionId::generate();
         let dead_sock = dir.join("aterm-77002.sock");
         let _ = std::fs::remove_file(&dead_sock);
-        drop(std::os::unix::net::UnixListener::bind(&dead_sock).expect("bind then drop"));
+        // Bound but NEVER LISTENING, by construction. `UnixListener::bind`
+        // listens before the drop can close, and a listening descriptor in a
+        // shared test process is fork bait: any co-running test's `pre_exec`
+        // Command snapshots the fd table between our listen and close, and the
+        // kernel keeps the socket ACCEPTING through the child's duplicate until
+        // its execve — hundreds of milliseconds under load — so the probe below
+        // transiently connected to a "dead" socket (measured 319-427 per 20,000
+        // rounds beside the fork-heavy handoff tests; 0 with this shape). Raw
+        // socket+bind+close never creates a listening instant to inherit, and
+        // the kernel answers exactly what a crashed sibling's leftover socket
+        // file answers: ECONNREFUSED.
+        // SAFETY: three straight-line libc calls on a path the std bind at this
+        // exact location already proved fits sun_path; every return is checked.
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket(AF_UNIX)");
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = dead_sock.as_os_str().as_encoded_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "sun_path fits");
+            for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+                *slot = *byte as libc::c_char;
+            }
+            let bound = libc::bind(
+                fd,
+                std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            assert_eq!(bound, 0, "bind never-listening dead socket");
+            assert_eq!(libc::close(fd), 0, "close bound socket");
+        }
         std::fs::write(dir.join("aterm-77002.token"), "beef\n").expect("token");
         crate::proxy::write_graph_entry(&dir, &dead, &dead_sock.to_string_lossy(), &nonce);
         let dead_line = format!("@{} text", dead.as_str());
@@ -11849,6 +12353,7 @@ mod tests {
         let term_b = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(11)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),
@@ -12283,7 +12788,7 @@ mod tests {
     }
 
     /// A live, PIPE-backed session: a real `SinkWriter` over the WRITE end of a
-    /// `pipe(2)` (so `seam_egress`/`cmd_send` bytes are readable from `rx`), its own
+    /// `pipe(2)` (so tracked input bytes are readable from `rx`), its own
     /// `Terminal`, and a `SessionHandle` registered under `local_id`. The read end
     /// is returned separately so the test can drain the bytes that reached THIS
     /// session's PTY. Mirrors the production wiring (term+sink+ctx are the SAME
@@ -12302,6 +12807,7 @@ mod tests {
         let nonce = LaunchNonce::generate();
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(wr)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -12497,26 +13003,60 @@ mod tests {
             drain_pipe(&self_rx).is_empty(),
             "self pty must be untouched"
         );
+        let turn = h_target
+            .ctx
+            .output_echo
+            .sample(&h_target.ctx.sink, std::time::Instant::now());
+        assert!(turn.last_boundary_at.is_some());
+        assert!(turn.last_accepted_at.is_none());
+        assert!(
+            h_self
+                .ctx
+                .output_echo
+                .sample(&h_self.ctx.sink, std::time::Instant::now())
+                .last_boundary_at
+                .is_none(),
+            "cross input must stamp only its resolved session"
+        );
 
-        // `feed 03` (Ctrl-C) cross-session: `cmd_feed(&ctx.sink, ..)` is ALREADY the
-        // resolved-target path — assert it stays correct alongside the new arms.
-        assert_eq!(cmd_feed(&ctx.sink, "03"), "OK 1 bytes\n");
+        // Raw feed/send retain their direct background route but now publish an
+        // accepted-input receipt on that same resolved SessionCtx.
+        let unlogged_before_feed = crate::unseamed_control_inputs();
+        cross_raw_input(&term, ctx, feed_bytes("03").unwrap());
         assert_eq!(
             drain_pipe(&target_rx),
             b"\x03",
             "feed bytes hit the TARGET pty"
         );
         assert!(drain_pipe(&self_rx).is_empty(), "feed must not touch self");
+        assert!(
+            crate::unseamed_control_inputs().saturating_sub(unlogged_before_feed) >= 1,
+            "the one-byte raw feed must disclose one unlogged input attempt"
+        );
 
         // `send` (the other always-cross writer) still writes to the resolved sink.
         // `send` is RAW (no implicit CR unless a literal trailing `\n` is given).
-        let _ = cmd_send(&ctx.sink, "ls");
+        let unlogged_before_send = crate::unseamed_control_inputs();
+        cross_raw_input(&term, ctx, send_bytes("ls"));
         assert_eq!(
             drain_pipe(&target_rx),
             b"ls",
             "send bytes hit the TARGET pty"
         );
         assert!(drain_pipe(&self_rx).is_empty(), "send must not touch self");
+        assert!(
+            crate::unseamed_control_inputs().saturating_sub(unlogged_before_send) >= 2,
+            "the two-byte raw send must disclose two unlogged input attempts"
+        );
+        assert!(
+            h_target
+                .ctx
+                .output_echo
+                .sample(&h_target.ctx.sink, std::time::Instant::now())
+                .last_accepted_at
+                .is_some(),
+            "the visible target can discount its controller-input echo"
+        );
 
         // `select` is ALREADY cross-correct and is left untouched (it has no
         // `is_cross` guard): it mutates the RESOLVED `term`'s selection and repaints
@@ -12576,6 +13116,7 @@ mod tests {
         let nonce = LaunchNonce::generate();
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(master)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid,
@@ -12800,6 +13341,7 @@ mod tests {
         use aterm_session::{EdgeTable, LaunchNonce, SessionId};
         Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(-1)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),
@@ -14836,6 +15378,7 @@ mod tests {
         }
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(master)),
+            output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -15051,7 +15594,7 @@ mod tests {
             cross_session_authorized(Scope::Owner, "send", &peer_h.ctx),
             "owner write ok"
         );
-        assert_eq!(cmd_send(&target.3.sink, "echo-into-peer"), "OK\n");
+        cross_raw_input(&target.0, &target.3, send_bytes("echo-into-peer"));
 
         // A read-only Edge is denied the SAME write BEFORE any byte is sent (op-gate).
         let read_scope = Scope::Edge(EdgeToken::generate());
@@ -17794,6 +18337,25 @@ mod tests {
         assert_eq!(read_request_line(&mut reader), None, "then EOF");
     }
 
+    #[test]
+    fn guarded_line_deadline_rearms_once_per_buffer_refill() {
+        let input = b"ACK 0123456789abcdef0123456789abcdef\n".to_vec();
+        let mut reader = BufReader::with_capacity(128, std::io::Cursor::new(input));
+        let mut rearms = 0usize;
+        let line = read_request_line_with_policy(&mut reader, false, || {
+            rearms += 1;
+            Ok(())
+        });
+        assert_eq!(
+            line.as_deref(),
+            Some("ACK 0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            rearms, 1,
+            "a fully buffered acknowledgement must not re-arm per byte"
+        );
+    }
+
     /// `ready` reports the target's readiness: a fresh OSC-133 prompt is `prompt`,
     /// an in-flight command times out (not ready), a completed command is `prompt`
     /// again, and a session marked `Exited` in the registry fails closed.
@@ -19239,7 +19801,7 @@ mod tests {
         let attack = format!("{hex}:{bridge_producer}:{}", u64::MAX);
         assert_eq!(
             crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(attack.as_str()), || {
-                // `cmd_send` with an empty tail: OK, and nothing typed.
+                // `send` with an empty tail: OK, and nothing typed.
                 "OK\n".to_string()
             }),
             "OK\n"

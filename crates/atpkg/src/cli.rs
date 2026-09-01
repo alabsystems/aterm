@@ -32,6 +32,21 @@ use crate::flow::now_unix;
 /// they stopped dispatching — so a user who followed the suggestion got the
 /// very error that printed it. A hand-maintained help string cannot be
 /// trusted to track a match arm; a test can.
+/// The dispatch roster, for anything that DOCUMENTS these verbs.
+///
+/// Public so a prose gate in a sibling crate can pin what the manual says
+/// against what actually runs. The manual claimed that property already — "the
+/// roster `aterm pkg --help` prints is test-pinned to the dispatch table — it
+/// never advertises a verb that does not run" — and it was true of the ROSTER
+/// and false of the page asserting it: that page prescribed `aterm pkg
+/// shellenv`, `aterm pkg seam` and `aterm pkg doctor --fix`, none of which
+/// exist, and an unknown verb exits 2 with EMPTY stdout, so
+/// `eval "$(aterm pkg shellenv)"` succeeded and did nothing.
+#[must_use]
+pub fn dispatch_roster() -> &'static [&'static str] {
+    VERBS
+}
+
 const VERBS: &[&str] = &[
     "doctor",
     "status",
@@ -140,8 +155,24 @@ fn cmd_verb_help(verb: &str) -> ExitCode {
             println!("atpkg: full manual for this verb: aterm help pkg");
             ExitCode::SUCCESS
         }
-        // Not a verb we know — fall back to the roster rather than inventing one.
-        None => cmd_help(),
+        // NOT a verb we know. This used to fall back to `cmd_help()` — the
+        // roster, at exit 0 — which is a FALSE SUCCESS: `atpkg help install`,
+        // `atpkg help gc` and `atpkg help zzz-total-nonsense` returned three
+        // byte-identical pages at rc 0, and a page of text after a `help <x>`
+        // reads as "this is the help for x" (audit D-C). `aterm help` was
+        // already the honest counter-example, so this copies its shape: name
+        // the topic, suggest the near miss, list the real ones, exit 2.
+        None => {
+            eprintln!("atpkg help: unknown topic '{verb}'");
+            if let Some(near) = did_you_mean(verb) {
+                eprintln!("atpkg:   did you mean `atpkg help {near}`?");
+            }
+            eprintln!();
+            eprintln!("available topics (atpkg help <verb>):");
+            print_verb_tiers(&mut std::io::stderr());
+            eprintln!("full manual: aterm help pkg");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -301,10 +332,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     // dispatch-coherence test's arm extraction sees only real verbs.
     if matches!(verb, Some("help" | "-h" | "--help")) {
         // `atpkg help <verb>` answers for THAT verb, matching `aterm help <topic>`;
-        // bare `help` keeps the roster.
-        if let Some(topic) = args.get(1)
-            && usage_of(topic).is_some()
-        {
+        // bare `help` keeps the roster. An UNKNOWN topic is a usage error, not a
+        // roster at exit 0 — see `cmd_verb_help`.
+        if let Some(topic) = args.get(1) {
             return cmd_verb_help(topic);
         }
         return cmd_help();
@@ -3721,23 +3751,45 @@ fn cmd_install_argv(rest: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    cmd_install_elevated(operands.first().copied(), explicit)
+    cmd_install_elevated(operands.first().copied(), explicit, "install")
 }
 
 /// `atpkg install <program>` — resolve+verify the signed index from the configured account,
 /// then install/force-upgrade the program's channel-pinned build for this triple (download →
 /// verify_and_stage → activate → shim). Inert unless a root key is pinned at build time.
-/// `atpkg install --default-set` routes to the explicit whole-set bootstrap instead
-/// ([`cmd_install_default_set`]). Elevation follows the TTY rule; see
-/// [`cmd_install_elevated`] for the explicit form.
-fn cmd_install(program: Option<&String>) -> ExitCode {
-    cmd_install_elevated(program, None)
+/// The one line that explains why a failure reported under `<verb>` is about to
+/// recommend `install`. `None` when the reader typed `install` themselves, where
+/// the remedy needs no explanation and the extra line would be noise.
+fn routed_install_note(invoked_as: &str, program: &str) -> Option<String> {
+    (invoked_as != "install").then(|| {
+        format!(
+            "atpkg:   `{invoked_as} {program}` on a program that is not installed is a \
+             fresh install, which is why the remedy below says install"
+        )
+    })
 }
 
-/// [`cmd_install`] with an explicit elevation policy (`--elevate=…`), or `None` for the
+/// [`cmd_install`] reached from `update <program>` on a program that is NOT
+/// installed. Same path, same behaviour -- only the verb the messages name
+/// changes, so a reader is never told that a command they did not type failed.
+fn cmd_install_for_update(program: &String) -> ExitCode {
+    cmd_install_elevated(Some(program), None, "update")
+}
+
+/// `atpkg install <program>` — resolve+verify the signed index from the configured
+/// account, then install/force-upgrade the program's channel-pinned build for this
+/// triple (download → verify_and_stage → activate → shim). Inert unless a root key is
+/// pinned at build time. `atpkg install --default-set` routes to the explicit whole-set
+/// bootstrap ([`cmd_install_default_set`]).
+///
+/// Takes an explicit elevation policy (`--elevate=…`), or `None` for the
 /// TTY rule. THE EXPLICIT DOOR for an OS-installed member: this is the one verb that may
 /// elevate, and only on the thread that runs it — every unattended pass stays Deferred.
-fn cmd_install_elevated(program: Option<&String>, explicit: Option<crate::Elevation>) -> ExitCode {
+fn cmd_install_elevated(
+    program: Option<&String>,
+    explicit: Option<crate::Elevation>,
+    invoked_as: &str,
+) -> ExitCode {
     let Some(program) = program else {
         // A bare `install` is nearly always someone asking for the toolset, and the product
         // default IS the whole set — so say the spelling that grants it rather than a usage
@@ -3782,7 +3834,13 @@ fn cmd_install_elevated(program: Option<&String>, explicit: Option<crate::Elevat
         explicit,
         crate::elevate::stdin_is_tty(),
     ));
-    cmd_install_with(program, &layout, cfg, &*resolve_fetcher(&layout))
+    cmd_install_with(
+        program,
+        &layout,
+        cfg,
+        &*resolve_fetcher(&layout),
+        invoked_as,
+    )
 }
 
 /// The body of [`cmd_install`] against an ALREADY-BUILT fetcher, so a caller that has one
@@ -3799,6 +3857,14 @@ fn cmd_install_with(
     layout: &crate::store::Layout,
     cfg: &crate::config::PackagesConfig,
     fetcher: &dyn crate::flow::Fetcher,
+    // THE VERB THE USER TYPED, for messaging only. `update <p>` on a program
+    // that is not installed routes here deliberately (one install path), and
+    // this function used to answer under the name `install` regardless -- so
+    // `atpkg update status` replied `atpkg: install status failed: …`. A reader
+    // who is told their command failed under a name they did not type cannot
+    // tell whether the tool misheard them or they misused a different verb, and
+    // an audit of this CLI recorded exactly that confusion (D-4).
+    invoked_as: &str,
 ) -> ExitCode {
     reconcile_links(layout, cfg);
     if let Some(path) = explicit_install_door(layout, fetcher, program) {
@@ -3888,9 +3954,14 @@ fn cmd_install_with(
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("atpkg: install {program} failed: {e}");
+            eprintln!("atpkg: {invoked_as} {program} failed: {e}");
             if let Some(state) = canonical_non_error_state(&e) {
                 eprintln!("atpkg: {program}: {state}");
+            }
+            // Say WHY a verb the reader did not type is about to be recommended.
+            // Without this line the remedy reads like a non-sequitur.
+            if let Some(note) = routed_install_note(invoked_as, program) {
+                eprintln!("{note}");
             }
             print_unreachable_followup(&e, &format!("aterm pkg install {program}"));
             ExitCode::from(1)
@@ -6471,7 +6542,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
     let installed = crate::active_builds(&layout);
     if !installed.contains_key(program) {
         // Update of a not-installed program = a fresh explicit install (single path).
-        return cmd_install(Some(program));
+        return cmd_install_for_update(program);
     }
     let cur = installed.get(program).copied();
     let floor = build_floor(&layout);
@@ -6572,7 +6643,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
     // second one. Everything `cmd_install` would re-do first — `manager_enabled`,
     // `layout()`, `cfg` — ran above with the same answers, and `reconcile_links` still
     // runs inside `cmd_install_with` exactly as before, so the output is unchanged.
-    cmd_install_with(program, &layout, cfg, &*fetcher)
+    cmd_install_with(program, &layout, cfg, &*fetcher, "update")
 }
 
 /// Report a channel-apply outcome per coherence group and record per-program status,
@@ -7225,7 +7296,7 @@ mod tests {
     #[test]
     fn install_refuses_a_flag_as_a_program_name() {
         for flag in ["--progress-file", "-v", "--default-sett"] {
-            let code = super::cmd_install(Some(&flag.to_string()));
+            let code = super::cmd_install_elevated(Some(&flag.to_string()), None, "install");
             assert_eq!(
                 code,
                 std::process::ExitCode::from(2),
@@ -7497,6 +7568,56 @@ mod tests {
 
     /// The suggestion engine: a one-slip typo gets the fix, gibberish gets silence —
     /// a far-fetched guess erodes trust in the near ones.
+    #[test]
+    /// A reader must never be told that a command they did not type failed.
+    /// `atpkg update status` used to answer `atpkg: install status failed: …`
+    /// because `update` on a not-installed program routes through the single
+    /// install path (AUDIT-cli-per-verb-help-2026-08-31.md, D-4). The routing is
+    /// right; answering under the wrong verb was not.
+    #[test]
+    fn a_routed_failure_names_the_verb_the_reader_typed() {
+        let note = routed_install_note("update", "status").expect("update is a routed verb");
+        assert!(note.contains("`update status`"), "{note}");
+        assert!(
+            note.contains("fresh install"),
+            "the note must say WHY the remedy names a different verb: {note}"
+        );
+        assert!(
+            !note.contains("install status failed"),
+            "the note explains the remedy; it must not restate the failure: {note}"
+        );
+        // Typed `install` directly: the remedy is self-explanatory, so no note.
+        assert_eq!(routed_install_note("install", "rustc"), None);
+    }
+
+    #[test]
+    /// `help <x>` for an `x` that is not a verb must FAIL, not print the roster
+    /// at exit 0. Three byte-identical pages at rc 0 for `install`, `gc` and
+    /// `zzz-total-nonsense` is what made this a false success: a page of text
+    /// after `help <x>` reads as the help for x (audit D-C).
+    #[test]
+    fn help_for_an_unknown_topic_is_a_usage_error_not_a_roster() {
+        assert_eq!(
+            cmd_verb_help("zzz-total-nonsense"),
+            ExitCode::from(2),
+            "an unknown topic must exit 2"
+        );
+        // A real verb still answers, at 0.
+        assert_eq!(
+            cmd_verb_help("install"),
+            ExitCode::SUCCESS,
+            "`install` is a verb; its help is a success"
+        );
+        // Every advertised verb is answerable, or `help` sends a reader to a
+        // usage error for a verb the roster itself just offered them.
+        for verb in dispatch_roster() {
+            assert!(
+                usage_of(verb).is_some(),
+                "`atpkg help {verb}` would now exit 2 for a verb atpkg dispatches"
+            );
+        }
+    }
+
     #[test]
     fn did_you_mean_suggests_and_gives_up() {
         assert_eq!(did_you_mean("instal"), Some("install"));
@@ -8898,29 +9019,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE single-writer verb roster ([`crate::lock`]): every verb that mutates the
-    /// store (stage/activate/discard, shims, links, pins, gc) takes the store-wide
-    /// lock at the dispatch edge; every read-only verb stays lock-free. Exhaustive
-    /// over the dispatch table so a new verb must be classified deliberately.
-    /// Every dispatchable verb must be able to say what it accepts.
-    ///
-    /// The audit that prompted this found 35 of 55 CLI verbs unable to answer
-    /// "what do you take", and the gap cost a wrong conclusion in a written
-    /// document — `install --help` printed the roster, so a real `--elevate` flag
-    /// read as nonexistent. A new verb must not be able to land in that state.
-    #[test]
-    /// HELP AND ENFORCEMENT MUST NOT DRIFT. [`VERB_USAGE`] is hand-written prose and
-    /// [`NAME_TAKING_VERBS`] is what the dispatch edge actually accepts — two independent
-    /// tables. A flag added to the second without the first is accepted-but-undocumented,
-    /// which is precisely the state `--elevate` was in when an audit of this project
-    /// concluded atpkg "structurally requires sudo" and spent three weeks on it.
+    /// HELP AND THE NAME-OPERAND GATE MUST NOT DRIFT. [`VERB_USAGE`] is
+    /// hand-written prose and [`NAME_TAKING_VERBS`] is what the dispatch edge
+    /// accepts where a program name normally sits. A flag added to the second
+    /// without the first is accepted-but-undocumented, precisely the state
+    /// `--elevate` occupied when an audit concluded atpkg required sudo.
     ///
     /// Checks the option NAME, not the whole spelling: `install`'s usage collapses three
     /// values into `--elevate=sudo|osascript|never`, so `--elevate=never` is deliberately
     /// not a substring of it. Naming the option is what makes it discoverable; the values
     /// are the usage line's own business.
     #[test]
-    fn usage_names_every_flag_the_edge_accepts() {
+    fn name_operand_usage_names_every_accepted_flag() {
         for (verb, allowed) in NAME_TAKING_VERBS {
             let Some(usage) = usage_of(verb) else {
                 panic!("{verb} takes flags but has no usage line");
@@ -8935,6 +9045,30 @@ mod tests {
         }
     }
 
+    /// The two visible option parsers outside the name-operand gate also name
+    /// every accepted flag in their per-verb help. `--progress-file` is omitted
+    /// deliberately: the GUI strips that hidden machine channel before verb
+    /// dispatch, and it is not a user-facing CLI option.
+    #[test]
+    fn remaining_visible_option_usage_names_every_accepted_flag() {
+        for (verb, flags) in [
+            ("list", &["--porcelain"][..]),
+            ("relocate", &["--sign", "--advisory"][..]),
+        ] {
+            let usage = usage_of(verb).expect("visible option parser has usage");
+            for flag in flags {
+                assert!(
+                    usage.contains(flag),
+                    "`atpkg {verb}` accepts {flag} but its usage omits it:\n  {usage}"
+                );
+            }
+        }
+    }
+
+    /// Every dispatchable verb must be able to say what it accepts. The audit
+    /// that prompted this found 35 of 55 CLI verbs unable to answer that basic
+    /// question; a new verb must not be able to land in the same state.
+    #[test]
     fn every_verb_has_a_usage_line() {
         for verb in VERBS {
             assert!(
@@ -8971,6 +9105,11 @@ mod tests {
         }
     }
 
+    /// THE single-writer verb roster ([`crate::lock`]): every verb that mutates
+    /// the store (stage/activate/discard, shims, links, pins, gc) takes the
+    /// store-wide lock at the dispatch edge; every read-only verb stays
+    /// lock-free. Exhaustive over the dispatch table so a new verb must be
+    /// classified deliberately.
     #[test]
     fn store_lock_verb_roster_is_exact() {
         // EXHAUSTIVE over VERBS: a verb added to the dispatch without a place in

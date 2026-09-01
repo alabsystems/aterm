@@ -153,6 +153,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
     let nonce = LaunchNonce::generate();
     let ctx = Arc::new(SessionCtx {
         sink: Arc::new(SinkWriter::new(-1)),
+        output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         edges: Mutex::new(EdgeTable::new()),
         turn_lease: Mutex::new(None),
         self_id: sid.clone(),
@@ -214,14 +215,7 @@ pub fn run_redraw_conformance() -> i32 {
         registry.register(handle.clone());
         registry.register(registered_session(SIBLING_SID, &sibling_term));
     }
-    let host = GuiHost::with_fleet(
-        SID,
-        &term,
-        Some(&proxy),
-        &subscribers,
-        &store,
-        &handle.ctx.sink,
-    );
+    let host = GuiHost::with_fleet(SID, &term, Some(&proxy), &subscribers, &store, &handle.ctx);
 
     let caps = host.capabilities();
     println!(

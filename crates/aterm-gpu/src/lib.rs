@@ -12,6 +12,25 @@
 // This file currently lands the device + offscreen readback foundation; glyph
 // rendering builds on top.
 
+// THE FLIP: the wgpu-free macOS production configuration leaves the
+// oracle-SHARED spellings formally dead or single-armed — the neutral device
+// layer's two-variant seams collapse to their Metal arm (making the `else`
+// refusals irrefutable), and the wgpu-arm-only helpers keep compiling for the
+// oracle without a production caller. The ORACLE configuration — the one
+// `targo-tippy --all-targets -- -D warnings` lints, because every test/bench
+// target activates `wgpu-oracle` — compiles BOTH arms and keeps all four
+// lints sharp; the suppression below applies to the production configuration
+// alone, so the shared spellings need no fork.
+#![cfg_attr(
+    not(wgpu_arm),
+    allow(
+        dead_code,
+        unused_variables,
+        unreachable_patterns,
+        irrefutable_let_patterns
+    )
+)]
+
 use aterm_render::Frame;
 
 mod device_layer;
@@ -228,7 +247,13 @@ pub fn dx12_visual_swapchain_active() -> bool {
 /// application-present path (`GpuRenderer::create_window_surface`) blits the
 /// offscreen frame straight into a swapchain instead of reading it back to CPU.
 pub struct GpuContext {
+    /// THE FLIP: the wgpu device/queue exist only where the wgpu arm compiles
+    /// — every non-mac cell, plus mac oracle (test) builds. The production
+    /// macOS context is Metal-only: the armed renderer mints its own device
+    /// (`MetalArmLive`), and this struct carries just the neutral facts.
+    #[cfg(wgpu_arm)]
     pub device: wgpu::Device,
+    #[cfg(wgpu_arm)]
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: String,
@@ -242,7 +267,9 @@ pub struct GpuContext {
     pub(crate) srgb_offscreen: bool,
     /// Kept alive so window surfaces can be created from this instance, and so
     /// `surface.get_capabilities(&adapter)` can be queried at surface setup.
+    #[cfg(wgpu_arm)]
     pub(crate) instance: wgpu::Instance,
+    #[cfg(wgpu_arm)]
     pub(crate) adapter: wgpu::Adapter,
     /// Set once by wgpu's device-lost callback (registered at device creation) when
     /// the underlying GPU device is removed — a Windows NVIDIA/AMD driver
@@ -277,8 +304,13 @@ pub struct GpuContext {
     pub(crate) visual_swapchain: bool,
 }
 
-/// Row alignment required by `copy_texture_to_buffer`.
-const ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+/// Row alignment required by `copy_texture_to_buffer` — and, post-flip, BY
+/// THE FRAME BYTE CONTRACT ITSELF: the Metal readback arm reproduces this
+/// stride on builds that carry no wgpu, so the literal is the law and the
+/// gated assert below pins it to wgpu's constant wherever the oracle compiles.
+const ALIGN: usize = 256;
+#[cfg(wgpu_arm)]
+const _: () = assert!(ALIGN == wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
 
 /// THE READBACK ROW-PADDING CONTRACT (W4): wgpu requires
 /// `copy_texture_to_buffer` strides to be multiples of 256
@@ -323,6 +355,7 @@ pub(crate) fn frame_from_padded_rgba(bytes: &[u8], w: usize, h: usize, padded: u
 /// Map an `ATERM_GPU_BACKEND` value to a wgpu backend mask.
 /// `None` = unrecognized (caller warns and keeps the default).
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(wgpu_arm)]
 fn parse_gpu_backend(v: &str) -> Option<wgpu::Backends> {
     match v.to_ascii_lowercase().as_str() {
         "dx12" => Some(wgpu::Backends::DX12),
@@ -335,6 +368,7 @@ fn parse_gpu_backend(v: &str) -> Option<wgpu::Backends> {
 
 /// Map an `ATERM_GPU_POWER` value to a power preference.
 /// `None` = unrecognized (caller warns and keeps the `LowPower` default).
+#[cfg(wgpu_arm)]
 fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
     match v.to_ascii_lowercase().as_str() {
         "low" => Some(wgpu::PowerPreference::LowPower),
@@ -362,6 +396,7 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
 ///   floor is half of it). Defaults to 16 MiB. See [`terminal_memory_hints`] for
 ///   what the wgpu `Performance` default costs and why this exists.
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(wgpu_arm)]
 fn backends_from_env() -> wgpu::Backends {
     // Default backend: DX12 on Windows, `PRIMARY` elsewhere. DX12 is the native
     // Windows GPU API + the ONLY backend wired for the HDR/scRGB EDR present
@@ -384,33 +419,52 @@ fn backends_from_env() -> wgpu::Backends {
     }
 }
 
-/// W6a — THE DARK-LAUNCH SWITCH for the first-party Metal renderer arm:
-/// `ATERM_METAL=1` (exactly `1`) selects the Metal device/encoder/present
-/// path inside `GpuRenderer` on macOS. Read ONCE at backend init (the first
-/// call latches, like every other `ATERM_GPU_*` knob is read at construct
-/// time) — flipping the variable mid-process changes nothing.
+/// THE FLIP (map §5 W6, delivered): the first-party Metal renderer is the
+/// macOS backend — unconditionally. `ATERM_METAL` was the W6a dark-launch
+/// switch; it is RETIRED, not inverted, and there is deliberately NO
+/// `ATERM_WGPU=1` escape hatch. Why removal outright rather than one
+/// release of hatch (the Close report's confidence, recorded here so the
+/// decision is auditable):
 ///
-/// The wgpu path stays the DEFAULT: with the variable unset the built
-/// renderer is byte-identical to the pre-W6a build. This switch exists so
-/// the Metal arm can be driven on a real window (probe instances, the W6
-/// drills) before the flip; it is slated for REMOVAL at W6b, when Metal
-/// becomes the macOS default and the escape hatch inverts (map §5 W6).
+/// - The same release removes wgpu from the macOS normal dependency graph
+///   (`aterm-gpu` was the cell's ONLY edge into it). A compiled-in wgpu
+///   fallback would keep the entire dom(wgpu) hostage — 37 packages /
+///   635,044 lines — in the shipped closure, which is the exact prize the
+///   flip collects; a hatch and the graph retirement cannot coexist.
+/// - The armed arm's evidence is not a projection: 8 armed differentials
+///   byte-identical against wgpu on the full-frame AND present paths, the
+///   paint matrix row-for-row green on the armed arm (N>=5, deterministic
+///   rows), the injected-loss drill end-to-end, live on-glass fingerprints
+///   byte-identical cross-process, and the W6a acquire-tail regression
+///   measured GONE (armed p99 0.02 ms vs wgpu 0.03 ms).
+/// - A macOS box where Metal genuinely fails to init lands on the SAME
+///   floor device loss always landed on: the softbuffer CPU present path,
+///   which stays shipped. The hatch would duplicate an existing safety
+///   arm, not add one.
+///
+/// Setting `ATERM_METAL` still works for scripts that armed the dark
+/// launch (`=1` selects what is now the default); any OTHER value gets a
+/// one-time note that the switch is retired, then the default proceeds.
+/// The variable is read once and latched, like every `ATERM_GPU_*` knob.
 #[cfg(target_os = "macos")]
 pub fn metal_backend_selected() -> bool {
     static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SELECTED.get_or_init(|| metal_selected_from(std::env::var("ATERM_METAL").ok().as_deref()))
-}
-
-/// The pure decision behind [`metal_backend_selected`]: exactly the string
-/// `"1"` arms the dark launch. NOT a truthy parse — `true`/`yes`/`2` stay
-/// off, so a typo cannot half-arm a renderer swap the way a lenient parse
-/// would; the flag is a switch, not a tuning knob.
-#[cfg(target_os = "macos")]
-fn metal_selected_from(v: Option<&str>) -> bool {
-    v == Some("1")
+    *SELECTED.get_or_init(|| {
+        if let Ok(v) = std::env::var("ATERM_METAL")
+            && v != "1"
+        {
+            eprintln!(
+                "aterm-gpu: ATERM_METAL={v:?} ignored — the dark-launch switch is \
+                 retired and Metal is the macOS renderer (the wgpu arm left the \
+                 macOS build; on init failure the CPU present path is the floor)"
+            );
+        }
+        true
+    })
 }
 
 /// `ATERM_GPU_POWER` (see [`backends_from_env`] for the env-var table).
+#[cfg(wgpu_arm)]
 fn power_preference_from_env() -> wgpu::PowerPreference {
     match std::env::var("ATERM_GPU_POWER") {
         Ok(v) if !v.is_empty() => parse_gpu_power(&v).unwrap_or_else(|| {
@@ -445,6 +499,7 @@ const MEMBLOCK_CEILING_MIB: u64 = 128;
 
 /// Parse `ATERM_GPU_MEMBLOCK` (see [`terminal_memory_hints`]).
 /// `None` = unrecognized (caller warns and keeps the default).
+#[cfg(wgpu_arm)]
 fn parse_memblock(v: &str) -> Option<wgpu::MemoryHints> {
     match v.to_ascii_lowercase().as_str() {
         "performance" => Some(wgpu::MemoryHints::Performance),
@@ -468,6 +523,7 @@ fn parse_memblock(v: &str) -> Option<wgpu::MemoryHints> {
 /// ones, so `(16, 128)` MiB device means `(8, 64)` MiB host — a 24 MiB floor
 /// across the two memory types a terminal touches first, against the 192 MiB
 /// (128 device + 64 host) that [`wgpu::MemoryHints::Performance`] floors at.
+#[cfg(wgpu_arm)]
 fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
     const MIB: u64 = 1024 * 1024;
     wgpu::MemoryHints::Manual {
@@ -476,6 +532,7 @@ fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
 }
 
 /// The shipped block sizing, before the env override.
+#[cfg(wgpu_arm)]
 fn terminal_memory_hints_default() -> wgpu::MemoryHints {
     memblock_hints(MEMBLOCK_FLOOR_MIB, MEMBLOCK_CEILING_MIB)
 }
@@ -518,6 +575,7 @@ fn terminal_memory_hints_default() -> wgpu::MemoryHints {
 /// same spirit as `ATERM_GPU_BACKEND` — see [`backends_from_env`] for the env-var
 /// table.
 #[must_use]
+#[cfg(wgpu_arm)]
 pub fn terminal_memory_hints() -> wgpu::MemoryHints {
     match std::env::var("ATERM_GPU_MEMBLOCK") {
         Ok(v) if !v.is_empty() => parse_memblock(&v).unwrap_or_else(|| {
@@ -534,7 +592,7 @@ pub fn terminal_memory_hints() -> wgpu::MemoryHints {
 /// `ATERM_GPU_ADAPTER` (see [`backends_from_env`] for the env-var table).
 /// Adapter enumeration is a native-only wgpu API; the wasm build has exactly one
 /// adapter anyway, so the override is a no-op there.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
 async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     let want = std::env::var("ATERM_GPU_ADAPTER")
         .ok()
@@ -554,12 +612,39 @@ async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
 }
 
 // Adapter enumeration is native-only; the wasm build has exactly one adapter.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(wgpu_arm, target_arch = "wasm32"))]
 async fn adapter_from_env(_instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     None
 }
 
 impl GpuContext {
+    /// THE FLIP — the PRODUCTION macOS constructor: no wgpu in this build, so
+    /// there is no adapter negotiation and nothing to block on. The context
+    /// carries the neutral facts (device name via the Metal FFI, the loss
+    /// domain wired at construct exactly as the armed init always did) and the
+    /// armed renderer mints its own device/queue lazily on the render thread
+    /// (`MetalArmLive::new`). `srgb_offscreen` is TRUE: Metal supports
+    /// sRGB-typed texture views of Unorm storage unconditionally
+    /// (`newTextureViewWithPixelFormat:` — the armed arm's PIXEL_FORMAT_VIEW
+    /// pairs), which is the same answer the wgpu Metal backend reported here.
+    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+    pub fn new() -> Result<Self, String> {
+        let adapter_name = metal::ffi::Device::system_default()
+            .map(|d| d.name())
+            .ok_or("no Metal device on this machine")?;
+        let ctx = Self {
+            adapter_name,
+            backend: "Metal".to_owned(),
+            srgb_offscreen: true,
+            device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metal_loss: std::sync::OnceLock::new(),
+            visual_swapchain: false,
+        };
+        let wired = ctx.wire_metal_loss_latch(std::sync::Arc::new(metal::loss::LossLatch::new()));
+        debug_assert!(wired, "a fresh context's loss-latch cell is empty");
+        Ok(ctx)
+    }
+
     /// Acquire a GPU. Works headless (no window/surface needed) — picks the
     /// default low-power adapter (Metal on macOS), subject to the
     /// `ATERM_GPU_*` env overrides (see [`backends_from_env`]).
@@ -572,7 +657,7 @@ impl GpuContext {
     /// forbidden). The wasm WebGPU path awaits the adapter/device futures
     /// instead — see [`GpuContext::request`] — so this synchronous constructor
     /// is excluded from the wasm32 build.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
     pub fn new() -> Result<Self, String> {
         // This instance must OUTLIVE device creation: it is kept on `GpuContext`
         // so a window surface can be created from it for the application-present
@@ -638,6 +723,7 @@ impl GpuContext {
     /// surface-independent. The WebGL backend instead needs the canvas surface as
     /// the adapter's compatibility target; see
     /// [`from_instance_with_surface`](Self::from_instance_with_surface).
+    #[cfg(wgpu_arm)]
     pub async fn from_instance(instance: wgpu::Instance) -> Result<Self, String> {
         Self::from_instance_with_surface(instance, None).await
     }
@@ -649,6 +735,7 @@ impl GpuContext {
     /// lives ON the `<canvas>`. So the wasm WebGL init creates the canvas surface
     /// first and passes it here; native (Metal/Vulkan) passes `None`, leaving the
     /// adapter/device descriptors byte-identical to the prior behavior.
+    #[cfg(wgpu_arm)]
     pub async fn from_instance_with_surface(
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
@@ -808,6 +895,7 @@ impl GpuContext {
     /// extent and abort. Upper bound mirrors `Renderer::create_atlas_texture`'s
     /// own-site `.min(max_tex_dim)`.
     #[inline]
+    #[cfg(wgpu_arm)]
     fn clamp_tex_dim(&self, d: u32) -> u32 {
         d.max(1).min(self.device.limits().max_texture_dimension_2d)
     }
@@ -816,6 +904,7 @@ impl GpuContext {
     /// routed construction site does its resource work through. Always the
     /// Wgpu variant here: the Metal arm is minted by the differential tests
     /// (and by W6's flip) from `metal::resources::MetalResourceDevice`.
+    #[cfg(wgpu_arm)]
     pub(crate) fn device_layer(&self) -> crate::device_layer::DeviceHandle<'_> {
         crate::device_layer::DeviceHandle::Wgpu {
             device: &self.device,
@@ -830,6 +919,7 @@ impl GpuContext {
     /// app-owned boundary. The platform compositor and scanout are unobserved.
     /// The parity tests (which build the atlas on the CPU, not this texture) are
     /// unaffected.
+    #[cfg(wgpu_arm)]
     pub fn offscreen_texture(&self, width: u32, height: u32) -> wgpu::Texture {
         // Defensive floor at this `create_texture` choke point: clamp to the device's
         // max 2D texture dimension (mirrors `Renderer::create_atlas_texture`). Without
@@ -880,6 +970,7 @@ impl GpuContext {
     /// and every pipeline target cannot drift apart (the C1/C2 bug class). Every
     /// render pipeline whose pass attaches `off.view` (additive glow/deco-add, bloom
     /// composite + extract, tray, test/readback blit) MUST build with this.
+    #[cfg(wgpu_arm)]
     pub(crate) fn offscreen_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_format(self.srgb_offscreen)
     }
@@ -887,6 +978,7 @@ impl GpuContext {
     /// The sRGB-typed VIEW format attached by the base OVER/REPLACE + cursor +
     /// deco-over passes (linear-light blend). Pipelines whose pass attaches
     /// `off.view_srgb` build with this. See [`crate::format_plan`].
+    #[cfg(wgpu_arm)]
     pub(crate) fn offscreen_srgb_view_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_srgb_view_format(self.srgb_offscreen)
     }
@@ -896,6 +988,7 @@ impl GpuContext {
     /// site never chooses between them by hand — the pipeline's own
     /// [`crate::pipeline_table::TargetRole`] does. Sites that also target the
     /// swapchain add it with `with_present`.
+    #[cfg(wgpu_arm)]
     pub(crate) fn pipeline_targets(&self) -> crate::pipeline_table::TargetFormats {
         crate::pipeline_table::TargetFormats {
             offscreen_srgb: self.offscreen_srgb_view_format(),
@@ -916,6 +1009,7 @@ impl GpuContext {
     /// instead of panicking for historical renderer-oracle/probe callers. Durable
     /// artifact APIs must call the fallible path and report capture failure rather
     /// than publishing this best-effort sentinel as real pixels.
+    #[cfg(wgpu_arm)]
     pub fn read_back(&self, texture: &wgpu::Texture, width: u32, height: u32) -> Frame {
         self.try_read_back(texture, width, height)
             .unwrap_or_else(|e| {
@@ -931,6 +1025,7 @@ impl GpuContext {
 
     /// Fallible core of [`Self::read_back`]: propagates buffer-map / device-poll
     /// failure (device loss) as `Err` instead of panicking.
+    #[cfg(wgpu_arm)]
     pub fn try_read_back(
         &self,
         texture: &wgpu::Texture,
@@ -1008,6 +1103,7 @@ impl GpuContext {
 
     /// Phase-1 proof of life: clear an offscreen target to a colour and read it
     /// back. Confirms the GPU pipeline + readback work on this machine.
+    #[cfg(wgpu_arm)]
     pub fn clear_to_frame(&self, width: u32, height: u32, rgb: u32) -> Frame {
         // Clamp ONCE up front so BOTH the offscreen texture AND the `read_back` copy
         // extent below use the same bounded dims. `offscreen_texture` clamps the
@@ -1066,19 +1162,15 @@ mod env_override_tests {
         assert_eq!(parse_gpu_backend(""), None);
     }
 
-    /// W6a: the dark-launch switch is exactly `ATERM_METAL=1` — not a truthy
-    /// parse (see `metal_selected_from`). The OnceLock wrapper is one latch
-    /// over this pure decision, so the decision is what gets pinned.
+    /// THE FLIP: selection is unconditional on macOS — no environment value
+    /// (including the retired `ATERM_METAL=0`) can turn the wgpu arm back
+    /// on, because the wgpu arm is no longer in the macOS production build.
+    /// This pin exists so a future "just add the hatch back" edit has to
+    /// delete a stated decision, not merely flip a boolean.
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_dark_launch_arms_on_exactly_one() {
-        assert!(metal_selected_from(Some("1")));
-        assert!(!metal_selected_from(Some("0")));
-        assert!(!metal_selected_from(Some("true")));
-        assert!(!metal_selected_from(Some("yes")));
-        assert!(!metal_selected_from(Some("2")));
-        assert!(!metal_selected_from(Some("")));
-        assert!(!metal_selected_from(None));
+    fn metal_selection_is_unconditional_post_flip() {
+        assert!(metal_backend_selected());
     }
 
     #[test]

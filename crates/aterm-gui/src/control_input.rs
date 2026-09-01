@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
 use aterm_core::terminal::Terminal;
 use aterm_session::Op;
-use aterm_session::sink::SinkWriter;
 use winit::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
@@ -85,12 +84,6 @@ pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
     } else {
         rest.as_bytes().to_vec()
     }
-}
-
-pub(crate) fn cmd_send(sink: &SinkWriter, rest: &str) -> String {
-    let bytes = send_bytes(rest);
-    write_pty(sink, &bytes);
-    "OK\n".to_string()
 }
 
 /// Parse the optional trailing `mods=<list>` token (e.g. `mods=ctrl+shift`),
@@ -555,16 +548,6 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
         i += 2;
     }
     Ok(bytes)
-}
-
-pub(crate) fn cmd_feed(sink: &SinkWriter, rest: &str) -> String {
-    let bytes = match feed_bytes(rest) {
-        Ok(bytes) => bytes,
-        Err(error) => return error.to_string(),
-    };
-    let n = bytes.len();
-    write_pty(sink, &bytes);
-    format!("OK {n} bytes\n")
 }
 
 /// `signal <name>` -> deliver a job-control signal to the PTY's CURRENT
@@ -1145,13 +1128,18 @@ pub(crate) fn find_status_line(status: &crate::app_search::FindStatus) -> String
         .map_or_else(|| "-".to_string(), |i| (i + 1).to_string());
     format!(
         "OK open=1 query={} case={} regex={} regex_error={} matches={} current={current} \
-         row={row} col={col} len={len} truncated={}\n",
+         row={row} col={col} len={len} truncated={} stale={}\n",
         super::pct_encode(&status.query),
         bit(status.case_sensitive),
         bit(status.is_regex),
         bit(status.regex_error),
         status.matches,
         bit(status.truncated),
+        // The same `…` the bar paints: the terminal moved since `matches` was
+        // counted. A driver that reads the pair without it is reading a census
+        // of a screen that no longer exists — and the count is the one thing
+        // this verb exists to report, so it must never be stated unqualified.
+        bit(status.stale),
     )
 }
 
@@ -1347,23 +1335,6 @@ pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> 
     Some(Ok(InputEvent::ResizeWindowPx { width, height }))
 }
 
-/// Funnel all control-verb bytes through the active session's single SinkWriter
-/// (whole-frame atomicity vs the GUI keyboard path + reader-thread replies). Drops
-/// a closed-peer error like the legacy writer did. Used ONLY by the audited raw
-/// hatch (`send`/`feed`); the human-vocabulary verbs go through the seam instead.
-pub(crate) fn write_pty(sink: &SinkWriter, data: &[u8]) {
-    // Control-driven input measures the same input→present slice a keystroke
-    // does, so a driven smoke can assert on typing latency.
-    crate::metrics::note_input();
-    // This write NEVER passes the App input seam, so an in-flight
-    // `video ... keys` recording structurally cannot log it. Count the attempts
-    // it carries: the recording reports the total as `unlogged_inputs`, which is
-    // what stops an empty ledger from being indistinguishable from a quiet
-    // screen.
-    crate::note_unseamed_control_bytes(data);
-    let _ = sink.write_frame(data);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,7 +1394,7 @@ mod tests {
         assert_eq!(
             line,
             "OK open=1 query=needle case=0 regex=0 regex_error=0 matches=0 current=- \
-             row=- col=- len=- truncated=0\n"
+             row=- col=- len=- truncated=0 stale=0\n"
         );
         // A match present is reported as itself, 1-based like the find bar's own
         // "3 of 7" — so the pin above is about ABSENCE, not about a dead formatter.
@@ -1443,6 +1414,41 @@ mod tests {
         assert!(
             line.contains("matches=7 current=3 row=-4 col=11 len=6"),
             "{line}"
+        );
+    }
+
+    /// A count the terminal has moved past reaches the wire QUALIFIED, exactly as
+    /// it reaches the glass. The pair is still reported — it is the last real
+    /// census and a driver may want it — but never as the present one.
+    #[test]
+    fn a_find_reply_marks_a_count_the_terminal_has_already_moved_past() {
+        let counted = crate::app_search::FindStatus {
+            open: true,
+            query: "needle".to_string(),
+            matches: 3,
+            current: Some(0),
+            current_match: Some((1, 0, 5)),
+            ..crate::app_search::FindStatus::CLOSED
+        };
+        assert!(
+            find_status_line(&counted).contains("matches=3 current=1")
+                && find_status_line(&counted).contains("stale=0"),
+            "a fresh count is stated plainly: {}",
+            find_status_line(&counted)
+        );
+
+        let moved = crate::app_search::FindStatus {
+            stale: true,
+            ..counted
+        };
+        let line = find_status_line(&moved);
+        assert!(
+            line.contains("matches=3 current=1"),
+            "the last real census is still reported: {line}"
+        );
+        assert!(
+            line.contains("stale=1"),
+            "…and is marked as older than the screen: {line}"
         );
     }
 
@@ -1596,10 +1602,9 @@ mod video_keys_ledger_tests {
     //! verb and the ledger is the single `control.rs` dispatch arm, which the
     //! on-glass recording in this change's report exercises end to end.
 
-    use super::{feed_bytes, parse_key, send_bytes, write_pty};
+    use super::{feed_bytes, parse_key, send_bytes};
     use crate::input::InputEvent;
     use crate::{VideoInputSample, record_controller_video_attempts, video_sample_for_key};
-    use aterm_session::sink::SinkWriter;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
     /// `video … keys` claims to log "socket input driven through the ACTIVE-TAB
@@ -1725,48 +1730,6 @@ mod video_keys_ledger_tests {
             VideoInputSample::Char('"').json_field(),
             "\"ch\":\"\\\"\"",
             "a typed quote cannot break the index"
-        );
-    }
-
-    /// The genuinely-unloggable path must be COUNTED, not silently ignored:
-    /// `write_pty` is the control-thread egress `cmd_send`/`cmd_feed` take for a
-    /// BACKGROUND target, and it never reaches the App input seam the ledger
-    /// hooks. A recording can only stay honest by reporting how many of them
-    /// happened during the take.
-    ///
-    /// The assertion is `>=` deliberately: the counter is process-wide and other
-    /// tests in this binary drive the same verbs concurrently, so they can only
-    /// ADD. Neutering the `note_unseamed_control_bytes()` call site makes this
-    /// delta 0 and the test fails.
-    ///
-    /// The unit is the LEDGER's unit — one per attempt that would have become an
-    /// `inputs[]` row — so `write_pty(b"abc")` counts THREE, matching what the
-    /// same three bytes would have logged had they been front-routed. A reader
-    /// comparing `inputs_logged` with `unlogged_inputs` is comparing like with
-    /// like.
-    #[test]
-    fn control_thread_input_egress_is_counted_for_the_video_ledger() {
-        let sink = SinkWriter::new(-1);
-        let before = crate::unseamed_control_inputs();
-        const DRIVES: u64 = 12;
-        for _ in 0..DRIVES {
-            write_pty(&sink, b"x");
-        }
-        let after = crate::unseamed_control_inputs();
-        assert!(
-            after.saturating_sub(before) >= DRIVES,
-            "{DRIVES} control-thread egresses must be countable; saw {} \
-             (an uncounted bypass is exactly the silent zero this instrument must not produce)",
-            after.saturating_sub(before)
-        );
-
-        // Per-ATTEMPT, not per-call: `send hey` at a background target is three
-        // attempts the ledger did not get, and must be reported as three.
-        let before = crate::unseamed_control_inputs();
-        write_pty(&sink, &send_bytes("hey"));
-        assert!(
-            crate::unseamed_control_inputs().saturating_sub(before) >= 3,
-            "a 3-byte background `send` is 3 unlogged attempts, not 1"
         );
     }
 

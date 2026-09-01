@@ -129,6 +129,18 @@ pub struct GlowQuad {
     pub alpha: u8,
 }
 
+impl GlowQuad {
+    /// Canonical lossless words used by cursor-effect fingerprints.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn damage_words(self) -> [u64; 2] {
+        [
+            pack_u16x4(self.row, self.x, self.y, self.w),
+            self.h as u64 | (self.color as u64) << 16 | (self.alpha as u64) << 48,
+        ]
+    }
+}
+
 /// Which compositing mode a [`GlowQuad`] emitter stamps on the quads it
 /// produces — the NAME of the [`GlowQuad::alpha`] convention, so a rasterizer
 /// shared by an additive stream and a source-over one says which it is being
@@ -219,6 +231,23 @@ pub struct RainHalo {
     pub mode: HaloMode,
 }
 
+impl RainHalo {
+    /// Canonical lossless words used by cursor-effect fingerprints.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn damage_words(self) -> [u64; 3] {
+        let mode = match self.mode {
+            HaloMode::Add => 0,
+            HaloMode::Over => 1,
+        };
+        [
+            pack_u16x4(self.row, self.x, self.y, self.w),
+            self.h as u64 | (self.color as u64) << 16 | (self.cx as u64) << 48,
+            pack_u16x4(self.cy, self.rx, self.ry, mode),
+        ]
+    }
+}
+
 /// How a [`FirePatch`]'s per-pixel field output composites onto the frame.
 ///
 /// [`Add`](FireMode::Add) is the dark-theme flame: the field emits
@@ -303,6 +332,31 @@ pub struct FirePatch {
     /// How the field output composites (defaults to the dark-theme
     /// [`FireMode::Add`]; [`FireMode::Over`] is the light-theme ink-fire).
     pub mode: FireMode,
+}
+
+impl FirePatch {
+    /// Canonical lossless words used by cursor-effect fingerprints.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn damage_words(self) -> [u64; 4] {
+        let mode = match self.mode {
+            FireMode::Add => 0,
+            FireMode::Over => 1,
+        };
+        [
+            pack_u16x4(self.row, self.x, self.y, self.w),
+            self.h as u64
+                | (self.base_y as u64) << 16
+                | (self.peak_h as u64) << 32
+                | (self.temp as u64) << 48
+                | (self.strength as u64) << 56,
+            self.phase as u64
+                | (self.lean.cast_unsigned() as u64) << 32
+                | (self.cov_cap as u64) << 40
+                | (self.cell_h as u64) << 48,
+            0x6669_7265_0000_0000 | mode,
+        ]
+    }
 }
 
 /// Compact, producer-built damage identity for a window-absolute cursor-effect
@@ -438,48 +492,25 @@ impl EffectStreamFingerprint {
 }
 
 #[inline]
-fn pack_u16x4(a: u16, b: u16, c: u16, d: u16) -> u64 {
-    u64::from(a) | (u64::from(b) << 16) | (u64::from(c) << 32) | (u64::from(d) << 48)
+const fn pack_u16x4(a: u16, b: u16, c: u16, d: u16) -> u64 {
+    a as u64 | (b as u64) << 16 | (c as u64) << 32 | (d as u64) << 48
 }
 
 fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
-    hasher.write_pair(
-        pack_u16x4(quad.row, quad.x, quad.y, quad.w),
-        u64::from(quad.h) | (u64::from(quad.color) << 16) | (u64::from(quad.alpha) << 48),
-    );
+    let [first, second] = quad.damage_words();
+    hasher.write_pair(first, second);
 }
 
 fn hash_rain_halo(halo: &RainHalo, hasher: &mut EffectStreamFingerprint) {
-    let mode = match halo.mode {
-        HaloMode::Add => 0,
-        HaloMode::Over => 1,
-    };
-    hasher.write_pair(
-        pack_u16x4(halo.row, halo.x, halo.y, halo.w),
-        u64::from(halo.h) | (u64::from(halo.color) << 16) | (u64::from(halo.cx) << 48),
-    );
-    hasher.write_pair(
-        pack_u16x4(halo.cy, halo.rx, halo.ry, mode),
-        0x7261_696e_6861_6c6f,
-    );
+    let [first, second, third] = halo.damage_words();
+    hasher.write_pair(first, second);
+    hasher.write_pair(third, 0);
 }
 
 fn hash_fire_patch(patch: &FirePatch, hasher: &mut EffectStreamFingerprint) {
-    let mode = match patch.mode {
-        FireMode::Add => 0,
-        FireMode::Over => 1,
-    };
-    let envelope = u64::from(patch.h)
-        | (u64::from(patch.base_y) << 16)
-        | (u64::from(patch.peak_h) << 32)
-        | (u64::from(patch.temp) << 48)
-        | (u64::from(patch.strength) << 56);
-    let field = u64::from(patch.phase)
-        | (u64::from(patch.lean.to_ne_bytes()[0]) << 32)
-        | (u64::from(patch.cov_cap) << 40)
-        | (u64::from(patch.cell_h) << 48);
-    hasher.write_pair(pack_u16x4(patch.row, patch.x, patch.y, patch.w), envelope);
-    hasher.write_pair(field, 0x6669_7265_0000_0000 | mode);
+    let [first, second, third, fourth] = patch.damage_words();
+    hasher.write_pair(first, second);
+    hasher.write_pair(third, fourth);
 }
 
 /// One textured sprite quad for a renderer-owned animated overlay. A `SpriteQuad` is a rectangle
@@ -1062,7 +1093,8 @@ fn selection_row_span_of(
 ///
 /// `PartialEq`/`Eq` are hand-written and compare only the rendered CONTENT (every
 /// field EXCEPT pure frame metadata such as
-/// [`snapshot_seq`](RenderInput::snapshot_seq) and
+/// [`snapshot_seq`](RenderInput::snapshot_seq),
+/// [`content_seq`](RenderInput::content_seq), and
 /// [`absolute_row_revision`](RenderInput::absolute_row_revision)): the CPU renderer's
 /// damage-tracking fast path compares a fresh `RenderInput` against the one it
 /// cached last frame — overall and per row — to decide which rows changed (and
@@ -1498,6 +1530,10 @@ pub struct RenderInput {
     /// it advances every damaged frame, so counting it would defeat the renderer's
     /// content-based damage cache.
     pub snapshot_seq: u64,
+    /// Content-only arrival clock coherent with this engine-filled snapshot.
+    /// Unlike [`snapshot_seq`](Self::snapshot_seq), damage-only frames cannot
+    /// advance it. Metadata only; excluded from equality.
+    pub content_seq: u64,
     /// Terminal parser batch sequence coherent with this engine-filled
     /// snapshot. Unlike the damage epoch it advances even when another batch
     /// joins an already-pending damage session, so one-shot input evidence can
@@ -1941,6 +1977,7 @@ impl Clone for RenderInput {
             default_fg: self.default_fg,
             cursor_color: self.cursor_color,
             snapshot_seq: self.snapshot_seq,
+            content_seq: self.content_seq,
             process_sequence: self.process_sequence,
             input_hot: self.input_hot,
             terminal_id: self.terminal_id,
@@ -2208,6 +2245,7 @@ impl RenderInput {
         self.default_fg = source.default_fg;
         self.cursor_color = source.cursor_color;
         self.snapshot_seq = source.snapshot_seq;
+        self.content_seq = source.content_seq;
         self.process_sequence = source.process_sequence;
         self.input_hot = source.input_hot;
         self.terminal_id = source.terminal_id;
@@ -2306,6 +2344,7 @@ impl RenderInput {
             default_fg: COLOR_UNSET,
             cursor_color: COLOR_UNSET,
             snapshot_seq: 0,
+            content_seq: 0,
             process_sequence: 0,
             input_hot: false,
             terminal_id: 0,
@@ -4821,11 +4860,78 @@ mod rain_channel_tests {
         );
     }
 
-    /// The producer record must cover every rendered `GlowQuad` field while
-    /// retaining only a row bitmap in the prior-frame cache.  This is a
-    /// deterministic guard for the hot 8k `glow_under` shape: timing belongs
-    /// to the ignored microbenchmark below, while payload coverage and memory
-    /// shape must stay true on every test run.
+    /// The canonical record-word schema covers every renderer-visible field.
+    /// Both producer damage and the cursor scheduler consume these methods, so
+    /// this one exhaustive table prevents either fingerprint from drifting.
+    #[test]
+    fn cursor_effect_damage_words_cover_every_visible_field() {
+        macro_rules! assert_fields_change {
+            ($name:literal, $base:ident, $($field:literal => $changed:expr),+ $(,)?) => {{
+                let base_words = $base.damage_words();
+                $(
+                    assert_ne!(
+                        ($changed).damage_words(),
+                        base_words,
+                        concat!($name, "::", $field)
+                    );
+                )+
+            }};
+        }
+
+        let glow = under_quad(1);
+        assert_fields_change!(
+            "GlowQuad",
+            glow,
+            "row" => GlowQuad { row: 9, ..glow },
+            "x" => GlowQuad { x: 9, ..glow },
+            "y" => GlowQuad { y: 9, ..glow },
+            "w" => GlowQuad { w: 9, ..glow },
+            "h" => GlowQuad { h: 9, ..glow },
+            "color" => GlowQuad { color: 0x65_4321, ..glow },
+            "alpha" => GlowQuad { alpha: 9, ..glow },
+        );
+
+        let rain = rain_halo(1);
+        assert_fields_change!(
+            "RainHalo",
+            rain,
+            "row" => RainHalo { row: 10, ..rain },
+            "x" => RainHalo { x: 10, ..rain },
+            "y" => RainHalo { y: 10, ..rain },
+            "w" => RainHalo { w: 10, ..rain },
+            "h" => RainHalo { h: 10, ..rain },
+            "color" => RainHalo { color: 0x65_4321, ..rain },
+            "cx" => RainHalo { cx: 10, ..rain },
+            "cy" => RainHalo { cy: 10, ..rain },
+            "rx" => RainHalo { rx: 10, ..rain },
+            "ry" => RainHalo { ry: 10, ..rain },
+            "mode" => RainHalo { mode: HaloMode::Over, ..rain },
+        );
+
+        let fire = fire_patch(1);
+        assert_fields_change!(
+            "FirePatch",
+            fire,
+            "row" => FirePatch { row: 14, ..fire },
+            "x" => FirePatch { x: 14, ..fire },
+            "y" => FirePatch { y: 14, ..fire },
+            "w" => FirePatch { w: 14, ..fire },
+            "h" => FirePatch { h: 14, ..fire },
+            "base_y" => FirePatch { base_y: 14, ..fire },
+            "peak_h" => FirePatch { peak_h: 14, ..fire },
+            "phase" => FirePatch { phase: 14, ..fire },
+            "temp" => FirePatch { temp: 14, ..fire },
+            "strength" => FirePatch { strength: 14, ..fire },
+            "lean" => FirePatch { lean: 14, ..fire },
+            "cov_cap" => FirePatch { cov_cap: 14, ..fire },
+            "cell_h" => FirePatch { cell_h: 14, ..fire },
+            "mode" => FirePatch { mode: FireMode::Over, ..fire },
+        );
+    }
+
+    /// The producer retains only a row bitmap for the hot 8k `glow_under`
+    /// shape. Field coverage is pinned cheaply in the canonical-word test
+    /// above; this test owns the large-stream memory and end-to-end control.
     #[test]
     fn damage_record_covers_8k_glow_under_without_retaining_its_payload() {
         const QUADS: usize = 8_191;
@@ -4860,26 +4966,16 @@ mod rain_channel_tests {
             "the compact cache must be smaller than the payload it replaces"
         );
 
-        for mutate in [
-            |quad: &mut GlowQuad| quad.row ^= 1,
-            |quad: &mut GlowQuad| quad.x ^= 1,
-            |quad: &mut GlowQuad| quad.y ^= 1,
-            |quad: &mut GlowQuad| quad.w ^= 1,
-            |quad: &mut GlowQuad| quad.h ^= 1,
-            |quad: &mut GlowQuad| quad.color ^= 1,
-            |quad: &mut GlowQuad| quad.alpha ^= 1,
-        ] {
-            let mut changed = source.clone();
-            mutate(&mut changed.glow_under[QUADS - 1]);
-            changed.refresh_cursor_effect_damage();
-            assert_eq!(
-                source
-                    .glow_under_damage
-                    .same_content(&changed.glow_under_damage),
-                Some(false),
-                "a rendered GlowQuad field was omitted from its damage revision"
-            );
-        }
+        let mut changed = source.clone();
+        changed.glow_under[QUADS - 1].color ^= 1;
+        changed.refresh_cursor_effect_damage();
+        assert_eq!(
+            source
+                .glow_under_damage
+                .same_content(&changed.glow_under_damage),
+            Some(false),
+            "the compact damage revision must detect a payload change"
+        );
     }
 
     /// Manual release-mode yardstick for the producer metadata path and the

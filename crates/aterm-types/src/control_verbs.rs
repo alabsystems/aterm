@@ -364,11 +364,11 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "text [trim]: the visible screen, one row per line",
+        "text [--json] [trim]: the visible screen, one row per line",
         "trim drops the trailing all-blank rows: the header becomes `OK <n> trimmed=<k>` with n = \
          the rows actually sent (interior blanks stay, so row i is still screen row i); `--json` \
          adds \"trimmed\":k and keeps dims.rows = the grid. Off by default (scripts count rows). \
-         Any other argument is `ERR usage: text [trim]` — nothing is silently ignored",
+         Any other argument is `ERR usage: text [--json] [trim]` — nothing is silently ignored",
     ),
     v(
         "screen",
@@ -480,12 +480,16 @@ pub const VERBS: &[VerbSpec] = &[
          `find accept` = ⏎ (exit, stay on the match), `find cancel` = ⎋ (exit, restore the \
          pre-find viewport); `find status` mutates nothing. Every form answers the SAME line: `OK \
          open=0` when no find bar is up, else `OK open=1 query=<pct> case= regex= regex_error= \
-         matches=<n> current=<i> row= col= len= truncated=`. row/col/len are the CURRENT match in \
+         matches=<n> current=<i> row= col= len= truncated= stale=`. row/col/len are the CURRENT \
+         match in \
          `search` coordinates (negative row = scrollback) and are `-` when there is no match — \
          never a position that does not exist. current/matches are the 1-based `i/n` the find bar \
          itself paints, so the wire and the glass always agree; `truncated=1` means the search \
          index capped the batch, so that pair counts within the cap rather than over the whole \
-         history. A form that types or steps while the bar is CLOSED changes nothing and answers \
+         history, and `stale=1` means the terminal has CHANGED since that pair was counted (the \
+         find bar paints the same fact as a trailing `…`): output is not re-searched per PTY \
+         batch, so the count is a past census and can be wrong in either direction until the next \
+         edit or `find next`/`find prev`. A form that types or steps while the bar is CLOSED changes nothing and answers \
          `open=0`; it can never fall through to the PTY. FRONT window of the resolved instance, \
          like `hover`",
     ),
@@ -775,8 +779,8 @@ pub const VERBS: &[VerbSpec] = &[
          same key. <epoch> is this session's launch nonce (the roster's nonce=); <producer> is any \
          u64 stable per driver; <seq> is that driver's own monotone sequence. A sequence at or \
          below the producer's high-water writes NOTHING and answers the duplicate marker IN THE \
-         VERB'S OWN FRAMING — `OK dup=1` for a `Status`-framed verb (`send`, `key`), `OK 0 dup=1` \
-         for a `Lines`/`Bytes` one (`turn`, `feed-bin`), because a bare `OK dup=1` would make a \
+         VERB'S OWN FRAMING — `OK dup=1` for a `Status`-framed verb (`send`, `key`, `feed-bin`), \
+         `OK 0 dup=1` for a `Lines`/`Bytes` one (`turn`), because a bare `OK dup=1` would make a \
          Lines client read `dup=1` as a row count — so a driver that crashed without seeing its \
          reply can retry safely. A retry of a sequence whose attempt \
          did NOT answer OK gets `ERR in-doubt seq=<n>` — it may have typed, so it is reported, \
@@ -1338,7 +1342,7 @@ pub const VERBS: &[VerbSpec] = &[
          in-session client already holds, so a halt an injected agent could lift locally would be \
          no halt at all. While on, every PTY-reaching verb resolving to that session answers `ERR \
          halted <reason>` from ANY scope — `send key ctrl feed feed-bin paste paste-bin mouse \
-         resize focus signal turn close invoke tab operator-propose-bin` — a TRANSIENT class \
+         resize focus signal turn close invoke hwkey pane tab operator-propose-bin` — a TRANSIENT class \
          beside `ERR busy`, so existing back-off code already does the right thing. `focus` is in \
          that set because it writes the DEC 1004 focus reports to the PTY; `invoke` is, because \
          `invoke Paste` writes the clipboard into the front tab's PTY; `tab` is, because `tab \
@@ -1967,6 +1971,115 @@ mod tests {
         assert!(spec("image").unwrap().help_line().contains("image --meta"));
     }
 
+    /// Help that RESTATES THE VERB NAME and adds nothing.
+    ///
+    /// Ported from clean's help-truth C2, which found this to be the commonest
+    /// help failure in a sibling CLI (`--verbose: "Show verbose output"`, 32
+    /// instances of that one string). This catalog measures **0 of 95** today,
+    /// which is the reason to pin it rather than to skip it: the check costs a
+    /// millisecond and the property is one a hurried entry loses first.
+    ///
+    /// A row fails when, after removing the verb's own words and a list of
+    /// filler verbs and articles, at most ONE content word survives — i.e. the
+    /// summary told a reader nothing they could not have read off the name.
+    #[test]
+    fn no_summary_is_a_restatement_of_the_verb_name() {
+        const FILLER: &[&str] = &[
+            "the", "a", "an", "for", "of", "to", "and", "or", "this", "its", "it", "in", "on",
+            "with", "from", "print", "prints", "show", "shows", "display", "displays", "run",
+            "runs", "get", "gets", "set", "sets", "output", "command", "current", "aterm", "ctl",
+        ];
+        let words = |s: &str| -> Vec<String> {
+            s.to_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut bad: Vec<String> = Vec::new();
+        for spec in VERBS {
+            let own: std::collections::HashSet<String> = words(spec.name).into_iter().collect();
+            let content = words(spec.summary)
+                .into_iter()
+                .filter(|w| !own.contains(w) && !FILLER.contains(&w.as_str()))
+                .count();
+            if content <= 1 {
+                bad.push(format!("{}: {:?}", spec.name, spec.summary));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} catalog summary(ies) restate the verb name and add nothing — a \
+             reader who did not know what the verb does still does not:\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
+    }
+
+    /// Every repo-rooted path a catalog entry names must exist.
+    ///
+    /// Ported from clean's help-truth C3. A reader who follows a path out of
+    /// help and gets nothing cannot tell whether they typed it wrong or the tool
+    /// is lying.
+    ///
+    /// **This catalog names ZERO repo paths today, so the check is vacuous over
+    /// it — and that is stated rather than hidden.** The first draft of this
+    /// comment claimed the catalog named one (`docs/AGENT-EXPERIENCE-…`, which
+    /// is in a doc comment on line 162, not in any `summary`/`detail`), and the
+    /// plant that should have proved the check red PASSED. A gate that reads
+    /// nothing reports success, which is the failure mode this whole family of
+    /// checks exists to prevent, so the extractor is proved on a synthetic
+    /// entry in the same test: if it ever stops finding a planted path, the
+    /// test fails whatever the catalog holds.
+    ///
+    /// The surface that DOES name repo paths is the manual
+    /// (`crates/aterm-cli/src/manual.rs`); it has its own check.
+    #[test]
+    fn every_repo_path_named_in_the_catalog_exists() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/aterm-types has a workspace root two levels up");
+        const ROOTS: &[&str] = &["crates/", "scripts/", "docs/", "tests/", "data/"];
+        let scan = |name: &str, text: &str, missing: &mut Vec<String>| {
+            for raw in text.split(|c: char| c.is_whitespace() || c == '`' || c == '"') {
+                let tok = raw.trim_matches(|c: char| {
+                    !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                });
+                if ROOTS.iter().any(|r| tok.starts_with(r)) && !root.join(tok).exists() {
+                    missing.push(format!("{name}: `{tok}`"));
+                }
+            }
+        };
+
+        // THE EXTRACTOR IS PROVED FIRST. Everything below is vacuous over a
+        // catalog that names no paths, and a vacuous check reports success.
+        let mut probe = Vec::new();
+        scan(
+            "synthetic",
+            "see `docs/NO-SUCH-FILE-9f3a.md` and crates/aterm-types/src/control_verbs.rs",
+            &mut probe,
+        );
+        assert_eq!(
+            probe,
+            vec!["synthetic: `docs/NO-SUCH-FILE-9f3a.md`".to_string()],
+            "the extractor must find a missing path and pass a real one; if this \
+             fails the check below proves nothing about the catalog"
+        );
+
+        let mut missing = Vec::new();
+        for spec in VERBS {
+            scan(spec.name, spec.summary, &mut missing);
+            scan(spec.name, spec.detail, &mut missing);
+        }
+        assert!(
+            missing.is_empty(),
+            "{} repo-rooted path(s) named in the verb catalog do not exist:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        );
+    }
+
     /// The two-tier contract: every summary fits one catalog row, and the whole
     /// short catalog fits the discovery budget — COMPUTED from the table, so a row
     /// that grows past either bound fails here rather than in an agent's context
@@ -2327,7 +2440,7 @@ mod tests {
             "operator-propose-bin",
             // `tab close [N]` RETIRES a session, which is the third act §5.3 says
             // a halt refuses — and the one a driver refused `close` substituted.
-            "close invoke tab operator-propose-bin",
+            "close invoke hwkey pane tab operator-propose-bin",
             "`tab` is, because `tab close [N]` RETIRES a session",
             "`post`, `inbox seen`, `meta set`, `lease` and every read verb stay answerable",
             "physical keyboard is untouched",

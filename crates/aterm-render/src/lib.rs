@@ -185,8 +185,10 @@ static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<std::sync::Arc<Vec<u8>>>> =
 /// THE ARGUMENT IS THE READER'S OWN HANDLE, and that is the whole point. This
 /// used to take a `&[u8]` and end in `bytes.to_vec()`, so from the read until the
 /// caller's buffer dropped a few microseconds later, the file was resident
-/// TWICE. On Linux the whole broad chain is ONE file, so the doubling is bounded
-/// by that single face.
+/// TWICE. On Linux the chain used to be ONE file, which bounded the doubling by
+/// that single face; since the per-script tier (W9) it is that face plus the
+/// per-script Noto faces the host has — 35 of them here, 5,443 kB in total, so
+/// the same argument now bounds the doubling by 24,471 kB rather than 19,028 kB.
 /// On WINDOWS Microsoft splits the world's scripts across per-script faces, so
 /// [`FALLBACK_CANDIDATES`]' Windows arm is NINE files totalling 40,464 kB and
 /// `build_fallback_chain` reads all nine CONCURRENTLY on scoped workers, so ~43 MB
@@ -2787,11 +2789,122 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/System/Library/Fonts/Apple Symbols.ttf",
-    // Linux (Debian/Ubuntu default install). NONE of these is an additive tier
-    // entry, so the first one that EXISTS ends the scan and IS the whole chain —
-    // which makes the leading entry the only Linux face a sealed GUI can reach,
-    // and therefore the one that has to carry every CJK script rather than most
-    // of them. HANGUL is the script that separates them, MEASURED from the real
+    // ---- Linux: the PER-SCRIPT tier (W9) -----------------------------------
+    //
+    // Debian/Ubuntu-family paths, every one an ADDITIVE tier entry, so the scan
+    // keeps going past each and reaches the BROAD BACKSTOP group below. An
+    // absent path is skipped WITHOUT ending the scan, so a host that ships none
+    // of these degrades to exactly the chain it had before — the script stays
+    // `.notdef`, which is honest, rather than crashing or drawing a wrong glyph.
+    //
+    // WHAT THIS FIXES. The Linux arm used to be the three broad backstops alone
+    // with NONE of them additive, so the built chain was EXACTLY ONE FACE
+    // (`NotoSansCJK-Regular.ttc` where it exists) and every script that face
+    // lacks was tofu — on the grid AND in the tab strip — even with the Noto
+    // per-script faces installed, because the GUI seals its font generation and
+    // the seal closes the pathname-discovery runtime tier that would otherwise
+    // have found them. MEASURED on this host from the real cmaps, over a 40
+    // code-point probe (one per script) against the primary face
+    // (`DejaVuSansMono.ttf`), the one-face chain, the symbol face and the colour
+    // face: 36 of 40 were covered by NOTHING. The four that drew (Arabic,
+    // Armenian, Lao, Georgian) are exactly what the PRIMARY face carries — the
+    // fallback chain contributed nothing at all outside CJK.
+    //
+    // Reordering the backstops cannot fix this and has been tried: a chain that
+    // is one face long covers one face's scripts whichever face leads.
+    //
+    // WHAT IT COSTS. Every tier entry that EXISTS is read into memory when the
+    // chain is built, and the laziness is UNCHANGED: `ensure_fallback` still
+    // builds on the first primary-face miss, on a background thread, so an
+    // embedder that never seals reads none of this for a Latin-only session.
+    // MEASURED by summing the built chain's own `bytes` on this host
+    // (`linux_fallback_chain_covers_the_scripts_it_claims` prints it): 36 faces,
+    // 25,058,652 B, against 19,484,784 B for the one-face chain before — the 35
+    // per-script faces present add 5,573,868 B (5,443 kB) to the 19,028 kB
+    // backstop they sit in front of, and the whole chain still builds in 8.0 ms.
+    //
+    // A GUI WINDOW IS THE EAGER CASE and always was:
+    // `seal_admitted_font_sources` calls `ensure_fallback` +
+    // `block_on_lazy_fallbacks` at window creation, so the whole chain is read
+    // before the first frame. MEASURED as process RSS on this host, two paired
+    // runs of before/after binaries built from one target directory: idle after
+    // the seal 179,256/178,688 kB -> 184,304/184,748 kB (+5,048/+6,060 kB, the
+    // font files themselves); after printing 32 of these scripts
+    // 187,844/189,116 kB -> 187,440/190,728 kB (-404/+1,612 kB, inside the
+    // run-to-run spread). So the bill is ~5.4 MB of bytes at window creation,
+    // and by the time a session has actually drawn non-Latin text it has
+    // levelled out — the misses it no longer takes cost what the faces cost.
+    //
+    // WHY THEY GO AHEAD OF THE BACKSTOPS, and what that is allowed to cost. A
+    // tier face is probed BEFORE the broad face, so its INCIDENTAL coverage
+    // shadows the broad face for any code point both carry. Walked cmap-by-cmap
+    // against all three backstops and then filtered to the points the primary
+    // face does NOT already absorb (those never reach the chain at all), every
+    // face below shadows only its OWN script plus zero-width controls — i.e. it
+    // takes exactly what it is here to take.
+    // `the_linux_per_script_tier_never_shadows_the_broad_cjk_backstop` re-walks
+    // that proof at test time, over the real files on whatever host runs it.
+    //
+    // TWO FACES ARE DELIBERATELY ABSENT for failing precisely that test, and
+    // they are the reason this tier could not simply swallow the whole Noto set:
+    // `NotoSansMongolian-Regular.ttf` and `NotoSansYi-Regular.ttf` carry CJK
+    // PUNCTUATION, and ahead of `NotoSansCJK-Regular.ttc` they would steal it —
+    // measured, 34 and 26 code points the primary does not cover, including
+    // U+3001 、 U+3002 。 U+300C-300F 「」『』 U+FF61-FF65 and (Mongolian)
+    // U+2460-2473 ① and the vertical forms U+FE3D-FE44. Those are FULL-WIDTH
+    // designs in the CJK face and proportional (Mongolian: rotated for vertical
+    // setting) in these, so ordinary Japanese and Chinese punctuation would have
+    // changed shape to buy two rare scripts. They can only be reached ahead of
+    // the CJK face — putting the CJK face in this tier instead would let
+    // DejaVu through as the backstop on a Droid-less host, which the note below
+    // forbids for a measured reason — so Mongolian and Yi stay `.notdef` on
+    // Linux, and that is the honest trade rather than a silent one. This is the
+    // same rule that keeps `msgothic.ttc` off the Windows arm.
+    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf", // Hebrew
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf", // Arabic (beyond the primary's basic block)
+    "/usr/share/fonts/truetype/noto/NotoSansSyriac-Regular.ttf", // Syriac
+    "/usr/share/fonts/truetype/noto/NotoSansThaana-Regular.ttf", // Thaana (Dhivehi)
+    "/usr/share/fonts/truetype/noto/NotoSansNKo-Regular.ttf",    // N'Ko
+    "/usr/share/fonts/truetype/noto/NotoSansAdlam-Regular.ttf",  // Adlam
+    "/usr/share/fonts/truetype/noto/NotoSansTifinagh-Regular.ttf", // Tifinagh
+    "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf", // Ethiopic
+    "/usr/share/fonts/truetype/noto/NotoSansVai-Regular.ttf",    // Vai
+    "/usr/share/fonts/truetype/noto/NotoSansCoptic-Regular.ttf", // Coptic
+    "/usr/share/fonts/truetype/noto/NotoSansArmenian-Regular.ttf", // Armenian
+    "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf", // Georgian
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", // Devanagari
+    "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf", // Bengali
+    "/usr/share/fonts/truetype/noto/NotoSansGurmukhi-Regular.ttf", // Gurmukhi
+    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf", // Gujarati
+    "/usr/share/fonts/truetype/noto/NotoSansOriya-Regular.ttf",  // Oriya
+    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",  // Tamil
+    "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf", // Telugu
+    "/usr/share/fonts/truetype/noto/NotoSansKannada-Regular.ttf", // Kannada
+    "/usr/share/fonts/truetype/noto/NotoSansMalayalam-Regular.ttf", // Malayalam
+    "/usr/share/fonts/truetype/noto/NotoSansSinhala-Regular.ttf", // Sinhala
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",   // Thai
+    "/usr/share/fonts/truetype/noto/NotoSansLao-Regular.ttf",    // Lao
+    "/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf",  // Khmer
+    "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf", // Myanmar
+    // Tibetan ships as the SERIF face in `fonts-noto-core`; the sans face is in
+    // `fonts-noto-extra`. Both are listed, sans first: whichever exists loads,
+    // and an absent path costs nothing.
+    "/usr/share/fonts/truetype/noto/NotoSansTibetan-Regular.ttf", // Tibetan (fonts-noto-extra)
+    "/usr/share/fonts/truetype/noto/NotoSerifTibetan-Regular.ttf", // Tibetan (fonts-noto-core)
+    "/usr/share/fonts/truetype/noto/NotoSansCherokee-Regular.ttf", // Cherokee
+    "/usr/share/fonts/truetype/noto/NotoSansCanadianAboriginal-Regular.ttf", // Unified Canadian Aboriginal
+    "/usr/share/fonts/truetype/noto/NotoSansOsage-Regular.ttf",              // Osage
+    "/usr/share/fonts/truetype/noto/NotoSansDeseret-Regular.ttf",            // Deseret
+    "/usr/share/fonts/truetype/noto/NotoSansRunic-Regular.ttf",              // Runic
+    "/usr/share/fonts/truetype/noto/NotoSansCuneiform-Regular.ttf",          // Cuneiform
+    "/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf", // Egyptian Hieroglyphs
+    "/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf", // Musical Symbols (U+1D100..1D1FF)
+    // ---- Linux: the BROAD BACKSTOP group -----------------------------------
+    //
+    // NONE of these is an additive tier entry, so the first one that EXISTS ends
+    // the scan and is the LAST face in the chain — they are ALTERNATIVES, not a
+    // sequence, and exactly one of them is ever resident. HANGUL is the script
+    // that separates them, MEASURED from the real
     // cmaps on this host over the 11,172 syllables U+AC00..D7A3 and the 256 jamo
     // U+1100..11FF: `NotoSansCJK-Regular.ttc` face 0 maps 11172/11172 and
     // 256/256, while `DroidSansFallbackFull.ttf` maps 3/11172 (U+AC00, U+D7A2,
@@ -2816,6 +2929,14 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     // `Emoji_Presentation=Yes` set, DejaVu maps 98 of them (U+1F600 😀 among
     // them) against Noto's 26 and Droid's 0 — it is the backstop for a host that
     // has neither CJK face, never a face to reach past them.
+    //
+    // THAT LAW IS ALSO WHY THE CJK FACE IS NOT IN THE PER-SCRIPT TIER, tempting
+    // as it looks: an additive `NotoSansCJK-Regular.ttc` no longer ends the scan,
+    // so on a host with Noto CJK and no `fonts-droid-fallback` (nothing makes one
+    // depend on the other — `fonts-noto-cjk` does not even Suggest it) the scan
+    // would run on to DejaVu and hand it 72 emoji code points the colour face
+    // exists for, 😀 among them. One face ends this group; that face is a CJK
+    // face wherever the host has one.
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -2880,10 +3001,51 @@ const FALLBACK_CANDIDATES: &[&str] = &[
 /// also listed in [`FALLBACK_CANDIDATES`]. Every Windows entry except the final
 /// broad backstop belongs here — otherwise it would end the scan and silently
 /// orphan every candidate after it, which is exactly the defect that made the
-/// Windows chain one face long and left Hangul as tofu. The pure list law is
-/// pinned by `every_windows_candidate_but_the_backstop_is_an_additive_tier`.
+/// Windows chain one face long and left Hangul as tofu. The pure list laws are
+/// pinned by `every_windows_candidate_but_the_backstop_is_an_additive_tier` and
+/// `every_linux_candidate_but_the_broad_backstops_is_an_additive_tier`; the
+/// duplication between the two consts is the price of a plain `&[&str]`, and
+/// those two tests are what stop it drifting.
 const NATIVE_SCRIPT_FALLBACK_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    // Linux per-script tier (W9) — the same list, in the same order, as the
+    // Linux arm of `FALLBACK_CANDIDATES` above minus its three broad backstops.
+    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSyriac-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThaana-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansNKo-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansAdlam-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTifinagh-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansVai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCoptic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArmenian-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGurmukhi-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansOriya-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansKannada-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMalayalam-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSinhala-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansLao-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTibetan-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSerifTibetan-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCherokee-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCanadianAboriginal-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansOsage-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDeseret-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansRunic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCuneiform-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf",
     #[cfg(windows)]
     "C:\\Windows\\Fonts\\msyh.ttc",
     #[cfg(windows)]
@@ -4279,7 +4441,8 @@ fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
 /// On macOS this yields `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
 /// broad backstop second); on Windows the per-script faces that exist (YaHei,
 /// Malgun Gothic, Nirmala UI, Leelawadee UI, Sylfaen, Ebrima, Gadugi, MV Boli)
-/// followed by Arial; on Linux a single broad face — each with any configured
+/// followed by Arial; on Linux the per-script Noto faces that exist followed by
+/// exactly one broad backstop (Noto CJK, else Droid, else DejaVu) — each with any configured
 /// faces AHEAD of it.
 ///
 /// WHY THE USER PREFIX IS ADDITIVE. `fallback_fonts` is documented as an ordered
@@ -7361,7 +7524,8 @@ impl Renderer {
     /// going after loading one — and only the platform's built-in BROAD BACKSTOP
     /// ends it. So on macOS the chain is `[Hiragino Sans GB, Arial Unicode]`
     /// (native CJK first, broad backstop second), on Windows the per-script
-    /// faces that exist followed by Arial, and on Linux a single broad face —
+    /// faces that exist followed by Arial, and on Linux (W9) the per-script Noto
+    /// faces that exist followed by ONE broad backstop —
     /// each with any configured faces ahead of it, in config order. See
     /// [`build_fallback_chain`].
     ///
@@ -25514,6 +25678,414 @@ mod tests {
             "chain of {} face(s) covered {checked} script(s)",
             chain.len()
         );
+    }
+
+    // ---- W9: the LINUX per-script tier --------------------------------------
+    //
+    // The Linux arm used to be three broad backstops and nothing else, none of
+    // them additive, so `build_fallback_chain` stopped at the first one that
+    // loaded and the whole Linux chain was EXACTLY ONE FACE. Every script that
+    // face lacks — Hebrew, Thai, all nine Indic scripts, Sinhala, Tibetan,
+    // Myanmar, Khmer, Syriac, Thaana, Ethiopic, Cherokee, Runic, Coptic, Vai,
+    // Adlam, Osage, Deseret, Cuneiform, Egyptian Hieroglyphs, Musical Symbols —
+    // drew as `.notdef` boxes with the Noto faces for them sitting on disk,
+    // because the GUI seals its font generation and the seal closes the
+    // pathname-discovery runtime tier that would otherwise have found them.
+    //
+    // The tests below pin the three facts that keep it fixed: the LIST law (no
+    // Linux per-script entry may end the scan), the COVERAGE fact (a face this
+    // host has must be REACHABLE), and the SHADOW law (a tier face placed ahead
+    // of the broad backstop must not take the backstop's own code points).
+
+    /// The Linux paths in [`FALLBACK_CANDIDATES`], in order.
+    fn linux_candidates() -> Vec<&'static str> {
+        FALLBACK_CANDIDATES
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with("/usr/share/fonts/"))
+            .collect()
+    }
+
+    /// The three Linux BROAD BACKSTOPS — alternatives, of which exactly one ever
+    /// ends the scan. Named here rather than derived so that deleting one from
+    /// the arm fails the list law instead of silently redefining it.
+    const LINUX_BROAD_BACKSTOPS: &[&str] = &[
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+
+    /// FACT 1, as a PURE LIST LAW — no font I/O, so it holds on any machine.
+    ///
+    /// Every Linux candidate except the three broad backstops must be an additive
+    /// ([`NATIVE_SCRIPT_FALLBACK_CANDIDATES`]) entry, the backstops must NOT be,
+    /// and the backstops must come LAST. A non-additive face ends the scan, so a
+    /// per-script entry that is not additive orphans every candidate behind it —
+    /// silently, and only on Linux. That is precisely the defect this tier
+    /// exists to close, and precisely how it would come back.
+    #[test]
+    fn every_linux_candidate_but_the_broad_backstops_is_an_additive_tier() {
+        let linux = linux_candidates();
+        assert!(
+            linux.len() > LINUX_BROAD_BACKSTOPS.len(),
+            "the Linux arm must have per-script faces as well as backstops, got {linux:?}"
+        );
+        let split = linux.len() - LINUX_BROAD_BACKSTOPS.len();
+        let (tier, backstops) = linux.split_at(split);
+        assert_eq!(
+            backstops, LINUX_BROAD_BACKSTOPS,
+            "the Linux broad backstops must be the LAST entries of the arm, in \
+             preference order — anything after them is unreachable"
+        );
+        for p in tier {
+            assert!(
+                NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(p),
+                "{p} is a Linux per-script candidate but not an additive tier \
+                 entry, so it ENDS the chain scan and orphans every candidate \
+                 after it — including the broad backstop"
+            );
+        }
+        for p in backstops {
+            assert!(
+                !NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(p),
+                "{p} is a Linux broad backstop and must END the scan, so it must \
+                 NOT be an additive tier entry — an additive backstop lets DejaVu \
+                 through past a CJK face and it steals the colour face's emoji"
+            );
+        }
+        // No duplicates: a repeated path would load the same file twice.
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &linux {
+            assert!(seen.insert(*p), "{p} is listed twice in the Linux arm");
+        }
+        eprintln!(
+            "Linux arm: {} per-script tier entries + {} broad backstops",
+            tier.len(),
+            backstops.len()
+        );
+    }
+
+    /// Every code point `path` maps to a REAL (non-`.notdef`) glyph, over every
+    /// face of a collection — the same authority [`Renderer::fallback_has`] uses,
+    /// read from the FILE rather than from any chain.
+    #[cfg(target_os = "linux")]
+    fn face_coverage(path: &str) -> std::collections::BTreeSet<u32> {
+        let mut out = std::collections::BTreeSet::new();
+        let Ok(bytes) = std::fs::read(path) else {
+            return out;
+        };
+        let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+        for i in 0..faces {
+            let Ok(f) = ttf_parser::Face::parse(&bytes, i) else {
+                continue;
+            };
+            let Some(cmap) = f.tables().cmap else {
+                continue;
+            };
+            let mut cps: Vec<u32> = Vec::new();
+            for sub in cmap.subtables {
+                if sub.is_unicode() {
+                    sub.codepoints(|cp| cps.push(cp));
+                }
+            }
+            for cp in cps {
+                if let Some(c) = char::from_u32(cp)
+                    && f.glyph_index(c).is_some_and(|g| g.0 != 0)
+                {
+                    out.insert(cp);
+                }
+            }
+        }
+        out
+    }
+
+    /// FACT 2 — THE DEFECT ITSELF, measured against the faces this host actually
+    /// has. Each script is checked only when the face that is supposed to carry
+    /// it is INSTALLED, so this never fails for a font the host does not ship;
+    /// it fails when the face IS there and the chain still cannot reach it, i.e.
+    /// when the scan stopped in front of it.
+    ///
+    /// The skip guard reads the FILESYSTEM, never the candidate list — asking
+    /// the list would turn "someone deleted this face from the arm" into a
+    /// silent SKIP, which is the one regression this test exists to catch.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_fallback_chain_covers_the_scripts_it_claims() {
+        let paths = present_fallback_paths();
+        let started = std::time::Instant::now();
+        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
+        let elapsed = started.elapsed();
+        let resident: usize = chain.iter().map(|f| f.bytes.len()).sum();
+        eprintln!(
+            "Linux chain: {} face(s), {resident} B ({:.1} MB) resident, built in {elapsed:?}",
+            chain.len(),
+            resident as f64 / (1024.0 * 1024.0),
+        );
+        assert!(!chain.is_empty(), "no fallback candidate loaded at all");
+        const N: &str = "/usr/share/fonts/truetype/noto/";
+        // (script, sample code point, the candidate that carries it)
+        let claims: &[(&str, char, &str)] = &[
+            ("Hebrew", '\u{05D0}', "NotoSansHebrew-Regular.ttf"),
+            ("Syriac", '\u{0710}', "NotoSansSyriac-Regular.ttf"),
+            ("Thaana", '\u{0780}', "NotoSansThaana-Regular.ttf"),
+            ("N'Ko", '\u{07C0}', "NotoSansNKo-Regular.ttf"),
+            ("Adlam", '\u{1E900}', "NotoSansAdlam-Regular.ttf"),
+            ("Tifinagh", '\u{2D30}', "NotoSansTifinagh-Regular.ttf"),
+            ("Ethiopic", '\u{1200}', "NotoSansEthiopic-Regular.ttf"),
+            ("Vai", '\u{A500}', "NotoSansVai-Regular.ttf"),
+            ("Coptic", '\u{2C80}', "NotoSansCoptic-Regular.ttf"),
+            ("Armenian", '\u{0531}', "NotoSansArmenian-Regular.ttf"),
+            ("Georgian", '\u{10D0}', "NotoSansGeorgian-Regular.ttf"),
+            ("Devanagari", '\u{0915}', "NotoSansDevanagari-Regular.ttf"),
+            ("Bengali", '\u{0985}', "NotoSansBengali-Regular.ttf"),
+            ("Gurmukhi", '\u{0A05}', "NotoSansGurmukhi-Regular.ttf"),
+            ("Gujarati", '\u{0A85}', "NotoSansGujarati-Regular.ttf"),
+            ("Oriya", '\u{0B05}', "NotoSansOriya-Regular.ttf"),
+            ("Tamil", '\u{0B95}', "NotoSansTamil-Regular.ttf"),
+            ("Telugu", '\u{0C05}', "NotoSansTelugu-Regular.ttf"),
+            ("Kannada", '\u{0C85}', "NotoSansKannada-Regular.ttf"),
+            ("Malayalam", '\u{0D05}', "NotoSansMalayalam-Regular.ttf"),
+            ("Sinhala", '\u{0D85}', "NotoSansSinhala-Regular.ttf"),
+            ("Thai", '\u{0E01}', "NotoSansThai-Regular.ttf"),
+            ("Lao", '\u{0E81}', "NotoSansLao-Regular.ttf"),
+            ("Khmer", '\u{1780}', "NotoSansKhmer-Regular.ttf"),
+            ("Myanmar", '\u{1000}', "NotoSansMyanmar-Regular.ttf"),
+            ("Tibetan", '\u{0F40}', "NotoSerifTibetan-Regular.ttf"),
+            ("Cherokee", '\u{13A0}', "NotoSansCherokee-Regular.ttf"),
+            (
+                "Canadian Aboriginal",
+                '\u{1401}',
+                "NotoSansCanadianAboriginal-Regular.ttf",
+            ),
+            ("Osage", '\u{104B0}', "NotoSansOsage-Regular.ttf"),
+            ("Deseret", '\u{10400}', "NotoSansDeseret-Regular.ttf"),
+            ("Runic", '\u{16A0}', "NotoSansRunic-Regular.ttf"),
+            ("Cuneiform", '\u{12000}', "NotoSansCuneiform-Regular.ttf"),
+            (
+                "Egyptian Hieroglyphs",
+                '\u{13000}',
+                "NotoSansEgyptianHieroglyphs-Regular.ttf",
+            ),
+            ("Musical Symbols", '\u{1D11E}', "NotoMusic-Regular.ttf"),
+        ];
+        let mut checked = 0usize;
+        for (script, ch, face) in claims {
+            if !std::path::Path::new(&format!("{N}{face}")).is_file() {
+                eprintln!("SKIP {script}: {face} is not installed here");
+                continue;
+            }
+            assert!(
+                chain_covers(&chain, *ch),
+                "{script} (U+{:04X}) is claimed by {face}, which IS installed, but \
+                 no chain face covers it — the candidate scan never reached it, so \
+                 it renders as a .notdef box on the grid AND in the tab strip",
+                *ch as u32
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no claimed face was installed; nothing proven");
+        // The additive rule must actually have kept the scan going: a chain that
+        // stopped at the first face could not hold a per-script face AND a broad
+        // backstop.
+        assert!(
+            chain.len() >= 2,
+            "the Linux chain collapsed to {} face(s) — the additive tier broke and \
+             every script outside that one face is tofu again",
+            chain.len()
+        );
+        // CONTROL: the chain still covers what it always covered. A chain that
+        // covered nothing new-and-nothing-old could not pass by accident.
+        if std::path::Path::new(LINUX_BROAD_BACKSTOPS[0]).is_file() {
+            for ch in ['\u{4E2D}', '\u{30C6}', '\u{D55C}'] {
+                assert!(
+                    chain_covers(&chain, ch),
+                    "the chain lost U+{:04X} — the per-script tier displaced the \
+                     broad CJK backstop instead of preceding it",
+                    ch as u32
+                );
+            }
+        }
+        eprintln!(
+            "Linux chain of {} face(s) covered {checked} per-script claim(s)",
+            chain.len()
+        );
+    }
+
+    /// FACT 3 — THE SHADOW LAW, and the reason this tier is a curated list
+    /// rather than "every Noto face on the box".
+    ///
+    /// A tier face is probed BEFORE the broad backstop
+    /// ([`font_chain::resolve_chain`] consults `Tier::Fallback` in chain order),
+    /// so any code point it maps is a code point the backstop no longer draws.
+    /// For the CJK backstop that is a real hazard: a per-script face that
+    /// happens to carry CJK punctuation would take 、。「」『』 away from the
+    /// face designed for them, at proportional instead of full width — ordinary
+    /// Japanese and Chinese text changing shape to buy one rare script.
+    ///
+    /// Points the PRIMARY face already covers are subtracted first: those never
+    /// reach the chain at all (`resolve_chain` returns at `Tier::Primary`), so
+    /// an overlap on ASCII or Latin punctuation is not a shadow.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_linux_per_script_tier_never_shadows_the_broad_cjk_backstop() {
+        let cjk_path = LINUX_BROAD_BACKSTOPS[0];
+        if !std::path::Path::new(cjk_path).is_file() {
+            eprintln!("SKIP: {cjk_path} is not installed here");
+            return;
+        }
+        let primary = primary_candidate_paths()
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file());
+        let Some(primary) = primary else {
+            eprintln!("SKIP: no primary font found");
+            return;
+        };
+        let primary_cov = face_coverage(&primary);
+        let cjk_cov = face_coverage(cjk_path);
+        // What the CJK backstop uniquely owns: its coverage minus whatever the
+        // primary already answers for. This is the set a tier face must not
+        // touch.
+        let owned: std::collections::BTreeSet<u32> =
+            cjk_cov.difference(&primary_cov).copied().collect();
+        assert!(
+            owned.len() > 10_000,
+            "the CJK backstop owns only {} code points — this host's fonts are \
+             not what this test assumes and it would prove nothing",
+            owned.len()
+        );
+        let linux = linux_candidates();
+        let tier = &linux[..linux.len() - LINUX_BROAD_BACKSTOPS.len()];
+        let mut checked = 0usize;
+        for path in tier {
+            if !std::path::Path::new(path).is_file() {
+                continue;
+            }
+            let steal: Vec<u32> = face_coverage(path)
+                .intersection(&owned)
+                .copied()
+                .take(24)
+                .collect();
+            assert!(
+                steal.is_empty(),
+                "{path} sits AHEAD of {cjk_path} in the chain and takes {} of the \
+                 code points only that face should draw: {} — a per-script face \
+                 may not shadow the broad CJK backstop",
+                steal.len(),
+                steal
+                    .iter()
+                    .map(|c| format!("U+{c:04X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no tier face was installed; nothing proven");
+
+        // NON-VACUITY, measured rather than asserted: the predicate above must be
+        // able to FAIL. These two Noto faces are deliberately absent from the tier
+        // for failing it, and on a host that has them they must still be caught —
+        // otherwise the loop above is checking a condition nothing can violate.
+        let mut offenders = 0usize;
+        for path in [
+            "/usr/share/fonts/truetype/noto/NotoSansMongolian-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansYi-Regular.ttf",
+        ] {
+            assert!(
+                !tier.contains(&path),
+                "{path} is in the per-script tier, where it steals CJK punctuation"
+            );
+            if !std::path::Path::new(path).is_file() {
+                continue;
+            }
+            let steal: Vec<u32> = face_coverage(path).intersection(&owned).copied().collect();
+            assert!(
+                !steal.is_empty(),
+                "{path} was expected to shadow the CJK backstop (that is WHY it is \
+                 excluded) but takes nothing from it — the shadow check above is \
+                 therefore vacuous on this host"
+            );
+            offenders += 1;
+            eprintln!(
+                "control: {} would have stolen {} code points ({} ...)",
+                path.rsplit('/').next().unwrap_or(path),
+                steal.len(),
+                steal
+                    .iter()
+                    .take(6)
+                    .map(|c| format!("U+{c:04X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        eprintln!(
+            "{checked} tier face(s) shadow nothing the CJK backstop owns; \
+             {offenders} known offender(s) confirmed still detectable"
+        );
+    }
+
+    /// The RENDER-SIDE end of the Linux defect: a code point from a script the
+    /// per-script tier claims must dispatch to [`FaceId::Fallback`] and
+    /// rasterize with real ink.
+    ///
+    /// `FaceId::Fallback` specifically, not merely "some tier". A GUI window
+    /// seals its font generation, which closes the pathname-discovery runtime
+    /// tier — so a Hebrew aleph that only `RuntimeFallback` can reach still
+    /// paints `.notdef` on screen, which is exactly what the screenshots showed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_script_code_points_dispatch_to_the_fallback_tier_with_real_ink() {
+        const N: &str = "/usr/share/fonts/truetype/noto/";
+        let probes: &[(&str, char, &str)] = &[
+            ("Hebrew", '\u{05D0}', "NotoSansHebrew-Regular.ttf"),
+            ("Devanagari", '\u{0915}', "NotoSansDevanagari-Regular.ttf"),
+            ("Thai", '\u{0E01}', "NotoSansThai-Regular.ttf"),
+            ("Tamil", '\u{0B95}', "NotoSansTamil-Regular.ttf"),
+            ("Ethiopic", '\u{1200}', "NotoSansEthiopic-Regular.ttf"),
+            ("Khmer", '\u{1780}', "NotoSansKhmer-Regular.ttf"),
+            ("Cherokee", '\u{13A0}', "NotoSansCherokee-Regular.ttf"),
+            ("Musical Symbols", '\u{1D11E}', "NotoMusic-Regular.ttf"),
+        ];
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.debug_block_on_lazy_fallbacks();
+        let mut checked = 0usize;
+        for (script, ch, face) in probes {
+            if !std::path::Path::new(&format!("{N}{face}")).is_file() {
+                eprintln!("SKIP {script}: {face} is not installed here");
+                continue;
+            }
+            if r.primary_unicode_gid(*ch).is_some() {
+                eprintln!("SKIP {script}: the primary face itself carries it here");
+                continue;
+            }
+            let key = r.glyph_key(*ch);
+            assert_eq!(
+                key.source,
+                FaceId::Fallback,
+                "{script} U+{:04X} resolved to {:?}, not the broad fallback chain. \
+                 Primary means the .notdef tofu box; RuntimeFallback means only the \
+                 UNSEALED path finds it, and every GUI window seals — so on screen \
+                 that is tofu too.",
+                *ch as u32,
+                key.source
+            );
+            let img = r.glyph_image(key);
+            assert!(
+                img.width() > 0 && img.height() > 0,
+                "{script} U+{:04X} rasterized to an empty bitmap",
+                *ch as u32
+            );
+            assert!(
+                img.bytes().iter().any(|&c| c > 0),
+                "{script} U+{:04X} rasterized with no coverage at all",
+                *ch as u32
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no probe face was installed; nothing proven");
+        eprintln!("{checked} script(s) dispatched to the fallback chain with real ink");
     }
 
     /// The RENDER-SIDE end of the same defect, on whatever platform this is: a

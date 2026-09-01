@@ -98,6 +98,22 @@ pub const VIDEO_DIR: &str = "video";
 /// non-abortable at the guarded wire boundary.
 pub(crate) const VIDEO_PUBLISHED_FILE: &str = ".published";
 
+/// Typed confinement outcome so callers never need an out-of-band `Cell<bool>`
+/// to distinguish a resource refusal from an invalid/unavailable path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactConfinementError {
+    Invalid,
+    AdmissionRefused,
+}
+
+fn confinement_open_error(error: std::io::Error) -> ArtifactConfinementError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        ArtifactConfinementError::AdmissionRefused
+    } else {
+        ArtifactConfinementError::Invalid
+    }
+}
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn enter_low_nofile_test_child(
     environment: &str,
@@ -151,13 +167,20 @@ pub(crate) fn enter_low_nofile_test_child(
 }
 
 /// One conservative filesystem-wide lock excludes concurrent explicit image
-/// writes in the shared `images/` namespace. Contenders fail busy instead of
-/// blocking the single encode lane. Locking the namespace (rather than a
-/// spelling-derived sidecar) deliberately covers case-folding, Unicode
-/// normalization, and Windows short-name aliases without guessing the mounted
-/// filesystem's name-equivalence rules.
+/// writes in the shared `images/` namespace. A contender waits briefly for an
+/// ordinary reply/ACK handoff, then fails busy so the single encode lane stays
+/// bounded. Locking the namespace (rather than a spelling-derived sidecar)
+/// covers case-folding, Unicode normalization, and Windows short-name aliases
+/// without guessing the mounted filesystem's name-equivalence rules.
 const CAPTURE_LOCK_DIR: &str = ".capture-locks";
 const CAPTURE_NAMESPACE_LEASE_FILE: &str = "explicit";
+
+/// How long an EXPLICIT capture waits for the previous reply's retention guard
+/// before it refuses. Long enough that two overlapping drivers queue instead of
+/// colliding (a guard is released the moment its client acknowledges —
+/// microseconds to a few milliseconds), short enough that a genuinely stuck
+/// holder is reported rather than hanging the control thread.
+const CAPTURE_NAMESPACE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Stable, collision-resistant identity for this exact server process.
 ///
@@ -209,6 +232,10 @@ pub(crate) struct ArtifactPathLease {
     /// directory chain and therefore can never outlive that owner's capacity
     /// charge. The final lease uses its own capability for convergence.
     video_sweep: Option<VideoRetentionSweep>,
+    /// Automatic-image namespace GC is armed by both the target and its wire
+    /// lease. The shared final reference drops only after every retained path
+    /// capability has closed.
+    _deferred_cleanup: Option<std::sync::Arc<DeferredImageCleanup>>,
 }
 
 #[cfg_attr(
@@ -336,21 +363,779 @@ struct ArtifactLeaseState {
     /// New readers fail closed instead of entering between the last-release
     /// decision and a retention rename.
     sweeping: bool,
+    /// Reserved when this distinct video key first enters the registry. The
+    /// final armed lease transfers it to the priority cleanup lane, so Drop
+    /// never races best-effort GC for admission or waits for queue capacity.
+    video_retention: Option<crate::control::VideoRetentionPermit>,
+}
+
+const ARTIFACT_CLEANUP_QUEUE_LIMIT: usize = 32;
+static ARTIFACT_CLEANUP_QUEUE_LIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Clone, Debug)]
+struct ArtifactCleanupQueuePermit {
+    _inner: std::sync::Arc<ArtifactCleanupQueuePermitInner>,
+}
+
+#[derive(Debug)]
+struct ArtifactCleanupQueuePermitInner {
+    live: Option<&'static std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct DeferredImageCleanup {
+    image_dir: PathBuf,
+    image_identity: crate::pinned_dir::PinnedDirIdentity,
+    fresh: std::ffi::OsString,
+    image_queue: Option<ArtifactCleanupQueuePermit>,
+    image_armed: std::sync::atomic::AtomicBool,
+    namespace_root: PathBuf,
+    current: String,
+    namespace_queue: Option<ArtifactCleanupQueuePermit>,
+}
+
+impl DeferredImageCleanup {
+    fn reserve(
+        image_dir: PathBuf,
+        image_identity: crate::pinned_dir::PinnedDirIdentity,
+        fresh: std::ffi::OsString,
+        namespace_root: PathBuf,
+        current: String,
+    ) -> Option<std::sync::Arc<Self>> {
+        Some(std::sync::Arc::new(Self {
+            image_dir,
+            image_identity,
+            fresh,
+            image_queue: Some(reserve_artifact_cleanup_queue()?),
+            image_armed: std::sync::atomic::AtomicBool::new(false),
+            namespace_root,
+            current,
+            namespace_queue: Some(reserve_artifact_cleanup_queue()?),
+        }))
+    }
+
+    fn arm_image_prune(&self) {
+        self.image_armed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for DeferredImageCleanup {
+    fn drop(&mut self) {
+        if self.image_armed.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(queue) = self.image_queue.take() {
+                let _ = try_schedule_artifact_cleanup(ArtifactCleanupTask::AutomaticImages {
+                    dir: self.image_dir.clone(),
+                    expected_dir: self.image_identity,
+                    fresh: self.fresh.clone(),
+                    _queue: queue,
+                });
+            } else {
+                debug_assert!(false, "deferred image prune lost its reserved queue slot");
+            }
+        }
+        if let Some(queue) = self.namespace_queue.take() {
+            schedule_dead_instance_namespace_sweep(&self.namespace_root, &self.current, queue);
+        } else {
+            debug_assert!(
+                false,
+                "deferred namespace sweep lost its reserved queue slot"
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeferredVideoCleanup {
+    tombstone_root: PathBuf,
+    tombstone_identity: crate::pinned_dir::PinnedDirIdentity,
+    tombstone_queue: Option<ArtifactCleanupQueuePermit>,
+    tombstone_armed: bool,
+    dead_root: PathBuf,
+    current: String,
+    dead_queue: Option<ArtifactCleanupQueuePermit>,
+}
+
+impl DeferredVideoCleanup {
+    fn arm_tombstone(&mut self) {
+        self.tombstone_armed = true;
+    }
+}
+
+impl Drop for DeferredVideoCleanup {
+    fn drop(&mut self) {
+        if self.tombstone_armed
+            && let Some(queue) = self.tombstone_queue.take()
+        {
+            schedule_video_tombstone_sweep(&self.tombstone_root, self.tombstone_identity, queue);
+        }
+        if let Some(queue) = self.dead_queue.take() {
+            schedule_dead_instance_namespace_sweep(&self.dead_root, &self.current, queue);
+        } else {
+            debug_assert!(false, "deferred video GC lost its reserved queue slot");
+        }
+    }
+}
+
+impl ArtifactCleanupQueuePermit {
+    fn try_acquire() -> Option<Self> {
+        ARTIFACT_CLEANUP_QUEUE_LIVE
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| (current < ARTIFACT_CLEANUP_QUEUE_LIMIT).then_some(current + 1),
+            )
+            .ok()
+            .map(|_| Self {
+                _inner: std::sync::Arc::new(ArtifactCleanupQueuePermitInner {
+                    live: Some(&ARTIFACT_CLEANUP_QUEUE_LIVE),
+                }),
+            })
+    }
+
+    #[cfg(test)]
+    fn unmetered() -> Self {
+        Self {
+            _inner: std::sync::Arc::new(ArtifactCleanupQueuePermitInner { live: None }),
+        }
+    }
+}
+
+impl Drop for ArtifactCleanupQueuePermitInner {
+    fn drop(&mut self) {
+        if let Some(live) = self.live {
+            let previous = live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            debug_assert!(previous > 0, "artifact cleanup queue permit underflow");
+        }
+    }
+}
+
+enum ArtifactCleanupTask {
+    AutomaticImages {
+        dir: PathBuf,
+        expected_dir: crate::pinned_dir::PinnedDirIdentity,
+        fresh: std::ffi::OsString,
+        _queue: ArtifactCleanupQueuePermit,
+    },
+    DeadNamespaces {
+        root: PathBuf,
+        current: String,
+        _queue: ArtifactCleanupQueuePermit,
+    },
+    DeadNamespaceContinuation(DeadNamespaceSweep),
+    VideoTombstones {
+        root: PathBuf,
+        expected_root: crate::pinned_dir::PinnedDirIdentity,
+        _queue: ArtifactCleanupQueuePermit,
+    },
+    VideoTombstoneContinuation(VideoTombstoneSweep),
+    #[cfg(test)]
+    Barrier(std::sync::mpsc::SyncSender<()>),
+    #[cfg(test)]
+    PanicForTest(ArtifactCleanupPanicRecovery),
+}
+
+#[derive(Clone)]
+enum ArtifactCleanupPanicRecovery {
+    AutomaticImages {
+        dir: PathBuf,
+        expected_dir: crate::pinned_dir::PinnedDirIdentity,
+        fresh: std::ffi::OsString,
+        queue: ArtifactCleanupQueuePermit,
+    },
+    DeadNamespaces {
+        root: PathBuf,
+        current: String,
+        queue: ArtifactCleanupQueuePermit,
+    },
+    VideoTombstones {
+        root: PathBuf,
+        expected_root: crate::pinned_dir::PinnedDirIdentity,
+        queue: ArtifactCleanupQueuePermit,
+    },
+    #[cfg(test)]
+    Barrier(std::sync::mpsc::SyncSender<()>),
+}
+
+impl ArtifactCleanupTask {
+    fn panic_recovery(&self) -> ArtifactCleanupPanicRecovery {
+        match self {
+            Self::AutomaticImages {
+                dir,
+                expected_dir,
+                fresh,
+                _queue,
+            } => ArtifactCleanupPanicRecovery::AutomaticImages {
+                dir: dir.clone(),
+                expected_dir: *expected_dir,
+                fresh: fresh.clone(),
+                queue: _queue.clone(),
+            },
+            Self::DeadNamespaces {
+                root,
+                current,
+                _queue,
+            } => ArtifactCleanupPanicRecovery::DeadNamespaces {
+                root: root.clone(),
+                current: current.clone(),
+                queue: _queue.clone(),
+            },
+            Self::DeadNamespaceContinuation(sweep) => {
+                ArtifactCleanupPanicRecovery::DeadNamespaces {
+                    root: sweep.root_path.clone(),
+                    current: sweep.current.clone(),
+                    queue: sweep._queue.clone(),
+                }
+            }
+            Self::VideoTombstones {
+                root,
+                expected_root,
+                _queue,
+            } => ArtifactCleanupPanicRecovery::VideoTombstones {
+                root: root.clone(),
+                expected_root: *expected_root,
+                queue: _queue.clone(),
+            },
+            Self::VideoTombstoneContinuation(sweep) => {
+                ArtifactCleanupPanicRecovery::VideoTombstones {
+                    root: sweep.root_path.clone(),
+                    expected_root: sweep.expected_root,
+                    queue: sweep._queue.clone(),
+                }
+            }
+            #[cfg(test)]
+            Self::Barrier(done) => ArtifactCleanupPanicRecovery::Barrier(done.clone()),
+            #[cfg(test)]
+            Self::PanicForTest(recovery) => recovery.clone(),
+        }
+    }
+}
+
+struct VideoRetentionTask {
+    root: Option<crate::pinned_dir::PinnedDir>,
+    fresh: std::ffi::OsString,
+    /// Last so the retained directory chain closes before its reservation is
+    /// made available to another distinct artifact key.
+    admission: Option<crate::control::VideoRetentionPermit>,
+    /// Last so every retained descriptor and its admission token are released
+    /// before the registry wakes a waiter, including during panic unwinding.
+    _completion: VideoRetentionCompletion,
+}
+
+struct VideoRetentionCompletion {
+    key: PathBuf,
+}
+
+impl Drop for VideoRetentionCompletion {
+    fn drop(&mut self) {
+        finish_video_retention_sweep(&self.key);
+    }
+}
+
+struct ArtifactCleanupScheduler {
+    video: std::sync::mpsc::Sender<VideoRetentionTask>,
+    best_effort: std::sync::mpsc::Sender<ArtifactCleanupTask>,
+    wake: std::sync::mpsc::SyncSender<()>,
+}
+
+fn artifact_cleanup_scheduler() -> Option<&'static ArtifactCleanupScheduler> {
+    static SCHEDULER: std::sync::OnceLock<ArtifactCleanupScheduler> = std::sync::OnceLock::new();
+    static INITIALIZING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(scheduler) = SCHEDULER.get() {
+        return Some(scheduler);
+    }
+    // `OnceLock<Option<_>>` would permanently cache one transient thread-spawn
+    // failure. Serialize attempts, but publish only a successfully spawned
+    // worker so a later request can retry without creating duplicate workers.
+    let _initializing = INITIALIZING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(scheduler) = SCHEDULER.get() {
+        return Some(scheduler);
+    }
+    // Both logical queues are externally bounded by permits reserved before
+    // work becomes visible. Their unbounded transport makes each final-lease
+    // send nonblocking and immune to best-effort saturation.
+    let (video, video_receiver) = std::sync::mpsc::channel();
+    let (best_effort, best_effort_receiver) = std::sync::mpsc::channel();
+    let (wake, wake_receiver) = std::sync::mpsc::sync_channel(1);
+    let worker_best_effort = best_effort.clone();
+    std::thread::Builder::new()
+        .name("aterm-artifact-cleanup".into())
+        .spawn(move || {
+            artifact_cleanup_worker(
+                &video_receiver,
+                &best_effort_receiver,
+                &wake_receiver,
+                &worker_best_effort,
+            );
+        })
+        .ok()?;
+    let scheduler = ArtifactCleanupScheduler {
+        video,
+        best_effort,
+        wake,
+    };
+    let published = SCHEDULER.set(scheduler).is_ok();
+    debug_assert!(published, "cleanup scheduler initialization serialized");
+    SCHEDULER.get()
+}
+
+fn notify_artifact_cleanup_worker(scheduler: &ArtifactCleanupScheduler) {
+    let _ = scheduler.wake.try_send(());
+}
+
+fn try_schedule_artifact_cleanup(task: ArtifactCleanupTask) -> bool {
+    let Some(scheduler) = artifact_cleanup_scheduler() else {
+        return false;
+    };
+    if scheduler.best_effort.send(task).is_err() {
+        return false;
+    }
+    notify_artifact_cleanup_worker(scheduler);
+    true
+}
+
+fn try_schedule_video_retention(task: VideoRetentionTask) -> bool {
+    let Some(scheduler) = artifact_cleanup_scheduler() else {
+        return false;
+    };
+    if scheduler.video.send(task).is_err() {
+        return false;
+    }
+    notify_artifact_cleanup_worker(scheduler);
+    true
+}
+
+fn reserve_artifact_cleanup_queue() -> Option<ArtifactCleanupQueuePermit> {
+    artifact_cleanup_scheduler()?;
+    ArtifactCleanupQueuePermit::try_acquire()
+}
+
+fn reserve_video_retention(path: &Path) -> Option<crate::control::VideoRetentionPermit> {
+    artifact_cleanup_scheduler()?;
+    crate::control::ReplyRetention::try_reserve_video_retention_for_path(path)
+}
+
+#[derive(Debug)]
+struct PendingDeadNamespaceSweep {
+    dirty: bool,
+}
+
+fn pending_dead_namespace_sweeps()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, PendingDeadNamespaceSweep>> {
+    static PENDING: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PendingDeadNamespaceSweep>>,
+    > = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Coalesce repeated capture-time GC requests and hand the actual directory
+/// census to the single bounded cleanup worker. Admission performs no scan or
+/// recursive deletion.
+fn schedule_dead_instance_namespace_sweep(
+    root: &Path,
+    current: &str,
+    queue: ArtifactCleanupQueuePermit,
+) {
+    let root = root.to_path_buf();
+    let pending = pending_dead_namespace_sweeps();
+    let mut held = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = held.get_mut(&root) {
+        // A persistent ReadDir is not required to observe entries created
+        // after it opened. Remember the coalesced generation so EOF restarts
+        // from a fresh cursor instead of losing the only lifecycle kick.
+        existing.dirty = true;
+        return;
+    }
+    held.insert(root.clone(), PendingDeadNamespaceSweep { dirty: false });
+    drop(held);
+    if !try_schedule_artifact_cleanup(ArtifactCleanupTask::DeadNamespaces {
+        root: root.clone(),
+        current: current.to_string(),
+        _queue: queue,
+    }) {
+        clear_pending_dead_namespace_sweep(&root);
+    }
+}
+
+fn clear_pending_dead_namespace_sweep(root: &Path) {
+    pending_dead_namespace_sweeps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(root);
+}
+
+fn recover_artifact_cleanup_after_panic(
+    recovery: ArtifactCleanupPanicRecovery,
+    sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+) {
+    match recovery {
+        ArtifactCleanupPanicRecovery::AutomaticImages {
+            dir,
+            expected_dir,
+            fresh,
+            queue,
+        } => {
+            let _ = sender.send(ArtifactCleanupTask::AutomaticImages {
+                dir,
+                expected_dir,
+                fresh,
+                _queue: queue,
+            });
+        }
+        ArtifactCleanupPanicRecovery::DeadNamespaces {
+            root,
+            current,
+            queue,
+        } => {
+            let pending = pending_dead_namespace_sweeps();
+            let mut held = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(state) = held.get_mut(&root) else {
+                return;
+            };
+            // The replacement task opens a fresh cursor and therefore covers
+            // every generation visible before this point. A later lifecycle
+            // kick sets `dirty` again and forces one more restart at EOF.
+            state.dirty = false;
+            drop(held);
+            if sender
+                .send(ArtifactCleanupTask::DeadNamespaces {
+                    root: root.clone(),
+                    current,
+                    _queue: queue,
+                })
+                .is_err()
+            {
+                clear_pending_dead_namespace_sweep(&root);
+            }
+        }
+        ArtifactCleanupPanicRecovery::VideoTombstones {
+            root,
+            expected_root,
+            queue,
+        } => {
+            let pending = pending_video_tombstone_sweeps();
+            let mut held = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = held
+                .iter_mut()
+                .find(|entry| entry.root == root && entry.expected_root == expected_root)
+            else {
+                return;
+            };
+            entry.dirty = false;
+            drop(held);
+            if sender
+                .send(ArtifactCleanupTask::VideoTombstones {
+                    root: root.clone(),
+                    expected_root,
+                    _queue: queue,
+                })
+                .is_err()
+            {
+                clear_pending_video_tombstone_sweep(&root, expected_root);
+            }
+        }
+        #[cfg(test)]
+        ArtifactCleanupPanicRecovery::Barrier(done) => {
+            let _ = sender.send(ArtifactCleanupTask::Barrier(done));
+        }
+    }
+}
+
+fn finish_or_restart_dead_namespace_sweep(
+    root: PathBuf,
+    current: String,
+    queue: ArtifactCleanupQueuePermit,
+    sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+) {
+    let pending = pending_dead_namespace_sweeps();
+    let mut held = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = held.get_mut(&root) else {
+        return;
+    };
+    if !state.dirty {
+        held.remove(&root);
+        return;
+    }
+    state.dirty = false;
+    drop(held);
+    if sender
+        .send(ArtifactCleanupTask::DeadNamespaces {
+            root: root.clone(),
+            current,
+            _queue: queue,
+        })
+        .is_err()
+    {
+        clear_pending_dead_namespace_sweep(&root);
+    }
+}
+
+fn finish_video_retention_sweep(key: &Path) {
+    let (leases, changed) = artifact_path_leases();
+    let mut held = leases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held
+        .get(key)
+        .is_some_and(|state| state.count == 0 && state.sweeping)
+    {
+        held.remove(key);
+    }
+    artifact_reader_finish_sweep_anchor();
+    changed.notify_all();
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_artifact_cleanup_for_test(path: &Path) {
+    // Test fixtures often build paths under macOS's `/var` spelling while
+    // confinement registers the canonical `/private/var` spelling. Preserve
+    // the registry key even if an ancestor was replaced after the lease was
+    // acquired; canonicalization changes spelling, not the stored path text.
+    let key = path
+        .ancestors()
+        .find_map(|ancestor| {
+            let canonical = std::fs::canonicalize(ancestor).ok()?;
+            let tail = path.strip_prefix(ancestor).ok()?;
+            Some(if tail.as_os_str().is_empty() {
+                canonical
+            } else {
+                canonical.join(tail)
+            })
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (leases, changed) = artifact_path_leases();
+    let mut held = leases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while held.contains_key(&key) {
+        let now = std::time::Instant::now();
+        assert!(now < deadline, "artifact cleanup timed out for {key:?}");
+        let (next, timeout) = changed
+            .wait_timeout(held, deadline.saturating_duration_since(now))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held = next;
+        assert!(!timeout.timed_out() || !held.contains_key(&key));
+    }
+}
+
+#[cfg(test)]
+fn wait_for_best_effort_cleanup_barrier_for_test() {
+    let (done, completed) = std::sync::mpsc::sync_channel(1);
+    assert!(try_schedule_artifact_cleanup(ArtifactCleanupTask::Barrier(
+        done
+    )));
+    completed
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("artifact best-effort cleanup barrier timed out");
+}
+
+fn run_video_retention_task(mut task: VideoRetentionTask) {
+    let root = task
+        .root
+        .as_ref()
+        .expect("video retention task owns its pinned root");
+    if let Ok(true) = prune_video_dirs(root, &task.fresh) {
+        let _ = root.sync();
+    }
+    // Close the transferred capability and release its reservation before
+    // the completion guard wakes a waiter. Keeping both fields inside `task`
+    // also gives panic unwinding the same declaration-order guarantee.
+    drop(task.root.take());
+    drop(task.admission.take());
+}
+
+fn run_best_effort_cleanup_task(
+    task: ArtifactCleanupTask,
+    sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+) {
+    match task {
+        ArtifactCleanupTask::AutomaticImages {
+            dir,
+            expected_dir,
+            fresh,
+            _queue,
+        } => {
+            let Some(admission) =
+                crate::control::ReplyRetention::try_reserve_cleanup_for_path(&dir)
+            else {
+                let _ = sender.send(ArtifactCleanupTask::AutomaticImages {
+                    dir,
+                    expected_dir,
+                    fresh,
+                    _queue,
+                });
+                return;
+            };
+            let Ok(pinned) = crate::pinned_dir::PinnedDir::open(&dir) else {
+                return;
+            };
+            if pinned.retained_identity().ok() != Some(expected_dir)
+                || pinned.validate_path_identity().is_err()
+            {
+                return;
+            }
+            prune_automatic_image_dir_at(&dir, &fresh, &pinned);
+            drop(admission);
+        }
+        ArtifactCleanupTask::DeadNamespaces {
+            root,
+            current,
+            _queue,
+        } => {
+            let Some(admission) =
+                crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+            else {
+                let _ = sender.send(ArtifactCleanupTask::DeadNamespaces {
+                    root,
+                    current,
+                    _queue,
+                });
+                return;
+            };
+            let mut sweep =
+                match DeadNamespaceSweep::begin(&root, current.clone(), _queue, admission) {
+                    Ok(sweep) => sweep,
+                    Err(queue) => {
+                        finish_or_restart_dead_namespace_sweep(root, current, queue, sender);
+                        return;
+                    }
+                };
+            if sweep.run_batch(&imp::pid_alive) {
+                finish_or_restart_dead_namespace_cursor(sweep, sender);
+            } else if sender
+                .send(ArtifactCleanupTask::DeadNamespaceContinuation(sweep))
+                .is_err()
+            {
+                clear_pending_dead_namespace_sweep(&root);
+            }
+        }
+        ArtifactCleanupTask::DeadNamespaceContinuation(mut sweep) => {
+            let root = sweep.root_path.clone();
+            if sweep.run_batch(&imp::pid_alive) {
+                finish_or_restart_dead_namespace_cursor(sweep, sender);
+            } else if sender
+                .send(ArtifactCleanupTask::DeadNamespaceContinuation(sweep))
+                .is_err()
+            {
+                clear_pending_dead_namespace_sweep(&root);
+            }
+        }
+        ArtifactCleanupTask::VideoTombstones {
+            root,
+            expected_root,
+            _queue,
+        } => {
+            let Some(admission) =
+                crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+            else {
+                let _ = sender.send(ArtifactCleanupTask::VideoTombstones {
+                    root,
+                    expected_root,
+                    _queue,
+                });
+                return;
+            };
+            let Some(mut sweep) =
+                VideoTombstoneSweep::begin(&root, expected_root, _queue, admission)
+            else {
+                clear_pending_video_tombstone_sweep(&root, expected_root);
+                return;
+            };
+            if sweep.run_batch() {
+                finish_or_restart_video_tombstone_sweep(sweep, sender);
+            } else if sender
+                .send(ArtifactCleanupTask::VideoTombstoneContinuation(sweep))
+                .is_err()
+            {
+                clear_pending_video_tombstone_sweep(&root, expected_root);
+            }
+        }
+        ArtifactCleanupTask::VideoTombstoneContinuation(mut sweep) => {
+            let root = sweep.root_path.clone();
+            let expected_root = sweep.expected_root;
+            if sweep.run_batch() {
+                finish_or_restart_video_tombstone_sweep(sweep, sender);
+            } else if sender
+                .send(ArtifactCleanupTask::VideoTombstoneContinuation(sweep))
+                .is_err()
+            {
+                clear_pending_video_tombstone_sweep(&root, expected_root);
+            }
+        }
+        #[cfg(test)]
+        ArtifactCleanupTask::Barrier(done) => {
+            let _ = done.try_send(());
+        }
+        #[cfg(test)]
+        ArtifactCleanupTask::PanicForTest(_) => {
+            panic!("injected artifact cleanup worker panic")
+        }
+    }
+}
+
+fn artifact_cleanup_worker(
+    video_receiver: &std::sync::mpsc::Receiver<VideoRetentionTask>,
+    best_effort_receiver: &std::sync::mpsc::Receiver<ArtifactCleanupTask>,
+    wake_receiver: &std::sync::mpsc::Receiver<()>,
+    best_effort_sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+) {
+    loop {
+        // Correctness-critical retention is checked before every bounded GC
+        // slice. New GC cannot overtake it, while each persistent cursor still
+        // makes progress by requeueing at the best-effort tail.
+        if let Ok(task) = video_receiver.try_recv() {
+            // A cleanup defect must not permanently strand the static senders
+            // on a dead receiver. The task's completion guard unwinds after its
+            // root and permit, reconciling the lease registry before we poll
+            // the next priority item.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_video_retention_task(task);
+            }));
+            continue;
+        }
+        if let Ok(task) = best_effort_receiver.try_recv() {
+            let recovery = task.panic_recovery();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_best_effort_cleanup_task(task, best_effort_sender);
+            }))
+            .is_err()
+            {
+                recover_artifact_cleanup_after_panic(recovery, best_effort_sender);
+            }
+            continue;
+        }
+        if wake_receiver.recv().is_err() {
+            return;
+        }
+    }
 }
 
 fn register_unique_artifact_path(
     key: PathBuf,
     video_sweep: VideoRetentionSweep,
-) -> Option<ArtifactPathLease> {
+    video_retention: crate::control::VideoRetentionPermit,
+) -> Result<ArtifactPathLease, crate::control::VideoRetentionPermit> {
     if video_sweep.root.path().join(&video_sweep.fresh) != key {
-        return None;
+        return Err(video_retention);
     }
     let (leases, _) = artifact_path_leases();
     let mut held = leases
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if held.contains_key(&key) {
-        return None;
+        return Err(video_retention);
     }
     held.insert(
         key.clone(),
@@ -359,20 +1144,30 @@ fn register_unique_artifact_path(
             video_identity: Some(video_sweep.identity),
             video_sweep_requested: false,
             sweeping: false,
+            video_retention: Some(video_retention),
         },
     );
     drop(held);
     artifact_reader_acquire_anchor();
-    Some(ArtifactPathLease {
+    Ok(ArtifactPathLease {
         key: Some(key),
         os_lock: None,
         video_sweep: Some(video_sweep),
+        _deferred_cleanup: None,
     })
 }
 
 pub(crate) fn acquire_capture_name_lease(
     target: &ConfinedImage,
     cancelled: impl Fn() -> bool,
+) -> std::io::Result<Option<ArtifactPathLease>> {
+    acquire_capture_name_lease_with_wait(target, cancelled, CAPTURE_NAMESPACE_WAIT)
+}
+
+fn acquire_capture_name_lease_with_wait(
+    target: &ConfinedImage,
+    cancelled: impl Fn() -> bool,
+    explicit_wait: std::time::Duration,
 ) -> std::io::Result<Option<ArtifactPathLease>> {
     // Auto captures live in this process's launch-unique namespace and have
     // server-minted collision-resistant names. Their local path lease is enough
@@ -391,15 +1186,21 @@ pub(crate) fn acquire_capture_name_lease(
     let mut held = leases
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The lease remains with an explicit reply through its client ACK, so a
+    // millisecond of ordinary handoff overlap should queue rather than fail.
+    // This runs on the singleton encode worker, hence the explicit deadline:
+    // a wedged reply is reported instead of parking unrelated encodes.
+    let waited_from = std::time::Instant::now();
     while held.contains_key(&key) {
-        if !automatic {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "another explicit capture reply owns the shared image namespace",
-            ));
-        }
         if cancelled() {
             return Ok(None);
+        }
+        if !automatic && waited_from.elapsed() >= explicit_wait {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "another explicit capture reply still owns the shared image \
+                 namespace after waiting — release the previous capture's reply",
+            ));
         }
         let (next, _) = changed
             .wait_timeout(held, std::time::Duration::from_millis(25))
@@ -416,6 +1217,7 @@ pub(crate) fn acquire_capture_name_lease(
             video_identity: None,
             video_sweep_requested: false,
             sweeping: false,
+            video_retention: None,
         },
     );
     drop(held);
@@ -424,6 +1226,7 @@ pub(crate) fn acquire_capture_name_lease(
         key: Some(key),
         os_lock: None,
         video_sweep: None,
+        _deferred_cleanup: target.deferred_cleanup.clone(),
     };
     if !automatic {
         // Lock the SAME retained authority the writer uses. On Unix the
@@ -432,11 +1235,11 @@ pub(crate) fn acquire_capture_name_lease(
         // locks a child file reached through the deny-delete pinned directory;
         // its share mode prevents replacement for the full lock lifetime.
         #[cfg(unix)]
-        let file = target.pinned.open_directory_lock()?;
+        let file = target.pinned()?.open_directory_lock()?;
         #[cfg(windows)]
         let file = {
             let lock_dir = target
-                .pinned
+                .pinned()?
                 .ensure_child(std::ffi::OsStr::new(CAPTURE_LOCK_DIR))?;
             lock_dir.open_namespace_lock(std::ffi::OsStr::new(CAPTURE_NAMESPACE_LEASE_FILE))?
         };
@@ -466,6 +1269,35 @@ pub(crate) fn acquire_capture_name_lease(
 /// the capability-bound convergence sweep. The caller must drop its pinned
 /// candidate handles and retry rather than returning paths from that in-between
 /// state.
+fn join_video_artifact_state(
+    state: &mut ArtifactLeaseState,
+    identity: VideoLeaseIdentity,
+) -> std::io::Result<bool> {
+    if state.sweeping {
+        artifact_reader_reject_acquire_anchor();
+        return Ok(false);
+    }
+    match state.video_identity {
+        Some(expected) if expected != identity => {
+            artifact_reader_reject_replaced_identity_anchor();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "recording identity changed while acquiring retention",
+            ));
+        }
+        Some(_) => {}
+        None => state.video_identity = Some(identity),
+    }
+    if state.video_retention.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "video retention cleanup admission is unavailable",
+        ));
+    }
+    state.count = state.count.saturating_add(1);
+    Ok(true)
+}
+
 pub(crate) fn retain_video_artifact_path(
     root: crate::pinned_dir::PinnedDir,
     fresh: std::ffi::OsString,
@@ -486,24 +1318,41 @@ pub(crate) fn retain_video_artifact_path(
     let mut held = leases
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state = held.entry(key.clone()).or_default();
-    if state.sweeping {
-        artifact_reader_reject_acquire_anchor();
+    let joined = if let Some(state) = held.get_mut(&key) {
+        join_video_artifact_state(state, identity)?
+    } else {
+        drop(held);
+        let video_retention = reserve_video_retention(root.path()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "video retention cleanup lane is busy",
+            )
+        })?;
+        held = leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = held.get_mut(&key) {
+            let joined = join_video_artifact_state(state, identity)?;
+            drop(video_retention);
+            joined
+        } else {
+            held.insert(
+                key.clone(),
+                ArtifactLeaseState {
+                    count: 1,
+                    video_identity: Some(identity),
+                    video_sweep_requested: false,
+                    sweeping: false,
+                    video_retention: Some(video_retention),
+                },
+            );
+            true
+        }
+    };
+    drop(held);
+    if !joined {
         return Ok(None);
     }
-    match state.video_identity {
-        Some(expected) if expected != identity => {
-            artifact_reader_reject_replaced_identity_anchor();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "recording identity changed while acquiring retention",
-            ));
-        }
-        Some(_) => {}
-        None => state.video_identity = Some(identity),
-    }
-    state.count = state.count.saturating_add(1);
-    drop(held);
     artifact_reader_acquire_anchor();
     Ok(Some(ArtifactPathLease {
         key: Some(key),
@@ -513,6 +1362,7 @@ pub(crate) fn retain_video_artifact_path(
             fresh,
             identity,
         }),
+        _deferred_cleanup: None,
     }))
 }
 
@@ -653,14 +1503,17 @@ impl Drop for ArtifactPathLease {
         }
         let sweep = if state.count == 0 {
             if state.video_sweep_requested {
-                match self.video_sweep.take() {
-                    Some(sweep) => {
+                match (self.video_sweep.take(), state.video_retention.take()) {
+                    (Some(sweep), Some(admission)) => {
                         state.sweeping = true;
                         artifact_reader_start_sweep_anchor();
-                        Some(sweep)
+                        Some((sweep, admission))
                     }
-                    None => {
-                        debug_assert!(false, "armed video lease lost its sweep capability");
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "armed video lease lost its sweep capability or reserved admission"
+                        );
                         held.remove(&key);
                         None
                     }
@@ -674,19 +1527,18 @@ impl Drop for ArtifactPathLease {
         };
         changed.notify_all();
         drop(held);
-        if let Some(sweep) = sweep {
-            prune_video_after_final_lease(&sweep.root, &sweep.fresh);
-            let mut held = leases
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if held
-                .get(&key)
-                .is_some_and(|state| state.count == 0 && state.sweeping)
-            {
-                held.remove(&key);
-            }
-            artifact_reader_finish_sweep_anchor();
-            changed.notify_all();
+        if let Some((sweep, admission)) = sweep {
+            let task = VideoRetentionTask {
+                root: Some(sweep.root),
+                fresh: sweep.fresh,
+                admission: Some(admission),
+                _completion: VideoRetentionCompletion { key },
+            };
+            // The task's slot was reserved when this registry key was admitted;
+            // best-effort work cannot saturate this nonblocking lane. If the
+            // worker is unavailable, dropping the unsent task completes the
+            // registry transition after releasing its retained resources.
+            let _ = try_schedule_video_retention(task);
         }
     }
 }
@@ -1031,77 +1883,226 @@ fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
 /// has been reused. Legacy namespaces without a lease retain the older PID
 /// fallback. Links/reparse points and malformed/unreadable leases are refused,
 /// never followed or guessed dead.
+const DEAD_INSTANCE_SCAN_LIMIT: usize = 256;
+const DEAD_INSTANCE_DELETE_LIMIT: usize = 16_384;
+const DEAD_INSTANCE_TOMBSTONE_PREFIX: &str = ".instance-prune-";
+
+fn fresh_instance_tombstone_name() -> std::ffi::OsString {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::ffi::OsString::from(format!(
+        "{DEAD_INSTANCE_TOMBSTONE_PREFIX}{}-{sequence:020}",
+        process_instance_id()
+    ))
+}
+
+fn cleanup_instance_tombstone(
+    root: &crate::pinned_dir::PinnedDir,
+    name: &std::ffi::OsStr,
+    namespace: &crate::pinned_dir::PinnedDir,
+    delete_budget: &mut usize,
+) -> bool {
+    let cleared = namespace.clear_contents_with_budget(delete_budget);
+    let mut mutated = cleared.removed > 0;
+    if cleared.result.is_ok() && *delete_budget > 0 {
+        *delete_budget -= 1;
+        if root.remove_empty_child_exact(name, namespace).is_ok() {
+            mutated = true;
+        }
+    }
+    mutated
+}
+
+struct DeadNamespaceSweep {
+    root_path: PathBuf,
+    root: crate::pinned_dir::PinnedDir,
+    entries: std::fs::ReadDir,
+    current: String,
+    /// Retained across continuation batches, so requeueing cannot exceed the
+    /// bounded population admitted before the first scan.
+    _queue: ArtifactCleanupQueuePermit,
+    /// Last so both retained directory handles close before the cleanup slot.
+    _admission: crate::control::ArtifactCleanupPermit,
+}
+
+impl DeadNamespaceSweep {
+    fn begin(
+        root: &Path,
+        current: String,
+        queue: ArtifactCleanupQueuePermit,
+        admission: crate::control::ArtifactCleanupPermit,
+    ) -> Result<Self, ArtifactCleanupQueuePermit> {
+        let root_path = match std::fs::canonicalize(root) {
+            Ok(path) => path,
+            Err(_) => return Err(queue),
+        };
+        let pinned_root = match crate::pinned_dir::PinnedDir::open(&root_path) {
+            Ok(root) => root,
+            Err(_) => return Err(queue),
+        };
+        let entries = match std::fs::read_dir(&root_path) {
+            Ok(entries) => entries,
+            Err(_) => return Err(queue),
+        };
+        // Bind the lexical iterator to the retained root before it can become a
+        // queued continuation. Later mutation is handle-rooted.
+        if pinned_root.validate_path_identity().is_err() {
+            return Err(queue);
+        }
+        Ok(Self {
+            root_path,
+            root: pinned_root,
+            entries,
+            current,
+            _queue: queue,
+            _admission: admission,
+        })
+    }
+
+    /// Consume one bounded slice of a persistent directory cursor. Returning
+    /// `true` means the cursor is exhausted or its retained root was replaced.
+    /// Continuations prevent a permanent live/clutter prefix from starving
+    /// valid stale namespaces beyond the first scan slice.
+    fn run_batch(&mut self, pid_alive: impl FnMut(u32) -> bool) -> bool {
+        self.run_batch_with_hook(pid_alive, || {})
+    }
+
+    fn run_batch_with_hook(
+        &mut self,
+        mut pid_alive: impl FnMut(u32) -> bool,
+        mut before_lease_probe: impl FnMut(),
+    ) -> bool {
+        if self.root.validate_path_identity().is_err() {
+            return true;
+        }
+        let mut delete_budget = DEAD_INSTANCE_DELETE_LIMIT;
+        let mut mutated = false;
+        for _ in 0..DEAD_INSTANCE_SCAN_LIMIT {
+            if delete_budget == 0 {
+                break;
+            }
+            let entry_name = match self.entries.next() {
+                Some(Ok(entry)) => entry.file_name(),
+                Some(Err(_)) => continue,
+                None => {
+                    if mutated {
+                        let _ = self.root.sync();
+                    }
+                    return true;
+                }
+            };
+            let Some(name) = entry_name.to_str() else {
+                continue;
+            };
+            if name.starts_with(DEAD_INSTANCE_TOMBSTONE_PREFIX) {
+                if let Ok(namespace) = self.root.child(&entry_name) {
+                    mutated |= cleanup_instance_tombstone(
+                        &self.root,
+                        &entry_name,
+                        &namespace,
+                        &mut delete_budget,
+                    );
+                }
+                continue;
+            }
+            if name == self.current {
+                continue;
+            }
+            let Some(pid) = instance_pid(name) else {
+                continue;
+            };
+            let Ok(namespace) = self.root.child(&entry_name) else {
+                continue;
+            };
+            if namespace.validate_path_identity().is_err() {
+                continue;
+            }
+            before_lease_probe();
+            let (lease_state, acquired_lease) = match namespace
+                .open_existing_namespace_lock_at_retained(std::ffi::OsStr::new(INSTANCE_LEASE_FILE))
+            {
+                Ok(lease) => match lease.try_lock() {
+                    Ok(()) => (InstanceLeaseState::Acquirable, Some(lease)),
+                    Err(std::fs::TryLockError::WouldBlock) => (InstanceLeaseState::Held, None),
+                    Err(std::fs::TryLockError::Error(_)) => (InstanceLeaseState::Invalid, None),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (InstanceLeaseState::Missing, None)
+                }
+                Err(_) => (InstanceLeaseState::Invalid, None),
+            };
+            // PID is the compatibility authority ONLY for a pre-lease namespace.
+            let legacy_pid_alive = lease_state == InstanceLeaseState::Missing && pid_alive(pid);
+            if decide_instance_namespace_sweep(lease_state, legacy_pid_alive)
+                == InstanceSweepDecision::Remove
+            {
+                // Keep a successful exact-lease acquisition alive across the exact
+                // rename and bounded cleanup. Legacy/no-lease removal carries no
+                // guard by definition.
+                let _acquired_lease = acquired_lease;
+                if namespace.validate_path_identity().is_err() {
+                    continue;
+                }
+                let tombstone = fresh_instance_tombstone_name();
+                if self
+                    .root
+                    .rename_child_exact(&entry_name, &namespace, &tombstone)
+                    .is_err()
+                {
+                    continue;
+                }
+                delete_budget -= 1;
+                mutated = true;
+                mutated |= cleanup_instance_tombstone(
+                    &self.root,
+                    &tombstone,
+                    &namespace,
+                    &mut delete_budget,
+                );
+            }
+        }
+        if mutated {
+            let _ = self.root.sync();
+        }
+        false
+    }
+}
+
+fn finish_or_restart_dead_namespace_cursor(
+    sweep: DeadNamespaceSweep,
+    sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+) {
+    let DeadNamespaceSweep {
+        root_path,
+        root,
+        entries,
+        current,
+        _queue,
+        _admission,
+    } = sweep;
+    // A new cursor is permitted only after every descriptor and the shared
+    // best-effort slot from the completed generation have been released.
+    drop(entries);
+    drop(root);
+    drop(_admission);
+    finish_or_restart_dead_namespace_sweep(root_path, current, _queue, sender);
+}
+
+#[cfg(test)]
 fn sweep_dead_instance_namespaces_with(
     root: &Path,
     current: &str,
     mut pid_alive: impl FnMut(u32) -> bool,
 ) {
-    let Ok(root) = std::fs::canonicalize(root) else {
+    let queue = ArtifactCleanupQueuePermit::unmetered();
+    let Some(admission) = crate::control::ReplyRetention::try_reserve_cleanup_for_path(root) else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&root) else {
+    let Ok(mut sweep) = DeadNamespaceSweep::begin(root, current.to_string(), queue, admission)
+    else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name == current {
-            continue;
-        }
-        let Some(pid) = instance_pid(&name) else {
-            continue;
-        };
-        let Ok(canonical) = std::fs::canonicalize(&path) else {
-            continue;
-        };
-        if canonical.parent() != Some(root.as_path()) {
-            continue;
-        }
-
-        let lease_path = canonical.join(INSTANCE_LEASE_FILE);
-        let (lease_state, acquired_lease) = match std::fs::symlink_metadata(&lease_path) {
-            Ok(lease_metadata) => {
-                if metadata_is_link_or_reparse(&lease_metadata) || !lease_metadata.is_file() {
-                    (InstanceLeaseState::Invalid, None)
-                } else {
-                    match open_instance_lease(&canonical, false) {
-                        Ok(lease) => match lease.try_lock() {
-                            Ok(()) => (InstanceLeaseState::Acquirable, Some(lease)),
-                            Err(std::fs::TryLockError::WouldBlock) => {
-                                (InstanceLeaseState::Held, None)
-                            }
-                            Err(std::fs::TryLockError::Error(_)) => {
-                                (InstanceLeaseState::Invalid, None)
-                            }
-                        },
-                        Err(_) => (InstanceLeaseState::Invalid, None),
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (InstanceLeaseState::Missing, None)
-            }
-            Err(_) => (InstanceLeaseState::Invalid, None),
-        };
-        // PID is the compatibility authority ONLY for a pre-lease namespace.
-        let legacy_pid_alive = lease_state == InstanceLeaseState::Missing && pid_alive(pid);
-        if decide_instance_namespace_sweep(lease_state, legacy_pid_alive)
-            == InstanceSweepDecision::Remove
-        {
-            // Keep a successful exact-lease acquisition alive across recursive
-            // removal. Legacy/no-lease removal carries no guard by definition.
-            let _acquired_lease = acquired_lease;
-            let _ = std::fs::remove_dir_all(&canonical);
-        }
-    }
+    while !sweep.run_batch(&mut pid_alive) {}
 }
 
 /// Resolve one process instance's private recording root.
@@ -1122,6 +2123,202 @@ pub struct ConfinedVideoDir {
     _retention_lease: ArtifactPathLease,
     published: bool,
     batch_synced: std::cell::Cell<bool>,
+    /// Last field: natural destruction first closes recording/root handles and
+    /// runs `_retention_lease`; only then may coalesced tombstone/namespace GC
+    /// wake. Both queue slots were reserved before the recording was created.
+    deferred_cleanup: DeferredVideoCleanup,
+}
+
+fn fresh_video_tombstone_name() -> std::ffi::OsString {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::ffi::OsString::from(format!(".prune-{}-{sequence:020}", process_instance_id()))
+}
+
+struct PendingVideoTombstoneSweep {
+    root: PathBuf,
+    expected_root: crate::pinned_dir::PinnedDirIdentity,
+    /// A tombstone arrived after the current persistent cursor began. Restart
+    /// once after EOF so directory-iteration snapshot semantics cannot lose it.
+    dirty: bool,
+}
+
+fn pending_video_tombstone_sweeps() -> &'static std::sync::Mutex<Vec<PendingVideoTombstoneSweep>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<PendingVideoTombstoneSweep>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn schedule_video_tombstone_sweep(
+    root: &Path,
+    expected_root: crate::pinned_dir::PinnedDirIdentity,
+    queue: ArtifactCleanupQueuePermit,
+) {
+    let root = root.to_path_buf();
+    let pending = pending_video_tombstone_sweeps();
+    let mut held = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = held
+        .iter_mut()
+        .find(|entry| entry.root == root && entry.expected_root == expected_root)
+    {
+        existing.dirty = true;
+        return;
+    }
+    held.push(PendingVideoTombstoneSweep {
+        root: root.clone(),
+        expected_root,
+        dirty: false,
+    });
+    drop(held);
+    if !try_schedule_artifact_cleanup(ArtifactCleanupTask::VideoTombstones {
+        root: root.clone(),
+        expected_root,
+        _queue: queue,
+    }) {
+        clear_pending_video_tombstone_sweep(&root, expected_root);
+    }
+}
+
+fn clear_pending_video_tombstone_sweep(
+    root: &Path,
+    expected_root: crate::pinned_dir::PinnedDirIdentity,
+) {
+    pending_video_tombstone_sweeps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|entry| entry.root != root || entry.expected_root != expected_root);
+}
+
+struct VideoTombstoneSweep {
+    root_path: PathBuf,
+    root: crate::pinned_dir::PinnedDir,
+    entries: std::fs::ReadDir,
+    expected_root: crate::pinned_dir::PinnedDirIdentity,
+    restart_required: bool,
+    _queue: ArtifactCleanupQueuePermit,
+    /// Last so the retained cursor/root close before the best-effort descriptor
+    /// slot becomes visible to another cursor.
+    _admission: crate::control::ArtifactCleanupPermit,
+}
+
+impl VideoTombstoneSweep {
+    fn begin(
+        root: &Path,
+        expected_root: crate::pinned_dir::PinnedDirIdentity,
+        queue: ArtifactCleanupQueuePermit,
+        admission: crate::control::ArtifactCleanupPermit,
+    ) -> Option<Self> {
+        let root_path = std::fs::canonicalize(root).ok()?;
+        let pinned_root = crate::pinned_dir::PinnedDir::open(&root_path).ok()?;
+        if pinned_root.retained_identity().ok()? != expected_root {
+            return None;
+        }
+        let entries = std::fs::read_dir(&root_path).ok()?;
+        pinned_root.validate_path_identity().ok()?;
+        Some(Self {
+            root_path,
+            root: pinned_root,
+            entries,
+            expected_root,
+            restart_required: false,
+            _queue: queue,
+            _admission: admission,
+        })
+    }
+
+    /// Consume one bounded slice. `true` means this cursor reached EOF or its
+    /// lexical root no longer names the retained identity.
+    fn run_batch(&mut self) -> bool {
+        if self.root.validate_path_identity().is_err() {
+            return true;
+        }
+        let mut work = VideoPruneWork::new(VIDEO_PRUNE_WORK_LIMIT);
+        let mut mutated = false;
+        for _ in 0..VIDEO_PRUNE_SCAN_LIMIT {
+            let entry_name = match self.entries.next() {
+                Some(Ok(entry)) => entry.file_name(),
+                Some(Err(_)) => continue,
+                None => {
+                    if mutated {
+                        let _ = self.root.sync();
+                    }
+                    return true;
+                }
+            };
+            if !work.scan() {
+                self.restart_required = true;
+                break;
+            }
+            let Some(name) = entry_name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(".prune-") {
+                continue;
+            }
+            let Ok(recording) = self.root.child(&entry_name) else {
+                continue;
+            };
+            let cleanup = cleanup_video_tombstone(&self.root, &entry_name, &recording, &mut work);
+            mutated |= cleanup.mutated;
+            if !cleanup.removed && work.remaining == 0 {
+                self.restart_required = true;
+                break;
+            }
+        }
+        if mutated {
+            let _ = self.root.sync();
+        }
+        false
+    }
+}
+
+fn finish_or_restart_video_tombstone_sweep(
+    sweep: VideoTombstoneSweep,
+    sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+) {
+    let VideoTombstoneSweep {
+        root_path,
+        root,
+        entries,
+        expected_root,
+        restart_required,
+        _queue,
+        _admission,
+    } = sweep;
+    drop(entries);
+    drop(root);
+    drop(_admission);
+
+    let mut held = pending_video_tombstone_sweeps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(position) = held
+        .iter()
+        .position(|entry| entry.root == root_path && entry.expected_root == expected_root)
+    else {
+        return;
+    };
+    let restart = restart_required || held[position].dirty;
+    if restart {
+        held[position].dirty = false;
+    } else {
+        held.swap_remove(position);
+    }
+    drop(held);
+
+    if restart
+        && sender
+            .send(ArtifactCleanupTask::VideoTombstones {
+                root: root_path.clone(),
+                expected_root,
+                _queue,
+            })
+            .is_err()
+    {
+        clear_pending_video_tombstone_sweep(&root_path, expected_root);
+    }
 }
 
 /// Closed identity checkpoint for one frame in a private video bundle.
@@ -1236,10 +2433,21 @@ impl ConfinedVideoDir {
         let Some(recording) = self.recording.as_ref() else {
             return Ok(());
         };
+        let expected_root = self.instance.retained_identity()?;
+        let tombstone = fresh_video_tombstone_name();
+        // Make the unpublished name disappear with one handle-rooted rename.
+        // Recursive cleanup is delegated to the bounded singleton worker; a
+        // saturated queue merely leaves a recognizable tombstone for a later
+        // retention pass.
         self.instance
-            .remove_child_tree_exact(&self.name, recording)?;
+            .rename_child_exact(&self.name, recording, &tombstone)?;
         self.recording = None;
         self.path = None;
+        debug_assert_eq!(
+            expected_root, self.deferred_cleanup.tombstone_identity,
+            "video cleanup root identity changed before quarantine"
+        );
+        self.deferred_cleanup.arm_tombstone();
         Ok(())
     }
 
@@ -1402,38 +2610,57 @@ impl Drop for ConfinedVideoDir {
 #[must_use]
 #[cfg(test)]
 pub fn confine_video_dir(sock_dir: &Path) -> Option<ConfinedVideoDir> {
-    confine_video_dir_with_admission(sock_dir, |_| true)
+    confine_video_dir_with_admission(sock_dir, |_| true).ok()
 }
 
-#[must_use]
 pub(crate) fn confine_video_dir_with_admission(
     sock_dir: &Path,
     admit: impl FnOnce(&Path) -> bool,
-) -> Option<ConfinedVideoDir> {
+) -> Result<ConfinedVideoDir, ArtifactConfinementError> {
     confine_video_dir_for_instance_with_admission(sock_dir, process_instance_id(), admit)
 }
 
 #[must_use]
 #[cfg(test)]
 fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<ConfinedVideoDir> {
-    confine_video_dir_for_instance_with_admission(sock_dir, instance, |_| true)
+    confine_video_dir_for_instance_with_admission(sock_dir, instance, |_| true).ok()
 }
 
-#[must_use]
 fn confine_video_dir_for_instance_with_admission(
     sock_dir: &Path,
     instance: &str,
     admit: impl FnOnce(&Path) -> bool,
-) -> Option<ConfinedVideoDir> {
+) -> Result<ConfinedVideoDir, ArtifactConfinementError> {
     if !valid_instance_component(instance) {
-        return None;
+        return Err(ArtifactConfinementError::Invalid);
     }
-    let video_root = ensure_canonical_direct_child(sock_dir, VIDEO_DIR).ok()?;
-    let canon = ensure_canonical_direct_child(&video_root, instance).ok()?;
-    let instance_dir = crate::pinned_dir::PinnedDir::open_with_admission(&canon, admit).ok()?;
-    let instance_identity = instance_dir.retained_identity().ok()?;
-    hold_current_instance_lease(&canon).ok()?;
-    sweep_dead_instance_namespaces_with(&video_root, instance, &imp::pid_alive);
+    let video_root = ensure_canonical_direct_child(sock_dir, VIDEO_DIR)
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    let canon = ensure_canonical_direct_child(&video_root, instance)
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    let instance_dir = crate::pinned_dir::PinnedDir::open_with_admission(&canon, admit)
+        .map_err(confinement_open_error)?;
+    let instance_identity = instance_dir
+        .retained_identity()
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    hold_current_instance_lease(&canon).map_err(|_| ArtifactConfinementError::Invalid)?;
+    let mut video_retention = Some(
+        reserve_video_retention(instance_dir.path())
+            .ok_or(ArtifactConfinementError::AdmissionRefused)?,
+    );
+    let tombstone_queue =
+        reserve_artifact_cleanup_queue().ok_or(ArtifactConfinementError::AdmissionRefused)?;
+    let dead_queue =
+        reserve_artifact_cleanup_queue().ok_or(ArtifactConfinementError::AdmissionRefused)?;
+    let deferred_cleanup = DeferredVideoCleanup {
+        tombstone_root: instance_dir.path().to_path_buf(),
+        tombstone_identity: instance_identity,
+        tombstone_queue: Some(tombstone_queue),
+        tombstone_armed: false,
+        dead_root: video_root,
+        current: instance.to_string(),
+        dead_queue: Some(dead_queue),
+    };
     static RECORDING_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let base = RECORDING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     for n in 0..1000u32 {
@@ -1443,7 +2670,7 @@ fn confine_video_dir_for_instance_with_admission(
                 let path = recording.path().to_path_buf();
                 let Ok(recording_identity) = recording.retained_identity() else {
                     let _ = instance_dir.remove_child_tree_exact(&name, &recording);
-                    return None;
+                    return Err(ArtifactConfinementError::Invalid);
                 };
                 let video_sweep = VideoRetentionSweep {
                     root: instance_dir.clone(),
@@ -1453,13 +2680,21 @@ fn confine_video_dir_for_instance_with_admission(
                         recording: recording_identity,
                     },
                 };
-                let Some(retention_lease) =
-                    register_unique_artifact_path(path.clone(), video_sweep)
-                else {
-                    let _ = instance_dir.remove_child_tree_exact(&name, &recording);
-                    continue;
+                let retention_lease = match register_unique_artifact_path(
+                    path.clone(),
+                    video_sweep,
+                    video_retention
+                        .take()
+                        .expect("live video retention admission"),
+                ) {
+                    Ok(lease) => lease,
+                    Err(admission) => {
+                        video_retention = Some(admission);
+                        let _ = instance_dir.remove_child_tree_exact(&name, &recording);
+                        continue;
+                    }
                 };
-                return Some(ConfinedVideoDir {
+                return Ok(ConfinedVideoDir {
                     path: Some(path),
                     instance: instance_dir,
                     recording: Some(recording),
@@ -1467,13 +2702,14 @@ fn confine_video_dir_for_instance_with_admission(
                     _retention_lease: retention_lease,
                     published: false,
                     batch_synced: std::cell::Cell::new(false),
+                    deferred_cleanup,
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
+            Err(_) => return Err(ArtifactConfinementError::Invalid),
         }
     }
-    None
+    Err(ArtifactConfinementError::Invalid)
 }
 
 pub(crate) const AUTO_IMAGE_KEEP: usize = 32;
@@ -1485,32 +2721,47 @@ const AUTO_IMAGE_SCAN_BUDGET: usize = 256;
 #[must_use]
 #[cfg(test)]
 pub(crate) fn confine_automatic_image_path(sock_dir: &Path, stem: &str) -> Option<ConfinedImage> {
-    confine_automatic_image_path_with_admission(sock_dir, stem, |_| true)
+    confine_automatic_image_path_with_admission(sock_dir, stem, |_| true).ok()
 }
 
-#[must_use]
 pub(crate) fn confine_automatic_image_path_with_admission(
     sock_dir: &Path,
     stem: &str,
     admit: impl FnOnce(&Path) -> bool,
-) -> Option<ConfinedImage> {
+) -> Result<ConfinedImage, ArtifactConfinementError> {
     if stem.is_empty()
         || !stem
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     {
-        return None;
+        return Err(ArtifactConfinementError::Invalid);
     }
-    let images = ensure_canonical_direct_child(sock_dir, IMAGES_DIR).ok()?;
-    let auto = ensure_canonical_direct_child(&images, AUTO_IMAGES_DIR).ok()?;
-    let dir = ensure_canonical_direct_child(&auto, process_instance_id()).ok()?;
-    let pinned = crate::pinned_dir::PinnedDir::open_with_admission(&dir, admit).ok()?;
-    hold_current_instance_lease(&dir).ok()?;
-    sweep_dead_instance_namespaces_with(&auto, process_instance_id(), &imp::pid_alive);
-    Some(ConfinedImage {
+    let images = ensure_canonical_direct_child(sock_dir, IMAGES_DIR)
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    let auto = ensure_canonical_direct_child(&images, AUTO_IMAGES_DIR)
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    let dir = ensure_canonical_direct_child(&auto, process_instance_id())
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    let pinned = crate::pinned_dir::PinnedDir::open_with_admission(&dir, admit)
+        .map_err(confinement_open_error)?;
+    let image_identity = pinned
+        .retained_identity()
+        .map_err(|_| ArtifactConfinementError::Invalid)?;
+    hold_current_instance_lease(&dir).map_err(|_| ArtifactConfinementError::Invalid)?;
+    let file_name: std::ffi::OsString = automatic_capture_name(stem).into();
+    let deferred_cleanup = DeferredImageCleanup::reserve(
+        dir.clone(),
+        image_identity,
+        file_name.clone(),
+        auto,
+        process_instance_id().to_string(),
+    )
+    .ok_or(ArtifactConfinementError::AdmissionRefused)?;
+    Ok(ConfinedImage {
         dir,
-        file_name: automatic_capture_name(stem).into(),
-        pinned,
+        file_name,
+        pinned: Some(pinned),
+        deferred_cleanup: Some(deferred_cleanup),
     })
 }
 
@@ -1524,11 +2775,23 @@ fn automatic_capture_sequence(name: &std::ffi::OsStr) -> Option<u64> {
 /// legitimate server-named overflow makes progress across later sweeps.
 /// Same-uid undeletable or adversarial clutter may prevent reaching the exact
 /// [`AUTO_IMAGE_KEEP`] cap; it never delays or invalidates the fresh reply.
-pub(crate) fn prune_automatic_image_dir(target: &ConfinedImage) {
-    let dir = &target.dir;
-    let eligible = dir
-        .file_name()
-        .is_some_and(|name| name == std::ffi::OsStr::new(process_instance_id()))
+#[cfg(test)]
+fn prune_automatic_image_dir(target: &ConfinedImage) {
+    let Some(pinned) = target.pinned.as_ref() else {
+        return;
+    };
+    prune_automatic_image_dir_at(&target.dir, &target.file_name, pinned);
+}
+
+fn prune_automatic_image_dir_at(
+    dir: &Path,
+    fresh: &std::ffi::OsStr,
+    pinned: &crate::pinned_dir::PinnedDir,
+) {
+    let eligible = automatic_capture_sequence(fresh).is_some()
+        && dir
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(process_instance_id()))
         && dir
             .parent()
             .and_then(Path::file_name)
@@ -1539,19 +2802,19 @@ pub(crate) fn prune_automatic_image_dir(target: &ConfinedImage) {
     let _sweep = retention_sweep_gate()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Ok(entries) = target.pinned.names_up_to(AUTO_IMAGE_SCAN_BUDGET) else {
+    let Ok(entries) = pinned.names_up_to(AUTO_IMAGE_SCAN_BUDGET) else {
         return;
     };
-    let leased = leased_artifact_names(&target.dir, &target.file_name);
+    let leased = leased_artifact_names(dir, fresh);
     let mut protected = 1usize;
     let mut files = entries
         .into_iter()
         .filter_map(|name| {
-            if name == target.file_name {
+            if name == fresh {
                 return None;
             }
             let sequence = automatic_capture_sequence(&name)?;
-            if !target.pinned.is_regular_file(&name) {
+            if !pinned.is_regular_file(&name) {
                 return None;
             }
             if leased.contains(&name) {
@@ -1572,8 +2835,8 @@ pub(crate) fn prune_automatic_image_dir(target: &ConfinedImage) {
         if needed == 0 {
             break;
         }
-        let path = target.dir.join(&name);
-        if mutate_unleased_artifact(&path, || target.pinned.remove_file_if_exists(&name))
+        let path = dir.join(&name);
+        if mutate_unleased_artifact(&path, || pinned.remove_file_if_exists(&name))
             .is_some_and(|result| result.is_ok())
         {
             needed -= 1;
@@ -1598,8 +2861,10 @@ fn is_current_automatic_image(target: &ConfinedImage) -> bool {
 /// truncating its unique target. Explicit caller paths never satisfy the
 /// auto-namespace predicate and are therefore never unlinked on an error.
 pub(crate) fn cleanup_failed_automatic_image(target: &ConfinedImage) {
-    if is_current_automatic_image(target) {
-        let _ = target.pinned.remove_file_if_exists(&target.file_name);
+    if is_current_automatic_image(target)
+        && let Some(pinned) = target.pinned.as_ref()
+    {
+        let _ = pinned.remove_file_if_exists(&target.file_name);
     }
 }
 
@@ -1727,35 +2992,53 @@ fn completed_recording(
     CompletionProbe::Complete((marker, index))
 }
 
+struct VideoTombstoneCleanup {
+    removed: bool,
+    mutated: bool,
+}
+
 fn cleanup_video_tombstone(
     root: &crate::pinned_dir::PinnedDir,
     name: &std::ffi::OsStr,
     recording: &crate::pinned_dir::PinnedDir,
     work: &mut VideoPruneWork,
-) -> bool {
+) -> VideoTombstoneCleanup {
     let entry_allowance = (work.remaining / VIDEO_DELETE_WORK).min(VIDEO_PRUNE_DELETE_ENTRY_LIMIT);
     if entry_allowance == 0 {
-        return false;
+        return VideoTombstoneCleanup {
+            removed: false,
+            mutated: false,
+        };
     }
     let mut entries_left = entry_allowance;
-    let result = recording.clear_contents_with_budget(&mut entries_left);
+    let cleared = recording.clear_contents_with_budget(&mut entries_left);
     let used = entry_allowance.saturating_sub(entries_left);
     for _ in 0..used {
         if !work.delete() {
-            return false;
+            return VideoTombstoneCleanup {
+                removed: false,
+                mutated: cleared.removed > 0,
+            };
         }
     }
-    if result.is_err() || !work.delete() {
-        return false;
+    if cleared.result.is_err() || !work.delete() {
+        return VideoTombstoneCleanup {
+            removed: false,
+            mutated: cleared.removed > 0,
+        };
     }
-    root.remove_empty_child_exact(name, recording).is_ok()
+    let removed = root.remove_empty_child_exact(name, recording).is_ok();
+    VideoTombstoneCleanup {
+        removed,
+        mutated: cleared.removed > 0 || removed,
+    }
 }
 
 fn prune_video_dirs_with_work(
     root: &crate::pinned_dir::PinnedDir,
     fresh: &std::ffi::OsStr,
     work: &mut VideoPruneWork,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let _sweep = retention_sweep_gate()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1765,11 +3048,14 @@ fn prune_video_dirs_with_work(
     let mut tombstones = Vec::new();
     let mut completed = Vec::new();
     let mut protected_completed = 0usize;
+    let mut mutated = false;
     for name in names {
         if !work.scan() {
             break;
         }
-        let text = name.to_string_lossy();
+        let Some(text) = name.to_str() else {
+            continue;
+        };
         if text.starts_with(".prune-") {
             tombstones.push(name);
             continue;
@@ -1805,8 +3091,10 @@ fn prune_video_dirs_with_work(
         let Ok(recording) = root.child(&name) else {
             continue;
         };
-        if !cleanup_video_tombstone(root, &name, &recording, work) && work.remaining == 0 {
-            return Ok(());
+        let cleanup = cleanup_video_tombstone(root, &name, &recording, work);
+        mutated |= cleanup.mutated;
+        if !cleanup.removed && work.remaining == 0 {
+            return Ok(mutated);
         }
     }
 
@@ -1832,10 +3120,7 @@ fn prune_video_dirs_with_work(
         if !work.rename() {
             break;
         }
-        static PRUNE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = PRUNE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tombstone =
-            std::ffi::OsString::from(format!(".prune-p{}-{sequence:020}", std::process::id()));
+        let tombstone = fresh_video_tombstone_name();
         // Keep the marker/index identities pinned through the completion
         // decision, then release their two handles immediately before the
         // handle-rooted quarantine rename.
@@ -1848,37 +3133,23 @@ fn prune_video_dirs_with_work(
         if !renamed {
             continue;
         }
+        mutated = true;
         needed -= 1;
-        if !cleanup_video_tombstone(root, &tombstone, &recording, work) && work.remaining == 0 {
+        let cleanup = cleanup_video_tombstone(root, &tombstone, &recording, work);
+        mutated |= cleanup.mutated;
+        if !cleanup.removed && work.remaining == 0 {
             break;
         }
     }
-    Ok(())
+    Ok(mutated)
 }
 
 fn prune_video_dirs(
     root: &crate::pinned_dir::PinnedDir,
     fresh: &std::ffi::OsStr,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let mut work = VideoPruneWork::new(VIDEO_PRUNE_WORK_LIMIT);
     prune_video_dirs_with_work(root, fresh, &mut work)
-}
-
-/// A producer reply or frames reply may temporarily force the recording count
-/// above the cap. When the final shared lease releases, run the single requested
-/// bounded sweep without waiting for a future recording. Preserve the
-/// just-advertised recording as `fresh`: a response may already have crossed its
-/// ACK boundary while the client still needs a stable pathname to open.
-fn prune_video_after_final_lease(
-    root: &crate::pinned_dir::PinnedDir,
-    recording_name: &std::ffi::OsStr,
-) {
-    if let Err(error) = prune_video_dirs(root, recording_name) {
-        eprintln!("aterm-gui: video retention skipped after final lease release: {error}");
-    }
-    if let Err(error) = root.sync() {
-        eprintln!("aterm-gui: video retention sync failed after final lease release: {error}");
-    }
 }
 
 /// Resolve the per-user directory that holds the control socket, token, and
@@ -2237,15 +3508,49 @@ pub struct ConfinedImage {
     pub file_name: std::ffi::OsString,
     /// Every absolute ancestor plus the exact output directory, retained from
     /// confinement until the encode worker commits or refuses the reply.
-    pinned: crate::pinned_dir::PinnedDir,
+    pinned: Option<crate::pinned_dir::PinnedDir>,
+    /// Last field. The target and its path lease share this kick, so stale
+    /// namespace GC starts only after the final retained path capability closes.
+    deferred_cleanup: Option<std::sync::Arc<DeferredImageCleanup>>,
 }
 
 impl ConfinedImage {
+    /// Target-free sentinel for an inline image reply. It carries no path and no
+    /// filesystem descriptor; the encode worker's `want_bytes` branch consumes
+    /// it without invoking any file-only method.
+    pub(crate) fn in_memory() -> Self {
+        Self {
+            dir: PathBuf::new(),
+            file_name: std::ffi::OsString::new(),
+            pinned: None,
+            deferred_cleanup: None,
+        }
+    }
+
+    fn pinned(&self) -> std::io::Result<&crate::pinned_dir::PinnedDir> {
+        self.pinned.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an inline image has no filesystem target",
+            )
+        })
+    }
+
     /// The full path, for logging / `OK <w> <h> <path>` replies only — NOT for
     /// re-opening (the writer must use [`Self::dir`] + [`Self::file_name`]).
     #[must_use]
     pub fn display_path(&self) -> PathBuf {
         self.dir.join(&self.file_name)
+    }
+
+    /// Request best-effort auto-image retention after every retained target,
+    /// file, and path-lease capability has closed. The shared finalizer already
+    /// owns its queue admission, so arming performs no filesystem or scheduler
+    /// work on the reply's Drop path.
+    pub(crate) fn arm_automatic_prune(&self) {
+        if let Some(cleanup) = self.deferred_cleanup.as_ref() {
+            cleanup.arm_image_prune();
+        }
     }
 
     /// Write relative to the directory handle retained at confinement time.
@@ -2265,10 +3570,10 @@ impl ConfinedImage {
         authorize: impl FnOnce() -> bool,
     ) -> std::io::Result<crate::pinned_dir::PinnedFile> {
         if is_current_automatic_image(self) {
-            self.pinned
+            self.pinned()?
                 .write_new_private_authorized(&self.file_name, bytes, authorize)
         } else {
-            self.pinned
+            self.pinned()?
                 .write_private_authorized(&self.file_name, bytes, authorize)
         }
     }
@@ -2287,7 +3592,7 @@ impl ConfinedImage {
         &self,
         file: &crate::pinned_dir::PinnedFile,
     ) -> std::io::Result<()> {
-        self.pinned.validate_path_identity()?;
+        self.pinned()?.validate_path_identity()?;
         file.validate_entry_identity_at_retained()
     }
 
@@ -2298,7 +3603,8 @@ impl ConfinedImage {
         Self {
             dir,
             file_name: file_name.into(),
-            pinned,
+            pinned: Some(pinned),
+            deferred_cleanup: None,
         }
     }
 }
@@ -2306,7 +3612,7 @@ impl ConfinedImage {
 #[must_use]
 #[cfg(test)]
 pub fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<ConfinedImage> {
-    confine_image_path_with_admission(sock_dir, requested, |_| true)
+    confine_image_path_with_admission(sock_dir, requested, |_| true).ok()
 }
 
 /// Resolve a caller-supplied `image` path inside the socket directory's
@@ -2402,18 +3708,20 @@ fn resolve_confined_image_target(
     Some((canon_images, file_name.to_os_string()))
 }
 
-#[must_use]
 pub(crate) fn confine_image_path_with_admission(
     sock_dir: &Path,
     requested: &str,
     admit: impl FnOnce(&Path) -> bool,
-) -> Option<ConfinedImage> {
-    let (canon_images, file_name) = resolve_confined_image_target(sock_dir, requested)?;
-    let pinned = crate::pinned_dir::PinnedDir::open_with_admission(&canon_images, admit).ok()?;
-    Some(ConfinedImage {
+) -> Result<ConfinedImage, ArtifactConfinementError> {
+    let (canon_images, file_name) = resolve_confined_image_target(sock_dir, requested)
+        .ok_or(ArtifactConfinementError::Invalid)?;
+    let pinned = crate::pinned_dir::PinnedDir::open_with_admission(&canon_images, admit)
+        .map_err(confinement_open_error)?;
+    Ok(ConfinedImage {
         dir: canon_images,
         file_name,
-        pinned,
+        pinned: Some(pinned),
+        deferred_cleanup: None,
     })
 }
 
@@ -2807,8 +4115,8 @@ mod tests {
         });
         assert!(admission_checked, "capacity is consulted after confinement");
         assert!(
-            rejected.is_none(),
-            "a confined path can still be refused by resource admission"
+            matches!(rejected, Err(ArtifactConfinementError::AdmissionRefused)),
+            "a confined path reports resource refusal distinctly"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2916,6 +4224,128 @@ mod tests {
             b"explicit",
             "failure cleanup is structurally unable to unlink explicit targets"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_capture_waiter_acquires_after_reply_release() {
+        let dir = std::env::temp_dir().join(format!("aterm-img-lease-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let first = ConfinedImage::for_test(&dir, "first.png");
+        let first_lease = acquire_capture_name_lease(&first, || false)
+            .expect("first lease acquisition")
+            .expect("first explicit lease");
+        let second = ConfinedImage::for_test(&dir, "second.png");
+        let observed_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_observed_wait = std::sync::Arc::clone(&observed_wait);
+        let waiter = std::thread::spawn(move || {
+            acquire_capture_name_lease_with_wait(
+                &second,
+                || {
+                    worker_observed_wait.store(true, std::sync::atomic::Ordering::Release);
+                    false
+                },
+                std::time::Duration::from_secs(1),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !observed_wait.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            observed_wait.load(std::sync::atomic::Ordering::Acquire),
+            "the successor observed the retained reply lease"
+        );
+
+        drop(first_lease);
+        let second_lease = waiter
+            .join()
+            .expect("lease waiter remains live")
+            .expect("released predecessor wakes its waiter")
+            .expect("waiter acquires the explicit namespace");
+        drop(second_lease);
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_capture_wait_cancellation_wins() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-img-lease-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let first = ConfinedImage::for_test(&dir, "first.png");
+        let first_lease = acquire_capture_name_lease(&first, || false)
+            .expect("first lease acquisition")
+            .expect("first explicit lease");
+        let second = ConfinedImage::for_test(&dir, "second.png");
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = std::sync::Arc::clone(&cancelled);
+        let worker_observed_wait = std::sync::Arc::clone(&observed_wait);
+        let waiter = std::thread::spawn(move || {
+            acquire_capture_name_lease_with_wait(
+                &second,
+                || {
+                    worker_observed_wait.store(true, std::sync::atomic::Ordering::Release);
+                    worker_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                },
+                std::time::Duration::from_secs(1),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !observed_wait.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            observed_wait.load(std::sync::atomic::Ordering::Acquire),
+            "the cancellation probe reached the wait"
+        );
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(
+            waiter
+                .join()
+                .expect("lease waiter remains live")
+                .expect("cancellation is not an I/O failure")
+                .is_none(),
+            "cancellation wins without acquiring the retained namespace"
+        );
+        drop(first_lease);
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_capture_stuck_holder_returns_busy_after_bound() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-img-lease-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let first = ConfinedImage::for_test(&dir, "first.png");
+        let first_lease = acquire_capture_name_lease(&first, || false)
+            .expect("first lease acquisition")
+            .expect("first explicit lease");
+        let second = ConfinedImage::for_test(&dir, "second.png");
+        let error = acquire_capture_name_lease_with_wait(
+            &second,
+            || false,
+            std::time::Duration::from_millis(40),
+        )
+        .expect_err("a stuck predecessor must not park the encode worker");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(first_lease);
+        drop(first);
+        drop(second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3362,6 +4792,10 @@ mod tests {
         held.get(path).map(|state| state.count)
     }
 
+    fn wait_for_artifact_cleanup(path: &Path) {
+        wait_for_artifact_cleanup_for_test(path);
+    }
+
     #[test]
     fn video_producer_lease_spans_marker_visible_reader_handoff() {
         let dir = std::env::temp_dir().join(format!(
@@ -3424,6 +4858,7 @@ mod tests {
         );
 
         drop(reader);
+        wait_for_artifact_cleanup(&path);
         assert_eq!(
             artifact_lease_count(&path),
             None,
@@ -3480,6 +4915,7 @@ mod tests {
         drop(marker);
         drop(index);
         drop(producer);
+        wait_for_artifact_cleanup(&path);
         assert!(
             !oldest.exists(),
             "the final producer retains its own charged root through the sweep"
@@ -3538,6 +4974,7 @@ mod tests {
         std::fs::write(root_path.join("sentinel"), b"replacement").unwrap();
 
         drop(second);
+        wait_for_artifact_cleanup(&key);
         assert!(
             completed_video_fixture_count(&moved) < 12,
             "the unarmed final reader honors the prior sweep request on its own root"
@@ -3791,6 +5228,7 @@ mod tests {
         drop(marker);
         drop(index);
         drop(fresh);
+        wait_for_artifact_cleanup(&fresh_path);
         assert_eq!(published, fresh_path);
         let mut recs: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
@@ -3861,6 +5299,7 @@ mod tests {
         drop(fresh_marker);
         drop(fresh_index);
         drop(fresh);
+        wait_for_artifact_cleanup(&fresh_path);
 
         assert!(
             queued_path.join("index.json").is_file(),
@@ -3928,6 +5367,80 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Automatic-image namespace GC owns another retained directory chain. It
+    /// must not start until the target, sealed file, and reply lease release
+    /// theirs, especially when only one file-open worth of headroom remains.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn automatic_image_gc_waits_for_final_capability_under_low_nofile() {
+        const CHILD: &str = "ATERM_TEST_AUTO_IMAGE_DEFERRED_GC_NOFILE";
+        if !enter_low_nofile_test_child(
+            CHILD,
+            "control_auth::tests::automatic_image_gc_waits_for_final_capability_under_low_nofile",
+            16,
+        ) {
+            return;
+        }
+
+        let temp = aterm_tempfile::tempdir().expect("temporary automatic image root");
+        let target = confine_automatic_image_path(temp.path(), "image")
+            .expect("confinement fits the descriptor budget");
+        let namespace_root = target.dir.parent().unwrap().to_path_buf();
+        let path = target.display_path();
+        let lease = acquire_capture_name_lease(&target, || false)
+            .unwrap()
+            .expect("automatic path lease");
+        let file = target
+            .write_private(b"png")
+            .expect("no concurrent GC consumes the remaining file descriptor");
+        target.validate_for_reply(&file).unwrap();
+        for sequence in 0..(AUTO_IMAGE_KEEP + 2) {
+            let name = automatic_capture_name_for(
+                "image",
+                process_instance_id(),
+                9_000_000 + sequence as u64,
+            );
+            std::fs::write(target.dir.join(name), b"old").unwrap();
+        }
+        target.arm_automatic_prune();
+        assert!(path.is_file());
+        assert!(
+            !pending_dead_namespace_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&namespace_root),
+            "automatic-image confinement must not eagerly schedule namespace GC"
+        );
+
+        drop(target);
+        drop(file);
+        let image_count = || {
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .filter(|entry| automatic_capture_sequence(&entry.file_name()).is_some())
+                .count()
+        };
+        assert!(
+            image_count() > AUTO_IMAGE_KEEP,
+            "auto-image retention must remain deferred while the path lease is live"
+        );
+        assert!(
+            !pending_dead_namespace_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&namespace_root),
+            "the path lease keeps cleanup deferred until every capability closes"
+        );
+        drop(lease);
+        wait_for_best_effort_cleanup_barrier_for_test();
+        assert_eq!(
+            image_count(),
+            AUTO_IMAGE_KEEP,
+            "the pre-reserved worker sweep converges after the final capability closes"
+        );
     }
 
     /// Scanning keeps names, not one open directory per recording. Run the
@@ -4140,6 +5653,189 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn instance_lease_authority_stays_on_pinned_root_after_ancestor_swap() {
+        let temp = aterm_tempfile::tempdir().expect("temporary namespace root");
+        let root = temp.path().join("root");
+        let moved = temp.path().join("root-moved");
+        let replacement = temp.path().join("replacement");
+        ensure_private_dir(&root).unwrap();
+        ensure_private_dir(&replacement).unwrap();
+
+        let name = "p424244-held";
+        let original_namespace = ensure_canonical_direct_child(&root, name).unwrap();
+        let held_lease = open_instance_lease(&original_namespace, true).unwrap();
+        held_lease.try_lock().unwrap();
+
+        // The replacement advertises the same namespace name but an unlocked
+        // lease. A lexical lease reopen after the swap would misclassify the
+        // live original as abandoned and delete it through the retained root.
+        let replacement_namespace = ensure_canonical_direct_child(&replacement, name).unwrap();
+        drop(open_instance_lease(&replacement_namespace, true).unwrap());
+
+        let queue = ArtifactCleanupQueuePermit::unmetered();
+        let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+            .expect("test cleanup admission");
+        let mut sweep = DeadNamespaceSweep::begin(&root, "p1-current".into(), queue, admission)
+            .expect("pinned sweep");
+        let mut swapped = false;
+        assert!(sweep.run_batch_with_hook(
+            |_| false,
+            || {
+                if !swapped {
+                    std::fs::rename(&root, &moved).unwrap();
+                    std::fs::rename(&replacement, &root).unwrap();
+                    swapped = true;
+                }
+            }
+        ));
+        assert!(swapped, "the race hook ran immediately before lease open");
+        assert!(
+            moved.join(name).is_dir(),
+            "lease authority must be opened through the retained namespace handle"
+        );
+        assert!(
+            root.join(name).is_dir(),
+            "the replacement namespace is outside the sweep authority"
+        );
+
+        drop(sweep);
+        std::fs::rename(&root, &replacement).unwrap();
+        std::fs::rename(&moved, &root).unwrap();
+        held_lease.unlock().unwrap();
+        drop(held_lease);
+    }
+
+    #[test]
+    fn dead_namespace_debt_after_cursor_open_restarts_with_fresh_generation() {
+        let temp = aterm_tempfile::tempdir().expect("temporary namespace root");
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        pending_dead_namespace_sweeps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), PendingDeadNamespaceSweep { dirty: false });
+
+        let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+            .expect("test cleanup admission");
+        let mut sweep = DeadNamespaceSweep::begin(
+            &root,
+            "p1-current".into(),
+            ArtifactCleanupQueuePermit::unmetered(),
+            admission,
+        )
+        .expect("initial cursor");
+
+        // Model another lifecycle release after the cursor snapshot opened.
+        // ReadDir need not reveal any corresponding entry to this cursor; the
+        // dirty generation itself must force a new one after EOF.
+        schedule_dead_instance_namespace_sweep(
+            &root,
+            "p1-current",
+            ArtifactCleanupQueuePermit::unmetered(),
+        );
+        assert!(sweep.run_batch(|_| false));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        finish_or_restart_dead_namespace_cursor(sweep, &sender);
+        let ArtifactCleanupTask::DeadNamespaces {
+            root: restarted_root,
+            current,
+            _queue,
+        } = receiver.try_recv().expect("dirty debt schedules a restart")
+        else {
+            panic!("dirty debt must restart from a new namespace cursor");
+        };
+        assert_eq!(restarted_root, root);
+        assert_eq!(current, "p1-current");
+        clear_pending_dead_namespace_sweep(&root);
+    }
+
+    #[test]
+    fn cleanup_worker_recovers_both_pending_debts_after_task_panics() {
+        let temp = aterm_tempfile::tempdir().expect("temporary namespace root");
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let name = "p424245-panic-recovery";
+        let namespace = ensure_canonical_direct_child(&root, name).unwrap();
+        drop(open_instance_lease(&namespace, true).unwrap());
+        pending_dead_namespace_sweeps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), PendingDeadNamespaceSweep { dirty: false });
+
+        let scheduler = artifact_cleanup_scheduler().expect("cleanup worker");
+        scheduler
+            .best_effort
+            .send(ArtifactCleanupTask::PanicForTest(
+                ArtifactCleanupPanicRecovery::DeadNamespaces {
+                    root: root.clone(),
+                    current: "p1-current".into(),
+                    queue: ArtifactCleanupQueuePermit::unmetered(),
+                },
+            ))
+            .unwrap();
+        notify_artifact_cleanup_worker(scheduler);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while namespace.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !namespace.exists(),
+            "panic recovery must requeue the pending root on a fresh cursor"
+        );
+        assert!(
+            !pending_dead_namespace_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&root),
+            "the recovered sweep must reconcile its coalescing registry"
+        );
+
+        let video_root = ensure_canonical_direct_child(&root, "video-tombstones").unwrap();
+        let tombstone = ensure_canonical_direct_child(&video_root, ".prune-panic").unwrap();
+        std::fs::write(tombstone.join("partial"), b"partial").unwrap();
+        let pinned = crate::pinned_dir::PinnedDir::open(&video_root).unwrap();
+        let expected_root = pinned.retained_identity().unwrap();
+        drop(pinned);
+        pending_video_tombstone_sweeps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PendingVideoTombstoneSweep {
+                root: video_root.clone(),
+                expected_root,
+                dirty: false,
+            });
+        scheduler
+            .best_effort
+            .send(ArtifactCleanupTask::PanicForTest(
+                ArtifactCleanupPanicRecovery::VideoTombstones {
+                    root: video_root.clone(),
+                    expected_root,
+                    queue: ArtifactCleanupQueuePermit::unmetered(),
+                },
+            ))
+            .unwrap();
+        notify_artifact_cleanup_worker(scheduler);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tombstone.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !tombstone.exists(),
+            "video panic recovery must requeue the tombstone cursor"
+        );
+        assert!(
+            !pending_video_tombstone_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|entry| { entry.root == video_root && entry.expected_root == expected_root }),
+            "the recovered video sweep must reconcile its coalescing registry"
+        );
+    }
+
     #[test]
     fn instance_sweep_decision_is_total_and_lease_authoritative() {
         use InstanceLeaseState::{Acquirable, Held, Invalid, Missing};
@@ -4281,6 +5977,7 @@ mod tests {
         }
 
         let mut fresh = confine_video_dir_for_instance(&dir, &instance).unwrap();
+        let fresh_path = fresh.path().to_path_buf();
         let index = fresh
             .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
             .unwrap();
@@ -4288,6 +5985,7 @@ mod tests {
         drop(fresh.publish_marker().unwrap());
         drop(index);
         drop(fresh);
+        wait_for_artifact_cleanup(&fresh_path);
 
         assert!(
             !root.join("rec-00000000000000000010-000").exists(),

@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.69.0"
+version = "0.70.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -184,6 +184,12 @@ aterm-ffi = { path = "crates/aterm-ffi" }
 aterm-sandbox = { path = "crates/aterm-sandbox" }
 aterm-render = { path = "crates/aterm-render" }
 aterm-gpu = { path = "crates/aterm-gpu" }
+# The first-party Objective-C runtime layer (macOS): typed message sends,
+# ownership, RUNTIME CLASS CREATION and the block ABI. It exists to retire the
+# objc2 + block2 + objc2-* cluster (255,335 lines / 20 packages, 44% of
+# mac-arm's remaining third-party lines), so it has ZERO dependencies of its own
+# — see the crate docs.
+aterm-objc = { path = "crates/aterm-objc" }
 # Shared deterministic colour/easing, vector-path, and Tile raster primitives
 # used by aterm-effects.
 aterm-scene = { path = "crates/aterm-scene" }
@@ -384,6 +390,24 @@ cfg-if = { path = "crates/aterm-cfg-if" }
 # ever wants the shim can write `arrayvec = { workspace = true }` without
 # tripping the census's hard error on a `workspace = true` edge with no root row.
 arrayvec = { path = "crates/aterm-arrayvec" }
+# The first-party `core_maths` replacement, DIRECTORY crates/aterm-core-maths
+# but PACKAGE `core_maths` — same reason as the rows above. No workspace member
+# consumes it (`grep -rn core_maths crates/ tools/ apps/ --include='*.rs'`
+# returns ZERO outside the shim itself), and both consumers are third-party, so
+# the patch table is the only lever. This row exists so `grep core_maths
+# Cargo.toml` finds the crate, and so a member that ever wants it can write
+# `core_maths = { workspace = true }` without tripping the census's hard error
+# on a `workspace = true` edge with no root row.
+core_maths = { path = "crates/aterm-core-maths" }
+# The first-party `once_cell` replacement, DIRECTORY crates/aterm-once-cell but
+# PACKAGE `once_cell` 1.21.4 — same reason as the rows above. No workspace
+# member consumes it (`grep -rn once_cell crates/ tools/ apps/ --include='*.rs'`
+# returns ZERO outside the shim itself) and all thirteen consumers are
+# third-party, so the patch table is the only lever. This row exists so
+# `grep once_cell Cargo.toml` finds the crate, and so a member that ever wants
+# it can write `once_cell = { workspace = true }` without tripping the census's
+# hard error on a `workspace = true` edge with no root row.
+once_cell = { path = "crates/aterm-once-cell" }
 # The first-party `log` facade, DIRECTORY crates/aterm-log-shim but PACKAGE
 # `log` 0.4.32 — same reason as the four rows above. The directory could not be
 # `crates/aterm-log`: that name is taken by aterm's REAL logger, the one every
@@ -642,3 +666,67 @@ libc = { path = "crates/aterm-libc" }
 # dev edges that make aterm's differential oracles), which is why the patch
 # table is the lever and editing any one consumer is not.
 log = { path = "crates/aterm-log-shim" }
+
+# `core_maths` is the entry whose PRIZE IS SOMEBODY ELSE'S FORK. The package is
+# 1,221 lines of extension trait; what it drags in is `libm`, which this
+# repository VENDORS (vendor/libm — 19,867 lines and a build script, forked
+# because upstream carried an `i64::abs` overflow at MIN that Trust refuses to
+# compile). `core_maths` is libm's SOLE parent on mac-arm and on wasm-cpu, so
+# retiring it takes 2 packages / 21,088 lines / 1 build script off each of those
+# two cells; linux, win and wasm-gpu keep libm through naga and num-traits and
+# lose only core_maths itself.
+#
+# THE SWAP MOVES NO CODE THAT RUNS, and that is measured rather than hoped. The
+# string `core_maths` appears exactly four times in the two consumers' sources —
+# rustybuzz's face.rs, aat_layout_trak_table.rs and ot_layout_gpos_table.rs, and
+# ttf-parser's lib.rs — and every one is a `use core_maths::CoreFloat;` sitting
+# directly under `#[cfg(not(feature = "std"))]`. `std` is ON for both crates in
+# all five cells (rustybuzz defaults to it; `std = ["ttf-parser/std"]` forwards
+# it), so the trait is never imported and rustybuzz's eleven `.round()` calls
+# and ttf-parser's `.sin()`/`.cos()`/`.tan()`/`.abs()` already resolve to std's
+# inherent methods. crates/aterm-core-maths therefore replaces a crate that is
+# LINKED AND NEVER CALLED, and its tests/consumers.rs re-checks both halves of
+# that per cell so the day it stops being true is the day the suite goes red.
+#
+# The replacement forwards to `std` where upstream forwards to `libm`, which is
+# a real divergence for a genuine no_std build and no divergence at all for
+# aterm (every cell has std, wasm32 included). `powi` is copied from upstream
+# verbatim instead, because libm has no `powi` and std's is an LLVM intrinsic
+# that may round differently. Full fidelity table in the crate's header.
+core_maths = { path = "crates/aterm-core-maths" }
+
+# `once_cell` is the row the post-flip sweep MISSED and its judge found, and the
+# first entry in this table whose replacement is REAL RUNNING CODE on four of
+# the five cells. 1 package / 3,950 lines / 53 unsafe tokens comes off every
+# cell — identical everywhere because `once_cell` is a LEAF, which is also why
+# the flip did not create this opportunity: a leaf's dominator is itself no
+# matter who its parents are, so the row was worth exactly as much before W6b as
+# after. What the flip changed is only the blame line on mac-arm (three parents
+# -> one, `rustls` alone). Re-measured with `cargo forge blame once_cell`:
+# dom 1 package / 3,950 LOC on every one of the five.
+#
+# THE CONSUMERS DO NOT AGREE ABOUT LIVENESS, and the census had to be per-cell
+# rather than per-crate. Three of the thirteen import it under a `cfg` that is
+# off — rustls and read-fonts under `#[cfg(not(feature = "std"))]`, naga under
+# `#[cfg(no_std)]`, with naga's build script deriving `std` from the `wgsl-in`
+# feature every cell turns on — so on MAC-ARM, where rustls is the only parent,
+# this is the same "linked and never called" trade `core_maths` made. On the
+# other four cells it is NOT: ahash, wgpu-core, wgpu-hal, wayland-sys, x11-dl,
+# x11rb, xkbcommon-dl, js-sys, wasm-bindgen and wasm-bindgen-futures all CALL
+# these types, and wgpu-core's resource pool depends on `get_or_try_init`
+# running its closure exactly once under contention — two calls would hand it
+# two `Arc`s for one bind group layout, which is the invariant the pool exists
+# to provide. crates/aterm-once-cell is therefore a BEHAVIOUR-carrying
+# replacement like `arrayvec`, not a facade like `cfg-if`, and it owes what
+# arrayvec owes: a real differential against a registry copy this table cannot
+# reach (`=1.21.3`, dev-only — the `[OB-15]` version-pin escape, which that
+# obligation reports as a NOTE).
+#
+# The prize beyond the line count is the unsafe. Upstream is `AtomicPtr`,
+# `UnsafeCell` and a hand-rolled parking queue: 53 unsafe tokens, written before
+# `std` had `OnceLock` or `LazyLock`. `std` has both now, so the replacement is
+# those same cells re-expressed over `OnceLock`/`Mutex`/`Cell` under
+# `#![forbid(unsafe_code)]` — 53 tokens to zero. THE VERSION IS A CONTRACT:
+# `read-fonts 0.43.2` requires `^1.21.4`, so a shim numbered any lower makes
+# this row silently inert (see the arrayvec note above for that failure mode).
+once_cell = { path = "crates/aterm-once-cell" }

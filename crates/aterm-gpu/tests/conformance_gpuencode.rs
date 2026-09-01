@@ -38,7 +38,7 @@ use aterm_spec::verify::ty_escalation;
 const MAX_CELLS: i64 = 4;
 /// Bytes per `BgInstance` (the renderer's packed `rect:[u16;4] + color:[u8;4]`),
 /// so a non-empty `bgInst` count maps to a non-empty byte stream — the input
-/// `should_slice` actually sees in `InstanceBuf::upload(bytemuck::cast_slice(&bg))`.
+/// `should_slice` actually sees in `InstanceBuf::upload(aterm_bits::cast_slice(&bg))`.
 const STRIDE: usize = 12;
 
 // VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:

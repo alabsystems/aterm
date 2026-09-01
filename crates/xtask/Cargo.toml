@@ -51,6 +51,12 @@ aterm-verify = { workspace = true }
 # `gate forge` verb and the `cargo forge check` verb a human runs by hand read
 # the tree by the same rules and cannot drift apart.
 aterm-forge = { path = "../aterm-forge" }
+# `gate cells` reads cargo's `--message-format=json` stream, because that is the
+# only channel that reports a FRESH unit: a warm re-run prints no `Checking`
+# line at all, so a coverage count parsed from the human output would read as a
+# collapse to zero. First-party, and already resolved in this graph through
+# aterm-forge — net-new third-party packages: ZERO.
+aterm-json = { workspace = true }
 
 [lints]
 workspace = true

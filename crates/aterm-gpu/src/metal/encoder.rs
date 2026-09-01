@@ -819,6 +819,53 @@ impl Drop for PassEncoder<'_, '_> {
     }
 }
 
+/// W6b — a PROBE-ONLY +1 handle onto a committed command buffer, for the
+/// production tap ring's status polling (the W5-proven mechanism,
+/// productionized). It answers "is my copy's command buffer terminal, and
+/// how did it end" and NEVER feeds the loss latch — the once-feed
+/// discipline stays with the ONE owning [`Submitted`] in the present ring,
+/// so a tap polling the same command buffer cannot double-book a loss.
+#[derive(Debug)]
+pub(crate) struct CbProbe {
+    cb: Obj,
+}
+
+impl CbProbe {
+    /// A +1 probe onto `sub`'s command buffer.
+    pub(crate) fn of(sub: &Submitted) -> Self {
+        Self {
+            cb: sub.cb.clone_retained(),
+        }
+    }
+
+    /// `None` while the command buffer is still in flight, `Some(outcome)`
+    /// once terminal. Feeds nothing (see the type doc).
+    pub(crate) fn try_terminal(&self) -> Option<loss::CbOutcome> {
+        match loss::outcome_of(self.cb.id()) {
+            loss::CbOutcome::Unfinished { .. } => None,
+            terminal => Some(terminal),
+        }
+    }
+
+    /// Block until terminal — the tap's `finish` drain, off the hot path by
+    /// definition. Feeds nothing.
+    pub(crate) fn wait_terminal(&self) -> loss::CbOutcome {
+        // SAFETY: `waitUntilCompleted` is a void message on the owned +1
+        // command buffer; it returns once the status is terminal.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            f(self.cb.id(), sel(c"waitUntilCompleted"));
+        }
+        loss::outcome_of(self.cb.id())
+    }
+}
+
+// SAFETY: the probe only reads command-buffer STATUS (`status`/`error` are
+// documented thread-safe reads on the Metal object) and waits; Drop is
+// `objc_release`, thread-safe per the module's THREADING note. The tap ring
+// lives on `WindowGpu`, which crosses a thread once at gui startup.
+unsafe impl Send for CbProbe {}
+
 /// A committed command buffer: the non-blocking completion handle the map
 /// substitutes for `addCompletedHandler:` (map §2's "MISSING" row four).
 #[derive(Debug)]

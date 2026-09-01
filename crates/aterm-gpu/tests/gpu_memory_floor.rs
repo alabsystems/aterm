@@ -66,7 +66,13 @@ fn scene() -> aterm_render::RenderInput {
 #[test]
 fn suballocator_reserves_a_terminal_sized_floor() {
     let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(g) => g,
+        // THE FLIP: this file audits the WGPU-HAL suballocator floors — the
+        // WGPU ORACLE arm, asked for by name post-flip.
+        Ok(mut g) => {
+            #[cfg(target_os = "macos")]
+            g.disarm_metal_for_oracle();
+            g
+        }
         Err(e) => {
             eprintln!("SKIP: no GPU/font available: {e}");
             return;
@@ -134,7 +140,13 @@ fn suballocator_reserves_a_terminal_sized_floor() {
 #[test]
 fn bloom_target_is_built_on_demand_not_with_the_offscreen() {
     let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(g) => g,
+        // THE FLIP: this file audits the WGPU-HAL suballocator floors — the
+        // WGPU ORACLE arm, asked for by name post-flip.
+        Ok(mut g) => {
+            #[cfg(target_os = "macos")]
+            g.disarm_metal_for_oracle();
+            g
+        }
         Err(e) => {
             eprintln!("SKIP: no GPU/font available: {e}");
             return;

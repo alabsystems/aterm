@@ -48,3 +48,10 @@ libc = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# TEST ONLY. `manual.rs` documents atpkg's verbs, and the prose gate in its
+# test module pins what the manual PRESCRIBES against `atpkg::dispatch_roster()`
+# — the dispatch table itself. Not a runtime dependency: the router composes
+# these crates, aterm-cli does not call atpkg.
+atpkg = { workspace = true }

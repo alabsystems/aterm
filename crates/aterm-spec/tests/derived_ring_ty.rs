@@ -62,10 +62,10 @@ use aterm_spec::derive::{
     native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
     one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
     operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
-    pad_absorption_model, pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
-    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
-    presented_frame_tap_model, press_custody_model, proxy_forward_model,
-    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
+    output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
+    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
+    present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
+    proxy_forward_model, rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
     reduced_motion_companion_handoff_model, release_channel_floor_model,
@@ -8722,6 +8722,49 @@ fn derived_effect_presentability_settle_proves_and_catches_stranded_pixels() {
 #[test]
 fn derived_effect_phase_lock_proves_and_catches_cadence_slide() {
     assert_proves_and_catches(&effect_phase_lock_model());
+}
+
+/// PRISM WAKE crosses three independently governed components: the visual
+/// episode, the host's parked scheduler, and the shared audio admission gate.
+/// Prove the healthy chain and require every historical mutant to be both
+/// reachable and invariant-breaking.
+#[test]
+fn derived_output_streak_delivery_proves_and_catches_lost_episode_edges() {
+    let model = output_streak_episode_delivery_model();
+    assert_proves_and_catches(&model);
+    let negative_controls = [
+        "BuggyThinOpening",
+        "BuggyRetireWithoutWake",
+        "BuggyClaimHumanGap",
+    ];
+    assert_eq!(
+        verify::audit_dead_negative_controls(&model, &negative_controls),
+        Ok(negative_controls.len()),
+        "every cue, wake, and human-slot mutant must fire and fail independently"
+    );
+
+    let mut state = model.init_state();
+    for action in [
+        "HumanVoice",
+        "OpenOutput",
+        "RetireVisuals",
+        "SettleAtWake",
+        "HumanGapElapses",
+        "CheckOutputDoesNotClaimHuman",
+        "NextHuman",
+    ] {
+        assert!(model.fire(action, &mut state), "healthy action {action}");
+    }
+    assert_eq!(
+        (
+            state["phase"],
+            state["shimmer"],
+            state["settle"],
+            state["wake"],
+            state["next_human"],
+        ),
+        (3, 1, 1, 0, 1)
+    );
 }
 
 /// PHOSPHOR rain lifecycle (docs/matrix-rain-design.md §10): the

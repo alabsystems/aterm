@@ -120,12 +120,24 @@ pub struct GridStorage {
     pub(crate) scrollback_clear_gen: u64,
     /// Monotonic generation bumped whenever retained HISTORY rows are
     /// RENUMBERED in the absolute-row space with no
-    /// [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate) emitted — today exactly
-    /// the Kitty CSI +T unscroll path (`unscroll_from_scrollback`), which
-    /// removes the NEWEST scrollback lines: every OLDER retained history row
-    /// keeps its line but its `oldest_absolute_row() + i` key shifts by the
-    /// removed count, while `absolute_row_counter`, `base_y()` and the
-    /// protected-footer revision all stay put. Ordinary retention eviction
+    /// [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate) emitted. Three paths
+    /// raise it, all with the same shape — the retained-line total moves while
+    /// `absolute_row_counter` does not, so `oldest_absolute_row()` (`counter −
+    /// visible − scrollback`) slides and carries every retained row's
+    /// `oldest + i` key with it, while `base_y()` arithmetic and the
+    /// protected-footer revision stay put:
+    ///
+    /// * the Kitty CSI +T unscroll (`unscroll_from_scrollback`), which removes
+    ///   the NEWEST scrollback lines;
+    /// * the width rewrap's scrollback restore (`scrollback_reflow.rs`), which
+    ///   re-splits history into a different number of rows;
+    /// * a ROWS-ONLY resize that adds or removes rows at the BOTTOM — the
+    ///   grow's blank append and the shrink's trailing-blank trim
+    ///   (`Grid::note_bottom_end_renumbered`). Rows moved ACROSS the
+    ///   live/history boundary (reveal, top-demote) leave the total unchanged
+    ///   and are pure relabels that do NOT bump this.
+    ///
+    /// Ordinary retention eviction
     /// drops the OLDEST lines and preserves every survivor's absolute key, so
     /// it deliberately does NOT bump this. Consumers that incrementally
     /// maintain absolute-row-keyed caches over history (the terminal's cached

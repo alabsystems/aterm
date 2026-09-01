@@ -2754,9 +2754,10 @@ fn dominant_hint(probes: &[(u32, String, Probe)], in_dir: Option<&Path>) -> Opti
                  without cleanup); retry in a moment"
                     .to_string()
             } else {
-                "nothing is serving these sockets — leftovers of exited instances; launch \
-                 aterm.app (`open -a aterm`) and retry"
-                    .to_string()
+                format!(
+                    "nothing is serving these sockets — leftovers of exited instances; \
+                     {LAUNCH_REMEDY} and retry"
+                )
             }
         }
         Cause::Other => {
@@ -3248,6 +3249,37 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         }
     }
 
+    // `<verb> … --help` DESCRIBES the verb. It never runs it.
+    //
+    // The loop above stops flag parsing at the first positional on purpose, so a
+    // `--help` after a verb used to travel to the server as PAYLOAD. That is not
+    // a documentation gap, it is a hazard, and it was measured as one:
+    // `aterm ctl turn --help` pressed Enter in the live terminal, and
+    // `aterm ctl window --help` wrote a screenshot to a file literally named
+    // `--help` (AUDIT-cli-per-verb-help-2026-08-31.md, D-3 and D-7). Asking a
+    // verb how it works must never do the thing.
+    //
+    // The answer is the server's own `help <verb>` catalog row, which all 88
+    // verbs already have — so this wires an EXISTING declaration to the route
+    // every human and agent tries first. No new prose, one call site, and it
+    // lands before the socket dial, before the `mux` report and before the
+    // discovery verbs, so it covers the whole surface rather than a list
+    // somebody remembered to update.
+    if let Some(rewritten) = help_request_rewrite(&request_parts) {
+        // `send` and `paste` are the only two verbs whose argument is arbitrary
+        // LITERAL text, so they are the only two where this interception can
+        // take something a caller meant. Name the escape instead of leaving
+        // them to work it out.
+        if matches!(request_parts[0].as_str(), "send" | "paste") {
+            let verb = &request_parts[0];
+            eprintln!(
+                "note: `--help` describes `{verb}`; to send it as literal text, \
+                 pipe it -- printf %s -- --help | aterm ctl {verb} --stdin"
+            );
+        }
+        request_parts = rewritten;
+    }
+
     // THE MULTIPLEXER BOUNDARY, decided BEFORE `@self` is expanded away — after
     // expansion the selector is a concrete sid and the "implicit target" shape
     // this guards is no longer visible. `mux` is the client-answered report of
@@ -3700,6 +3732,26 @@ fn forwarded_verb(parts: &[String]) -> Option<String> {
     }
 }
 
+/// `<verb> … --help` rewritten to the catalog query `help <verb>`; `None` when
+/// no help token follows the verb.
+///
+/// Only an argument that IS `-h` or `--help` counts — never `--help=x`, never a
+/// token that merely contains it — and never a request whose verb is already
+/// `help`, so `help`, `help text` and `help --full` reach the server unchanged.
+/// The verb is found with [`forwarded_verb`], so a `@<sid>` selector and the
+/// `dial <name> <verb>` form are handled by the same rule as everything else.
+fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
+    let verb = forwarded_verb(parts)?;
+    if verb == "help" {
+        return None;
+    }
+    parts
+        .iter()
+        .skip(1)
+        .any(|a| a == "-h" || a == "--help")
+        .then(|| vec![String::from("help"), verb])
+}
+
 /// The follow-up line count from a streaming verb's `OK <count>` header `tail`
 /// (everything after the first space). Only the FIRST whitespace token is the
 /// count: the server may append a free-form marker after it — `cmd_search`
@@ -3804,16 +3856,34 @@ fn connect_error(path: &str, e: &io::Error) -> io::Error {
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     ) {
-        msg.push_str(NOT_RUNNING_HINT);
+        msg.push_str(&not_running_hint());
     }
     io::Error::new(e.kind(), msg)
 }
 
+/// How to start aterm ON THIS PLATFORM.
+///
+/// macOS ships an `.app` bundle and `open -a` is the spelling that launches it. Nowhere
+/// else has that bundle, and `open` is not even the same program: on Linux it belongs to
+/// util-linux and opens a file (or is absent entirely), so naming `open -a aterm` there
+/// sent a stuck user to a command that cannot work — a remedy that fails is worse than no
+/// remedy, because it reads as "you did it wrong" rather than "this advice is not for you".
+/// Every non-macOS platform installs the binary on PATH, so its own name IS the remedy.
+#[cfg(target_os = "macos")]
+const LAUNCH_REMEDY: &str = "launch aterm.app (`open -a aterm`)";
+#[cfg(not(target_os = "macos"))]
+const LAUNCH_REMEDY: &str = "start aterm (`aterm`)";
+
 /// The remedy [`connect_error`] appends when nothing serves the socket. A
 /// SESSION serves no control socket (`aterm --help`): the introspectable
 /// engine is the window/headless mode, so the fix is launching the app.
-const NOT_RUNNING_HINT: &str = " — aterm isn't running (nothing is serving this \
-control socket); launch aterm.app (`open -a aterm`) and retry";
+/// The launch spelling itself is [`LAUNCH_REMEDY`], which is per-platform.
+fn not_running_hint() -> String {
+    format!(
+        " — aterm isn't running (nothing is serving this control socket); \
+         {LAUNCH_REMEDY} and retry"
+    )
+}
 
 /// The "malformed response header" error for a status line that lacks a
 /// parseable count. Renders `status_line` exactly like `{status_line:?}`:
@@ -4475,6 +4545,82 @@ mod tests {
     /// A proxied `@<sid> <verb>` must frame its response by the FORWARDED verb, not
     /// the selector — else the client drops the `OK <n>` payload (the bug the live
     /// recursion demo exposed: `@child screen`/`text` returned only the status line).
+    /// Asking a verb how it works must never do the thing. Every one of these
+    /// used to travel to the server as payload; `turn` pressed Enter in a live
+    /// terminal and `window` wrote a PNG named `--help`.
+    #[test]
+    fn help_after_a_verb_becomes_a_catalog_query_not_an_action() {
+        let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let h = |s: &str| help_request_rewrite(&p(s));
+        for req in [
+            "turn --help",
+            "turn -h",
+            "window --help",
+            "text --help",
+            "settings --help",
+            "grants -h",
+            // A selector and the `dial` form resolve through the same rule.
+            "@s-abc text --help",
+            "dial box screen --help",
+            "dial box @s-remote screen -h",
+            // Past other arguments, not just adjacent to the verb.
+            "search needle --json --help",
+        ] {
+            let verb = forwarded_verb(&p(req)).expect("probe has a verb");
+            assert_eq!(
+                h(req),
+                Some(vec![String::from("help"), verb.clone()]),
+                "`{req}` must ask the catalog about `{verb}`, not run it"
+            );
+        }
+    }
+
+    /// The rewrite must not fire on a request that is ALREADY a help query, on a
+    /// verb with no help token, or on a token that merely looks like one — a
+    /// false positive here silently replaces a real action with a help page.
+    #[test]
+    fn help_rewrite_leaves_everything_else_alone() {
+        let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        for req in [
+            "help",
+            "help text",
+            "help --full",
+            "text",
+            "send hello",
+            // Not the exact token: neither is a request for help.
+            "send --help=1",
+            "send x--help",
+            "send help",
+            // The VERB itself is never scanned, only what follows it.
+            "-h",
+        ] {
+            assert_eq!(
+                help_request_rewrite(&p(req)),
+                None,
+                "`{req}` must reach the server unchanged"
+            );
+        }
+        assert_eq!(help_request_rewrite(&[]), None);
+    }
+
+    /// Every client-answered discovery verb must have a local help entry, or the
+    /// rewrite turns `ls --help` into a server round-trip for a verb the server
+    /// has never heard of — the exact `ERR unknown verb 'ls'` this file already
+    /// fixed once for `help ls`.
+    #[test]
+    fn rewritten_discovery_help_is_answerable_without_the_server() {
+        for verb in DISCOVERY_VERBS {
+            let req = vec![String::from(verb), String::from("--help")];
+            let rewritten = help_request_rewrite(&req).expect("discovery verb rewrites");
+            assert!(
+                client_help_reply(&rewritten).is_some(),
+                "`aterm ctl {verb} --help` rewrites to `{rewritten:?}`, which no \
+                 client entry answers -- it would dial the socket and be told the \
+                 verb does not exist"
+            );
+        }
+    }
+
     #[test]
     fn forwarded_verb_skips_proxy_selector() {
         let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
@@ -4753,7 +4899,19 @@ mod tests {
                 "the raw cause stays first: {msg}"
             );
             assert!(msg.contains("aterm isn't running"), "{msg}");
-            assert!(msg.contains("open -a aterm"), "the remedy is named: {msg}");
+            // A REMEDY MUST BE RUNNABLE WHERE IT IS PRINTED. `open -a` is a macOS
+            // spelling; on Linux `open` is util-linux's file opener (or missing), so
+            // printing it there hands a stuck user a command that cannot work. This is
+            // the whole point of LAUNCH_REMEDY being per-platform.
+            #[cfg(not(target_os = "macos"))]
+            assert!(
+                !msg.contains("open -a aterm") && !msg.contains("aterm.app"),
+                "a non-macOS build must not name a macOS-only remedy: {msg}"
+            );
+            assert!(
+                msg.contains(LAUNCH_REMEDY),
+                "the remedy is named, and is the one THIS platform can run: {msg}"
+            );
             assert_eq!(e.kind(), kind);
         }
     }
@@ -5947,7 +6105,7 @@ mod tests {
                 says: &[
                     "the addressed instance did not answer (wrong --sock/--pid, not running, or a different user):",
                     "\n  /tmp/aterm-10274.sock  connect: Connection refused — stale, pid 10274 is not running",
-                    "open -a aterm",
+                    LAUNCH_REMEDY,
                 ],
                 never_says: &[FLEET_CLAIM, "found 1 control socket"],
             },
@@ -6123,7 +6281,7 @@ mod tests {
                     "\n  /tmp/run/aterm-6.sock  connect: Permission denied (os error 13) — another user's socket, or a sandbox refusing AF_UNIX connect()",
                     "hint: inside Codex CLI run with --allow-unix-socket \"/tmp/run\"",
                 ],
-                never_says: &[FLEET_CLAIM, "open -a aterm"],
+                never_says: &[FLEET_CLAIM, LAUNCH_REMEDY],
             },
         ];
         for row in rows {

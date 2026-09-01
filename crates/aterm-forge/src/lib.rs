@@ -44,6 +44,9 @@
 //! | [`policy`] | `vendor/forge.toml` — forks, decisions, comment-preserving |
 //! | [`budget`] | `tools/forge-budget.tsv` — the lower-only ratchet |
 //! | [`attest`] | provenance, license and `[patch]`-liveness obligations |
+//! | [`mirror`] | Lane 1 generator: `Cargo.lock` → enforced `local-registry` |
+//! | [`mirror_bundle`] | Lane 1 delivery: one deterministic, verified-before-unpack bundle |
+//! | [`mirror_config`] | the shippable `[source]` fragment, split from `.cargo/config.toml` |
 //! | [`check`] | the gate reporter: all of the above, no compilation |
 //! | `measured` | test-only: the pinned per-cell baseline, in ONE place |
 
@@ -59,6 +62,9 @@ pub mod loc;
 /// was told instead of the one the graph has.
 #[cfg(test)]
 pub mod measured;
+pub mod mirror;
+pub mod mirror_bundle;
+pub mod mirror_config;
 pub mod model;
 pub mod policy;
 pub mod resolve;

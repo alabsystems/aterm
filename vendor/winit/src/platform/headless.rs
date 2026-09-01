@@ -1,3 +1,5 @@
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
 //! Windowless event loops.
 //!
 //! Selecting this backend is always EXPLICIT. `EventLoop::new` will never fall back to it

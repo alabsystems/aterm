@@ -44,6 +44,115 @@ pub enum ImmediateWrite {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputEpoch(u64);
 
+/// Opaque process-local order of frames accepted by one PTY sink.
+///
+/// Unlike [`InputEpoch`], this token is minted at the sink's actual direct-write
+/// or spill-FIFO linearization point.  It therefore follows accepted byte order
+/// even when lock contention lets a later input attempt serialize first.  Values
+/// are meaningful only relative to receipts from the same [`SinkWriter`].  The
+/// numeric representation stays private so callers cannot manufacture a token
+/// or mistake it for a terminal/content sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AcceptedOrder(u64);
+
+/// Result of a blocking or spill-tolerant sink write, with its accepted order.
+///
+/// `order()` is `None` exactly when this call accepted no bytes (including an
+/// empty frame or a peer-close `0` write).  A spilled frame counts as accepted:
+/// its bytes have entered the sink's bounded FIFO at the reported order, even if
+/// the detached drainer has not handed them to the kernel yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct WriteReceipt {
+    accepted: usize,
+    order: Option<AcceptedOrder>,
+}
+
+impl WriteReceipt {
+    fn new(accepted: usize, order: Option<AcceptedOrder>) -> Self {
+        debug_assert_eq!(accepted == 0, order.is_none());
+        Self { accepted, order }
+    }
+
+    /// Number of bytes accepted by this call.
+    #[must_use]
+    pub const fn accepted(self) -> usize {
+        self.accepted
+    }
+
+    /// Accepted serialization/spill order, or `None` when no bytes were accepted.
+    #[must_use]
+    pub const fn order(self) -> Option<AcceptedOrder> {
+        self.order
+    }
+}
+
+/// A sink write error together with any prefix accepted before it occurred.
+///
+/// Receipt-aware callers need both facts: the frame did not land in full, but
+/// an accepted prefix may still be echoed by the foreground program. Legacy
+/// callers recover the original [`io::Error`] with [`Self::into_error`].
+#[derive(Debug)]
+pub struct WriteReceiptError {
+    error: io::Error,
+    receipt: WriteReceipt,
+}
+
+impl WriteReceiptError {
+    fn new(error: io::Error, accepted: usize, order: Option<AcceptedOrder>) -> Self {
+        Self {
+            error,
+            receipt: WriteReceipt::new(accepted, order),
+        }
+    }
+
+    fn after_write(error: io::Error, accepted: usize, order: AcceptedOrder) -> Self {
+        Self::new(error, accepted, (accepted > 0).then_some(order))
+    }
+
+    /// The original I/O error by reference.
+    #[must_use]
+    pub const fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    /// Number of bytes accepted before the error.
+    #[must_use]
+    pub const fn accepted(&self) -> usize {
+        self.receipt.accepted()
+    }
+
+    /// Accepted serialization/spill order, or `None` when no bytes moved.
+    #[must_use]
+    pub const fn order(&self) -> Option<AcceptedOrder> {
+        self.receipt.order()
+    }
+
+    /// Recover the original I/O error without reclassification or wrapping.
+    #[must_use]
+    pub fn into_error(self) -> io::Error {
+        self.error
+    }
+}
+
+impl From<io::Error> for WriteReceiptError {
+    fn from(error: io::Error) -> Self {
+        Self::new(error, 0, None)
+    }
+}
+
+impl std::fmt::Display for WriteReceiptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for WriteReceiptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// The ONE place bytes enter a session's PTY master fd. Every writer — the GUI
 /// keyboard, every control verb, the future `keys` forwarder, and the reader
 /// thread's query replies — funnels through [`SinkWriter::write_frame`], so two
@@ -169,6 +278,10 @@ struct Shared {
 
 /// See [`Shared::spill`].
 struct Spill {
+    /// Per-sink order assigned at the actual direct-write/spill acceptance seam.
+    /// Keeping it inside the ordering mutex makes the linearization discipline
+    /// structural. `u64::MAX` is terminal rather than wrapping into freshness.
+    accepted_order: u64,
     /// Spilled bytes, oldest first. A frame is appended contiguously under the
     /// mutex, and the drainer removes bytes only AFTER the kernel accepted them —
     /// so "non-empty" is exactly "undelivered bytes exist", the predicate every
@@ -179,6 +292,17 @@ struct Spill {
     // Live only on the unix spill/drain path; the Windows twin writes blocking.
     #[cfg_attr(not(unix), allow(dead_code))]
     draining: bool,
+}
+
+impl Spill {
+    fn next_accepted_order(&mut self) -> io::Result<AcceptedOrder> {
+        let next = self
+            .accepted_order
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("PTY sink accepted-order token exhausted"))?;
+        self.accepted_order = next;
+        Ok(AcceptedOrder(next))
+    }
 }
 
 impl SinkWriter {
@@ -383,6 +507,24 @@ impl SinkWriter {
         self.shared.spill_is_empty()
     }
 
+    /// Non-parking observation of [`Self::egress_drained_to_kernel`].
+    ///
+    /// `Some(true)` means the process-local spill is empty, `Some(false)` means
+    /// bytes remain, and `None` means another thread currently owns the spill
+    /// mutex so no answer was available without waiting. A poisoned mutex is
+    /// already acquired by `try_lock`; recovering that guard therefore remains
+    /// non-parking and yields the same conservative state observation.
+    #[must_use]
+    pub fn try_egress_drained_to_kernel(&self) -> Option<bool> {
+        match self.shared.spill.try_lock() {
+            Ok(spill) => Some(spill.buf.is_empty()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().buf.is_empty())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Current attempted-input epoch for this sink.
     ///
     /// This observes INPUT attempts, not terminal output. It therefore closes
@@ -439,8 +581,20 @@ impl SinkWriter {
     /// refuses without writing.
     #[cfg(unix)]
     pub fn try_write_frame_immediate(&self, bytes: &[u8]) -> ImmediateWrite {
+        self.try_write_frame_immediate_with_receipt(bytes).0
+    }
+
+    /// Receipt-bearing twin of [`Self::try_write_frame_immediate`].
+    ///
+    /// A non-empty full write or non-zero partial write carries the token minted
+    /// while both ordering locks are held. Refusals and empty writes carry none.
+    #[cfg(unix)]
+    pub fn try_write_frame_immediate_with_receipt(
+        &self,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, Option<AcceptedOrder>) {
         if bytes.is_empty() {
-            return ImmediateWrite::Full;
+            return (ImmediateWrite::Full, None);
         }
         // Reserve before every possible wait/refusal. A concurrent conditional
         // actuator must see even an attempt that ultimately encounters EAGAIN.
@@ -462,19 +616,29 @@ impl SinkWriter {
         expected: InputEpoch,
         bytes: &[u8],
     ) -> (ImmediateWrite, InputEpoch) {
+        let (write, epoch, _) =
+            self.try_write_frame_immediate_if_epoch_with_receipt(expected, bytes);
+        (write, epoch)
+    }
+
+    /// Receipt-bearing twin of [`Self::try_write_frame_immediate_if_epoch`].
+    #[cfg(unix)]
+    pub fn try_write_frame_immediate_if_epoch_with_receipt(
+        &self,
+        expected: InputEpoch,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, InputEpoch, Option<AcceptedOrder>) {
         if bytes.is_empty() {
-            return (ImmediateWrite::Full, expected);
+            return (ImmediateWrite::Full, expected, None);
         }
         let Some((previous, reserved)) = self.reserve_input_attempt() else {
-            return (ImmediateWrite::ConflictZero, self.input_epoch());
+            return (ImmediateWrite::ConflictZero, self.input_epoch(), None);
         };
         if previous != expected {
-            return (ImmediateWrite::ConflictZero, reserved);
+            return (ImmediateWrite::ConflictZero, reserved, None);
         }
-        (
-            self.try_write_frame_immediate_reserved(bytes, Some(reserved)),
-            reserved,
-        )
+        let (write, order) = self.try_write_frame_immediate_reserved(bytes, Some(reserved));
+        (write, reserved, order)
     }
 
     #[cfg(unix)]
@@ -482,12 +646,12 @@ impl SinkWriter {
         &self,
         bytes: &[u8],
         conditional: Option<InputEpoch>,
-    ) -> ImmediateWrite {
+    ) -> (ImmediateWrite, Option<AcceptedOrder>) {
         if bytes.len() > Self::IMMEDIATE_FRAME_MAX {
-            return ImmediateWrite::BusyZero;
+            return (ImmediateWrite::BusyZero, None);
         }
         if !self.master_nonblocking.load(Ordering::Relaxed) {
-            return ImmediateWrite::BusyZero;
+            return (ImmediateWrite::BusyZero, None);
         }
 
         // `try_lock` is load-bearing: neither a foreground write nor a spill
@@ -498,25 +662,32 @@ impl SinkWriter {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return ImmediateWrite::BusyZero;
+                return (ImmediateWrite::BusyZero, None);
             }
         };
-        let spill_guard = match self.shared.spill.try_lock() {
+        let mut spill_guard = match self.shared.spill.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return ImmediateWrite::BusyZero;
+                return (ImmediateWrite::BusyZero, None);
             }
         };
         if !spill_guard.buf.is_empty() {
-            return ImmediateWrite::BusyZero;
+            return (ImmediateWrite::BusyZero, None);
         }
         // This is the conditional operation's linearization point. Any input
         // attempt that reserved before it invalidates the frame. A producer that
         // reserves later is ordered after this lock holder.
         if conditional.is_some_and(|reserved| self.input_epoch() != reserved) {
-            return ImmediateWrite::ConflictZero;
+            return (ImmediateWrite::ConflictZero, None);
         }
+
+        // Reserve while both ordering locks are held. The syscall may still
+        // refuse, leaving an unobservable gap, but no later spill/direct frame
+        // can receive an earlier token than bytes this call accepts.
+        let Ok(order) = spill_guard.next_accepted_order() else {
+            return (ImmediateWrite::BusyZero, None);
+        };
 
         // Keep both guards through the syscall.  In particular, a normal writer
         // cannot observe an empty spill and then race this frame for the fd.
@@ -527,9 +698,14 @@ impl SinkWriter {
             | aterm_pty::NonParkWrite::WouldBlock
             | aterm_pty::NonParkWrite::Fatal(_) => ImmediateWrite::BusyZero,
         };
+        let accepted = match result {
+            ImmediateWrite::Full => bytes.len(),
+            ImmediateWrite::PartialInDoubt { accepted } => accepted,
+            ImmediateWrite::BusyZero | ImmediateWrite::ConflictZero => 0,
+        };
         drop(spill_guard);
         drop(fd_guard);
-        result
+        (result, (accepted > 0).then_some(order))
     }
 
     /// Windows fail-closed twin of [`Self::try_write_frame_immediate`].
@@ -540,11 +716,20 @@ impl SinkWriter {
     /// native bounded primitive exists.
     #[cfg(windows)]
     pub fn try_write_frame_immediate(&self, bytes: &[u8]) -> ImmediateWrite {
+        self.try_write_frame_immediate_with_receipt(bytes).0
+    }
+
+    /// Windows fail-closed receipt-bearing twin.
+    #[cfg(windows)]
+    pub fn try_write_frame_immediate_with_receipt(
+        &self,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, Option<AcceptedOrder>) {
         if bytes.is_empty() {
-            return ImmediateWrite::Full;
+            return (ImmediateWrite::Full, None);
         }
         let _ = self.reserve_input_attempt();
-        ImmediateWrite::BusyZero
+        (ImmediateWrite::BusyZero, None)
     }
 
     /// Windows fail-closed conditional twin. ConPTY still has no bounded input
@@ -556,16 +741,28 @@ impl SinkWriter {
         expected: InputEpoch,
         bytes: &[u8],
     ) -> (ImmediateWrite, InputEpoch) {
+        let (write, epoch, _) =
+            self.try_write_frame_immediate_if_epoch_with_receipt(expected, bytes);
+        (write, epoch)
+    }
+
+    /// Windows fail-closed conditional receipt-bearing twin.
+    #[cfg(windows)]
+    pub fn try_write_frame_immediate_if_epoch_with_receipt(
+        &self,
+        expected: InputEpoch,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, InputEpoch, Option<AcceptedOrder>) {
         if bytes.is_empty() {
-            return (ImmediateWrite::Full, expected);
+            return (ImmediateWrite::Full, expected, None);
         }
         let Some((previous, reserved)) = self.reserve_input_attempt() else {
-            return (ImmediateWrite::ConflictZero, self.input_epoch());
+            return (ImmediateWrite::ConflictZero, self.input_epoch(), None);
         };
         if previous != expected {
-            return (ImmediateWrite::ConflictZero, reserved);
+            return (ImmediateWrite::ConflictZero, reserved, None);
         }
-        (ImmediateWrite::BusyZero, reserved)
+        (ImmediateWrite::BusyZero, reserved, None)
     }
 
     /// Write a WHOLE frame atomically with respect to other writers, returning the
@@ -596,9 +793,20 @@ impl SinkWriter {
         )
     )]
     pub fn write_frame(&self, bytes: &[u8]) -> io::Result<usize> {
-        if !bytes.is_empty() {
-            let _ = self.reserve_input_attempt();
+        self.write_frame_with_receipt(bytes)
+            .map(WriteReceipt::accepted)
+            .map_err(WriteReceiptError::into_error)
+    }
+
+    /// Receipt-bearing twin of [`Self::write_frame`].
+    pub fn write_frame_with_receipt(
+        &self,
+        bytes: &[u8],
+    ) -> Result<WriteReceipt, WriteReceiptError> {
+        if bytes.is_empty() {
+            return Ok(WriteReceipt::new(0, None));
         }
+        let _ = self.reserve_input_attempt();
         self.write_frame_after_reserve(bytes)
     }
 
@@ -606,7 +814,7 @@ impl SinkWriter {
     /// non-empty input attempt. The non-parking API delegates here when it must
     /// apply blocking backpressure, so that one public attempt advances the epoch
     /// exactly once rather than reserving again through [`Self::write_frame`].
-    fn write_frame_after_reserve(&self, bytes: &[u8]) -> io::Result<usize> {
+    fn write_frame_after_reserve(&self, bytes: &[u8]) -> Result<WriteReceipt, WriteReceiptError> {
         // FIFO with any SPILLED bytes: while the wedged-tty spill buffer is
         // non-empty this frame must queue BEHIND it (a direct write would overtake
         // spilled keystrokes), under the SPILL_CAP wait so a paste into a wedged
@@ -614,26 +822,29 @@ impl SinkWriter {
         // BEFORE the fd lock: while draining, the drainer may sit parked in a
         // blocking write HOLDING the fd lock, and waiting on it here would park
         // this caller behind the wedge instead of behind the cap.
-        if !self.shared.spill_is_empty() && self.shared.spill_append(self.master, bytes, true) {
-            return Ok(bytes.len());
+        if !self.shared.spill_is_empty()
+            && let Some(order) = self.shared.spill_append(self.master, bytes, true)?
+        {
+            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         }
         let guard = self
             .shared
             .lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Re-check under the guard: a mid-frame spill by the previous lock holder
-        // (or a racing writer's append) may have landed since the entry check.
-        if !self.shared.spill_is_empty() {
+        // Re-check and mint as one spill-locked step: a non-parking contender can
+        // append without the fd lock, and must not obtain an earlier token after
+        // this frame has committed to the direct lane.
+        let Some(order) = self.shared.direct_order_if_spill_empty()? else {
             drop(guard);
-            if self.shared.spill_append(self.master, bytes, true) {
-                return Ok(bytes.len());
+            if let Some(order) = self.shared.spill_append(self.master, bytes, true)? {
+                return Ok(WriteReceipt::new(bytes.len(), Some(order)));
             }
             // Spill unavailable (drainer could not be arranged): fall through to
             // the plain blocking write — degraded exactly to the legacy behavior.
             return self.write_frame_locked(bytes);
-        }
-        self.write_frame_body_locked(guard, bytes)
+        };
+        self.write_frame_body_locked(guard, bytes, order)
     }
 
     /// Write a whole frame while HOLDING the fd lock. Ordinary callers are
@@ -670,7 +881,8 @@ impl SinkWriter {
         &self,
         guard: std::sync::MutexGuard<'_, ()>,
         bytes: &[u8],
-    ) -> io::Result<usize> {
+        order: AcceptedOrder,
+    ) -> Result<WriteReceipt, WriteReceiptError> {
         let mut off = 0;
         while off < bytes.len() {
             // `get` + saturating_add (the drain_loop idiom): `off < len` makes
@@ -682,11 +894,11 @@ impl SinkWriter {
             match aterm_pty::write_some_blocking(self.master, rest) {
                 Ok(0) => break, // peer closed mid-frame
                 Ok(n) => off = off.saturating_add(n),
-                Err(e) => return Err(e),
+                Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
             }
         }
         drop(guard);
-        Ok(off)
+        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
     }
 
     /// Windows twin of [`Self::write_frame_body_locked`]: a ConPTY handle is not a
@@ -699,7 +911,8 @@ impl SinkWriter {
         &self,
         guard: std::sync::MutexGuard<'_, ()>,
         bytes: &[u8],
-    ) -> io::Result<usize> {
+        order: AcceptedOrder,
+    ) -> Result<WriteReceipt, WriteReceiptError> {
         let mut off = 0;
         while off < bytes.len() {
             // `get` + saturating_add (the drain_loop idiom): `off < len` makes
@@ -711,35 +924,34 @@ impl SinkWriter {
             match aterm_pty::write_some_blocking(self.master, rest) {
                 Ok(0) => break, // peer closed mid-frame
                 Ok(n) => off = off.saturating_add(n),
-                Err(e) => return Err(e),
+                Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
             }
         }
         drop(guard);
-        Ok(off)
+        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
     }
 
     /// The legacy blocking write, taking the fd lock itself (the degraded path
     /// when spilling is impossible — e.g. `dup(2)` refused a drainer fd).
-    fn write_frame_locked(&self, bytes: &[u8]) -> io::Result<usize> {
-        let _guard = self
-            .shared
-            .lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let mut off = 0;
-        while off < bytes.len() {
-            // `get` + saturating_add (the drain_loop idiom): `off < len` makes
-            // the `get` always Some, and `n <= rest.len()` (POSIX) means the
-            // sum never saturates. write_some_blocking is cross-crate, so `n` is
-            // unbounded to the verifier — byte-identical on every real path.
-            let Some(rest) = bytes.get(off..) else { break };
-            match aterm_pty::write_some_blocking(self.master, rest) {
-                Ok(0) => break, // peer closed mid-frame
-                Ok(n) => off = off.saturating_add(n),
-                Err(e) => return Err(e),
-            }
+    fn write_frame_locked(&self, bytes: &[u8]) -> Result<WriteReceipt, WriteReceiptError> {
+        loop {
+            let guard = self
+                .shared
+                .lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let Some(order) = self.shared.direct_order_if_spill_empty()? else {
+                drop(guard);
+                if let Some(order) = self.shared.spill_append(self.master, bytes, true)? {
+                    return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+                }
+                // The spill emptied while its drainer exited and arranging a
+                // replacement failed. Reacquire and recheck instead of racing a
+                // new spill with a direct write.
+                continue;
+            };
+            return self.write_frame_body_locked(guard, bytes, order);
         }
-        Ok(off)
     }
 
     /// Frames larger than this bypass the non-parking path and take the plain
@@ -790,9 +1002,21 @@ impl SinkWriter {
     )]
     #[cfg(unix)]
     pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
-        if !bytes.is_empty() {
-            let _ = self.reserve_input_attempt();
+        self.write_frame_nonparking_with_receipt(bytes)
+            .map(WriteReceipt::accepted)
+            .map_err(WriteReceiptError::into_error)
+    }
+
+    /// Receipt-bearing twin of [`Self::write_frame_nonparking`].
+    #[cfg(unix)]
+    pub fn write_frame_nonparking_with_receipt(
+        &self,
+        bytes: &[u8],
+    ) -> Result<WriteReceipt, WriteReceiptError> {
+        if bytes.is_empty() {
+            return Ok(WriteReceipt::new(0, None));
         }
+        let _ = self.reserve_input_attempt();
         // Only SMALL frames get the non-parking treatment. The UI thread only
         // ever produces small frames (keystrokes / mouse reports / IME commits —
         // tens of bytes); anything larger is paste/bulk from an expendable
@@ -828,8 +1052,10 @@ impl SinkWriter {
             return self.write_frame_after_reserve(bytes);
         }
         // Undelivered spill exists → queue behind it (order), never touch the fd.
-        if !self.shared.spill_is_empty() && self.shared.spill_append(self.master, bytes, false) {
-            return Ok(bytes.len());
+        if !self.shared.spill_is_empty()
+            && let Some(order) = self.shared.spill_append(self.master, bytes, false)?
+        {
+            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         }
         // Bounded spin-then-retry before conceding the race. CONCEDING is not free:
         // the fallback below reaches `spill_append`, which — with no drainer yet —
@@ -859,22 +1085,21 @@ impl SinkWriter {
         let Some(guard) = acquired else {
             // Another writer is mid-frame (or the drainer is writing): queueing
             // behind the current holder preserves order without waiting on it.
-            if self.shared.spill_append(self.master, bytes, false) {
-                return Ok(bytes.len());
+            if let Some(order) = self.shared.spill_append(self.master, bytes, false)? {
+                return Ok(WriteReceipt::new(bytes.len(), Some(order)));
             }
             // No drainer possible: degrade to the legacy blocking write.
             return self.write_frame_locked(bytes);
         };
-        // Re-check under the guard: the previous holder may have spilled a frame
-        // tail between the entry check and our try_lock — writing directly now
-        // would overtake it (and could split its frame).
-        if !self.shared.spill_is_empty() {
+        // Re-check and mint as one spill-locked step: after this frame commits to
+        // the direct lane, a contending spill must receive a later token.
+        let Some(order) = self.shared.direct_order_if_spill_empty()? else {
             drop(guard);
-            if self.shared.spill_append(self.master, bytes, false) {
-                return Ok(bytes.len());
+            if let Some(order) = self.shared.spill_append(self.master, bytes, false)? {
+                return Ok(WriteReceipt::new(bytes.len(), Some(order)));
             }
             return self.write_frame_locked(bytes);
-        }
+        };
         // The WRITE UNIT per POLLOUT check. `poll` promises only that SOME room
         // exists (on a pty master, as little as one byte below the watermark), so
         // the unit must be one the kernel can REFUSE without parking us:
@@ -917,8 +1142,8 @@ impl SinkWriter {
             if !whole_frame {
                 match aterm_pty::poll_writable(self.master, 0) {
                     Ok(true) => {}
-                    Ok(false) => return self.spill_tail_locked(guard, bytes, off),
-                    Err(e) => return Err(e),
+                    Ok(false) => return self.spill_tail_locked(guard, bytes, off, order),
+                    Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
                 }
             }
             // `off < bytes.len()` (the loop condition) makes both `get`s always
@@ -949,13 +1174,15 @@ impl SinkWriter {
                 // path it is the poll-race case. Both mean the same thing: spill
                 // the tail from here.
                 aterm_pty::NonParkWrite::WouldBlock => {
-                    return self.spill_tail_locked(guard, bytes, off);
+                    return self.spill_tail_locked(guard, bytes, off, order);
                 }
-                aterm_pty::NonParkWrite::Fatal(e) => return Err(e),
+                aterm_pty::NonParkWrite::Fatal(e) => {
+                    return Err(WriteReceiptError::after_write(e, off, order));
+                }
             }
         }
         drop(guard);
-        Ok(off)
+        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
     }
 
     /// Windows: the unix spill/`poll(2)` machinery does not apply to a ConPTY handle
@@ -965,10 +1192,18 @@ impl SinkWriter {
     /// unix tty input buffer does.
     #[cfg(windows)]
     pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
-        if !bytes.is_empty() {
-            let _ = self.reserve_input_attempt();
-        }
-        self.write_frame_after_reserve(bytes)
+        self.write_frame_nonparking_with_receipt(bytes)
+            .map(WriteReceipt::accepted)
+            .map_err(WriteReceiptError::into_error)
+    }
+
+    /// Windows receipt-bearing twin of [`Self::write_frame_nonparking`].
+    #[cfg(windows)]
+    pub fn write_frame_nonparking_with_receipt(
+        &self,
+        bytes: &[u8],
+    ) -> Result<WriteReceipt, WriteReceiptError> {
+        self.write_frame_with_receipt(bytes)
     }
 
     /// Spill `bytes[off..]` while HOLDING the fd lock — the only state in which a
@@ -985,18 +1220,19 @@ impl SinkWriter {
         guard: std::sync::MutexGuard<'_, ()>,
         bytes: &[u8],
         off: usize,
-    ) -> io::Result<usize> {
+        order: AcceptedOrder,
+    ) -> Result<WriteReceipt, WriteReceiptError> {
         // Both callers pass `off` from inside a `while off < bytes.len()` write
         // loop, so `off <= bytes.len()` always holds and this `get` is always
         // `Some`; the unreachable `else` arm reports the frame accepted exactly
         // like the successful-prepend path, so it is behavior-identical.
         let Some(tail) = bytes.get(off..) else {
             drop(guard);
-            return Ok(bytes.len());
+            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         };
         if self.shared.spill_prepend(self.master, tail) {
             drop(guard);
-            return Ok(bytes.len());
+            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
         }
         let mut off = off;
         while off < bytes.len() {
@@ -1005,7 +1241,9 @@ impl SinkWriter {
             // frame, so the observable result is unchanged.
             let Some(rest) = bytes.get(off..) else { break };
             match aterm_pty::write_some_blocking(self.master, rest) {
-                Ok(0) => return Ok(off), // peer closed mid-frame
+                Ok(0) => {
+                    return Ok(WriteReceipt::new(off, (off > 0).then_some(order)));
+                }
                 // `write_some_blocking` never writes more than the slice it was
                 // given (`write(2)` returns at most its count), so `n <= bytes.len() -
                 // off` and this clamp is a no-op — it equals the previous
@@ -1020,11 +1258,11 @@ impl SinkWriter {
                     let room = bytes.len().saturating_sub(off);
                     off = off.saturating_add(if n <= room { n } else { room });
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
             }
         }
         drop(guard);
-        Ok(off)
+        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
     }
 }
 
@@ -1045,10 +1283,25 @@ impl Shared {
             lock: Mutex::new(()),
             input_epoch: AtomicU64::new(0),
             spill: Mutex::new(Spill {
+                accepted_order: 0,
                 buf: VecDeque::new(),
                 draining: false,
             }),
             drained: Condvar::new(),
+        }
+    }
+
+    /// While the caller holds the fd lock, bind an empty spill observation to a
+    /// direct-write order token. A contending non-parking writer can append to
+    /// the spill without taking the fd lock, so observing and minting must occur
+    /// under this mutex in one step; otherwise its later bytes could receive an
+    /// earlier token in the gap.
+    fn direct_order_if_spill_empty(&self) -> io::Result<Option<AcceptedOrder>> {
+        let mut spill = self.spill.lock().unwrap_or_else(|p| p.into_inner());
+        if spill.buf.is_empty() {
+            spill.next_accepted_order().map(Some)
+        } else {
+            Ok(None)
         }
     }
 
@@ -1091,16 +1344,22 @@ impl Shared {
         true
     }
 
-    /// Append one frame to the spill, arranging the drainer, returning whether the
-    /// frame was accepted. `wait_for_room` applies the `SPILL_CAP` backpressure.
+    /// Append one frame to the spill, arranging the drainer, returning its
+    /// accepted-order token. `wait_for_room` applies the `SPILL_CAP` backpressure.
     /// It normally belongs to expendable blocking callers; the conditional
     /// non-parking API can also select it after its spill-cap guard, which is why
     /// that public method explicitly warns its caller may park at the cap.
-    /// Returns `false` only when a drainer could not be arranged (no `dup`/spawn),
-    /// in which case NOTHING was appended and the caller must fall back to a
-    /// blocking write — spilling without a drainer would strand the bytes.
+    /// Returns `Ok(None)` only when a drainer could not be arranged (no
+    /// `dup`/spawn), in which case NOTHING was appended and the caller must fall
+    /// back to a blocking write — spilling without a drainer would strand the
+    /// bytes. Token exhaustion is a hard error and likewise appends nothing.
     #[cfg(unix)]
-    fn spill_append(self: &Arc<Self>, master: i32, bytes: &[u8], wait_for_room: bool) -> bool {
+    fn spill_append(
+        self: &Arc<Self>,
+        master: i32,
+        bytes: &[u8],
+        wait_for_room: bool,
+    ) -> io::Result<Option<AcceptedOrder>> {
         let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
         if wait_for_room {
             while s.draining && s.buf.len() > Self::SPILL_CAP {
@@ -1108,20 +1367,26 @@ impl Shared {
             }
         }
         if !s.draining && !self.arrange_drainer(master, &mut s) {
-            return false;
+            return Ok(None);
         }
+        let order = s.next_accepted_order()?;
         s.buf.extend(bytes.iter().copied());
-        true
+        Ok(Some(order))
     }
 
     /// Windows stub: the fd-`dup(2)` spill drainer does not exist for a ConPTY handle,
-    /// so spilling is never available — return `false` so the caller
+    /// so spilling is never available — return `Ok(None)` so the caller
     /// ([`SinkWriter::write_frame`]) falls through to the ordered blocking write. Kept
     /// as a compiled no-op (never reached at runtime — `spill_is_empty()` is always
     /// true on Windows, so the caller short-circuits before this).
     #[cfg(windows)]
-    fn spill_append(self: &Arc<Self>, _master: i32, _bytes: &[u8], _wait_for_room: bool) -> bool {
-        false
+    fn spill_append(
+        self: &Arc<Self>,
+        _master: i32,
+        _bytes: &[u8],
+        _wait_for_room: bool,
+    ) -> io::Result<Option<AcceptedOrder>> {
+        Ok(None)
     }
 
     /// Spawn the drainer thread (caller holds the spill mutex and has checked
@@ -1261,6 +1526,24 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    #[test]
+    fn receipt_error_preserves_prefix_order_and_original_io_error() {
+        let partial = WriteReceiptError::after_write(
+            io::Error::from_raw_os_error(libc::EIO),
+            3,
+            AcceptedOrder(7),
+        );
+        assert_eq!(partial.accepted(), 3);
+        assert_eq!(partial.order(), Some(AcceptedOrder(7)));
+        assert_eq!(partial.error().raw_os_error(), Some(libc::EIO));
+        assert_eq!(partial.into_error().raw_os_error(), Some(libc::EIO));
+
+        let refused = WriteReceiptError::from(io::Error::from_raw_os_error(libc::EBADF));
+        assert_eq!(refused.accepted(), 0);
+        assert_eq!(refused.order(), None);
+        assert_eq!(refused.into_error().raw_os_error(), Some(libc::EBADF));
+    }
+
     // Whole-frame atomicity: N threads each write a distinct frame LARGER than the
     // socket send buffer (so a single `write` short-writes and the loop iterates,
     // giving the kernel real opportunities to interleave two writers). Through one
@@ -1346,6 +1629,164 @@ mod tests {
         reader.read_exact(&mut buf).expect("read_exact");
         assert_eq!(&buf, b"hello-sink");
         drop(writer);
+    }
+
+    #[test]
+    fn receipt_twins_report_actual_acceptance_in_increasing_order() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+
+        let empty = sink
+            .write_frame_with_receipt(b"")
+            .expect("empty blocking receipt");
+        assert_eq!(empty.accepted(), 0);
+        assert_eq!(empty.order(), None, "empty writes do not enter sink order");
+
+        let blocking = sink
+            .write_frame_with_receipt(b"B")
+            .expect("blocking receipt");
+        let nonparking = sink
+            .write_frame_nonparking_with_receipt(b"N")
+            .expect("non-parking receipt");
+
+        writer.set_nonblocking(true).expect("nonblocking writer");
+        sink.note_master_nonblocking(true);
+        let (immediate, immediate_order) = sink.try_write_frame_immediate_with_receipt(b"I");
+        assert_eq!(immediate, ImmediateWrite::Full);
+        let expected = sink.input_epoch();
+        let (conditional, _next, conditional_order) =
+            sink.try_write_frame_immediate_if_epoch_with_receipt(expected, b"C");
+        assert_eq!(conditional, ImmediateWrite::Full);
+
+        assert_eq!(blocking.accepted(), 1);
+        assert_eq!(nonparking.accepted(), 1);
+        let blocking_order = blocking.order().expect("blocking accepted order");
+        let nonparking_order = nonparking.order().expect("non-parking accepted order");
+        let immediate_order = immediate_order.expect("immediate accepted order");
+        let conditional_order = conditional_order.expect("conditional accepted order");
+        assert!(blocking_order < nonparking_order);
+        assert!(nonparking_order < immediate_order);
+        assert!(immediate_order < conditional_order);
+
+        let mut bytes = [0_u8; 4];
+        reader.read_exact(&mut bytes).expect("read receipt frames");
+        assert_eq!(&bytes, b"BNIC");
+    }
+
+    #[test]
+    fn peer_closed_immediate_write_has_no_accepted_order() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        writer.set_nonblocking(true).expect("nonblocking writer");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        sink.note_master_nonblocking(true);
+        drop(reader);
+
+        let (write, order) = sink.try_write_frame_immediate_with_receipt(b"closed");
+        assert_eq!(write, ImmediateWrite::BusyZero);
+        assert_eq!(order, None, "a minted-but-unaccepted token stays private");
+    }
+
+    /// Attempt order is deliberately NOT acceptance order. Hold the fd lock so
+    /// a blocking writer reserves its InputEpoch first and waits; a later
+    /// non-parking writer must spill and complete first. The receipts and bytes
+    /// both follow `B` then `A`, not the attempted `A` then `B` order.
+    #[test]
+    fn accepted_order_follows_forced_spill_linearization_not_attempt_epoch() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+        let held = sink.shared.lock.lock().unwrap();
+        let initial_epoch = sink.input_epoch();
+
+        let blocked_sink = Arc::clone(&sink);
+        let blocked = thread::spawn(move || {
+            blocked_sink
+                .write_frame_with_receipt(b"A")
+                .expect("delayed blocking receipt")
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while sink.input_epoch() == initial_epoch {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "blocking writer never reserved its earlier attempt"
+            );
+            thread::yield_now();
+        }
+
+        let first = sink
+            .write_frame_nonparking_with_receipt(b"B")
+            .expect("later attempt spills without waiting");
+        assert_eq!(first.accepted(), 1);
+        assert!(!blocked.is_finished(), "fd-lock holder still blocks A");
+        drop(held);
+
+        let second = blocked.join().expect("blocking writer thread");
+        assert_eq!(second.accepted(), 1);
+        assert!(
+            first.order().expect("B order") < second.order().expect("A order"),
+            "receipts must follow spill/direct serialization, not attempt reservation"
+        );
+
+        let mut bytes = [0_u8; 2];
+        reader
+            .read_exact(&mut bytes)
+            .expect("read reordered frames");
+        assert_eq!(&bytes, b"BA", "kernel/spill order agrees with receipts");
+    }
+
+    #[test]
+    fn degraded_locked_fallback_rechecks_a_racing_spill() {
+        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        {
+            let mut spill = sink.shared.spill.lock().unwrap();
+            spill.accepted_order = 1;
+            spill.buf.push_back(b'B');
+            // Model the narrow post-arrangement race without spawning a real
+            // drainer: the fallback must append, so this flag is sufficient.
+            spill.draining = true;
+        }
+
+        let receipt = sink
+            .write_frame_locked(b"A")
+            .expect("fallback queues behind the racing spill");
+        assert_eq!(receipt.accepted(), 1);
+        assert_eq!(receipt.order(), Some(AcceptedOrder(2)));
+        let spill = sink.shared.spill.lock().unwrap();
+        assert_eq!(spill.buf.iter().copied().collect::<Vec<_>>(), b"BA");
+    }
+
+    #[test]
+    fn try_egress_drained_is_nonblocking_and_recovers_poison() {
+        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+        assert_eq!(sink.try_egress_drained_to_kernel(), Some(true));
+
+        {
+            let mut spill = sink.shared.spill.lock().unwrap();
+            assert_eq!(
+                sink.try_egress_drained_to_kernel(),
+                None,
+                "contended observation must not wait"
+            );
+            spill.buf.push_back(b'x');
+        }
+        assert_eq!(sink.try_egress_drained_to_kernel(), Some(false));
+        sink.shared.spill.lock().unwrap().buf.clear();
+
+        let poison_sink = Arc::clone(&sink);
+        assert!(
+            thread::spawn(move || {
+                let _spill = poison_sink.shared.spill.lock().unwrap();
+                panic!("poison spill mutex for recovery coverage");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(
+            sink.try_egress_drained_to_kernel(),
+            Some(true),
+            "a poisoned try_lock already owns the guard and remains non-parking"
+        );
     }
 
     /// Each public non-empty write call is one input attempt, even when the

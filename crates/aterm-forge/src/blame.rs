@@ -1189,7 +1189,12 @@ mod tests {
     #[test]
     fn blame_names_the_fork_its_path_and_its_cost_in_every_cell() {
         let root = repo_root();
-        let cells = ["mac-arm".to_string(), "linux".to_string()];
+        // THE FLIP moved this specimen's cell: `indexmap`'s only mac-arm
+        // parents were naga/wgpu-core, so it left that graph when wgpu did.
+        // linux still resolves the fork (winit -> sctk paths never held it;
+        // wgpu remains that cell's renderer), so linux is where blame's
+        // obligations are now exercised against a LIVE fork.
+        let cells = ["linux".to_string()];
         let out = run(&root, "indexmap", &cells).expect("blame runs");
         assert!(out.ok, "{}", out.log);
         assert!(

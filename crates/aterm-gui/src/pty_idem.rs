@@ -597,6 +597,59 @@ fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `send`'s help SPLITS the keyed verbs by framing, and the split is derived
+    /// from the table — so the roster in the prose must agree with it.
+    ///
+    /// It did not. The sentence filed `feed-bin` under "`OK 0 dup=1` for a
+    /// `Lines`/`Bytes` one", but `feed-bin` is declared `Status`
+    /// (`control_verbs.rs`, the `v("feed-bin", Write, Status, …)` row), so
+    /// `dup_reply` answers `OK dup=1` for it — as this crate's own test at
+    /// `control.rs` already asserted. The code and its test agreed with each
+    /// other and disagreed with the help.
+    ///
+    /// The prior catalog check asserted only that both PHRASES appear, which is
+    /// why a verb on the wrong side of the split survived it. This derives each
+    /// verb's side from `framing_of` and requires the prose to name it there.
+    #[test]
+    fn the_send_help_files_every_keyed_verb_on_the_side_its_framing_puts_it() {
+        use aterm_types::control_verbs::{Framing, framing_of, spec};
+        let detail = spec("send").expect("`send` is a catalog verb").detail;
+        // The two PARENTHESISED rosters, not "everything before/after the split
+        // point". A first draft split the detail on `` `OK 0 dup=1` `` and looked
+        // for each verb in the prefix — and passed the plant, because `feed-bin`
+        // is also named two sentences earlier ("`key`, `feed-bin` and `turn` take
+        // the same key"). A roster check must read the roster.
+        let roster = |after: &str| -> String {
+            let tail = detail
+                .split_once(after)
+                .unwrap_or_else(|| panic!("`send`'s help states {after:?}"))
+                .1;
+            tail.split_once(')')
+                .expect("the roster is parenthesised")
+                .0
+                .to_string()
+        };
+        let status = roster("`Status`-framed verb (");
+        let lines = roster("`Lines`/`Bytes` one (");
+        for verb in KEYED_VERBS {
+            let quoted = format!("`{verb}`");
+            let (side, other, name) = match framing_of(verb, verb) {
+                Framing::Status => (&status, &lines, "Status"),
+                _ => (&lines, &status, "Lines/Bytes"),
+            };
+            assert!(
+                side.contains(&quoted),
+                "`{verb}` is {name}-framed, so `send`'s help must list it in the \
+                 {name} roster; that roster reads ({side})"
+            );
+            assert!(
+                !other.contains(&quoted),
+                "`{verb}` is {name}-framed but `send`'s help also lists it in the \
+                 OTHER roster ({other}) — a reader cannot tell which reply to expect"
+            );
+        }
+    }
     use super::*;
 
     fn nonce() -> LaunchNonce {

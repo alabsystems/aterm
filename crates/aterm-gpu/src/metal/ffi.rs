@@ -223,6 +223,26 @@ impl Drop for Obj {
 /// An `@autoreleasepool` scope. Metal's descriptor accessors return
 /// autoreleased objects; without a pool on the calling thread they accumulate
 /// until the thread dies, which for the render thread means "forever".
+///
+/// # The nesting rule, corrected
+///
+/// This type used to claim, beside its `Drop`, that "pools are strictly nested
+/// because this type is neither `Send` nor cloneable and the token never
+/// escapes". THAT IS FALSE: neither `!Send` nor `!Clone` implies LIFO drop
+/// order, and `drop(outer); drop(inner);` is ordinary safe Rust that pops the
+/// outer pool first — freeing everything the inner one was holding — and then
+/// aborts the process on the stale token with
+/// `Invalid autorelease pools are a fatal error`. The claim was inherited
+/// verbatim by `aterm-objc`, where an adversarial review found it; that crate
+/// now offers `autoreleasepool(|_| …)` and makes the token constructor
+/// `unsafe`, which is the enforced form.
+///
+/// What is true HERE is narrower, and is why this stays a plain guard: the type
+/// is `pub(crate)` inside a PRIVATE `mod metal`, and every one of its uses is a
+/// `let _pool = …` (or `let _test_pool = …`) at the top of a scope, so drop
+/// order is the scope's and is LIFO by construction. That is a property of the
+/// current call sites, not of the type — the reason the shared crate does not
+/// rely on it.
 pub(crate) struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {
@@ -235,9 +255,9 @@ impl AutoreleasePool {
 
 impl Drop for AutoreleasePool {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the token from the matching push. Pools are
-        // strictly nested because this type is neither `Send` nor cloneable and
-        // the token never escapes.
+        // SAFETY: `self.0` is the token from the matching push, and this is the
+        // innermost live pool — see the type's own note: every holder in this
+        // module is a scope-guard local, so drops are LIFO by construction.
         unsafe { objc_autoreleasePoolPop(self.0) }
     }
 }

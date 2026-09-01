@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-objc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's first-party Objective-C runtime layer: typed message sends, ownership, runtime class creation, and the block ABI — the foundation that retires the objc2 cluster."
+
+# ZERO dependencies, by construction. This crate exists to REMOVE third-party
+# code (objc2 + block2 + the objc2-* binding crates), so adding one here would
+# defeat the whole point. Everything below is std plus `libobjc`/`Foundation`,
+# which ship with the OS and are already loaded in every aterm process.
+
+[lints]
+workspace = true

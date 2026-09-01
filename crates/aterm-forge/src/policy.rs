@@ -1197,7 +1197,7 @@ census.mode = "build-dep-only"
     // --- tests that walk the REAL tree (the house norm) ---------------------
 
     #[test]
-    fn the_real_patch_table_is_five_live_vendored_forks_and_six_first_party_targets() {
+    fn the_real_patch_table_is_five_live_vendored_forks_and_seven_first_party_targets() {
         let root = repo_root();
         let all = patch_entries(&root).expect("the real patch table reads");
         let (vendored, first_party): (Vec<_>, Vec<_>) = all.iter().partition(|e| e.is_vendored());
@@ -1231,6 +1231,8 @@ census.mode = "build-dep-only"
                 ("arrayvec", "crates/aterm-arrayvec"),
                 ("libc", "crates/aterm-libc"),
                 ("log", "crates/aterm-log-shim"),
+                ("core_maths", "crates/aterm-core-maths"),
+                ("once_cell", "crates/aterm-once-cell"),
             ]
         );
         // LIVENESS, on the other hand, is owed by every entry alike: a patch
@@ -1259,8 +1261,8 @@ census.mode = "build-dep-only"
         let shims: Vec<_> = all.iter().filter(|e| !e.is_vendored()).collect();
         assert_eq!(
             shims.len(),
-            6,
-            "this tree has six first-party patch targets"
+            8,
+            "this tree has eight first-party patch targets"
         );
         // EVERY one, not the first one found. The original read
         // `.find(|e| !e.is_vendored())` and asserted `0.1.44` — which happened
@@ -1285,6 +1287,8 @@ census.mode = "build-dep-only"
                 ("arrayvec", "0.7.8"),
                 ("libc", "0.2.186"),
                 ("log", "0.4.32"),
+                ("core_maths", "0.1.1"),
+                ("once_cell", "1.21.4"),
             ]
         );
     }

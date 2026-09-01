@@ -34,7 +34,15 @@ use aterm_render::{
 
 fn gpu_or_skip(px: f32, theme: Theme) -> Option<aterm_gpu::GpuRenderer> {
     match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => Some(g),
+        Ok(mut g) => {
+            // THE FLIP: present_real is the wgpu present-theorem harness (its
+            // stand-in textures and taps are wgpu-typed) — the WGPU ORACLE by
+            // name. The armed twin lives in the metal armed differentials
+            // (`metal_present_bytes_for_test` + the tap-ring differential).
+            #[cfg(target_os = "macos")]
+            g.disarm_metal_for_oracle();
+            Some(g)
+        }
         Err(e) => {
             eprintln!("SKIP: no GPU/font available: {e}");
             None

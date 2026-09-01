@@ -110,3 +110,11 @@ __pycache__/
 # content matches only this rule, and no script under `tools/`, `scripts/` or
 # `.githooks/` names it — so ignoring it hides no tracked or trackable input.
 /.fabric-wt/
+
+# THE DELIVERED LANE 1 MIRROR — 78 MB of `.crate` tarballs that must never
+# enter git (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1: the mirror is delivered
+# as a signed bundle, not as repository content). `tools/cargo-mirror-config.toml`
+# points cargo's `local-registry` at exactly this path, so it is where
+# `cargo forge mirror unbundle --out mirror` lands; unignored, it would stop
+# `cargo ship cut` at `gates::clean_tree` the moment anyone delivered one.
+/mirror/

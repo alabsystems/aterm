@@ -1309,16 +1309,47 @@ impl SearchIndex {
         self.max_cached_lines = max.max(1);
     }
 
-    /// Record that a bulk-built index intentionally omitted an older history
-    /// prefix. Result completeness and the retained watermark remain honest
-    /// without copying or indexing rows outside the configured suffix.
-    pub(crate) fn mark_history_prefix_evicted(&mut self, lowest_retained_line: usize) {
-        if lowest_retained_line == 0 {
-            return;
+    /// State — in BOTH directions — whether the bulk build that just finished
+    /// omitted an older history prefix the source buffer still holds.
+    ///
+    /// `Some(base)`: the builder deliberately indexed only the newest suffix
+    /// (the configured depth cap is shallower than the retained history), so
+    /// results are incomplete below `base` and the watermark says exactly where
+    /// the searchable range starts. `None`: the WHOLE retained source window is
+    /// indexed, so results are exhaustive again and the watermark is zero.
+    ///
+    /// The `None` arm is why this is a setter and not a one-way
+    /// `mark_…_evicted`. [`results_may_be_incomplete`](Self::results_may_be_incomplete)
+    /// is a LATCH on the incremental append path — an eviction there really is
+    /// unrecoverable, because the dropped text is gone and nothing re-feeds it.
+    /// A bulk builder is the opposite case: it re-establishes the index's
+    /// contents from the source on every build, so once the source's history
+    /// has fallen back under the cap (a `clear`, a scrollback eviction, a
+    /// raised cap) the index IS exhaustive, and a latched flag would make the
+    /// find bar print `N+` for the life of the session over a count it knows is
+    /// exact. Only a caller that has just (re)indexed every retained source row
+    /// may pass `None`; the GUI bulk builder is bounded by the same
+    /// `max_cached_lines` it constructs the index with, so its fed range can
+    /// never trip the internal cap eviction that this could otherwise paper
+    /// over.
+    ///
+    /// `first_eviction_warned` is deliberately NOT reset: it guards a
+    /// one-per-index log line, not observable result state, and re-arming it
+    /// would re-warn on every cap crossing.
+    pub(crate) fn set_history_prefix_eviction(&mut self, lowest_retained_line: Option<usize>) {
+        match lowest_retained_line {
+            Some(base) if base > 0 => {
+                self.lowest_retained_line = base;
+                self.first_cached_line = self.first_cached_line.max(base);
+                self.eviction_occurred = true;
+            }
+            // A zero base names the oldest addressable row: nothing is omitted,
+            // which is the same statement `None` makes.
+            _ => {
+                self.lowest_retained_line = 0;
+                self.eviction_occurred = false;
+            }
         }
-        self.lowest_retained_line = self.lowest_retained_line.max(lowest_retained_line);
-        self.first_cached_line = self.first_cached_line.max(lowest_retained_line);
-        self.eviction_occurred = true;
     }
 
     /// Drop cached absolute rows below a newly-retained history boundary.

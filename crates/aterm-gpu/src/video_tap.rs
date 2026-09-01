@@ -68,14 +68,14 @@ struct CaptureEncoding {
 
 impl CaptureEncoding {
     fn new(
-        format: wgpu::TextureFormat,
+        format: crate::device_layer::TexelFormat,
         color_space: CaptureColorSpace,
         sdr_white_scale: f32,
     ) -> Result<Self, String> {
         if color_space == CaptureColorSpace::Unknown {
             return Err("presented-frame colour space is unknown".to_string());
         }
-        let format_is_f16 = format == wgpu::TextureFormat::Rgba16Float;
+        let format_is_f16 = format == crate::device_layer::TexelFormat::Rgba16Float;
         let space_is_linear = color_space == CaptureColorSpace::ExtendedLinearSrgb;
         if format_is_f16 != space_is_linear {
             return Err(format!(
@@ -98,19 +98,20 @@ impl CaptureEncoding {
         })
     }
 
-    fn format_label(self, format: wgpu::TextureFormat) -> &'static str {
+    fn format_label(self, format: crate::device_layer::TexelFormat) -> &'static str {
         match (format, self.color_space) {
-            (wgpu::TextureFormat::Bgra8Unorm, CaptureColorSpace::Srgb) => "bgra8",
-            (wgpu::TextureFormat::Rgba8Unorm, CaptureColorSpace::Srgb) => "rgba8",
-            (wgpu::TextureFormat::Bgra8Unorm, CaptureColorSpace::DisplayP3) => {
+            (crate::device_layer::TexelFormat::Bgra8Unorm, CaptureColorSpace::Srgb) => "bgra8",
+            (crate::device_layer::TexelFormat::Rgba8Unorm, CaptureColorSpace::Srgb) => "rgba8",
+            (crate::device_layer::TexelFormat::Bgra8Unorm, CaptureColorSpace::DisplayP3) => {
                 "bgra8-display-p3->srgb8"
             }
-            (wgpu::TextureFormat::Rgba8Unorm, CaptureColorSpace::DisplayP3) => {
+            (crate::device_layer::TexelFormat::Rgba8Unorm, CaptureColorSpace::DisplayP3) => {
                 "rgba8-display-p3->srgb8"
             }
-            (wgpu::TextureFormat::Rgba16Float, CaptureColorSpace::ExtendedLinearSrgb) => {
-                "rgba16f-scrgb->srgb8-tonemapped"
-            }
+            (
+                crate::device_layer::TexelFormat::Rgba16Float,
+                CaptureColorSpace::ExtendedLinearSrgb,
+            ) => "rgba16f-scrgb->srgb8-tonemapped",
             _ => "unknown",
         }
     }
@@ -398,8 +399,54 @@ impl SlotState {
 }
 
 struct Slot {
-    buffer: wgpu::Buffer,
+    buffer: SlotBuf,
     state: SlotState,
+}
+
+/// W6b - which backend's staging buffer a slot holds. A ring is HOMOGENEOUS
+/// (chosen at `new`/`new_metal`); the cross-arm enqueue guards finalize a
+/// recording honestly if a renderer disarm flips the present path mid-take.
+enum SlotBuf {
+    #[cfg(wgpu_arm)]
+    Wgpu(wgpu::Buffer),
+    /// The ARMED arm's slot: a shared-storage `MTLBuffer` plus, once this
+    /// present's Submit B is committed, a PROBE onto that command buffer -
+    /// status polling is the map's completion-handler substitute, and the
+    /// probe never feeds the loss latch (the present ring's `Submitted`
+    /// owns the once-feed).
+    #[cfg(target_os = "macos")]
+    Metal {
+        buf: crate::metal::resources::SharedBuffer,
+        probe: Option<crate::metal::encoder::CbProbe>,
+    },
+}
+
+impl SlotBuf {
+    /// Whether this slot stages through the wgpu arm — the cross-arm enqueue
+    /// guards' neutral spelling (compiles on the wgpu-free build, where it is
+    /// constantly false).
+    fn is_wgpu(&self) -> bool {
+        #[cfg(wgpu_arm)]
+        {
+            matches!(self, Self::Wgpu(_))
+        }
+        #[cfg(not(wgpu_arm))]
+        {
+            false
+        }
+    }
+
+    /// The wgpu buffer, for the map/harvest paths only WGPU slots reach.
+    #[cfg(wgpu_arm)]
+    fn wgpu(&self) -> &wgpu::Buffer {
+        match self {
+            Self::Wgpu(b) => b,
+            #[cfg(target_os = "macos")]
+            Self::Metal { .. } => {
+                unreachable!("a Metal slot never reaches the wgpu map/harvest path")
+            }
+        }
+    }
 }
 
 /// Per-window recording state. Owned by the window's GPU state; `None` = off.
@@ -437,7 +484,7 @@ pub struct VideoTap {
     /// enqueue time (resize / format flip) finalizes the recording honestly.
     src_w: u32,
     src_h: u32,
-    format: wgpu::TextureFormat,
+    format: crate::device_layer::TexelFormat,
     /// First source encoding actually copied. Later metadata changes are
     /// transformed per-slot and make the aggregate source label explicit.
     first_capture_encoding: Option<CaptureEncoding>,
@@ -503,7 +550,7 @@ fn spawn_convert_worker(
     _src_w: u32,
     _src_h: u32,
     _padded_row: usize,
-    _format: wgpu::TextureFormat,
+    _format: crate::device_layer::TexelFormat,
     _half_res: bool,
 ) -> Option<ConvertWorker> {
     None
@@ -518,7 +565,7 @@ fn spawn_convert_worker(
     src_w: u32,
     src_h: u32,
     padded_row: usize,
-    format: wgpu::TextureFormat,
+    format: crate::device_layer::TexelFormat,
     half_res: bool,
 ) -> Option<ConvertWorker> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -569,10 +616,11 @@ fn spawn_convert_worker(
 /// Bytes per source pixel for every destination format the presented-frame taps
 /// support. Kept independent of a device so the decode contract can be tested
 /// exhaustively without an adapter.
-fn capture_bpp(format: wgpu::TextureFormat) -> Result<u32, String> {
+fn capture_bpp(format: crate::device_layer::TexelFormat) -> Result<u32, String> {
     match format {
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm => Ok(4),
-        wgpu::TextureFormat::Rgba16Float => Ok(8),
+        crate::device_layer::TexelFormat::Bgra8Unorm
+        | crate::device_layer::TexelFormat::Rgba8Unorm => Ok(4),
+        crate::device_layer::TexelFormat::Rgba16Float => Ok(8),
         other => Err(format!("unsupported presented-frame format {other:?}")),
     }
 }
@@ -590,7 +638,7 @@ fn mapped_to_rgba8(
     src_w: u32,
     src_h: u32,
     padded_row: usize,
-    format: wgpu::TextureFormat,
+    format: crate::device_layer::TexelFormat,
     capture_encoding: CaptureEncoding,
     half_res: bool,
 ) -> Result<(Vec<u8>, u32, u32), String> {
@@ -633,8 +681,8 @@ fn mapped_to_rgba8(
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| "presented-frame output size overflow".to_string())?;
     let mut rgba = vec![0u8; out_len];
-    let is_f16 = format == wgpu::TextureFormat::Rgba16Float;
-    let bgra = format == wgpu::TextureFormat::Bgra8Unorm;
+    let is_f16 = format == crate::device_layer::TexelFormat::Rgba16Float;
+    let bgra = format == crate::device_layer::TexelFormat::Bgra8Unorm;
 
     // Fetch one source pixel as straight, non-linear sRGB RGBA8. Alpha is
     // linear coverage and must NEVER receive a transfer or gamut transform.
@@ -758,11 +806,12 @@ pub struct CaptureOpts {
 impl VideoTap {
     /// Build a tap for the CURRENT swapchain size/format with the client's
     /// [`CaptureOpts`].
-    pub fn new(
+    #[cfg(wgpu_arm)]
+    pub(crate) fn new(
         device: &wgpu::Device,
         src_w: u32,
         src_h: u32,
-        format: wgpu::TextureFormat,
+        format: crate::device_layer::TexelFormat,
         color_space: CaptureColorSpace,
         sdr_white_scale: f32,
         opts: CaptureOpts,
@@ -783,12 +832,12 @@ impl VideoTap {
         let (done_tx, done_rx) = mpsc::channel();
         let slots = (0..RING)
             .map(|i| Slot {
-                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                buffer: SlotBuf::Wgpu(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("aterm-video staging {i}")),
                     size,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
-                }),
+                })),
                 state: SlotState::Free,
             })
             .collect();
@@ -834,6 +883,7 @@ impl VideoTap {
     /// Enqueue the swapchain copy into THIS present's encoder (called between
     /// the render-pass close and `queue.submit`). Never blocks: a saturated
     /// ring or a mismatched size counts a drop / finalizes instead.
+    #[cfg(wgpu_arm)]
     pub fn enqueue_copy(
         &mut self,
         enc: &mut wgpu::CommandEncoder,
@@ -846,7 +896,7 @@ impl VideoTap {
         }
         if frame_tex.width() != self.src_w
             || frame_tex.height() != self.src_h
-            || frame_tex.format() != self.format
+            || crate::device_layer::TexelFormat::from_wgpu(frame_tex.format()) != Some(self.format)
         {
             // Mid-capture resize/format flip: finalize honestly (the ring was
             // sized for the old geometry) rather than chase it.
@@ -862,6 +912,18 @@ impl VideoTap {
         else {
             return;
         };
+        // W6b cross-arm guard: a wgpu-encoder copy cannot land in a Metal
+        // ring (a renderer disarm mid-take) — finalize honestly, like a
+        // resize, rather than mis-copy or panic.
+        #[cfg(target_os = "macos")]
+        if self
+            .slots
+            .first()
+            .is_some_and(|s| matches!(s.buffer, SlotBuf::Metal { .. }))
+        {
+            self.resized_early_stop = true;
+            return;
+        }
         let Some(idx) = self
             .slots
             .iter()
@@ -879,7 +941,7 @@ impl VideoTap {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.slots[idx].buffer,
+                buffer: self.slots[idx].buffer.wgpu(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded as u32),
@@ -908,6 +970,325 @@ impl VideoTap {
                 };
             }
             _ => unreachable!("a free video slot enqueues to Pending without a drop"),
+        }
+    }
+
+    /// W6b — build an ARMED-arm tap: the same ring, counters, budget, fps
+    /// gate and conversion lane, with Metal shared-storage staging slots and
+    /// STATUS-POLLED harvest in place of `map_async` (the map's
+    /// completion-handler substitute, productionized from the W5 replay).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn new_metal(
+        mint: &crate::metal::resources::MetalResourceDevice,
+        src_w: u32,
+        src_h: u32,
+        format: crate::device_layer::TexelFormat,
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+        opts: CaptureOpts,
+    ) -> Result<Self, String> {
+        let bpp = capture_bpp(format)
+            .map_err(|_| format!("video: unsupported swapchain format {format:?}"))?;
+        let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
+            .map_err(|error| format!("video: {error}"))?;
+        let padded = padded_row_bytes(src_w, bpp);
+        let size = usize::try_from(padded * u64::from(src_h))
+            .map_err(|_| "video: staging size overflows usize".to_owned())?;
+        let worker = usize::try_from(padded)
+            .ok()
+            .and_then(|row| spawn_convert_worker(src_w, src_h, row, format, opts.half_res));
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut slots = Vec::with_capacity(RING);
+        for _ in 0..RING {
+            slots.push(Slot {
+                buffer: SlotBuf::Metal {
+                    buf: crate::metal::resources::SharedBuffer::new(mint.buffer(size)?),
+                    probe: None,
+                },
+                state: SlotState::Free,
+            });
+        }
+        Ok(Self {
+            slots,
+            done_tx,
+            done_rx,
+            store: VecDeque::new(),
+            store_bytes: 0,
+            budget_bytes: opts.budget_bytes.max(16 * 1024 * 1024),
+            dropped: 0,
+            evicted: 0,
+            decimated: 0,
+            fps_cap: opts.fps_cap.map(|f| f.clamp(1, 120)),
+            requested_ms: opts.requested_ms,
+            next_capture_us: 0,
+            epoch: aterm_time::Instant::now(),
+            seq: 0,
+            half_res: opts.half_res,
+            src_w,
+            src_h,
+            format,
+            first_capture_encoding: None,
+            mixed_capture_encoding: false,
+            bpp,
+            resized_early_stop: false,
+            worker,
+        })
+    }
+
+    /// W6b — the ARMED enqueue: append this present's destination copy to
+    /// the SAME Submit B command buffer, before commit — the exact
+    /// "appended to the encoder before submit" ordering the wgpu tap uses.
+    /// Same gates, same counters, same finalize disciplines as
+    /// [`Self::enqueue_copy`], slot for slot.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_enqueue_copy(
+        &mut self,
+        cb: &mut crate::metal::encoder::CommandBuffer<'_>,
+        target: &crate::metal::resources::SealedTexture,
+        target_format: crate::device_layer::TexelFormat,
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+    ) -> Result<(), String> {
+        if self.resized_early_stop {
+            return Ok(());
+        }
+        // Cross-arm guard, the mirror of the wgpu enqueue's: a Metal copy
+        // cannot land in a wgpu ring.
+        if self.slots.first().is_some_and(|s| s.buffer.is_wgpu()) {
+            self.resized_early_stop = true;
+            return Ok(());
+        }
+        if target.width() != self.src_w as usize
+            || target.height() != self.src_h as usize
+            || target_format != self.format
+        {
+            self.resized_early_stop = true;
+            return Ok(());
+        }
+        let now_us = self.epoch.elapsed().as_micros() as u64;
+        let Some(capture_encoding) =
+            self.capture_encoding_for_present(now_us, color_space, sdr_white_scale)
+        else {
+            return Ok(());
+        };
+        let Some(idx) = self
+            .slots
+            .iter()
+            .position(|s| matches!(s.state, SlotState::Free))
+        else {
+            self.dropped += 1; // GPU behind: skip, never block.
+            return Ok(());
+        };
+        let padded = self.padded_row() as usize;
+        {
+            let SlotBuf::Metal { buf, probe } = &mut self.slots[idx].buffer else {
+                unreachable!("guarded homogeneous above")
+            };
+            *probe = None;
+            cb.copy_texture_to_buffer(
+                target,
+                self.src_w as usize,
+                self.src_h as usize,
+                buf.obj(),
+                padded,
+            )?;
+        }
+        self.seq += 1;
+        self.note_capture_encoding(capture_encoding);
+        let transition =
+            video_slot_transition(self.slots[idx].state.phase(), VideoSlotEvent::Enqueue)
+                .expect("the selected video staging slot is free");
+        match transition {
+            VideoSlotDecision {
+                phase: VideoSlotPhase::Pending,
+                count_drop: false,
+            } => {
+                self.slots[idx].state = SlotState::Pending {
+                    seq: self.seq,
+                    capture_encoding,
+                };
+            }
+            _ => unreachable!("a free video slot enqueues to Pending without a drop"),
+        }
+        Ok(())
+    }
+
+    /// W6b — attach the committed Submit B's probe to the Pending slot the
+    /// enqueue above filled (at most one per present). Called by the
+    /// renderer right after `commit`; a no-op when nothing is Pending.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_note_submitted(&mut self, probe: crate::metal::encoder::CbProbe) {
+        for slot in &mut self.slots {
+            if matches!(slot.state, SlotState::Pending { .. })
+                && let SlotBuf::Metal { probe: p, .. } = &mut slot.buffer
+                && p.is_none()
+            {
+                *p = Some(probe);
+                return;
+            }
+        }
+    }
+
+    /// W6b — the STATUS-POLLED harvest (the Metal arm of
+    /// [`Self::harvest_ready`]): a terminal `Completed` probe hands the
+    /// slot's shared bytes to the conversion lane exactly as a completed
+    /// map does; any other terminal outcome (or a lost probe) is one
+    /// counted drop. `block` waits each probe to terminal — the `finish`
+    /// drain; the per-present call never blocks.
+    #[cfg(target_os = "macos")]
+    fn metal_harvest_ready(&mut self, block: bool) {
+        self.adopt_converted();
+        for idx in 0..self.slots.len() {
+            let SlotState::InFlight {
+                seq,
+                t_us,
+                capture_encoding,
+            } = self.slots[idx].state
+            else {
+                continue;
+            };
+            let outcome = {
+                let SlotBuf::Metal { probe, .. } = &self.slots[idx].buffer else {
+                    continue;
+                };
+                match probe {
+                    Some(p) if block => Some(p.wait_terminal()),
+                    Some(p) => p.try_terminal(),
+                    // No probe: the present never committed after the
+                    // enqueue — book the loss now.
+                    None => Some(crate::metal::loss::CbOutcome::Lost {
+                        code: None,
+                        name: "tap copy's command buffer was never committed",
+                    }),
+                }
+            };
+            let Some(outcome) = outcome else { continue };
+            let ok = matches!(outcome, crate::metal::loss::CbOutcome::Completed);
+            let event = if ok {
+                VideoSlotEvent::MapOk
+            } else {
+                VideoSlotEvent::MapError
+            };
+            let transition = video_slot_transition(self.slots[idx].state.phase(), event)
+                .expect("a terminal probe belongs to an in-flight slot");
+            if ok
+                && let Some(frame) =
+                    self.metal_convert_or_dispatch(idx, seq, t_us, capture_encoding)
+            {
+                self.push_frame(frame);
+            }
+            if transition.count_drop {
+                self.dropped += 1;
+            }
+            let SlotBuf::Metal { probe, .. } = &mut self.slots[idx].buffer else {
+                unreachable!("matched Metal above")
+            };
+            *probe = None;
+            match transition.phase {
+                VideoSlotPhase::Free => self.slots[idx].state = SlotState::Free,
+                _ => unreachable!("a completed video probe always releases its slot"),
+            }
+        }
+        self.adopt_converted();
+    }
+
+    /// W6b — [`Self::convert_or_dispatch`]'s Metal twin: source the raw
+    /// padded bytes from the slot's shared buffer (the probe's `Completed`
+    /// is the coherence point) instead of a mapped range; the worker lane,
+    /// backlog bound and inline fallback are identical.
+    #[cfg(target_os = "macos")]
+    fn metal_convert_or_dispatch(
+        &mut self,
+        idx: usize,
+        seq: u64,
+        t_us: u64,
+        capture_encoding: CaptureEncoding,
+    ) -> Option<CapturedFrame> {
+        let len = self.padded_row() as usize * self.src_h as usize;
+        let raw = {
+            let SlotBuf::Metal { buf, .. } = &self.slots[idx].buffer else {
+                unreachable!("a Metal harvest reads a Metal slot")
+            };
+            // SAFETY: shared storage of exactly `len` bytes; the probe
+            // reported the writing command buffer terminal.
+            unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
+        };
+        if let Some(worker) = self.worker.as_mut() {
+            if worker.pending >= CONVERT_BACKLOG {
+                self.dropped += 1;
+                return None;
+            }
+            match worker.job_tx.send(ConvertJob {
+                raw,
+                seq,
+                t_us,
+                capture_encoding,
+            }) {
+                Ok(()) => {
+                    worker.pending += 1;
+                    return None;
+                }
+                Err(send_err) => {
+                    // Worker died: inline fallback for the rest of the take.
+                    self.worker = None;
+                    let raw = send_err.0.raw;
+                    return Some(Self::metal_inline_convert(
+                        &raw,
+                        self.src_w,
+                        self.src_h,
+                        self.padded_row() as usize,
+                        self.format,
+                        capture_encoding,
+                        self.half_res,
+                        seq,
+                        t_us,
+                    ));
+                }
+            }
+        }
+        Some(Self::metal_inline_convert(
+            &raw,
+            self.src_w,
+            self.src_h,
+            self.padded_row() as usize,
+            self.format,
+            capture_encoding,
+            self.half_res,
+            seq,
+            t_us,
+        ))
+    }
+
+    /// The inline (no-worker) conversion for a Metal slot's raw bytes.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments, reason = "a private conversion tail")]
+    fn metal_inline_convert(
+        raw: &[u8],
+        src_w: u32,
+        src_h: u32,
+        padded: usize,
+        format: crate::device_layer::TexelFormat,
+        capture_encoding: CaptureEncoding,
+        half_res: bool,
+        seq: u64,
+        t_us: u64,
+    ) -> CapturedFrame {
+        let (rgba, width, height) = mapped_to_rgba8(
+            raw,
+            src_w,
+            src_h,
+            padded,
+            format,
+            capture_encoding,
+            half_res,
+        )
+        .expect("VideoTap staging layout is validated at construction");
+        CapturedFrame {
+            seq,
+            t_us,
+            w: width,
+            h: height,
+            rgba,
         }
     }
 
@@ -973,6 +1354,7 @@ impl VideoTap {
     /// (a raw memcpy handed to the conversion worker — never per-pixel work
     /// here) and adopt any finished conversions into the store. Bounded work;
     /// never waits on the GPU or the worker.
+    #[cfg(wgpu_arm)]
     pub fn after_present(&mut self, device: &wgpu::Device, t_us: u64) {
         // Stamp + map the newest Pending slot (at most one per present).
         for (i, slot) in self.slots.iter_mut().enumerate() {
@@ -981,12 +1363,22 @@ impl VideoTap {
                 capture_encoding,
             } = slot.state
             {
-                let tx = self.done_tx.clone();
-                slot.buffer
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| {
-                        let _ = tx.send((i, r.is_ok()));
-                    });
+                match &slot.buffer {
+                    SlotBuf::Wgpu(buffer) => {
+                        let tx = self.done_tx.clone();
+                        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                            let _ = tx.send((i, r.is_ok()));
+                        });
+                    }
+                    // W6b — a Metal slot's "map" is its probe: the copy rides
+                    // the present's Submit B, so InFlight means "that command
+                    // buffer is not yet terminal". A Pending slot with NO
+                    // probe means the present never committed (Submit B
+                    // failed after the enqueue) — the harvest below books it
+                    // as a map error, one counted drop.
+                    #[cfg(target_os = "macos")]
+                    SlotBuf::Metal { .. } => {}
+                }
                 let transition =
                     video_slot_transition(slot.state.phase(), VideoSlotEvent::StartMap)
                         .expect("only pending slots start mapping");
@@ -1008,6 +1400,49 @@ impl VideoTap {
         // Non-blocking poll: advances map completions without waiting.
         let _ = device.poll(wgpu::PollType::Poll);
         self.harvest_ready();
+        #[cfg(target_os = "macos")]
+        self.metal_harvest_ready(false);
+    }
+
+    /// Whether this ring stages through the ARMED (Metal) arm — the renderer
+    /// wrapper's dispatch key (a ring is homogeneous; see `SlotBuf`).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ring_is_metal(&self) -> bool {
+        self.slots.first().is_some_and(|s| !s.buffer.is_wgpu())
+    }
+
+    /// THE FLIP — [`Self::after_present`] for a build with no wgpu device to
+    /// poll: the armed (Metal) ring's post-present hook. Same StartMap
+    /// transition per Pending slot (a Metal slot's "map" is its probe), same
+    /// non-blocking harvest; there is no wgpu map to start and no device to
+    /// poll, which is the entire difference.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_after_present(&mut self, t_us: u64) {
+        for slot in self.slots.iter_mut() {
+            if let SlotState::Pending {
+                seq,
+                capture_encoding,
+            } = slot.state
+            {
+                let transition =
+                    video_slot_transition(slot.state.phase(), VideoSlotEvent::StartMap)
+                        .expect("only pending slots start mapping");
+                match transition {
+                    VideoSlotDecision {
+                        phase: VideoSlotPhase::InFlight,
+                        count_drop: false,
+                    } => {
+                        slot.state = SlotState::InFlight {
+                            seq,
+                            t_us,
+                            capture_encoding,
+                        };
+                    }
+                    _ => unreachable!("a pending video slot starts mapping without a drop"),
+                }
+            }
+        }
+        self.metal_harvest_ready(false);
     }
 
     /// Drain the completion channel: adopt finished off-thread conversions,
@@ -1015,6 +1450,7 @@ impl VideoTap {
     /// copied out raw and unmapped HERE, so a slot's lifetime is still bounded
     /// by map latency alone — conversion lag can never saturate the staging
     /// ring, it can only (bounded, counted) drop via [`CONVERT_BACKLOG`].
+    #[cfg(wgpu_arm)]
     fn harvest_ready(&mut self) {
         self.adopt_converted();
         while let Ok((idx, ok)) = self.done_rx.try_recv() {
@@ -1039,7 +1475,7 @@ impl VideoTap {
             if transition.count_drop {
                 self.dropped += 1;
             }
-            self.slots[idx].buffer.unmap();
+            self.slots[idx].buffer.wgpu().unmap();
             match transition.phase {
                 VideoSlotPhase::Free => self.slots[idx].state = SlotState::Free,
                 _ => unreachable!("a completed video map always releases its slot"),
@@ -1057,6 +1493,7 @@ impl VideoTap {
     /// worker already [`CONVERT_BACKLOG`] frames behind means conversion is
     /// not keeping pace: count one mid-stream drop rather than queueing
     /// unbounded raw copies or blocking the present thread.
+    #[cfg(wgpu_arm)]
     fn convert_or_dispatch(
         &mut self,
         idx: usize,
@@ -1069,7 +1506,12 @@ impl VideoTap {
                 self.dropped += 1;
                 return None;
             }
-            let raw = self.slots[idx].buffer.slice(..).get_mapped_range().to_vec();
+            let raw = self.slots[idx]
+                .buffer
+                .wgpu()
+                .slice(..)
+                .get_mapped_range()
+                .to_vec();
             match worker.job_tx.send(ConvertJob {
                 raw,
                 seq,
@@ -1111,6 +1553,7 @@ impl VideoTap {
     /// swizzle/decode + (optionally) 2×2 box-downscale one mapped slot into a
     /// tightly-packed RGBA8 frame, synchronously on the calling (present)
     /// thread.
+    #[cfg(wgpu_arm)]
     fn copy_out(
         &self,
         idx: usize,
@@ -1119,7 +1562,7 @@ impl VideoTap {
         capture_encoding: CaptureEncoding,
     ) -> CapturedFrame {
         let padded = self.padded_row() as usize;
-        let data = self.slots[idx].buffer.slice(..).get_mapped_range();
+        let data = self.slots[idx].buffer.wgpu().slice(..).get_mapped_range();
         let (rgba, width, height) = mapped_to_rgba8(
             &data,
             self.src_w,
@@ -1173,7 +1616,35 @@ impl VideoTap {
     /// (off the hot path by definition — the recording is over), then hand the
     /// store out. Every frame the worker was still converting is adopted
     /// before the take is sealed, so deferring the tonemap loses nothing.
+    /// THE FLIP — [`Self::finish`] for a build with no wgpu device: blocking
+    /// Metal drain (wait every in-flight probe terminal, harvest), then the
+    /// same abort sweep, conversion-lane drain, and take assembly.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_finish(mut self) -> VideoTake {
+        self.metal_harvest_ready(true);
+        for s in &mut self.slots {
+            if !matches!(s.state, SlotState::Free) {
+                let transition = video_slot_transition(s.state.phase(), VideoSlotEvent::Abort)
+                    .expect("only an outstanding slot reaches finalization abort");
+                self.dropped += u64::from(transition.count_drop);
+                match transition.phase {
+                    VideoSlotPhase::Free => s.state = SlotState::Free,
+                    _ => unreachable!("finalization abort always releases the video slot"),
+                }
+            }
+        }
+        self.drain_convert_lane();
+        self.into_take()
+    }
+
+    #[cfg(wgpu_arm)]
     pub fn finish(mut self, device: &wgpu::Device) -> VideoTake {
+        // W6b — the Metal drain first: wait every in-flight probe to
+        // terminal and harvest (blocking is the finish contract; the
+        // recording is over). The abort sweep below then cleans anything
+        // still outstanding on either arm.
+        #[cfg(target_os = "macos")]
+        self.metal_harvest_ready(true);
         let any_inflight = self
             .slots
             .iter()
@@ -1194,9 +1665,14 @@ impl VideoTap {
                 }
             }
         }
-        // Conversion lane drain: dropping the job sender lets the worker run
-        // its queue dry and exit; every outstanding result is adopted here. A
-        // worker that died with jobs outstanding is counted honestly.
+        self.drain_convert_lane();
+        self.into_take()
+    }
+
+    /// Conversion lane drain: dropping the job sender lets the worker run
+    /// its queue dry and exit; every outstanding result is adopted here. A
+    /// worker that died with jobs outstanding is counted honestly.
+    fn drain_convert_lane(&mut self) {
         if let Some(ConvertWorker {
             job_tx,
             result_rx,
@@ -1219,6 +1695,10 @@ impl VideoTap {
             }
             let _ = handle.join();
         }
+    }
+
+    /// The take assembly both finish arms share.
+    fn into_take(self) -> VideoTake {
         let (dw, dh) = if self.half_res {
             (self.src_w.div_ceil(2), self.src_h.div_ceil(2))
         } else {
@@ -1397,24 +1877,25 @@ impl PresentedFrameState {
 /// active recording can copy the same destination in one encoder without
 /// consuming or perturbing each other's state.
 pub(crate) struct PresentedFrameTap {
-    buffer: wgpu::Buffer,
+    buffer: SlotBuf,
     done_tx: mpsc::Sender<bool>,
     done_rx: mpsc::Receiver<bool>,
     state: PresentedFrameState,
     result: Option<Result<CapturedFrame, String>>,
     src_w: u32,
     src_h: u32,
-    format: wgpu::TextureFormat,
+    format: crate::device_layer::TexelFormat,
     capture_encoding: Option<CaptureEncoding>,
     bpp: u32,
 }
 
 impl PresentedFrameTap {
+    #[cfg(wgpu_arm)]
     pub(crate) fn new(
         device: &wgpu::Device,
         src_w: u32,
         src_h: u32,
-        format: wgpu::TextureFormat,
+        format: crate::device_layer::TexelFormat,
         color_space: CaptureColorSpace,
         sdr_white_scale: f32,
     ) -> Result<Self, String> {
@@ -1428,12 +1909,12 @@ impl PresentedFrameTap {
         if size == 0 {
             return Err("presented snapshot: destination has zero area".to_string());
         }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = SlotBuf::Wgpu(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("aterm presented-frame snapshot staging"),
             size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        });
+        }));
         let (done_tx, done_rx) = mpsc::channel();
         Ok(Self {
             buffer,
@@ -1451,6 +1932,202 @@ impl PresentedFrameTap {
 
     fn padded_row(&self) -> u64 {
         padded_row_bytes(self.src_w, self.bpp)
+    }
+
+    /// W6b — the ARMED one-shot tap: same lifecycle, Metal staging + probe.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn new_metal(
+        mint: &crate::metal::resources::MetalResourceDevice,
+        src_w: u32,
+        src_h: u32,
+        format: crate::device_layer::TexelFormat,
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+    ) -> Result<Self, String> {
+        let bpp = capture_bpp(format)
+            .map_err(|_| format!("presented snapshot: unsupported format {format:?}"))?;
+        let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
+            .map_err(|error| format!("presented snapshot: {error}"))?;
+        let size = padded_row_bytes(src_w, bpp)
+            .checked_mul(u64::from(src_h))
+            .ok_or_else(|| "presented snapshot: staging size overflow".to_string())?;
+        if size == 0 {
+            return Err("presented snapshot: destination has zero area".to_string());
+        }
+        let size = usize::try_from(size)
+            .map_err(|_| "presented snapshot: staging size overflows usize".to_string())?;
+        let (done_tx, done_rx) = mpsc::channel();
+        Ok(Self {
+            buffer: SlotBuf::Metal {
+                buf: crate::metal::resources::SharedBuffer::new(mint.buffer(size)?),
+                probe: None,
+            },
+            done_tx,
+            done_rx,
+            state: PresentedFrameState::Armed,
+            result: None,
+            src_w,
+            src_h,
+            format,
+            capture_encoding: None,
+            bpp,
+        })
+    }
+
+    /// W6b — the ARMED enqueue (see `VideoTap::metal_enqueue_copy`): append
+    /// the one-shot copy to this present's Submit B before commit. Mismatch
+    /// and metadata refusals are terminal and explicit, exactly the wgpu
+    /// arm's.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_enqueue_copy(
+        &mut self,
+        cb: &mut crate::metal::encoder::CommandBuffer<'_>,
+        target: &crate::metal::resources::SealedTexture,
+        target_format: crate::device_layer::TexelFormat,
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+    ) -> Result<(), String> {
+        if self.state != PresentedFrameState::Armed {
+            return Ok(());
+        }
+        if self.buffer.is_wgpu() {
+            self.result = Some(Err(
+                "presented snapshot: the renderer armed mid-capture (wgpu staging, \
+                 Metal present)"
+                    .to_string(),
+            ));
+            let outcome = self.apply_transition(PresentedFrameEvent::RejectEnqueue, None);
+            debug_assert_eq!(outcome, PresentedFrameOutcome::Error);
+            return Ok(());
+        }
+        if target.width() != self.src_w as usize
+            || target.height() != self.src_h as usize
+            || target_format != self.format
+        {
+            self.result = Some(Err(format!(
+                "presented snapshot: destination changed from {}x{} {:?} to {}x{} {:?}",
+                self.src_w,
+                self.src_h,
+                self.format,
+                target.width(),
+                target.height(),
+                target_format,
+            )));
+            let outcome = self.apply_transition(PresentedFrameEvent::RejectEnqueue, None);
+            debug_assert_eq!(outcome, PresentedFrameOutcome::Error);
+            return Ok(());
+        }
+        let capture_encoding = match CaptureEncoding::new(self.format, color_space, sdr_white_scale)
+        {
+            Ok(encoding) => encoding,
+            Err(error) => {
+                self.result = Some(Err(format!("presented snapshot: {error}")));
+                let outcome = self.apply_transition(PresentedFrameEvent::RejectEnqueue, None);
+                debug_assert_eq!(outcome, PresentedFrameOutcome::Error);
+                return Ok(());
+            }
+        };
+        {
+            let padded = self.padded_row() as usize;
+            let (src_w, src_h) = (self.src_w as usize, self.src_h as usize);
+            let SlotBuf::Metal { buf, probe } = &mut self.buffer else {
+                unreachable!("guarded above")
+            };
+            *probe = None;
+            cb.copy_texture_to_buffer(target, src_w, src_h, buf.obj(), padded)?;
+        }
+        self.capture_encoding = Some(capture_encoding);
+        let outcome = self.apply_transition(PresentedFrameEvent::EnqueueValid, None);
+        debug_assert_eq!(outcome, PresentedFrameOutcome::None);
+        Ok(())
+    }
+
+    /// W6b — attach the committed Submit B's probe (see
+    /// `VideoTap::metal_note_submitted`).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_note_submitted(&mut self, probe: crate::metal::encoder::CbProbe) {
+        if self.state == PresentedFrameState::Pending
+            && let SlotBuf::Metal { probe: p, .. } = &mut self.buffer
+            && p.is_none()
+        {
+            *p = Some(probe);
+        }
+    }
+
+    /// W6b — the STATUS-POLLED harvest: on a terminal `Completed` probe the
+    /// shared bytes convert exactly as a completed map's; any other
+    /// terminal outcome is the explicit error result. `block` is the
+    /// `finish` drain.
+    #[cfg(target_os = "macos")]
+    fn metal_harvest(&mut self, block: bool) {
+        let PresentedFrameState::InFlight { t_us } = self.state else {
+            return;
+        };
+        let outcome = {
+            let SlotBuf::Metal { probe, .. } = &self.buffer else {
+                return;
+            };
+            match probe {
+                Some(p) if block => Some(p.wait_terminal()),
+                Some(p) => p.try_terminal(),
+                None => Some(crate::metal::loss::CbOutcome::Lost {
+                    code: None,
+                    name: "snapshot copy's command buffer was never committed",
+                }),
+            }
+        };
+        let Some(outcome) = outcome else { return };
+        let result = if matches!(outcome, crate::metal::loss::CbOutcome::Completed) {
+            let len = self.padded_row() as usize * self.src_h as usize;
+            let raw = {
+                let SlotBuf::Metal { buf, .. } = &self.buffer else {
+                    unreachable!("matched above")
+                };
+                // SAFETY: shared storage of exactly `len` bytes; the probe
+                // reported the writing command buffer terminal.
+                unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
+            };
+            mapped_to_rgba8(
+                &raw,
+                self.src_w,
+                self.src_h,
+                self.padded_row() as usize,
+                self.format,
+                self.capture_encoding
+                    .expect("a pending presented copy freezes its capture encoding"),
+                false,
+            )
+            .map(|(rgba, w, h)| CapturedFrame {
+                seq: 1,
+                t_us,
+                w,
+                h,
+                rgba,
+            })
+        } else {
+            Err(format!(
+                "presented snapshot: the present's command buffer ended {outcome:?}"
+            ))
+        };
+        let completed_ok = result.is_ok();
+        if let SlotBuf::Metal { probe, .. } = &mut self.buffer {
+            *probe = None;
+        }
+        self.result = Some(result);
+        let event = if completed_ok {
+            PresentedFrameEvent::CompleteMap
+        } else {
+            PresentedFrameEvent::MapError
+        };
+        let outcome = self.apply_transition(event, None);
+        debug_assert_eq!(
+            outcome,
+            if completed_ok {
+                PresentedFrameOutcome::Frame
+            } else {
+                PresentedFrameOutcome::Error
+            }
+        );
     }
 
     fn apply_transition(
@@ -1474,6 +2151,7 @@ impl PresentedFrameTap {
     /// Append this one-shot copy to the SAME encoder as the completed destination
     /// render. A mismatch is terminal and explicit; it never silently returns a
     /// differently-sized or differently-encoded frame.
+    #[cfg(wgpu_arm)]
     pub(crate) fn enqueue_copy(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1486,7 +2164,7 @@ impl PresentedFrameTap {
         }
         if frame_tex.width() != self.src_w
             || frame_tex.height() != self.src_h
-            || frame_tex.format() != self.format
+            || crate::device_layer::TexelFormat::from_wgpu(frame_tex.format()) != Some(self.format)
         {
             self.result = Some(Err(format!(
                 "presented snapshot: destination changed from {}x{} {:?} to {}x{} {:?}",
@@ -1511,6 +2189,18 @@ impl PresentedFrameTap {
                 return;
             }
         };
+        // W6b cross-arm guard: see VideoTap::enqueue_copy.
+        #[cfg(target_os = "macos")]
+        if matches!(self.buffer, SlotBuf::Metal { .. }) {
+            self.result = Some(Err(
+                "presented snapshot: the renderer disarmed mid-capture (Metal staging, \
+                 wgpu present)"
+                    .to_string(),
+            ));
+            let outcome = self.apply_transition(PresentedFrameEvent::RejectEnqueue, None);
+            debug_assert_eq!(outcome, PresentedFrameOutcome::Error);
+            return;
+        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: frame_tex,
@@ -1519,7 +2209,7 @@ impl PresentedFrameTap {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.buffer,
+                buffer: self.buffer.wgpu(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_row() as u32),
@@ -1539,6 +2229,7 @@ impl PresentedFrameTap {
 
     /// Stamp and map the copy belonging to the successful present. Non-blocking:
     /// [`Self::finish`] owns the off-hot-path wait.
+    #[cfg(wgpu_arm)]
     pub(crate) fn after_present(&mut self, device: &wgpu::Device, t_us: u64) -> Result<(), String> {
         match self.state {
             PresentedFrameState::Armed => {
@@ -1548,12 +2239,20 @@ impl PresentedFrameTap {
                 );
             }
             PresentedFrameState::Pending => {
-                let tx = self.done_tx.clone();
-                self.buffer
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |result| {
-                        let _ = tx.send(result.is_ok());
-                    });
+                match &self.buffer {
+                    SlotBuf::Wgpu(buffer) => {
+                        let tx = self.done_tx.clone();
+                        buffer
+                            .slice(..)
+                            .map_async(wgpu::MapMode::Read, move |result| {
+                                let _ = tx.send(result.is_ok());
+                            });
+                    }
+                    // W6b — the probe (attached at commit) is the map; the
+                    // harvest below polls it.
+                    #[cfg(target_os = "macos")]
+                    SlotBuf::Metal { .. } => {}
+                }
                 let outcome = self.apply_transition(PresentedFrameEvent::StartMap, Some(t_us));
                 debug_assert_eq!(outcome, PresentedFrameOutcome::None);
             }
@@ -1561,9 +2260,60 @@ impl PresentedFrameTap {
         }
         let _ = device.poll(wgpu::PollType::Poll);
         self.harvest_ready();
+        #[cfg(target_os = "macos")]
+        self.metal_harvest(false);
         self.result_status()
     }
 
+    /// Whether this one-shot stages through the ARMED (Metal) arm.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn tap_is_metal(&self) -> bool {
+        !self.buffer.is_wgpu()
+    }
+
+    /// THE FLIP — [`Self::after_present`] with no wgpu device to poll: the
+    /// armed one-shot's post-present hook (the probe is the map).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_after_present(&mut self, t_us: u64) -> Result<(), String> {
+        match self.state {
+            PresentedFrameState::Armed => {
+                return Err(
+                    "presented snapshot: successful present did not enqueue a destination copy"
+                        .to_string(),
+                );
+            }
+            PresentedFrameState::Pending => {
+                let outcome = self.apply_transition(PresentedFrameEvent::StartMap, Some(t_us));
+                debug_assert_eq!(outcome, PresentedFrameOutcome::None);
+            }
+            PresentedFrameState::InFlight { .. } | PresentedFrameState::Complete => {}
+        }
+        self.metal_harvest(false);
+        self.result_status()
+    }
+
+    /// THE FLIP — [`Self::finish`] with no wgpu device: blocking probe drain.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_finish(&mut self) -> Result<(), String> {
+        match self.state {
+            PresentedFrameState::Armed => {
+                return Err("presented snapshot: no successful present was captured".to_string());
+            }
+            PresentedFrameState::Pending => {
+                return Err(
+                    "presented snapshot: after-present hook was not called before finish"
+                        .to_string(),
+                );
+            }
+            PresentedFrameState::InFlight { .. } => {
+                self.metal_harvest(true);
+            }
+            PresentedFrameState::Complete => {}
+        }
+        self.result_status()
+    }
+
+    #[cfg(wgpu_arm)]
     fn harvest_ready(&mut self) {
         let Ok(mapped) = self.done_rx.try_recv() else {
             return;
@@ -1572,7 +2322,7 @@ impl PresentedFrameTap {
             return;
         };
         let result = if mapped {
-            let data = self.buffer.slice(..).get_mapped_range();
+            let data = self.buffer.wgpu().slice(..).get_mapped_range();
             let converted = mapped_to_rgba8(
                 &data,
                 self.src_w,
@@ -1595,7 +2345,7 @@ impl PresentedFrameTap {
             Err("presented snapshot: staging-buffer map failed".to_string())
         };
         let completed_ok = result.is_ok();
-        self.buffer.unmap();
+        self.buffer.wgpu().unmap();
         self.result = Some(result);
         let event = if completed_ok {
             PresentedFrameEvent::CompleteMap
@@ -1622,6 +2372,7 @@ impl PresentedFrameTap {
 
     /// Blocking completion, called only after the explicit capture leaves the
     /// present hot path. The frame remains owned by the tap until [`Self::take`].
+    #[cfg(wgpu_arm)]
     pub(crate) fn finish(&mut self, device: &wgpu::Device) -> Result<(), String> {
         match self.state {
             PresentedFrameState::Armed => {
@@ -1634,8 +2385,14 @@ impl PresentedFrameTap {
                 );
             }
             PresentedFrameState::InFlight { .. } => {
+                // W6b — a Metal capture drains by probe, not by device poll.
+                #[cfg(target_os = "macos")]
+                if matches!(self.buffer, SlotBuf::Metal { .. }) {
+                    self.metal_harvest(true);
+                    return self.result_status();
+                }
                 if let Err(error) = device.poll(wgpu::PollType::wait_indefinitely()) {
-                    self.buffer.unmap();
+                    self.buffer.wgpu().unmap();
                     self.result = Some(Err(format!(
                         "presented snapshot: GPU completion wait failed: {error}"
                     )));
@@ -1644,7 +2401,7 @@ impl PresentedFrameTap {
                 } else {
                     self.harvest_ready();
                     if self.state != PresentedFrameState::Complete {
-                        self.buffer.unmap();
+                        self.buffer.wgpu().unmap();
                         self.result = Some(Err(
                             "presented snapshot: map callback did not complete".to_string(),
                         ));
@@ -1797,7 +2554,7 @@ mod tests {
             half_res: false,
             src_w: 2,
             src_h: 2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: crate::device_layer::TexelFormat::Rgba8Unorm,
             first_capture_encoding: None,
             mixed_capture_encoding: false,
             bpp: 4,
@@ -1829,7 +2586,7 @@ mod tests {
     }
 
     fn encoding(
-        format: wgpu::TextureFormat,
+        format: crate::device_layer::TexelFormat,
         color_space: CaptureColorSpace,
         sdr_white_scale: f32,
     ) -> CaptureEncoding {
@@ -1936,7 +2693,7 @@ mod tests {
         ];
         let sdr_raw = padded_fixture(&sdr_rows, stride);
         let sdr_enc = encoding(
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             CaptureColorSpace::Srgb,
             1.0,
         );
@@ -1952,7 +2709,7 @@ mod tests {
         let edr_rows: [&[u8]; 2] = [&edr_pixels[..16], &edr_pixels[16..]];
         let edr_raw = padded_fixture(&edr_rows, stride);
         let edr_enc = encoding(
-            wgpu::TextureFormat::Rgba16Float,
+            crate::device_layer::TexelFormat::Rgba16Float,
             CaptureColorSpace::ExtendedLinearSrgb,
             1.0,
         );
@@ -1960,14 +2717,14 @@ mod tests {
             (
                 "sdr",
                 sdr_raw,
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 sdr_enc,
                 false,
             ),
             (
                 "edr",
                 edr_raw,
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 edr_enc,
                 true,
             ),
@@ -2065,9 +2822,9 @@ mod tests {
             2,
             1,
             8,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2083,9 +2840,9 @@ mod tests {
             2,
             1,
             8,
-            wgpu::TextureFormat::Bgra8Unorm,
+            crate::device_layer::TexelFormat::Bgra8Unorm,
             encoding(
-                wgpu::TextureFormat::Bgra8Unorm,
+                crate::device_layer::TexelFormat::Bgra8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2106,9 +2863,9 @@ mod tests {
             2,
             1,
             16,
-            wgpu::TextureFormat::Rgba16Float,
+            crate::device_layer::TexelFormat::Rgba16Float,
             encoding(
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 CaptureColorSpace::ExtendedLinearSrgb,
                 1.0,
             ),
@@ -2134,9 +2891,9 @@ mod tests {
             2,
             2,
             256,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2156,9 +2913,9 @@ mod tests {
             2,
             2,
             256,
-            wgpu::TextureFormat::Bgra8Unorm,
+            crate::device_layer::TexelFormat::Bgra8Unorm,
             encoding(
-                wgpu::TextureFormat::Bgra8Unorm,
+                crate::device_layer::TexelFormat::Bgra8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2177,9 +2934,9 @@ mod tests {
             2,
             2,
             256,
-            wgpu::TextureFormat::Rgba16Float,
+            crate::device_layer::TexelFormat::Rgba16Float,
             encoding(
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 CaptureColorSpace::ExtendedLinearSrgb,
                 1.0,
             ),
@@ -2205,9 +2962,9 @@ mod tests {
             2,
             2,
             256,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2229,9 +2986,9 @@ mod tests {
             2,
             2,
             256,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2253,9 +3010,9 @@ mod tests {
             2,
             2,
             256,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2280,9 +3037,9 @@ mod tests {
             3,
             3,
             256,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2298,9 +3055,9 @@ mod tests {
             1,
             1,
             4,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2324,9 +3081,9 @@ mod tests {
                 1,
                 1,
                 8,
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 encoding(
-                    wgpu::TextureFormat::Rgba16Float,
+                    crate::device_layer::TexelFormat::Rgba16Float,
                     CaptureColorSpace::ExtendedLinearSrgb,
                     scale,
                 ),
@@ -2354,9 +3111,9 @@ mod tests {
             1,
             1,
             8,
-            wgpu::TextureFormat::Rgba16Float,
+            crate::device_layer::TexelFormat::Rgba16Float,
             encoding(
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 CaptureColorSpace::ExtendedLinearSrgb,
                 2.0,
             ),
@@ -2381,9 +3138,9 @@ mod tests {
             1,
             1,
             4,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::DisplayP3,
                 1.0,
             ),
@@ -2398,9 +3155,9 @@ mod tests {
             1,
             1,
             4,
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             encoding(
-                wgpu::TextureFormat::Rgba8Unorm,
+                crate::device_layer::TexelFormat::Rgba8Unorm,
                 CaptureColorSpace::Srgb,
                 1.0,
             ),
@@ -2419,7 +3176,7 @@ mod tests {
     fn capture_encoding_rejects_format_space_mismatch_and_bad_scale() {
         assert!(
             CaptureEncoding::new(
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 CaptureColorSpace::Srgb,
                 1.0,
             )
@@ -2427,7 +3184,7 @@ mod tests {
         );
         assert!(
             CaptureEncoding::new(
-                wgpu::TextureFormat::Bgra8Unorm,
+                crate::device_layer::TexelFormat::Bgra8Unorm,
                 CaptureColorSpace::ExtendedLinearSrgb,
                 1.0,
             )
@@ -2435,7 +3192,7 @@ mod tests {
         );
         assert!(
             CaptureEncoding::new(
-                wgpu::TextureFormat::Rgba16Float,
+                crate::device_layer::TexelFormat::Rgba16Float,
                 CaptureColorSpace::ExtendedLinearSrgb,
                 f32::NAN,
             )
@@ -2443,7 +3200,7 @@ mod tests {
         );
         assert!(
             CaptureEncoding::new(
-                wgpu::TextureFormat::Bgra8Unorm,
+                crate::device_layer::TexelFormat::Bgra8Unorm,
                 CaptureColorSpace::Unknown,
                 1.0,
             )
@@ -2454,12 +3211,12 @@ mod tests {
     #[test]
     fn in_flight_slots_freeze_encoding_while_later_frames_track_changes() {
         let srgb = encoding(
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             CaptureColorSpace::Srgb,
             1.0,
         );
         let p3 = encoding(
-            wgpu::TextureFormat::Rgba8Unorm,
+            crate::device_layer::TexelFormat::Rgba8Unorm,
             CaptureColorSpace::DisplayP3,
             1.0,
         );
@@ -2482,12 +3239,12 @@ mod tests {
         ));
 
         let scale_one = encoding(
-            wgpu::TextureFormat::Rgba16Float,
+            crate::device_layer::TexelFormat::Rgba16Float,
             CaptureColorSpace::ExtendedLinearSrgb,
             1.0,
         );
         let scale_two = encoding(
-            wgpu::TextureFormat::Rgba16Float,
+            crate::device_layer::TexelFormat::Rgba16Float,
             CaptureColorSpace::ExtendedLinearSrgb,
             2.0,
         );

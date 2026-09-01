@@ -48,6 +48,24 @@ pub(crate) enum ClosePreflightVisibility {
     Quiet,
 }
 
+/// Type the operator bootstrap command through the session's canonical input
+/// receipt while preserving its exact one-frame `line + CR` wire contract.
+fn inject_operator_launch_line(
+    term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
+    ctx: &crate::SessionCtx,
+) {
+    let mut bytes = crate::status_item::OPERATOR_LAUNCH_LINE.as_bytes().to_vec();
+    bytes.push(0x0d);
+    let event = crate::input::InputEvent::KeySequence(bytes);
+    crate::app_input::tracked_egress(
+        term,
+        &ctx.sink,
+        &ctx.output_echo,
+        &event,
+        crate::input::EgressMode::Backpressured,
+    );
+}
+
 /// Decide whether a background tab's new title epoch changes visible tab chrome.
 ///
 /// The epoch remains the cheapest gate for ordinary PTY output. Once it changes,
@@ -2703,10 +2721,10 @@ impl App {
                                     MetaField::Title,
                                     MetaEdit::Set("operator: starting"),
                                 );
-                                (h.local_id, h.ctx.sink.clone())
+                                (h.local_id, h.term.clone(), h.ctx.clone())
                             })
                         };
-                        if let Some((local, sink)) = stamped {
+                        if let Some((local, term, ctx)) = stamped {
                             // The wire meta arm's fan-out, mirrored (the GUI
                             // rename discipline): chrome recompose + a
                             // subscriber notify so the fresh records push.
@@ -2717,10 +2735,7 @@ impl App {
                                     .unwrap_or_else(|p| p.into_inner())
                                     .notify(local);
                             }
-                            let mut bytes =
-                                crate::status_item::OPERATOR_LAUNCH_LINE.as_bytes().to_vec();
-                            bytes.push(0x0d);
-                            let _ = sink.write_frame(&bytes);
+                            inject_operator_launch_line(&term, &ctx);
                         }
                         self.refresh_operator_status_item();
                     }
@@ -7621,6 +7636,39 @@ mod rename_strip_click_tests {
 #[cfg(test)]
 mod operator_glance_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_launch_line_is_exact_and_stamps_its_session_receipt() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::sync::Arc;
+
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let sink = Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
+        let session = crate::stub_session_with_sink(77, sink);
+        inject_operator_launch_line(&session.term, &session.ctx);
+
+        let mut expected = crate::status_item::OPERATOR_LAUNCH_LINE.as_bytes().to_vec();
+        expected.push(b'\r');
+        let mut observed = vec![0; expected.len()];
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        reader
+            .read_exact(&mut observed)
+            .expect("operator launch bytes");
+        assert_eq!(observed, expected);
+        let sample = session
+            .ctx
+            .output_echo
+            .sample(&session.ctx.sink, std::time::Instant::now());
+        assert!(sample.last_accepted_at.is_none());
+        assert!(sample.last_boundary_at.is_some());
+        assert!(!sample.input_hot);
+
+        drop(session);
+        unsafe { libc::close(fds[1]) };
+    }
 
     fn set_meta(app: &App, session: u64, field: &str, value: &str) {
         let store = app.store.read().unwrap_or_else(|p| p.into_inner());

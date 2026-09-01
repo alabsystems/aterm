@@ -466,6 +466,13 @@ objc2-app-kit = { version = "0.2", features = ["block2", "NSGraphicsContext", "N
 objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults", "NSDictionary", "NSValue", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop", "NSData"] }
 objc2 = { version = "0.5" }
 block2 = "0.5"
+# THE FIRST-PARTY REPLACEMENT for the two lines above (and for the objc2-* binding
+# crates): typed message sends, ownership, runtime class creation and the block
+# ABI, with zero dependencies of its own. W1 ports ONE of the seven
+# `declare_class!` sites onto it — `platform.rs`'s `ReduceMotionTarget` — and the
+# rest follow in W2. Not optional and not feature-gated: the ported site is the
+# shipping path.
+aterm-objc = { workspace = true }
 
 # ORACLE ONLY (never in a shipped build). `security-framework` used to be a hard
 # macOS dependency for exactly two calls — Keychain get/set of the network-drive

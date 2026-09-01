@@ -1,3 +1,5 @@
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
 //! The event-loop routines.
 
 use std::cell::{Cell, RefCell};

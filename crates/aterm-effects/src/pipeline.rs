@@ -520,8 +520,10 @@ impl EffectsPipeline {
     /// its coarse poll instead of pinning rAF for the whole multi-second
     /// cooling tail — the native `next_change_deadline` collapse, mirrored.
     /// This lets web hosts stay input-immediate without repainting
-    /// byte-identical terminal frames at monitor refresh. Settled one-shots
-    /// arm no idle deadline.
+    /// byte-identical terminal frames at monitor refresh. PRISM WAKE likewise
+    /// parks after its last visible comet and arms only its earliest exact
+    /// transition: the mandatory idle cutoff or analytic episode-settle
+    /// crossing. Settled one-shots arm no deadline.
     #[must_use]
     pub fn next_deadline_ms(&self) -> Option<f64> {
         let now = self.now();
@@ -542,10 +544,20 @@ impl EffectsPipeline {
             .as_ref()
             .filter(|rain| rain.is_active())
             .map(|rain| rain.next_tick_in_ms() as f64);
-        match (glow_ms, rain_ms) {
-            (Some(g), Some(r)) => Some(g.min(r)),
-            (g, r) => g.or(r),
-        }
+        let streak_ms = if let Some(streak) = self.streak.as_deref() {
+            match streak.next_change_deadline(now, self.streak_cfg.idle_secs) {
+                Some(d) if d > now => Some(d.duration_since(now).as_secs_f64() * 1000.0),
+                Some(_) if streak.is_active() => return None, // visible comet → display-rAF
+                Some(_) => Some(0.0), // overdue idle/Settle → immediate one-shot
+                None => None,
+            }
+        } else {
+            None
+        };
+        [glow_ms, rain_ms, streak_ms]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
     }
 
     /// One scheduling verdict ([`Wake`]) for the winit deadline fold and the
@@ -2198,6 +2210,7 @@ impl EffectsPipeline {
         let streak_now = self.now();
         let streak_geom = self.chrome_geom(rows, cols, cell_w, cell_h);
         let streak_cfg = self.streak_cfg;
+        let streak_token = term.content_seq();
         let streak_fp = if let Some(streak) = self.streak.as_deref_mut() {
             let now = streak_now;
             // `content_seq` advances on content mutation only — never on
@@ -2205,9 +2218,9 @@ impl EffectsPipeline {
             // written" clock rather than a "something moved" one.
             streak.note_output_cells(
                 &input.cells,
-                input.cursor_row,
-                input.cursor_col,
+                (input.cursor_row, input.cursor_col),
                 rows,
+                streak_token,
                 now,
                 false,
             );
@@ -4942,6 +4955,72 @@ mod tests {
         assert_eq!(fp, 0, "all-off apply is fingerprint 0");
         assert!(input.nova_add.is_empty());
         assert!(!p.is_active());
+    }
+
+    /// After the last comet leaves the glass, an open PRISM WAKE episode does
+    /// not pin rAF. The pipeline exposes the analytic low-crossing as one exact
+    /// wake, whose tick emits one Settle and returns the scheduler to Idle.
+    #[test]
+    fn output_streak_parks_until_its_exact_settle_deadline() {
+        let mut p = EffectsPipeline::new();
+        let t0 = p.now();
+        let cfg = StreakConfig {
+            enabled: true,
+            sound: true,
+            idle_secs: 10.0,
+            ..StreakConfig::default()
+        };
+        let geom = p.chrome_geom(24, 80, 10, 20);
+        let mut streak = OutputStreak::new(17);
+        assert!(!streak.note_output(1, &[(4, 0, 40)], t0, false));
+        let spawned = t0 + Duration::from_millis(350);
+        assert!(streak.note_output(2, &[(4, 0, 40)], spawned, false));
+        let mut out = Vec::new();
+        let opened = streak.tick(spawned, geom, &cfg, &mut out);
+        assert_eq!(
+            opened.cue.map(|cue| cue.sound),
+            Some(crate::output_streak::StreakSound::Shimmer)
+        );
+
+        // `MAX_DT_S` is 250 ms; four bounded ticks retire even the 900 ms
+        // comet while momentum is still above EPISODE_LOW.
+        for step in 1..=4 {
+            out.clear();
+            streak.tick(
+                spawned + Duration::from_millis(250 * step),
+                geom,
+                &cfg,
+                &mut out,
+            );
+        }
+        let parked = spawned + Duration::from_secs(1);
+        assert!(!streak.is_active(), "the last visible comet has retired");
+        let due = streak
+            .next_change_deadline(parked, cfg.idle_secs)
+            .expect("the open episode still owes one Settle");
+        assert!(due > parked);
+
+        p.clock = parked.duration_since(p.t0);
+        p.streak_cfg = cfg;
+        p.streak = Some(Box::new(streak));
+        match p.wake() {
+            Wake::At(at) => assert_eq!(at, due),
+            other => panic!("parked episode must own one exact wake, got {other:?}"),
+        }
+
+        let fired = due + Duration::from_millis(1);
+        p.clock = fired.duration_since(p.t0);
+        out.clear();
+        let settled = p
+            .streak
+            .as_deref_mut()
+            .expect("streak retained through deadline")
+            .tick(fired, geom, &cfg, &mut out);
+        assert_eq!(
+            settled.cue.map(|cue| cue.sound),
+            Some(crate::output_streak::StreakSound::Settle)
+        );
+        assert!(matches!(p.wake(), Wake::Idle));
     }
 
     /// THE CO-RESIDENCY DISCIPLINE (the shared `nova_add` channel). The

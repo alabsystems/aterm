@@ -1763,15 +1763,24 @@ mod tests {
             "pkg-config is the one build-dep-only patch"
         );
         assert_eq!(set.vendored_build_only[0].0, "pkg-config");
-        // The SIX FIRST-PARTY patch targets — workspace members aterm wrote,
+        // The EIGHT FIRST-PARTY patch targets — workspace members aterm wrote,
         // reached only by third-party consumers through the patch table:
-        //   `arrayvec`  crates/aterm-arrayvec   re-export of aterm_alloc::ArrayVec
-        //   `cfg-if`    crates/aterm-cfg-if     the cfg_if! macro
-        //   `libc`      crates/aterm-libc       first-party libc replacement
-        //   `log`       crates/aterm-log-shim   no-op facade (NOT crates/aterm-log,
-        //                                       which is aterm's real logger)
-        //   `profiling` crates/aterm-profiling  no-op facade
-        //   `tracing`   crates/aterm-tracing    no-op facade
+        //   `arrayvec`   crates/aterm-arrayvec   re-export of aterm_alloc::ArrayVec
+        //   `cfg-if`     crates/aterm-cfg-if     the cfg_if! macro
+        //   `core_maths` crates/aterm-core-maths CoreFloat over std, not libm —
+        //                                        the entry that takes the
+        //                                        vendored libm fork off mac-arm
+        //                                        and wasm-cpu
+        //   `libc`       crates/aterm-libc       first-party libc replacement
+        //   `log`        crates/aterm-log-shim   no-op facade (NOT crates/aterm-log,
+        //                                        which is aterm's real logger)
+        //   `once_cell`  crates/aterm-once-cell  sync/unsync/race cells over
+        //                                        std's OnceLock, Mutex and Cell —
+        //                                        the ONLY entry here that is live
+        //                                        code rather than a facade, a
+        //                                        re-export or a cfg-ed-off import
+        //   `profiling`  crates/aterm-profiling  no-op facade
+        //   `tracing`    crates/aterm-tracing    no-op facade
         // Sorted, because `derive` sorts them. Each owes NO review row, and
         // each is absent from `scan_dirs` above because no first-party crate
         // depends on it.
@@ -1780,8 +1789,16 @@ mod tests {
             vec![
                 ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
                 ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
+                (
+                    "core_maths".to_string(),
+                    "crates/aterm-core-maths".to_string()
+                ),
                 ("libc".to_string(), "crates/aterm-libc".to_string()),
                 ("log".to_string(), "crates/aterm-log-shim".to_string()),
+                (
+                    "once_cell".to_string(),
+                    "crates/aterm-once-cell".to_string()
+                ),
                 (
                     "profiling".to_string(),
                     "crates/aterm-profiling".to_string()
@@ -1793,12 +1810,13 @@ mod tests {
         // ASSERTED PER CRATE, not as a count: the hazard is one of them
         // acquiring a first-party dependant and quietly becoming GUI process
         // code whose locks nothing censuses. `crates/aterm-arrayvec` is the
-        // live risk — it is the only one of the five that is a real data
+        // live risk — it is the only one of the six that is a real data
         // structure a member could plausibly start using, and it already
         // depends on `aterm-alloc`, which IS in the closure.
         for dir in [
             "crates/aterm-arrayvec/src",
             "crates/aterm-cfg-if/src",
+            "crates/aterm-core-maths/src",
             "crates/aterm-log-shim/src",
             "crates/aterm-profiling/src",
             "crates/aterm-tracing/src",
@@ -1918,6 +1936,8 @@ mod tests {
             ("cfg-if", "crates/aterm-cfg-if"),
             ("arrayvec", "crates/aterm-arrayvec"),
             ("log", "crates/aterm-log-shim"),
+            ("core_maths", "crates/aterm-core-maths"),
+            ("once_cell", "crates/aterm-once-cell"),
         ] {
             assert_eq!(
                 classify_patch_target(pkg, path, &repo_root()),

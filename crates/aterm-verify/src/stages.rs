@@ -50,6 +50,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
         StageId::DifferentialOracle => differential_oracle(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
+        StageId::CrossCells => cross_cells(ctx, &mut r),
     }
     r
 }
@@ -785,12 +786,16 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 
 // ---------------------------------------------------------------------------
 // 3.55) TRUST-GATE VERDICT SELF-TEST — tools/trust-gate-all.sh prints the
-//    sentence that IS the campaign claim ("100% MACHINE-PROVED (workspace, …)")
-//    and has two knobs that shrink the run. Until its self-test existed the
-//    verdict logic had never been exercised against a narrowed run at all, and
-//    it printed the workspace sentence for runs that were not the workspace.
-//    Hard-required, exactly like test-install-channel.sh: a missing self-test is
-//    not a skip, because the thing it guards is a claim.
+//    sentence that IS the campaign claim ("100% MACHINE-PROVED (workspace +
+//    every vendored fork, …)") and has several inputs that shrink the run.
+//    Until its self-test existed the verdict logic had never been exercised
+//    against a narrowed run at all, and it printed the workspace sentence for
+//    runs that were not the workspace. It now also covers the gate LIST: that
+//    members are addressed `-p name@version` and forks by manifest path, and
+//    that a fork can neither appear in the resolved graph undeclared nor vanish
+//    from it while the roster still lists it. Hard-required, exactly like
+//    test-install-channel.sh: a missing self-test is not a skip, because the
+//    thing it guards is a claim.
 // ---------------------------------------------------------------------------
 fn trust_gate_verdict(ctx: &Ctx, r: &mut Report) {
     let t = ctx.tools_dir().join("test-trust-gate-verdict.sh");
@@ -1080,6 +1085,36 @@ fn differential_oracle(ctx: &Ctx, r: &mut Report) {
 //    An unavailable toolchain is reported PROMINENTLY and skipped, exactly as the
 //    --full contract promises; it is never described as discharged.
 // ---------------------------------------------------------------------------
+/// `--full` only: every forge cell type-checked FOR ITS OWN TRIPLE.
+///
+/// The rest of this gate compiles aterm for one target. aterm ships five, and
+/// until 2026-09-01 the other four were held by source reading — which is where
+/// both defects the `once_cell` judge found had been living. `xtask gate cells`
+/// runs a real compiler per triple, on a toolchain that carries that std, from
+/// a cwd and into a target directory OUTSIDE this repo. A cell whose toolchain
+/// is not installed SKIPS inside the verb and says out loud that nothing was
+/// compiled for it; a cell that runs and fails is a FAILURE, never re-read as a
+/// skip.
+///
+/// AND IT READS THIS REPO'S OWN CODE ON ALL FIVE. For the first day of its life
+/// the verb was GREEN on linux and win while neither cell had type-checked one
+/// line of aterm's first-party crates: `ring` and `zstd-sys` bundle C, their
+/// build scripts could not run for those triples, and the excuse for that took
+/// eighteen crates with it. They are SHIMMED now (`tools/cross-cell-gate.tsv`,
+/// `cshim` rows), and each cell FAILS if any in-repo package in its graph goes
+/// unread — an obligation with no escape hatch in the policy file.
+fn cross_cells(ctx: &Ctx, r: &mut Report) {
+    if ctx.selftest {
+        r.skip("cross-cell type-check (selftest)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("cross-cell type-check (no targo)");
+        return;
+    }
+    run_labeled(ctx, r, "gate cells", &targo(ctx, xtask_gate_args("cells")));
+}
+
 fn kani_floor(ctx: &Ctx, r: &mut Report) {
     if ctx.selftest {
         r.skip("trust-mc (selftest)");

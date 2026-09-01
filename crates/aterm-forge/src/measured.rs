@@ -228,48 +228,190 @@ pub struct Baseline {
 // `MAC_ARM_DOMINATORS` only `wgpu` (+83) and `winit` (+713) — winit being the
 // fork itself. Recorded in `tools/forge-budget.tsv` through the tool's own
 // `--allow-regress` channel, with that reason.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RE-MEASURED 2026-08-31 — THE FLIP (map §5 W6, delivered).
 //
-// RE-PINNED 2026-08-31 (mac-arm, linux, win; the two wasm cells did not move).
-// Two causes, each accounted for exactly, and neither is dependency drift:
+// wgpu left the macOS normal dependency graph: the first-party Metal renderer
+// is the default and only macOS arm, and wgpu survives on the cell solely as
+// the differential ORACLE, activated by aterm-gpu's target-gated self-dev-
+// dependency (`wgpu-oracle`) — a dev edge, invisible to `cargo tree -e
+// normal` and therefore to every number in this file. `blame wgpu --cell
+// mac-arm` now answers NOT RESOLVED, and the mac-arm row collapsed by exactly
+// the pinned prize: 88 -> 51 third-party packages (-37 = dom(wgpu).pkgs) and
+// 1,224,481 -> 589,449 lines against the +652-drifted pre-flip live (the
+// difference to the collapse below is the winit-fork edits recorded in the
+// ratchet's --allow-regress reason; the dom itself came off at 635,044 to the
+// line). The resolved count also sheds the two vendored wgpu shims
+// (wgpu-naga-bridge, wgpu-core-deps-apple): -39 nodes total, 0 added.
+// linux/win/wasm-gpu/wasm-cpu package sets AND feature sets diffed
+// byte-identical to pre-flip; their loc rows carry only the pre-existing
+// winit-fork drift (+652 owner headless arm, +12 §4(b) notices attest was
+// owed — see the ratchet reason).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RE-MEASURED 2026-09-01 — the post-flip sweep, item 1 of 2: `bytemuck_derive`.
 //
-//   * `resolved` +1 and `workspace` +1 in all three: `crates/trust-gate` joined
-//     the workspace in ecb1d6691 and `crates/aterm` depends on it. It is the
-//     compiler gate, it has NO dependencies by construction (its build script
-//     runs among the first units precisely because nothing precedes it), so
-//     `third_party` is unchanged at 88 / 190 / 93. A new member that added a
-//     third-party edge would have moved that column too, which is the check.
-//   * `third_party_loc` +652 in all three, and the `winit` dominator with it
-//     (79,669 -> 80,321 at the SAME 12 packages): 48f847478 grew the fork by
-//     `vendor/winit/src/platform_impl/linux/headless.rs` and its wiring —
-//     `git show --stat` reports 675 insertions and 23 deletions over 6 files,
-//     and 675 - 23 = 652. Same number in three cells because the added source
-//     is target-independent as far as this counter is concerned; absent from
-//     both wasm cells because neither browser graph contains winit at all.
+// A PROC MACRO left the mac-arm cell, and it is the flip that made it
+// purchasable. `bytemuck`'s `derive` feature had two requesters on this cell
+// before — `wgpu-types` and `wgpu-hal` both name `bytemuck/derive` in their own
+// manifests — so aterm-gpu dropping the feature bought exactly nothing while
+// wgpu was in the normal graph. Post-flip aterm-gpu was the SOLE activator
+// (rustybuzz, the row's other parent, asks only for `extern_crate_alloc`), so
+// swapping its ten `#[derive(Pod, Zeroable)]` uniform/instance structs onto
+// `aterm-bits` — this workspace's own `Pod`/`Zeroable`, already `aterm-core`'s —
+// takes the whole package off.
 //
-// The two wasm cells staying EXACTLY put is the load-bearing half of this
-// audit rather than a footnote: trust-gate is reached through `crates/aterm`,
-// a `[[bin]]` nothing compiles for wasm32, and winit is not in either browser
-// graph. A change that moved all five cells would have meant something other
-// than these two commits.
+//   mac-arm  51 -> 50 third-party, 589,449 -> 586,515 LOC (-2,934, exactly
+//            `bytemuck_derive 1.10.2`), 24,898 -> 24,888 unsafe tokens,
+//            proc macros 3 -> 2, resolved 117 -> 116. Build scripts, workspace
+//            members and the one duplicate name are unchanged.
+//
+// `bytemuck 1.25.0` ITSELF STAYS, and this is the honest half of the entry: its
+// remaining parent is rustybuzz, so the row's other 5,433 lines do not fall
+// until the shaper is replaced — at which point they fall for free, which is
+// what makes this a pre-payment rather than a whole retirement. No dominator
+// anchor moved: `syn`'s parent set drops 4 -> 3 but dom(syn) is 1 package
+// either way, because proc-macro2/quote/unicode-ident are reached by
+// serde_derive as well.
+//
+// linux, win, wasm-cpu and wasm-gpu are UNCHANGED to the line: they still
+// resolve `bytemuck_derive` through wgpu, which never left those cells.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RE-MEASURED 2026-09-01 — the post-flip sweep, item 2 of 2: `core_maths`,
+// AND WITH IT THE `libm` FORK ON TWO CELLS.
+//
+// `[patch.crates-io] core_maths = { path = "crates/aterm-core-maths" }`. The
+// package itself is 1,221 lines of extension trait; the prize is what it drags
+// in — `libm`, which this repository VENDORS (vendor/libm, 19,867 lines and a
+// build script). `core_maths` is libm's SOLE parent on mac-arm and on wasm-cpu,
+// which is why those two cells lose 2 packages and 21,088 lines while the other
+// three lose only core_maths (naga and num-traits keep libm there).
+//
+//   mac-arm   50 -> 48 third-party, 586,515 -> 565,427 LOC, 24,888 -> 24,831
+//             unsafe, build scripts 11 -> 10, resolved 116 -> 115
+//   wasm-cpu  25 -> 23, 246,067 -> 224,979, 1,064 -> 1,007 unsafe,
+//             build scripts 7 -> 6, resolved 63 -> 62
+//   linux     190 -> 189, 2,741,839 -> 2,740,618  (libm STAYS)
+//   win        93 ->  92, 3,589,068 -> 3,587,847  (libm STAYS)
+//   wasm-gpu   62 ->  61,   957,778 ->   956,557  (libm STAYS)
+//
+// Every cell also gains ONE workspace member — the replacement crate — which is
+// why `resolved` falls by less than `third_party` does. Total across the five:
+// 7 third-party packages, 45,839 lines, 2 build scripts.
+//
+// THE ROW MOVED WITH THE FLIP, and that is the whole reason it was purchasable
+// now. Pre-flip, libm had THREE parents on mac-arm (core_maths, naga,
+// num-traits), so dom(core_maths) was 1,221 lines — a ~6:1 write and nowhere
+// near the taken band. The flip took naga and num-traits off this cell with
+// wgpu, leaving core_maths alone over libm and the dominator at 21,088.
+//
+// WHAT DID NOT MOVE IS ANY EXECUTED INSTRUCTION, and it is measured, not hoped.
+// The string `core_maths` occurs exactly four times in the two consumers'
+// sources, every one of them a `use core_maths::CoreFloat;` under
+// `#[cfg(not(feature = "std"))]`, and `std` is ON for rustybuzz and ttf-parser
+// in all five cells. The trait is linked and never imported: rustybuzz's eleven
+// `.round()` calls and ttf-parser's `.sin()`/`.cos()`/`.tan()`/`.abs()` already
+// resolve to std's inherent methods. `crates/aterm-core-maths/tests/consumers.rs`
+// holds both halves of that per cell, and both tripwires were fired once on
+// purpose before being restored.
+//
+// No dominator anchor moved: neither core_maths nor libm is one, and no anchor
+// reaches either. `[OB-12]` now records `libm` as live in 3 of 5 cells instead
+// of 5 — a NOTE by design ("recorded so a SHRINKING cell set is visible"), not
+// a failure.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RE-MEASURED 2026-09-01 — `once_cell`, the row the post-flip sweep MISSED.
+//
+// `[patch.crates-io] once_cell = { path = "crates/aterm-once-cell" }`. The
+// package is 3,950 lines and 53 unsafe tokens, no build script, no proc macro,
+// and — the fact that decides everything else about this row — it is a LEAF.
+// It has no dependencies of its own, so dom(once_cell) is 1 package / 3,950
+// lines in every cell, and the SAME 1 / 3,950 comes off all five:
+//
+//   mac-arm   48 -> 47 third-party, 565,427 -> 561,477 LOC, 24,831 -> 24,778 unsafe
+//   linux    189 -> 188,            2,740,618 -> 2,736,668
+//   win       92 -> 91,             3,587,847 -> 3,583,897
+//   wasm-cpu  23 -> 22,               224,979 ->   221,029, 1,007 -> 954 unsafe
+//   wasm-gpu  61 -> 60,               956,557 ->   952,607
+//
+// Build scripts, proc macros, duplicate names and `resolved` are UNCHANGED on
+// every cell: the package brought none of the first two, and every cell gains
+// one workspace member (the replacement) as it loses one third-party package.
+// Total across the five: 5 third-party packages, 19,750 lines, 265 unsafe
+// tokens.
+//
+// THE FLIP DID NOT CREATE THIS ROW, and the correction matters because the
+// sweep's judge found the row by looking at post-flip parent sets. A LEAF'S
+// DOMINATOR IS ITSELF NO MATTER WHO ITS PARENTS ARE, so dom(once_cell) was 1 /
+// 3,950 before W6b too. What the flip changed is only the blame line on
+// mac-arm: three parents (rustls, naga, wgpu-core) became one (rustls alone)
+// when wgpu left. This row was always buyable and simply was not on the list —
+// unlike `core_maths` above, whose dominator genuinely went 1,221 -> 21,088
+// because the flip left it alone over the vendored `libm` fork.
+//
+// A DOMINATOR ANCHOR DID MOVE, and this is the first row in this file where one
+// has. `dom(rustls)` on mac-arm falls 6 packages / 69,363 lines -> 5 / 65,413,
+// because rustls is once_cell's ONLY parent on that cell, so once_cell sat
+// inside rustls's dominator and has now left the third-party graph entirely.
+// The mac-arm ranking is unchanged in ORDER (rustls stays third, behind
+// objc2-app-kit and winit); only its cost moved. `MAC_ARM_DOMINATORS` is
+// updated below rather than the test relaxed.
+//
+// WHAT MOVED THAT DOES RUN — and this is where `once_cell` stops resembling
+// every other first-party patch target. `tracing`, `profiling`, `cfg-if`,
+// `log` and `core_maths` are facades, macros, re-exports or `cfg`-ed-off
+// imports; NOTHING executed changed when they landed. Here, ten third-party
+// crates CALL these types:
+//
+//   dead   rustls, naga, read-fonts        cfg-gated off in every cell
+//   live   ahash                           linux            race::OnceBox
+//          wgpu-core                       linux win wasm-gpu   sync::OnceCell
+//          x11-dl, xkbcommon-dl            linux            sync::OnceCell
+//          wayland-sys, x11rb              linux            sync::Lazy
+//          wgpu-hal                        win              sync::Lazy
+//          js-sys, wasm-bindgen,
+//          wasm-bindgen-futures            wasm             unsync::Lazy
+//
+// So MAC-ARM is the only cell on which this row is the familiar "linked and
+// never called" trade: `rustls`'s import is `#[cfg(not(feature = "std"))]` and
+// `std` is on. On the other four the replacement is running code, which is why
+// it is the first one here to carry behaviour tests with PLANTED CONTROLS
+// (crates/aterm-once-cell/tests/behaviour.rs) instead of a liveness tripwire
+// alone. The sharpest of them: wgpu-core's `ResourcePool` relies on
+// `get_or_try_init` calling its closure exactly once under contention, and the
+// obvious wrapper over `OnceLock` does not — that plant is checked in as the
+// test's own control.
+//
+// [OB-15] IS CLEAN, checked before the row was written: `once_cell` is named in
+// no manifest anywhere in this repository, so nothing it redirects was ever a
+// differential oracle. `rustix 1.1.4` declares it as a WINDOWS DEV-dependency
+// and never uses it, which is neither an oracle nor an edge in any cell.
 // ---------------------------------------------------------------------------
 
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 156,
+    resolved: 115,
     workspace: 68,
-    third_party: 88,
-    third_party_loc: 1_224_481,
-    build_scripts: 20,
-    proc_macros: 6,
-    duplicate_names: 4,
+    third_party: 47,
+    third_party_loc: 561_477,
+    build_scripts: 10,
+    proc_macros: 2,
+    duplicate_names: 1,
 };
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
     resolved: 259,
-    workspace: 69,
-    third_party: 190,
-    third_party_loc: 2_741_827,
+    workspace: 71,
+    third_party: 188,
+    third_party_loc: 2_736_668,
     build_scripts: 31,
     proc_macros: 16,
     duplicate_names: 6,
@@ -278,9 +420,9 @@ pub const LINUX: Baseline = Baseline {
 pub const WIN: Baseline = Baseline {
     cell: "win",
     resolved: 160,
-    workspace: 67,
-    third_party: 93,
-    third_party_loc: 3_589_056,
+    workspace: 69,
+    third_party: 91,
+    third_party_loc: 3_583_897,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -306,11 +448,11 @@ pub const WIN: Baseline = Baseline {
 /// here, and stayed on wasm-gpu where web-sys and wgpu hold it.
 pub const WASM_CPU: Baseline = Baseline {
     cell: "wasm-cpu",
-    resolved: 63,
-    workspace: 38,
-    third_party: 25,
-    third_party_loc: 246_067,
-    build_scripts: 7,
+    resolved: 62,
+    workspace: 40,
+    third_party: 22,
+    third_party_loc: 221_029,
+    build_scripts: 6,
     proc_macros: 2,
     duplicate_names: 0,
 };
@@ -328,9 +470,9 @@ pub const WASM_CPU: Baseline = Baseline {
 pub const WASM_GPU: Baseline = Baseline {
     cell: "wasm-gpu",
     resolved: 103,
-    workspace: 41,
-    third_party: 62,
-    third_party_loc: 957_778,
+    workspace: 43,
+    third_party: 60,
+    third_party_loc: 952_607,
     build_scripts: 16,
     proc_macros: 6,
     duplicate_names: 0,
@@ -342,8 +484,12 @@ pub const CELLS: [Baseline; 5] = [MAC_ARM, LINUX, WIN, WASM_CPU, WASM_GPU];
 
 /// The names duplicated in the mac-arm cell. Pinned as NAMES rather than a
 /// count because which crate is doubled is the actionable half of the fact.
-pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] =
-    ["bitflags", "block2", "objc2", "objc2-foundation"];
+/// THE FLIP shrank this to ONE: `block2`, `objc2` and `objc2-foundation`
+/// each resolved twice only because wgpu-hal held the 0.3/0.6 generation
+/// beside winit's 0.2/0.5 one — the whole doubled half was wgpu's, and it
+/// left with the graph. `bitflags` remains (1.3.2 under core-graphics beside
+/// 2.x everywhere else), exactly the survey's one dedup row.
+pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] = ["bitflags"];
 
 /// `hashbrown`'s version count, pinned separately because it was for a long
 /// time the worst duplicate in the cell — THREE live versions in one binary,
@@ -369,7 +515,12 @@ pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] =
 /// `objc2-foundation` at 59,492 LOC (0.2.2 beside 0.3.2). That ordering flips
 /// again the day `wgpu` leaves, because the 0.3.2 copy is wgpu's alone — which
 /// is the point of pinning the NAMES and not just the count.
-pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 1;
+/// ZERO since THE FLIP: every `hashbrown` parent on this cell — naga, wgpu,
+/// wgpu-core, wgpu-hal, indexmap under them — left with the wgpu graph, so
+/// the package is not resolved here at all. (The ordering note above about
+/// the biggest dedup flipping "the day wgpu leaves" resolved itself: the
+/// whole `objc2-foundation` duplicate left too.)
+pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 0;
 
 // --------------------------------------------------------- dominator anchors
 
@@ -476,25 +627,16 @@ pub struct Dom {
 /// `indexmap` alone, which is the same two-parents-bill-neither shape this
 /// list keeps recording, running for once in the direction of a shrink.
 ///
+/// RE-PINNED AT THE FLIP (2026-08-31): `wgpu` (37 / 635,044), `wgpu-hal`
+/// and `naga` are GONE from the graph — the campaign's prize collected in
+/// full, asserted as ABSENCE in `dominator::tests` (the libc/AccessKit
+/// shape: a zero cost would also be reported for a package forge failed to
+/// see). What leads now is the AppKit/window stack and the updater's TLS:
+/// `objc2-app-kit` unchanged at the top, `winit` up by exactly the fork's
+/// own +664 lines of edits (the headless arm + the §4(b) notices),
+/// `rustls`, `syn`, and the 0.2-generation `objc2-foundation` (whose 0.3
+/// twin left with wgpu-hal).
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
-    Dom {
-        name: "wgpu",
-        version: None,
-        pkgs: 37,
-        loc: 635_044,
-    },
-    Dom {
-        name: "wgpu-hal",
-        version: None,
-        pkgs: 8,
-        loc: 251_320,
-    },
-    Dom {
-        name: "naga",
-        version: None,
-        pkgs: 8,
-        loc: 212_320,
-    },
     Dom {
         name: "objc2-app-kit",
         version: None,
@@ -505,7 +647,30 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         name: "winit",
         version: None,
         pkgs: 12,
-        loc: 80_321,
+        loc: 80_333,
+    },
+    // RE-PINNED 2026-09-01 by the `once_cell` row, and it is the first time a
+    // first-party patch target has moved an anchor in this file. `rustls` is
+    // `once_cell`'s ONLY parent on mac-arm, so the leaf sat inside rustls's
+    // dominator; retiring it takes exactly 1 package / 3,950 lines off this
+    // number and nothing else. The ORDER is unchanged — rustls stays third.
+    Dom {
+        name: "rustls",
+        version: None,
+        pkgs: 5,
+        loc: 65_413,
+    },
+    Dom {
+        name: "syn",
+        version: None,
+        pkgs: 1,
+        loc: 64_931,
+    },
+    Dom {
+        name: "objc2-foundation",
+        version: None,
+        pkgs: 2,
+        loc: 60_733,
     },
 ];
 

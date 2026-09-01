@@ -76,10 +76,11 @@ KEY USAGE
   aterm <tool> [args]        run a pinned, store-resolved toolchain tool, e.g.
                              `aterm ay`, `aterm ty` (never $PATH — the managed build)
   aterm pkg <args>           the toolchain package manager (see `aterm help pkg`)
-  aterm doctor               pre-flight health check; exit 0 = ready. Its `tty` check
-                             FAILS whenever stdout is not a terminal, and that is folded
-                             into the verdict — so a piped, CI or agent run exits 1 on a
-                             healthy machine. Read the lines, not just the code.
+  aterm doctor               pre-flight health check; exit 0 = ready, and scriptable.
+                             The `tty` row is a `note`, not a verdict: it measures
+                             doctor's OWN stdout, so a piped, CI or agent run no longer
+                             exits 1 on a healthy machine. Only `containment` and
+                             `shell` move the code; `tty` and `privacy` never do.
   aterm show-config | validate-config | explain-config | list-fonts | list-themes
                              read-only diagnostics; print and exit, no shell spawned
   aterm --sandbox            run the shell under the macOS sandbox (deny net + secrets)
@@ -335,21 +336,22 @@ WHEN TO REACH FOR IT
   Distinct from `targo --unverified ship`/aterm-release (which CUTS aterm.app itself).
   When a toolchain looks MISSING: rustup's exact words `error: toolchain 'trust' is not
   installed` mean the `trust` link under ~/.rustup no longer reaches the managed store.
-  Run `aterm pkg doctor` — it names the seam that broke — and `aterm pkg doctor --fix`
-  re-asserts it through the same code the install pass runs. Never rebuild a toolchain
-  from source to answer that message.
-  When a foreign shell needs the tools: `eval "$(aterm pkg shellenv)"` — the one export
-  line, PATH APPENDED, for the shell you are in (the same line doctor shows; no rc file
-  is written).
+  Run `aterm pkg doctor` — it names the seam that broke — then `aterm pkg repair`, which
+  re-lays the shims and shell integration through the same code the install pass runs.
+  Never rebuild a toolchain from source to answer that message.
+  (`doctor` takes no flags: it reports, `repair` acts.)
+  When a foreign shell needs the tools: prefix the command — `aterm <tool>` — or read the
+  export line out of `aterm pkg doctor`, which prints it. Nothing writes into an rc file,
+  by design.
   When you want the seams spelled out — which rustup link, which PATH hook, which
-  checkout pins, and what each currently points at — `aterm pkg seam` lists them.
+  checkout pins, and what each currently points at — `aterm pkg doctor` names them, and
+  `aterm pkg status` / `aterm pkg which` answer the narrower questions.
 
 GOTCHAS (in the order they bite)
   * PATH: the managed tools are on PATH only in shells started inside aterm (shell.d
     APPENDS the managed bin/, never shadowing system sudo/ssh/git). In a plain
-    Terminal.app, over ssh, or in CI, use `aterm <tool>` or `eval "$(aterm pkg
-    shellenv)"` — the same export line `aterm pkg doctor` prints. Nothing writes into
-    ~/.zshrc, by design. And bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
+    Terminal.app, over ssh, or in CI, use `aterm <tool>`, or copy the export line
+    `aterm pkg doctor` prints. Nothing writes into ~/.zshrc, by design. And bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
     (those names are on the sensitive-shim deny-list): cargo reaches the compiler
     through rustup's `trust` toolchain link, which atpkg points at `store/trust/current`
     and re-asserts on every install and update pass — a store update moves the
@@ -369,11 +371,13 @@ GOTCHAS (in the order they bite)
     verbs (install/update/rollback) refuse with exit 1; local read/maintenance verbs
     (list/which/run/doctor/verify/...) still work.
   * `aterm pkg doctor` is the truth about THIS machine, not this page: every check
-    prints ok / warn / FAIL. `--strict` makes a warn exit non-zero (for gates and
-    scripts), `--porcelain` prints the stable one-check-per-line form for parsers, and
-    `--fix` repairs what it can — the rustup link and the PATH hook first — through the
-    same owner code the install pass runs, never a second implementation. What --fix
-    cannot repair it names, with the verb that can.
+    prints ok / warn / FAIL, and its exit code carries the worst of them. It takes NO
+    flags — it is a report. To act on what it finds, use `aterm pkg repair`, which
+    re-lays the rustup link, the shims and the PATH hook through the same owner code the
+    install pass runs, never a second implementation. (This page described
+    `--fix`, `--strict` and `--porcelain` on `doctor` until 2026-09-01; `doctor`
+    parses no arguments, so all three were silently ignored — and `--fix` was named
+    as THE cure for a missing toolchain.)
   * Channel is hard-wired to "stable" today, and the roster `aterm pkg --help` prints is
     test-pinned to the dispatch table — it never advertises a verb that does not run."#,
         ),
@@ -622,7 +626,8 @@ WHEN TO REACH FOR IT
 GOTCHAS
   * NEVER run a bare workspace `targo --unverified test` here — it has kernel-panicked the machine (OOM);
     several test binaries are enormous. Use `targo --unverified nextest run` (honors the single-threaded
-    `heavy` group) or scripts/test-capped.sh; the biggest GPU tests are #[ignore]'d.
+    `heavy` group) or `scripts/test-capped.sh` in the nn tree; the biggest GPU tests
+    are #[ignore]'d.
   * Intake rule: pre-exported torch.export graph.json + safetensors, not raw
     ONNX/.pt. `--verify` is a report request, feature-gated."#,
         ),
@@ -1481,6 +1486,190 @@ mod tests {
         }
     }
 
+    /// Every repo-rooted path the MANUAL names must exist.
+    ///
+    /// Ported from clean's help-truth C3, which caught two shipped defects
+    /// there. A reader who follows a path out of `aterm help <topic>` and finds
+    /// nothing cannot tell whether they typed it wrong or the tool is lying —
+    /// and the manual is where aterm's paths actually live (the `ctl` verb
+    /// catalog names none, which its own copy of this check says out loud
+    /// rather than reporting a vacuous pass).
+    ///
+    /// Scans every page a reader can reach: `TOPICS`, `EXTRA_PAGES`, the agent
+    /// brief and the front page. The extractor is PROVED on a synthetic string
+    /// first, because a check that finds nothing passes.
+    #[test]
+    fn every_repo_path_named_in_the_manual_exists() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/aterm-cli has a workspace root two levels up");
+        const ROOTS: &[&str] = &["crates/", "scripts/", "docs/", "tests/", "data/"];
+        // A path in ANOTHER tree is not this repo's to have. The manual documents
+        // the sibling tools, so `scripts/x.sh` on an `nn` page means nn's — and a
+        // reader reading it from inside aterm cannot tell unless the line says
+        // so. Naming the tree is therefore REQUIRED, exactly as clean's C3
+        // requires the sentence to say which run writes a file: satisfying the
+        // check and improving the sentence are one edit.
+        //
+        // But naming a tree is not by itself a pass. When that sibling is
+        // checked out beside this one, the path is RESOLVED THERE — so a
+        // cross-repo reference is verified rather than excused whenever it can
+        // be. Only an absent sibling yields, and the reader has at least been
+        // told where to look.
+        const SIBLINGS: &[&str] = &[
+            "nn",
+            "ny",
+            "ay",
+            "clean",
+            "trust",
+            "gamma-crown",
+            "ty",
+            "trust-cg",
+            "trust-ir",
+            "trust-vc",
+            "zani",
+        ];
+        let siblings_root = root.parent().map(std::path::Path::to_path_buf);
+        let scan = |page: &str, text: &str, missing: &mut Vec<String>| {
+            for line in text.lines() {
+                let named: Vec<&str> = SIBLINGS
+                    .iter()
+                    .filter(|r| {
+                        line.contains(&format!("{r} tree")) || line.contains(&format!("{r} repo"))
+                    })
+                    .copied()
+                    .collect();
+                for raw in line.split(|c: char| c.is_whitespace() || c == '`' || c == '"') {
+                    let tok = raw.trim_matches(|c: char| {
+                        !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                    });
+                    if !ROOTS.iter().any(|r| tok.starts_with(r)) || root.join(tok).exists() {
+                        continue;
+                    }
+                    if named.is_empty() {
+                        missing.push(format!("{page}: `{tok}`"));
+                        continue;
+                    }
+                    let mut checked_out = false;
+                    let mut found = false;
+                    for sib in &named {
+                        let Some(dir) = siblings_root.as_ref().map(|p| p.join(sib)) else {
+                            continue;
+                        };
+                        if dir.is_dir() {
+                            checked_out = true;
+                            found |= dir.join(tok).exists();
+                        }
+                    }
+                    if checked_out && !found {
+                        missing.push(format!(
+                            "{page}: `{tok}` (names the {} tree, which IS checked out beside \
+                             this one, and the path is not there)",
+                            named.join("/")
+                        ));
+                    }
+                }
+            }
+        };
+
+        let mut probe = Vec::new();
+        scan(
+            "synthetic",
+            "see `docs/NO-SUCH-FILE-9f3a.md` and crates/aterm-cli/src/manual.rs",
+            &mut probe,
+        );
+        assert_eq!(
+            probe,
+            vec!["synthetic: `docs/NO-SUCH-FILE-9f3a.md`".to_string()],
+            "the extractor must find a missing path and pass a real one; if this \
+             fails, the scan below proves nothing about the manual"
+        );
+        // ...and the sibling-tree exemption must be EARNED, not automatic.
+        let mut probe = Vec::new();
+        scan(
+            "synthetic",
+            "run `scripts/none.sh` in the nn tree",
+            &mut probe,
+        );
+        // `nn` is not cloned beside this repo on every machine. Where it IS, the
+        // path is checked there and this probe is a finding; where it is not,
+        // naming the tree is the most a source check can ask for. Both are
+        // correct, so the probe asserts the DISJUNCTION rather than pinning
+        // whichever machine happens to run it.
+        let nn_present = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .is_some_and(|siblings| siblings.join("nn").is_dir());
+        assert_eq!(
+            probe.is_empty(),
+            !nn_present,
+            "a named sibling tree is resolved when checked out and yielded when not; \
+             nn_present={nn_present}, probe={probe:?}"
+        );
+        // The RESOLVING branch, proved against whichever sibling is actually
+        // checked out beside this repo. Without this, the cross-repo rule could
+        // decay into a blanket exemption on every machine and still look green.
+        let siblings_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        if let Some(present) = siblings_dir.as_ref().and_then(|d| {
+            ["clean", "trust", "nn", "ny", "ay"]
+                .into_iter()
+                .find(|s| d.join(s).is_dir())
+        }) {
+            let mut probe = Vec::new();
+            scan(
+                "synthetic",
+                &format!("see `docs/NO-SUCH-FILE-9f3a.md` in the {present} tree"),
+                &mut probe,
+            );
+            assert_eq!(
+                probe.len(),
+                1,
+                "`{present}` is checked out beside this repo, so a path named as \
+                 its own must be RESOLVED there, not excused: {probe:?}"
+            );
+        }
+
+        let mut probe = Vec::new();
+        scan("synthetic", "run `scripts/none.sh` somewhere", &mut probe);
+        assert_eq!(
+            probe.len(),
+            1,
+            "an UNqualified missing path is still a finding: {probe:?}"
+        );
+
+        let mut names: Vec<&str> = TOPICS.iter().map(|t| t.name).collect();
+        names.extend(EXTRA_PAGES.iter().copied());
+        names.push("agent");
+        let mut missing = Vec::new();
+        let mut scanned = 0usize;
+        for name in names {
+            let (page, _) = render(Some(name), None);
+            scanned += 1;
+            scan(name, &page, &mut missing);
+        }
+        let (front, _) = render(None, None);
+        scan("(front page)", &front, &mut missing);
+        assert!(
+            scanned > 10,
+            "only {scanned} manual page(s) scanned — the page registry moved and \
+             this check has stopped covering the manual"
+        );
+        assert!(
+            missing.is_empty(),
+            "{} repo-rooted path(s) named in the manual do not exist. A reader who \
+             follows one gets nothing and cannot tell whether they typed it wrong \
+             or the tool is lying:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        );
+    }
+
     /// `aterm help permissions` (design §5.5) — every load-bearing point, each
     /// one a thing an agent otherwise gets wrong at real cost.
     #[test]
@@ -1701,34 +1890,22 @@ mod tests {
     /// only complete roster lived in `aterm pkg --help`, and a reader of the manual
     /// could not discover `rollback` or `relocate` existed at all. The roster itself
     /// is guarded on the atpkg side (its tier partition test against the dispatch
-    /// table); this pins the manual to the same 21 names.
+    /// table); this pins the manual to that same roster — read live, not copied,
+    /// so the count is whatever the table says rather than a number in a comment.
+    /// (It said "the same 21 names" while the table held 22.)
     #[test]
     fn pkg_manual_names_every_verb() {
         let (page, code) = render(Some("pkg"), None);
         assert_eq!(code, 0);
-        for verb in [
-            "doctor",
-            "status",
-            "which",
-            "list",
-            "uninstall",
-            "tree-root",
-            "verify-index",
-            "verify-pkg",
-            "install",
-            "seed",
-            "update",
-            "rollback",
-            "pin",
-            "unpin",
-            "gc",
-            "verify",
-            "link",
-            "unlink",
-            "refresh",
-            "run",
-            "relocate",
-        ] {
+        // Reads `atpkg::cli::dispatch_roster()` — the DISPATCH TABLE — rather
+        // than a list typed out here. This test held its own copy of the
+        // verbs until 2026-09-01, and that copy was missing `repair`, so it
+        // passed while the page it guards omitted the same verb. A
+        // completeness test that duplicates the data it checks against
+        // cannot see a divergence in that data: it had exactly the manual's
+        // blind spot, which is why the omission survived a test named
+        // "names every verb".
+        for verb in atpkg::cli::dispatch_roster() {
             assert!(
                 page.contains(verb),
                 "the pkg manual page must name the `{verb}` verb"
@@ -1738,6 +1915,59 @@ mod tests {
         assert!(
             page.contains("aterm pkg install --default-set"),
             "the usual first command is spelled as typed"
+        );
+    }
+
+    /// The manual may not prescribe an atpkg verb that does not run.
+    ///
+    /// The mirror of `pkg_manual_names_every_verb`, and the direction nothing
+    /// checked. The atpkg page asserted, two bullets below three false claims,
+    /// that "the roster `aterm pkg --help` prints is test-pinned to the
+    /// dispatch table — it never advertises a verb that does not run". True of
+    /// the ROSTER; false of the page saying it. On 2026-09-01 these pages
+    /// prescribed `aterm pkg shellenv`, `aterm pkg seam` and
+    /// `aterm pkg doctor --fix`. None exists, and an unknown verb exits 2 with
+    /// EMPTY stdout — so the page's own `eval "$(aterm pkg shellenv)"`
+    /// evaluated nothing and SUCCEEDED. `doctor --fix` was named as THE cure
+    /// for `error: toolchain 'trust' is not installed`, directly above "Never
+    /// rebuild a toolchain from source to answer that message"; `doctor` parses
+    /// no arguments at all.
+    ///
+    /// Only SOUNDNESS lives here. Completeness is the test above. The two are
+    /// separate because the directions are not symmetric: both ROSTERS are
+    /// closed, so completeness is decidable — but the front-door NAMESPACE is
+    /// open (`aterm <tool>` routes any store program, which is why
+    /// `aterm trustc` and `aterm targo` are correct prose), so the same check
+    /// cannot be run there.
+    #[test]
+    fn manual_never_prescribes_a_pkg_verb_that_does_not_run() {
+        let roster = atpkg::cli::dispatch_roster();
+        let mut ghosts: Vec<String> = Vec::new();
+        for topic in TOPICS {
+            let Some(body) = topic.body else { continue };
+            let mut rest = body;
+            while let Some(at) = rest.find("aterm pkg ") {
+                let after = &rest[at + "aterm pkg ".len()..];
+                let verb: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                let step = verb.len().max(1).min(after.len());
+                rest = &after[step..];
+                // `aterm pkg --help` and `aterm pkg <tool>` are not verbs.
+                if verb.is_empty() || verb.starts_with('-') || roster.contains(&verb.as_str()) {
+                    continue;
+                }
+                ghosts.push(format!("{}: `aterm pkg {verb}`", topic.name));
+            }
+        }
+        assert!(
+            ghosts.is_empty(),
+            "the manual prescribes {} atpkg verb(s) that are not in the dispatch \
+             roster. An unknown verb exits 2 with EMPTY stdout, so a reader who \
+             follows one gets silence, not an error:\n  {}\n  Roster: {roster:?}",
+            ghosts.len(),
+            ghosts.join("\n  ")
         );
     }
 

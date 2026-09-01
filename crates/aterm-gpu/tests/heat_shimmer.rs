@@ -300,6 +300,12 @@ fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h:
 #[test]
 fn shimmer_reaches_all_three_introspection_paths() {
     let Some(mut gpu) = gpu_or_skip() else { return };
+    // THE FLIP: the three taps here are the wgpu stand-in harness (the
+    // swapchain stand-in reads the wgpu offscreen) — the WGPU ORACLE arm.
+    // The armed tap ring has its own differential
+    // (`armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte`).
+    #[cfg(target_os = "macos")]
+    gpu.disarm_metal_for_oracle();
     gpu.set_bloom(true); // the full parity-class stack, as shipped
     gpu.set_sdr_glow_boost(0.0); // keep the crown's own wall-clock ease out
     gpu.set_shimmer_phase_for_test(Some(0.31));

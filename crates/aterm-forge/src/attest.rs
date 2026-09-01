@@ -1716,7 +1716,7 @@ mod tests {
     }
 
     /// The patch table PARTITIONED. Five vendored forks — third-party source
-    /// this repository redistributes and must keep reviewing — and five
+    /// this repository redistributes and must keep reviewing — and EIGHT
     /// first-party targets, which are workspace members and owe none of that.
     /// Asserting the two lists separately is the point: the old single-list
     /// assertion could only be repaired by adding "tracing" to a list named
@@ -1726,11 +1726,22 @@ mod tests {
     /// The first-party arm went 1 → 5 in one wave (`profiling`, `cfg-if`,
     /// `arrayvec`, `log`), which is the shape the partition was built for: four
     /// packages left the shipped graph and NOT ONE of them added a
-    /// REVIEWED_VENDORED_CRATES row, a NOTICE line or a §4(b) byte-diff. The
+    /// REVIEWED_VENDORED_CRATES row, a NOTICE line or a §4(b) byte-diff.
+    /// `core_maths` (2026-09-01) is the seventh and the first whose PRIZE is a
+    /// vendored fork: retiring it left `libm` with no parent on mac-arm or
+    /// wasm-cpu, so the fork's review burden now falls on three cells instead
+    /// of five — visible above as an [OB-12] liveness NOTE, by design.
+    /// `once_cell` (2026-09-01) is the eighth and the first that is LIVE CODE:
+    /// every entry before it is a facade, a re-export or an import that is
+    /// `cfg`-ed off, whereas ten third-party crates CALL this one on four of
+    /// the five cells. That is why it is the first first-party target to carry
+    /// behaviour tests with planted controls rather than a liveness tripwire
+    /// alone.
+    ///
     /// The arm is SORTED (measured, not assumed — the first draft of this
     /// assertion listed them in manifest order and went red).
     #[test]
-    fn the_real_patch_table_is_five_vendored_forks_and_six_first_party_targets() {
+    fn the_real_patch_table_is_five_vendored_forks_and_eight_first_party_targets() {
         let root = repo_root();
         let (vendored, first_party) = partition_patches(&patch_paths(&root).unwrap(), &root);
         let mut names: Vec<String> = vendored.into_iter().map(|(n, _)| n).collect();
@@ -1744,8 +1755,16 @@ mod tests {
             vec![
                 ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
                 ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
+                (
+                    "core_maths".to_string(),
+                    "crates/aterm-core-maths".to_string()
+                ),
                 ("libc".to_string(), "crates/aterm-libc".to_string()),
                 ("log".to_string(), "crates/aterm-log-shim".to_string()),
+                (
+                    "once_cell".to_string(),
+                    "crates/aterm-once-cell".to_string()
+                ),
                 (
                     "profiling".to_string(),
                     "crates/aterm-profiling".to_string()

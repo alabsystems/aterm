@@ -11,6 +11,18 @@ description = "aterm GPU renderer (wgpu/Metal): glyph-atlas + instanced cell qua
 
 [features]
 default = []
+# THE FLIP (map §5 W6): the wgpu ORACLE arm, OFF in every production build.
+# On macOS the wgpu dependency below is OPTIONAL and this feature is its only
+# activator; the target-gated self-dev-dependency at the bottom of this file
+# turns it on for every test/bench target of THIS crate, so the 18-row
+# differential ladder, the full-frame/present byte gates, and the integration
+# oracle suites (blit bands, present_real, the EDR gates, ...) keep compiling
+# both arms — while `cargo build`/`cargo tree --edges normal` (the graph forge
+# prices dom() and the ratchets on: resolve.rs `run_tree`, verified) never see
+# wgpu on the mac cell at all. Non-mac cells list wgpu NON-optional in their
+# own target tables, so this feature is a no-op there. Code gates on
+# `cfg(wgpu_arm)`, emitted by build.rs as `not(macos) OR wgpu-oracle`.
+wgpu-oracle = ["dep:wgpu"]
 # TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]` anchors binding the
 # bg-instance build/slice path (→ external `GpuEncode.tla`). OFF by default
 # (byte-identical production renderer, no `aterm-spec`/`inventory`); aterm-gui's
@@ -36,7 +48,8 @@ aterm-hash = { workspace = true }
 # clocks below use it so GPU init/present never traps in the web renderer —
 # same clock aterm-effects already uses across this crate's wasm closure.
 aterm-time = { workspace = true }
-wgpu = { version = "29", default-features = false }
+# THE FLIP: the base `wgpu` row is GONE — wgpu is declared per target below
+# (macOS: optional, oracle-only; linux/windows/wasm: required, unchanged).
 # THE ROW's one public leak, closed. `GpuRenderer::create_window_surface` took
 # `impl Into<wgpu::SurfaceTarget<'static>>` — the ONLY place a wgpu type crossed
 # this crate's public API, and the one thing a first-party macOS backend could
@@ -54,7 +67,23 @@ wgpu = { version = "29", default-features = false }
 # which is the house rule: a direct use gets a direct dependency rather than
 # riding another crate's re-export.
 raw-window-handle = "0.6"
-bytemuck = { version = "1", features = ["derive"] }
+# THE FLIP's last proc macro on this cell. `bytemuck` reached aterm-gpu for two
+# things — the `Pod`/`Zeroable` traits and their `derive` — and this crate was
+# the SOLE activator of that `derive` feature on macOS once wgpu-types and
+# wgpu-hal left the normal graph (rustybuzz, the row's other parent, asks only
+# for `extern_crate_alloc`). `aterm-bits` is this workspace's own `Pod`/
+# `Zeroable` and the byte casts over them (already `aterm-core`'s), with no
+# derive: the ten `#[repr(C)]` uniform/instance structs in `renderer.rs` carry
+# hand-written `unsafe impl`s through the `impl_pod_zeroable!` macro there,
+# which restates the padding proof the derive used to check.
+#
+# PRIZE, measured: `bytemuck_derive 1.10.2` — 2,934 LOC, a PROC MACRO — leaves
+# the mac-arm graph, taking the cell's proc-macro count 3 -> 2 and `syn`'s
+# parent set 4 -> 3. `bytemuck 1.25.0` itself STAYS, held by rustybuzz alone
+# until the shaper is replaced; this pre-pays that row, which then falls whole
+# (8,367 LOC / 2 packages). The other cells still resolve bytemuck_derive
+# through wgpu, so linux/windows/wasm are unchanged.
+aterm-bits = { workspace = true }
 # Optional: only pulled in by the off-by-default `spec-anchors` feature.
 aterm-spec = { workspace = true, optional = true }
 
@@ -119,7 +148,12 @@ aterm-spec = { workspace = true, optional = true }
 # documented fail-soft arm for device loss; this makes it the first fallback
 # rather than the second. Reverting is one feature name per row.
 [target.'cfg(target_os = "macos")'.dependencies]
-wgpu = { version = "29", default-features = false, features = ["metal", "wgsl"] }
+# THE FLIP: optional — the first-party Metal renderer is the macOS backend,
+# and wgpu compiles on this cell ONLY as the differential oracle (see the
+# `wgpu-oracle` feature above). `cargo tree -e normal --target
+# aarch64-apple-darwin` finds no wgpu under aterm-gpu; `blame wgpu --cell
+# mac-arm` prices its dominator at absence.
+wgpu = { version = "29", optional = true, default-features = false, features = ["metal", "wgsl"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
@@ -175,6 +209,18 @@ windows = { version = "0.62", features = [
     # a COMPILE error and not a resolution one.
     "Win32_Graphics_Gdi",
 ] }
+
+# THE FLIP's oracle activation: a target-gated SELF-dev-dependency. Building
+# any test/bench target of aterm-gpu on macOS unifies the `wgpu-oracle`
+# feature into the lib under test, which re-activates the optional wgpu row
+# above — so both renderer arms compile for the differential suites. Dev
+# edges are invisible to `cargo tree --edges normal` (verified against
+# aterm-forge/src/resolve.rs AND empirically: the optional dep activated only
+# through this edge does not appear on the mac cell), so dom(), the budget
+# ratchets, and the shipped closure never carry it. `cargo build -p aterm`
+# ignores dev edges entirely: the production macOS binary has no wgpu.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+aterm-gpu = { path = ".", features = ["wgpu-oracle"] }
 
 [dev-dependencies]
 criterion = "0.5"

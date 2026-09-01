@@ -2136,6 +2136,50 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
 
 #[cfg(test)]
 mod inbox_hold {
+
+    /// `hold`'s help ENUMERATES the PTY-reaching verbs, and `is_pty_reaching` is
+    /// the set that actually decides. A hand-typed roster beside a derived set
+    /// drifts, and this one had: it omitted `hwkey` and `pane`, so two verbs
+    /// that really are refused while a hold is on were documented as answerable.
+    ///
+    /// Both directions. A verb missing from the prose UNDERSTATES the halt — the
+    /// dangerous side, since a driver reads the list to plan what it can still
+    /// do. A verb in the prose but not in the set overstates it, stranding a
+    /// caller that waits for a refusal which never comes.
+    #[test]
+    fn the_hold_help_enumerates_exactly_the_pty_reaching_set() {
+        let detail = aterm_types::control_verbs::spec("hold")
+            .expect("`hold` is a catalog verb")
+            .detail;
+        let listed: std::collections::BTreeSet<&str> = detail
+            .split_once("from ANY scope — `")
+            .and_then(|(_, tail)| tail.split_once('`'))
+            .expect("the help quotes the roster in one backticked run")
+            .0
+            .split_whitespace()
+            .collect();
+        assert!(!listed.is_empty(), "the roster parse found nothing");
+        for verb in &listed {
+            assert!(
+                is_pty_reaching(verb),
+                "`hold`'s help lists `{verb}` as PTY-reaching, but `is_pty_reaching` \
+                 does not — a caller waits for a refusal that never comes"
+            );
+        }
+        // The other direction needs the candidate set: every verb the catalog
+        // knows, so a NEW pty-reaching verb fails here on arrival.
+        for spec in aterm_types::control_verbs::VERBS {
+            if is_pty_reaching(spec.name) {
+                assert!(
+                    listed.contains(spec.name),
+                    "`{}` is refused while a hold is on and `hold`'s help does not \
+                     say so — the roster understates the halt, which is the side a \
+                     driver plans against",
+                    spec.name
+                );
+            }
+        }
+    }
     use super::*;
     use crate::session_store::{Store, new_store, test_handle};
 

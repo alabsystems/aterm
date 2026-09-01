@@ -2965,6 +2965,12 @@ impl TrailSynth {
                 // phrase — thinning it would silence entire bars, so it
                 // outranks the gap exactly like the other punctuation.
                 | SoundGesture::Celebration(_)
+                // Machine output owns a separately governed one-per-episode
+                // cue. It may arrive immediately after Enter; thinning it here
+                // would lose the only Shimmer because the streak engine does
+                // not retry. It still does not CLAIM `since_voice` below, so
+                // the machine can never steal the human's next key slot.
+                | SoundGesture::Output(_)
         );
         // THE ERASE GATE. A deletion is thinned against OTHER DELETIONS
         // ([`ERASE_MIN_GAP`]) and against nothing else — see the constant for
@@ -8150,6 +8156,21 @@ mod tests {
         }
     }
 
+    fn output(style: GlowStyle, gesture: OutputGesture) -> SoundEvent {
+        SoundEvent {
+            style,
+            voice: SoundVoice::Style,
+            kind: SoundGesture::Output(gesture),
+            pan: 0.0,
+            heat: 0.0,
+            hue: 0.3,
+            gain: 0.4,
+            tone: Tone::Technical,
+            bed: false,
+            shifted: false,
+        }
+    }
+
     /// The same trail event under an explicit tone (the tone-proof helper).
     fn toned(style: GlowStyle, kind: SoundKind, tone: Tone) -> SoundEvent {
         SoundEvent {
@@ -9521,6 +9542,80 @@ mod tests {
             s.live_voices(),
             after_first + 2,
             "bonk within gap must be admitted"
+        );
+    }
+
+    /// PRISM WAKE owns a one-shot episode governor upstream, so its sole cue
+    /// must survive the synth's shared keystroke gap. It remains unauthored:
+    /// no RNG/melody state and no human admission slot are consumed, and the
+    /// closing Settle stays quieter than the opening Shimmer.
+    #[test]
+    fn output_cues_bypass_but_never_claim_the_human_voice_gap() {
+        let mut s = TrailSynth::new(48_000.0, 0x0A17_0A17);
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Jump));
+        let after_enter = s.live_voices();
+        let musical_state = (
+            s.rng,
+            s.walk,
+            s.theme_pos,
+            s.phrase_idx,
+            s.bass_step,
+            s.song_pulse,
+            s.song_notes,
+        );
+        let human_gap = s.since_voice;
+        assert!(
+            human_gap < MIN_GAP,
+            "Enter must actually occupy the shared human admission gap"
+        );
+
+        // No rendered time has passed since Enter: this is the gap that used
+        // to swallow the episode's only opening cue.
+        s.push(output(GlowStyle::RainbowKitty, OutputGesture::Shimmer));
+        assert_eq!(s.live_voices(), after_enter + 1, "Shimmer must be admitted");
+        assert_eq!(
+            (
+                s.rng,
+                s.walk,
+                s.theme_pos,
+                s.phrase_idx,
+                s.bass_step,
+                s.song_pulse,
+                s.song_notes,
+            ),
+            musical_state,
+            "machine output must not rewrite the human melody"
+        );
+        assert_eq!(
+            s.since_voice, human_gap,
+            "machine output must not claim the next human admission slot"
+        );
+
+        // Once the Enter's own gap has elapsed, inserting an output cue just
+        // before the next key cannot thin that key.
+        s.since_voice = MIN_GAP;
+        s.push(output(GlowStyle::RainbowKitty, OutputGesture::Shimmer));
+        let after_output = s.live_voices();
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        assert!(
+            s.live_voices() > after_output,
+            "an unauthored cue cannot steal the following key's beat"
+        );
+
+        let voice_level = |s: &TrailSynth| {
+            s.voices
+                .iter()
+                .filter(|voice| voice.on)
+                .map(|voice| voice.gl + voice.gr)
+                .sum::<f32>()
+        };
+        let mut shimmer = TrailSynth::new(48_000.0, 7);
+        let mut settle = TrailSynth::new(48_000.0, 7);
+        shimmer.push(output(GlowStyle::RainbowKitty, OutputGesture::Shimmer));
+        settle.push(output(GlowStyle::RainbowKitty, OutputGesture::Settle));
+        assert!(
+            voice_level(&settle) < voice_level(&shimmer),
+            "the closing exhale must stay below the opening cue"
         );
     }
 

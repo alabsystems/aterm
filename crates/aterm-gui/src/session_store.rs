@@ -1077,6 +1077,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
     let nonce = LaunchNonce::generate();
     let ctx = Arc::new(SessionCtx {
         sink: Arc::new(SinkWriter::new(-1)),
+        output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         edges: Mutex::new(EdgeTable::new()),
         self_id: sid.clone(),
         nonce,

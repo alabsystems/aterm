@@ -1,3 +1,5 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+
 // A display-free event loop for `--headless` runs.
 //
 // WHY THIS EXISTS. The other two Unix backends are named after the display server they

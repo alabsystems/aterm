@@ -927,12 +927,14 @@ mod tests {
 
     #[test]
     fn the_vendored_forks_are_third_party_and_workspace_crates_are_not() {
-        let s = survey(0);
+        // THE FLIP: `indexmap` (this test's fork specimen) left the mac-arm
+        // graph with wgpu, its only parents there. linux still resolves it.
+        let s = survey(1);
         let fork = s
             .facts
             .iter()
             .find(|(id, _)| id.name == "indexmap")
-            .expect("the indexmap fork is in the mac-arm graph");
+            .expect("the indexmap fork is in the linux graph");
         assert!(
             fork.1.is_third_party,
             "a [patch.crates-io] fork is still upstream code"

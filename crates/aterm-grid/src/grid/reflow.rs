@@ -362,7 +362,14 @@ impl Grid {
         // fill is gated to `prev_offset == 0` precisely so the anchor below
         // stays exact); everything deeper is untouched in both. `prev_offset >
         // 0` means the row under the eye IS such a line, which is what makes
-        // this anchor exact rather than approximate. A WIDTH reflow renumbers
+        // this anchor exact rather than approximate. NOT in the two arms that
+        // add or remove rows at the BOTTOM (the grow's blank append, the
+        // shrink's trailing-blank trim): those change the retained-line total
+        // and therefore slide the whole absolute space, which is why they raise
+        // `history_renumber_epoch` (see `note_bottom_end_renumbered`) and why
+        // the anchor degrades to approximate there — by the appended/trimmed
+        // row count, and only for a reader who is already scrolled back into a
+        // history too short to satisfy the grow. A WIDTH reflow renumbers
         // rows wholesale (the wrapped-line count changes), so no exact anchor
         // exists there and the clamped offset stays the best available answer —
         // staying in history is far better than snapping a scrolled-back reader
@@ -671,6 +678,12 @@ impl Grid {
                 self.storage.total_lines = keep;
                 // Their extras keys land >= `target` after the demote shift
                 // below and are swept by the caller's `retain_rows_below`.
+                // RENUMBERING: dropping rows off the BOTTOM shrinks the retained
+                // total while `absolute_row_counter` stays put, and
+                // `oldest_absolute_row()` is `counter − visible − scrollback` —
+                // so every surviving row's absolute key just shifted UP by
+                // `trim`. See `note_bottom_end_renumbered`.
+                self.note_bottom_end_renumbered();
             }
             let remaining = shrink - trim;
 
@@ -855,11 +868,49 @@ impl Grid {
                     rows.push(unsafe { Row::new(new_cols, pages) });
                 }
                 self.storage.total_lines += rows_to_add;
+                // RENUMBERING: the reveal above is a pure relabel that keeps
+                // absolute numbering, but these blank rows are ADDED at the
+                // bottom — the retained total grows while
+                // `absolute_row_counter` stays put, so `oldest_absolute_row()`
+                // (`counter − visible − scrollback`) and every retained row's
+                // key shift DOWN by `rows_to_add`. See
+                // `note_bottom_end_renumbered`.
+                self.note_bottom_end_renumbered();
             }
             return (revealed, reveal_extras);
         }
         // target == visible: nothing to reclassify.
         (0, Vec::new())
+    }
+
+    /// Record that a rows-only resize changed the retained-line total at the
+    /// BOTTOM of the buffer, which RENUMBERS every retained row.
+    ///
+    /// `oldest_absolute_row()` is `absolute_row_counter − visible_rows −
+    /// scrollback_lines()`, i.e. `counter − retained_total`, and a rows-only
+    /// resize deliberately leaves `absolute_row_counter` alone. Moving rows
+    /// ACROSS the live/history boundary (the grow-side reveal, the shrink-side
+    /// top-demote) keeps `retained_total` fixed and is therefore the pure
+    /// relabel the resize docs describe — every absolute key survives it. Two
+    /// arms are not relabels: the shrink's trailing-blank TRIM removes rows from
+    /// the bottom and the grow's blank APPEND adds them there. Both change
+    /// `retained_total`, so `oldest_absolute_row()` slides and EVERY retained
+    /// row's `oldest + i` key slides with it, while `content_gen` (a bulk
+    /// mutation), `absolute_row_revision` (no splice) and `base_y()` arithmetic
+    /// look exactly like an ordinary resize.
+    ///
+    /// That is the definition of the epoch this bumps: a wholesale history
+    /// renumbering invisible to the `(content_gen, absolute_row_revision,
+    /// geometry)` key set. Without it, absolute-row-keyed caches carried
+    /// pre-shift keys forward — the GUI search index re-fed only the rows
+    /// at/after the OLD visible base and dropped the top band of the screen out
+    /// of the search corpus entirely, so find reported "no matches" for text
+    /// plainly on the glass after `clear` + a taller window. Same reasoning and
+    /// the same fix as the Kitty unscroll (`scroll_unscroll.rs`) and the
+    /// scrollback rewrap (`scrollback_reflow.rs`): a spurious rebuild is
+    /// harmless, a missed one is silently wrong results.
+    fn note_bottom_end_renumbered(&mut self) {
+        self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
     }
 
     /// The write-side inverse of [`Self::extract_row_extras`]: re-attach a
