@@ -30,6 +30,112 @@ use std::fmt;
 pub unsafe trait Encode {
     /// The encoding string, e.g. `"@"` for an object or `"d"` for a `CGFloat`.
     const ENCODING: &'static str;
+
+    /// Whether `Self` CONTAINS, anywhere in its layout tree, a field at an
+    /// offset that is not a multiple of that field's own alignment.
+    ///
+    /// # The rule is TRANSITIVE, and saying so is the whole of the fix
+    ///
+    /// This used to read "whether `Self` places any field at an offset that is
+    /// not a multiple of that field's own alignment", which is a rule about
+    /// `Self`'s OWN fields and nothing deeper. Applied literally it answers
+    /// `false` for a wrapper that has exactly one field, at offset 0, whose own
+    /// alignment is 1 — and such a wrapper is still MEMORY-classified on
+    /// System V x86-64, because the classification walks the whole layout tree.
+    /// CODEGEN-PROVED with `clang -arch x86_64 -O1 -S` (this box cannot execute
+    /// that slice), three shapes, all built from the same 9-byte packed struct
+    /// `struct __attribute__((packed)) Packed9 { char c; long q; }`:
+    ///
+    /// ```text
+    /// struct Wrap    { struct Packed9 inner; }              9  1  _objc_msgSend_stret
+    /// struct WrapPad { struct Packed9 inner; char pad[7]; } 16  1  _objc_msgSend_stret
+    /// struct ArrOne  { struct Packed9 a[1]; }               9  1  _objc_msgSend_stret
+    /// struct NineChars { char c[9]; }                       9  1  _objc_msgSend
+    /// ```
+    ///
+    /// and the LLVM IR shows the shape of the corruption exactly:
+    ///
+    /// ```text
+    /// call void @objc_msgSend_stret(ptr … sret(%struct.Wrap) align 1 %2, …)
+    /// ```
+    ///
+    /// — the hidden result pointer in `RDI`, which is where plain
+    /// `objc_msgSend` reads `self`, i.e. the register shift
+    /// [`crate::returns_indirectly`] describes. Every one of the three answers
+    /// `false` under the old wording and `true` under this one. `NineChars` is
+    /// the control: same size, same alignment, no packing anywhere in its tree,
+    /// plain `objc_msgSend`.
+    ///
+    /// So the question a type's author must answer is about the type's WHOLE
+    /// layout, not its outermost struct: a type is `true` here if it is packed
+    /// in a way that misaligns something, **or if any field, element or nested
+    /// struct of it is**.
+    ///
+    /// This is not an encoding: `@encode` does not record packing, and two
+    /// types with the same encoding string can differ here. It lives on this
+    /// trait because this trait is the ONE place a type declares its C ABI, and
+    /// because it is the term [`crate::returns_indirectly`] needs and `size_of`
+    /// cannot supply. On `x86_64-apple-darwin` a type with an unaligned field
+    /// is classified MEMORY at ANY size — measured down to three bytes — so it
+    /// must be sent through `objc_msgSend_stret` even though it is small.
+    ///
+    /// The default is `false` and every impl in this crate takes it: nothing in
+    /// Foundation, AppKit, CoreGraphics or this crate is packed. A packed type
+    /// must set it by hand, and then it works rather than corrupting registers:
+    ///
+    /// ```
+    /// # use aterm_objc::{Encode, returns_indirectly};
+    /// #[repr(C, packed)]
+    /// struct Packed {
+    ///     c: i8,
+    ///     q: i64,
+    /// }
+    /// // SAFETY: `{Packed=cq}` is the layout; the `q` sits at offset 1, so
+    /// // System V x86-64 classification is MEMORY regardless of the 9-byte size.
+    /// unsafe impl Encode for Packed {
+    ///     const ENCODING: &'static str = "{Packed=cq}";
+    ///     const HAS_UNALIGNED_FIELDS: bool = true;
+    /// }
+    /// assert_eq!(size_of::<Packed>(), 9);
+    /// assert_eq!(returns_indirectly::<Packed>(), cfg!(target_arch = "x86_64"));
+    /// ```
+    ///
+    /// A wrapper inherits it, which is the transitive half stated as code:
+    ///
+    /// ```
+    /// # use aterm_objc::{Encode, returns_indirectly};
+    /// #[repr(C, packed)]
+    /// struct Packed { c: i8, q: i64 }
+    /// // SAFETY: `{Packed=cq}`; the `q` sits at offset 1.
+    /// unsafe impl Encode for Packed {
+    ///     const ENCODING: &'static str = "{Packed=cq}";
+    ///     const HAS_UNALIGNED_FIELDS: bool = true;
+    /// }
+    /// #[repr(C)]
+    /// struct Wrap { inner: Packed }
+    /// // ONE field, at offset 0, whose own alignment is 1 — so the rule this
+    /// // doc used to state answers `false`. The right answer is the field's.
+    /// // SAFETY: the misalignment is `Packed`'s and `Wrap` inherits it.
+    /// unsafe impl Encode for Wrap {
+    ///     const ENCODING: &'static str = "{Wrap={Packed=cq}}";
+    ///     const HAS_UNALIGNED_FIELDS: bool = <Packed as Encode>::HAS_UNALIGNED_FIELDS;
+    /// }
+    /// assert_eq!(size_of::<Wrap>(), 9);
+    /// assert_eq!(align_of::<Wrap>(), 1);
+    /// assert_eq!(returns_indirectly::<Wrap>(), cfg!(target_arch = "x86_64"));
+    /// ```
+    ///
+    /// Writing it as `<Field as Encode>::HAS_UNALIGNED_FIELDS` rather than a
+    /// hand-typed `true` is the spelling to prefer: it cannot go stale when the
+    /// field's own answer changes.
+    ///
+    /// # Safety
+    /// Setting this to `false` for a type that misaligns a field ANYWHERE in
+    /// its layout tree routes an x86_64 send to the wrong `objc_msgSend` entry
+    /// point, which shifts every argument by one register. That is the same
+    /// class of undefined behaviour a wrong [`Self::ENCODING`] causes, on the
+    /// direct-send path rather than the reflective one.
+    const HAS_UNALIGNED_FIELDS: bool = false;
 }
 
 macro_rules! prim {
@@ -183,17 +289,102 @@ unsafe impl Encode for Bool {
     const ENCODING: &'static str = BOOL_ENCODING;
 }
 
-// `Id` is `*mut c_void`. In THIS crate a raw void pointer in a method position
-// always means `id` — see the type alias's docs. Nothing in aterm's 33 methods
-// or winit's 71 passes a non-object `void *`.
-// SAFETY: object pointers encode as `"@"`.
-unsafe impl Encode for *mut c_void {
+// The four pointer-shaped runtime types, and the four different letters clang
+// emits for them. ALL FOUR were `*mut c_void`/`*const c_void` aliases once, and
+// two impls had to carry four meanings; each is a `#[repr(transparent)]`
+// newtype now, so each can say its own letter. MEASURED on this box:
+//
+// ```text
+// @encode(id)           = @      @encode(Class)        = #
+// @encode(Protocol *)   = @      @encode(SEL)          = :
+// @encode(void *)       = ^v     @encode(const void *) = r^v
+// ```
+//
+// SAFETY: object pointers encode as `"@"`, and `Id` is `#[repr(transparent)]`
+// over exactly the pointer the runtime passes.
+unsafe impl Encode for crate::runtime::Id {
     const ENCODING: &'static str = "@";
 }
-// `Sel` is `*const c_void` — the `_cmd` slot and `doCommandBySelector:`.
-// SAFETY: selectors encode as `":"`.
-unsafe impl Encode for *const c_void {
+// SAFETY: a class object encodes as `"#"`, NOT `"@"`. Measured: `- (void)
+// setDelegateClass:(Class)c` registers `v24@0:8#16`. This is the impl that used
+// to be unwritable, because `ClassPtr` and `Id` were the same type.
+unsafe impl Encode for crate::runtime::ClassPtr {
+    const ENCODING: &'static str = "#";
+}
+// SAFETY: `@encode(Protocol *)` is `"@"` — a `Protocol` IS an object, and this
+// one is measured rather than inferred from the name, since the neighbouring
+// `Class` does not follow the same rule.
+unsafe impl Encode for crate::runtime::ProtocolPtr {
+    const ENCODING: &'static str = "@";
+}
+// SAFETY: selectors encode as `":"`. `Sel` is a `#[repr(transparent)]` newtype
+// over the pointer precisely so that this impl and the two below can DISAGREE:
+// they used to be the same type, and the shared impl said `":"`, so a
+// `const void *context` argument would have been declared to the runtime as a
+// SELECTOR.
+unsafe impl Encode for crate::runtime::Sel {
     const ENCODING: &'static str = ":";
+}
+// A bare `void *`: an opaque caller-owned context pointer, NOT an object. THIS
+// is the spelling the live sites use — the SDK's `NSKeyValueObserving.h` writes
+// `context:(nullable void *)context`, `objc2-foundation`'s generated binding
+// writes `context: *mut c_void`, and so does
+// `vendor/winit/src/platform_impl/macos/window_delegate.rs:456`. It was mapped
+// to `"@"` until this pass, i.e. registered as an OBJECT, which is worse than
+// the `":"` the `Sel` newtype was introduced to prevent: `"@"` invites
+// `NSInvocation` and forwarding to retain a pointer the caller owns.
+// SAFETY: `void *` encodes as `"^v"` — `^` is "pointer to", `v` is `void`.
+unsafe impl Encode for *mut c_void {
+    const ENCODING: &'static str = "^v";
+}
+// The const-qualified twin. clang emits `r^v` for it, where the leading `r` is
+// the `const` TYPE QUALIFIER; qualifiers are optional in a method type string
+// and `NSMethodSignature` skips them, so the unqualified `"^v"` is what this
+// crate registers — the same short form it uses everywhere else (`"v@:@"`, not
+// `"v24@0:8@16"`).
+// SAFETY: as above.
+unsafe impl Encode for *const c_void {
+    const ENCODING: &'static str = "^v";
+}
+// `char *` — what `-[NSString UTF8String]` returns.
+// SAFETY: the runtime spells a C string `"*"`, distinct from the general
+// `"^c"` it would otherwise be.
+unsafe impl Encode for *const std::ffi::c_char {
+    const ENCODING: &'static str = "*";
+}
+
+/// `@encode(BOOL *)` for the target being compiled — and it is NOT `"^"` plus
+/// [`BOOL_ENCODING`] on both arms.
+///
+/// MEASURED, because the obvious composition is wrong on the compat slice:
+///
+/// ```text
+/// clang -arch arm64  : @encode(BOOL*) = "^B"   (BOOL is _Bool)
+/// clang -arch x86_64 : @encode(BOOL*) = "*"    (BOOL is signed char, so
+///                                               BOOL* IS char*, which the
+///                                               runtime spells "*")
+/// ```
+///
+/// The arm64 figure is execution-measured; the x86_64 figure is CODEGEN-proved
+/// (`clang -arch x86_64 -S`, reading the emitted string literal), because this
+/// box cannot execute that slice.
+#[cfg(target_arch = "aarch64")]
+const BOOL_PTR_ENCODING: &str = "^B";
+/// See the `aarch64` arm.
+#[cfg(not(target_arch = "aarch64"))]
+const BOOL_PTR_ENCODING: &str = "*";
+
+// `BOOL *` — the `stop` out-parameter of every `enumerate…UsingBlock:` in
+// Foundation, and the shape a block takes it in. Spelling it `*mut bool` in
+// Rust is [`Bool`]'s rule broken through a pointer: on the x86_64 compat slice
+// the framework writes a `signed char` into that byte, and materialising an
+// arbitrary byte as a Rust `bool` is undefined behaviour rather than a wrong
+// answer. `bool` has no `Encode` impl and neither does `*mut bool`, so the
+// bound on `RcBlock::newN` refuses it and this is the only spelling that
+// compiles.
+// SAFETY: measured on both arms — see [`BOOL_PTR_ENCODING`].
+unsafe impl Encode for *mut Bool {
+    const ENCODING: &'static str = BOOL_PTR_ENCODING;
 }
 
 /// A `CGPoint` / `NSPoint`.
@@ -233,6 +424,57 @@ unsafe impl Encode for CGSize {
 // SAFETY: as above.
 unsafe impl Encode for CGRect {
     const ENCODING: &'static str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
+}
+
+/// An `NSRange` — a location/length pair over `NSUInteger`.
+///
+/// Needed because winit's `NSTextInputClient` conformance cannot be declared
+/// without it: `- (NSRect)firstRectForCharacterRange:(NSRange)range
+/// actualRange:(NSRangePointer)actualRange` takes one BY VALUE and one BY
+/// POINTER, and `selectedRange`/`markedRange` return one. Six of the IME
+/// methods `vendor/winit/src/platform_impl/macos/view.rs` declares mention it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NSRange {
+    /// `NSNotFound` (`NSIntegerMax`) when there is no range.
+    pub location: usize,
+    /// Length in UTF-16 code units, which is what `NSTextInputClient` counts.
+    pub length: usize,
+}
+
+// SAFETY: `@encode(NSRange)` is `{_NSRange=QQ}` — MEASURED with clang on this
+// box. The struct TAG is `_NSRange`, not `NSRange` (`NSRange` is a typedef),
+// and `Q` is `unsigned long long`, which `usize` is on every 64-bit Apple
+// target. `#[repr(C)]` with two `usize` fields matches the C layout exactly and
+// nothing is packed.
+unsafe impl Encode for NSRange {
+    const ENCODING: &'static str = "{_NSRange=QQ}";
+}
+
+// `NSRangePointer` — `NSRange *`, the out-parameter half of
+// `firstRectForCharacterRange:actualRange:`. Measured: clang registers that
+// method as
+//
+// ```text
+// {CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32
+// ```
+//
+// A POINTER TO A STRUCT encodes as `^` followed by the pointee's own encoding.
+// That rule is spelled out per type rather than derived, because `ENCODING` is
+// a `&'static str` associated const and stable Rust has no way to concatenate
+// one at compile time — `concat!` takes literals only, and building the string
+// generically needs `generic_const_exprs`. A downstream crate that needs
+// `^{SomeOtherStruct=…}` writes a `#[repr(transparent)]` newtype over the
+// pointer and one `Encode` impl beside it, which is the same three lines.
+// SAFETY: `^` is "pointer to" and `{_NSRange=QQ}` is the pointee's measured
+// encoding.
+unsafe impl Encode for *mut NSRange {
+    const ENCODING: &'static str = "^{_NSRange=QQ}";
+}
+// SAFETY: as above; the `const` qualifier `r` is omitted for the reason given
+// on `*const c_void`.
+unsafe impl Encode for *const NSRange {
+    const ENCODING: &'static str = "^{_NSRange=QQ}";
 }
 
 /// Build a method type-encoding string: return type, then the implicit

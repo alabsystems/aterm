@@ -2030,11 +2030,18 @@ mod win32 {
 /// selection by whole words/lines with the origin unit always fully selected.
 #[derive(Debug, Clone, Copy)]
 struct GestureOrigin {
-    /// Live-screen selection row of the original word/line.
+    /// Live-screen selection row the original word/line STARTS on.
+    ///
+    /// The unit is LOGICAL, so a soft-wrapped word or line spans
+    /// `row..=end_row`; on an unwrapped line the two are equal.
     row: i32,
-    /// Inclusive first column of the original unit (0 for a line).
+    /// Live-screen selection row the original word/line ENDS on (== `row`
+    /// unless the unit straddles a soft wrap).
+    end_row: i32,
+    /// Inclusive first column of the original unit ON `row` (0 for a line).
     start_col: u16,
-    /// Inclusive last column of the original unit (`cols-1` for a line).
+    /// Inclusive last column of the original unit ON `end_row` (`cols-1` for a
+    /// line).
     end_col: u16,
     /// `Semantic` (double-click, by words) or `Lines` (triple-click, by rows).
     kind: SelectionType,
@@ -29131,6 +29138,7 @@ mod multi_window_tests {
             ws.selecting = true;
             ws.gesture = Some(GestureOrigin {
                 row: 0,
+                end_row: 0,
                 start_col: 0,
                 end_col: 5,
                 kind: SelectionType::Semantic,

@@ -106,7 +106,7 @@ use aterm_control::selection as control_selection;
 // click), which reach through the stable `crate::control::NAME` path. They take a
 // bare `&mut Terminal` off the GUI's own lock guard — no host — so the crate move
 // left their signatures alone.
-pub(crate) use aterm_control::selection::{select_line, select_word, word_cols};
+pub(crate) use aterm_control::selection::{select_line, select_word, word_span};
 // The response-framing primitives moved WITH the verbs (which reached them via
 // `super::`, so a duplicate here would be a second escape to drift from). Bound
 // at their pre-move visibilities, so every `crate::control::NAME` and `super::`

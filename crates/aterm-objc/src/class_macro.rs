@@ -141,6 +141,17 @@ macro_rules! __aterm_objc_count {
 ///   This is the same obligation [`crate::msg`] imposes in the other direction.
 /// * `NAME` must be globally unique in the process. Registration panics rather
 ///   than silently returning nil if it is not.
+/// * ~~`Ivars` may be any Rust type.~~ NOT ANY: a type whose slot needs more
+///   than 16-byte alignment is now a compile error, because
+///   `class_createInstance` allocates the instance with a `malloc` that
+///   guarantees exactly 16 and the slot sits at a fixed offset from that base.
+///   This was reachable with no `unsafe` token at the call site and is `S4`'s
+///   second half — see [`crate::ClassBuilder::add_rust_ivar`] for the
+///   measurement.
+/// * ~~A method may take any number of arguments.~~ Fourteen, because a send
+///   needs a [`crate::MsgFn`] prototype and that trait is implemented up to
+///   sixteen parameters counting `self` and `_cmd`. Wider used to REGISTER and
+///   be unreachable from Rust; it is now a compile error naming the ceiling.
 ///
 /// # The colon count is CHECKED, and more than one argument works
 ///
@@ -161,6 +172,36 @@ macro_rules! __aterm_objc_count {
 ///     }
 /// }
 /// ```
+///
+/// # The ceiling is a compile error at the DECLARE end too
+///
+/// A method wider than [`crate::MsgFn`]'s sixteen parameters — `self`, `_cmd`
+/// and fourteen arguments — used to REGISTER, answer `respondsToSelector:` with
+/// `YES` and dispatch from Objective-C, while `msg()` refused to build a
+/// prototype for it. That is a method the runtime can reach and Rust cannot,
+/// which is D1's and F1's trap a third time, and it is now refused where it is
+/// written:
+///
+/// ```compile_fail
+/// aterm_objc::declare_class! {
+///     struct DocTooWide: NSObject {
+///         const NAME: &str = "ATermDocTooWide";
+///         type Ivars = ();
+///
+///         // Fifteen arguments — seventeen parameters.
+///         @sel(a:b:c:d:e:f:g:h:i:j:k:l:m:n:o:)
+///         fn too_wide(
+///             &self,
+///             _a: i64, _b: i64, _c: i64, _d: i64, _e: i64,
+///             _f: i64, _g: i64, _h: i64, _i: i64, _j: i64,
+///             _k: i64, _l: i64, _m: i64, _n: i64, _o: i64,
+///         ) {}
+///     }
+/// }
+/// ```
+///
+/// Fourteen — the ceiling exactly — still compiles, registers and sends; see
+/// `tests/adversary_w2c.rs`.
 ///
 /// The identical class with the colon its argument requires compiles, and so
 /// do two and three arguments — the shapes that used to fail with
@@ -233,6 +274,24 @@ macro_rules! declare_class {
                         $crate::cstr!(::core::stringify!($super)),
                         $crate::cstr!($objc_name),
                     );
+                    // `class_createInstance` gives the instance base 16-byte
+                    // alignment and nothing more, so the ivar slot cannot
+                    // out-align that. `add_rust_ivar` carries the same
+                    // assertion; this one is here so the error names the CLASS.
+                    // See `S4` in the crate's soundness list.
+                    const {
+                        ::core::assert!(
+                            ::core::mem::align_of::<$crate::IvarSlot<$ivars>>() <= 16,
+                            ::core::concat!(
+                                "aterm-objc: `",
+                                ::core::stringify!($name),
+                                "`'s `Ivars` need more than the 16-byte \
+                                 alignment `class_createInstance`'s allocator \
+                                 guarantees, so the ivar slot would land \
+                                 misaligned in some fraction of instances",
+                            ),
+                        )
+                    };
                     __b.add_rust_ivar::<$ivars>();
                     $($( __b.add_protocol($crate::cstr!(::core::stringify!($proto))); )*)?
 
@@ -241,7 +300,32 @@ macro_rules! declare_class {
                         unsafe extern "C" fn __dealloc(__this: $crate::Id, _cmd: $crate::Sel) {
                             let __guard = ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
-                                    let __meta = $name::meta();
+                                    // NOT `$name::meta()`. -dealloc is
+                                    // REGISTERED here but RUNS later, on an
+                                    // instance — which cannot exist until
+                                    // `class()` has returned, i.e. until this
+                                    // very `get_or_init` has completed. So the
+                                    // cell is always initialised by the time
+                                    // this runs and the accessor would take
+                                    // its fast path... but the call still sits
+                                    // lexically inside the initializer, and
+                                    // OB-19's census is name-based by design:
+                                    // it reads this as an initializer that
+                                    // re-enters its own cell and fails the L0
+                                    // freeze gate, which has no waiver.
+                                    // `get()` is the gate's own prescribed
+                                    // repair ("if the nested read is only a
+                                    // cache peek, use the non-blocking
+                                    // `get()`"), and it is the stronger
+                                    // spelling regardless: a peek that can
+                                    // never block cannot park a -dealloc on
+                                    // the main thread, whatever a future edit
+                                    // does to the initializer above it.
+                                    let __meta = META.get().expect(
+                                        "-dealloc runs only on an instance, \
+                                         which cannot exist before the class \
+                                         is registered and META initialised",
+                                    );
                                     let __slot = ::core::ptr::with_exposed_provenance_mut::<
                                         $crate::IvarSlot<$ivars>,
                                     >(
@@ -286,6 +370,28 @@ macro_rules! declare_class {
                         // types. Reconcile the two HERE, at compile time,
                         // rather than letting AppKit discover the disagreement
                         // through `NSMethodSignature` at run time.
+                        // The SEND end has always refused a method wider than
+                        // `MsgFn`'s sixteen parameters; the DECLARE end had no
+                        // ceiling at all, so a fifteen-argument method
+                        // registered, answered `respondsToSelector:` YES, and
+                        // was unreachable from Rust. Both ends now stop in the
+                        // same place.
+                        const {
+                            ::core::assert!(
+                                $crate::__aterm_objc_count!($($arg)*) + 2 <= 16,
+                                ::core::concat!(
+                                    "aterm-objc: `fn ",
+                                    ::core::stringify!($method),
+                                    "` has more arguments than a message send \
+                                     can carry — `MsgFn` is implemented up to \
+                                     SIXTEEN parameters including the implicit \
+                                     `self` and `_cmd`, i.e. fourteen \
+                                     arguments. Registering it would create a \
+                                     method Objective-C can reach and Rust \
+                                     cannot.",
+                                ),
+                            )
+                        };
                         const {
                             ::core::assert!(
                                 $crate::__aterm_objc_colons!($($sel_tok)+)
@@ -364,7 +470,7 @@ macro_rules! declare_class {
             #[inline]
             #[allow(dead_code)]
             $vis fn as_id(&self) -> $crate::Id {
-                ::core::ptr::from_ref(self).cast_mut().cast()
+                $crate::Id::from_ptr(::core::ptr::from_ref(self).cast_mut().cast())
             }
 
             /// The `objc_super` a `[super …]` send from THIS class needs.
@@ -432,7 +538,16 @@ macro_rules! declare_class {
 
             $(
                 $(#[$mmeta])*
-                #[allow(non_snake_case, dead_code)]
+                // `non_snake_case` because a method is named for its selector;
+                // `dead_code` because the runtime, not Rust, is the caller;
+                // `too_many_arguments` because the ARITY IS THE SELECTOR'S and
+                // the user has no way to suppress it — the lint would fire with
+                // its span inside this expansion, so an `#[allow]` written at
+                // the `declare_class!` call site does not reach it and the only
+                // place that can silence it is here. AppKit's widest
+                // initializer is ten arguments; clippy's default ceiling is
+                // seven.
+                #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
                 fn $method(& $slf $(, $arg: $argty)*) $(-> $ret)? $body
             )*
         }

@@ -4,10 +4,14 @@
 //! W2 second pass, part two: the claims nobody armed.
 
 #![cfg(target_os = "macos")]
-// `declare_class!` emits the body as an inherent `fn` carrying every declared
-// argument, so a wide selector trips `too_many_arguments` at the CALL SITE and
-// the macro cannot suppress it from inside — see the W2 second-pass report.
-#![allow(clippy::too_many_arguments)]
+// This file USED to carry `#![allow(clippy::too_many_arguments)]`, because
+// `declare_class!` emits each body as an inherent `fn` carrying every declared
+// argument and the ten-colon selector below therefore tripped the lint with its
+// span inside the expansion — where no `#[allow]` a caller writes can reach.
+// The macro now emits the allow itself, alongside the `non_snake_case` and
+// `dead_code` it already emitted. The absence of the attribute here IS F9's
+// arming: put the ten-colon method back under a bare `cargo clippy` and the
+// lint fires again if the macro stops emitting it.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;

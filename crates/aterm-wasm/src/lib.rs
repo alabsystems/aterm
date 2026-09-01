@@ -1636,10 +1636,16 @@ impl AtermTerminal {
     }
 
     /// Select the whole word/URL at display `row`/`col` (double-click) and return
-    /// its text. Mirrors aterm-gui's select_word: a Semantic selection EXPANDED to
-    /// the word's inclusive cell span (smart_word_at's end col is exclusive); on
-    /// whitespace it falls back to the clicked cell. The selection stays active so
-    /// the highlight paints.
+    /// its text: a Semantic selection EXPANDED to the word's inclusive cell span
+    /// (smart_word_at's end col is exclusive); on whitespace it falls back to the
+    /// clicked cell. The selection stays active so the highlight paints.
+    ///
+    /// PHYSICAL ROW, unlike the desktop GUI: `aterm_control::selection::word_span`
+    /// runs the rules over the LOGICAL line (soft-wrapped rows joined), so a word
+    /// straddling the wrap is selected whole there (a RAGGED wrap, cut short by a
+    /// double-width glyph, still splits one) and only its clicked-row
+    /// fragment here. This facade's own `smart_word_at` path has not been moved
+    /// over — stated so the difference is known rather than discovered.
     pub fn selection_word(&mut self, row: i32, col: u16) -> Option<String> {
         self.note_host_visual_change(); // WF-1 gate (see selection_start)
                                         // smart_word_at is display-offset-aware (takes the DISPLAY row); the
@@ -1659,9 +1665,14 @@ impl AtermTerminal {
         self.term.selection_to_string()
     }
 
-    /// Select the whole line at display `row` (triple-click) and return its text.
-    /// Mirrors aterm-gui's select_line: a Lines selection expanded to the full row
-    /// width. `col` is accepted for a uniform host API but unused (whole row).
+    /// Select the whole PHYSICAL row at display `row` (triple-click) and return
+    /// its text: a Lines selection expanded to the full row width. `col` is
+    /// accepted for a uniform host API but unused (whole row).
+    ///
+    /// The desktop GUI's triple-click selects the LOGICAL line
+    /// (`aterm_control::selection::select_line`, which walks
+    /// `Terminal::logical_line_span`), so a soft-wrapped line comes back whole
+    /// there and truncated at the window width here. Not moved over with it.
     pub fn selection_line(&mut self, row: i32, col: u16) -> Option<String> {
         self.note_host_visual_change(); // WF-1 gate (see selection_start)
         let _ = col;

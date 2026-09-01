@@ -73,6 +73,46 @@
 //! assert!(block.is_some());
 //! ```
 //!
+//! # Every argument and the return state their ABI
+//!
+//! `RcBlock::newN` carries an [`crate::Encode`] bound on each argument and on
+//! the return type, for the reason [`crate::msg`] carries one on its return
+//! type: `Encode` is the single place a type states the C ABI it crosses a
+//! boundary with, and a block's `invoke` is a boundary exactly like a send. It
+//! was the LAST place in the crate exempt from that rule.
+//!
+//! It costs the tree nothing — all three real sites already satisfy it — and it
+//! buys the same two refusals `msg` gets. An ObjC `BOOL` out-parameter spelled
+//! as a Rust `bool` pointer does not compile, which is `Bool`'s rule reaching
+//! through a pointer for the first time (`tests/blocks.rs` had exactly this,
+//! written `*mut bool`, until the bound refused it):
+//!
+//! ```compile_fail
+//! # use aterm_objc::{Id, RcBlock};
+//! // `-[NSString enumerateLinesUsingBlock:]` takes `void (^)(NSString *, BOOL *)`.
+//! // On the x86_64 compat slice `BOOL` is `signed char`, so materialising the
+//! // byte the framework writes as a Rust `bool` is undefined behaviour.
+//! let _ = unsafe { RcBlock::new2(|_line: Id, _stop: *mut bool| {}) };
+//! ```
+//!
+//! Nor does a bare array return, whose System V x86-64 classification nobody
+//! has stated:
+//!
+//! ```compile_fail
+//! # use aterm_objc::RcBlock;
+//! let _ = unsafe { RcBlock::new0(|| [0_u8; 24]) };
+//! ```
+//!
+//! The `BOOL *` spelling that DOES compile is `*mut Bool`, and its encoding is
+//! one of this crate's stranger measurements — `^B` on arm64 but `*` on
+//! x86_64, because `BOOL` is `signed char` there and so `BOOL *` IS `char *`:
+//!
+//! ```
+//! # use aterm_objc::{Bool, Id, RcBlock};
+//! let block = unsafe { RcBlock::new2(|_line: Id, _stop: *mut Bool| {}) };
+//! assert!(block.is_some());
+//! ```
+//!
 //! # Named gap: no `BLOCK_HAS_SIGNATURE`
 //!
 //! These blocks carry no type-encoding string. An API that introspects a block
@@ -187,11 +227,26 @@ macro_rules! block_ctor {
             /// The closure must not unwind. It is wrapped in a panic guard that
             /// aborts, because unwinding out of a block into framework code is
             /// undefined behaviour.
+            ///
+            /// # The `Encode` bounds
+            ///
+            /// Every argument and the return type must implement
+            /// [`crate::Encode`], for the reason [`crate::msg`] carries the same
+            /// bound on ITS return type: `Encode` is the one place a type states
+            /// the C ABI it crosses a boundary with, and a block's `invoke` is a
+            /// boundary. It cost nothing to add — all three real sites in the
+            /// tree already satisfy it (`(Id) -> Id`, `(i64) -> ()`,
+            /// `(Id, Id) -> ()`) — and it buys the same two refusals `msg` gets:
+            /// a Rust `bool` standing in for an ObjC `BOOL` (which has no
+            /// `Encode` impl, deliberately) and a packed struct whose
+            /// System V x86-64 classification nobody has stated. This is the
+            /// crate's rule applied at the LAST place that was exempt from it.
             #[must_use]
             pub unsafe fn $ctor<$($A,)* R, F>(closure: F) -> Option<Self>
             where
                 F: Fn($($A),*) -> R + 'static,
-                R: Default,
+                $($A: $crate::Encode,)*
+                R: $crate::Encode,
             {
                 /// The stack block: the fixed header, then the closure.
                 #[repr(C)]
@@ -200,7 +255,14 @@ macro_rules! block_ctor {
                     closure: F,
                 }
 
-                unsafe extern "C" fn $invoke<$($A,)* R: Default, F: Fn($($A),*) -> R>(
+                // No bound on `R` beyond being the closure's return type. It
+                // used to be `R: Default`, left over from a version that
+                // returned `R::default()` on a caught panic; the guard now
+                // lands on `abort_on_unwind`, which is `!` and coerces to any
+                // `R`, so the bound bought nothing and cost every block whose
+                // return type has no `Default` — an `Option<T>` for a `T` that
+                // is not `Default`, a `Retained<T>`, a bare `Id` newtype.
+                unsafe extern "C" fn $invoke<$($A,)* R, F: Fn($($A),*) -> R>(
                     block: *mut c_void,
                     $($arg: $A),*
                 ) -> R {
@@ -221,13 +283,30 @@ macro_rules! block_ctor {
                 /// the Rust move; there is nothing left to copy.
                 unsafe extern "C" fn copy_helper(_dst: *mut c_void, _src: *const c_void) {}
 
+                /// The LAST unguarded `extern "C"` callback in the crate, and
+                /// the reason it needed one is subtle: a panicking `Drop` in a
+                /// captured value does abort here either way, because Rust's
+                /// own `extern "C"` shim turns an escaping unwind into
+                /// `thread caused non-unwinding panic. aborting.` — defined
+                /// behaviour, not UB. But that message names neither the crate
+                /// nor the callback, and `invoke`, `__tramp` and `__dealloc`
+                /// all abort through [`crate::abort_on_unwind`] with a name.
+                /// A convention with one silent exception is not a convention.
                 unsafe extern "C" fn dispose_helper<F>(block: *mut c_void) {
                     let blk = block.cast::<Blk<F>>();
-                    // SAFETY: `dispose` runs exactly once, on the last release
-                    // of a heap block this module built, so the closure is live
-                    // and owned by that block. `&raw mut` avoids forming a
-                    // reference to the partially-torn-down block.
-                    unsafe { ::std::ptr::drop_in_place(&raw mut (*blk).closure) };
+                    let guard = ::std::panic::catch_unwind(
+                        ::std::panic::AssertUnwindSafe(|| {
+                            // SAFETY: `dispose` runs exactly once, on the last
+                            // release of a heap block this module built, so the
+                            // closure is live and owned by that block.
+                            // `&raw mut` avoids forming a reference to the
+                            // partially-torn-down block.
+                            unsafe { ::std::ptr::drop_in_place(&raw mut (*blk).closure) };
+                        }),
+                    );
+                    if guard.is_err() {
+                        crate::abort_on_unwind("block dispose");
+                    }
                 }
 
                 struct Desc<F>(PhantomData<F>);

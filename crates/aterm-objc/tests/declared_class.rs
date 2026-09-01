@@ -103,7 +103,7 @@ declare_class! {
                 drops: Arc::clone(&ivars.drops),
             }) {
                 Some(child) => child.autorelease(),
-                None => std::ptr::null_mut(),
+                None => Id::NIL,
             }
         }
 
@@ -414,8 +414,8 @@ fn two_and_three_argument_methods_reach_their_bodies_with_the_arguments_in_order
             cmd(
                 obj.as_id(),
                 sel!(control:textView:doCommandBySelector:),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                Id::NIL,
+                Id::NIL,
                 sel!(insertNewline:)
             )
             .as_bool()
@@ -424,8 +424,8 @@ fn two_and_three_argument_methods_reach_their_bodies_with_the_arguments_in_order
             !cmd(
                 obj.as_id(),
                 sel!(control:textView:doCommandBySelector:),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                Id::NIL,
+                Id::NIL,
                 sel!(insertTab:)
             )
             .as_bool()
@@ -450,8 +450,8 @@ fn an_object_returning_method_hands_back_a_plus_zero_reference() {
             f(
                 obj.as_id(),
                 sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                Id::NIL,
+                Id::NIL,
                 Bool::YES,
             )
         };

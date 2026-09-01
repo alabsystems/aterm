@@ -656,14 +656,29 @@ pub fn check_selection<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     }
 }
 
-/// The first live-screen row carrying non-blank text, with that row's text. The
-/// only content a check can select and read back WITHOUT writing to the session —
-/// hence the round trip above being conditional rather than assumed.
+/// The first live-screen row carrying non-blank text, with the text `select
+/// line` will select there. The only content a check can select and read back
+/// WITHOUT writing to the session — hence the round trip above being
+/// conditional rather than assumed.
+///
+/// LOGICAL line, not physical row: `select line` selects the whole soft-wrapped
+/// run, and the copy joins its rows with NO newline, so the expectation is the
+/// rows of `logical_line_span` concatenated exactly the way
+/// `selection_to_string` concatenates them. Comparing against the clicked row
+/// alone would fail this check on any screen whose first line happens to wrap.
 fn first_text_row<H: SessionHost>(host: &H, sid: u64) -> Option<(i32, String)> {
     host.with_terminal(sid, |t: &Terminal| {
         (0..i32::from(t.rows())).find_map(|row| {
             let text = t.get_line_text(row, None)?;
-            (!text.trim().is_empty()).then_some((row, text))
+            if text.trim().is_empty() {
+                return None;
+            }
+            let (first, last) = t.logical_line_span(row);
+            let mut joined = String::new();
+            for r in first..=last {
+                joined.push_str(&t.get_line_text(r, None).unwrap_or_default());
+            }
+            Some((row, joined))
         })
     })?
 }

@@ -911,7 +911,13 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "select a region / word <r> <c> / line <r> / clear",
-        "",
+        "`word` and `line` are the double/triple-click gestures and select the \
+         LOGICAL line, not the physical row: a soft-wrapped line is selected \
+         from its first row through its last (so `copy` gets the whole command, \
+         not the window's width of it), and a word straddling the wrap is \
+         selected whole across both rows — except across a RAGGED wrap, where a \
+         double-width glyph cut the row short and the blank it left still splits \
+         the word. A HARD newline still ends either one.",
     ),
     v(
         "signal",

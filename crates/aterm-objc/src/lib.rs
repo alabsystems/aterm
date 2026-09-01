@@ -67,9 +67,20 @@
 //!   claim, and `bool` as `BOOL` twice); re-reading the rest with the same
 //!   suspicion found three more (what [`msg`]'s `size_of` assertion actually
 //!   proves, when an ivar slot is guaranteed written, and which receivers a
-//!   trampoline can be handed). All six are corrected IN PLACE, each keeping a
-//!   note of what it used to claim, because a silent correction teaches
-//!   nothing.
+//!   trampoline can be handed); a THIRD pass found four more, all of them about
+//!   the word "aligned" or the word "always" — [`IvarSlot`]'s three alignment
+//!   preconditions, which the SAFE `ivars()` accessor could not establish, and
+//!   the claim that "in this crate a MUTABLE raw void pointer in a method
+//!   position always means `id`", which the KVO `context:` argument refutes at
+//!   every live site. All ten are corrected IN PLACE, each keeping a note of
+//!   what it used to claim, because a silent correction teaches nothing.
+//! * A GUARD ARMED AT THE WRONG SPELLING IS NOT A GUARD. Two of the second
+//!   pass's fixes were green for a whole pass against shapes that occur nowhere
+//!   in the code being ported: `Sel`'s newtype was armed with `*const c_void`
+//!   where the SDK, `objc2-foundation` and vendored winit all write
+//!   `*mut c_void`, and `HAS_UNALIGNED_FIELDS` was armed with a packed struct
+//!   where the rule it states also has to answer for a WRAPPER around one. Both
+//!   armings were moved to the live spelling.
 //!
 //! # Where this improves on `metal/ffi.rs`, and why
 //!
@@ -104,6 +115,16 @@
 //!   site is asked to remember the rule. See [`returns_indirectly`].
 //! * **`BOOL` is a type, not `bool`** — see [`Bool`], and the measurement in
 //!   [`encode`].
+//! * **Every pointer-shaped runtime type is its OWN type, so it can carry its
+//!   own encoding.** `Id`, `ClassPtr`, `ProtocolPtr` and `Sel` were all aliases
+//!   of `*mut c_void` / `*const c_void`, so two `Encode` impls had to serve four
+//!   meanings and each impl picked one. `Sel` was newtyped first, which fixed
+//!   `const void *`; the `*mut` side stayed broken and mapped an opaque `void *`
+//!   — KVO's `context:`, spelled `*mut c_void` in the SDK, in
+//!   `objc2-foundation`'s binding and in vendored winit — to `"@"`, an OBJECT.
+//!   `Class` had the same problem in the other direction: `@encode(Class)` is
+//!   `"#"`. All four are `#[repr(transparent)]` newtypes now and each carries
+//!   the letter clang emits, measured on this box.
 //! * **An autorelease pool is a SCOPE** — see [`autoreleasepool`]. The RAII
 //!   token form let safe code pop out of order, which is a use-after-free.
 //!
@@ -132,18 +153,39 @@
 //!   unexercised. UNCLOSED. Closing it means deciding what aterm's own
 //!   main-thread proof is, which is the same open question the ported site
 //!   names as W2's.
-//! * **`S4` — block captures cannot out-align `malloc`. CLOSED, by refusal.**
-//!   `_Block_copy` allocates with `malloc`, which guarantees 16-byte alignment;
-//!   a closure needing more would land misaligned in the heap block. There is
-//!   no ABI knob to ask for more, so each [`RcBlock`] constructor carries a
-//!   `const` assertion that rejects such a closure at compile time rather than
-//!   producing a misaligned one at run time.
+//! * **`S4` — nothing `malloc` allocates can out-align 16 bytes. CLOSED, by
+//!   refusal, on BOTH of its paths.** `_Block_copy` allocates with `malloc`,
+//!   which guarantees 16-byte alignment; a closure needing more would land
+//!   misaligned in the heap block. There is no ABI knob to ask for more, so
+//!   each [`RcBlock`] constructor carries a `const` assertion that rejects such
+//!   a closure at compile time rather than producing a misaligned one at run
+//!   time.
+//!
+//!   That was recorded as CLOSED while its exact twin stood open one module
+//!   over. `class_createInstance` — what `+alloc` calls — uses the same
+//!   allocator, `class_addIvar` can align the ivar's OFFSET but not the
+//!   instance BASE, and so a `type Ivars = T` with `align_of::<T>() > 16` lands
+//!   misaligned in some fraction of instances: MEASURED through `ivar_getOffset`
+//!   on raw `+alloc` addresses, 9/4096 at `align(64)` and 19/4096 at
+//!   `align(32)`, with 0/4096 at 16. It was reachable with NOT ONE `unsafe`
+//!   token at the call site (`declare_class!{ type Ivars = Align64 }` then
+//!   `X::alloc_init(v)`), aborted in debug at `IvarSlot::init`'s `ptr::write`
+//!   alignment precondition and again on the `dealloc` path, and in release
+//!   compiles the check out and lets LLVM propagate the alignment it was
+//!   promised. [`ClassBuilder::add_rust_ivar`] and [`declare_class!`] now carry
+//!   the same `const` assertion the block constructors do — which is also what
+//!   makes [`IvarSlot`]'s three "aligned" preconditions dischargeable, since
+//!   its `get` is reached from the SAFE `ivars()` accessor.
 //! * **`x86_64` is proved by CODEGEN, not by execution.** Every claim this
 //!   crate makes about `x86_64-apple-darwin` — `@encode(BOOL) == "c"`, the
-//!   `objc_msgSend_stret` threshold at 16 bytes — was measured by compiling the
-//!   equivalent Objective-C with `clang -arch x86_64 -S` and reading the
-//!   emitted assembly, because the development box cannot execute that slice.
-//!   The aarch64 half of each pair IS execution-proved, by the tests here.
+//!   `objc_msgSend_stret` threshold at 16 bytes, and the SECOND `_stret` rule
+//!   that has no threshold at all (a struct with a misaligned field goes
+//!   indirect at any size, measured down to three bytes) — was measured by
+//!   compiling the equivalent Objective-C with `clang -arch x86_64 -S` and
+//!   reading which symbol the call lands on, because the development box cannot
+//!   execute that slice. The Rust side's `x86_64` arms are type-checked by a
+//!   cross `cargo check --target x86_64-apple-darwin`, never run. The aarch64
+//!   half of each pair IS execution-proved, by the tests here.
 
 #![cfg(target_os = "macos")]
 
@@ -160,7 +202,7 @@ pub use declare::{
     ClassBuilder, ClassMeta, IVAR_NAME, IvarSlot, abort_on_unwind, begin, send_super_dealloc,
     super_of,
 };
-pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode};
+pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode, NSRange};
 pub use retained::{ClassType, Retained};
 pub use runtime::{
     AutoreleasePool, ClassPtr, Id, IvarPtr, MsgFn, Obj, ObjcSuper, ProtocolPtr, Sel, autorelease,

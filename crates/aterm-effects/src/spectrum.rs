@@ -1235,105 +1235,13 @@ pub fn spectrum_clear_of_cyan(t: f32) -> u32 {
 /// quantized result so the guarantee applies to the emitted RGB value.
 #[must_use]
 pub fn clear_thing_of_cyan(rgb: u32) -> u32 {
-    // **UN-RETIRED 2026-08-29, AND ONLY FOR THE MARK IT WAS ALWAYS ABOUT.**
-    //
-    // The ROYGBIV merge made this the identity on a measurement it took of the
-    // WRONG SUBJECT: "it moved 8.9 % of the thing arc, worst sample `#00817E ->
-    // #658180`, chroma `130 -> 28`". That number is what this law does when it is
-    // pointed at `spectrum` — and nothing shipping points it at `spectrum`. Its
-    // one production call site is the caret's emitted BLOCK FILL
-    // (`cursor_rainbow`), which is not the arc: it is `mix_rgb(cursor_colour,
-    // arc, mix)`, a straight per-channel line between a colour the arc did not
-    // choose and one it did. Restoring it here costs the ribbon's arc EXACTLY
-    // NOTHING — `spectrum_clear_of_cyan` stays the identity, so the thing-arc
-    // keeps every level of the chroma the seven anchors bought.
-    //
-    // What the retirement cost, measured on glass at `c63e9558` (24-frame typing
-    // capture, shipped default `rainbow kitty`, dark): a SOLID 15 x 28 device-pixel
-    // block — one whole cell of caret — reading `#5CA5C0`, HSV hue `196.4°`,
-    // `S 0.52`, `V 192`. That is this function's own docstring's `#17A9E7`
-    // defect, back verbatim, and it was the brightest cyan in the capture.
-    let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
-    let (r, g, b) = (chan(16), chan(8), chan(0));
-    let hi = r.max(g).max(b);
-    let lo = r.min(g).min(b);
-    let d = hi - lo;
-    if d <= 0.0 {
-        return rgb;
-    }
-    let hue = if hi == r {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
-    } else if hi == g {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    let lo_deg = SPECTRUM_CYAN_LO as f32;
-    let hi_deg = SPECTRUM_CYAN_HI as f32;
-    // Three factors, all `smoothstep01f`, all COMPLETE at the bound they guard:
-    // full chroma at the floor, fully shut at the window's own edges. Anything
-    // the ruling can flag therefore meets the ceiling, and nothing steps.
-    let inside = smoothstep01f(d / SPECTRUM_THING_CHROMA_FLOOR)
-        * smoothstep01f((hue - (lo_deg - SPECTRUM_THING_SOFT_LO)) / SPECTRUM_THING_SOFT_LO)
-        * smoothstep01f(((hi_deg + SPECTRUM_THING_SOFT_HI) - hue) / SPECTRUM_THING_SOFT_HI);
-    let sat = d / hi;
-    let ceil = SPECTRUM_CYAN_SAT_CEIL as f32;
-    let envelope = ceil + (1.0 - ceil) * (1.0 - inside);
-    if inside <= 0.0 || sat <= envelope {
-        return rgb;
-    }
-    // Toward the GREY OF THE SAME VALUE, because the caret is a FILL and not
-    // light: every channel keeps its distance from `hi` in proportion, so the
-    // block's hue and its value are bit-exact and only its chroma moves. The
-    // light-side law below cannot use this move for exactly that reason — see
-    // [`clear_light_of_cyan`].
-    let grey = ((hi as u32) << 16) | ((hi as u32) << 8) | hi as u32;
-    settle_on_the_byte(lerp_rgb(grey, rgb, envelope / sat), grey)
-}
-
-/// **THE GUARANTEE IS ON THE BYTE, AND THE BYTE IS ROUNDED** — the last step of
-/// [`clear_thing_of_cyan`].
-///
-/// The projection is exact in `f32`; the `u8` triple it comes back as has each
-/// channel within half a level, which rotates the MEASURED hue by up to
-/// `60 / spread` degrees — around two, at [`SPECTRUM_THING_CHROMA_FLOOR`]. Just
-/// outside the window the envelope is necessarily ABOVE §2.3.4's `S > 0.3` floor
-/// (it has to climb back to `1` within a few degrees or there is no shoulder at
-/// all), so a colour the law measured at `201.2°` and treated as legal can be
-/// EMITTED reading `200.00°` at `S = 0.303`.
-///
-/// Iterating the projection does not close it — the same hazard simply reappears
-/// at the new hue, and the two answers oscillate. What closes it is asking the
-/// question the ruling actually asks, of the bytes that are actually leaving: if
-/// this triple READS inside the window over the ceiling, take it to the ceiling.
-/// A colour at the ceiling re-reads at `~0.22`, nowhere near the floor, so there
-/// is no second round.
-#[inline]
-fn settle_on_the_byte(rgb: u32, grey: u32) -> u32 {
-    let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
-    let (r, g, b) = (chan(16), chan(8), chan(0));
-    let hi = r.max(g).max(b);
-    let d = hi - r.min(g).min(b);
-    if d <= 0.0 || hi <= 0.0 {
-        return rgb;
-    }
-    let hue = if hi == r {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
-    } else if hi == g {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    let ceil = SPECTRUM_CYAN_SAT_CEIL as f32;
-    let sat = d / hi;
-    if sat <= ceil
-        || d < SPECTRUM_THING_CHROMA_FLOOR
-        || hue < SPECTRUM_CYAN_LO as f32
-        || hue > SPECTRUM_CYAN_HI as f32
-    {
-        return rgb;
-    }
-    lerp_rgb(grey, rgb, ceil / sat)
+    // RETIRED 2026-09-01 — owner ruling: "you can have cyan so long as it's a
+    // rainbow". A sky rainbow runs green -> blue THROUGH cyan; that crossing is
+    // the colour, not a defect. Every law in this family bought a zero cyan
+    // census by spending the arc's chroma, and the fold it spent was
+    // luminance-preserving — so what it actually emitted was a bright GREY.
+    // Identity, kept as a named seam so the call sites read honestly.
+    rgb
 }
 
 /// [`smoothstep01`]'s `f32` twin, for the two laws that run per frame rather than
@@ -1499,46 +1407,14 @@ pub fn compose_halo_on_glass(ground: u32, colour: u32, weight: u8, over: bool) -
 /// `halos` and which no quad law can reach.
 #[must_use]
 pub fn clear_halo_of_cyan(colour: u32, over: bool, ground: u32) -> u32 {
-    // `HaloMode::Over` stores its centre-alpha ceiling in the colour's high
-    // byte.  It is live renderer metadata, not a colour channel: zero means an
-    // uncapped 255, while every other value limits the radial weights that can
-    // reach glass.  Preserve it through the RGB projection and ask the law only
-    // about that renderer-reachable weight domain.  Dropping it would turn a
-    // corrected, legibility-capped veil into an uncapped opaque centre.
-    let over_bits = if over { colour & 0xff00_0000 } else { 0 };
-    let max_weight = if over {
-        aterm_render::halo_over_cap(colour)
-    } else {
-        255
-    };
-    let pale = |keep: f32| pale_at_constant_light(colour, keep) | over_bits;
-    let bad = |c: u32| {
-        (1..=u32::from(max_weight))
-            .any(|w| over_the_glass_ceiling(compose_halo_on_glass(ground, c, w as u8, over)))
-    };
-    // An ACHROMATIC halo cannot make a saturated composite in the window: it
-    // displaces the ground along the achromatic axis, so the composite keeps the
-    // ground's own hue (`222.9°` on the shipped default). The crown, the vapor
-    // and the fresh-ink pops are all theme-fg white, so this is the branch almost
-    // every halo takes.
-    let chroma = {
-        let (r, g, b) = ((colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff);
-        r.max(g).max(b) - r.min(g).min(b)
-    };
-    if chroma == 0 || !bad(colour) {
-        return colour;
-    }
-    let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    for _ in 0..10 {
-        let mid = 0.5 * (lo + hi);
-        if bad(pale(mid)) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    let kept = pale(lo);
-    if bad(kept) { pale(0.0) } else { kept }
+    // RETIRED 2026-09-01 — owner ruling: "you can have cyan so long as it's a
+    // rainbow". A sky rainbow runs green -> blue THROUGH cyan; that crossing is
+    // the colour, not a defect. Every law in this family bought a zero cyan
+    // census by spending the arc's chroma, and the fold it spent was
+    // luminance-preserving — so what it actually emitted was a bright GREY.
+    // Identity, kept as a named seam so the call sites read honestly.
+    let _ = (over, ground);
+    colour
 }
 
 /// **THE LIGHT-LAW** — §2.3's ruling, asked of the PIXEL and answered at emit
@@ -1584,24 +1460,14 @@ pub fn clear_halo_of_cyan(colour: u32, over: bool, ground: u32) -> u32 {
 /// monotone in `keep`.
 #[must_use]
 pub fn clear_light_of_cyan(premul: u32, alpha: u8, ground: u32) -> u32 {
-    if !the_stack_is_over_the_ceiling(premul, alpha, ground) {
-        return premul;
-    }
-    let (mut lo, mut hi) = (0.0f32, 1.0f32);
-    for _ in 0..12 {
-        let mid = 0.5 * (lo + hi);
-        if the_stack_is_over_the_ceiling(pale_at_constant_light(premul, mid), alpha, ground) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    let kept = pale_at_constant_light(premul, lo);
-    if the_stack_is_over_the_ceiling(kept, alpha, ground) {
-        pale_at_constant_light(premul, 0.0)
-    } else {
-        kept
-    }
+    // RETIRED 2026-09-01 — owner ruling: "you can have cyan so long as it's a
+    // rainbow". A sky rainbow runs green -> blue THROUGH cyan; that crossing is
+    // the colour, not a defect. Every law in this family bought a zero cyan
+    // census by spending the arc's chroma, and the fold it spent was
+    // luminance-preserving — so what it actually emitted was a bright GREY.
+    // Identity, kept as a named seam so the call sites read honestly.
+    let _ = (alpha, ground);
+    premul
 }
 
 /// **THE PREDICATE, FOR A CALLER THAT COMPOSITES ITS OWN PIXELS** — is this
@@ -1633,59 +1499,6 @@ pub fn light_is_over_the_glass_ceiling(px: u32) -> bool {
 #[must_use]
 pub fn pale_light_at_constant_light(rgb: u32, keep: f32) -> u32 {
     pale_at_constant_light(rgb, keep)
-}
-
-/// How deep a stack of ONE quad's own light [`clear_light_of_cyan`] answers for.
-///
-/// **THE PIXEL IS NOT ONE QUAD, AND THAT IS WRITTEN DOWN IN THIS TREE ALREADY.**
-/// `bed_coverage_for`'s own note: *"That bounds ONE quad. It says nothing about
-/// the pixel where several land"*, measured at `231` and `238` levels of light
-/// over the ground where the brightest SINGLE bed quad composited to `131`. And
-/// the retired `RAINBOW_STREAK_SAT_PAIR` was named for exactly this: *"the
-/// saturation at which TWO overlapping dim layers of one colour compose into the
-/// cyan window"*. A law that asked only about one layer scored zero on the arc
-/// and left **27,879** cyan composites in `the_jump_streak_is_never_cyan_on_glass`
-/// — which is that gate refuting this law's first draft, which is what a gate is
-/// for.
-///
-/// `add_sat(ground, n·C)` walks a RAY from the ground in the direction of `C`,
-/// and the hue along that ray moves — a dim green that composites to `140°`
-/// alone reads `168°` doubled. Six layers is past where the ray has converged on
-/// `C`'s own hue for any colour bright enough to matter, and past the depth the
-/// budget's own ceilings allow.
-const SPECTRUM_GLASS_STACK: u32 = 6;
-
-/// Is any depth of a stack of this one quad over the ceiling?
-///
-/// Exact for `n` identical layers in BOTH modes, because it composites them
-/// rather than modelling them: additive light sums along the ray, and repeated
-/// source-over converges on the colour with residual ground `(1 - a)^n`.
-///
-/// # What is NOT asked, measured both ways (2026-08-29)
-///
-/// The rasterizer also draws FRACTIONS of a quad's coverage — edge
-/// antialiasing, and the compositor's own mixing — and desaturating toward the
-/// blue-black ground can walk a legal green edge pixel into the window. A
-/// fractional clause (eight sub-coverages of one layer) was tried here and
-/// REFUTED ON GLASS both ways at once: it widened the crossing's non-counting
-/// gap from a median of 8 device pixels to 22 (the bisection spends the quad's
-/// CORE chroma to fix its edge, which is the grey hole one layer down), and
-/// the capture still carried in-window pixels in 24 frames (peak `S 0.67`,
-/// at bytes no single-quad model produces — the leak it chased lives in the
-/// compositor's mixing of DIFFERENT marks' light, which no per-quad predicate
-/// can see). The residual edge leak is bounded at the SOURCE instead: the arc
-/// spends as few bright entries as the aliasing budget allows inside the
-/// drift-prone hue strip below the window (see `SPECTRUM_ROOF_PACE`).
-#[inline]
-fn the_stack_is_over_the_ceiling(premul: u32, alpha: u8, ground: u32) -> bool {
-    let mut px = ground;
-    for _ in 0..SPECTRUM_GLASS_STACK {
-        px = compose_on_glass(px, premul, alpha);
-        if over_the_glass_ceiling(px) {
-            return true;
-        }
-    }
-    false
 }
 
 /// **THE CARET'S STEEPEST BYTE RATE FROM A GIVEN BASE** — the composed counterpart
@@ -2103,64 +1916,6 @@ mod tests {
         );
     }
 
-    /// **THE CYAN BOUND, IN THE DESIGN'S OWN WINDOW** (§2.3.4): at most
-    /// [`SPECTRUM_CYAN_DWELL_MAX`] of `t` may resolve to a colour whose **HSV**
-    /// hue lies in `[165°, 200°]` at `S > 0.3`.
-    ///
-    /// **THE WINDOW IS THE LAW AND IT DOES NOT MOVE.** The arc this replaced
-    /// passed a test that had re-scoped the measurement to OkLCh `194.77° ± 10°`
-    /// — a different space at half the width — while sitting **15.59 %** inside
-    /// the window the design actually states, with a dead-centre `#008E8E` (HSV
-    /// `180.00°`, `S = 1.00`) in its committed table. So this measures HSV, over
-    /// the stated `[165, 200]`, at the stated saturation floor, on the
-    /// INTERPOLATED colours [`spectrum`] actually returns.
-    ///
-    /// The bound is on dwell, not presence: the continuous green-to-blue leg
-    /// cannot skip the window (§2.3), and this test measures the actual arc.
-    #[test]
-    fn spectrum_never_rests_on_cyan() {
-        let mut inside = 0usize;
-        let mut worst: Option<(f64, u32, f64, f64)> = None;
-        for i in 0..=WALK {
-            let t = i as f64 / WALK as f64;
-            let rgb = spectrum(t as f32);
-            let (hue, sat, _) = spectrum_hsv(rgb);
-            if (SPECTRUM_CYAN_LO..=SPECTRUM_CYAN_HI).contains(&hue) && sat > SPECTRUM_CYAN_SAT_MIN {
-                inside += 1;
-                if worst.is_none_or(|(_, _, h, _)| (hue - 180.0).abs() < (h - 180.0).abs()) {
-                    worst = Some((t, rgb, hue, sat));
-                }
-            }
-        }
-        let dwell = inside as f64 / (WALK + 1) as f64;
-        assert!(
-            dwell <= SPECTRUM_CYAN_DWELL_MAX,
-            "the arc dwells {:.3} % inside HSV [{SPECTRUM_CYAN_LO}, {SPECTRUM_CYAN_HI}] at \
-             S > {SPECTRUM_CYAN_SAT_MIN} (bound {:.1} %); nearest-to-cyan sample {worst:?}",
-            dwell * 100.0,
-            SPECTRUM_CYAN_DWELL_MAX * 100.0
-        );
-        // The crossing assertion keeps the dwell bound non-vacuous: a curve
-        // that skipped the window entirely would have a reversal or gap.
-        let crosses = (0..=WALK).any(|i| {
-            let hue = spectrum_hsv(spectrum(i as f32 / WALK as f32)).0;
-            (SPECTRUM_CYAN_LO..=SPECTRUM_CYAN_HI).contains(&hue)
-        });
-        assert!(crosses, "a monotone red->violet arc must cross cyan");
-        // AND NO NAMED STOP IS CYAN — the ruling's other half (§2.3.2). A band
-        // may pass through the window; a THING that snaps to a name may not land
-        // in it.
-        for i in 0..SPECTRUM_STOPS {
-            let (hue, sat, _) = spectrum_hsv(spectrum_stop(i));
-            assert!(
-                !((SPECTRUM_CYAN_LO..=SPECTRUM_CYAN_HI).contains(&hue)
-                    && sat > SPECTRUM_CYAN_SAT_MIN),
-                "stop {i} (#{:06X}) is cyan: hue {hue:.2}°, S {sat:.2}",
-                spectrum_stop(i)
-            );
-        }
-    }
-
     /// The arc may follow the seven anchors' deliberately broad luminance span,
     /// but it must not introduce a deep interior dip between adjacent stops.
     #[test]
@@ -2477,49 +2232,6 @@ mod tests {
         assert!(spectrum_max_byte_rate() > 0.0);
     }
 
-    /// The two grounds the chroma law is solved against: the SHIPPED default
-    /// (`ColorScheme::default`, `#111318` — hue `222.9°`) and Tokyo Night's
-    /// `#1A1B26`, which the legibility certifiers in `cursor_glow` already model
-    /// with. Both are dark and BLUE-LEANING, which is the whole mechanism: it is
-    /// the ground's own blue lead that turns dim green light teal.
-    const GLASS_GROUNDS: [u32; 2] = [0x0011_1318, 0x001A_1B26];
-
-    /// A pixel dark enough to be the ground is not a pixel of the mark. `24` is
-    /// the shipped ground's own V, so this is exactly "brighter than the page".
-    const GLASS_LIT_MIN: u32 = 24;
-
-    #[test]
-    fn over_halo_cyan_correction_preserves_the_renderer_alpha_cap() {
-        let ground = 0x00FD_F6E3;
-        for colour in [0x8000_8080u32, 0xBE00_8080] {
-            let cap = aterm_render::halo_over_cap(colour);
-            let bad_at = |c: u32, weight: u8| {
-                over_the_glass_ceiling(compose_halo_on_glass(ground, c, weight, true))
-            };
-            assert!(
-                (1..=cap).any(|weight| bad_at(colour, weight)),
-                "#{colour:08X} must exercise the cyan correction"
-            );
-
-            let ruled = clear_halo_of_cyan(colour, true, ground);
-            assert_ne!(
-                ruled & 0x00ff_ffff,
-                colour & 0x00ff_ffff,
-                "the witness did not reach the projection"
-            );
-            assert_eq!(
-                ruled & 0xff00_0000,
-                colour & 0xff00_0000,
-                "the RGB projection changed the live Over-halo alpha cap"
-            );
-            assert_eq!(aterm_render::halo_over_cap(ruled), cap);
-            assert!(
-                (1..=cap).all(|weight| !bad_at(ruled, weight)),
-                "#{ruled:08X} remains cyan at a renderer-reachable weight"
-            );
-        }
-    }
-
     #[test]
     fn over_halo_cyan_correction_ignores_unreachable_weights() {
         let ground = 0x00FD_F6E3;
@@ -2543,186 +2255,4 @@ mod tests {
         );
     }
 
-    /// **THE GATE THAT WAS GREEN WHILE THE GLASS WAS NOT — TWICE.**
-    ///
-    /// # The first blindness (recorded by the merge, and real)
-    ///
-    /// `spectrum_never_rests_on_cyan` reads the RAW arc, and the raw arc is not
-    /// what anyone looks at. A shipped build measured **`3.51 %`** there while
-    /// captured frames of the same build read **`6.31 %`** of their lit pixels
-    /// inside the very same window.
-    ///
-    /// # The second blindness (2026-08-29), which this gate carried itself
-    ///
-    /// It composited with `add_sat(ground, premul(colour, cov))` — ADDITIVE — and
-    /// **the rainbow bed does not composite additively.** `emit_rainbow_ribbon`
-    /// passes `GlowBlend::Over`, so every bed quad carries its coverage in
-    /// `GlowQuad::alpha` and the renderer runs `over_premul`. A gate that models a
-    /// blend the emitter does not perform is measuring a different picture, and
-    /// this one measured `0` cyan for an additive-derived `SPECTRUM_SAT_ENV` that
-    /// still leaves `52` source-over composites in the window at `V` up to `152`.
-    ///
-    /// And its bound had been moved from ZERO to a `4 %` SHARE, over a grid whose
-    /// denominator is five-sixths red/orange/yellow/indigo/violet — hues at which
-    /// cyan is arithmetically impossible. `2.489 %` under a `4 %` bar is a gate
-    /// that PERMITS the defect it is named for. On glass at `c63e9558`, with this
-    /// gate green, a 231-frame capture of the shipped default carried **70,317**
-    /// cyan pixels, peaked at **4.242 %** of one frame's lit pixels, and put a
-    /// solid one-cell block of `V 192` teal under the hand.
-    ///
-    /// # What it walks now
-    ///
-    /// The pair the rasterizer is handed — `(premul_rgb(colour, cov), alpha)` —
-    /// through [`compose_on_glass`], in BOTH modes the family emits (`alpha == 0`
-    /// additive for the ZOOM streak, `alpha == cov` source-over for the bed), over
-    /// both shipped grounds, and through [`clear_light_of_cyan`] exactly as
-    /// `spend_rainbow_budget` runs it. The bound is **ZERO** again: the composite
-    /// is the pixel, and the ruling is about the pixel.
-    ///
-    /// It keeps BOTH anti-vacuity clauses and adds a third:
-    ///
-    /// * the **arc** may not go grey to dodge the window (`min_chroma >= 24` over
-    ///   `spectrum` itself — and the arc is untouched, so this reads `130`);
-    /// * the **unruled** walk must be richly cyan, or the law is being proved
-    ///   against a picture that never had the defect;
-    /// * the **crossing on glass** must keep chroma. This is the clause that
-    ///   would have caught the retired `SPECTRUM_SAT_ENV`: a law that bought zero
-    ///   by paling the whole green→blue leg leaves the BRIGHT composites of that
-    ///   leg grey, and this measures exactly them.
-    #[test]
-    fn the_band_is_never_cyan_on_glass() {
-        let chroma = |c: u32| {
-            let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
-            r.max(g).max(b) - r.min(g).min(b)
-        };
-        let is_cyan = |px: u32| {
-            let (hue, sat, val) = spectrum_hsv(px);
-            (val * 255.0) as u32 > GLASS_LIT_MIN
-                && (SPECTRUM_CYAN_LO..=SPECTRUM_CYAN_HI).contains(&hue)
-                && sat > SPECTRUM_CYAN_SAT_MIN
-        };
-        let mut lit_seen = 0usize;
-        let mut ruled = 0usize;
-        let mut unruled = 0usize;
-        // The first composite that broke the ruling, rendered where it is found:
-        // a tuple wide enough to name every term of the failure is a puzzle in the
-        // message, and a struct for it is fields nothing reads.
-        let mut worst: Option<String> = None;
-        // The chroma of the composites bright enough to READ as colour, over the
-        // green→blue leg — the currency the last reversal was decided in.
-        let mut leg_chroma_sum = 0u64;
-        let mut leg_chroma_n = 0u64;
-        let mut leg_chroma_worst = u32::MAX;
-        for i in 0..=4096u32 {
-            let t = i as f32 / 4096.0;
-            let colour = spectrum(t);
-            let on_the_leg = (0.5..=0.667).contains(&t);
-            for ground in GLASS_GROUNDS {
-                for cov in 1..=171u32 {
-                    let premul = aterm_render::premul_rgb(colour, cov as u8);
-                    // BOTH modes the family emits, not the one this gate used to
-                    // assume: `alpha == 0` is the additive ZOOM streak, `alpha ==
-                    // cov` is the source-over bed (`GlowBlend::Over`).
-                    for alpha in [0u8, cov as u8] {
-                        let raw = compose_on_glass(ground, premul, alpha);
-                        if (spectrum_hsv(raw).2 * 255.0) as u32 <= GLASS_LIT_MIN {
-                            continue;
-                        }
-                        lit_seen += 1;
-                        if is_cyan(raw) {
-                            unruled += 1;
-                        }
-                        let kept = clear_light_of_cyan(premul, alpha, ground);
-                        let px = compose_on_glass(ground, kept, alpha);
-                        if is_cyan(px) {
-                            ruled += 1;
-                            if worst.is_none() {
-                                let (hue, sat, val) = spectrum_hsv(px);
-                                worst = Some(format!(
-                                    "t={t:.5} arc=#{colour:06X} cov={cov} \
-                                     alpha={alpha} px=#{px:06X} hue={hue:.1} \
-                                     S={sat:.2} V={:.0}",
-                                    val * 255.0
-                                ));
-                            }
-                        }
-                        if on_the_leg && (spectrum_hsv(px).2 * 255.0) as u32 > 96 {
-                            let c = chroma(px);
-                            leg_chroma_sum += u64::from(c);
-                            leg_chroma_n += 1;
-                            leg_chroma_worst = leg_chroma_worst.min(c);
-                        }
-                    }
-                }
-            }
-        }
-        // The census prints its exact numbers, so a regression is a NUMBER rather
-        // than an opinion.
-        println!(
-            "BAND-CYAN-CENSUS lit={lit_seen} unruled={unruled} ({:.3}%) ruled={ruled} \
-             first={worst:?} leg_bright_chroma mean={:.0} worst={leg_chroma_worst}",
-            unruled as f64 * 100.0 / lit_seen as f64,
-            leg_chroma_sum as f64 / leg_chroma_n.max(1) as f64,
-        );
-        // NON-VACUOUS: the walk lit something. A grid that produced no lit pixel
-        // at all would pass this trivially.
-        assert!(lit_seen > 100_000, "only {lit_seen} lit composites walked");
-
-        // NON-VACUOUS THE SECOND WAY, and this is the clause the merge's version
-        // did not have: the picture the law is applied to must CONTAIN the defect.
-        // Canonical ROYGBIV runs a straight line from `#00FF00` to `#0000FF`
-        // through `#007D82`, so an unruled walk is thick with cyan; a future arc
-        // that stopped being so would make the clause below vacuous, and this says
-        // so out loud instead.
-        assert!(
-            unruled > lit_seen / 100,
-            "the unruled walk put only {unruled} of {lit_seen} composites in the \
-             window — this gate is no longer measuring the defect it exists for"
-        );
-
-        // **THE BOUND IS ZERO.** Not a dwell, not a share. `clear_light_of_cyan`
-        // is asked of every pair the rasterizer will be handed, so there is no
-        // pair left for which the ruling can be broken.
-        assert_eq!(
-            ruled, 0,
-            "cyan is not a rainbow colour: {ruled} of {lit_seen} lit composites \
-             landed in hue [{SPECTRUM_CYAN_LO}, {SPECTRUM_CYAN_HI}] at \
-             S > {SPECTRUM_CYAN_SAT_MIN} AFTER the light-law; first {worst:?}"
-        );
-
-        // **AND THE ZERO MAY NOT BE BOUGHT WITH THE ARC'S CHROMA.** Two clauses,
-        // because there are two ways to buy it.
-        //
-        // (1) At the SOURCE — the retired six-anchor arc scored zero here by
-        // collapsing chroma across the green→blue interval until the composite had
-        // no hue to be judged on: a grey hole a seventh of the arc wide, which is
-        // the defect the owner rejected. `clear_light_of_cyan` never touches the
-        // arc, so this reads the seven anchors' own `130`.
-        let min_chroma = (0..=4096u32)
-            .map(|i| chroma(spectrum(i as f32 / 4096.0)))
-            .min()
-            .unwrap();
-        assert!(
-            min_chroma >= 100,
-            "the crossing went grey to dodge the window: min chroma on the arc \
-             is {min_chroma}"
-        );
-
-        // (2) ON GLASS — the clause the source-side one cannot make. A pixel law
-        // could leave `SPECTRUM_LUT` bit-identical and still pale every bright
-        // composite of the green→blue leg, which is the same hole one layer down.
-        // Measured with the shipping law: mean 96, worst 35. The retired
-        // `SPECTRUM_SAT_ENV`, which is a SOURCE law, fails this at 34/34 — it has
-        // no bright composite left to measure.
-        assert!(
-            leg_chroma_n > 1_000,
-            "only {leg_chroma_n} bright composites on the green->blue leg"
-        );
-        let leg_mean = leg_chroma_sum as f64 / leg_chroma_n as f64;
-        assert!(
-            leg_mean >= 80.0,
-            "the light-law paled the whole crossing rather than the pixels that \
-             needed it: mean chroma of the leg's bright composites is {leg_mean:.0}"
-        );
-    }
 }

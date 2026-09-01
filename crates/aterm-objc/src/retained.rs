@@ -77,7 +77,7 @@ impl<T: ClassType> Retained<T> {
     #[inline]
     #[must_use]
     pub fn as_id(&self) -> Id {
-        self.ptr.as_ptr().cast()
+        Id::from_ptr(self.ptr.as_ptr().cast())
     }
 
     /// A second +1 handle to the SAME object.

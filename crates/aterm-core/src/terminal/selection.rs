@@ -37,6 +37,20 @@ const MAX_SELECTION_ROWS: usize = 1_000_000;
 /// clips a realistic copy while capping the pathological one.
 const MAX_SELECTION_BYTES: usize = 64 * 1024 * 1024;
 
+/// Absolute cap, in EACH direction, on how many physical rows
+/// [`Terminal::logical_line_span`] will walk to join one soft-wrapped LOGICAL
+/// line.
+///
+/// The walk reads one wrap bit per row, and a history row's bit can cost a tier
+/// fetch (a `Line` construction or a decompressed-block clone), all under the
+/// terminal mutex the render path contends for. Scrollback retention is
+/// UNLIMITED by configuration, so a session holding one enormous pasted line
+/// would otherwise let a single double/triple-click do O(scrollback) work.
+/// 4096 rows is `MAX_GRID_COLS` worth of rows — ~320 KiB of text at 80 columns,
+/// far past any line a human selects — so it never clips a real logical line
+/// while bounding the pathological one.
+const MAX_LOGICAL_LINE_ROWS: usize = 4096;
+
 /// Per-line byte ceiling for scrollback text extraction in [`Terminal::get_line_text`].
 ///
 /// A scrollback [`Line`](aterm_scrollback::Line)'s byte length is UNBOUNDED: a
@@ -191,8 +205,6 @@ struct SelectionGeometry {
     adj_start_col: u16,
     /// Side-adjusted end column, inclusive.
     adj_end_col: u16,
-    /// `grid.rows()` widened to the row coordinate type.
-    visible_rows: i32,
     /// `grid.cols()`; the caller has already rejected a zero-column grid.
     cols: u16,
 }
@@ -295,7 +307,6 @@ impl Terminal {
             adj_end_row,
             adj_start_col,
             adj_end_col,
-            visible_rows,
             cols,
         };
 
@@ -401,7 +412,6 @@ impl Terminal {
             adj_end_row,
             adj_start_col,
             adj_end_col,
-            visible_rows,
             cols,
         } = geom;
         let mut rows_emitted = 0usize;
@@ -441,24 +451,11 @@ impl Terminal {
                 // Only insert newline if this row is NOT a soft-wrap continuation.
                 // Row::is_wrapped() / Line::is_wrapped() means "this row continues
                 // the previous row's content" (soft wrap, not a hard line break).
-                #[allow(
-                    clippy::redundant_closure_for_method_calls,
-                    reason = "private row/line types prevent method-reference shorthand"
-                )]
-                let is_continuation = if row >= 0 && row < visible_rows {
-                    // LIVE-frame read: selection rows are terminal-relative
-                    // (see get_line_text), so the display-mapped Grid::row
-                    // would test the wrong row's wrap flag while scrolled.
-                    u16::try_from(row)
-                        .ok()
-                        .and_then(|idx| self.grid.row_at_screen(idx))
-                        .is_some_and(|r| r.is_wrapped())
-                } else if row < 0 {
-                    history_line.as_ref().is_some_and(|l| l.is_wrapped())
-                } else {
-                    false
-                };
-                if !is_continuation {
+                // ONE reading of that bit, shared with the logical-line click
+                // gestures — see `Terminal::continuation_bit`. The already-hoisted
+                // `history_line` is threaded in so this loop keeps its SCR-4
+                // one-fetch-per-history-row property.
+                if !self.continuation_bit(row, history_line.as_deref()) {
                     result.push('\n');
                 }
             }
@@ -495,6 +492,194 @@ impl Terminal {
         }
 
         (rows_emitted, truncated)
+    }
+
+    /// Whether selection-space `row` CONTINUES the previous row's content — a
+    /// SOFT WRAP, not a hard line break.
+    ///
+    /// `Row::is_wrapped()` / `Line::is_wrapped()` both mean exactly that, and
+    /// this is the ONE place the terminal reads them for selection purposes:
+    /// [`Self::push_linear_selection`] (which decides where a copied newline
+    /// goes) and [`Self::logical_line_span`] (which decides how far a
+    /// word/line CLICK reaches) must agree cell for cell, or the highlight and
+    /// the clipboard describe different text.
+    ///
+    /// `history_line` is the caller's ALREADY-RESOLVED line for a negative row,
+    /// threaded in so the copy walk keeps its one-fetch-per-history-row hoist
+    /// (SCR-4); pass `None` and this resolves it itself.
+    ///
+    /// LIVE-frame read: selection rows are terminal-relative (see
+    /// [`Self::get_line_text`]), so the display-mapped `Grid::row` would test
+    /// the wrong row's wrap flag while scrolled.
+    #[allow(
+        clippy::redundant_closure_for_method_calls,
+        reason = "private row/line types prevent method-reference shorthand"
+    )]
+    fn continuation_bit(&self, row: i32, history_line: Option<&aterm_scrollback::Line>) -> bool {
+        let visible_rows = i32::from(self.grid.rows());
+        if row >= 0 && row < visible_rows {
+            u16::try_from(row)
+                .ok()
+                .and_then(|idx| self.grid.row_at_screen(idx))
+                .is_some_and(|r| r.is_wrapped())
+        } else if row < 0 {
+            match history_line {
+                Some(line) => line.is_wrapped(),
+                None => usize::try_from(-(i64::from(row)) - 1)
+                    .ok()
+                    .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
+                    .is_some_and(|l| l.is_wrapped()),
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Whether selection-space `row` continues the previous row (soft wrap).
+    ///
+    /// The self-resolving form of [`Self::continuation_bit`] — see there for
+    /// the coordinate space and why one reading of the bit is load-bearing.
+    #[must_use]
+    pub fn row_continues_previous(&self, row: i32) -> bool {
+        self.continuation_bit(row, None)
+    }
+
+    /// The inclusive physical row span `(first, last)` of the LOGICAL line
+    /// containing selection-space `row` — the maximal run of rows joined by
+    /// SOFT WRAPS.
+    ///
+    /// This is what the word/line CLICK gestures must select. The copy walk
+    /// ([`Self::push_linear_selection`]) already treats a soft-wrapped run as
+    /// ONE line — it emits no newline before a continuation row — so a
+    /// press→drag→release across a wrapped line joins correctly; a triple-click
+    /// bound to the PHYSICAL row instead stops at the window width and SILENTLY
+    /// drops the continuation, which is the shape of a data-loss bug (the
+    /// highlight looks edge-to-edge, the clipboard is short). Every mainstream
+    /// terminal selects the logical line here.
+    ///
+    /// A HARD newline ends the run in both directions, so the span never
+    /// swallows the neighbouring logical line, and an unwrapped row answers
+    /// `(row, row)`. The walk stops at the live screen's bottom row and at the
+    /// scrollback floor (a run whose head has been EVICTED starts at the oldest
+    /// retained row — the same clamp `adjust_for_scroll` applies), and a row
+    /// outside the addressable range answers `(row, row)` unchanged.
+    ///
+    /// Bounded by [`MAX_LOGICAL_LINE_ROWS`] rows in EACH direction: the walk
+    /// reads one wrap bit per row, and a history row's bit can cost a tier
+    /// fetch, so an unlimited-scrollback session full of one enormous pasted
+    /// line must not turn a click into O(scrollback) work under the terminal
+    /// mutex.
+    #[must_use]
+    pub fn logical_line_span(&self, row: i32) -> (i32, i32) {
+        let visible_rows = i32::from(self.grid.rows());
+        let floor = -i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
+        if row < floor || row >= visible_rows {
+            return (row, row);
+        }
+        let cap = i32::try_from(MAX_LOGICAL_LINE_ROWS).unwrap_or(i32::MAX);
+        let up_stop = row.saturating_sub(cap).max(floor);
+        let mut first = row;
+        while first > up_stop && self.row_continues_previous(first) {
+            first -= 1;
+        }
+        let down_stop = row.saturating_add(cap).min(visible_rows - 1);
+        let mut last = row;
+        while last < down_stop && self.row_continues_previous(last + 1) {
+            last += 1;
+        }
+        (first, last)
+    }
+
+    /// The column-aligned text of ONE WINDOW of a logical line: rows `first..=last`,
+    /// which the caller has already clamped to the line's own span.
+    ///
+    /// Same alignment contract as [`Self::logical_line_text`] — every row but the last
+    /// contributes exactly `cols` columns — so the same `g / cols`, `g % cols` arithmetic
+    /// maps a column of the result back to a cell, relative to `first`.
+    ///
+    /// WHY A WINDOW EXISTS. `logical_line_text` joins the WHOLE line, and the word rules
+    /// then scan the whole join. One `cat` of a minified bundle is a single logical line
+    /// of 320 kB across 4000 rows, and a double-click on it cost ~70 ms in the rules scan
+    /// alone — per pointer move, under the terminal mutex the render path contends for,
+    /// i.e. ~7 fps while dragging. A word is delimited by whitespace, so the answer is
+    /// almost always within a row or two of the click; the caller reads a small window
+    /// and only widens it when the match runs to an edge.
+    #[must_use]
+    pub fn line_range_text(&self, first: i32, last: i32) -> Option<String> {
+        let own = self.get_line_text(first, None)?;
+        if first == last {
+            return Some(own);
+        }
+        let cols = usize::from(self.grid.cols());
+        // Measure each PART, never the accumulating buffer: `byte_to_column` is linear in
+        // what it is handed, so measuring the join on every row would make this quadratic
+        // in the window — which on a 4000-row line is seconds, not milliseconds.
+        let rows = usize::try_from(last.saturating_sub(first))
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut text = String::with_capacity(rows.saturating_mul(cols.saturating_add(1)));
+        let mut part = own;
+        for r in first..=last {
+            if r > first {
+                part = self.get_line_text(r, None).unwrap_or_default();
+            }
+            let width = crate::grapheme::byte_to_column(&part, part.len());
+            text.push_str(&part);
+            if r < last {
+                for _ in width..cols {
+                    text.push(' ');
+                }
+            }
+        }
+        Some(text)
+    }
+
+    /// The COLUMN-ALIGNED text of the logical line containing selection-space
+    /// `row`, with the span it was joined from: `(text, first_row, last_row)`.
+    ///
+    /// Every row of the span but the LAST contributes exactly `cols` columns —
+    /// padded with spaces when that row's own extraction trimmed trailing
+    /// blanks — so a column in the joined text maps back to a cell by plain
+    /// arithmetic:
+    ///
+    /// ```text
+    /// row = first_row + g / cols        col = g % cols
+    /// ```
+    ///
+    /// That alignment is the whole point: it lets the double-click run the
+    /// SAME smart-selection rules over the whole logical line (so a word
+    /// straddling the wrap is one word — except across a RAGGED wrap, where the
+    /// padding below stands in for a column a double-width glyph could not use
+    /// and reads as a word break) and hand the boundaries back as cells.
+    /// The padding is a COORDINATE fixup, not content — the copy path
+    /// re-extracts the cells it is given and keeps its own trailing-blank rule.
+    ///
+    /// `None` only when `row` addresses no line at all (the same condition
+    /// [`Self::get_line_text`] returns `None` for).
+    #[must_use]
+    pub fn logical_line_text(&self, row: i32) -> Option<(String, i32, i32)> {
+        let own = self.get_line_text(row, None)?;
+        let (first, last) = self.logical_line_span(row);
+        if first == last {
+            return Some((own, first, last));
+        }
+        let cols = usize::from(self.grid.cols());
+        let mut text = String::new();
+        for r in first..=last {
+            let part = if r == row {
+                own.clone()
+            } else {
+                self.get_line_text(r, None).unwrap_or_default()
+            };
+            let width = crate::grapheme::byte_to_column(&part, part.len());
+            text.push_str(&part);
+            if r < last {
+                for _ in width..cols {
+                    text.push(' ');
+                }
+            }
+        }
+        Some((text, first, last))
     }
 
     /// Get text from a line (visible or scrollback).
@@ -939,6 +1124,121 @@ mod tests {
             term.selection_to_string().as_deref(),
             Some("line28"),
             "a viewport scroll must not change what an existing selection copies"
+        );
+    }
+
+    /// The wrapped-line fixture the click gestures are about: the reported
+    /// docker command, auto-wrapped across two rows of an 80-column screen,
+    /// with an ordinary (hard-newline) line after it.
+    ///
+    /// Row 0 holds the first 80 columns — ending `aterm-build rust`, the exact
+    /// point the truncated clipboard stopped at — row 1 holds the remaining 50
+    /// and carries the `is_wrapped` bit; row 2 is a different LOGICAL line.
+    fn wrapped_docker_fixture() -> (crate::terminal::Terminal, String) {
+        const HEAD: &str =
+            "docker run --rm -v $PWD:/w -w /w --network host --name bld-boxy aterm-build rust";
+        const TAIL: &str = ":1.85 cargo build --release --features gpu,wayland";
+        let cmd = format!("{HEAD}{TAIL}");
+        assert_eq!(
+            HEAD.len(),
+            80,
+            "the head must fill the 80-column row exactly"
+        );
+        let mut term = crate::terminal::Terminal::new(6, 80);
+        term.process(cmd.as_bytes());
+        term.process(b"\r\nAFTER");
+        (term, cmd)
+    }
+
+    /// A soft wrap is ONE logical line and a hard newline ends it.
+    ///
+    /// This is the span the word/line CLICK gestures select. Bound to the
+    /// physical row instead, a triple-click on row 0 stops at column 79 and the
+    /// clipboard silently loses the continuation.
+    #[test]
+    fn logical_line_span_joins_a_soft_wrap_and_stops_at_a_hard_newline() {
+        let (term, _) = wrapped_docker_fixture();
+        assert!(
+            term.row_continues_previous(1),
+            "precondition: row 1 must carry the soft-wrap bit"
+        );
+        assert!(
+            !term.row_continues_previous(2),
+            "precondition: row 2 follows a HARD newline"
+        );
+        assert_eq!(
+            term.logical_line_span(0),
+            (0, 1),
+            "clicking the head of a wrapped line must reach its continuation"
+        );
+        assert_eq!(
+            term.logical_line_span(1),
+            (0, 1),
+            "…and clicking the continuation must reach back to the head"
+        );
+        assert_eq!(
+            term.logical_line_span(2),
+            (2, 2),
+            "a hard newline must bound the span — the wrapped line above must \
+             not be swallowed, nor this line by it"
+        );
+    }
+
+    /// The joined text is COLUMN-ALIGNED: `first_row + g / cols` /
+    /// `g % cols` must land on the cell that actually holds column `g`.
+    ///
+    /// That is the contract the double-click leans on to map word boundaries
+    /// found in the joined text back to cells.
+    #[test]
+    fn logical_line_text_is_column_aligned_across_the_wrap() {
+        let (term, cmd) = wrapped_docker_fixture();
+        let (text, first, last) = term.logical_line_text(0).expect("row 0 has text");
+        assert_eq!((first, last), (0, 1));
+        assert_eq!(text, cmd, "the joined line must be the whole command");
+        // Every column of the joined line must equal the cell it maps back to.
+        // (Blank columns are skipped: a single-cell extraction trims its own
+        // trailing blank, which says nothing about alignment.)
+        for (g, ch) in cmd.char_indices().filter(|&(_, c)| c != ' ') {
+            let row = first + i32::try_from(g / 80).expect("small");
+            let col = u16::try_from(g % 80).expect("small");
+            let cell = term
+                .get_line_text(row, Some((col, col)))
+                .expect("cell text");
+            assert_eq!(
+                cell,
+                ch.to_string(),
+                "column {g} of the joined line must map back to cell ({row}, {col})"
+            );
+        }
+        assert_eq!(
+            term.logical_line_text(2).map(|(t, f, l)| (t, f, l)),
+            Some(("AFTER".to_string(), 2, 2)),
+            "an unwrapped row is its own logical line, text unchanged"
+        );
+    }
+
+    /// A logical line that straddles the scrollback/live boundary joins across
+    /// it: the head is history row -1, the tail is live row 0.
+    #[test]
+    fn logical_line_span_joins_across_the_scrollback_boundary() {
+        let mut term = crate::terminal::Terminal::new(2, 10);
+        // Wraps to two rows, then one more line pushes the head into history.
+        term.process(b"ABCDEFGHIJKL");
+        term.process(b"\r\nsecond\r\nthird");
+        assert_eq!(
+            term.get_line_text(-1, None).as_deref(),
+            Some("KL"),
+            "precondition: the wrapped TAIL is the newest history row"
+        );
+        assert_eq!(
+            term.logical_line_span(-1),
+            (-2, -1),
+            "the span must reach back into scrollback for the wrapped head"
+        );
+        assert_eq!(
+            term.logical_line_text(-1).map(|(t, ..)| t).as_deref(),
+            Some("ABCDEFGHIJKL"),
+            "and join the two history rows into the whole logical line"
         );
     }
 }

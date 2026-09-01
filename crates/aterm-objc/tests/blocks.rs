@@ -92,10 +92,18 @@ fn foundation_invokes_an_arity_two_block() {
     // completion handler has.
     let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
+    // The `stop` out-parameter is `BOOL *`, and it used to be spelled
+    // `*mut bool` here — [`Bool`]'s rule broken through a pointer. On the
+    // x86_64 compat slice Foundation writes a `signed char` into that byte, so
+    // materialising it as a Rust `bool` is undefined behaviour rather than a
+    // wrong answer. The `Encode` bound this pass put on `RcBlock::newN` is what
+    // refuses `*mut bool`; `*mut Bool` is the only spelling that compiles, and
+    // its encoding is `^B` on arm64 and `*` on x86_64 (measured; `BOOL *` IS
+    // `char *` there).
     // SAFETY: the prototype below is exactly what AppKit documents for
     // `enumerateLinesUsingBlock:`.
     let block = unsafe {
-        RcBlock::new2(move |line: Id, _stop: *mut bool| {
+        RcBlock::new2(move |line: Id, _stop: *mut aterm_objc::Bool| {
             // SAFETY (inherited from the enclosing block): Foundation passes a
             // live, autoreleased NSString for the duration of the call; the
             // bytes are copied out before returning.
@@ -208,7 +216,7 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
     // `-class` is a plain accessor.
     unsafe {
         let cls: unsafe extern "C" fn(Id, Sel) -> aterm_objc::ClassPtr = msg();
-        let c = cls(block.as_ptr(), sel!(class));
+        let c = cls(Id::from_ptr(block.as_ptr()), sel!(class));
         assert!(!c.is_null());
         let name = aterm_objc::class_name(c).to_string_lossy().into_owned();
         assert!(
@@ -216,11 +224,20 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
             "heap block reported class {name:?}, expected an NSBlock kind"
         );
         // And it is a kind of the shared NSBlock class Foundation exports.
-        let is_kind: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> bool = msg();
-        assert!(is_kind(
-            block.as_ptr(),
-            sel!(isKindOfClass:),
-            class(c"NSBlock")
-        ));
+        // `-isKindOfClass:` returns `BOOL`, not a Rust `bool`. This line said
+        // `-> bool` until the `Encode` bound on `msg` refused it: on the
+        // x86_64 compat slice `BOOL` is `signed char`, so a receiver that
+        // answered a non-0/1 byte would have been materialised as an invalid
+        // `bool`. D3's rule, now enforced rather than remembered.
+        let is_kind: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
+            msg();
+        assert!(
+            is_kind(
+                Id::from_ptr(block.as_ptr()),
+                sel!(isKindOfClass:),
+                class(c"NSBlock")
+            )
+            .as_bool()
+        );
     }
 }

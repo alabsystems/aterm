@@ -108,8 +108,12 @@
 //!   into scrollback). `select clear` clears the selection.
 //! * `select word <r> <c>` — word-select the cell via the engine's builtin
 //!   smart-selection rules (URLs/paths/words; a whitespace cell selects just
-//!   itself) — the double-click gesture.
-//! * `select line <r>` — select the full line of row `r` (triple-click).
+//!   itself) — the double-click gesture. The rules run over the LOGICAL line,
+//!   so a word straddling a soft wrap is selected whole, across both rows.
+//! * `select line <r>` — select the LOGICAL line at row `r` (triple-click): a
+//!   soft-wrapped line is selected from its first physical row through its
+//!   last, so `copy` gets the whole line and not the window's width of it. A
+//!   hard newline still ends the selection.
 //! * `select block <r1> <c1> <r2> <c2>` — rectangular selection, the two
 //!   cells as inclusive corners (alt-drag).
 //! * `select extend <r> <c>` — extend the existing selection so `(r,c)` is

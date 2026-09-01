@@ -83,8 +83,8 @@ fn from_owned_and_retain_reject_nil() {
     // SAFETY: null is the one value both constructors are documented to accept
     // and to map to `None`.
     unsafe {
-        assert!(Obj::from_owned(std::ptr::null_mut()).is_none());
-        assert!(Obj::retain(std::ptr::null_mut()).is_none());
+        assert!(Obj::from_owned(Id::NIL).is_none());
+        assert!(Obj::retain(Id::NIL).is_none());
     }
 }
 
@@ -130,7 +130,7 @@ fn an_error_description_is_read_out_of_a_real_nserror() {
                 sel!(errorWithDomain:code:userInfo:),
                 domain.id(),
                 42,
-                std::ptr::null_mut(),
+                Id::NIL,
             )
         };
         assert!(!err.is_null());
@@ -143,7 +143,7 @@ fn an_error_description_is_read_out_of_a_real_nserror() {
         );
         // SAFETY: null is the documented nil input.
         assert_eq!(
-            unsafe { aterm_objc::ns_error_string(std::ptr::null_mut()) },
+            unsafe { aterm_objc::ns_error_string(Id::NIL) },
             "(nil NSError)"
         );
     });
@@ -173,7 +173,9 @@ fn a_cache_slot_survives_concurrent_first_use() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         let slot = std::sync::Arc::clone(&slot);
-        handles.push(std::thread::spawn(move || slot.get(c"isEqual:").addr()));
+        handles.push(std::thread::spawn(move || {
+            slot.get(c"isEqual:").as_ptr().addr()
+        }));
     }
     let seen: Vec<usize> = handles
         .into_iter()
@@ -183,7 +185,7 @@ fn a_cache_slot_survives_concurrent_first_use() {
         seen.iter().all(|a| *a == seen[0]),
         "racing fills disagreed: {seen:?}"
     );
-    assert_eq!(seen[0], sel_uncached(c"isEqual:").addr());
+    assert_eq!(seen[0], sel_uncached(c"isEqual:").as_ptr().addr());
 }
 
 /// The measurement behind [`aterm_objc::sel!`]: the cached send path must not be
@@ -326,9 +328,9 @@ fn utf8_string_of_a_nil_receiver_is_empty() {
     // SAFETY: sending to nil is defined by the runtime and returns 0/null.
     let p: *const c_char = unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
-        f(std::ptr::null_mut(), sel!(UTF8String))
+        f(Id::NIL, sel!(UTF8String))
     };
     assert!(p.is_null());
     // SAFETY: null is the documented `None` input.
-    assert_eq!(unsafe { ns_string_to_rust(std::ptr::null_mut()) }, "");
+    assert_eq!(unsafe { ns_string_to_rust(Id::NIL) }, "");
 }

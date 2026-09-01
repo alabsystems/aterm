@@ -7,10 +7,12 @@
 //! `aterm-gui`'s `control_selection.rs` (behavior-preserving) and re-typed
 //! against [`SessionHost`], so the wire bytes are unchanged.
 //!
-//! The three GESTURE helpers (`word_cols`/`select_word`/`select_line`) keep
+//! The three GESTURE helpers (`word_span`/`select_word`/`select_line`) keep
 //! taking a bare `&mut Terminal`: the GUI's double/triple-click calls them
 //! DIRECTLY off its lock guard, and they must share one rule set with the
-//! `select word` verb.
+//! `select word` verb. All three work in LOGICAL lines — soft-wrapped rows
+//! joined — so a click gesture never stops at the window width the way the
+//! copy path never inserts a newline there.
 
 use std::sync::OnceLock;
 
@@ -275,48 +277,147 @@ fn smart_rules() -> &'static SmartSelection {
     SMART_RULES.get_or_init(SmartSelection::with_builtin_rules)
 }
 
-/// Inclusive word-column bounds at live-screen `(row, col)`, from the engine's
-/// builtin smart-selection rules (URL/path/email/... patterns, falling back to
-/// plain alphanumeric+underscore words). `None` when the cell is whitespace or
-/// to the right of the row's text — the caller selects just the clicked cell.
+/// Rows of a wrapped line joined on each side of a click before the word rules are asked,
+/// doubling while the match still reaches a window edge.
+///
+/// Two rows each way is ~three screen widths of context, which contains every word a
+/// person double-clicks; a token longer than that (a very long URL or path) simply costs
+/// one more doubling. The point is that the COMMON case stops being linear in the whole
+/// logical line — see the loop in [`word_span`].
+const WORD_WINDOW_ROWS: usize = 2;
+
+/// The widest a double-click will ever look, in rows of the wrapped line.
+///
+/// The window widens while the match still runs off an edge, which is right for a long
+/// URL or path — but a line can be ONE unbroken token (`cat` of a minified bundle is
+/// 320 kB with no break in it), and there the widening reads the whole thing on every
+/// call, twice per pointer move, under the terminal mutex. So the widening STOPS here and
+/// the gesture returns the bounded span it found.
+///
+/// 64 rows is ~5 kB at 80 columns: past any identifier, URL, path or hash a person
+/// double-clicks to grab, and small enough that the scan stays under a millisecond. A
+/// token longer than this is selected up to the bound rather than freezing the window —
+/// the drag and the triple-click still reach the whole logical line, and this bound is
+/// only on what ONE double-click will widen to.
+const WORD_WINDOW_MAX_ROWS: usize = 64;
+
+/// Inclusive word CELL bounds `((start_row, start_col), (end_row, end_col))` at
+/// live-screen `(row, col)`, from the engine's builtin smart-selection rules
+/// (URL/path/email/... patterns, falling back to plain alphanumeric+underscore
+/// words). `None` when the cell is whitespace or to the right of the line's
+/// text — the caller selects just the clicked cell.
+///
+/// LOGICAL, not physical: the rules run over
+/// [`Terminal::logical_line_text`](aterm_core::terminal::Terminal::logical_line_text)
+/// — the soft-wrapped rows joined and COLUMN-ALIGNED — so a word straddling the
+/// wrap is ONE word and the returned cells may sit on different rows. Bound to
+/// the physical row instead, a double-click on such a word yields only the
+/// fragment on the clicked row ("…STR" or "ADDLEWORD", never the whole word).
+///
+/// A HARD newline still bounds the run: `logical_line_text` joins soft wraps
+/// only, so a word can never reach into the following logical line.
 #[must_use]
-pub fn word_cols(t: &Terminal, row: i32, col: u16) -> Option<(u16, u16)> {
-    let text = t.get_line_text(row, None)?;
-    // `word_boundaries_at_column` clamps a past-the-text column INTO the text
-    // (it would snap to the LAST word); a click right of the text is whitespace.
-    if usize::from(col) >= aterm_core::grapheme::byte_to_column(&text, text.len()) {
+pub fn word_span(t: &Terminal, row: i32, col: u16) -> Option<((i32, u16), (i32, u16))> {
+    let cols = usize::from(t.cols());
+    if cols == 0 {
         return None;
     }
-    let (start, end) = smart_rules().word_boundaries_at_column(&text, usize::from(col))?;
+    // WINDOWED, not whole-line. The rules scan is linear in the text it is handed, and a
+    // logical line can be enormous — one `cat` of a minified bundle is 320 kB across 4000
+    // rows. Scanning all of it cost ~70 ms per call, and the double-click DRAG arm calls
+    // this twice per pointer move under the terminal mutex, which is ~7 fps while dragging.
+    // A word is delimited by whitespace, so the answer is almost always within a row or
+    // two; read a small window and widen ONLY when the match reaches an edge that is not
+    // the line's own end. Bounded by the line span, so the widest case is the old cost and
+    // the common case is a few hundred bytes.
+    let (line_first, line_last) = t.logical_line_span(row);
+    let mut back = WORD_WINDOW_ROWS;
+    let mut fwd = WORD_WINDOW_ROWS;
+    let (first_row, start, end) = loop {
+        let win_first = row
+            .saturating_sub(i32::try_from(back).unwrap_or(i32::MAX))
+            .max(line_first);
+        let win_last = row
+            .saturating_add(i32::try_from(fwd).unwrap_or(i32::MAX))
+            .min(line_last);
+        let text = t.line_range_text(win_first, win_last)?;
+        let offset = usize::try_from(row.checked_sub(win_first)?).ok()?;
+        let global = offset.checked_mul(cols)?.checked_add(usize::from(col))?;
+        // `word_boundaries_at_column` clamps a past-the-text column INTO the text
+        // (it would snap to the LAST word); a click right of the text is whitespace.
+        if global >= aterm_core::grapheme::byte_to_column(&text, text.len()) {
+            return None;
+        }
+        let (start, end) = smart_rules().word_boundaries_at_column(&text, global)?;
+        // A match touching the window edge may continue past it. Widen and re-ask, unless
+        // the edge IS the logical line's end, where there is nothing more to read.
+        let open_up = start == 0 && win_first > line_first;
+        let open_down =
+            end >= aterm_core::grapheme::byte_to_column(&text, text.len()) && win_last < line_last;
+        if !open_up && !open_down {
+            break (win_first, start, end);
+        }
+        if back.saturating_add(fwd) >= WORD_WINDOW_MAX_ROWS {
+            break (win_first, start, end);
+        }
+        if open_up {
+            back = back.saturating_mul(2);
+        }
+        if open_down {
+            fwd = fwd.saturating_mul(2);
+        }
+    };
     // The returned end column is EXCLUSIVE; selection anchors are inclusive cells.
     let last = end.saturating_sub(1).max(start);
-    let clamp = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
-    Some((clamp(start), clamp(last)))
+    let cell = |g: usize| -> (i32, u16) {
+        let dr = i32::try_from(g / cols).unwrap_or(i32::MAX);
+        let c = u16::try_from(g % cols).unwrap_or(u16::MAX);
+        (first_row.saturating_add(dr), c)
+    };
+    Some((cell(start), cell(last)))
 }
 
 /// Word-select at live-screen `(row, col)` — the double-click / `select word`
 /// gesture: a `Semantic` selection spanning the word's cells (both boundary
 /// cells inclusive, Left/Right anchor sides), or just the clicked cell when on
 /// whitespace. Completes the selection and returns the inclusive
-/// `(start_col, end_col)` actually selected.
-pub fn select_word(t: &mut Terminal, row: i32, col: u16) -> (u16, u16) {
-    let (start, end) = word_cols(t, row, col).unwrap_or((col, col));
+/// `((start_row, start_col), (end_row, end_col))` actually selected — which
+/// spans two rows when the word straddles a SOFT WRAP.
+pub fn select_word(t: &mut Terminal, row: i32, col: u16) -> ((i32, u16), (i32, u16)) {
+    let (start, end) = word_span(t, row, col).unwrap_or(((row, col), (row, col)));
     let sel = t.text_selection_mut();
-    sel.start_selection(row, col, SelectionSide::Left, SelectionType::Semantic);
-    sel.expand_semantic(start, end);
+    sel.start_selection(
+        start.0,
+        start.1,
+        SelectionSide::Left,
+        SelectionType::Semantic,
+    );
+    sel.update_selection(end.0, end.1, SelectionSide::Right);
     sel.complete_selection();
     (start, end)
 }
 
-/// Line-select live-screen row `row` — the triple-click / `select line`
-/// gesture: a `Lines` selection expanded to the full row width (the extracted
-/// text is the whole row, trailing blanks trimmed). Completes the selection.
-pub fn select_line(t: &mut Terminal, row: i32) {
+/// Line-select the LOGICAL line at live-screen row `row` — the triple-click /
+/// `select line` gesture: a `Lines` selection from column 0 of the logical
+/// line's FIRST physical row to the last column of its LAST, so a soft-wrapped
+/// line is selected whole. Completes the selection and returns the inclusive
+/// `(first_row, last_row)` span it covered.
+///
+/// The span comes from
+/// [`Terminal::logical_line_span`](aterm_core::terminal::Terminal::logical_line_span),
+/// the same soft-wrap bit the copy walk uses to decide where a newline goes —
+/// so the extracted text is the whole logical line with NO newline invented at
+/// the wrap, and a HARD newline still ends it (the following logical line is
+/// never swallowed). Selecting the physical row alone truncated a wrapped line
+/// at the window width while the highlight still looked edge-to-edge.
+pub fn select_line(t: &mut Terminal, row: i32) -> (i32, i32) {
+    let (first, last) = t.logical_line_span(row);
     let max_col = t.cols().saturating_sub(1);
     let sel = t.text_selection_mut();
-    sel.start_selection(row, 0, SelectionSide::Left, SelectionType::Lines);
-    sel.expand_lines(max_col);
+    sel.start_selection(first, 0, SelectionSide::Left, SelectionType::Lines);
+    sel.update_selection(last, max_col, SelectionSide::Right);
     sel.complete_selection();
+    (first, last)
 }
 
 /// `select ...` -> drive the engine's text selection. Forms:
@@ -326,8 +427,11 @@ pub fn select_line(t: &mut Terminal, row: i32) {
 ///   to reading order first, so either order works).
 /// * `select word <r> <c>` — semantic (word/URL/path) selection at the cell
 ///   via the engine's builtin smart-selection rules; a whitespace cell selects
-///   just itself. Same code path as the GUI's double-click.
-/// * `select line <r>` — full-line selection of row `r` (triple-click).
+///   just itself. Same code path as the GUI's double-click, so a word
+///   straddling a SOFT WRAP is selected whole, across both rows.
+/// * `select line <r>` — LOGICAL-line selection at row `r` (triple-click): a
+///   soft-wrapped line is selected from its first physical row through its
+///   last, and a hard newline ends it.
 /// * `select block <r1> <c1> <r2> <c2>` — rectangular (block) selection with
 ///   the two cells as INCLUSIVE corners (any corner order).
 /// * `select extend <r> <c>` — extend the EXISTING selection so cell `(r,c)`
@@ -550,5 +654,245 @@ pub fn cmd_copy(host: &impl SessionHost, sid: u64) -> String {
             }
         }
         _ => "OK 0\n".to_string(),
+    }
+}
+
+/// The CLICK gestures against soft wraps — the defect this module's
+/// `word_span`/`select_line` exist to close.
+///
+/// A soft-wrapped line is ONE logical line to the copy path (it emits no
+/// newline before a continuation row), so a click gesture bound to the PHYSICAL
+/// row selected a prefix while the highlight ran edge-to-edge: the user saw a
+/// complete selection and middle-clicked a TRUNCATED command. Every check below
+/// is on bytes — the length and the text — not on the anchors, because the
+/// anchors were never the thing that was wrong.
+#[cfg(test)]
+mod gesture_tests {
+    use aterm_core::selection::SelectionType;
+    use aterm_core::terminal::Terminal;
+
+    use super::{select_line, select_word, word_span};
+
+    /// The reported command: 130 chars auto-wrapped across two rows of an
+    /// 80-column screen. The head fills row 0 exactly and ends
+    /// `aterm-build rust` — the point the truncated clipboard stopped at; the
+    /// tail is the 50 bytes that were silently dropped.
+    const HEAD: &str =
+        "docker run --rm -v $PWD:/w -w /w --network host --name bld-boxy aterm-build rust";
+    const TAIL: &str = ":1.85 cargo build --release --features gpu,wayland";
+
+    /// That command on row 0/1, then a SEPARATE logical line after a hard
+    /// newline (the boundary the join must never cross).
+    fn wrapped_command() -> (Terminal, String) {
+        let cmd = format!("{HEAD}{TAIL}");
+        assert_eq!(HEAD.len(), 80, "the head must fill the row exactly");
+        let mut term = Terminal::new(6, 80);
+        term.process(cmd.as_bytes());
+        term.process(b"\r\necho AFTER");
+        (term, cmd)
+    }
+
+    /// A word straddling the wrap: `STRADDLEWORD` starts at column 74 of row 0
+    /// and finishes on row 1.
+    fn wrapped_word() -> Terminal {
+        let mut term = Terminal::new(6, 80);
+        let filler = "word ".repeat(14) + "abc ";
+        assert_eq!(filler.len(), 74);
+        term.process(format!("{filler}STRADDLEWORD tail").as_bytes());
+        term
+    }
+
+    /// Rebuild the text the HIGHLIGHT covers, straight from the predicate the
+    /// renderer paints with (`TextSelection::contains`), joining rows by the
+    /// same soft-wrap rule the copy uses.
+    ///
+    /// A highlight that disagrees with the clipboard is its own defect — the
+    /// user's only evidence of what they are about to paste is the paint — so
+    /// every gesture below is checked BOTH ways against this.
+    fn highlighted_text(term: &Terminal) -> String {
+        let cols = term.cols();
+        let rows = i32::from(term.rows());
+        let mut out = String::new();
+        let mut first = true;
+        for row in 0..rows {
+            let sel = term.text_selection();
+            let lo = (0..cols).find(|&c| sel.contains(row, c));
+            let hi = (0..cols).rev().find(|&c| sel.contains(row, c));
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                continue;
+            };
+            if !first && !term.row_continues_previous(row) {
+                out.push('\n');
+            }
+            first = false;
+            out.push_str(&term.get_line_text(row, Some((lo, hi))).unwrap_or_default());
+        }
+        out
+    }
+
+    /// THE DEFECT: a triple-click on the head of a soft-wrapped command must
+    /// copy the WHOLE command, not the 80 bytes that fit on the row.
+    #[test]
+    fn a_line_click_selects_the_whole_soft_wrapped_logical_line() {
+        let (mut term, cmd) = wrapped_command();
+        let span = select_line(&mut term, 0);
+        assert_eq!(span, (0, 1), "the gesture must cover both physical rows");
+
+        let copied = term.selection_to_string().expect("a selection was made");
+        assert_eq!(
+            copied.len(),
+            cmd.len(),
+            "the clipboard must carry all {} bytes, not the {} that fit on the row",
+            cmd.len(),
+            HEAD.len()
+        );
+        assert_eq!(copied, cmd);
+        assert!(
+            !copied.contains('\n'),
+            "a SOFT wrap must not invent a newline mid-line: {copied:?}"
+        );
+        assert_eq!(
+            highlighted_text(&term),
+            copied,
+            "the highlight the user sees must be byte-for-byte what they copy"
+        );
+    }
+
+    /// The same logical line, clicked on its CONTINUATION row: the gesture
+    /// reaches BACK to the head, so where in the wrapped line the user clicks
+    /// cannot change what they get.
+    #[test]
+    fn a_line_click_on_the_continuation_row_selects_the_same_logical_line() {
+        let (mut term, cmd) = wrapped_command();
+        assert_eq!(select_line(&mut term, 1), (0, 1));
+        let copied = term.selection_to_string().expect("a selection was made");
+        assert_eq!(copied, cmd);
+        assert_eq!(highlighted_text(&term), copied);
+    }
+
+    /// The boundary that is NOT a soft wrap: a HARD newline still ends the
+    /// selection. The wrapped line must not swallow the line after it, and the
+    /// line after it must not reach back.
+    #[test]
+    fn a_hard_newline_still_bounds_a_line_click() {
+        let (mut term, cmd) = wrapped_command();
+        select_line(&mut term, 0);
+        let copied = term.selection_to_string().expect("a selection was made");
+        assert!(
+            !copied.contains("echo AFTER"),
+            "the next LOGICAL line must not be swallowed: {copied:?}"
+        );
+        assert_eq!(copied, cmd);
+
+        assert_eq!(
+            select_line(&mut term, 2),
+            (2, 2),
+            "an unwrapped row is its own logical line"
+        );
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("echo AFTER"),
+            "and selecting it must not reach back over the hard newline"
+        );
+    }
+
+    /// A double-click on a word straddling the wrap must select the WHOLE word,
+    /// not the `STRADD` fragment on the clicked row.
+    #[test]
+    fn a_word_click_selects_a_word_straddling_the_wrap_whole() {
+        let mut term = wrapped_word();
+        // Column 76 is inside the fragment on row 0.
+        let (start, end) = select_word(&mut term, 0, 76);
+        assert_eq!(
+            (start, end),
+            ((0, 74), (1, 5)),
+            "the word's cells must span both rows"
+        );
+        let copied = term.selection_to_string().expect("a selection was made");
+        assert_eq!(copied, "STRADDLEWORD");
+        assert_eq!(highlighted_text(&term), copied);
+
+        // Clicking the TAIL fragment answers the same word.
+        let (start2, end2) = select_word(&mut term, 1, 2);
+        assert_eq!((start2, end2), (start, end));
+        assert_eq!(term.selection_to_string().as_deref(), Some("STRADDLEWORD"));
+    }
+
+    /// The gestures must not have grown a taste for joining everything: an
+    /// ORDINARY unwrapped line still selects exactly itself, word and line
+    /// alike, with the same anchors as before.
+    /// THE WINDOW MUST NOT COST CORRECTNESS. `word_span` reads a small window around the
+    /// click instead of the whole logical line; a word longer than that window must still
+    /// come back whole, which is what the widening loop is for. This builds a token far
+    /// wider than `WORD_WINDOW_ROWS` rows and clicks in its MIDDLE, so the match runs off
+    /// BOTH edges of the first window and both arms have to widen.
+    #[test]
+    fn a_word_wider_than_the_window_is_still_selected_whole() {
+        let cols = 80usize;
+        let rows = super::WORD_WINDOW_ROWS * 4 + 3;
+        let token = "x".repeat(cols * rows);
+        // The terminal must be TALLER than the token, or most of it scrolls into
+        // history and the click row addresses something else entirely.
+        let mut term = Terminal::new(
+            u16::try_from(rows + 3).unwrap(),
+            u16::try_from(cols).unwrap(),
+        );
+        term.process(format!("{token} tail").as_bytes());
+        // Click in the middle row of the token, so the window opens upward AND downward.
+        let mid = i32::try_from(rows / 2).unwrap();
+        select_word(&mut term, mid, 10);
+        let picked = term.selection_to_string().expect("a selection was made");
+        assert_eq!(
+            picked.len(),
+            token.len(),
+            "a token spanning {rows} rows came back {} bytes instead of {} — the window \
+             widened too little",
+            picked.len(),
+            token.len()
+        );
+        assert!(
+            picked.chars().all(|c| c == 'x'),
+            "the widened span picked up neighbours"
+        );
+    }
+
+    /// The widening must STOP at the logical line's own end rather than walking into the
+    /// next line. A token that ends exactly at the last row of a wrapped line touches the
+    /// window edge on the way down, but there is nothing beyond it to take.
+    #[test]
+    fn widening_stops_at_the_end_of_the_logical_line() {
+        let mut term = Terminal::new(6, 80);
+        // 80-col head + a tail token, then a HARD newline and another word.
+        term.process(format!("{}ENDTOKEN", "y".repeat(80)).as_bytes());
+        term.process(b"\r\nNEXTWORD");
+        select_word(&mut term, 1, 2);
+        let picked = term.selection_to_string().expect("a selection was made");
+        assert!(
+            !picked.contains("NEXTWORD"),
+            "widening walked past the hard newline into the next logical line: {picked:?}"
+        );
+    }
+
+    #[test]
+    fn unwrapped_lines_and_words_are_unchanged() {
+        let mut term = Terminal::new(6, 80);
+        term.process(b"alpha beta gamma\r\ndelta epsilon");
+        assert_eq!(select_line(&mut term, 0), (0, 0));
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("alpha beta gamma")
+        );
+        assert_eq!(term.text_selection().selection_type(), SelectionType::Lines);
+
+        assert_eq!(select_word(&mut term, 0, 7), ((0, 6), (0, 9)));
+        assert_eq!(term.selection_to_string().as_deref(), Some("beta"));
+        assert_eq!(
+            term.text_selection().selection_type(),
+            SelectionType::Semantic
+        );
+
+        // A click past the end of the text still selects just that cell.
+        assert_eq!(select_word(&mut term, 0, 40), ((0, 40), (0, 40)));
+        assert!(word_span(&term, 0, 40).is_none());
     }
 }

@@ -649,7 +649,15 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     const GOLDEN: [u64; 9] = [
         12_541_784_599_013_147_129,
         1_564_493_126_147_229_498,
-        8_767_316_529_295_529_117,
+        // RE-BASELINED 2026-09-01 — index 2 (RainbowKitty) ONLY, for the
+        // deliberate repaint the module header sanctions. The owner retired the
+        // no-cyan ruling ("you can have cyan so long as it's a rainbow"), so the
+        // three paling laws became identity and the jump streak's four chroma
+        // folds were removed: the green->blue crossing now emits the arc's own
+        // colour instead of a luminance-preserving fold toward grey. The other
+        // EIGHT entries are byte-identical on this tree, which is the evidence
+        // that the repaint is scoped to the mark it was aimed at.
+        9_540_101_506_406_840_834,
         5_181_506_246_111_895_746,
         17_288_162_128_308_037_669,
         7_964_602_191_947_693_616,

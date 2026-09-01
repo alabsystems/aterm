@@ -74,7 +74,7 @@ impl ClassMeta {
         // The address came from `objc_allocateClassPair`, i.e. from FFI, so it
         // already has exposed provenance; a class pointer is never dereferenced
         // by Rust anyway, only handed back to the runtime.
-        std::ptr::with_exposed_provenance_mut(self.class_addr)
+        ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr))
     }
 
     /// Byte offset of [`IVAR_NAME`] within an instance.
@@ -112,6 +112,15 @@ impl<T> IvarSlot<T> {
     /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose
     /// `initialized` flag is currently `false` (i.e. freshly `+alloc`ed memory,
     /// never a slot that was already filled — that would leak the old value).
+    ///
+    /// "Properly aligned" is the half that used to be UNDISCHARGED. The only
+    /// caller is [`crate::declare_class!`]'s `alloc_init`, which derives `slot`
+    /// from the instance base plus the registered ivar offset — and the offset
+    /// is aligned within the instance while the BASE is only 16-aligned, so for
+    /// `align_of::<Self>() > 16` this precondition was violated by construction
+    /// from SAFE code. [`crate::ClassBuilder::add_rust_ivar`] now refuses such a
+    /// `T` at compile time, which is what makes this contract dischargeable —
+    /// see `S4` in the crate's soundness list.
     pub unsafe fn init(slot: *mut Self, value: T) {
         // SAFETY: the caller pins `slot` as an aligned, writable, not-yet-filled
         // slot. Writing the whole struct (rather than the fields) is a single
@@ -144,6 +153,15 @@ impl<T> IvarSlot<T> {
     /// # Safety
     /// `slot` must point at an aligned, readable `IvarSlot<T>` (initialised or
     /// zeroed) that outlives `'a`.
+    ///
+    /// The word "aligned" here was the SECOND undischargeable precondition of
+    /// this type, and the more serious one: `get`'s only caller is the SAFE
+    /// `ivars()` accessor the macro generates, which cannot establish it at all
+    /// — the same shape as the pool contract F2 was raised for, one pass later.
+    /// It is dischargeable now because `add_rust_ivar` refuses any `T` whose
+    /// slot needs more than the 16 bytes `class_createInstance` guarantees, so
+    /// every registered class HAS an aligned slot and the accessor's obligation
+    /// is met by the class's own existence.
     #[must_use]
     pub unsafe fn get<'a>(slot: *const Self) -> &'a T {
         // SAFETY: the caller pins `slot` as aligned, readable and live for
@@ -166,8 +184,12 @@ impl<T> IvarSlot<T> {
     /// Drop the value in place if it was ever written; idempotent.
     ///
     /// # Safety
-    /// `slot` must point at a writable `IvarSlot<T>` (initialised or zeroed)
-    /// that nothing else is borrowing.
+    /// `slot` must point at an aligned, writable `IvarSlot<T>` (initialised or
+    /// zeroed) that nothing else is borrowing. Alignment is discharged the way
+    /// [`Self::init`] and [`Self::get`] discharge it — by `add_rust_ivar`
+    /// refusing an over-aligned `T` — which is also the second of the two sites
+    /// an over-aligned ivar aborted at (`(*slot).initialized` on the dealloc
+    /// path, below).
     pub unsafe fn dispose(slot: *mut Self) {
         // SAFETY: the caller pins `slot` as writable; reading the flag is
         // always valid because `+alloc` zeroed it.
@@ -239,7 +261,72 @@ impl ClassBuilder {
     /// is the honest encoding for a Rust value, and it is deliberately NOT a
     /// pointer encoding: the runtime must not treat these bytes as an object
     /// reference to retain, release or scan.
+    ///
+    /// # An ivar cannot out-align the instance allocator: `S4`'s SECOND half
+    ///
+    /// `_Block_copy` allocates with `malloc` and a block capture needing more
+    /// than 16-byte alignment is refused at compile time — that is `S4`, and it
+    /// was recorded as CLOSED while its exact twin stood open one module over.
+    /// `class_createInstance` (what `+alloc` calls) uses the same allocator, so
+    /// the ivar SLOT inherits the instance base's alignment and nothing more:
+    /// `class_addIvar` aligns the OFFSET within the instance, which is all it
+    /// can do, and the base is the part `malloc` decides.
+    ///
+    /// MEASURED through `ivar_getOffset` and the raw `+alloc` addresses — no
+    /// Rust reference anywhere in the measurement, so nothing is folded away —
+    /// 4,096 instances per class on this box:
+    ///
+    /// ```text
+    /// Ivars align  ivar offset  slot misaligned    base not 32-aligned
+    ///        16         16          0 / 4096          2042 / 4096
+    ///        32         32         19 / 4096            19 / 4096
+    ///        64         64          9 / 4096             9 / 4096
+    /// ```
+    ///
+    /// Sixteen is exact, and it is exact for the same reason and at the same
+    /// number as the block case. The `align 16` row also shows the base really
+    /// is only 16-aligned rather than accidentally more.
+    ///
+    /// It was reachable from safe code with NOT ONE `unsafe` token at the call
+    /// site — `declare_class!{ type Ivars = Align64 }` then `X::alloc_init(v)`
+    /// — and in a debug build it aborted at `IvarSlot::init`'s `ptr::write`
+    /// ("unsafe precondition(s) violated: ptr::write requires that the pointer
+    /// argument is aligned and non-null"), with a second site on the `dealloc`
+    /// path. In RELEASE the precondition compiles out and LLVM is entitled to
+    /// fold the alignment check to `true` off the reference's declared
+    /// alignment, which makes it assumption-propagating undefined behaviour
+    /// rather than a tolerated unaligned access.
+    ///
+    /// So the fix is the one the crate already wrote for blocks: refuse the
+    /// type at compile time, since there is no knob to ask the runtime for more.
+    ///
+    /// ```compile_fail
+    /// #[repr(align(32))]
+    /// struct WideIvars(u64);
+    /// aterm_objc::declare_class! {
+    ///     struct DocOverAligned: NSObject {
+    ///         const NAME: &str = "ATermDocOverAligned";
+    ///         type Ivars = WideIvars;
+    ///
+    ///         @sel(ping)
+    ///         fn ping(&self) {}
+    ///     }
+    /// }
+    /// let _ = DocOverAligned::alloc_init(WideIvars(1));
+    /// ```
     pub fn add_rust_ivar<T>(&mut self) {
+        // `class_createInstance` allocates the instance with the same 16-byte
+        // `malloc` guarantee `_Block_copy` has, and the slot sits at a fixed
+        // offset from that base — so a `T` wanting more lands misaligned in
+        // some fraction of instances and there is no way to ask for more. See
+        // this method's docs for the measurement.
+        const {
+            assert!(
+                align_of::<IvarSlot<T>>() <= 16,
+                "aterm-objc: this class's `Ivars` need more than the 16-byte \
+                 alignment `class_createInstance`'s allocator guarantees"
+            )
+        };
         let size = size_of::<IvarSlot<T>>();
         let align = align_of::<IvarSlot<T>>();
         debug_assert!(align.is_power_of_two());
@@ -395,9 +482,27 @@ pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
 /// Unwinding out of an ObjC frame is undefined behaviour, so every trampoline
 /// [`crate::declare_class!`] generates catches and lands here. This is the
 /// same rule the tree already applies to its C FFI entry points.
+/// # Why not `eprintln!`
+///
+/// It was `eprintln!`, and `eprintln!` PANICS if the write fails — a closed or
+/// full stderr, which is an ordinary state for a GUI app launched from Finder
+/// or re-parented by `launchd`. The process still aborts either way, but a
+/// panic here unwinds out of the very `extern "C"` frame this function exists
+/// to stop, and lands on Rust's own shim with "thread caused non-unwinding
+/// panic. aborting." — the unnamed message the guard was added to avoid. That
+/// is F3's defect inside F3's own fix.
+///
+/// The replacement writes the three pieces straight to stderr and IGNORES the
+/// result. It allocates nothing (no `format!`), so there is no second failure
+/// mode, and the string every test greps for is unchanged.
 #[cold]
 #[inline(never)]
 pub fn abort_on_unwind(method: &str) -> ! {
-    eprintln!("aterm-objc: panic escaped Objective-C method `{method}`; aborting");
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(b"aterm-objc: panic escaped Objective-C method `");
+    let _ = err.write_all(method.as_bytes());
+    let _ = err.write_all(b"`; aborting\n");
+    let _ = err.flush();
     std::process::abort()
 }

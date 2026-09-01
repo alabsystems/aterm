@@ -2873,58 +2873,77 @@ impl App {
             // selection's start IS the origin, and it rides `adjust_for_scroll`. Only
             // fall back to the captured row when there is no live selection to read
             // (the first move after a press that the engine has since cleared).
-            let origin_row = match term.text_selection().state() {
+            //
+            // The anchor is read as a CELL, not just a row: a LOGICAL origin
+            // unit can straddle a soft wrap, and the cell is what re-derives
+            // WHICH unit (`logical_line_span` / `word_span` at that cell answer
+            // the same span from either of its ends), so the drag stays on the
+            // whole wrapped word/line however it was last anchored.
+            let origin_cell = match term.text_selection().state() {
                 aterm_core::selection::SelectionState::None => None,
-                _ => Some(term.text_selection().start().row),
+                _ => {
+                    let start = term.text_selection().start();
+                    Some((start.row, start.col))
+                }
             };
             match fws.gesture {
                 None => {
                     term.text_selection_mut()
                         .update_selection(sel_row, col, fws.last_mouse_side);
                 }
-                // Triple-click drag: whole rows from the origin line to the
-                // hovered line. Rebuilt from the origin each move so the
-                // anchor sides stay inclusive in either drag direction.
+                // Triple-click drag: whole LOGICAL lines from the origin line to
+                // the hovered line. Rebuilt from the origin each move so the
+                // anchor sides stay inclusive in either drag direction, and both
+                // ends snap to a logical line so a soft-wrapped row is never
+                // half-selected.
                 Some(g) if g.kind == SelectionType::Lines => {
-                    let g_row = origin_row.unwrap_or(g.row);
+                    let (g_first, g_last) = match origin_cell {
+                        Some((r, _)) => term.logical_line_span(r),
+                        None => (g.row, g.end_row),
+                    };
+                    let (m_first, m_last) = term.logical_line_span(sel_row);
                     let max_col = term.cols().saturating_sub(1);
                     let sel = term.text_selection_mut();
-                    if sel_row < g_row {
+                    if sel_row < g_first {
                         sel.start_selection(
-                            g_row,
+                            g_last,
                             max_col,
                             SelectionSide::Right,
                             SelectionType::Lines,
                         );
-                        sel.update_selection(sel_row, 0, SelectionSide::Left);
+                        sel.update_selection(m_first, 0, SelectionSide::Left);
                     } else {
-                        sel.start_selection(g_row, 0, SelectionSide::Left, SelectionType::Lines);
-                        sel.update_selection(sel_row, max_col, SelectionSide::Right);
+                        sel.start_selection(g_first, 0, SelectionSide::Left, SelectionType::Lines);
+                        sel.update_selection(m_last, max_col, SelectionSide::Right);
                     }
                 }
                 // Double-click drag: snap the moving end to the hovered word
                 // (or bare cell on whitespace); the origin word stays fully
                 // selected by anchoring at its far boundary.
                 Some(g) => {
-                    let g_row = origin_row.unwrap_or(g.row);
-                    let (ws, we) = control::word_cols(&term, sel_row, col).unwrap_or((col, col));
+                    let (g_start, g_end) = match origin_cell {
+                        Some((r, c)) => control::word_span(&term, r, c).unwrap_or(((r, c), (r, c))),
+                        None => ((g.row, g.start_col), (g.end_row, g.end_col)),
+                    };
+                    let (ws, we) = control::word_span(&term, sel_row, col)
+                        .unwrap_or(((sel_row, col), (sel_row, col)));
                     let sel = term.text_selection_mut();
-                    if (sel_row, col) < (g_row, g.start_col) {
+                    if (sel_row, col) < g_start {
                         sel.start_selection(
-                            g_row,
-                            g.end_col,
+                            g_end.0,
+                            g_end.1,
                             SelectionSide::Right,
                             SelectionType::Semantic,
                         );
-                        sel.update_selection(sel_row, ws, SelectionSide::Left);
+                        sel.update_selection(ws.0, ws.1, SelectionSide::Left);
                     } else {
                         sel.start_selection(
-                            g_row,
-                            g.start_col,
+                            g_start.0,
+                            g_start.1,
                             SelectionSide::Left,
                             SelectionType::Semantic,
                         );
-                        sel.update_selection(sel_row, we, SelectionSide::Right);
+                        sel.update_selection(we.0, we.1, SelectionSide::Right);
                     }
                 }
             }
@@ -3156,6 +3175,10 @@ impl App {
     /// Double-click: word-select the pressed cell (builtin smart rules — URLs,
     /// paths, words; just the cell on whitespace), completed immediately, and
     /// arm the gesture so a drag before release extends by whole words.
+    ///
+    /// The word is the one on the LOGICAL line: a word straddling a soft wrap
+    /// is selected whole, across both physical rows, the way every mainstream
+    /// terminal does it and the way the copy path already joins those rows.
     pub(crate) fn select_word_click(&mut self, wid: WindowId, sel_row: i32, col: u16) {
         let Some(term) = self
             .front_terminal(wid)
@@ -3163,30 +3186,37 @@ impl App {
         else {
             return;
         };
-        let (start_col, end_col) = {
+        let (start, end) = {
             let mut term = term_lock(&term);
-            let cols = control::select_word(&mut term, sel_row, col);
+            let cells = control::select_word(&mut term, sel_row, col);
             // PRESS CUSTODY: the double-click PRESS is where the highlight comes into
             // existence. `arm_gesture_drag` below pre-sets `sel_dragged`, so the
             // RELEASE eventually records a `UserSelect` — but that is the end of the
             // gesture, and until it arrives the record named an event that did not
             // make this selection.
             note_selection_custody(&mut term, true);
-            cols
+            cells
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.gesture = Some(GestureOrigin {
-                row: sel_row,
-                start_col,
-                end_col,
+                row: start.0,
+                end_row: end.0,
+                start_col: start.1,
+                end_col: end.1,
                 kind: SelectionType::Semantic,
             });
         }
         self.arm_gesture_drag(wid, sel_row, col);
     }
 
-    /// Triple-click: select the full line under the press, completed
+    /// Triple-click: select the full LOGICAL line under the press, completed
     /// immediately, and arm the gesture so a drag extends by whole lines.
+    ///
+    /// A soft-wrapped line is selected from its first physical row through its
+    /// last — binding this to the pressed ROW truncated the copy at the window
+    /// width while the highlight still ran edge-to-edge, so the user saw a
+    /// complete selection and got a short clipboard. A HARD newline still ends
+    /// the selection.
     pub(crate) fn select_line_click(&mut self, wid: WindowId, sel_row: i32, col: u16) {
         let Some(term) = self
             .front_terminal(wid)
@@ -3194,17 +3224,18 @@ impl App {
         else {
             return;
         };
-        let end_col = {
+        let (first_row, last_row, end_col) = {
             let mut term = term_lock(&term);
-            control::select_line(&mut term, sel_row);
+            let (first_row, last_row) = control::select_line(&mut term, sel_row);
             // PRESS CUSTODY: as for the double-click above — the press that made the
             // highlight records it, not only the release that ends the gesture.
             note_selection_custody(&mut term, true);
-            term.cols().saturating_sub(1)
+            (first_row, last_row, term.cols().saturating_sub(1))
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.gesture = Some(GestureOrigin {
-                row: sel_row,
+                row: first_row,
+                end_row: last_row,
                 start_col: 0,
                 end_col,
                 kind: SelectionType::Lines,
@@ -8314,6 +8345,175 @@ mod tests {
             text.lines().next(),
             Some("L05"),
             "with nothing live to read, the captured gesture row is the origin"
+        );
+    }
+
+    /// The 130-char command from the defect report, auto-wrapped across rows 0/1
+    /// of the headless 24x80 screen, with a separate logical line after it.
+    ///
+    /// The head fills row 0 exactly and ends `aterm-build rust`; the 50-byte
+    /// tail on row 1 is what a physical-row triple-click silently dropped.
+    fn wrapped_command_screen() -> (Vec<u8>, String) {
+        const HEAD: &str =
+            "docker run --rm -v $PWD:/w -w /w --network host --name bld-boxy aterm-build rust";
+        const TAIL: &str = ":1.85 cargo build --release --features gpu,wayland";
+        assert_eq!(HEAD.len(), 80, "the head must fill the 80-column row");
+        let cmd = format!("{HEAD}{TAIL}");
+        let mut seed = cmd.clone().into_bytes();
+        seed.extend_from_slice(b"\r\necho AFTER");
+        (seed, cmd)
+    }
+
+    /// THE DEFECT, through the REAL double/triple-click handlers: a triple-click
+    /// on a soft-wrapped command must put the whole command on the clipboard.
+    ///
+    /// The oracle is BYTES — `selection_to_string` is exactly what ⌘-C and the
+    /// X11 PRIMARY write — because the bug was never visible in the anchors or
+    /// in the paint: the highlight ran edge-to-edge on row 0 and looked
+    /// complete while the copy stopped at the window width, so a middle-click
+    /// ran a TRUNCATED command.
+    #[test]
+    fn a_triple_click_copies_the_whole_soft_wrapped_command() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let (seed, cmd) = wrapped_command_screen();
+        term_lock(&term).process(&seed);
+        assert_eq!(
+            term_lock(&term).get_line_text(0, None).map(|t| t.len()),
+            Some(80),
+            "precondition: row 0 is full, so the command wraps onto row 1"
+        );
+
+        app.select_line_click(wid, 0, 10);
+
+        let copied = term_lock(&term)
+            .selection_to_string()
+            .expect("the triple-click selected something");
+        assert_eq!(
+            copied.len(),
+            cmd.len(),
+            "the clipboard must carry all {} bytes of the command, not the 80 \
+             that fit on the clicked row",
+            cmd.len()
+        );
+        assert_eq!(copied, cmd);
+        assert!(
+            !copied.contains('\n'),
+            "a soft wrap must not become a newline in the copy: {copied:?}"
+        );
+        assert!(
+            !copied.contains("echo AFTER"),
+            "the HARD newline after the command must still end the selection"
+        );
+        assert_eq!(
+            app.windows[&wid].gesture.map(|g| (g.row, g.end_row)),
+            Some((0, 1)),
+            "the armed gesture origin must be the whole logical line"
+        );
+    }
+
+    /// A double-click on a word straddling the wrap selects the WHOLE word —
+    /// `STRADDLEWORD`, never the `STRADD` fragment on the clicked row.
+    #[test]
+    fn a_double_click_copies_a_word_straddling_the_wrap_whole() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let filler = "word ".repeat(14) + "abc ";
+        assert_eq!(filler.len(), 74);
+        term_lock(&term).process(format!("{filler}STRADDLEWORD tail").as_bytes());
+
+        app.select_word_click(wid, 0, 76);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("STRADDLEWORD"),
+            "the double-click must reach across the soft wrap for the rest of the word"
+        );
+        assert_eq!(
+            app.windows[&wid]
+                .gesture
+                .map(|g| ((g.row, g.start_col), (g.end_row, g.end_col))),
+            Some(((0, 74), (1, 5))),
+            "the armed origin word must be the whole word, on both rows"
+        );
+    }
+
+    /// A DRAG started from a wrapped line must not re-truncate it: the origin
+    /// logical line stays whole while the moving end extends, in either
+    /// direction. The click arms the gesture; every pointer move rebuilds the
+    /// selection from that origin, so the drag arms need the same logical span
+    /// the click used or the fix would only survive until the pointer twitched.
+    ///
+    /// The UPWARD drag is the discriminating half. Dragging DOWN off a wrapped
+    /// line reads the same either way — the copy joins the continuation row
+    /// whether or not the gesture claimed it — so only anchoring at the origin's
+    /// LAST row, which a physical-row gesture cannot name, separates a whole
+    /// origin line from its 80-byte head.
+    #[test]
+    fn a_drag_from_a_wrapped_line_keeps_the_whole_origin_line() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        // Row 0 is an ordinary line; the wrapped command is rows 1-2; row 3 is
+        // the next logical line. The origin therefore has content on BOTH sides.
+        let (mut seed, cmd) = wrapped_command_screen();
+        let mut screen = b"BEFORE\r\n".to_vec();
+        screen.append(&mut seed);
+        term_lock(&term).process(&screen);
+        assert!(
+            term_lock(&term).row_continues_previous(2),
+            "precondition: the command wraps from row 1 onto row 2"
+        );
+
+        app.select_line_click(wid, 1, 10);
+        // Drag DOWN onto the next logical line.
+        app.drag_selection(wid, 3, 0);
+        assert_eq!(
+            term_lock(&term)
+                .selection_to_string()
+                .expect("the drag resolves to text"),
+            format!("{cmd}\necho AFTER"),
+            "the whole wrapped origin line, then the hovered line — one newline \
+             between them, at the HARD break only"
+        );
+
+        // Drag back UP, PAST the origin, onto the line above it. The origin must
+        // stay whole: anchored at its LAST row, not at the row that was clicked.
+        app.drag_selection(wid, 0, 0);
+        assert_eq!(
+            term_lock(&term)
+                .selection_to_string()
+                .expect("the drag resolves to text"),
+            format!("BEFORE\n{cmd}"),
+            "dragging up past the origin must keep the whole wrapped origin line; \
+             anchoring on the clicked ROW would stop the copy at the window width"
+        );
+
+        // And back INTO the origin's own continuation row: still the whole line.
+        app.drag_selection(wid, 2, 0);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some(cmd.as_str()),
+            "dragging within the origin logical line must keep it whole"
         );
     }
 

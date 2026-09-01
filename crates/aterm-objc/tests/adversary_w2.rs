@@ -106,7 +106,7 @@ declare_class! {
                 drops: Arc::clone(&self.ivars().drops),
             }) {
                 Some(c) => c.autorelease(),
-                None => std::ptr::null_mut(),
+                None => Id::NIL,
             }
         }
 
@@ -119,7 +119,7 @@ declare_class! {
                 drops: Arc::clone(&self.ivars().drops),
             }) {
                 Some(c) => c.into_raw(),
-                None => std::ptr::null_mut(),
+                None => Id::NIL,
             }
         }
 
@@ -189,7 +189,7 @@ fn arity_four_five_and_six_reach_their_bodies_with_arguments_in_order() {
             sel!(i:d:o:s:f:),
             7,
             0.5,
-            std::ptr::null_mut(),
+            Id::NIL,
             sel!(insertNewline:),
             0.25,
         );
@@ -636,10 +636,10 @@ fn the_sel_cache_is_correct_under_a_hard_concurrent_first_use() {
             b.wait();
             let mut v = Vec::new();
             for _ in 0..64 {
-                v.push(sel!(objectAtIndex:) as usize);
-                v.push(sel!(initWithBytes:length:encoding:) as usize);
-                v.push(sel!(description) as usize);
-                v.push(sel!(isEqualToString:) as usize);
+                v.push(sel!(objectAtIndex:).as_ptr().addr());
+                v.push(sel!(initWithBytes:length:encoding:).as_ptr().addr());
+                v.push(sel!(description).as_ptr().addr());
+                v.push(sel!(isEqualToString:).as_ptr().addr());
             }
             v
         }));
@@ -651,11 +651,13 @@ fn the_sel_cache_is_correct_under_a_hard_concurrent_first_use() {
     }
     assert_eq!(
         first[0],
-        aterm_objc::sel_uncached(c"objectAtIndex:") as usize
+        aterm_objc::sel_uncached(c"objectAtIndex:").as_ptr().addr()
     );
     assert_eq!(
         first[1],
-        aterm_objc::sel_uncached(c"initWithBytes:length:encoding:") as usize
+        aterm_objc::sel_uncached(c"initWithBytes:length:encoding:")
+            .as_ptr()
+            .addr()
     );
 }
 

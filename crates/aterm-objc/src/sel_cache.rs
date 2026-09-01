@@ -52,7 +52,7 @@ impl SelCache {
     pub fn get(&self, name: &'static CStr) -> Sel {
         let cached = self.0.load(Ordering::Relaxed);
         if !cached.is_null() {
-            return cached.cast_const().cast();
+            return Sel::from_ptr(cached.cast_const());
         }
         self.fill(name)
     }
@@ -62,7 +62,8 @@ impl SelCache {
     #[inline(never)]
     fn fill(&self, name: &'static CStr) -> Sel {
         let resolved = sel(name);
-        self.0.store(resolved.cast_mut().cast(), Ordering::Relaxed);
+        self.0
+            .store(resolved.as_ptr().cast_mut(), Ordering::Relaxed);
         resolved
     }
 }

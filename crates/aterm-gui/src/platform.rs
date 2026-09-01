@@ -1683,7 +1683,7 @@ mod reduce_motion {
                 aterm_objc::sel!(sharedWorkspace),
             );
             if ws.is_null() {
-                return std::ptr::null_mut();
+                return aterm_objc::Id::NIL;
             }
             let g: unsafe extern "C" fn(aterm_objc::Id, aterm_objc::Sel) -> aterm_objc::Id =
                 aterm_objc::msg();
@@ -1729,7 +1729,7 @@ mod reduce_motion {
                     target.as_id(),
                     aterm_objc::sel!(reduceMotionDidChange:),
                     name.id(),
-                    std::ptr::null_mut(),
+                    aterm_objc::Id::NIL,
                 );
             }
             true
@@ -1839,7 +1839,7 @@ mod reduce_motion {
                         center,
                         aterm_objc::sel!(postNotificationName:object:),
                         name.id(),
-                        std::ptr::null_mut(),
+                        aterm_objc::Id::NIL,
                     );
                 }
             });
@@ -1877,16 +1877,24 @@ mod reduce_motion {
             // SAFETY: `target` is a live instance; `-respondsToSelector:` is a
             // side-effect-free query.
             unsafe {
+                // `-respondsToSelector:` returns `BOOL`. This said `-> bool`
+                // until `msg` grew its `Encode` bound and refused it: `bool`
+                // has no `Encode` impl on purpose, because on the x86_64
+                // compat slice `BOOL` is `signed char` and only two of its 256
+                // values are valid `bool` bit patterns.
                 let responds: unsafe extern "C" fn(
                     aterm_objc::Id,
                     aterm_objc::Sel,
                     aterm_objc::Sel,
-                ) -> bool = aterm_objc::msg();
-                assert!(responds(
-                    target.as_id(),
-                    aterm_objc::sel!(respondsToSelector:),
-                    aterm_objc::sel!(reduceMotionDidChange:)
-                ));
+                ) -> aterm_objc::Bool = aterm_objc::msg();
+                assert!(
+                    responds(
+                        target.as_id(),
+                        aterm_objc::sel!(respondsToSelector:),
+                        aterm_objc::sel!(reduceMotionDidChange:)
+                    )
+                    .as_bool()
+                );
             }
 
             assert!(register(&target), "workspace centre registration failed");

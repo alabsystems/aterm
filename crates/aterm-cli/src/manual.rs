@@ -1528,7 +1528,11 @@ mod tests {
             "trust-cg",
             "trust-ir",
             "trust-vc",
-            "zani",
+            // The legacy BMC checkout is deliberately NOT on this roster: the
+            // owner's ruling (grep guard B1) bans its name from the shipped
+            // tree with zero tolerance, mentions included — and in a tree that
+            // honors that ruling no manual page can reference it either, so a
+            // roster entry for it is unreachable by construction.
         ];
         let siblings_root = root.parent().map(std::path::Path::to_path_buf);
         let scan = |page: &str, text: &str, missing: &mut Vec<String>| {
